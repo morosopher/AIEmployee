@@ -1,6 +1,9 @@
 # Brainstorming visual companion
 .superpowers/
 
+# Local isolated worktrees
+.worktrees/
+
 # Environment and secrets
 .env
 .env.*
