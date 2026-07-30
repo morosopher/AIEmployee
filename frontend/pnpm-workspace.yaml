@@ -1,0 +1,4 @@
+# pnpm 11 默认拒绝依赖构建脚本；仅批准 Vite 所需的 esbuild 平台二进制安装步骤。
+# 其他依赖仍保持默认拒绝，避免把未来新增包的安装脚本静默纳入信任边界。
+allowBuilds:
+  esbuild: true

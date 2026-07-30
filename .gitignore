@@ -8,13 +8,18 @@
 .env
 .env.*
 !.env.example
+secrets/
 *.pem
 *.key
+*.dump
+*.enc
 
 # Python
 __pycache__/
+**/__pycache__/
 *.py[cod]
 .venv/
+backend/.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -27,8 +32,12 @@ build/
 
 # Node / Vue
 node_modules/
+frontend/node_modules/
 frontend/dist/
 coverage/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
 pnpm-debug.log*
 
 # Runtime data

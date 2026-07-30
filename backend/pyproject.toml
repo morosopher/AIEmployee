@@ -1,0 +1,53 @@
+[project]
+name = "ai-employee"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.16,<2",
+  "argon2-cffi>=25,<26",
+  "asyncpg>=0.30,<1",
+  "beautifulsoup4>=4.13,<5",
+  "cryptography>=48.0.1,<49",
+  "fastapi>=0.118,<1",
+  "httpx>=0.28,<1",
+  "langgraph>=1.0,<2",
+  "langgraph-checkpoint-postgres>=2,<4",
+  "prometheus-client>=0.22,<1",
+  "pydantic-settings>=2.10,<3",
+  "redis>=6,<7",
+  "sse-starlette>=3,<4",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "structlog>=25,<26",
+  "taskiq>=0.11,<1",
+  "taskiq-redis>=1,<2",
+  "uvicorn[standard]>=0.35,<1"
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.17,<2",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=1.1,<2",
+  "respx>=0.22,<1",
+  "ruff>=0.12,<1"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_employee"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]

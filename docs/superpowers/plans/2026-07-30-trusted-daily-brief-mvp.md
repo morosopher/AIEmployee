@@ -96,6 +96,7 @@
 - Create: `backend/pyproject.toml`
 - Create: `backend/uv.lock`
 - Create: `frontend/package.json`
+- Create: `frontend/pnpm-workspace.yaml`
 - Create: `scripts/test-tooling.sh`
 
 - [ ] **Step 1: Write the failing tooling contract**
@@ -119,19 +120,48 @@ for recipe in "${required_recipes[@]}"; do
 done
 ~~~
 
+After the recipe-name check, the script must create an isolated `mktemp -d` sandbox, copy the root
+justfile and imported modules into it, and install fake `docker`, `uv`, and
+`scripts/restore-postgres.sh` commands that only append their arguments to a sandbox log. A trap
+must remove the sandbox. The behavior contract must verify all of the following without touching
+the real repository scripts, Docker daemon, network, or databases:
+
+- revision names, log service names, and restore paths containing spaces, quotes, and semicolons
+  arrive as one unchanged argument and cannot create an injection sentinel;
+- `db-reset` and `restore` reject missing or unknown `APP_ENV` values and allow only explicit
+  `development` or `test`;
+- `db-reset` rejects missing/unsafe database configuration, identifiers longer than PostgreSQL's
+  63-byte limit, system database names, and test-environment database names without `_test`;
+- the raw `DATABASE_URL` must begin with the exact lowercase `postgresql://` or
+  `postgresql+asyncpg://` prefix, with no leading whitespace or control character, and must contain
+  no TAB, LF, or CR anywhere because `urlsplit` silently removes them while SQLAlchemy preserves
+  them; the parsed URL must then use the configured username, a loopback host, an explicit `5432`
+  port, no query or fragment, and a database path exactly matching `POSTGRES_DB`, all before a fake
+  destructive call;
+- successful `db-reset` output includes the verified endpoint, database name, and user without a
+  password or complete URL, while fake `uv` proves `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE`,
+  `PGUSER`, `PGSERVICE`, and `PGSERVICEFILE` are absent from the migration process;
+- `just --show db-reset` and `just --show restore` retain `[confirm]`, while `just --yes` still
+  cannot bypass the recipe's own exact target confirmation;
+- `doctor` checks the `python3` runtime used by the local URL guard;
+- `logs` preserves the no-service form and uses `--` plus one quoted service argument when present.
+
 - [ ] **Step 2: Run the tooling contract and observe the expected failure**
 
 Run: `bash scripts/test-tooling.sh`
 
 Expected: FAIL because the root justfile does not exist.
 
+After the root justfile exists, the same contract must also fail against the original unsafe
+template-interpolation recipes and pass only after the sandbox behavior checks are implemented.
+
 - [ ] **Step 3: Add the root imports and recipe groups**
 
 Create `justfile`:
 
 ~~~just
-set dotenv-load := true
-set positional-arguments := true
+set dotenv-load
+set positional-arguments
 
 import 'justfiles/dev.just'
 import 'justfiles/test.just'
@@ -151,6 +181,7 @@ doctor:
     @command -v uv
     @command -v pnpm
     @command -v docker
+    @command -v python3
     @docker compose version
 
 [group('development')]
@@ -227,21 +258,146 @@ ci: check test-integration
 
 Create `justfiles/db.just`:
 
+The destructive recipes below are intentionally fail-closed: they require an explicit development
+or test environment, enforce ASCII PostgreSQL identifiers of at most 63 UTF-8 bytes, require test
+database names to end in `_test`, and parse `DATABASE_URL` locally with `urllib.parse`. Before
+parsing, the raw value must begin with the exact lowercase `postgresql://` or
+`postgresql+asyncpg://` prefix so mixed-case schemes and leading characters silently stripped by
+`urlsplit` are rejected before any destructive call. It must also contain no TAB, LF, or CR at any
+position because `urlsplit` silently removes those characters while SQLAlchemy preserves them.
+Only the configured user on `localhost`, `127.0.0.1`, or `::1` with an explicit `5432` port, no
+query or fragment, and an exact database path is accepted. The validated endpoint, database name,
+and user are shown before exact confirmation without printing the password or complete URL.
+Migration commands remove libpq target/service override variables so Alembic consumes only
+`DATABASE_URL`; a second exact confirmation remains mandatory even when `just --yes` bypasses the
+outer `[confirm]` prompt.
+
 ~~~just
 [group('database')]
 db-upgrade:
-    uv run --project backend alembic -c backend/alembic.ini upgrade head
+    # 清除可覆盖连接目标或 libpq service 的环境变量，保证迁移只消费应用显式提供的 DATABASE_URL。
+    env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGSERVICE -u PGSERVICEFILE uv run --project backend alembic -c backend/alembic.ini upgrade head
 
 [group('database')]
 db-revision name:
-    uv run --project backend alembic -c backend/alembic.ini revision --autogenerate -m "{{name}}"
+    uv run --project backend alembic -c backend/alembic.ini revision --autogenerate -m "$1"
 
-[group('database')]
 [confirm]
+[group('database')]
 db-reset:
-    @test "${APP_ENV:-development}" != "production"
-    docker compose exec -T postgres dropdb --if-exists -U "${POSTGRES_USER:-ai_employee}" ai_employee
-    docker compose exec -T postgres createdb -U "${POSTGRES_USER:-ai_employee}" ai_employee
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # just 的 [confirm] 只能防止误触；脚本仍需独立验证环境、精确目标和人工输入。
+    fail() {
+      printf 'db-reset refused: %s\n' "$1" >&2
+      exit 1
+    }
+
+    app_env="${APP_ENV-}"
+    case "${app_env}" in
+      development|test) ;;
+      *) fail 'APP_ENV must be explicitly set to development or test' ;;
+    esac
+
+    database_name="${POSTGRES_DB-}"
+    database_user="${POSTGRES_USER-}"
+    database_url="${DATABASE_URL-}"
+    [[ -n "${database_name}" ]] || fail 'POSTGRES_DB is required'
+    [[ -n "${database_user}" ]] || fail 'POSTGRES_USER is required'
+    [[ -n "${database_url}" ]] || fail 'DATABASE_URL is required'
+
+    # 使用 Python 标准库解析 URL，避免 Bash 字符串切片漏掉 username、host 或 port。
+    # 敏感 URL 通过临时环境变量传入，不作为参数或错误消息输出；脚本只打印静态拒绝原因。
+    AI_EMPLOYEE_DB_RESET_ENV="${app_env}" \
+    AI_EMPLOYEE_DB_RESET_NAME="${database_name}" \
+    AI_EMPLOYEE_DB_RESET_USER="${database_user}" \
+    AI_EMPLOYEE_DB_RESET_URL="${database_url}" \
+    python3 - <<'PY'
+    import os
+    import re
+    import sys
+    from typing import NoReturn
+    from urllib.parse import urlsplit
+
+
+    def reject(reason: str) -> NoReturn:
+        """以不泄露 URL、密码或完整标识符的方式终止数据库目标校验。"""
+
+        print(f"db-reset refused: {reason}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+    app_env = os.environ["AI_EMPLOYEE_DB_RESET_ENV"]
+    database_name = os.environ["AI_EMPLOYEE_DB_RESET_NAME"]
+    database_user = os.environ["AI_EMPLOYEE_DB_RESET_USER"]
+    database_url = os.environ["AI_EMPLOYEE_DB_RESET_URL"]
+
+
+    def validate_identifier(label: str, value: str) -> None:
+        """验证 PostgreSQL 标识符的 ASCII 语法和 63 字节上限。"""
+
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
+            reject(f"{label} must match [A-Za-z_][A-Za-z0-9_]*")
+        if len(value.encode("utf-8")) > 63:
+            reject(f"{label} must be at most 63 UTF-8 bytes")
+
+
+    validate_identifier("POSTGRES_DB", database_name)
+    validate_identifier("POSTGRES_USER", database_user)
+    if database_name.casefold() in {"postgres", "template0", "template1"}:
+        reject("system databases cannot be reset")
+    if app_env == "test" and not database_name.endswith("_test"):
+        reject("test database name must end with _test")
+
+    # urlsplit 会规范化 scheme 大小写，并从任意位置静默删除 TAB、LF、CR；先校验原始
+    # 字符串，确保安全 guard 与后续 SQLAlchemy 对 DATABASE_URL 的接受范围完全一致。
+    if not database_url.startswith(("postgresql://", "postgresql+asyncpg://")):
+        reject("DATABASE_URL must begin with an exact lowercase PostgreSQL scheme")
+    if any(character in database_url for character in "\t\n\r"):
+        reject("DATABASE_URL must not contain TAB, LF, or CR characters")
+
+    try:
+        parsed_url = urlsplit(database_url)
+        url_scheme = parsed_url.scheme
+        url_username = parsed_url.username
+        url_hostname = parsed_url.hostname
+        url_port = parsed_url.port
+    except ValueError:
+        # urlsplit 会对非法 IPv6 或 port 抛出 ValueError；不要把原始 URL 带入错误。
+        reject("DATABASE_URL is malformed")
+
+    if url_scheme not in {"postgresql", "postgresql+asyncpg"}:
+        reject("DATABASE_URL must use a PostgreSQL scheme")
+    if url_username != database_user:
+        reject("DATABASE_URL username must exactly match POSTGRES_USER")
+    if url_hostname is None or url_hostname.lower() not in {"localhost", "127.0.0.1", "::1"}:
+        reject("DATABASE_URL host must be localhost, 127.0.0.1, or ::1")
+    if url_port != 5432:
+        reject("DATABASE_URL port must be explicitly set to 5432")
+    # SQLAlchemy 与底层驱动可能把 query 解释为 authority/path 的覆盖项；破坏性操作不接受任何 query。
+    if "?" in database_url:
+        reject("DATABASE_URL must not contain a query")
+    if "#" in database_url:
+        reject("DATABASE_URL must not contain a fragment")
+    if parsed_url.path != f"/{database_name}":
+        reject("DATABASE_URL database must exactly match POSTGRES_DB")
+
+    # 仅输出完成全部校验后的规范化端点，不回显密码、query、fragment 或完整 URL。
+    normalized_host = f"[{url_hostname.lower()}]" if ":" in url_hostname else url_hostname.lower()
+    print(f"Verified endpoint: {normalized_host}:{url_port}", file=sys.stderr)
+    PY
+
+    printf 'APP_ENV=%s\nCompose service: postgres\nDatabase target: %s\nDatabase user: %s\n' \
+      "${app_env}" "${database_name}" "${database_user}" >&2
+    printf 'Type the exact database name to confirm: ' >&2
+    confirmation=''
+    IFS= read -r confirmation || fail 'confirmation input is required'
+    [[ "${confirmation}" == "${database_name}" ]] || fail 'confirmation did not match database target'
+
+    # 只有全部验证与精确确认完成后才允许 Fake/真实命令接触目标；set -e 保证迁移严格后置。
+    docker compose exec -T postgres dropdb --if-exists -U "${database_user}" "${database_name}"
+    docker compose exec -T postgres createdb -U "${database_user}" "${database_name}"
     just db-upgrade
 ~~~
 
@@ -258,7 +414,16 @@ infra-down:
 
 [group('docker')]
 logs service='':
-    docker compose logs -f {{service}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    service="${1-}"
+    if [[ -z "${service}" ]]; then
+      docker compose logs -f
+    else
+      # -- 将用户提供的 service 与 Compose 选项隔离，双引号确保它始终是单一参数。
+      docker compose logs -f -- "${service}"
+    fi
 
 [group('docker')]
 ps:
@@ -276,11 +441,35 @@ Create `justfiles/ops.just`:
 backup:
     scripts/backup-postgres.sh
 
-[group('operations')]
 [confirm]
+[group('operations')]
 restore file:
-    @test "${APP_ENV:-development}" != "production"
-    scripts/restore-postgres.sh "{{file}}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    fail() {
+      printf 'restore refused: %s\n' "$1" >&2
+      exit 1
+    }
+
+    app_env="${APP_ENV-}"
+    case "${app_env}" in
+      development|test) ;;
+      *) fail 'APP_ENV must be explicitly set to development or test' ;;
+    esac
+
+    restore_file="${1-}"
+    [[ -n "${restore_file}" ]] || fail 'restore file must not be empty'
+
+    printf 'APP_ENV=%s\nCompose service: postgres\nRestore target: %s\n' \
+      "${app_env}" "${restore_file}" >&2
+    printf 'Type the exact restore file path to confirm: ' >&2
+    confirmation=''
+    IFS= read -r confirmation || fail 'confirmation input is required'
+    [[ "${confirmation}" == "${restore_file}" ]] || fail 'confirmation did not match restore target'
+
+    # Task 19 才提供真实恢复脚本；此处只冻结安全调用协议，不提前实现恢复逻辑。
+    scripts/restore-postgres.sh "${restore_file}"
 ~~~
 
 - [ ] **Step 4: Add reproducible package manifests**
@@ -324,6 +513,8 @@ secrets/
 
 Create `backend/pyproject.toml`:
 
+Security note: the minimum versions of `cryptography` and `pytest` are raised to address GHSA-537c-gmf6-5ccf and PYSEC-2026-1845.
+
 ~~~toml
 [project]
 name = "ai-employee"
@@ -334,7 +525,7 @@ dependencies = [
   "argon2-cffi>=25,<26",
   "asyncpg>=0.30,<1",
   "beautifulsoup4>=4.13,<5",
-  "cryptography>=45,<47",
+  "cryptography>=48.0.1,<49",
   "fastapi>=0.118,<1",
   "httpx>=0.28,<1",
   "langgraph>=1.0,<2",
@@ -353,7 +544,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "mypy>=1.17,<2",
-  "pytest>=8.4,<9",
+  "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.1,<2",
   "respx>=0.22,<1",
   "ruff>=0.12,<1"
@@ -406,6 +597,13 @@ pnpm --dir frontend add vue pinia vue-router markdown-it dompurify
 pnpm --dir frontend add -D @eslint/js @playwright/test @types/markdown-it @vitejs/plugin-vue @vitest/coverage-v8 @vue/test-utils eslint eslint-plugin-vue globals jsdom prettier typescript typescript-eslint vite vitest vue-eslint-parser vue-tsc
 ~~~
 
+Use pnpm 11.18.0 for the lockfile. Keep the generated manifest's compatible direct ranges for
+TypeScript (`^5.9.3`), Vite (`^7.3.6`), and Vue Router (`^4.6.4`) so the lint/build toolchain has
+no unresolved peer dependencies.
+
+Create `frontend/pnpm-workspace.yaml` with an explicit project-level build allowlist. Only `esbuild`
+may run its install script; all other dependency build scripts remain denied by default.
+
 Create `.env.example`:
 
 ~~~dotenv
@@ -452,12 +650,12 @@ pnpm --dir frontend install
 bash scripts/test-tooling.sh
 ~~~
 
-Expected: PASS; every required recipe is present.
+Expected: PASS; every required recipe is present and all sandbox behavior/security checks pass.
 
 - [ ] **Step 6: Commit the scaffold**
 
 ~~~bash
-git add .python-version .node-version .gitignore .env.example justfile justfiles backend/pyproject.toml backend/uv.lock frontend/package.json frontend/pnpm-lock.yaml scripts/test-tooling.sh
+git add .python-version .node-version .gitignore .env.example justfile justfiles backend/pyproject.toml backend/uv.lock frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml scripts/test-tooling.sh docs/superpowers/plans/2026-07-30-trusted-daily-brief-mvp.md
 git commit -m "chore: scaffold project tooling"
 ~~~
 
