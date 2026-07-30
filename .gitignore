@@ -1,0 +1,39 @@
+# Brainstorming visual companion
+.superpowers/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Node / Vue
+node_modules/
+frontend/dist/
+coverage/
+pnpm-debug.log*
+
+# Runtime data
+*.log
+backups/
+data/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
