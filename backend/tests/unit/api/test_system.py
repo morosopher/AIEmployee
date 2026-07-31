@@ -1,7 +1,11 @@
 """验证 API 进程系统端点与高风险运行模式配置。"""
 
+from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
+
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from ai_employee.config import Settings
 from ai_employee.main import create_app
@@ -27,9 +31,69 @@ def test_readiness_reports_dependency_probe_result() -> None:
     }
 
 
+def test_system_responses_expose_stable_openapi_schemas() -> None:
+    """健康与就绪端点应以命名且字段受约束的 Schema 暴露公共响应契约。"""
+    openapi_schema = create_app().openapi()
+    paths = openapi_schema["paths"]
+    components = openapi_schema["components"]["schemas"]
+
+    health_response = paths["/api/v1/system/health"]["get"]["responses"]["200"]
+    assert health_response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HealthResponse"
+    }
+    health_schema = components["HealthResponse"]
+    assert health_schema["properties"]["status"]["const"] == "ok"
+    assert health_schema["properties"]["service"]["const"] == "api"
+    assert set(health_schema["required"]) == {"status", "service"}
+
+    readiness_response = paths["/api/v1/system/readiness"]["get"]["responses"]["200"]
+    assert readiness_response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ReadinessResponse"
+    }
+    readiness_schema = components["ReadinessResponse"]
+    assert readiness_schema["properties"]["status"]["enum"] == ["ready", "not_ready"]
+    assert readiness_schema["properties"]["dependencies"]["additionalProperties"] == {
+        "type": "boolean"
+    }
+    assert set(readiness_schema["required"]) == {"status", "dependencies"}
+
+
 def test_production_rejects_test_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
     """生产环境不得启用测试适配器，避免合成数据被误作业务事实。"""
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("APP_TEST_MODE", "true")
     with pytest.raises(ValueError, match="APP_TEST_MODE"):
         Settings()
+
+
+def test_settings_reject_invalid_iana_timezone() -> None:
+    """默认时区必须是时区数据库中存在的 IANA 名称。"""
+    with pytest.raises(ZoneInfoNotFoundError):
+        Settings(default_timezone="Invalid/Timezone")
+
+
+def test_settings_reject_step_timeout_above_task_timeout() -> None:
+    """单步超时超过任务总超时时应拒绝启动配置。"""
+    with pytest.raises(ValueError, match="TASK_STEP_TIMEOUT_SECONDS"):
+        Settings(task_timeout_seconds=60, task_step_timeout_seconds=61)
+
+
+def test_read_secret_file_reads_utf8_strips_whitespace_and_returns_secret(
+    tmp_path: Path,
+) -> None:
+    """Secret 文件应按 UTF-8 读取、去除边界空白并返回遮蔽类型。"""
+    secret_path = tmp_path / "secret"
+    secret_path.write_text("  密钥内容\n", encoding="utf-8")
+
+    secret = Settings().read_secret_file(secret_path)
+
+    assert isinstance(secret, SecretStr)
+    assert secret.get_secret_value() == "密钥内容"
+
+
+def test_read_secret_file_does_not_swallow_missing_file_error(tmp_path: Path) -> None:
+    """Secret 文件缺失时应保留文件系统异常，避免以空凭据继续运行。"""
+    missing_path = tmp_path / "missing-secret"
+
+    with pytest.raises(FileNotFoundError):
+        Settings().read_secret_file(missing_path)
