@@ -46,8 +46,12 @@ def test_system_responses_expose_stable_openapi_schemas() -> None:
     assert health_schema["properties"]["service"]["const"] == "api"
     assert set(health_schema["required"]) == {"status", "service"}
 
-    readiness_response = paths["/api/v1/system/readiness"]["get"]["responses"]["200"]
+    readiness_responses = paths["/api/v1/system/readiness"]["get"]["responses"]
+    readiness_response = readiness_responses["200"]
     assert readiness_response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ReadinessResponse"
+    }
+    assert readiness_responses["503"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/ReadinessResponse"
     }
     readiness_schema = components["ReadinessResponse"]

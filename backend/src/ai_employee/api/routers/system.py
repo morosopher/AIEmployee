@@ -50,7 +50,11 @@ def build_system_router(readiness_probe: Callable[[], dict[str, bool]]) -> APIRo
         """
         return HealthResponse(status="ok", service="api")
 
-    @router.get("/readiness", response_model=ReadinessResponse)
+    @router.get(
+        "/readiness",
+        response_model=ReadinessResponse,
+        responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ReadinessResponse}},
+    )
     def readiness(response: Response) -> ReadinessResponse:
         """执行注入的依赖探针并映射为就绪状态响应。
 
