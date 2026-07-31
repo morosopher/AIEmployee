@@ -9,6 +9,7 @@ from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from ai_employee.infrastructure.db import models as db_models
+from ai_employee.infrastructure.db.alembic import set_alembic_database_url
 from ai_employee.infrastructure.db.base import Base
 
 config = context.config
@@ -16,7 +17,7 @@ config = context.config
 database_url = os.environ.get("DATABASE_URL")
 if database_url is not None and not config.get_main_option("sqlalchemy.url"):
     # 命令行迁移从环境接收部署配置，但不覆盖测试通过 Alembic Config 注入的隔离 URL。
-    config.set_main_option("sqlalchemy.url", database_url)
+    set_alembic_database_url(config, database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

@@ -10,6 +10,7 @@ from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
+from ai_employee.infrastructure.db.alembic import set_alembic_database_url
 from ai_employee.infrastructure.db.session import build_engine
 
 # 清理范围只允许使用经过代码审查的应用表，顺序先子后父，且绝不包含 alembic_version。
@@ -55,7 +56,7 @@ def migrated_database(database_url: str) -> Iterator[None]:
 
     backend_root = Path(__file__).resolve().parents[2]
     alembic_config = Config(backend_root / "alembic.ini")
-    alembic_config.set_main_option("sqlalchemy.url", database_url)
+    set_alembic_database_url(alembic_config, database_url)
     command.upgrade(alembic_config, "head")
     yield
 
