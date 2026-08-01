@@ -5,10 +5,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.use_cases.auth import IdentityRepository
+from ai_employee.application.use_cases.maintenance import SessionMaintenanceRepository
+from ai_employee.application.use_cases.schedules import ActiveUserBriefSchedule
 from ai_employee.domain.identity import (
     NewAdmin,
     SessionAuthenticationRecord,
@@ -232,3 +234,71 @@ class SqlAlchemyIdentityRepositoryFactory:
         """在单一事务内暴露窄 Repository，并在异常时由 SQLAlchemy 回滚。"""
         async with self._session_factory.begin() as session:
             yield SqlAlchemyIdentityRepository(session)
+
+
+class SqlAlchemyActiveUserScheduleReader:
+    """从 PostgreSQL 读取活动用户的最小每日简报计划快照。"""
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存共享 Session factory；读取期间不暴露 ORM 对象。"""
+        self._session_factory = session_factory
+
+    async def list_active(self) -> tuple[ActiveUserBriefSchedule, ...]:
+        """按用户 UUID 稳定顺序读取活动用户时区与墙上简报时间。"""
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        UserModel.id,
+                        UserModel.timezone,
+                        UserModel.brief_time,
+                    )
+                    .where(UserModel.is_active.is_(True))
+                    .order_by(UserModel.id)
+                )
+            ).all()
+        return tuple(
+            ActiveUserBriefSchedule(
+                user_id=row.id,
+                timezone=row.timezone,
+                brief_time=row.brief_time,
+            )
+            for row in rows
+        )
+
+
+class SqlAlchemySessionMaintenanceRepository:
+    """在调用方事务内执行受 UTC 边界约束的到期会话清理。"""
+
+    def __init__(self, session: AsyncSession) -> None:
+        """绑定由维护 factory 管理生命周期的异步 Session。"""
+        self._session = session
+
+    async def delete_expired(self, *, now: datetime) -> int:
+        """真实删除 ``expires_at <= now`` 的会话，并返回命中行数。
+
+        原始 Cookie 从未进入数据库，本操作只清理不可逆摘要。应用用例已验证 ``now`` 是
+        timezone-aware UTC；Repository 不根据宿主机时区推断过期时间。
+        """
+        deleted_ids = (
+            await self._session.scalars(
+                delete(UserSessionModel)
+                .where(UserSessionModel.expires_at <= now)
+                .returning(UserSessionModel.id)
+            )
+        ).all()
+        return len(deleted_ids)
+
+
+class SqlAlchemySessionMaintenanceRepositoryFactory:
+    """为每次会话过期清理提供独立且自动提交/回滚的事务。"""
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存共享 Session factory，不在构造时获取连接。"""
+        self._session_factory = session_factory
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[SessionMaintenanceRepository]:
+        """在短事务中暴露会话维护端口，异常时由 SQLAlchemy 自动回滚。"""
+        async with self._session_factory.begin() as session:
+            yield SqlAlchemySessionMaintenanceRepository(session)

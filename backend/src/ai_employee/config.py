@@ -28,6 +28,31 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     task_timeout_seconds: int = Field(default=900, ge=1)
     task_step_timeout_seconds: int = Field(default=300, ge=1)
+    task_lease_seconds: int = Field(
+        default=360,
+        ge=1,
+        description="Worker 执行租约与节点间续租使用的正整数秒数。",
+    )
+    outbox_claim_seconds: int = Field(
+        default=60,
+        ge=1,
+        description="Outbox 在外部投递前向后移动 available_at 的短 claim 秒数。",
+    )
+    outbox_retry_base_seconds: int = Field(
+        default=5,
+        ge=1,
+        description="Outbox 首次安全投递失败后的指数退避基准秒数。",
+    )
+    outbox_retry_max_seconds: int = Field(
+        default=300,
+        ge=1,
+        description="Outbox 指数退避允许达到的最大秒数。",
+    )
+    outbox_relay_batch_size: int = Field(
+        default=100,
+        ge=1,
+        description="单次 Outbox relay 事务最多 claim 的未发布事件数。",
+    )
     session_cookie_name: str = "ai_employee_session"
     session_ttl_seconds: int = Field(
         default=604800,
@@ -82,6 +107,12 @@ class Settings(BaseSettings):
         # 单步截止时间必须受任务总截止时间约束，避免任务已超时但步骤仍在运行。
         if self.task_step_timeout_seconds > self.task_timeout_seconds:
             raise ValueError("TASK_STEP_TIMEOUT_SECONDS cannot exceed TASK_TIMEOUT_SECONDS")
+        # 当前 Worker 只在节点边界续租；租约短于单步预算会允许第二 Worker 在节点中途接管。
+        if self.task_lease_seconds < self.task_step_timeout_seconds:
+            raise ValueError("TASK_LEASE_SECONDS cannot be shorter than TASK_STEP_TIMEOUT_SECONDS")
+        # 初始退避高于上限会让配置语义自相矛盾，也会使首次失败无法遵守最大等待值。
+        if self.outbox_retry_base_seconds > self.outbox_retry_max_seconds:
+            raise ValueError("OUTBOX_RETRY_BASE_SECONDS cannot exceed OUTBOX_RETRY_MAX_SECONDS")
         return self
 
     def read_secret_file(self, path: Path) -> SecretStr:
