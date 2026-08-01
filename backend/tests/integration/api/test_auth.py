@@ -230,17 +230,20 @@ async def test_login_sets_secure_cookies_persists_only_hashes_and_me_returns_use
 
 
 @pytest.mark.asyncio
-async def test_login_rejects_wrong_password_and_inactive_user_without_creating_session(
+async def test_login_rejects_unknown_wrong_password_and_inactive_user_identically(
     auth_context: AuthTestContext,
 ) -> None:
-    """错误密码或停用用户都应使用同一凭据错误，且不得泄露账户状态。"""
+    """未知、错误密码或停用用户应返回同一公共错误，且都不创建会话。"""
     user_id = await _seed_user(auth_context)
 
+    unknown_user = await auth_context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "missing@example.com", "password": ADMIN_PASSWORD},
+    )
     wrong_password = await auth_context.client.post(
         "/api/v1/auth/login",
         json={"email": ADMIN_EMAIL, "password": "wrong-password"},
     )
-    first_problem = _assert_problem(wrong_password, 401, "invalid_credentials")
 
     async with auth_context.session_factory.begin() as session:
         saved_user = await session.get(UserModel, user_id)
@@ -248,9 +251,12 @@ async def test_login_rejects_wrong_password_and_inactive_user_without_creating_s
         saved_user.is_active = False
 
     inactive = await _login(auth_context)
-    second_problem = _assert_problem(inactive, 401, "invalid_credentials")
-    assert first_problem.title == second_problem.title
-    assert first_problem.detail == second_problem.detail
+    problems = tuple(
+        _assert_problem(response, 401, "invalid_credentials")
+        for response in (unknown_user, wrong_password, inactive)
+    )
+    public_payloads = tuple(problem.model_dump(exclude={"trace_id"}) for problem in problems)
+    assert public_payloads == (public_payloads[0],) * 3
     async with auth_context.session_factory() as session:
         assert (await session.scalar(select(UserSessionModel))) is None
 

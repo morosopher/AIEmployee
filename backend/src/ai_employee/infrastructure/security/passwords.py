@@ -4,6 +4,10 @@ from argon2 import PasswordHasher as Argon2PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from argon2.low_level import Type
 
+# 此 Argon2id 哈希由一次性随机输入预生成且原文已丢弃，只用于让未知、停用或无哈希身份
+# 执行真实密码验证工作。它不是用户凭据，也不得写入日志或 API 响应。
+_FALLBACK_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=4$whX9PnBcbFaROV5yRWw4Sw$IqWRQPLFm87vR7WPoUB3+pJ4QZQrVcTFj6JfiiA3sFA"
+
 
 class PasswordHasher:
     """以 Argon2id 对管理员密码进行不可逆哈希与恒定接口验证。
@@ -15,6 +19,15 @@ class PasswordHasher:
     def __init__(self) -> None:
         """创建使用 Argon2id 的密码哈希器。"""
         self._hasher = Argon2PasswordHasher(type=Type.ID)
+
+    @property
+    def fallback_password_hash(self) -> str:
+        """返回跨请求稳定且可由 Argon2id 验证器处理的 fallback 哈希。
+
+        Returns:
+            预先生成的有效 Argon2id 编码哈希；其原始随机输入不保存也不使用。
+        """
+        return _FALLBACK_PASSWORD_HASH
 
     def hash(self, password: str) -> str:
         """为明文密码生成带独立随机盐的 Argon2id 编码哈希。

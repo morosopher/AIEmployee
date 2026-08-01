@@ -20,6 +20,16 @@ def test_password_hash_is_salted_argon2id_and_verifiable() -> None:
     assert not hasher.verify(first, "wrong")
 
 
+def test_fallback_password_hash_is_precomputed_valid_argon2id_work() -> None:
+    """Fallback 哈希必须跨实例稳定，并能驱动一次真实 Argon2id 验证。"""
+    first = PasswordHasher()
+    second = PasswordHasher()
+
+    assert first.fallback_password_hash == second.fallback_password_hash
+    assert first.fallback_password_hash.startswith("$argon2id$")
+    assert not first.verify(first.fallback_password_hash, "synthetic-candidate-password")
+
+
 def test_new_token_returns_independent_urlsafe_values() -> None:
     """每次令牌生成都应返回足够长且可安全放入 Cookie 的独立值。"""
     first = new_token()

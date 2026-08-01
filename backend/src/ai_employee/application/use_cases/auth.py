@@ -61,6 +61,10 @@ class Clock(Protocol):
 class PasswordVerifier(Protocol):
     """抽象密码验证能力，避免应用层依赖 Argon2 SDK。"""
 
+    @property
+    def fallback_password_hash(self) -> str:
+        """返回用于不可用身份路径的有效密码哈希。"""
+
     def verify(self, password_hash: str, password: str) -> bool:
         """验证候选密码是否匹配编码哈希。"""
 
@@ -205,28 +209,33 @@ class LoginUseCase:
         async with self._repositories() as repository:
             user = await repository.get_active_user_by_email(normalized_email)
             if user is None or not user.is_active or user.password_hash is None:
-                raise InvalidCredentialsError
-            # Argon2 验证是 CPU 密集操作，移出事件循环以避免阻塞并发 API 请求。
+                authenticatable_user = None
+                password_hash = self._password_verifier.fallback_password_hash
+            else:
+                authenticatable_user = user
+                password_hash = user.password_hash
+            # 不可用身份也使用有效 Argon2id fallback 哈希完成同量级工作，避免通过远程时延
+            # 枚举活动管理员邮箱；验证仍移出事件循环，且身份可用性与密码结果分别判定。
             password_matches = await asyncio.to_thread(
                 self._password_verifier.verify,
-                user.password_hash,
+                password_hash,
                 password,
             )
-            if not password_matches:
+            if authenticatable_user is None or not password_matches:
                 raise InvalidCredentialsError
 
             raw_session_token = self._token_factory()
             raw_csrf_token = self._token_factory()
             now = _utc_now(self._clock)
             session = await repository.create_session(
-                user_id=user.identity.id,
+                user_id=authenticatable_user.identity.id,
                 token_hash=self._token_hasher(raw_session_token),
                 csrf_hash=self._token_hasher(raw_csrf_token),
                 created_at=now,
                 expires_at=now + self._session_ttl,
             )
         return LoginResult(
-            user=user.identity,
+            user=authenticatable_user.identity,
             session=session,
             raw_session_token=raw_session_token,
             raw_csrf_token=raw_csrf_token,
