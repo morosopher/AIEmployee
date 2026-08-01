@@ -128,7 +128,7 @@ def _validate_json_value(
     if value is None or type(value) in {str, int, bool}:
         return
     if type(value) is float:
-        if not math.isfinite(cast(float, value)):
+        if not math.isfinite(value):
             raise ValueError("approval payload JSON numbers must be finite")
         return
     if type(value) not in {list, dict}:
