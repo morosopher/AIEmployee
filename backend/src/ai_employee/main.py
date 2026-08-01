@@ -1,10 +1,26 @@
 """创建 FastAPI 应用并暴露供 ASGI 服务器加载的进程级实例。"""
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
+from ai_employee.api.deps import (
+    ApiProblem,
+    SystemClock,
+    handle_api_problem,
+    handle_request_validation_error,
+)
+from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.system import build_system_router
+from ai_employee.config import get_settings
+from ai_employee.infrastructure.db.repositories.identity import (
+    SqlAlchemyIdentityRepositoryFactory,
+)
+from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.security.passwords import PasswordHasher
+from ai_employee.infrastructure.security.tokens import hash_token, new_token
 
 
 def create_app(
@@ -18,11 +34,32 @@ def create_app(
             Redis 探测。
 
     Returns:
-        已注册系统状态路由的 FastAPI 应用实例。
+        已注册系统状态与认证路由，并持有可释放数据库引擎的 FastAPI 应用实例。
     """
-    app = FastAPI(title="AI Employee API", version="0.1.0")
+    settings = get_settings()
+    session_factory = build_session_factory(settings.database_url)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """在 API 进程退出时释放认证数据库连接池。"""
+        try:
+            yield
+        finally:
+            await session_factory.dispose()
+
+    app = FastAPI(title="AI Employee API", version="0.1.0", lifespan=lifespan)
+    app.state.auth_settings = settings
+    app.state.auth_session_factory = session_factory
+    app.state.auth_repository_factory = SqlAlchemyIdentityRepositoryFactory(session_factory)
+    app.state.auth_clock = SystemClock()
+    app.state.auth_token_factory = new_token
+    app.state.auth_token_hasher = hash_token
+    app.state.auth_password_verifier = PasswordHasher()
+    app.add_exception_handler(ApiProblem, handle_api_problem)
+    app.add_exception_handler(RequestValidationError, handle_request_validation_error)
     probe = readiness_probe or (lambda: {"postgres": True, "redis": True})
     app.include_router(build_system_router(probe))
+    app.include_router(build_auth_router())
     return app
 
 

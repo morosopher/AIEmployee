@@ -6,7 +6,7 @@ required_recipes=(
   doctor bootstrap dev infra-up infra-down web api worker scheduler
   test test-backend test-frontend test-integration test-e2e
   lint format typecheck check ci db-upgrade db-revision db-reset
-  logs ps health backup restore
+  create-admin logs ps health backup restore
 )
 
 # 只读取 just 的摘要，避免测试依赖面向人的分组标题、颜色或详细帮助格式。
@@ -231,6 +231,22 @@ if [[ -e "${revision_sentinel}" ]]; then
 fi
 assert_contains "${revision_payload}" "${command_log}"
 assert_exact_line $'uv\trun\t--project\tbackend\talembic\t-c\tbackend/alembic.ini\trevision\t--autogenerate\t-m\t'"${revision_payload}" "${command_log}"
+assert_line_count 1 "${command_log}"
+
+# create-admin 的邮箱与密码文件路径必须各自作为单一参数传给 Python 模块，不能发生 shell 逃逸。
+clear_command_log
+admin_sentinel="${sandbox_dir}/admin-injection-sentinel"
+admin_email="owner+\"; : > \"${admin_sentinel}\"; #@example.com"
+admin_password_file="${sandbox_dir}/password file; quoted.txt"
+if ! run_just_capture "${output_file}" just --yes create-admin "${admin_email}" "${admin_password_file}"; then
+  printf 'tooling behavior contract failed: safe create-admin invocation failed\n' >&2
+  exit 1
+fi
+if [[ -e "${admin_sentinel}" ]]; then
+  printf 'tooling behavior contract failed: create-admin payload escaped into shell\n' >&2
+  exit 1
+fi
+assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.create_admin\t--email\t'"${admin_email}"$'\t--password-file\t'"${admin_password_file}" "${command_log}"
 assert_line_count 1 "${command_log}"
 
 # service 参数同样不能逃逸；有参数时还必须经过 -- 与固定命令选项隔离。

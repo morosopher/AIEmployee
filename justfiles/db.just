@@ -8,6 +8,10 @@ db-upgrade:
 db-revision name:
     uv run --project backend alembic -c backend/alembic.ini revision --autogenerate -m "$1"
 
+[group('database')]
+create-admin email password_file:
+    uv run --project backend python -m ai_employee.cli.create_admin --email "$1" --password-file "$2"
+
 [confirm]
 [group('database')]
 db-reset:
