@@ -10,6 +10,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from ai_employee.api.deps import ProblemDetails
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.models.identity import UserModel, UserSessionModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
@@ -127,20 +128,14 @@ def _set_cookie_header(response: httpx.Response, cookie_name: str) -> str:
     )
 
 
-def _assert_problem(
-    response: httpx.Response, status_code: int, error_code: str
-) -> dict[str, object]:
+def _assert_problem(response: httpx.Response, status_code: int, error_code: str) -> ProblemDetails:
     """验证认证错误遵循带稳定扩展字段的 RFC 9457 Problem Details。"""
     assert response.status_code == status_code
     assert response.headers["content-type"].startswith("application/problem+json")
-    body = response.json()
-    assert body["status"] == status_code
-    assert body["error_code"] == error_code
-    assert isinstance(body["type"], str)
-    assert isinstance(body["title"], str)
-    assert isinstance(body["detail"], str)
-    assert isinstance(body["trace_id"], str)
-    assert len(body["trace_id"]) >= 16
+    body = ProblemDetails.model_validate(response.json())
+    assert body.status == status_code
+    assert body.error_code == error_code
+    assert len(body.trace_id) >= 16
     return body
 
 
@@ -254,8 +249,8 @@ async def test_login_rejects_wrong_password_and_inactive_user_without_creating_s
 
     inactive = await _login(auth_context)
     second_problem = _assert_problem(inactive, 401, "invalid_credentials")
-    assert first_problem["title"] == second_problem["title"]
-    assert first_problem["detail"] == second_problem["detail"]
+    assert first_problem.title == second_problem.title
+    assert first_problem.detail == second_problem.detail
     async with auth_context.session_factory() as session:
         assert (await session.scalar(select(UserSessionModel))) is None
 
@@ -470,8 +465,8 @@ async def test_cross_user_revoke_is_indistinguishable_from_missing_and_does_not_
 
     cross_problem = _assert_problem(cross_user, 404, "session_not_found")
     missing_problem = _assert_problem(missing, 404, "session_not_found")
-    assert cross_problem["title"] == missing_problem["title"]
-    assert cross_problem["detail"] == missing_problem["detail"]
+    assert cross_problem.title == missing_problem.title
+    assert cross_problem.detail == missing_problem.detail
     async with auth_context.session_factory() as session:
         untouched = await session.get(UserSessionModel, other_session_id)
         assert untouched is not None

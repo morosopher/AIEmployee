@@ -9,10 +9,15 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ai_employee.application.use_cases.auth import AuthenticateSessionUseCase
+from ai_employee.application.use_cases.auth import (
+    AuthenticateSessionUseCase,
+    IdentityRepository,
+)
 from ai_employee.domain.identity import (
+    NewAdmin,
     SessionAuthenticationRecord,
     SessionRecord,
+    SessionSummary,
     UserCredential,
     UserIdentity,
 )
@@ -47,6 +52,22 @@ class ConcurrentIdentityRepository:
     def __init__(self, state: ConcurrentSessionState) -> None:
         """绑定共享状态，使两个事务可重现竞争窗口。"""
         self._state = state
+
+    async def get_active_user_by_email(self, email: str) -> UserCredential | None:
+        """拒绝并发认证测试不应触发的邮箱凭据查询。"""
+        raise AssertionError("unexpected get_active_user_by_email call")
+
+    async def create_session(
+        self,
+        *,
+        user_id: UUID,
+        token_hash: bytes,
+        csrf_hash: bytes,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> SessionRecord:
+        """拒绝并发认证测试不应触发的会话创建。"""
+        raise AssertionError("unexpected create_session call")
 
     async def get_session_authentication(
         self, token_hash: bytes
@@ -100,6 +121,26 @@ class ConcurrentIdentityRepository:
             )
             return True
 
+    async def list_active_sessions(
+        self, *, user_id: UUID, now: datetime
+    ) -> tuple[SessionSummary, ...]:
+        """拒绝并发认证测试不应触发的活动会话查询。"""
+        raise AssertionError("unexpected list_active_sessions call")
+
+    async def revoke_active_session(
+        self, *, user_id: UUID, session_id: UUID, revoked_at: datetime
+    ) -> bool:
+        """拒绝并发认证测试不应触发的会话撤销。"""
+        raise AssertionError("unexpected revoke_active_session call")
+
+    async def get_admin_for_creation(self) -> UserCredential | None:
+        """拒绝并发认证测试不应触发的管理员创建锁定查询。"""
+        raise AssertionError("unexpected get_admin_for_creation call")
+
+    async def create_admin(self, admin: NewAdmin) -> UserIdentity:
+        """拒绝并发认证测试不应触发的管理员创建。"""
+        raise AssertionError("unexpected create_admin call")
+
 
 class ConcurrentRepositoryFactory:
     """为每个并发调用提供共享状态上的窄事务上下文。"""
@@ -109,7 +150,7 @@ class ConcurrentRepositoryFactory:
         self._repository = repository
 
     @asynccontextmanager
-    async def __call__(self) -> AsyncIterator[ConcurrentIdentityRepository]:
+    async def __call__(self) -> AsyncIterator[IdentityRepository]:
         """返回不执行外部 I/O 的测试事务上下文。"""
         yield self._repository
 
