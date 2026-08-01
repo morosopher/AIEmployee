@@ -177,7 +177,7 @@ def _canonicalize_payload(payload: dict[str, JsonValue]) -> str:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ApprovalProposal:
     """绑定操作名、精确冻结载荷、哈希与初始审批状态的提案。
 
@@ -192,6 +192,14 @@ class ApprovalProposal:
     payload_hash: str
     status: ApprovalStatus
     _canonical_payload: str = field(repr=False)
+
+    def __init__(self) -> None:
+        """拒绝普通构造，确保所有正常实例都经过载荷验证与哈希绑定。
+
+        Raises:
+            TypeError: 始终抛出，调用方必须使用 :meth:`create`。
+        """
+        raise TypeError("ApprovalProposal must be created with ApprovalProposal.create()")
 
     @property
     def payload(self) -> dict[str, JsonValue]:
@@ -222,11 +230,14 @@ class ApprovalProposal:
             TypeError: 载荷包含非 JSON 数据或非字符串对象键。
             ValueError: 载荷包含 NaN、无穷值或循环容器。
         """
+        if type(payload) is not dict:
+            raise TypeError("approval payload root must be a JSON object")
+
         canonical_payload = _canonicalize_payload(payload)
         payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
-        return cls(
-            action=action,
-            payload_hash=payload_hash,
-            status=ApprovalStatus.PENDING,
-            _canonical_payload=canonical_payload,
-        )
+        proposal = object.__new__(cls)
+        object.__setattr__(proposal, "action", action)
+        object.__setattr__(proposal, "payload_hash", payload_hash)
+        object.__setattr__(proposal, "status", ApprovalStatus.PENDING)
+        object.__setattr__(proposal, "_canonical_payload", canonical_payload)
+        return proposal

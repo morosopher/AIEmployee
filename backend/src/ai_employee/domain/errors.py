@@ -48,6 +48,34 @@ def _freeze_metadata(
     return MappingProxyType(copied)
 
 
+def _normalize_retry_after(retry_after: float | None) -> float | None:
+    """把供应商重试提示规范为有限且非负的浮点秒数。
+
+    Args:
+        retry_after: 供应商返回的普通整数、浮点秒数或缺失值。
+
+    Returns:
+        ``None``，或可安全参与重试时间计算的非负有限浮点秒数。
+
+    Raises:
+        TypeError: 输入是布尔值或不是普通整数/浮点数。
+        ValueError: 输入为负数、非有限值或大到无法转换为浮点数。
+    """
+    if retry_after is None:
+        return None
+    if type(retry_after) not in {int, float}:
+        raise TypeError("retry_after must be an int, float, or None")
+
+    try:
+        normalized = float(retry_after)
+    except OverflowError as error:
+        raise ValueError("retry_after must be representable as finite seconds") from error
+
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError("retry_after must be finite and non-negative")
+    return normalized
+
+
 class DomainError(Exception):
     """所有可分类领域失败的稳定基类。
 
@@ -57,9 +85,9 @@ class DomainError(Exception):
         metadata: 调用方已脱敏的扁平机器字段；构造时会复制并冻结。
     """
 
-    error_code: str
-    message: str
-    metadata: ErrorMetadata
+    _error_code: str
+    _message: str
+    _metadata: ErrorMetadata
 
     def __init__(
         self,
@@ -70,9 +98,24 @@ class DomainError(Exception):
     ) -> None:
         """保存稳定错误契约，并让标准异常字符串保持为安全消息。"""
         super().__init__(message)
-        self.error_code = error_code
-        self.message = message
-        self.metadata = _freeze_metadata(metadata)
+        self._error_code = error_code
+        self._message = message
+        self._metadata = _freeze_metadata(metadata)
+
+    @property
+    def error_code(self) -> str:
+        """返回构造时冻结的稳定英文机器错误码。"""
+        return self._error_code
+
+    @property
+    def message(self) -> str:
+        """返回与 ``BaseException.args`` 一致的安全错误消息。"""
+        return self._message
+
+    @property
+    def metadata(self) -> ErrorMetadata:
+        """返回构造时复制并冻结的已脱敏机器元数据。"""
+        return self._metadata
 
 
 class UserActionRequiredError(DomainError):
@@ -82,7 +125,7 @@ class UserActionRequiredError(DomainError):
 class TransientProviderError(DomainError):
     """表示供应商限流、超时或临时不可用等可重试错误。"""
 
-    retry_after: float | None
+    _retry_after: float | None
 
     def __init__(
         self,
@@ -92,16 +135,25 @@ class TransientProviderError(DomainError):
         retry_after: float | None = None,
         metadata: Mapping[str, ErrorMetadataValue] | None = None,
     ) -> None:
-        """保存临时错误以及供应商建议的可选重试等待秒数。
+        """保存临时错误并规范供应商建议的可选重试等待秒数。
 
         Args:
             error_code: 稳定英文机器错误码。
             message: 不含敏感供应商内容的安全消息。
             retry_after: 供应商建议的等待秒数；缺失时由上层重试策略决定。
             metadata: 调用方已脱敏的扁平机器字段。
+
+        Raises:
+            TypeError: ``retry_after`` 是布尔值或不是普通整数/浮点数。
+            ValueError: ``retry_after`` 为负数、非有限值或无法转为浮点数。
         """
         super().__init__(error_code=error_code, message=message, metadata=metadata)
-        self.retry_after = retry_after
+        self._retry_after = _normalize_retry_after(retry_after)
+
+    @property
+    def retry_after(self) -> float | None:
+        """返回构造时规范且冻结的供应商重试等待秒数。"""
+        return self._retry_after
 
 
 class PermanentProviderError(DomainError):

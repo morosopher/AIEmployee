@@ -1,11 +1,33 @@
 """验证审批提案使用确定性哈希并冻结精确 JSON 载荷。"""
 
 import hashlib
+from collections.abc import Callable
 from typing import cast
 
 import pytest
 
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, JsonValue
+
+
+def test_public_constructor_cannot_forge_approval_proposal() -> None:
+    """普通构造调用不得绕过工厂注入批准状态、伪哈希或非对象载荷。"""
+    constructor = cast(Callable[..., ApprovalProposal], ApprovalProposal)
+
+    with pytest.raises(TypeError):
+        constructor(
+            action="synthetic.action",
+            payload_hash="0" * 64,
+            status=ApprovalStatus.APPROVED,
+            _canonical_payload="[]",
+        )
+
+
+def test_approval_factory_rejects_non_object_root() -> None:
+    """动态调用边界也必须拒绝 list 等非普通字典根节点。"""
+    factory = cast(Callable[[str, object], ApprovalProposal], ApprovalProposal.create)
+
+    with pytest.raises(TypeError, match="JSON object"):
+        factory("synthetic.action", ["synthetic-item"])
 
 
 def test_approval_hash_changes_when_payload_changes() -> None:
