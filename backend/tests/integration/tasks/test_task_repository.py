@@ -1,12 +1,22 @@
 """在真实 PostgreSQL 上验证任务创建的原子性、幂等性与用户隔离。"""
 
+import asyncio
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
-from uuid import UUID
+from typing import Any, cast
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_employee.application.use_cases.tasks import CreateTaskUseCase
+from ai_employee.application.use_cases.tasks import (
+    CreateTaskResult,
+    CreateTaskUseCase,
+    TaskRepository,
+)
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
@@ -14,8 +24,66 @@ from ai_employee.infrastructure.db.models.tasks import (
     OutboxEventModel,
     TaskRunModel,
 )
-from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
-from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.db.repositories import tasks as task_repository_module
+from ai_employee.infrastructure.db.repositories.tasks import (
+    SqlAlchemyTaskRepository,
+    SqlAlchemyTaskRepositoryFactory,
+)
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
+
+
+class FirstSelectBarrierSession:
+    """只在真实 Session 的首次 ``scalar`` 查询完成后同步两个并发调用。
+
+    代理不伪造查询、flush 或约束结果；首次幂等 SELECT 仍由 PostgreSQL 执行，随后两个
+    事务在 barrier 汇合，因而都已经观察到“尚不存在”。``Any`` 只用于忠实转发
+    SQLAlchemy 第三方 Session 的泛型参数与返回边界，Repository 看到的仍是原 API。
+    """
+
+    def __init__(self, session: AsyncSession, barrier: asyncio.Barrier) -> None:
+        """绑定一个独立真实 Session 及本测试共享的两方屏障。"""
+        self._session = session
+        self._barrier = barrier
+        self._first_scalar_completed = False
+
+    async def scalar(self, *args: Any, **kwargs: Any) -> Any:
+        """委托真实查询，并只在首次返回后等待另一个事务。"""
+        result = await self._session.scalar(*args, **kwargs)
+        if not self._first_scalar_completed:
+            self._first_scalar_completed = True
+            assert result is None
+            await self._barrier.wait()
+        return result
+
+    def add_all(self, instances: Iterable[object]) -> None:
+        """把 ORM 对象原样加入真实 Session。"""
+        self._session.add_all(instances)
+
+    async def flush(self) -> None:
+        """在真实事务中执行 flush，不模拟唯一约束或错误。"""
+        await self._session.flush()
+
+
+class BarrierTaskRepositoryFactory:
+    """为并发测试的每次调用创建独立事务和首次查询屏障代理。"""
+
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        barrier: asyncio.Barrier,
+    ) -> None:
+        """保存真实 Session factory，并记录实际创建的 Session 标识。"""
+        self._session_factory = session_factory
+        self._barrier = barrier
+        self.session_ids: list[int] = []
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[TaskRepository]:
+        """开启独立外层事务，并仅包装本次调用的首次幂等查询。"""
+        async with self._session_factory.begin() as session:
+            self.session_ids.append(id(session))
+            proxy = FirstSelectBarrierSession(session, self._barrier)
+            yield SqlAlchemyTaskRepository(cast(AsyncSession, proxy))
 
 
 def _synthetic_user(*, email: str, display_name: str) -> UserModel:
@@ -34,6 +102,18 @@ def _synthetic_user(*, email: str, display_name: str) -> UserModel:
 def _assert_utc(value: datetime) -> None:
     """确认数据库返回的是显式 UTC 时间，而不是宿主机本地时间。"""
     assert value.utcoffset() == timedelta(0)
+
+
+def _postgres_constraint_name(error: IntegrityError) -> str | None:
+    """从 asyncpg 原始异常链提取已命名 PostgreSQL 约束。
+
+    SQLAlchemy 的 asyncpg 适配器保留 ``UniqueViolationError`` 为 ``orig`` 的 cause；
+    ``getattr`` 只存在于这个第三方异常边界，返回值立即收窄为字符串。
+    """
+    if error.orig is None:
+        return None
+    constraint_name = getattr(error.orig.__cause__, "constraint_name", None)
+    return constraint_name if isinstance(constraint_name, str) else None
 
 
 @pytest.mark.asyncio
@@ -172,5 +252,128 @@ async def test_same_idempotency_key_is_isolated_by_user(database_url: str) -> No
         assert outbox_count == 2
         assert first_task is not None
         assert second_task is not None
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_idempotency_key_returns_one_task(database_url: str) -> None:
+    """两个都先读到空值的真实事务必须返回同一任务，而不是让输家泄漏唯一约束错误。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            user = _synthetic_user(
+                email="concurrent-task-owner@example.com",
+                display_name="Concurrent Task Owner",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+        repositories = BarrierTaskRepositoryFactory(session_factory, asyncio.Barrier(2))
+        use_case = CreateTaskUseCase(repositories)
+        results = await asyncio.gather(
+            use_case.execute(
+                user_id=user_id,
+                kind="daily_brief",
+                input_payload={"local_date": "2026-07-30"},
+                idempotency_key="brief:concurrent:2026-07-30:scheduled",
+            ),
+            use_case.execute(
+                user_id=user_id,
+                kind="daily_brief",
+                input_payload={"local_date": "2026-07-30"},
+                idempotency_key="brief:concurrent:2026-07-30:scheduled",
+            ),
+            return_exceptions=True,
+        )
+
+        result_types = sorted(type(result).__name__ for result in results)
+        assert result_types == ["CreateTaskResult", "CreateTaskResult"]
+        first, second = results
+        assert isinstance(first, CreateTaskResult)
+        assert isinstance(second, CreateTaskResult)
+        assert first.task_id == second.task_id
+        assert len(repositories.session_ids) == 2
+        assert repositories.session_ids[0] != repositories.session_ids[1]
+
+        async with session_factory() as session:
+            task_count = await session.scalar(select(func.count()).select_from(TaskRunModel))
+            audit_count = await session.scalar(select(func.count()).select_from(AuditEventModel))
+            outbox_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
+
+        assert task_count == 1
+        assert audit_count == 1
+        assert outbox_count == 1
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_non_task_unique_error_rolls_back_all_new_facts(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outbox 唯一冲突必须原样抛出，且同事务内的新 TaskRun 与 AuditEvent 一并回滚。"""
+    session_factory = build_session_factory(database_url)
+    fixed_task_id = uuid4()
+    deduplication_key = f"task.execute:{fixed_task_id}:initial"
+    try:
+        async with session_factory.begin() as session:
+            user = _synthetic_user(
+                email="rollback-task-owner@example.com",
+                display_name="Rollback Task Owner",
+            )
+            session.add(user)
+            session.add(
+                OutboxEventModel(
+                    topic="synthetic.preexisting",
+                    aggregate_id=uuid4(),
+                    deduplication_key=deduplication_key,
+                    payload={"synthetic": True},
+                )
+            )
+            await session.flush()
+            user_id = user.id
+
+        # 固定应用生成的任务 UUID，让真实 Outbox 唯一约束稳定命中；flush 与数据库不模拟。
+        monkeypatch.setattr(task_repository_module, "uuid4", lambda: fixed_task_id)
+        use_case = CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory))
+        with pytest.raises(IntegrityError) as raised:
+            await use_case.execute(
+                user_id=user_id,
+                kind="daily_brief",
+                input_payload={"local_date": "2026-07-30"},
+                idempotency_key="brief:rollback:2026-07-30:scheduled",
+            )
+
+        assert _postgres_constraint_name(raised.value) == ("uq_outbox_events_deduplication_key")
+
+        async with session_factory() as session:
+            task_count = await session.scalar(
+                select(func.count())
+                .select_from(TaskRunModel)
+                .where(
+                    TaskRunModel.user_id == user_id,
+                    TaskRunModel.idempotency_key == "brief:rollback:2026-07-30:scheduled",
+                )
+            )
+            audit_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.user_id == user_id,
+                    AuditEventModel.task_id == fixed_task_id,
+                )
+            )
+            outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(OutboxEventModel.deduplication_key == deduplication_key)
+            )
+
+        assert task_count == 0
+        assert audit_count == 0
+        assert outbox_count == 1
     finally:
         await session_factory.dispose()

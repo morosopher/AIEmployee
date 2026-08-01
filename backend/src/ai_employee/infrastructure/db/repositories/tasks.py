@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.use_cases.tasks import (
@@ -18,6 +19,8 @@ from ai_employee.infrastructure.db.models.tasks import (
     TaskRunModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+
+TASK_IDEMPOTENCY_CONSTRAINT = "uq_task_runs_user_id_idempotency_key"
 
 
 class SqlAlchemyTaskRepository:
@@ -38,8 +41,11 @@ class SqlAlchemyTaskRepository:
         """创建任务、审计和 Outbox，或复用同一用户的已有任务。
 
         查询必须同时携带 ``user_id`` 与幂等键；否则另一个用户复用同一客户端键时会错误
-        取得不属于自己的任务。新任务 UUID 在 flush 前由应用进程生成，使三个待插入对象
-        能引用同一标识；所有对象一次加入并只 flush 一次，提交或回滚交给调用方事务。
+        取得不属于自己的任务。初始查询是顺序重放的快速路径；两个事务都读到空值时，
+        PostgreSQL 通过命名唯一约束原子决定哪个事务认领 TaskRun。只有认领者写审计与
+        Outbox，并对这两个 ORM 事实进行一次显式 flush；三类事实仍由调用方外层事务一起
+        提交或回滚。``ON CONFLICT`` 只指定任务幂等约束，因此其他唯一、FK 或数据错误不会
+        被解释为已有任务。
 
         Args:
             user_id: 任务所属用户，也是幂等查询的强制隔离条件。
@@ -50,28 +56,40 @@ class SqlAlchemyTaskRepository:
         Returns:
             新建或已有任务的基础设施无关 UUID 结果。
         """
-        existing_task_id = await self._session.scalar(
-            select(TaskRunModel.id).where(
-                TaskRunModel.user_id == user_id,
-                TaskRunModel.idempotency_key == idempotency_key,
-            )
+        existing_task_query = select(TaskRunModel.id).where(
+            TaskRunModel.user_id == user_id,
+            TaskRunModel.idempotency_key == idempotency_key,
         )
+        existing_task_id = await self._session.scalar(existing_task_query)
         if existing_task_id is not None:
             return CreateTaskResult(task_id=existing_task_id)
 
         task_id = uuid4()
         status = TaskStatus.CREATED.value
-        task = TaskRunModel(
-            id=task_id,
-            user_id=user_id,
-            kind=kind,
-            status=status,
-            idempotency_key=idempotency_key,
-            input_payload=input_payload,
+        claimed_task_id: UUID | None = await self._session.scalar(
+            insert(TaskRunModel)
+            .values(
+                id=task_id,
+                user_id=user_id,
+                kind=kind,
+                status=status,
+                idempotency_key=idempotency_key,
+                input_payload=input_payload,
+            )
+            .on_conflict_do_nothing(constraint=TASK_IDEMPOTENCY_CONSTRAINT)
+            .returning(TaskRunModel.id)
         )
+        if claimed_task_id is None:
+            # PostgreSQL 的 READ COMMITTED 会在冲突事务提交后让下一条 SELECT 看到赢家；
+            # 若仍不可见，说明数据库隔离或约束与本适配器的不变量不一致，不能伪造结果。
+            existing_task_id = await self._session.scalar(existing_task_query)
+            if existing_task_id is None:
+                raise RuntimeError("task idempotency winner is not visible after conflict")
+            return CreateTaskResult(task_id=existing_task_id)
+
         audit = AuditEventModel(
             user_id=user_id,
-            task=task,
+            task_id=claimed_task_id,
             event_type="task.created",
             actor_type="system",
             actor_id=None,
@@ -79,13 +97,13 @@ class SqlAlchemyTaskRepository:
         )
         outbox = OutboxEventModel(
             topic="task.execute",
-            aggregate_id=task_id,
-            deduplication_key=f"task.execute:{task_id}:initial",
-            payload={"task_id": str(task_id)},
+            aggregate_id=claimed_task_id,
+            deduplication_key=f"task.execute:{claimed_task_id}:initial",
+            payload={"task_id": str(claimed_task_id)},
         )
-        self._session.add_all((task, audit, outbox))
+        self._session.add_all((audit, outbox))
         await self._session.flush()
-        return CreateTaskResult(task_id=task_id)
+        return CreateTaskResult(task_id=claimed_task_id)
 
 
 class SqlAlchemyTaskRepositoryFactory:
