@@ -1,4 +1,4 @@
-"""验证 Alembic 能在独立空数据库中完成首个身份迁移并保持元数据一致。"""
+"""验证 Alembic 能从空数据库升级到当前任务持久化 Schema 且无元数据漂移。"""
 
 import asyncio
 from pathlib import Path
@@ -52,6 +52,50 @@ def _check_constraint_names(database_url: URL) -> set[str]:
     return asyncio.run(read_names())
 
 
+def _task_unique_constraint_names(database_url: URL) -> set[str]:
+    """读取 Task 6 明确要求的幂等与顺序唯一约束名称。"""
+
+    async def read_names() -> set[str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT c.conname "
+                        "FROM pg_catalog.pg_constraint AS c "
+                        "JOIN pg_catalog.pg_class AS t ON t.oid = c.conrelid "
+                        "WHERE t.relname IN ("
+                        "'task_runs', 'task_steps', 'tool_executions', 'outbox_events'"
+                        ") AND c.contype = 'u'"
+                    )
+                )
+                return {row[0] for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_names())
+
+
+def _audit_index_names(database_url: URL) -> set[str]:
+    """读取审计表索引，确认按任务追加重放路径已经落到迁移。"""
+
+    async def read_names() -> set[str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT indexname FROM pg_catalog.pg_indexes "
+                        "WHERE schemaname = 'public' AND tablename = 'audit_events'"
+                    )
+                )
+                return {row[0] for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_names())
+
+
 def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
     empty_migration_database: URL,
 ) -> None:
@@ -68,6 +112,12 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
 
     assert _public_table_names(empty_migration_database) == {
         "alembic_version",
+        "approval_requests",
+        "audit_events",
+        "outbox_events",
+        "task_runs",
+        "task_steps",
+        "tool_executions",
         "users",
         "user_sessions",
     }
@@ -75,4 +125,11 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
     }
+    assert _task_unique_constraint_names(empty_migration_database) == {
+        "uq_outbox_events_deduplication_key",
+        "uq_task_runs_user_id_idempotency_key",
+        "uq_task_steps_task_id_sequence",
+        "uq_tool_executions_idempotency_key",
+    }
+    assert "ix_audit_events_task_id_id" in _audit_index_names(empty_migration_database)
     command.check(alembic_config)

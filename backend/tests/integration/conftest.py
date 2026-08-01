@@ -23,7 +23,16 @@ from ai_employee.infrastructure.db.database_url import (
 from ai_employee.infrastructure.db.session import build_engine
 
 # 清理范围只允许使用经过代码审查的应用表，顺序先子后父，且绝不包含 alembic_version。
-APPLICATION_TABLES: tuple[str, ...] = ("user_sessions", "users")
+APPLICATION_TABLES: tuple[str, ...] = (
+    "tool_executions",
+    "approval_requests",
+    "task_steps",
+    "audit_events",
+    "outbox_events",
+    "task_runs",
+    "user_sessions",
+    "users",
+)
 
 
 @pytest.fixture(scope="session")
