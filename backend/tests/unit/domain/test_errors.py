@@ -190,6 +190,36 @@ def test_domain_error_public_fields_cannot_be_rebound(
     assert str(error) == error.message
 
 
+@pytest.mark.parametrize(
+    ("attribute", "replacement"),
+    [
+        pytest.param("args", ("Tampered args",), id="args"),
+        pytest.param("_message", "Tampered message", id="private-message"),
+        pytest.param("_error_code", "tampered_error_code", id="private-error-code"),
+        pytest.param("_metadata", {"attempt": 99}, id="private-metadata"),
+    ],
+)
+def test_domain_error_contract_backing_fields_cannot_be_rebound(
+    attribute: str,
+    replacement: object,
+) -> None:
+    """异常参数和私有后备字段也必须冻结，避免绕过只读 properties。"""
+    error = DomainError(
+        error_code="synthetic_domain_error",
+        message="Synthetic safe message",
+        metadata={"attempt": 1},
+    )
+
+    with pytest.raises(AttributeError):
+        setattr(error, attribute, replacement)
+
+    assert error.error_code == "synthetic_domain_error"
+    assert error.message == "Synthetic safe message"
+    assert error.metadata == {"attempt": 1}
+    assert error.args == ("Synthetic safe message",)
+    assert str(error) == error.message
+
+
 def test_transient_provider_retry_after_cannot_be_rebound() -> None:
     """规范后的重试等待秒数必须只读，避免调度判断在异常传递期间漂移。"""
     error = TransientProviderError(
@@ -203,6 +233,46 @@ def test_transient_provider_retry_after_cannot_be_rebound() -> None:
         setattr(error, attribute, 60)
 
     assert error.retry_after == 30.0
+
+
+def test_transient_provider_retry_after_backing_field_cannot_be_rebound() -> None:
+    """私有重试后备字段也必须冻结，避免绕过公开只读属性。"""
+    error = TransientProviderError(
+        error_code="provider_rate_limited",
+        message="Synthetic temporary failure",
+        retry_after=30,
+    )
+    attribute = "_retry_after"
+
+    with pytest.raises(AttributeError):
+        setattr(error, attribute, 60.0)
+
+    assert error.retry_after == 30.0
+    assert error.args == ("Synthetic temporary failure",)
+    assert str(error) == error.message
+
+
+def test_frozen_domain_error_preserves_exception_chaining() -> None:
+    """冻结契约不得阻止正常 raise/catch、Traceback、cause 或 context 传播。"""
+    try:
+        try:
+            raise RuntimeError("Synthetic root cause")
+        except RuntimeError as cause:
+            raise DomainError(
+                error_code="synthetic_domain_error",
+                message="Synthetic safe message",
+                metadata={"attempt": 1},
+            ) from cause
+    except DomainError as error:
+        assert isinstance(error.__cause__, RuntimeError)
+        assert str(error.__cause__) == "Synthetic root cause"
+        assert error.__context__ is error.__cause__
+        assert error.__traceback__ is not None
+        assert error.error_code == "synthetic_domain_error"
+        assert error.message == "Synthetic safe message"
+        assert error.metadata == {"attempt": 1}
+        assert error.args == ("Synthetic safe message",)
+        assert str(error) == error.message
 
 
 def test_error_metadata_is_an_immutable_defensive_copy() -> None:

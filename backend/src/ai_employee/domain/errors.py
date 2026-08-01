@@ -3,9 +3,21 @@
 import math
 from collections.abc import Mapping
 from types import MappingProxyType
+from typing import Final
 
 type ErrorMetadataValue = str | int | float | bool | None
 type ErrorMetadata = Mapping[str, ErrorMetadataValue]
+
+_FROZEN_ERROR_CONTRACT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "args",
+        "_contract_frozen",
+        "_error_code",
+        "_message",
+        "_metadata",
+        "_retry_after",
+    }
+)
 
 
 def _freeze_metadata(
@@ -88,6 +100,7 @@ class DomainError(Exception):
     _error_code: str
     _message: str
     _metadata: ErrorMetadata
+    _contract_frozen: bool
 
     def __init__(
         self,
@@ -98,9 +111,28 @@ class DomainError(Exception):
     ) -> None:
         """保存稳定错误契约，并让标准异常字符串保持为安全消息。"""
         super().__init__(message)
-        self._error_code = error_code
-        self._message = message
-        self._metadata = _freeze_metadata(metadata)
+        object.__setattr__(self, "_error_code", error_code)
+        object.__setattr__(self, "_message", message)
+        object.__setattr__(self, "_metadata", _freeze_metadata(metadata))
+        object.__setattr__(self, "_contract_frozen", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """冻结错误契约字段，同时保留标准异常传播属性可写。
+
+        ``traceback``、``cause``、``context`` 等属性仍交给 ``BaseException``
+        处理；这里只拒绝会改变错误码、安全消息、元数据、重试提示或字符串表示
+        的普通重绑定。
+
+        Args:
+            name: 调用方准备写入的属性名。
+            value: 调用方准备写入的属性值。
+
+        Raises:
+            AttributeError: 构造完成后尝试重绑定受保护的契约字段。
+        """
+        if getattr(self, "_contract_frozen", False) and name in _FROZEN_ERROR_CONTRACT_FIELDS:
+            raise AttributeError(f"{name} is immutable after domain error construction")
+        super().__setattr__(name, value)
 
     @property
     def error_code(self) -> str:
@@ -148,7 +180,7 @@ class TransientProviderError(DomainError):
             ValueError: ``retry_after`` 为负数、非有限值或无法转为浮点数。
         """
         super().__init__(error_code=error_code, message=message, metadata=metadata)
-        self._retry_after = _normalize_retry_after(retry_after)
+        object.__setattr__(self, "_retry_after", _normalize_retry_after(retry_after))
 
     @property
     def retry_after(self) -> float | None:
