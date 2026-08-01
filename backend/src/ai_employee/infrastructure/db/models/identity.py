@@ -3,7 +3,16 @@
 from datetime import datetime, time
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, String, Time
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    String,
+    Time,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ai_employee.infrastructure.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -36,7 +45,17 @@ class UserSessionModel(UUIDPrimaryKeyMixin, Base):
     """
 
     __tablename__ = "user_sessions"
-    __table_args__ = (Index("ix_user_sessions_user_expires", "user_id", "expires_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "octet_length(token_hash) = 32",
+            name="ck_user_sessions_token_hash_octet_length_32",
+        ),
+        CheckConstraint(
+            "octet_length(csrf_hash) = 32",
+            name="ck_user_sessions_csrf_hash_octet_length_32",
+        ),
+        Index("ix_user_sessions_user_expires", "user_id", "expires_at"),
+    )
 
     user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False

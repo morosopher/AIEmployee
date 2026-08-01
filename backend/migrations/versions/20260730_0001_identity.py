@@ -17,7 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """创建身份基础表、唯一约束、级联外键及会话过期索引。"""
+    """创建身份基础表、摘要长度约束、级联外键及会话过期索引。"""
 
     op.create_table(
         "users",
@@ -55,6 +55,14 @@ def upgrade() -> None:
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+        sa.CheckConstraint(
+            "octet_length(token_hash) = 32",
+            name="ck_user_sessions_token_hash_octet_length_32",
+        ),
+        sa.CheckConstraint(
+            "octet_length(csrf_hash) = 32",
+            name="ck_user_sessions_csrf_hash_octet_length_32",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("token_hash"),
     )
