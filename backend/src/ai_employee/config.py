@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ai_employee.domain.identity import MAX_SESSION_TTL_SECONDS, MIN_SESSION_TTL_SECONDS
+
 
 class Settings(BaseSettings):
     """从环境变量与本地开发文件加载并验证后端进程配置。
@@ -27,7 +29,11 @@ class Settings(BaseSettings):
     task_timeout_seconds: int = Field(default=900, ge=1)
     task_step_timeout_seconds: int = Field(default=300, ge=1)
     session_cookie_name: str = "ai_employee_session"
-    session_ttl_seconds: int = 604800
+    session_ttl_seconds: int = Field(
+        default=604800,
+        ge=MIN_SESSION_TTL_SECONDS,
+        le=MAX_SESSION_TTL_SECONDS,
+    )
     app_master_key_file: Path = Path("/run/secrets/app_master_key")
     google_client_id: str = ""
     google_client_secret_file: Path = Path("/run/secrets/google_client_secret")

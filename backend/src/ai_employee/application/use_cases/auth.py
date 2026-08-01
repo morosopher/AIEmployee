@@ -9,6 +9,8 @@ from typing import Protocol
 from uuid import UUID
 
 from ai_employee.domain.identity import (
+    MAX_SESSION_TTL_SECONDS,
+    MIN_SESSION_TTL_SECONDS,
     AuthenticatedSession,
     ListedSession,
     NewAdmin,
@@ -95,6 +97,15 @@ class IdentityRepository(Protocol):
 
     async def get_active_user_by_email(self, email: str) -> UserCredential | None:
         """按规范化邮箱读取活动用户凭据。"""
+
+    async def lock_active_user_for_session_creation(
+        self,
+        *,
+        user_id: UUID,
+        email: str,
+        password_hash: str,
+    ) -> UserCredential | None:
+        """锁定并复核用于创建会话的活动用户及已验证密码哈希。"""
 
     async def create_session(
         self,
@@ -184,7 +195,16 @@ class LoginUseCase:
         clock: Clock,
         session_ttl_seconds: int,
     ) -> None:
-        """注入认证事务、安全原语、可控时钟与会话 TTL。"""
+        """注入认证事务、安全原语、可控时钟与会话 TTL。
+
+        Raises:
+            ValueError: TTL 小于一秒或超过批准的一年安全上限。
+        """
+        if not MIN_SESSION_TTL_SECONDS <= session_ttl_seconds <= MAX_SESSION_TTL_SECONDS:
+            raise ValueError(
+                "session_ttl_seconds must be between "
+                f"{MIN_SESSION_TTL_SECONDS} and {MAX_SESSION_TTL_SECONDS}"
+            )
         self._repositories = repositories
         self._password_verifier = password_verifier
         self._token_factory = token_factory
@@ -208,34 +228,46 @@ class LoginUseCase:
         normalized_email = normalize_email(email)
         async with self._repositories() as repository:
             user = await repository.get_active_user_by_email(normalized_email)
-            if user is None or not user.is_active or user.password_hash is None:
-                authenticatable_user = None
-                password_hash = self._password_verifier.fallback_password_hash
-            else:
-                authenticatable_user = user
-                password_hash = user.password_hash
-            # 不可用身份也使用有效 Argon2id fallback 哈希完成同量级工作，避免通过远程时延
-            # 枚举活动管理员邮箱；验证仍移出事件循环，且身份可用性与密码结果分别判定。
-            password_matches = await asyncio.to_thread(
-                self._password_verifier.verify,
-                password_hash,
-                password,
-            )
-            if authenticatable_user is None or not password_matches:
-                raise InvalidCredentialsError
+        if user is None or not user.is_active or user.password_hash is None:
+            authenticatable_user = None
+            password_hash = self._password_verifier.fallback_password_hash
+        else:
+            authenticatable_user = user
+            password_hash = user.password_hash
+        # 先释放短读事务，再执行 CPU 密集的 Argon2id；不可用身份仍使用有效 fallback 哈希，
+        # 既避免占用数据库连接，也保持未知邮箱与错误密码的主要计算工作量一致。
+        password_matches = await asyncio.to_thread(
+            self._password_verifier.verify,
+            password_hash,
+            password,
+        )
+        if authenticatable_user is None or not password_matches:
+            raise InvalidCredentialsError
 
-            raw_session_token = self._token_factory()
-            raw_csrf_token = self._token_factory()
-            now = _utc_now(self._clock)
-            session = await repository.create_session(
+        raw_session_token = self._token_factory()
+        raw_csrf_token = self._token_factory()
+        token_hash = self._token_hasher(raw_session_token)
+        csrf_hash = self._token_hasher(raw_csrf_token)
+        now = _utc_now(self._clock)
+        async with self._repositories() as repository:
+            # Argon2id 期间可能发生停用、改密或管理员替换；写事务必须锁定并重新确认
+            # 同一身份与同一密码哈希，不能用读事务留下的陈旧快照直接创建会话。
+            locked_user = await repository.lock_active_user_for_session_creation(
                 user_id=authenticatable_user.identity.id,
-                token_hash=self._token_hasher(raw_session_token),
-                csrf_hash=self._token_hasher(raw_csrf_token),
+                email=normalized_email,
+                password_hash=password_hash,
+            )
+            if locked_user is None:
+                raise InvalidCredentialsError
+            session = await repository.create_session(
+                user_id=locked_user.identity.id,
+                token_hash=token_hash,
+                csrf_hash=csrf_hash,
                 created_at=now,
                 expires_at=now + self._session_ttl,
             )
         return LoginResult(
-            user=authenticatable_user.identity,
+            user=locked_user.identity,
             session=session,
             raw_session_token=raw_session_token,
             raw_csrf_token=raw_csrf_token,

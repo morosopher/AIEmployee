@@ -1,7 +1,7 @@
 """验证认证应用用例在并发与可替换端口下保持确定性。"""
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, time, timedelta
@@ -46,6 +46,9 @@ class LoginRepositoryState:
 
     user: UserCredential | None
     create_session_calls: int = 0
+    lock_for_session_creation_calls: int = 0
+    transaction_entries: int = 0
+    transaction_open: bool = False
 
 
 class LoginIdentityRepository:
@@ -72,6 +75,26 @@ class LoginIdentityRepository:
         """记录并拒绝无效凭据场景不应发生的会话创建。"""
         self._state.create_session_calls += 1
         raise AssertionError("unexpected create_session call")
+
+    async def lock_active_user_for_session_creation(
+        self,
+        *,
+        user_id: UUID,
+        email: str,
+        password_hash: str,
+    ) -> UserCredential | None:
+        """模拟写事务中的活动身份锁定与已验证哈希复核。"""
+        self._state.lock_for_session_creation_calls += 1
+        user = self._state.user
+        if (
+            user is None
+            or not user.is_active
+            or user.identity.id != user_id
+            or user.identity.email != email
+            or user.password_hash != password_hash
+        ):
+            return None
+        return user
 
     async def get_session_authentication(
         self, token_hash: bytes
@@ -114,14 +137,21 @@ class LoginIdentityRepository:
 class LoginRepositoryFactory:
     """为一次登录调用提供同一个确定性 Repository 事务上下文。"""
 
-    def __init__(self, repository: LoginIdentityRepository) -> None:
+    def __init__(self, repository: LoginIdentityRepository, state: LoginRepositoryState) -> None:
         """保存登录测试 Repository。"""
         self._repository = repository
+        self._state = state
 
     @asynccontextmanager
     async def __call__(self) -> AsyncIterator[IdentityRepository]:
-        """返回不执行外部 I/O 的登录测试事务上下文。"""
-        yield self._repository
+        """记录事务生命周期，并保证异常退出后恢复关闭状态。"""
+        assert not self._state.transaction_open
+        self._state.transaction_entries += 1
+        self._state.transaction_open = True
+        try:
+            yield self._repository
+        finally:
+            self._state.transaction_open = False
 
 
 @dataclass(slots=True)
@@ -129,15 +159,22 @@ class RecordingPasswordVerifier:
     """记录密码验证参数，并可模拟持久哈希损坏异常。"""
 
     fallback_password_hash: str
+    result: bool = False
     failure: Exception | None = None
+    repository_state: LoginRepositoryState | None = None
+    on_verify: Callable[[], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     def verify(self, password_hash: str, password: str) -> bool:
         """记录一次等价验证工作，必要时抛出场景指定异常。"""
+        if self.repository_state is not None:
+            assert not self.repository_state.transaction_open
         self.calls.append((password_hash, password))
+        if self.on_verify is not None:
+            self.on_verify()
         if self.failure is not None:
             raise self.failure
-        return False
+        return self.result
 
 
 def _login_credential(
@@ -172,9 +209,12 @@ async def test_unavailable_login_identity_still_performs_fallback_password_verif
 ) -> None:
     """未知、停用或无哈希身份都必须执行一次等价密码验证后统一拒绝。"""
     state = LoginRepositoryState(user=user)
-    verifier = RecordingPasswordVerifier(FALLBACK_PASSWORD_HASH)
+    verifier = RecordingPasswordVerifier(
+        FALLBACK_PASSWORD_HASH,
+        repository_state=state,
+    )
     use_case = LoginUseCase(
-        LoginRepositoryFactory(LoginIdentityRepository(state)),
+        LoginRepositoryFactory(LoginIdentityRepository(state), state),
         verifier,
         lambda: "unused-token",
         hash_token,
@@ -190,6 +230,8 @@ async def test_unavailable_login_identity_still_performs_fallback_password_verif
 
     assert verifier.calls == [(FALLBACK_PASSWORD_HASH, CANDIDATE_PASSWORD)]
     assert state.create_session_calls == 0
+    assert state.transaction_entries == 1
+    assert not state.transaction_open
 
 
 @pytest.mark.asyncio
@@ -198,9 +240,13 @@ async def test_active_login_preserves_damaged_password_hash_exception() -> None:
     damaged_hash = "synthetic-damaged-password-hash"
     state = LoginRepositoryState(user=_login_credential(password_hash=damaged_hash))
     verifier_error = RuntimeError("stored password hash is damaged")
-    verifier = RecordingPasswordVerifier(FALLBACK_PASSWORD_HASH, failure=verifier_error)
+    verifier = RecordingPasswordVerifier(
+        FALLBACK_PASSWORD_HASH,
+        failure=verifier_error,
+        repository_state=state,
+    )
     use_case = LoginUseCase(
-        LoginRepositoryFactory(LoginIdentityRepository(state)),
+        LoginRepositoryFactory(LoginIdentityRepository(state), state),
         verifier,
         lambda: "unused-token",
         hash_token,
@@ -213,6 +259,119 @@ async def test_active_login_preserves_damaged_password_hash_exception() -> None:
 
     assert verifier.calls == [(damaged_hash, CANDIDATE_PASSWORD)]
     assert state.create_session_calls == 0
+    assert state.transaction_entries == 1
+    assert not state.transaction_open
+
+
+@pytest.mark.asyncio
+async def test_login_password_verification_runs_after_read_transaction_closes() -> None:
+    """Argon2 验证期间不得占用 Repository 事务或数据库连接。"""
+    stored_hash = "synthetic-stored-password-hash"
+    state = LoginRepositoryState(user=_login_credential(password_hash=stored_hash))
+    verifier = RecordingPasswordVerifier(
+        FALLBACK_PASSWORD_HASH,
+        repository_state=state,
+    )
+    use_case = LoginUseCase(
+        LoginRepositoryFactory(LoginIdentityRepository(state), state),
+        verifier,
+        lambda: "unused-token",
+        hash_token,
+        FixedClock(datetime(2030, 1, 1, 8, 0, tzinfo=UTC)),
+        3600,
+    )
+
+    with pytest.raises(InvalidCredentialsError):
+        await use_case.execute(email="owner@example.com", password=CANDIDATE_PASSWORD)
+
+    assert verifier.calls == [(stored_hash, CANDIDATE_PASSWORD)]
+    assert state.transaction_entries == 1
+    assert not state.transaction_open
+
+
+@pytest.mark.parametrize(
+    "changed_state",
+    ["inactive", "changed-password-hash", "different-user-id"],
+)
+@pytest.mark.asyncio
+async def test_login_revalidates_locked_user_before_session_creation(
+    changed_state: str,
+) -> None:
+    """验证成功后身份停用、改密或替换时必须在新事务中拒绝创建会话。"""
+    original = _login_credential()
+    state = LoginRepositoryState(user=original)
+
+    def mutate_user_after_verification() -> None:
+        """模拟 Argon2 验证期间另一事务提交身份安全状态变更。"""
+        if changed_state == "inactive":
+            state.user = replace(original, is_active=False)
+        elif changed_state == "changed-password-hash":
+            state.user = replace(original, password_hash="synthetic-replacement-password-hash")
+        else:
+            state.user = replace(
+                original,
+                identity=replace(original.identity, id=uuid4()),
+            )
+
+    verifier = RecordingPasswordVerifier(
+        FALLBACK_PASSWORD_HASH,
+        result=True,
+        on_verify=mutate_user_after_verification,
+    )
+    use_case = LoginUseCase(
+        LoginRepositoryFactory(LoginIdentityRepository(state), state),
+        verifier,
+        lambda: "unused-token",
+        hash_token,
+        FixedClock(datetime(2030, 1, 1, 8, 0, tzinfo=UTC)),
+        3600,
+    )
+
+    with pytest.raises(InvalidCredentialsError):
+        await use_case.execute(email="owner@example.com", password=CANDIDATE_PASSWORD)
+
+    assert verifier.calls == [(original.password_hash, CANDIDATE_PASSWORD)]
+    assert state.transaction_entries == 2
+    assert state.lock_for_session_creation_calls == 1
+    assert state.create_session_calls == 0
+    assert not state.transaction_open
+
+
+@pytest.mark.parametrize("session_ttl_seconds", [0, -1, 31_536_001])
+def test_login_use_case_rejects_session_ttl_outside_security_bounds(
+    session_ttl_seconds: int,
+) -> None:
+    """用例构造必须防御绕过 Settings 注入的非法会话 TTL。"""
+    state = LoginRepositoryState(user=None)
+
+    with pytest.raises(ValueError, match="session_ttl_seconds"):
+        LoginUseCase(
+            LoginRepositoryFactory(LoginIdentityRepository(state), state),
+            RecordingPasswordVerifier(FALLBACK_PASSWORD_HASH),
+            lambda: "unused-token",
+            hash_token,
+            FixedClock(datetime(2030, 1, 1, 8, 0, tzinfo=UTC)),
+            session_ttl_seconds,
+        )
+
+
+@pytest.mark.parametrize("session_ttl_seconds", [1, 31_536_000])
+def test_login_use_case_accepts_session_ttl_security_boundaries(
+    session_ttl_seconds: int,
+) -> None:
+    """用例构造必须接受批准范围的首尾两个精确 TTL 值。"""
+    state = LoginRepositoryState(user=None)
+
+    use_case = LoginUseCase(
+        LoginRepositoryFactory(LoginIdentityRepository(state), state),
+        RecordingPasswordVerifier(FALLBACK_PASSWORD_HASH),
+        lambda: "unused-token",
+        hash_token,
+        FixedClock(datetime(2030, 1, 1, 8, 0, tzinfo=UTC)),
+        session_ttl_seconds,
+    )
+
+    assert isinstance(use_case, LoginUseCase)
 
 
 @dataclass(slots=True)
@@ -236,6 +395,16 @@ class ConcurrentIdentityRepository:
     async def get_active_user_by_email(self, email: str) -> UserCredential | None:
         """拒绝并发认证测试不应触发的邮箱凭据查询。"""
         raise AssertionError("unexpected get_active_user_by_email call")
+
+    async def lock_active_user_for_session_creation(
+        self,
+        *,
+        user_id: UUID,
+        email: str,
+        password_hash: str,
+    ) -> UserCredential | None:
+        """拒绝并发认证测试不应触发的登录身份锁定复核。"""
+        raise AssertionError("unexpected lock_active_user_for_session_creation call")
 
     async def create_session(
         self,

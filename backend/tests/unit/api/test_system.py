@@ -82,6 +82,25 @@ def test_settings_reject_step_timeout_above_task_timeout() -> None:
         Settings(task_timeout_seconds=60, task_step_timeout_seconds=61)
 
 
+@pytest.mark.parametrize("session_ttl_seconds", [0, -1, 31_536_001])
+def test_settings_rejects_session_ttl_outside_security_bounds(
+    session_ttl_seconds: int,
+) -> None:
+    """启动配置必须拒绝立即失效、负数或超过一年的会话 TTL。"""
+    with pytest.raises(ValueError, match="session_ttl_seconds"):
+        Settings(session_ttl_seconds=session_ttl_seconds)
+
+
+@pytest.mark.parametrize("session_ttl_seconds", [1, 31_536_000])
+def test_settings_accepts_session_ttl_security_boundaries(
+    session_ttl_seconds: int,
+) -> None:
+    """启动配置必须接受批准范围的首尾两个精确 TTL 值。"""
+    assert Settings(session_ttl_seconds=session_ttl_seconds).session_ttl_seconds == (
+        session_ttl_seconds
+    )
+
+
 def test_read_secret_file_reads_utf8_strips_whitespace_and_returns_secret(
     tmp_path: Path,
 ) -> None:

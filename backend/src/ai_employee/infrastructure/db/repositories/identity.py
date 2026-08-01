@@ -64,6 +64,26 @@ class SqlAlchemyIdentityRepository:
         )
         return None if model is None else _to_user_credential(model)
 
+    async def lock_active_user_for_session_creation(
+        self,
+        *,
+        user_id: UUID,
+        email: str,
+        password_hash: str,
+    ) -> UserCredential | None:
+        """锁定并复核验证期间未被停用、改密或替换的同一活动用户。"""
+        model = await self._session.scalar(
+            select(UserModel)
+            .where(
+                UserModel.id == user_id,
+                UserModel.email == email,
+                UserModel.is_active.is_(True),
+                UserModel.password_hash == password_hash,
+            )
+            .with_for_update()
+        )
+        return None if model is None else _to_user_credential(model)
+
     async def create_session(
         self,
         *,

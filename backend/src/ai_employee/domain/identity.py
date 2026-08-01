@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from uuid import UUID
 
+# 会话 TTL 下限阻止立即失效或负向生命周期，上限限制长期 Cookie 与会话暴露窗口，
+# 同时避免未经配置边界的超大 timedelta 扩大 datetime 和 Cookie Max-Age 边界风险。
+MIN_SESSION_TTL_SECONDS = 1
+MAX_SESSION_TTL_SECONDS = 365 * 24 * 60 * 60
+
 
 def normalize_email(email: str) -> str:
     """规范化管理员邮箱以形成稳定且幂等的身份键。
