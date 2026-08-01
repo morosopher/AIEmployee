@@ -341,9 +341,16 @@ async def test_deleting_task_preserves_retry_and_audit_retention(database_url: s
             )
 
         async with session_factory() as session:
-            retry_reference = await session.scalar(
-                select(TaskRunModel.retry_of_task_id).where(TaskRunModel.id == retry_id)
-            )
+            # ``one`` 同时证明 retry 行仍存在，避免把错误 CASCADE 删除误判为已正确 SET NULL。
+            retry_row = (
+                await session.execute(
+                    select(
+                        TaskRunModel.id,
+                        TaskRunModel.retry_of_task_id,
+                        TaskRunModel.user_id,
+                    ).where(TaskRunModel.id == retry_id)
+                )
+            ).one()
             audit_row = (
                 await session.execute(
                     select(AuditEventModel.task_id, AuditEventModel.user_id).where(
@@ -352,7 +359,9 @@ async def test_deleting_task_preserves_retry_and_audit_retention(database_url: s
                 )
             ).one()
 
-        assert retry_reference is None
+        assert retry_row.id == retry_id
+        assert retry_row.retry_of_task_id is None
+        assert retry_row.user_id == fixture.first_user_id
         assert audit_row.task_id is None
         assert audit_row.user_id == fixture.first_user_id
     finally:
