@@ -52,8 +52,16 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.ForeignKeyConstraint(["retry_of_task_id"], ["task_runs.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(
+            ["retry_of_task_id", "user_id"],
+            ["task_runs.id", "task_runs.user_id"],
+            name="fk_task_runs_retry_of_task_id_user_id",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("id", "user_id", name="uq_task_runs_id_user_id"),
         sa.UniqueConstraint(
             "user_id",
             "idempotency_key",
@@ -75,6 +83,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.ForeignKeyConstraint(["task_id"], ["task_runs.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("id", "task_id", name="uq_task_steps_id_task_id"),
         sa.UniqueConstraint(
             "task_id",
             "sequence",
@@ -100,6 +109,13 @@ def upgrade() -> None:
             ["users.id"],
             ondelete="SET NULL",
         ),
+        sa.ForeignKeyConstraint(
+            ["step_id", "task_id"],
+            ["task_steps.id", "task_steps.task_id"],
+            name="fk_approval_requests_step_id_task_id",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         sa.ForeignKeyConstraint(["step_id"], ["task_steps.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["task_id"], ["task_runs.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
@@ -116,6 +132,13 @@ def upgrade() -> None:
         sa.Column("result_summary", postgresql.JSONB(), nullable=True),
         sa.Column("error_code", sa.String(length=100), nullable=True),
         sa.Column("id", sa.Uuid(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["step_id", "task_id"],
+            ["task_steps.id", "task_steps.task_id"],
+            name="fk_tool_executions_step_id_task_id",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         sa.ForeignKeyConstraint(["step_id"], ["task_steps.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["task_id"], ["task_runs.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
@@ -138,6 +161,13 @@ def upgrade() -> None:
             sa.DateTime(timezone=True),
             server_default=sa.text("now()"),
             nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["task_id", "user_id"],
+            ["task_runs.id", "task_runs.user_id"],
+            name="fk_audit_events_task_id_user_id",
+            deferrable=True,
+            initially="DEFERRED",
         ),
         sa.ForeignKeyConstraint(["task_id"], ["task_runs.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="RESTRICT"),
@@ -177,11 +207,22 @@ def upgrade() -> None:
             name="uq_outbox_events_deduplication_key",
         ),
     )
+    op.create_index(
+        "ix_outbox_events_unpublished_available_at_id",
+        "outbox_events",
+        ["available_at", "id"],
+        unique=False,
+        postgresql_where=sa.text("published_at IS NULL"),
+    )
 
 
 def downgrade() -> None:
     """按依赖逆序移除 Task 6 表；生产环境不得用破坏性降级恢复数据。"""
 
+    op.drop_index(
+        "ix_outbox_events_unpublished_available_at_id",
+        table_name="outbox_events",
+    )
     op.drop_table("outbox_events")
     op.drop_index("ix_audit_events_task_id_id", table_name="audit_events")
     op.drop_table("audit_events")
