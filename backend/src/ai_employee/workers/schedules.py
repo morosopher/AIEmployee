@@ -1,8 +1,9 @@
 """把 Task 7 三个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
+from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.schedules import (
     DispatchDueDailyBriefsUseCase,
     daily_brief_idempotency_key,
@@ -18,8 +19,8 @@ from ai_employee.infrastructure.db.repositories.identity import (
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.broker import broker
-from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
-from ai_employee.workers.outbox import OutboxRelay, SqlAlchemyOutboxStore
+from ai_employee.workers.execute_task import execute_task
+from ai_employee.workers.outbox import build_outbox_relay
 
 __all__ = [
     "daily_brief_idempotency_key",
@@ -36,13 +37,10 @@ session_factory = build_session_factory(settings.database_url)
 
 def _build_outbox_relay() -> OutboxRelay:
     """用同一数据库池与 Taskiq enqueue adapter 构造即时/分钟共享的 relay 路径。"""
-    return OutboxRelay(
-        store=SqlAlchemyOutboxStore(session_factory),
-        enqueuer=TaskiqTaskEnqueuer(),
-        clock=lambda: datetime.now(UTC),
-        claim_ttl=timedelta(seconds=settings.outbox_claim_seconds),
-        retry_base=timedelta(seconds=settings.outbox_retry_base_seconds),
-        retry_max=timedelta(seconds=settings.outbox_retry_max_seconds),
+    return build_outbox_relay(
+        session_factory=session_factory,
+        settings=settings,
+        task_sender=execute_task.kiq,
     )
 
 

@@ -8,16 +8,16 @@ import pytest
 from pydantic import ValidationError
 
 import ai_employee.workers.execute_task as execute_task_module
+from ai_employee.application.use_cases.task_execution import (
+    DurableTaskRunner,
+    LeasedTask,
+    TaskExecutionStep,
+)
 from ai_employee.config import Settings
 from ai_employee.domain.errors import TransientProviderError
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.queue.broker import broker
 from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
-from ai_employee.workers.execute_task import (
-    DurableTaskRunner,
-    LeasedTask,
-    TaskExecutionStep,
-)
 
 
 @pytest.mark.parametrize(
@@ -82,9 +82,7 @@ def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -
 
 
 @pytest.mark.asyncio
-async def test_enqueue_adapter_sends_only_canonical_task_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_enqueue_adapter_sends_only_canonical_task_id() -> None:
     """enqueue 适配器调用 Taskiq 入口的 ``kiq``，且 Redis 消息只携带 UUID 字符串。"""
     task_id = uuid4()
     received: list[str] = []
@@ -92,9 +90,7 @@ async def test_enqueue_adapter_sends_only_canonical_task_id(
     async def fake_kiq(value: str) -> None:
         received.append(value)
 
-    monkeypatch.setattr(execute_task_module.execute_task, "kiq", fake_kiq)
-
-    await TaskiqTaskEnqueuer().enqueue(task_id)
+    await TaskiqTaskEnqueuer(fake_kiq).enqueue(task_id)
 
     assert received == [str(task_id)]
 
@@ -118,8 +114,10 @@ class RecordingLeaseStore:
         self.acquired: list[tuple[UUID, str, datetime, datetime]] = []
         self.renewed: list[tuple[UUID, str, datetime]] = []
         self.finished: list[tuple[TaskStatus, str | None]] = []
+        self.internal_failures: list[tuple[UUID, str, datetime, str]] = []
         self.allow_renew = True
         self.allow_finish = True
+        self.allow_internal_failure = True
 
     async def prepare_retry(self, *, task_id: UUID, now: datetime) -> None:
         """记录重试消息在重新租约前执行了持久状态归队。"""
@@ -160,6 +158,43 @@ class RecordingLeaseStore:
         """记录带 owner 的终态 CAS；结果由测试开关控制。"""
         self.finished.append((status, error_code))
         return self.allow_finish
+
+    async def fail_internal(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        failed_at: datetime,
+        error_code: str,
+    ) -> bool:
+        """记录前置持久化异常后的 owner/status 安全失败 CAS 意图。"""
+        self.internal_failures.append((task_id, lease_owner, failed_at, error_code))
+        return self.allow_internal_failure
+
+
+class FailingPrepareStore(RecordingLeaseStore):
+    """在重试准备边界注入未知数据库异常。"""
+
+    async def prepare_retry(self, *, task_id: UUID, now: datetime) -> None:
+        """模拟 prepare transaction 在应用用例可分类前失败。"""
+        del task_id, now
+        raise RuntimeError("synthetic prepare failure")
+
+
+class FailingAcquireStore(RecordingLeaseStore):
+    """在租约获取边界注入未知数据库异常。"""
+
+    async def acquire(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> LeasedTask | None:
+        """模拟 acquisition transaction 的未知失败或提交结果丢失。"""
+        del task_id, lease_owner, now, lease_expires_at
+        raise RuntimeError("synthetic acquire failure")
 
 
 class AdvancingAcquireStore(RecordingLeaseStore):
@@ -206,6 +241,15 @@ class CallableStep:
         """执行测试回调；任务快照由 Runner 传入但不做修改。"""
         del task
         await self._callback()
+
+
+class PersistenceUnavailableRunner:
+    """模拟主失败后数据库也无法写入安全终态的最后防线场景。"""
+
+    async def run(self, task_id: UUID) -> bool:
+        """对可关联任务抛出未知持久化异常。"""
+        del task_id
+        raise RuntimeError("synthetic persistence unavailable")
 
 
 def _leased_task(*, started_at: datetime) -> LeasedTask:
@@ -416,3 +460,77 @@ async def test_unknown_exception_is_safely_failed_without_reaching_retry() -> No
 
     assert owned is True
     assert store.finished == [(TaskStatus.FAILED, "internal_worker_error")]
+
+
+@pytest.mark.asyncio
+async def test_prepare_retry_unknown_error_requests_safe_non_retry_failure() -> None:
+    """重试准备未知异常必须尝试写安全失败码，且不能逃逸到 SmartRetry。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = FailingPrepareStore(task)
+    runner = _runner(store=store, clock=MutableClock(now), steps=())
+
+    handled = await runner.run(task_id=task.task_id, lease_owner="worker-prepare")
+
+    assert handled is True
+    assert store.acquired == []
+    assert store.internal_failures == [
+        (
+            task.task_id,
+            "worker-prepare",
+            now,
+            "task_execution_internal_error",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acquire_unknown_error_requests_safe_non_retry_failure() -> None:
+    """租约获取未知异常必须覆盖可能已提交的本 owner，而不重新抛出。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = FailingAcquireStore(task)
+    runner = _runner(store=store, clock=MutableClock(now), steps=())
+
+    handled = await runner.run(task_id=task.task_id, lease_owner="worker-acquire")
+
+    assert handled is True
+    assert store.prepared == [task.task_id]
+    assert store.internal_failures == [
+        (
+            task.task_id,
+            "worker-acquire",
+            now,
+            "task_execution_internal_error",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_internal_failure_cas_miss_does_not_fallback_to_overwrite_owner() -> None:
+    """安全失败 CAS 未命中时必须无副作用退出，不能再用宽松终态写覆盖他人。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = FailingAcquireStore(task)
+    store.allow_internal_failure = False
+    runner = _runner(store=store, clock=MutableClock(now), steps=())
+
+    handled = await runner.run(task_id=task.task_id, lease_owner="stale-worker")
+
+    assert handled is False
+    assert len(store.internal_failures) == 1
+    assert store.finished == []
+
+
+@pytest.mark.asyncio
+async def test_taskiq_entrypoint_swallows_unknown_when_failure_cannot_be_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """数据库也不可写时入口作为最后防线终止未知异常，不让 SmartRetry 接收它。"""
+    monkeypatch.setattr(
+        execute_task_module,
+        "build_task_runner",
+        lambda: PersistenceUnavailableRunner(),
+    )
+
+    await execute_task_module.execute_task.original_func(str(uuid4()))

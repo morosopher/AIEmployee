@@ -54,14 +54,14 @@ class CreateTaskUseCase:
     def __init__(
         self,
         repositories: TaskRepositoryFactory,
-        dispatcher: TaskDispatcher | None = None,
+        dispatcher: TaskDispatcher,
     ) -> None:
         """注入不暴露 SQLAlchemy 的任务 Repository 事务工厂。
 
         Args:
             repositories: 每次调用创建独立提交/回滚边界的工厂。
-            dispatcher: 可选的提交后立即投递端口。Task 6 的纯持久化测试可以省略；
-                API 与 Scheduler 的运行时组合必须注入同一个 Outbox relay 路径。
+            dispatcher: 必需的提交后立即投递端口。纯持久化测试也必须注入明确 Fake，
+                以证明所有构造点都遵守同一 claim/transition/enqueue 路径。
         """
         self._repositories = repositories
         self._dispatcher = dispatcher
@@ -99,7 +99,5 @@ class CreateTaskUseCase:
 
         # 外部队列 I/O 必须发生在创建事务提交之后。dispatcher 自身先用新事务 claim，
         # 即使 Redis 失败也会返回已经持久化的 QUEUED 状态并把未发布事实留给 minute relay。
-        if self._dispatcher is None:
-            return result
         status = await self._dispatcher.dispatch(result.task_id)
         return CreateTaskResult(task_id=result.task_id, status=status)

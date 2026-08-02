@@ -8,19 +8,26 @@ import pytest
 from sqlalchemy import select
 
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
+from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.schedules import DispatchDueDailyBriefsUseCase
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel, UserSessionModel
-from ai_employee.infrastructure.db.models.tasks import OutboxEventModel, TaskRunModel
+from ai_employee.infrastructure.db.models.tasks import (
+    AuditEventModel,
+    OutboxEventModel,
+    TaskRunModel,
+)
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
     SqlAlchemySessionMaintenanceRepositoryFactory,
 )
+from ai_employee.infrastructure.db.repositories.outbox import SqlAlchemyOutboxStore
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
-from ai_employee.workers.execute_task import SqlAlchemyTaskExecutionStore
-from ai_employee.workers.outbox import OutboxRelay, SqlAlchemyOutboxStore
 
 
 class RecordingEnqueuer:
@@ -62,6 +69,51 @@ class InspectingEnqueuer:
             await session_factory.dispose()
 
 
+class CommitObservingDispatcher:
+    """为 relay 测试保留初始 Outbox，同时证明创建事务已在新 Session 可见。"""
+
+    def __init__(self, database_url: str) -> None:
+        """保存隔离测试数据库地址，并初始化调用记录。"""
+        self._database_url = database_url
+        self.task_ids: list[UUID] = []
+
+    async def dispatch(self, task_id: UUID) -> TaskStatus:
+        """观察已提交 Task/Outbox 后返回当前状态，不执行队列投递。"""
+        session_factory = build_session_factory(self._database_url)
+        try:
+            async with session_factory() as session:
+                task = await session.get(TaskRunModel, task_id)
+                event = await session.scalar(
+                    select(OutboxEventModel).where(OutboxEventModel.aggregate_id == task_id)
+                )
+            assert task is not None
+            assert event is not None
+            self.task_ids.append(task_id)
+            return TaskStatus(task.status)
+        finally:
+            await session_factory.dispose()
+
+
+class SyntheticProcessCrash(BaseException):
+    """模拟 enqueue 开始后、结果持久化前进程被终止的不可捕获控制流。"""
+
+
+class CrashOnceEnqueuer:
+    """第一次投递模拟进程崩溃，claim 到期后的重复投递正常返回。"""
+
+    def __init__(self) -> None:
+        """初始化投递记录与一次性崩溃开关。"""
+        self.task_ids: list[UUID] = []
+        self._must_crash = True
+
+    async def enqueue(self, task_id: UUID) -> None:
+        """记录每次至少一次投递，并在首次调用抛出 BaseException。"""
+        self.task_ids.append(task_id)
+        if self._must_crash:
+            self._must_crash = False
+            raise SyntheticProcessCrash
+
+
 def _user() -> UserModel:
     """构造仅含合成资料且显式使用 UTC 的活动用户。"""
     return UserModel(
@@ -91,7 +143,11 @@ async def test_relay_claims_created_task_then_marks_event_published(database_url
             await session.flush()
             user_id = user.id
 
-        created = await CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory)).execute(
+        setup_dispatcher = CommitObservingDispatcher(database_url)
+        created = await CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=setup_dispatcher,
+        ).execute(
             user_id=user_id,
             kind="daily_brief",
             input_payload={"local_date": "2026-08-01"},
@@ -109,6 +165,7 @@ async def test_relay_claims_created_task_then_marks_event_published(database_url
         published = await relay.relay_once(limit=100)
 
         assert published == 1
+        assert setup_dispatcher.task_ids == [created.task_id]
         assert enqueuer.observed == [
             (
                 TaskStatus.QUEUED.value,
@@ -146,7 +203,11 @@ async def test_failed_enqueue_leaves_claimed_task_queued_for_later_relay(
             await session.flush()
             user_id = user.id
 
-        created = await CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory)).execute(
+        setup_dispatcher = CommitObservingDispatcher(database_url)
+        created = await CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=setup_dispatcher,
+        ).execute(
             user_id=user_id,
             kind="daily_brief",
             input_payload={"local_date": "2026-08-01"},
@@ -164,6 +225,7 @@ async def test_failed_enqueue_leaves_claimed_task_queued_for_later_relay(
         published = await relay.relay_once(limit=100)
 
         assert published == 0
+        assert setup_dispatcher.task_ids == [created.task_id]
         async with session_factory() as session:
             task = await session.get(TaskRunModel, created.task_id)
             event = await session.scalar(
@@ -245,7 +307,11 @@ async def test_concurrent_relays_skip_rows_already_claimed_by_other_transaction(
             await session.flush()
             user_id = user.id
 
-        created = await CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory)).execute(
+        setup_dispatcher = CommitObservingDispatcher(database_url)
+        created = await CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=setup_dispatcher,
+        ).execute(
             user_id=user_id,
             kind="daily_brief",
             input_payload={"local_date": "2026-08-01"},
@@ -274,7 +340,77 @@ async def test_concurrent_relays_skip_rows_already_claimed_by_other_transaction(
         )
 
         assert sum(counts) == 1
+        assert setup_dispatcher.task_ids == [created.task_id]
         assert first_enqueuer.task_ids + second_enqueuer.task_ids == [created.task_id]
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_claim_survives_crash_and_becomes_due_after_exact_claim_window(
+    database_url: str,
+) -> None:
+    """claim 提交后崩溃不伪造结果，60 秒内跳过，到期后允许至少一次重复投递。"""
+    session_factory = build_session_factory(database_url)
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    current = now
+    enqueuer = CrashOnceEnqueuer()
+    try:
+        async with session_factory.begin() as session:
+            user = _user()
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+        setup_dispatcher = CommitObservingDispatcher(database_url)
+        created = await CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=setup_dispatcher,
+        ).execute(
+            user_id=user_id,
+            kind="daily_brief",
+            input_payload={"local_date": "2030-08-01"},
+            idempotency_key="daily_brief:crash-recovery:2030-08-01:scheduled",
+        )
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            clock=lambda: current,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        with pytest.raises(SyntheticProcessCrash):
+            await relay.relay_once(limit=1)
+
+        async with session_factory() as session:
+            crashed_task = await session.get(TaskRunModel, created.task_id)
+            crashed_event = await session.scalar(
+                select(OutboxEventModel).where(OutboxEventModel.aggregate_id == created.task_id)
+            )
+        assert crashed_task is not None
+        assert crashed_task.status == TaskStatus.QUEUED.value
+        assert crashed_event is not None
+        assert crashed_event.available_at == now + timedelta(seconds=60)
+        assert crashed_event.published_at is None
+        assert crashed_event.attempt_count == 0
+        assert crashed_event.last_error is None
+
+        current = now + timedelta(seconds=59)
+        assert await relay.relay_once(limit=1) == 0
+        assert enqueuer.task_ids == [created.task_id]
+
+        current = now + timedelta(seconds=60)
+        assert await relay.relay_once(limit=1) == 1
+        assert enqueuer.task_ids == [created.task_id, created.task_id]
+        async with session_factory() as session:
+            recovered_event = await session.scalar(
+                select(OutboxEventModel).where(OutboxEventModel.aggregate_id == created.task_id)
+            )
+        assert recovered_event is not None
+        assert recovered_event.published_at == now + timedelta(seconds=60)
+        assert recovered_event.last_error is None
     finally:
         await session_factory.dispose()
 
@@ -361,6 +497,128 @@ async def test_execution_lease_is_single_owner_replaceable_after_expiry_and_cas_
             lease_expires_at=now + timedelta(seconds=120),
         )
         assert terminal_claim is None
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_internal_execution_failure_cas_preserves_foreign_owner_and_terminal_state(
+    database_url: str,
+) -> None:
+    """前置未知异常只失败无 owner 或本 owner 的非终态，不得覆盖他人和既有终态。"""
+    session_factory = build_session_factory(database_url)
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    try:
+        async with session_factory.begin() as session:
+            user = _user()
+            session.add(user)
+            await session.flush()
+            queued = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.QUEUED.value,
+                idempotency_key="internal-failure:queued",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            retry_scheduled = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RETRY_SCHEDULED.value,
+                idempotency_key="internal-failure:retry",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            same_owner = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                idempotency_key="internal-failure:same-owner",
+                input_payload={"local_date": "2030-08-01"},
+                lease_owner="worker-a",
+                lease_expires_at=now + timedelta(seconds=30),
+                started_at=now,
+            )
+            foreign_owner = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                idempotency_key="internal-failure:foreign-owner",
+                input_payload={"local_date": "2030-08-01"},
+                lease_owner="worker-b",
+                lease_expires_at=now + timedelta(seconds=30),
+                started_at=now,
+            )
+            terminal = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.SUCCEEDED.value,
+                idempotency_key="internal-failure:terminal",
+                input_payload={"local_date": "2030-08-01"},
+                started_at=now,
+                finished_at=now,
+            )
+            session.add_all((queued, retry_scheduled, same_owner, foreign_owner, terminal))
+            await session.flush()
+            task_ids = {
+                "queued": queued.id,
+                "retry": retry_scheduled.id,
+                "same": same_owner.id,
+                "foreign": foreign_owner.id,
+                "terminal": terminal.id,
+            }
+
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        results = {
+            name: await store.fail_internal(
+                task_id=task_id,
+                lease_owner="worker-a",
+                failed_at=now + timedelta(seconds=1),
+                error_code="task_execution_internal_error",
+            )
+            for name, task_id in task_ids.items()
+        }
+
+        assert results == {
+            "queued": True,
+            "retry": True,
+            "same": True,
+            "foreign": False,
+            "terminal": False,
+        }
+        async with session_factory() as session:
+            tasks = {
+                task.id: task
+                for task in (
+                    await session.scalars(
+                        select(TaskRunModel).where(TaskRunModel.id.in_(task_ids.values()))
+                    )
+                ).all()
+            }
+            failure_audits = (
+                await session.scalars(
+                    select(AuditEventModel).where(
+                        AuditEventModel.task_id.in_(task_ids.values()),
+                        AuditEventModel.event_type == "task.failed",
+                    )
+                )
+            ).all()
+
+        for key in ("queued", "retry", "same"):
+            task = tasks[task_ids[key]]
+            assert task.status == TaskStatus.FAILED.value
+            assert task.error_code == "task_execution_internal_error"
+            assert task.finished_at == now + timedelta(seconds=1)
+            assert task.lease_owner is None
+            assert task.lease_expires_at is None
+
+        assert tasks[task_ids["foreign"]].status == TaskStatus.RUNNING.value
+        assert tasks[task_ids["foreign"]].lease_owner == "worker-b"
+        assert tasks[task_ids["terminal"]].status == TaskStatus.SUCCEEDED.value
+        assert tasks[task_ids["terminal"]].error_code is None
+        assert {audit.task_id for audit in failure_audits} == {
+            task_ids["queued"],
+            task_ids["retry"],
+            task_ids["same"],
+        }
     finally:
         await session_factory.dispose()
 

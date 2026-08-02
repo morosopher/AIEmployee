@@ -26,8 +26,8 @@ api:
 
 [group('development')]
 worker:
-    uv run --project backend taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker
+    uv run --project backend taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules
 
 [group('development')]
 scheduler:
-    uv run --project backend taskiq scheduler ai_employee.infrastructure.queue.scheduler:scheduler
+    uv run --project backend taskiq scheduler ai_employee.infrastructure.queue.scheduler:scheduler ai_employee.workers.schedules

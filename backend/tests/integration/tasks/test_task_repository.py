@@ -86,6 +86,34 @@ class BarrierTaskRepositoryFactory:
             yield SqlAlchemyTaskRepository(cast(AsyncSession, proxy))
 
 
+class CommitObservingDispatcher:
+    """从新 Session 验证 Task/Outbox 已提交，再记录 dispatcher 调用。"""
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存真实 Session factory，并初始化提交后观察记录。"""
+        self._session_factory = session_factory
+        self.calls: list[UUID] = []
+
+    async def dispatch(self, task_id: UUID) -> TaskStatus:
+        """只观察已提交事实，不模拟 Redis，适用于 Task 6 纯持久化测试。
+
+        Args:
+            task_id: 创建事务返回的稳定任务标识。
+
+        Returns:
+            新 Session 读取到的持久任务状态。
+        """
+        async with self._session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            outbox = await session.scalar(
+                select(OutboxEventModel).where(OutboxEventModel.aggregate_id == task_id)
+            )
+        assert task is not None
+        assert outbox is not None
+        self.calls.append(task_id)
+        return TaskStatus(task.status)
+
+
 def _synthetic_user(*, email: str, display_name: str) -> UserModel:
     """构造不含真实个人资料且使用显式 UTC 偏好的测试用户。"""
     return UserModel(
@@ -130,7 +158,11 @@ async def test_create_task_commits_task_audit_and_outbox_once(database_url: str)
             await session.flush()
             user_id = user.id
 
-        use_case = CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory))
+        dispatcher = CommitObservingDispatcher(session_factory)
+        use_case = CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=dispatcher,
+        )
         created = await use_case.execute(
             user_id=user_id,
             kind="daily_brief",
@@ -145,6 +177,7 @@ async def test_create_task_commits_task_audit_and_outbox_once(database_url: str)
         )
 
         assert repeated.task_id == created.task_id
+        assert dispatcher.calls == [created.task_id, created.task_id]
 
         # 必须从新 Session 读取提交后的事实，避免把同一 identity map 的未提交对象误判为成功。
         async with session_factory() as session:
@@ -214,7 +247,11 @@ async def test_same_idempotency_key_is_isolated_by_user(database_url: str) -> No
             first_user_id = first_user.id
             second_user_id = second_user.id
 
-        use_case = CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory))
+        dispatcher = CommitObservingDispatcher(session_factory)
+        use_case = CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=dispatcher,
+        )
         first = await use_case.execute(
             user_id=first_user_id,
             kind="daily_brief",
@@ -229,6 +266,7 @@ async def test_same_idempotency_key_is_isolated_by_user(database_url: str) -> No
         )
 
         assert first.task_id != second.task_id
+        assert dispatcher.calls == [first.task_id, second.task_id]
 
         async with session_factory() as session:
             task_count = await session.scalar(select(func.count()).select_from(TaskRunModel))
@@ -271,7 +309,8 @@ async def test_concurrent_same_idempotency_key_returns_one_task(database_url: st
             user_id = user.id
 
         repositories = BarrierTaskRepositoryFactory(session_factory, asyncio.Barrier(2))
-        use_case = CreateTaskUseCase(repositories)
+        dispatcher = CommitObservingDispatcher(session_factory)
+        use_case = CreateTaskUseCase(repositories, dispatcher=dispatcher)
         results = await asyncio.gather(
             use_case.execute(
                 user_id=user_id,
@@ -296,6 +335,8 @@ async def test_concurrent_same_idempotency_key_returns_one_task(database_url: st
         assert first.task_id == second.task_id
         assert len(repositories.session_ids) == 2
         assert repositories.session_ids[0] != repositories.session_ids[1]
+        assert len(dispatcher.calls) == 2
+        assert set(dispatcher.calls) == {first.task_id}
 
         async with session_factory() as session:
             task_count = await session.scalar(select(func.count()).select_from(TaskRunModel))
@@ -338,7 +379,11 @@ async def test_non_task_unique_error_rolls_back_all_new_facts(
 
         # 固定应用生成的任务 UUID，让真实 Outbox 唯一约束稳定命中；flush 与数据库不模拟。
         monkeypatch.setattr(task_repository_module, "uuid4", lambda: fixed_task_id)
-        use_case = CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory))
+        dispatcher = CommitObservingDispatcher(session_factory)
+        use_case = CreateTaskUseCase(
+            SqlAlchemyTaskRepositoryFactory(session_factory),
+            dispatcher=dispatcher,
+        )
         with pytest.raises(IntegrityError) as raised:
             await use_case.execute(
                 user_id=user_id,
@@ -348,6 +393,7 @@ async def test_non_task_unique_error_rolls_back_all_new_facts(
             )
 
         assert _postgres_constraint_name(raised.value) == ("uq_outbox_events_deduplication_key")
+        assert dispatcher.calls == []
 
         async with session_factory() as session:
             task_count = await session.scalar(
