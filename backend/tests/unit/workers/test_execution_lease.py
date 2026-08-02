@@ -71,6 +71,7 @@ def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -
     """队列只使用固定 Stream/group，SmartRetry 为三次、五秒、jitter 与封顶指数退避。"""
     assert broker.queue_name == "ai_employee_tasks"
     assert broker.consumer_group_name == "ai_employee_workers"
+    assert broker.consumer_id == "0-0"
     assert len(broker.middlewares) == 1
     retry = broker.middlewares[0]
     assert retry.default_retry_count == 3

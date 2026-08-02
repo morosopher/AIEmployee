@@ -100,3 +100,96 @@ asyncio.run(main())
     assert len(entries) == 1
     message = entries[0][1][b"data"]
     assert str(task_id).encode() in message
+
+
+@pytest.mark.asyncio
+async def test_first_worker_start_consumes_message_enqueued_before_group_creation(
+    empty_redis: RedisTestUrl,
+) -> None:
+    """首次 group 创建必须从 Stream 起点读取已经入队的 task，而不是从尾部跳过。"""
+    broker_path, modules = await _worker_command_parts()
+    task_id = uuid4()
+    environment = os.environ.copy()
+    environment["REDIS_URL"] = str(empty_redis)
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import json
+import sys
+from uuid import UUID
+
+from redis.asyncio import Redis
+from taskiq.cli.utils import import_object, import_tasks
+
+from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
+
+broker = import_object(sys.argv[1])
+broker.is_worker_process = True
+modules = sys.argv[2:-2]
+redis_url = sys.argv[-2]
+task_id = UUID(sys.argv[-1])
+import_tasks(modules, ["**/tasks.py"], False)
+tasks = broker.get_all_tasks()
+
+async def main():
+    client = Redis.from_url(redis_url, decode_responses=False)
+    listener = broker.listen()
+    received = False
+    pending_after_ack = -1
+    try:
+        sender = tasks["ai_employee.workers.execute_task:execute_task"].kiq
+        await TaskiqTaskEnqueuer(sender).enqueue(task_id)
+        groups_before_startup = await client.xinfo_groups("ai_employee_tasks")
+        if groups_before_startup:
+            raise RuntimeError("consumer group unexpectedly existed before worker startup")
+
+        await broker.startup()
+        try:
+            message = await asyncio.wait_for(anext(listener), timeout=0.4)
+        except TimeoutError:
+            pass
+        else:
+            received = str(task_id).encode() in message.data
+            await message.ack()
+            pending = await client.xpending("ai_employee_tasks", "ai_employee_workers")
+            pending_after_ack = int(pending["pending"])
+    finally:
+        await listener.aclose()
+        await broker.shutdown()
+        await client.aclose()
+
+    print(
+        json.dumps(
+            {
+                "received": received,
+                "pending_after_ack": pending_after_ack,
+                "tasks": sorted(tasks),
+            }
+        )
+    )
+
+asyncio.run(main())
+""",
+            broker_path,
+            *modules,
+            str(empty_redis),
+            str(task_id),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result == {
+        "received": True,
+        "pending_after_ack": 0,
+        "tasks": EXPECTED_TASK_NAMES,
+    }

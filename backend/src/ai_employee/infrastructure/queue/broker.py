@@ -14,6 +14,10 @@ broker = RedisStreamBroker(
     url=settings.redis_url,
     queue_name="ai_employee_tasks",
     consumer_group_name="ai_employee_workers",
+    # taskiq-redis 只在首次 ``XGROUP CREATE`` 时使用 consumer_id。显式从 ``0-0`` 创建
+    # 可让首个 Worker 消费 group 建立前已写入的 backlog；若 group 已存在，Redis 会保留
+    # 既有 last-delivered-id 与 pending 状态，本配置不会重置 offset 或重复接管已确认消息。
+    consumer_id="0-0",
 ).with_middlewares(
     SmartRetryMiddleware(
         default_retry_count=3,
