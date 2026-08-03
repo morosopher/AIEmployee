@@ -8,6 +8,7 @@ from datetime import UTC, datetime, time
 from uuid import UUID
 
 import pytest
+from redis.asyncio import Redis
 from sse_starlette import ServerSentEvent
 
 from ai_employee.api.sse import TaskEventStore, TaskEventStream
@@ -137,6 +138,29 @@ async def _append_event(
         session.add(event)
         await session.flush()
         return event.id
+
+
+async def _wait_for_task_channel_subscriber(*, redis_url: str, task_id: UUID) -> None:
+    """等待 Redis 确认任务频道已有订阅者，避免依赖任意固定睡眠时间。
+
+    Args:
+        redis_url: 已由集成测试环境提供的隔离 Redis 地址。
+        task_id: SSE 流订阅的任务频道标识。
+
+    Raises:
+        TimeoutError: Redis 未在合理测试预算内确认订阅，表示流未准备好接收唤醒通知。
+    """
+    client = Redis.from_url(redis_url, decode_responses=True)
+    channel = TaskEventPublisher.channel(task_id)
+    try:
+        async with asyncio.timeout(1):
+            while True:
+                subscriptions = await client.pubsub_numsub(channel)
+                if any(name == channel and count >= 1 for name, count in subscriptions):
+                    return
+                await asyncio.sleep(0.01)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -322,7 +346,7 @@ async def test_redis_pubsub_notification_wakes_task_stream(
     stream = TaskEventStream(TaskEventStore(session_factory, task_store), redis_url=redis_url)
     events = stream.events(task_id=task_id, user_id=user_id, last_event_id=None)
     pending_event = asyncio.create_task(anext(events))
-    await asyncio.sleep(0.1)
+    await _wait_for_task_channel_subscriber(redis_url=redis_url, task_id=task_id)
     event_id = await _append_event(session_factory, user_id, task_id, "task.running")
     payload = _event_payload(await asyncio.wait_for(pending_event, timeout=2))
     await events.aclose()
