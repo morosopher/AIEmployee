@@ -92,7 +92,11 @@ class SqlAlchemyTaskViewStore:
             return await self._get_in_session(session, task_id=task_id, user_id=user_id)
 
     async def cancel(self, *, task_id: UUID, user_id: UUID, now: datetime) -> TaskSnapshot | None:
-        """锁定任务，验证状态机后追加可重放的取消审计事件。"""
+        """锁定任务、原子追加取消事实，并在提交后返回固定读取视图。
+
+        取消状态、审计事件必须同事务提交；响应快照则在提交后另开 ``REPEATABLE READ``
+        事务读取，避免默认 ``READ COMMITTED`` 的多条查询让事件游标超前于任务或步骤。
+        """
         async with self._session_factory.begin() as session:
             task = await session.scalar(
                 select(TaskRunModel)
@@ -117,7 +121,7 @@ class SqlAlchemyTaskViewStore:
                 )
             )
             await session.flush()
-            return await self._get_in_session(session, task_id=task_id, user_id=user_id)
+        return await self.get(task_id=task_id, user_id=user_id)
 
     async def retry(
         self, *, task_id: UUID, user_id: UUID, idempotency_key: str, now: datetime
@@ -161,71 +165,75 @@ class SqlAlchemyTaskViewStore:
                 )
             )
             if existing is not None:
-                return await self._get_in_session(session, task_id=existing.id, user_id=user_id)
-            replacement_id = uuid4()
-            inserted = await session.scalar(
-                insert(TaskRunModel)
-                .values(
-                    id=replacement_id,
-                    user_id=user_id,
-                    retry_of_task_id=task_id,
-                    kind=original.kind,
-                    status=TaskStatus.CREATED.value,
-                    idempotency_key=retry_key,
-                    input_payload=original.input_payload,
-                )
-                .on_conflict_do_nothing(constraint="uq_task_runs_user_id_idempotency_key")
-                .returning(TaskRunModel.id)
-            )
-            if inserted is None:
-                existing = await session.scalar(
-                    select(TaskRunModel).where(
-                        TaskRunModel.user_id == user_id,
-                        TaskRunModel.retry_of_task_id == task_id,
-                        TaskRunModel.idempotency_key == retry_key,
+                replacement_task_id = existing.id
+            else:
+                replacement_id = uuid4()
+                inserted = await session.scalar(
+                    insert(TaskRunModel)
+                    .values(
+                        id=replacement_id,
+                        user_id=user_id,
+                        retry_of_task_id=task_id,
+                        kind=original.kind,
+                        status=TaskStatus.CREATED.value,
+                        idempotency_key=retry_key,
+                        input_payload=original.input_payload,
                     )
+                    .on_conflict_do_nothing(constraint="uq_task_runs_user_id_idempotency_key")
+                    .returning(TaskRunModel.id)
                 )
-                if existing is None:
-                    raise RuntimeError("retry idempotency winner is not visible")
-                return await self._get_in_session(session, task_id=existing.id, user_id=user_id)
-            transition_task(TaskStatus.CREATED, TaskStatus.QUEUED)
-            await session.execute(
-                update(TaskRunModel)
-                .where(TaskRunModel.id == replacement_id)
-                .values(status=TaskStatus.QUEUED.value)
-            )
-            session.add_all(
-                (
-                    AuditEventModel(
-                        user_id=user_id,
-                        task_id=replacement_id,
-                        event_type="task.created",
-                        actor_type="user",
-                        actor_id=str(user_id),
-                        event_metadata={
-                            "retry_of_task_id": str(task_id),
-                            "status": TaskStatus.CREATED.value,
-                        },
-                    ),
-                    AuditEventModel(
-                        user_id=user_id,
-                        task_id=replacement_id,
-                        event_type="task.queued",
-                        actor_type="user",
-                        actor_id=str(user_id),
-                        event_metadata={"status": TaskStatus.QUEUED.value},
-                    ),
-                    OutboxEventModel(
-                        topic="task.execute",
-                        aggregate_id=replacement_id,
-                        deduplication_key=f"task.execute:{replacement_id}:initial",
-                        payload={"task_id": str(replacement_id)},
-                        available_at=now,
-                    ),
-                )
-            )
-            await session.flush()
-            return await self._get_in_session(session, task_id=replacement_id, user_id=user_id)
+                if inserted is None:
+                    existing = await session.scalar(
+                        select(TaskRunModel).where(
+                            TaskRunModel.user_id == user_id,
+                            TaskRunModel.retry_of_task_id == task_id,
+                            TaskRunModel.idempotency_key == retry_key,
+                        )
+                    )
+                    if existing is None:
+                        raise RuntimeError("retry idempotency winner is not visible")
+                    replacement_task_id = existing.id
+                else:
+                    transition_task(TaskStatus.CREATED, TaskStatus.QUEUED)
+                    await session.execute(
+                        update(TaskRunModel)
+                        .where(TaskRunModel.id == replacement_id)
+                        .values(status=TaskStatus.QUEUED.value)
+                    )
+                    session.add_all(
+                        (
+                            AuditEventModel(
+                                user_id=user_id,
+                                task_id=replacement_id,
+                                event_type="task.created",
+                                actor_type="user",
+                                actor_id=str(user_id),
+                                event_metadata={
+                                    "retry_of_task_id": str(task_id),
+                                    "status": TaskStatus.CREATED.value,
+                                },
+                            ),
+                            AuditEventModel(
+                                user_id=user_id,
+                                task_id=replacement_id,
+                                event_type="task.queued",
+                                actor_type="user",
+                                actor_id=str(user_id),
+                                event_metadata={"status": TaskStatus.QUEUED.value},
+                            ),
+                            OutboxEventModel(
+                                topic="task.execute",
+                                aggregate_id=replacement_id,
+                                deduplication_key=f"task.execute:{replacement_id}:initial",
+                                payload={"task_id": str(replacement_id)},
+                                available_at=now,
+                            ),
+                        )
+                    )
+                    await session.flush()
+                    replacement_task_id = replacement_id
+        # 写事务已经提交；独立可重复读事务为 REST 与 SSE 建立同一事实基线。
+        return await self.get(task_id=replacement_task_id, user_id=user_id)
 
     @staticmethod
     def _retry_idempotency_key(*, task_id: UUID, idempotency_key: str) -> str:
