@@ -18,6 +18,11 @@ from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import JsonValue
 
+IdempotencyKeyHeader = Annotated[
+    str | None,
+    Header(alias="Idempotency-Key", min_length=1, max_length=255),
+]
+
 
 class CreateTaskRequest(BaseModel):
     """创建可恢复任务时接收的内部种类与规范 JSON 输入。"""
@@ -98,7 +103,7 @@ def build_tasks_router() -> APIRouter:
         payload: CreateTaskRequest,
         authenticated: CsrfProtectedSession,
         use_case: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)],
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+        idempotency_key: IdempotencyKeyHeader = None,
     ) -> CreateTaskResponse:
         """事务创建任务，并要求客户端提供用户范围的幂等键。"""
         if not idempotency_key:
@@ -180,7 +185,7 @@ def build_tasks_router() -> APIRouter:
         task_id: UUID,
         authenticated: CsrfProtectedSession,
         use_case: Annotated[RetryTaskUseCase, Depends(get_retry_task_use_case)],
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+        idempotency_key: IdempotencyKeyHeader = None,
     ) -> TaskResponse:
         """从失败任务创建新运行记录，不修改原终态事实。"""
         if not idempotency_key:

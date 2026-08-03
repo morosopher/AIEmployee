@@ -125,6 +125,27 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
 
 
 @pytest.mark.asyncio
+async def test_create_rejects_idempotency_key_longer_than_persisted_column(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """超过任务表长度的幂等键在请求边界返回 RFC 9457 验证问题。"""
+    client, session_factory, _ = task_client
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+
+    response = await client.post(
+        "/api/v1/tasks",
+        json={"kind": "fake_write", "input_payload": {}},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "x" * 256},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["error_code"] == "request_validation_failed"
+    async with session_factory() as session:
+        assert await session.scalar(select(TaskRunModel.id)) is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_and_retry_create_a_replacement(
     task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
 ) -> None:
