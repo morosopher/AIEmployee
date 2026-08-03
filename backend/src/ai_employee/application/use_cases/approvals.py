@@ -1,10 +1,23 @@
 """定义人工审批决定与到期清理的应用用例边界。"""
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from ai_employee.domain.tasks import ApprovalProposal
+from ai_employee.domain.tasks import ApprovalProposal, JsonValue
+
+
+@dataclass(frozen=True, slots=True)
+class FakeWriteTask:
+    """提供 Worker 恢复审批图所需的非 ORM 任务快照。
+
+    该快照只用于判断任务种类并向 LangGraph 提供已经持久化的输入载荷，避免 Worker
+    直接读取 SQLAlchemy 模型而破坏进程组合层的依赖边界。
+    """
+
+    kind: str
+    input_payload: dict[str, JsonValue]
 
 
 class PendingApproval:
@@ -37,6 +50,9 @@ class ApprovalProposalStore(Protocol):
         self, *, task_id: UUID, decision: str, payload_hash: str, now: datetime
     ) -> None:
         """在 Graph 终点把已恢复的假写任务持久化为成功。"""
+
+    async def get_fake_write_task(self, *, task_id: UUID) -> FakeWriteTask | None:
+        """返回恢复假写审批图需要的任务快照，不暴露持久化实现类型。"""
 
 
 class ApprovalStore(Protocol):

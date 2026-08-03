@@ -9,10 +9,10 @@ from taskiq import Context, TaskiqDepends
 
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
+from ai_employee.application.use_cases.approvals import ApprovalProposalStore
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.config import get_settings
 from ai_employee.domain.errors import InternalInvariantError
-from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
@@ -100,14 +100,14 @@ async def execute_task(
         settings = get_settings()
         session_factory = build_session_factory(settings.database_url)
         try:
+            approval_store: ApprovalProposalStore = SqlAlchemyApprovalStore(session_factory)
             try:
-                async with session_factory() as session:
-                    task = await session.get(TaskRunModel, parsed_task_id)
+                task = await approval_store.get_fake_write_task(task_id=parsed_task_id)
             except Exception:  # noqa: BLE001 - 非 fake 任务仍交给既有 DurableTaskRunner 路径。
                 task = None
             if task is not None and task.kind == "fake_write":
                 graph = FakeWriteGraph(
-                    approval_store=SqlAlchemyApprovalStore(session_factory),
+                    approval_store=approval_store,
                     clock=lambda: datetime.now(UTC),
                     approval_ttl=timedelta(minutes=5),
                     fake_tool=_fake_write_tool,

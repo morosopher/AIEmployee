@@ -6,7 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from ai_employee.application.use_cases.approvals import PendingApproval
+from ai_employee.application.use_cases.approvals import FakeWriteTask, PendingApproval
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, StepStatus, TaskStatus
 from ai_employee.infrastructure.db.models.tasks import (
@@ -25,6 +25,17 @@ class SqlAlchemyApprovalStore:
     def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
         """保存进程级会话工厂而不提前占用数据库连接。"""
         self._session_factory = session_factory
+
+    async def get_fake_write_task(self, *, task_id: UUID) -> FakeWriteTask | None:
+        """读取恢复 LangGraph 所需的最小任务快照。
+
+        Worker 只消费这个应用层快照，因此不需要导入 ORM 模型或自行发起 SQL 查询。
+        """
+        async with self._session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            if task is None:
+                return None
+            return FakeWriteTask(kind=task.kind, input_payload=task.input_payload)
 
     async def create_or_get_pending(
         self,
