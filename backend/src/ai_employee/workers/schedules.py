@@ -1,7 +1,8 @@
-"""把 Task 7 四个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
+"""把 Task 8 五个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
 
 from datetime import UTC, datetime
 
+from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.schedules import (
@@ -15,6 +16,7 @@ from ai_employee.application.use_cases.task_retry_recovery import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.config import get_settings
+from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
     SqlAlchemySessionMaintenanceRepositoryFactory,
@@ -31,6 +33,7 @@ from ai_employee.workers.outbox import build_outbox_relay
 __all__ = [
     "daily_brief_idempotency_key",
     "dispatch_due_briefs",
+    "expire_approvals",
     "expire_sessions",
     "is_daily_brief_due",
     "recover_task_retries",
@@ -86,3 +89,10 @@ async def expire_sessions() -> None:
     """每小时调用应用用例，在短事务中真实删除已到期会话摘要。"""
     use_case = ExpireSessionsUseCase(SqlAlchemySessionMaintenanceRepositoryFactory(session_factory))
     await use_case.execute(now=datetime.now(UTC))
+
+
+@broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "expire-approvals"}])
+async def expire_approvals() -> None:
+    """每分钟锁定有界过期待审批并原子写入失败及无内容审计。"""
+    use_case = ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory))
+    await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)

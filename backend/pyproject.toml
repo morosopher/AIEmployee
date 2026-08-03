@@ -13,6 +13,7 @@ dependencies = [
   "langgraph>=1.0,<2",
   "langgraph-checkpoint-postgres>=2,<4",
   "prometheus-client>=0.22,<1",
+  "psycopg[binary]>=3.3,<4",
   "pydantic-settings>=2.10,<3",
   "redis>=6,<7",
   "sse-starlette>=3,<4",

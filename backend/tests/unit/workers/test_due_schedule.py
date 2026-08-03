@@ -17,6 +17,7 @@ from ai_employee.infrastructure.queue.scheduler import scheduler
 from ai_employee.workers.schedules import (
     daily_brief_idempotency_key,
     dispatch_due_briefs,
+    expire_approvals,
     expire_sessions,
     is_daily_brief_due,
     recover_task_retries,
@@ -148,7 +149,7 @@ def test_due_comparison_rejects_naive_now() -> None:
 
 
 def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
-    """固定调度同时覆盖 Outbox、重试恢复、到期简报与会话清理。"""
+    """固定调度同时覆盖 Outbox、重试恢复、到期简报、审批与会话清理。"""
     assert relay_outbox.labels["schedule"] == [{"cron": "* * * * *", "schedule_id": "outbox-relay"}]
     assert recover_task_retries.labels["schedule"] == [
         {"cron": "* * * * *", "schedule_id": "recover-task-retries"}
@@ -158,6 +159,9 @@ def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
     ]
     assert expire_sessions.labels["schedule"] == [
         {"cron": "0 * * * *", "schedule_id": "expire-sessions"}
+    ]
+    assert expire_approvals.labels["schedule"] == [
+        {"cron": "* * * * *", "schedule_id": "expire-approvals"}
     ]
     assert scheduler.broker is broker
     assert len(scheduler.sources) == 1
