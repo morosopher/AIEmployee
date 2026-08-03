@@ -126,13 +126,13 @@ describe('tasks store', () => {
     expect(store.tasks['task-1']?.status).toBe('succeeded')
   })
 
-  it('does not regress status or step state when a lower sequence arrives late', () => {
+  it('does not regress a succeeded task when a queued event arrives late', () => {
     const store = useTasksStore()
 
     store.applyEvent(
       event({
-        id: 2,
-        sequence: 2,
+        id: 8,
+        sequence: 8,
         event: 'task.status_changed',
         step_id: null,
         payload: { status: 'succeeded' },
@@ -140,17 +140,25 @@ describe('tasks store', () => {
     )
     store.applyEvent(
       event({
-        id: 1,
-        sequence: 1,
+        id: 7,
+        sequence: 7,
         event: 'task.status_changed',
         step_id: null,
         payload: { status: 'queued' },
       }),
     )
+
+    expect(store.tasks['task-1']?.status).toBe('succeeded')
+    expect(store.latestSequences['task-1']).toBe(8)
+  })
+
+  it('does not regress a completed step when a started event arrives late', () => {
+    const store = useTasksStore()
+
     store.applyEvent(
       event({
-        id: 4,
-        sequence: 4,
+        id: 8,
+        sequence: 8,
         event: 'step.completed',
         step_id: 'step-1',
         payload: { name: '同步邮件', status: 'completed' },
@@ -158,16 +166,16 @@ describe('tasks store', () => {
     )
     store.applyEvent(
       event({
-        id: 3,
-        sequence: 3,
+        id: 7,
+        sequence: 7,
         event: 'step.started',
         step_id: 'step-1',
         payload: { name: '同步邮件', status: 'started' },
       }),
     )
 
-    expect(store.tasks['task-1']?.status).toBe('succeeded')
     expect(store.tasks['task-1']?.steps[0]?.status).toBe('completed')
+    expect(store.latestSequences['task-1']).toBe(8)
   })
 
   it('uses a REST snapshot cursor to reject older status and step replays', () => {
