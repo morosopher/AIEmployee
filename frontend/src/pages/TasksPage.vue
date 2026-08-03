@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { cancelTask, getTask, retryTask } from '@/api/client'
+import { cancelTask, getTask, ProblemError, retryTask } from '@/api/client'
 import TaskTimeline from '@/components/TaskTimeline.vue'
 import { useTaskEvents } from '@/composables/useTaskEvents'
 import { cancellableTaskStatuses, useTasksStore } from '@/stores/tasks'
@@ -85,9 +85,15 @@ async function retryFailedTask(failedTaskId: string) {
     retryIntentKeys.get(failedTaskId) ??
     `task-retry:${failedTaskId}:${crypto.randomUUID()}`
   retryIntentKeys.set(failedTaskId, idempotencyKey)
-  const replacement = await retryTask(failedTaskId, idempotencyKey)
-  retryIntentKeys.delete(failedTaskId)
-  return replacement
+  try {
+    const replacement = await retryTask(failedTaskId, idempotencyKey)
+    retryIntentKeys.delete(failedTaskId)
+    return replacement
+  } catch (retryError) {
+    // 服务器已明确拒绝时该意图未执行；运输层失败仍可能已创建任务，必须保留同键安全重放。
+    if (retryError instanceof ProblemError) retryIntentKeys.delete(failedTaskId)
+    throw retryError
+  }
 }
 
 /**

@@ -367,6 +367,10 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                     "id": str(snapshot.id),
                     "kind": snapshot.kind,
                     "status": snapshot.status.value,
+                    "retry_of_task_id": (
+                        str(snapshot.retry_of_task_id) if snapshot.retry_of_task_id else None
+                    ),
+                    "error_code": snapshot.error_code,
                     "steps": [
                         {
                             "id": str(step.id),

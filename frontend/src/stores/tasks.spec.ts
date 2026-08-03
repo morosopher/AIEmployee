@@ -65,7 +65,7 @@ describe('tasks store', () => {
     expect(store.tasks['task-1']?.status).toBe('running')
   })
 
-  it('replaces stale local state with a replay-gap snapshot while retaining connection state', () => {
+  it('restores retry linkage and task error from a replay-gap snapshot', () => {
     const store = useTasksStore()
     store.setConnectionState('task-1', 'reconnecting')
     store.applyEvent(
@@ -78,14 +78,18 @@ describe('tasks store', () => {
           id: 'task-1',
           kind: 'daily_brief',
           status: 'succeeded',
-          retry_of_task_id: null,
-          error_code: null,
+          retry_of_task_id: 'original-task',
+          error_code: 'provider_temporarily_unavailable',
           steps: [],
         },
       }),
     )
 
     expect(store.tasks['task-1']?.status).toBe('succeeded')
+    expect(store.tasks['task-1']).toMatchObject({
+      retry_of_task_id: 'original-task',
+      error_code: 'provider_temporarily_unavailable',
+    })
     expect(store.connections['task-1']).toBe('reconnecting')
   })
 

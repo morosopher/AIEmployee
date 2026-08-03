@@ -7,6 +7,12 @@ import type { TaskSnapshot } from '../api/types'
 import { useTasksStore } from '../stores/tasks'
 
 const api = vi.hoisted(() => ({
+  ProblemError: class ProblemError extends Error {
+    /** 构造模拟的服务端已响应错误，以便与页面的 instanceof 判断共享构造器。 */
+    constructor(readonly problem: { status: number }) {
+      super('Problem response')
+    }
+  },
   cancelTask: vi.fn(),
   getTask: vi.fn(),
   retryTask: vi.fn(),
@@ -124,6 +130,33 @@ describe('TasksPage', () => {
 
     expect(api.retryTask).toHaveBeenCalledTimes(2)
     expect(api.retryTask.mock.calls[0]?.[1]).toBe(
+      api.retryTask.mock.calls[1]?.[1],
+    )
+    wrapper.unmount()
+  })
+
+  it('starts a new retry intent after the server explicitly rejects one', async () => {
+    api.getTask.mockResolvedValue({ ...queuedSnapshot, status: 'failed' })
+    api.retryTask
+      .mockRejectedValueOnce(
+        new api.ProblemError({ status: 409 }),
+      )
+      .mockResolvedValueOnce({
+        ...queuedSnapshot,
+        id: 'replacement-task',
+        status: 'queued',
+        retry_of_task_id: 'task-1',
+      })
+    const wrapper = mount(TasksPage, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+
+    await wrapper.get('aside button').trigger('click')
+    await flushPromises()
+    await wrapper.get('aside button').trigger('click')
+    await flushPromises()
+
+    expect(api.retryTask).toHaveBeenCalledTimes(2)
+    expect(api.retryTask.mock.calls[0]?.[1]).not.toBe(
       api.retryTask.mock.calls[1]?.[1],
     )
     wrapper.unmount()

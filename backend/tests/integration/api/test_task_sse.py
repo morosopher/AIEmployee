@@ -278,9 +278,15 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
 ) -> None:
     """过期游标先接收同一数据库快照中的任务状态和最大审计游标。"""
     session_factory, user_id, build_stream = sse_store
+    original_task_id = await _create_task(session_factory, user_id, status="failed")
     task_id = await _create_task(session_factory, user_id, status="running")
     event_id = await _append_event(session_factory, user_id, task_id, "task.running")
     async with session_factory.begin() as session:
+        task = await session.get(TaskRunModel, task_id)
+        assert task is not None
+        task.retry_of_task_id = original_task_id
+        task.error_code = "provider_temporarily_unavailable"
+        task.input_payload = {"internal_only": "must-not-leak"}
         session.add(
             TaskStepModel(
                 task_id=task_id,
@@ -305,6 +311,8 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
         "id": str(task_id),
         "kind": "fake_write",
         "status": "running",
+        "retry_of_task_id": str(original_task_id),
+        "error_code": "provider_temporarily_unavailable",
         "steps": [
             {
                 "id": payload["payload"]["steps"][0]["id"],

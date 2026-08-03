@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 
+import { ProblemError } from '@/api/client'
 import type { TaskSnapshot, TaskStep } from '@/api/types'
 
 /** 任务时间线的输入契约；所有内容均以纯文本形式显示。 */
@@ -31,8 +32,11 @@ async function retryTask(): Promise<void> {
   try {
     const replacement = await props.retry(props.task.id)
     props.follow(replacement.id, props.task.id)
-  } catch {
-    retryError.value = '重试请求未完成，请稍后再试。'
+  } catch (error) {
+    retryError.value =
+      error instanceof ProblemError
+        ? '重试被服务器拒绝，请处理当前任务状态后再试。'
+        : '重试结果未知；再次点击会安全重放同一请求。'
   } finally {
     retrying.value = false
   }
