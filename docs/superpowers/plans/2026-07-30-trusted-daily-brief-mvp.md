@@ -1587,9 +1587,10 @@ set `available_at` to the retry backoff. If the relay crashes after claiming, th
 again after 60 seconds. A duplicate delivery is safe because the Worker leases from PostgreSQL and
 terminal tasks exit without work.
 
-Register these first three fixed scheduler jobs:
+Register these first four fixed scheduler jobs:
 
 - relay Outbox every minute;
+- recover confirmed delayed retries after Redis loss every minute;
 - dispatch due briefs every minute;
 - clean expired sessions hourly.
 
@@ -1613,7 +1614,7 @@ scheduler = TaskiqScheduler(
 )
 ~~~
 
-Attach schedule IDs `outbox-relay`, `due-daily-briefs`, and `expire-sessions` to these three
+Attach schedule IDs `outbox-relay`, `recover-task-retries`, `due-daily-briefs`, and `expire-sessions` to these four
 jobs. The labels schedule system scans only; user-specific times remain database rows. Task 8 adds
 approval expiry after the approval model exists, Task 13 adds the ten-minute Google
 incremental-sync dispatcher after both adapters exist, and Task 18 adds diagnostics and daily
