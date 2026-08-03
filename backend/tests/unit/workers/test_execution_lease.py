@@ -166,7 +166,9 @@ async def test_fake_write_worker_disposes_every_message_scoped_session_factory(
             """不执行图，模拟正常 Worker 返回。"""
             return True
 
-    def build_factory(_database_url: str) -> Factory:
+    def build_factory(_database_url: str, *, task_event_publisher: object) -> Factory:
+        """模拟 Worker 的通知型会话工厂，并确认生产组合根已提供发布适配器。"""
+        assert task_event_publisher is not None
         factory = Factory()
         factories.append(factory)
         return factory
@@ -220,7 +222,12 @@ async def test_fake_write_graph_reuses_worker_message_session_factory(
             """满足 Worker 的 finally 释放协议。"""
 
     factory = Factory()
-    monkeypatch.setattr(execute_task_module, "build_session_factory", lambda _url: factory)
+    def build_factory(_database_url: str, *, task_event_publisher: object) -> Factory:
+        """返回同一合成工厂，并验证 Worker 没有绕开提交后通知组合边界。"""
+        assert task_event_publisher is not None
+        return factory
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", build_factory)
     monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", Store)
     monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
 

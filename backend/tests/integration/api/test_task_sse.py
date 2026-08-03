@@ -167,6 +167,27 @@ async def test_last_event_id_replays_only_later_durable_events(
 
 
 @pytest.mark.asyncio
+async def test_expired_approval_replays_as_canonical_approval_resolution(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+) -> None:
+    """过期审批保留原始审计类型，但 SSE 必须公开稳定的解决事件语义。"""
+    session_factory, user_id, build_stream = sse_store
+    task_id = await _create_task(session_factory, user_id)
+    event_id = await _append_event(session_factory, user_id, task_id, "approval.expired")
+
+    events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=None)
+    payload = _event_payload(await anext(events))
+    await events.aclose()
+
+    assert payload["id"] == event_id
+    assert payload["event"] == "approval.resolved"
+    assert payload["payload"] == {
+        "status": "expired",
+        "reason": "approval_expired",
+    }
+
+
+@pytest.mark.asyncio
 async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
     sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
 ) -> None:
@@ -217,11 +238,27 @@ async def test_dropped_pubsub_notification_is_recovered_by_next_postgres_tick(
 
 @pytest.mark.asyncio
 async def test_redis_pubsub_notification_wakes_task_stream(
-    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+    database_url: str,
 ) -> None:
-    """任务频道通知仅唤醒 SSE，事件内容仍由 PostgreSQL 审计行提供。"""
-    session_factory, user_id, _ = sse_store
+    """事务提交后的审计事实必须自行唤醒在线 SSE，而非等待心跳轮询。"""
     redis_url = os.environ["TEST_REDIS_URL"]
+    session_factory = build_session_factory(
+        database_url,
+        task_event_publisher=TaskEventPublisher(redis_url),
+    )
+    async with session_factory.begin() as session:
+        user = UserModel(
+            email="sse-notify-owner@example.com",
+            display_name="SSE notify owner",
+            password_hash="synthetic-password-hash",
+            timezone="Asia/Shanghai",
+            locale="zh-CN",
+            brief_time=time(8, 0),
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        user_id = user.id
     task_id = await _create_task(session_factory, user_id)
     task_store = SqlAlchemyTaskViewStore(session_factory)
     stream = TaskEventStream(TaskEventStore(session_factory, task_store), redis_url=redis_url)
@@ -229,10 +266,9 @@ async def test_redis_pubsub_notification_wakes_task_stream(
     pending_event = asyncio.create_task(anext(events))
     await asyncio.sleep(0.1)
     event_id = await _append_event(session_factory, user_id, task_id, "task.running")
-    publisher = TaskEventPublisher(redis_url)
-    await publisher.publish(task_id=task_id, event_id=event_id)
     payload = _event_payload(await asyncio.wait_for(pending_event, timeout=2))
     await events.aclose()
+    await session_factory.dispose()
 
     assert payload["id"] == event_id
     assert payload["event"] == "task.status_changed"

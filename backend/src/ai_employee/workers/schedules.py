@@ -32,6 +32,7 @@ from ai_employee.infrastructure.db.repositories.task_retry_recovery import (
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.queue.broker import broker
 from ai_employee.workers.execute_task import execute_task
 from ai_employee.workers.outbox import build_outbox_relay
@@ -49,7 +50,10 @@ __all__ = [
 ]
 
 settings = get_settings()
-session_factory = build_session_factory(settings.database_url)
+session_factory = build_session_factory(
+    settings.database_url,
+    task_event_publisher=TaskEventPublisher(settings.redis_url),
+)
 
 
 def _build_outbox_relay() -> OutboxRelay:

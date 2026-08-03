@@ -35,6 +35,7 @@ from ai_employee.infrastructure.db.repositories.task_views import (
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
 
@@ -53,7 +54,10 @@ def create_app(
         已注册系统状态与认证路由，并持有可释放数据库引擎的 FastAPI 应用实例。
     """
     settings = get_settings()
-    session_factory = build_session_factory(settings.database_url)
+    session_factory = build_session_factory(
+        settings.database_url,
+        task_event_publisher=TaskEventPublisher(settings.redis_url),
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

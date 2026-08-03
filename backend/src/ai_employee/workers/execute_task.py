@@ -22,6 +22,7 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 
 RETRY_DELAY_SECONDS = 5
@@ -155,7 +156,10 @@ def build_task_runner() -> DurableTaskRunner:
     在此之前使用显式失败节点，避免收到队列消息后把未实现业务错误标记为成功。
     """
     settings = get_settings()
-    session_factory = build_session_factory(settings.database_url)
+    session_factory = build_session_factory(
+        settings.database_url,
+        task_event_publisher=TaskEventPublisher(settings.redis_url),
+    )
     return DurableTaskRunner(
         store=SqlAlchemyTaskExecutionStore(session_factory),
         clock=lambda: datetime.now(UTC),
@@ -198,7 +202,10 @@ async def execute_task(
         if resume is not None and resume not in {"approved", "rejected"}:
             return
         settings = get_settings()
-        session_factory = build_session_factory(settings.database_url)
+        session_factory = build_session_factory(
+            settings.database_url,
+            task_event_publisher=TaskEventPublisher(settings.redis_url),
+        )
         try:
             approval_store: ApprovalProposalStore = SqlAlchemyApprovalStore(session_factory)
             try:

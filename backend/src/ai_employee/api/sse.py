@@ -198,7 +198,20 @@ def _public_event_type(audit_event_type: str) -> str:
         return "task.status_changed"
     if audit_event_type == "approval.requested":
         return "approval.required"
+    if audit_event_type == "approval.expired":
+        return "approval.resolved"
     return audit_event_type
+
+
+def _public_event_payload(event: DurableTaskEvent) -> dict[str, JsonValue]:
+    """复制审计元数据并补齐旧事件映射需要的公开语义，不改写历史审计记录。"""
+    if event.event == "approval.expired":
+        return {
+            **event.payload,
+            "status": "expired",
+            "reason": "approval_expired",
+        }
+    return event.payload
 
 
 def _event(event: DurableTaskEvent) -> ServerSentEvent:
@@ -215,7 +228,7 @@ def _event(event: DurableTaskEvent) -> ServerSentEvent:
                 "event": event_type,
                 "occurred_at": event.occurred_at.isoformat(),
                 "step_id": str(event.step_id) if event.step_id else None,
-                "payload": event.payload,
+                "payload": _public_event_payload(event),
             }
         ),
     )
