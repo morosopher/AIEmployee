@@ -474,7 +474,7 @@ async def test_acquisition_latency_is_included_in_whole_task_budget() -> None:
 async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retry_state_is_durable() -> (
     None
 ):
-    """尚有队列重试预算时临时错误先持久化 RETRY_SCHEDULED，再上浮给 Taskiq。"""
+    """临时错误延后发生时，恢复期限仍从实际失败边界起算。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     clock = MutableClock(now)
     task = _leased_task(started_at=now)
@@ -485,6 +485,8 @@ async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retr
     )
 
     async def fail_transiently() -> None:
+        # 队列消息可能在长节点运行后才失败；恢复期限不能使用 Worker 收到消息的旧时刻。
+        clock.current += timedelta(seconds=302)
         raise transient
 
     runner = _runner(
@@ -498,12 +500,12 @@ async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retr
             task_id=task.task_id,
             lease_owner="worker-a",
             may_retry_transient=True,
-            retry_recovery_at=now + timedelta(seconds=301),
+            retry_recovery_delay=timedelta(seconds=301),
         )
 
     assert raised.value is transient
     assert store.finished == [(TaskStatus.RETRY_SCHEDULED, "provider_temporarily_unavailable")]
-    assert store.retry_recovery_deadlines == [now + timedelta(seconds=301)]
+    assert store.retry_recovery_deadlines == [now + timedelta(seconds=603)]
 
 
 @pytest.mark.asyncio

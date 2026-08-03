@@ -46,8 +46,8 @@ def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
     return retries < max_retries
 
 
-def retry_recovery_at(*, now: datetime, recovery_seconds: int) -> datetime:
-    """按 Worker 已锁定的 SmartRetry 上界计算 PostgreSQL 恢复期限。
+def retry_recovery_delay(*, recovery_seconds: int) -> timedelta:
+    """按 Worker 已锁定的 SmartRetry 上界计算 PostgreSQL 兜底等待时长。
 
     Taskiq 的指数退避被 ``max_delay_exponent`` 限制为 300 秒，jitter 为 ``[0, 1)`` 秒。
     默认 301 秒因此不会让正常 Redis 调度被恢复器抢先重复投递；配置可增大该保守期限，
@@ -56,7 +56,7 @@ def retry_recovery_at(*, now: datetime, recovery_seconds: int) -> datetime:
     minimum_seconds = RETRY_DELAY_MAX_SECONDS + RETRY_JITTER_MAX_SECONDS
     if recovery_seconds < minimum_seconds:
         raise ValueError("task_retry_recovery_seconds is below the SmartRetry delay upper bound")
-    return now + timedelta(seconds=recovery_seconds)
+    return timedelta(seconds=recovery_seconds)
 
 
 class _MissingTaskHandlerStep:
@@ -134,8 +134,7 @@ async def execute_task(
         await runner.run(
             parsed_task_id,
             may_retry_transient=True,
-            retry_recovery_at=retry_recovery_at(
-                now=datetime.now(UTC),
+            retry_recovery_delay=retry_recovery_delay(
                 recovery_seconds=settings.task_retry_recovery_seconds,
             ),
         )

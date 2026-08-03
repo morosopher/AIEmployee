@@ -161,7 +161,7 @@ class DurableTaskRunner:
         lease_owner: str | None = None,
         *,
         may_retry_transient: bool = True,
-        retry_recovery_at: datetime | None = None,
+        retry_recovery_delay: timedelta | None = None,
     ) -> bool:
         """获取租约并执行一次持久任务尝试。
 
@@ -172,8 +172,9 @@ class DurableTaskRunner:
             may_retry_transient: 当前队列消息按基础设施重试规则仍可重新投递时为 ``True``。
                 application 层只消费这个已规范化的业务决定，绝不依赖 Taskiq 消息或标签类型；
                 默认值用于保持非队列调用方的既有临时错误重试语义。
-            retry_recovery_at: Worker 根据队列策略计算的保守 PostgreSQL 恢复期限；只在允许
-                临时重试时使用，不能传入 Taskiq 类型或标签。
+            retry_recovery_delay: Worker 根据队列策略计算的保守 PostgreSQL 恢复等待时长；
+                只在允许临时重试时使用。用例在实际捕获异常时才将它换算为 UTC 期限，不能
+                传入 Taskiq 类型或标签。
 
         Returns:
             当前执行者最终仍拥有并处理了任务时为 ``True``；未获租约、丢失 owner 或
@@ -187,10 +188,8 @@ class DurableTaskRunner:
         """
         owner = lease_owner or f"worker:{os.getpid()}:{uuid4().hex}"
         now = utc_instant(self._clock(), field="clock")
-        if retry_recovery_at is not None:
-            retry_recovery_at = utc_instant(retry_recovery_at, field="retry_recovery_at")
-            if retry_recovery_at <= now:
-                raise ValueError("retry_recovery_at must be later than clock")
+        if retry_recovery_delay is not None and retry_recovery_delay <= timedelta(0):
+            raise ValueError("retry_recovery_delay must be positive")
         try:
             await self._store.prepare_retry(task_id=task_id, now=now)
             leased = await self._store.acquire(
@@ -247,7 +246,7 @@ class DurableTaskRunner:
                     status=TaskStatus.FAILED,
                     error_code="task_retries_exhausted",
                 )
-            if retry_recovery_at is None:
+            if retry_recovery_delay is None:
                 # 没有 PostgreSQL 兜底期限时不能进入 RETRY_SCHEDULED；否则调用方遗漏队列
                 # 元数据或 Redis 丢失都会让任务永久悬挂。安全终态优于不可恢复的“重试”。
                 return await self._finish(
@@ -261,7 +260,11 @@ class DurableTaskRunner:
                 lease_owner=owner,
                 status=TaskStatus.RETRY_SCHEDULED,
                 error_code=error.error_code,
-                retry_recovery_at=retry_recovery_at,
+                # 从捕获供应商临时错误的真实边界起算。Worker 接收消息后可能长时间执行，
+                # 不能让 PostgreSQL 兜底期限早于 SmartRetry 实际开始延迟调度的时刻。
+                retry_recovery_at=(
+                    utc_instant(self._clock(), field="clock") + retry_recovery_delay
+                ),
             )
             if persisted:
                 raise
