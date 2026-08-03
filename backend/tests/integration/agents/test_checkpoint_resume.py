@@ -52,6 +52,7 @@ async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: st
                     user_id=user_id,
                     kind="fake_write",
                     status=TaskStatus.RUNNING.value,
+                    lease_owner="initial-worker",
                     idempotency_key="checkpoint-reject",
                     input_payload={},
                 )
@@ -69,6 +70,7 @@ async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: st
             result = await graph.ainvoke(
                 {
                     "task_id": str(task_id),
+                    "lease_owner": "initial-worker",
                     "proposal_payload": {"value": "synthetic"},
                     "approval_decision": None,
                     "tool_called": False,
@@ -124,7 +126,15 @@ async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: st
                     payload_hash=approval.payload_hash,
                     now=now,
                 )
-            result = await graph.ainvoke(Command(resume="rejected"), config=config)
+            async with session_factory.begin() as session:
+                resumed_task = await session.get(TaskRunModel, task_id, with_for_update=True)
+                assert resumed_task is not None
+                resumed_task.status = TaskStatus.RUNNING.value
+                resumed_task.lease_owner = "resume-worker"
+
+            result = await graph.ainvoke(
+                Command(resume="rejected", update={"lease_owner": "resume-worker"}), config=config
+            )
 
         assert result["tool_called"] is False
         assert result["messages"].count("proposal prepared") == 1
@@ -133,5 +143,67 @@ async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: st
             completed_task = await session.get(TaskRunModel, task_id)
         assert completed_task is not None
         assert completed_task.status == TaskStatus.SUCCEEDED.value
+    finally:
+        await session_factory.dispose()
+
+
+async def test_stale_graph_owner_cannot_pause_new_task_lease(database_url: str) -> None:
+    """旧 Worker 的 checkpoint 重放不能暂停已由新 owner 接管的任务。"""
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    task_id = uuid4()
+    now = datetime.now(UTC)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="stale-owner@example.test",
+                    display_name="Stale Owner",
+                    password_hash="fake",
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="new-worker",
+                    idempotency_key="stale-owner",
+                    input_payload={},
+                )
+            )
+
+        graph = FakeWriteGraph(
+            approval_store=SqlAlchemyApprovalStore(session_factory),
+            clock=lambda: now,
+            approval_ttl=timedelta(minutes=5),
+            fake_tool=lambda _payload: __import__("asyncio").sleep(0),
+        )
+        async with postgres_checkpointer(database_url) as saver:
+            compiled = graph.compile(checkpointer=saver)
+            with pytest.raises(StateConflictError) as conflict:
+                await compiled.ainvoke(
+                    {
+                        "task_id": str(task_id),
+                        "lease_owner": "stale-worker",
+                        "proposal_payload": {"value": "synthetic"},
+                        "approval_decision": None,
+                        "tool_called": False,
+                        "messages": [],
+                    },
+                    config={"configurable": {"thread_id": str(task_id)}},
+                )
+        assert conflict.value.error_code == "task_conflict"
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            approval = await session.scalar(select(ApprovalRequestModel))
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING.value
+        assert task.lease_owner == "new-worker"
+        assert approval is None
     finally:
         await session_factory.dispose()

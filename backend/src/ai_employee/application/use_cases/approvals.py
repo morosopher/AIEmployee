@@ -45,11 +45,12 @@ class ApprovalProposalStore(Protocol):
         self,
         *,
         task_id: UUID,
+        lease_owner: str,
         proposal: ApprovalProposal,
         preview_markdown: str,
         expires_at: datetime,
     ) -> PendingApproval:
-        """原子复用或创建审批、步骤、状态与审计事实。"""
+        """以当前 ``RUNNING`` 租约原子创建审批、步骤、状态与审计事实。"""
 
     async def find_for_graph(self, *, task_id: UUID, payload_hash: str) -> PendingApproval | None:
         """返回同一冻结提案的现有审批，供 checkpoint 重放识别终态。"""

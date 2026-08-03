@@ -9,6 +9,7 @@ from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.infrastructure.db.alembic import set_alembic_database_url
 
 
@@ -223,3 +224,66 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "fk_tool_executions_step_id_task_id": (True, True),
     }
     command.check(alembic_config)
+
+
+def test_checkpoint_migration_matches_langgraph_setup_contract(
+    empty_migration_database: URL,
+) -> None:
+    """Alembic 创建的 checkpoint Schema 必须让 LangGraph setup 成为空操作。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    rendered_url = empty_migration_database.render_as_string(hide_password=False)
+    set_alembic_database_url(alembic_config, rendered_url)
+    command.upgrade(alembic_config, "head")
+
+    async def read_contract() -> tuple[list[int], set[str]]:
+        """读取供应商迁移版本与规范索引名。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                versions = list(
+                    (
+                        await connection.execute(
+                            text("SELECT v FROM checkpoint_migrations ORDER BY v")
+                        )
+                    ).scalars()
+                )
+                indexes = set(
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT indexname FROM pg_catalog.pg_indexes "
+                                "WHERE tablename IN ('checkpoints', 'checkpoint_blobs', "
+                                "'checkpoint_writes')"
+                            )
+                        )
+                    ).scalars()
+                )
+                return versions, indexes
+        finally:
+            await engine.dispose()
+
+    before_versions, before_indexes = asyncio.run(read_contract())
+
+    async def run_setup() -> None:
+        """运行供应商 setup；正确迁移时它不应再应用任何 DDL 迁移。"""
+        async with postgres_checkpointer(rendered_url) as saver:
+            await saver.setup()
+
+    asyncio.run(run_setup())
+    versions, indexes = asyncio.run(read_contract())
+    assert before_versions == list(range(10))
+    assert before_indexes == {
+        "checkpoints_pkey",
+        "checkpoint_blobs_pkey",
+        "checkpoint_writes_pkey",
+        "checkpoints_thread_id_idx",
+        "checkpoint_blobs_thread_id_idx",
+        "checkpoint_writes_thread_id_idx",
+    }
+    assert versions == list(range(10))
+    assert {
+        "checkpoints_thread_id_idx",
+        "checkpoint_blobs_thread_id_idx",
+        "checkpoint_writes_thread_id_idx",
+    }.issubset(indexes)

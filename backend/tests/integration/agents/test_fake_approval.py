@@ -3,10 +3,12 @@
 from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import select
 
 from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
-from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
+from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
@@ -90,5 +92,90 @@ async def test_expire_approvals_fails_overdue_task_without_tool_execution(
         assert task.error_code == "approval_expired"
         assert [event.event_type for event in events] == ["approval.expired"]
         assert tool_executions == []
+    finally:
+        await session_factory.dispose()
+
+
+async def test_claimed_fake_tool_replay_fails_without_marking_unknown_call_successful(
+    database_url: str,
+) -> None:
+    """工具调用后崩溃留下 claimed 记录时，重放必须安全失败而不能伪造成功。"""
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    task_id = uuid4()
+    payload = {"value": "synthetic"}
+    proposal = ApprovalProposal.create("fake.write", payload)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="claimed-tool@example.test",
+                    display_name="Claimed Tool",
+                    password_hash="fake",
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="worker-a",
+                    idempotency_key="claimed-tool",
+                    input_payload=payload,
+                )
+            )
+            step = TaskStepModel(
+                task_id=task_id,
+                sequence=1,
+                name="approval",
+                kind="approval",
+                status="running",
+                input_summary={},
+            )
+            session.add(step)
+            await session.flush()
+            approval = ApprovalRequestModel(
+                task_id=task_id,
+                step_id=step.id,
+                version=1,
+                action="fake.write",
+                payload=payload,
+                payload_hash=proposal.payload_hash,
+                preview_markdown="synthetic preview",
+                status=ApprovalStatus.APPROVED.value,
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+            session.add(approval)
+            await session.flush()
+            session.add(
+                ToolExecutionModel(
+                    task_id=task_id,
+                    step_id=step.id,
+                    tool_name="fake.write",
+                    idempotency_key=f"fake.write:{task_id}:{approval.id}:1",
+                    request_payload_hash=proposal.payload_hash,
+                    status="claimed",
+                )
+            )
+
+        store = SqlAlchemyApprovalStore(session_factory)
+        with pytest.raises(StateConflictError) as conflict:
+            await store.claim_fake_tool_execution(
+                task_id=task_id,
+                lease_owner="worker-a",
+                expected_payload_hash=proposal.payload_hash,
+            )
+        assert conflict.value.error_code == "tool_execution_outcome_unknown"
+        async with session_factory() as session:
+            execution = await session.scalar(select(ToolExecutionModel))
+            task = await session.get(TaskRunModel, task_id)
+        assert execution is not None
+        assert execution.status == "claimed"
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING.value
     finally:
         await session_factory.dispose()

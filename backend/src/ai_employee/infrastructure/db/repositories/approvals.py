@@ -4,7 +4,7 @@ from datetime import datetime
 from hmac import compare_digest
 from uuid import UUID
 
-from sqlalchemy import and_, false, or_, select
+from sqlalchemy import select
 
 from ai_employee.application.use_cases.approvals import (
     FakeToolClaim,
@@ -46,17 +46,28 @@ class SqlAlchemyApprovalStore:
         self,
         *,
         task_id: UUID,
+        lease_owner: str,
         proposal: ApprovalProposal,
         preview_markdown: str,
         expires_at: datetime,
     ) -> PendingApproval:
-        """幂等冻结提案、创建审批步骤并让任务进入等待状态。"""
+        """仅当前 ``RUNNING`` owner 能冻结提案并暂停任务。
+
+        该租约 CAS 必须与审批和状态迁移处于同一事务：旧 Worker 即使在其租约被接管后
+        才到达中断点，也不能把新 owner 正在执行的任务错误地改为等待审批。
+        """
         async with self._session_factory.begin() as session:
             task = await session.scalar(
-                select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.id == task_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+                .with_for_update()
             )
             if task is None:
-                raise StateConflictError(error_code="task_not_found", message="task is unavailable")
+                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             existing = await session.scalar(
                 select(ApprovalRequestModel)
                 .where(
@@ -95,8 +106,6 @@ class SqlAlchemyApprovalStore:
                 status=ApprovalStatus.PENDING.value,
                 expires_at=expires_at,
             )
-            if task.status not in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}:
-                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             task.status = TaskStatus.WAITING_APPROVAL.value
             # 中断事务提交时释放执行租约，避免暂停任务被过期租约接管。
             task.lease_owner = None
@@ -180,14 +189,6 @@ class SqlAlchemyApprovalStore:
     ) -> None:
         """仅把已由审批决定恢复到队列的假写任务标记为成功。"""
         async with self._session_factory.begin() as session:
-            legacy_direct_graph = (
-                and_(
-                    TaskRunModel.status == TaskStatus.QUEUED.value,
-                    TaskRunModel.lease_owner.is_(None),
-                )
-                if lease_owner == ""
-                else false()
-            )
             approval = await session.scalar(
                 select(ApprovalRequestModel)
                 .where(
@@ -201,15 +202,8 @@ class SqlAlchemyApprovalStore:
                 select(TaskRunModel)
                 .where(
                     TaskRunModel.id == task_id,
-                    or_(
-                        and_(
-                            TaskRunModel.status == TaskStatus.RUNNING.value,
-                            TaskRunModel.lease_owner == lease_owner,
-                        ),
-                        # 仅保留给早期 Graph 直接集成测试的无 owner 恢复兼容；实际 Worker
-                        # 路径总是携带租约 owner，因而仍由 RUNNING + owner CAS 保护。
-                        legacy_direct_graph,
-                    ),
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
                 )
                 .with_for_update()
             )
@@ -277,7 +271,15 @@ class SqlAlchemyApprovalStore:
                 .with_for_update()
             )
             if execution is not None:
-                return FakeToolClaim(payload=proposal.payload, should_call=False)
+                if execution.status == "succeeded":
+                    return FakeToolClaim(payload=proposal.payload, should_call=False)
+                # 外部副作用已经可能发生，但本地并没有成功事实时不能重放，也不能把
+                # ``claimed`` 误当作成功；由 DurableTaskRunner 收敛为安全失败，要求人工
+                # 从新 TaskRun 重新发起，而不是对未知结果再次写入。
+                raise StateConflictError(
+                    error_code="tool_execution_outcome_unknown",
+                    message="tool execution outcome is unavailable",
+                )
             session.add(
                 ToolExecutionModel(
                     task_id=task_id,

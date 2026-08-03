@@ -52,6 +52,27 @@ class _MissingTaskHandlerStep:
         )
 
 
+class _TaskKindLookupFailureStep:
+    """把任务分类读取异常交给耐久执行边界收敛为安全失败。"""
+
+    name = "load_task_kind"
+
+    async def execute(self, task: LeasedTask) -> None:
+        """拒绝把数据库异常伪装成未注册 handler。
+
+        Args:
+            task: 已获取租约的任务快照，仅用于保持统一节点接口。
+
+        Raises:
+            InternalInvariantError: 分类读取边界发生未知持久化异常。
+        """
+        del task
+        raise InternalInvariantError(
+            error_code="task_kind_lookup_failed",
+            message="task kind lookup failed",
+        )
+
+
 class _FakeWriteStep:
     """在 DurableTaskRunner 租约内驱动一次 fake-write Graph。"""
 
@@ -170,33 +191,43 @@ async def execute_task(
             approval_store: ApprovalProposalStore = SqlAlchemyApprovalStore(session_factory)
             try:
                 task = await approval_store.get_fake_write_task(task_id=parsed_task_id)
-            except Exception:  # noqa: BLE001 - 非 fake 任务和测试替身继续走通用持久执行边界。
-                task = None
+            except Exception:  # noqa: BLE001 - 由耐久 Runner 而非 Missing handler 收敛。
+                runner = DurableTaskRunner(
+                    store=SqlAlchemyTaskExecutionStore(session_factory),
+                    clock=lambda: datetime.now(UTC),
+                    lease_duration=timedelta(seconds=settings.task_lease_seconds),
+                    task_timeout_seconds=settings.task_timeout_seconds,
+                    task_step_timeout_seconds=settings.task_step_timeout_seconds,
+                    max_transient_retries=DEFAULT_RETRY_COUNT,
+                    resolve_steps=lambda _task: (_TaskKindLookupFailureStep(),),
+                )
+            else:
+                runner = (
+                    DurableTaskRunner(
+                        store=SqlAlchemyTaskExecutionStore(session_factory),
+                        clock=lambda: datetime.now(UTC),
+                        lease_duration=timedelta(seconds=settings.task_lease_seconds),
+                        task_timeout_seconds=settings.task_timeout_seconds,
+                        task_step_timeout_seconds=settings.task_step_timeout_seconds,
+                        max_transient_retries=DEFAULT_RETRY_COUNT,
+                        resolve_steps=lambda _task: (
+                            _FakeWriteStep(
+                                resume=resume,
+                                database_url=settings.database_url,
+                                checkpoint_database_url=settings.checkpoint_database_url,
+                            ),
+                        ),
+                    )
+                    if task is not None and task.kind == "fake_write"
+                    else build_task_runner()
+                )
+            await runner.run(
+                parsed_task_id,
+                may_retry_transient=True,
+                retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
+            )
         finally:
             await session_factory.dispose()
-        if task is not None and task.kind == "fake_write":
-            runner = DurableTaskRunner(
-                store=SqlAlchemyTaskExecutionStore(build_session_factory(settings.database_url)),
-                clock=lambda: datetime.now(UTC),
-                lease_duration=timedelta(seconds=settings.task_lease_seconds),
-                task_timeout_seconds=settings.task_timeout_seconds,
-                task_step_timeout_seconds=settings.task_step_timeout_seconds,
-                max_transient_retries=DEFAULT_RETRY_COUNT,
-                resolve_steps=lambda _task: (
-                    _FakeWriteStep(
-                        resume=resume,
-                        database_url=settings.database_url,
-                        checkpoint_database_url=settings.checkpoint_database_url,
-                    ),
-                ),
-            )
-        else:
-            runner = build_task_runner()
-        await runner.run(
-            parsed_task_id,
-            may_retry_transient=True,
-            retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
-        )
     except Exception:  # noqa: BLE001 - 未知异常绝不能绕过已持久化的失败边界。
         # 正常可写数据库路径已由应用用例持久化安全 FAILED/error_code。这里只处理主失败后
         # 数据库同样不可写或 composition 构建失败的最后防线，并且不记录可能敏感的原文。

@@ -55,16 +55,22 @@ def upgrade() -> None:
         sa.Column("task_path", sa.Text(), server_default="", nullable=False),
         sa.PrimaryKeyConstraint("thread_id", "checkpoint_ns", "checkpoint_id", "task_id", "idx"),
     )
-    op.create_index("ix_checkpoints_thread_id", "checkpoints", ["thread_id"])
-    op.create_index("ix_checkpoint_blobs_thread_id", "checkpoint_blobs", ["thread_id"])
-    op.create_index("ix_checkpoint_writes_thread_id", "checkpoint_writes", ["thread_id"])
+    # 与固定版本的 AsyncPostgresSaver 迁移清单同名同版本。否则首次 Worker 调用
+    # ``saver.setup()`` 会在运行时再次执行供应商 DDL，甚至尝试创建重复索引。
+    op.create_index("checkpoints_thread_id_idx", "checkpoints", ["thread_id"])
+    op.create_index("checkpoint_blobs_thread_id_idx", "checkpoint_blobs", ["thread_id"])
+    op.create_index("checkpoint_writes_thread_id_idx", "checkpoint_writes", ["thread_id"])
+    op.bulk_insert(
+        sa.table("checkpoint_migrations", sa.column("v", sa.Integer())),
+        [{"v": version} for version in range(10)],
+    )
 
 
 def downgrade() -> None:
     """按依赖逆序移除 checkpoint 表。"""
-    op.drop_index("ix_checkpoint_writes_thread_id", table_name="checkpoint_writes")
-    op.drop_index("ix_checkpoint_blobs_thread_id", table_name="checkpoint_blobs")
-    op.drop_index("ix_checkpoints_thread_id", table_name="checkpoints")
+    op.drop_index("checkpoint_writes_thread_id_idx", table_name="checkpoint_writes")
+    op.drop_index("checkpoint_blobs_thread_id_idx", table_name="checkpoint_blobs")
+    op.drop_index("checkpoints_thread_id_idx", table_name="checkpoints")
     op.drop_table("checkpoint_writes")
     op.drop_table("checkpoint_blobs")
     op.drop_table("checkpoints")

@@ -108,12 +108,130 @@ async def test_taskiq_entrypoint_uses_durable_retry_without_reading_message_labe
             received.append((received_task_id, may_retry_transient))
             return True
 
+    class NonFakeStore:
+        """让入口按非 fake 任务走缓存 Runner，不读取真实数据库。"""
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> None:
+            """返回空快照，代表任务不是 fake-write。"""
+            del task_id
+
     monkeypatch.setattr(execute_task_module, "build_task_runner", lambda: RecordingRunner())
+    monkeypatch.setattr(
+        execute_task_module, "SqlAlchemyApprovalStore", lambda _factory: NonFakeStore()
+    )
     context = object()
 
     await execute_task_module.execute_task.original_func(str(task_id), context)
 
     assert received == [(task_id, True)]
+
+
+@pytest.mark.asyncio
+async def test_fake_write_worker_disposes_every_message_scoped_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fake-write 消息临时创建的每个数据库工厂必须在退出路径释放连接池。"""
+    task_id = uuid4()
+    factories: list[object] = []
+
+    class Factory:
+        """记录 Worker 是否释放此消息创建的资源。"""
+
+        def __init__(self) -> None:
+            self.disposed = False
+
+        async def dispose(self) -> None:
+            """模拟 SQLAlchemy engine 的异步关闭。"""
+            self.disposed = True
+
+    class Store:
+        """只返回 fake-write 判别快照，避免该单测连接数据库。"""
+
+        def __init__(self, _factory: Factory) -> None:
+            pass
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> object:
+            """返回最小任务分类对象。"""
+            del task_id
+            return type("FakeTask", (), {"kind": "fake_write", "input_payload": {}})()
+
+    class Runner:
+        """替代执行用例，仅确保组合完成后可检查资源释放。"""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def run(self, *_args: object, **_kwargs: object) -> bool:
+            """不执行图，模拟正常 Worker 返回。"""
+            return True
+
+    def build_factory(_database_url: str) -> Factory:
+        factory = Factory()
+        factories.append(factory)
+        return factory
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", build_factory)
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", Store)
+    monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
+
+    await execute_task_module.execute_task.original_func(str(task_id))
+
+    assert len(factories) == 1
+    assert all(factory.disposed for factory in factories)
+
+
+@pytest.mark.asyncio
+async def test_fake_write_graph_reuses_worker_message_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Graph 审批存储必须复用 Worker 已管理的工厂，不能额外创建连接池。"""
+    task_id = uuid4()
+    factory = object()
+    stores: list[object] = []
+    captured_steps: list[object] = []
+
+    class Store:
+        """提供 fake-write 分类，并记录由组合层创建的审批存储。"""
+
+        def __init__(self, received_factory: object) -> None:
+            assert received_factory is factory
+            stores.append(self)
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> object:
+            """返回最小 fake-write 分类快照。"""
+            del task_id
+            return type("FakeTask", (), {"kind": "fake_write", "input_payload": {}})()
+
+    class Runner:
+        """捕获步骤解析器输出而不执行外部 I/O。"""
+
+        def __init__(self, **kwargs: object) -> None:
+            self._resolve_steps = kwargs["resolve_steps"]
+
+        async def run(self, received_task_id: UUID, **_kwargs: object) -> bool:
+            """解析一次步骤，验证 Graph 持有同一审批存储实例。"""
+            captured_steps.extend(
+                self._resolve_steps(
+                    _leased_task(task_id=received_task_id, started_at=datetime.now(UTC))
+                )
+            )
+            return True
+
+    class Factory:
+        """模拟带释放入口的单条消息数据库工厂。"""
+
+        async def dispose(self) -> None:
+            """满足 Worker 的 finally 释放协议。"""
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", lambda _url: factory)
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", Store)
+    monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
+
+    await execute_task_module.execute_task.original_func(str(task_id))
+
+    assert len(stores) == 1
+    assert len(captured_steps) == 1
+    assert captured_steps[0]._approval_store is stores[0]
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,7 @@ class FakeWriteGraph:
         if pending is None:
             pending = await self._approval_store.create_or_get_pending(
                 task_id=task_id,
+                lease_owner=state["lease_owner"],
                 proposal=proposal,
                 preview_markdown="将执行合成假写操作。",
                 expires_at=self._clock() + self._approval_ttl,
