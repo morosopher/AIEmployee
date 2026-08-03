@@ -11,6 +11,7 @@ from langgraph.types import interrupt
 
 from ai_employee.agents.fake_write.state import FakeWriteState
 from ai_employee.application.use_cases.approvals import ApprovalProposalStore
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, JsonValue
 
 FakeTool = Callable[[dict[str, object]], Awaitable[None]]
@@ -50,7 +51,12 @@ class FakeWriteGraph:
         return {"messages": [*state["messages"], "proposal prepared"]}
 
     async def approval(self, state: FakeWriteState) -> dict[str, object]:
-        """持久化冻结审批后中断，恢复时以同一事实避免重建提案。"""
+        """持久化冻结审批后中断，并以数据库终态恢复重投的初始消息。
+
+        Taskiq 采用至少一次投递，初始消息可能在图保存 interrupt 后、确认队列前重投。
+        若用户已决定，不能再次依赖旧消息的 ``resume=None`` 参数中断；必须使用冻结审批
+        的持久终态继续至 execute，使批准仅执行一次、拒绝不执行工具。
+        """
         proposal = ApprovalProposal.create(
             "fake.write",
             _as_json_payload(state["proposal_payload"]),
@@ -67,15 +73,23 @@ class FakeWriteGraph:
                 preview_markdown="将执行合成假写操作。",
                 expires_at=self._clock() + self._approval_ttl,
             )
-        decision = interrupt(
-            {
-                "approval_id": str(pending.approval_id),
-                "action": proposal.action,
-                "payload_hash": proposal.payload_hash,
-                "preview_markdown": "将执行合成假写操作。",
-                "version": pending.version,
-            }
-        )
+        if pending.status == "pending":
+            decision = interrupt(
+                {
+                    "approval_id": str(pending.approval_id),
+                    "action": proposal.action,
+                    "payload_hash": proposal.payload_hash,
+                    "preview_markdown": "将执行合成假写操作。",
+                    "version": pending.version,
+                }
+            )
+        elif pending.status in {"approved", "rejected"}:
+            # 审批决定与冻结载荷同属 PostgreSQL 事实，不能由陈旧队列消息覆盖。
+            decision = pending.status
+        else:
+            raise StateConflictError(
+                error_code="approval_conflict", message="approval is unavailable"
+            )
         return {
             "approval_decision": decision,
             "messages": [*state["messages"], "approved resolved"],
