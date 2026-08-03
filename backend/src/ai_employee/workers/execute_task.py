@@ -183,6 +183,9 @@ async def execute_task(
 
     Taskiq 只消费 Outbox relay 发送的 task_id。临时错误已由 Runner 在 PostgreSQL 事务内
     写入延迟 Outbox，故本入口不能重新抛出它再让 SmartRetryMiddleware 绕过 Outbox 写 Redis。
+
+    Raises:
+        RuntimeError: Runner 未能将异常持久化时上抛稳定错误，阻止 Worker 静默确认消息。
     """
     try:
         parsed_task_id = UUID(task_id)
@@ -238,10 +241,11 @@ async def execute_task(
             )
         finally:
             await session_factory.dispose()
-    except Exception:  # noqa: BLE001 - 未知异常绝不能绕过已持久化的失败边界。
-        # 正常可写数据库路径已由应用用例持久化安全 FAILED/error_code。这里只处理主失败后
-        # 数据库同样不可写或 composition 构建失败的最后防线，并且不记录可能敏感的原文。
-        return
+    except (OSError, RuntimeError, ValueError):
+        # 正常可写数据库路径已由 Runner 收敛为安全 FAILED/error_code。若该收敛本身也失败，
+        # 不能伪装成已处理并 ACK 消息；这些进程组合边界异常改为稳定错误并隐藏可能敏感原文。
+        # 其余编程错误直接上抛，避免宽泛捕获再次把调用契约错误静默转换为确认。
+        raise RuntimeError("task execution persistence boundary unavailable") from None
 
 
 async def _fake_write_tool(payload: dict[str, object]) -> None:

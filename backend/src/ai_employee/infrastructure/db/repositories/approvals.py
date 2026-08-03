@@ -216,12 +216,19 @@ class SqlAlchemyApprovalStore:
                 if task is None:
                     continue
                 approval.status = ApprovalStatus.EXPIRED.value
-                if task.status == TaskStatus.WAITING_APPROVAL.value:
+                if task.status in {
+                    TaskStatus.WAITING_APPROVAL.value,
+                    TaskStatus.RUNNING.value,
+                }:
+                    # checkpoint recovery 可能已用短租约把仍为 PENDING 的审批任务接管为
+                    # RUNNING。审批到期是更高优先级的不可逆安全事实，必须撤销该租约并终止
+                    # 任务，不能等图恢复后再把它误收敛为普通冲突或成功。
                     task.status = TaskStatus.FAILED.value
                     task.error_code = "approval_expired"
                     task.finished_at = now
                     task.lease_owner = None
                     task.lease_expires_at = None
+                    task.approval_checkpoint_recovery_at = None
                     session.add(
                         AuditEventModel(
                             user_id=task.user_id,

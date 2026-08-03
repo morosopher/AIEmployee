@@ -18,6 +18,7 @@ from ai_employee.infrastructure.db.models.tasks import (
     ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
+from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.session import build_session_factory
 
 
@@ -92,6 +93,78 @@ async def test_expire_approvals_fails_overdue_task_without_tool_execution(
         assert task.error_code == "approval_expired"
         assert [event.event_type for event in events] == ["approval.expired"]
         assert tool_executions == []
+    finally:
+        await session_factory.dispose()
+
+
+async def test_expiry_converges_recovered_running_task_to_approval_expired(
+    database_url: str,
+) -> None:
+    """恢复租约先将过期审批任务置 RUNNING 时，到期扫描仍必须终止任务。"""
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    task_id = uuid4()
+    now = datetime.now(UTC)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="expiry-recovery-race@example.test",
+                    display_name="Expiry Recovery Race",
+                    password_hash="fake",
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="initial-worker",
+                    idempotency_key="expiry-recovery-race",
+                    input_payload={"value": "synthetic"},
+                )
+            )
+        approval_store = SqlAlchemyApprovalStore(session_factory)
+        await approval_store.create_or_get_pending(
+            task_id=task_id,
+            lease_owner="initial-worker",
+            proposal=ApprovalProposal.create("fake.write", {"value": "synthetic"}),
+            preview_markdown="将执行合成假写操作。",
+            expires_at=now - timedelta(seconds=1),
+            checkpoint_recovery_at=now - timedelta(seconds=1),
+        )
+        recovered = await SqlAlchemyTaskExecutionStore(session_factory).acquire(
+            task_id=task_id,
+            lease_owner="checkpoint-recovery-worker",
+            now=now,
+            lease_expires_at=now + timedelta(minutes=1),
+            recover_waiting_approval=True,
+        )
+        assert recovered is not None
+
+        expired = await ExpireApprovalsUseCase(approval_store).execute(now=now, limit=10)
+        assert expired == 1
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            approval = await session.scalar(select(ApprovalRequestModel))
+            events = list(
+                (
+                    await session.scalars(
+                        select(AuditEventModel).where(AuditEventModel.task_id == task_id)
+                    )
+                ).all()
+            )
+        assert task is not None
+        assert approval is not None
+        assert task.status == TaskStatus.FAILED.value
+        assert task.error_code == "approval_expired"
+        assert task.lease_owner is None
+        assert approval.status == ApprovalStatus.EXPIRED.value
+        assert [event.event_type for event in events].count("approval.expired") == 1
     finally:
         await session_factory.dispose()
 

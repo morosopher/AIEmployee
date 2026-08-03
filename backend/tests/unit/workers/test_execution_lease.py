@@ -102,9 +102,10 @@ async def test_taskiq_entrypoint_uses_durable_retry_without_reading_message_labe
             *,
             may_retry_transient: bool,
             retry_delay: timedelta,
+            recover_waiting_approval: bool = False,
         ) -> bool:
             """记录当前任务与保守预算决定，不连接任何持久化基础设施。"""
-            del retry_delay
+            del retry_delay, recover_waiting_approval
             received.append((received_task_id, may_retry_transient))
             return True
 
@@ -422,7 +423,7 @@ class CallableStep:
 class PersistenceUnavailableRunner:
     """模拟主失败后数据库也无法写入安全终态的最后防线场景。"""
 
-    async def run(self, task_id: UUID) -> bool:
+    async def run(self, task_id: UUID, **_kwargs: object) -> bool:
         """对可关联任务抛出未知持久化异常。"""
         del task_id
         raise RuntimeError("synthetic persistence unavailable")
@@ -782,14 +783,28 @@ async def test_internal_failure_cas_miss_does_not_fallback_to_overwrite_owner() 
 
 
 @pytest.mark.asyncio
-async def test_taskiq_entrypoint_swallows_unknown_when_failure_cannot_be_persisted(
+async def test_taskiq_entrypoint_propagates_unknown_when_failure_cannot_be_persisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """数据库也不可写时入口作为最后防线终止未知异常，不创建无事实的重试。"""
+    """数据库也不可写时入口不得静默确认未持久化的执行失败。"""
+
+    class NonFakeStore:
+        """绕开分类读取异常，确保测试抵达持久 Runner 的最终失败边界。"""
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> None:
+            """返回空快照，表示当前任务不使用 fake-write Graph。"""
+            del task_id
+
     monkeypatch.setattr(
         execute_task_module,
         "build_task_runner",
         lambda: PersistenceUnavailableRunner(),
     )
+    monkeypatch.setattr(
+        execute_task_module,
+        "SqlAlchemyApprovalStore",
+        lambda _factory: NonFakeStore(),
+    )
 
-    await execute_task_module.execute_task.original_func(str(uuid4()))
+    with pytest.raises(RuntimeError, match="task execution persistence boundary unavailable"):
+        await execute_task_module.execute_task.original_func(str(uuid4()))
