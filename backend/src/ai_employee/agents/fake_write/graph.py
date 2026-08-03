@@ -85,19 +85,32 @@ class FakeWriteGraph:
         decision = state["approval_decision"]
         if decision not in {"approved", "rejected"}:
             raise ValueError("approval decision is unavailable")
+        proposal = ApprovalProposal.create(
+            "fake.write", _as_json_payload(state["proposal_payload"])
+        )
         if decision == "approved":
-            await self._fake_tool(state["proposal_payload"])
-            tool_called = True
+            claim = await self._approval_store.claim_fake_tool_execution(
+                task_id=UUID(state["task_id"]),
+                lease_owner=state.get("lease_owner", ""),
+                expected_payload_hash=proposal.payload_hash,
+            )
+            if claim.should_call:
+                await self._fake_tool(dict(claim.payload))
+                await self._approval_store.complete_fake_tool_execution(
+                    task_id=UUID(state["task_id"]),
+                    lease_owner=state.get("lease_owner", ""),
+                    expected_payload_hash=proposal.payload_hash,
+                )
+            tool_called = claim.should_call
             message = "fake tool called"
         else:
             tool_called = False
             message = "proposal rejected"
         await self._approval_store.finish_fake_write(
             task_id=UUID(state["task_id"]),
+            lease_owner=state.get("lease_owner", ""),
             decision=decision,
-            payload_hash=ApprovalProposal.create(
-                "fake.write", _as_json_payload(state["proposal_payload"])
-            ).payload_hash,
+            payload_hash=proposal.payload_hash,
             now=self._clock(),
         )
         return {"tool_called": tool_called, "messages": [*state["messages"], message]}

@@ -60,7 +60,7 @@ def test_payload_hash_uses_canonical_utf8_json() -> None:
         "说明": "合成内容",
         "details": {"enabled": True, "items": [1, None]},
     }
-    canonical_json = '{"details":{"enabled":true,"items":[1,null]},"说明":"合成内容"}'
+    canonical_json = '{"action":"synthetic.action","payload":{"details":{"enabled":true,"items":[1,null]},"说明":"合成内容"}}'
 
     proposal = ApprovalProposal.create("synthetic.action", payload)
 

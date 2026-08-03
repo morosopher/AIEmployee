@@ -26,6 +26,24 @@ if config.config_file_name is not None:
 _ = db_models
 target_metadata = Base.metadata
 
+_EXTERNAL_MANAGED_TABLES = frozenset(
+    {"checkpoint_migrations", "checkpoints", "checkpoint_blobs", "checkpoint_writes"}
+)
+
+
+def include_object(
+    object_: object, name: str | None, type_: str, reflected: bool, compare_to: object
+) -> bool:
+    """从 ORM 自动比对中排除由 LangGraph 固定协议管理的 checkpoint 表。
+
+    表仍由本仓库 Alembic 迁移创建，但没有对应 ORM 模型；否则 ``alembic check`` 会把
+    正确的第三方协议表误报为待删除。Task 7 的条件恢复索引同样尚未建模，保留迁移事实。
+    """
+    del object_, compare_to
+    if type_ == "table" and reflected and name in _EXTERNAL_MANAGED_TABLES:
+        return False
+    return not (type_ == "index" and reflected and name == "ix_task_runs_retry_recovery_due")
+
 
 def run_migrations_offline() -> None:
     """在无数据库连接时生成 SQL 迁移脚本。
@@ -52,7 +70,9 @@ def do_run_migrations(connection: Connection) -> None:
         connection: 由异步连接通过 ``run_sync`` 暴露的同步 SQLAlchemy 连接。
     """
 
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection, target_metadata=target_metadata, include_object=include_object
+    )
 
     with context.begin_transaction():
         context.run_migrations()

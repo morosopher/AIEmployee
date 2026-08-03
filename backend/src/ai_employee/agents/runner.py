@@ -13,14 +13,13 @@ def checkpoint_database_url(database_url: str) -> str:
 
 @asynccontextmanager
 async def postgres_checkpointer(database_url: str) -> AsyncIterator[AsyncPostgresSaver]:
-    """创建并初始化唯一的 PostgreSQL checkpoint 表连接。
+    """创建已由 Alembic 管理的 PostgreSQL checkpoint 连接。
 
     Args:
         database_url: 已验证的 SQLAlchemy 异步 PostgreSQL URL。
 
     Yields:
-        已运行 ``setup`` 的 ``AsyncPostgresSaver``，由调用方传给 Graph 编译。
+        可直接用于 Graph 编译的 ``AsyncPostgresSaver``。
     """
     async with AsyncPostgresSaver.from_conn_string(checkpoint_database_url(database_url)) as saver:
-        await saver.setup()
         yield saver

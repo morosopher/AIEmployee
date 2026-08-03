@@ -10,7 +10,11 @@ from taskiq import Context, TaskiqDepends
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.use_cases.approvals import ApprovalProposalStore
-from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.application.use_cases.task_execution import (
+    DurableTaskRunner,
+    LeasedTask,
+    TaskWaitingApproval,
+)
 from ai_employee.config import get_settings
 from ai_employee.domain.errors import InternalInvariantError
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
@@ -46,6 +50,69 @@ class _MissingTaskHandlerStep:
             message="task handler is not registered",
             metadata={"task_kind": task.kind},
         )
+
+
+class _FakeWriteStep:
+    """在 DurableTaskRunner 租约内驱动一次 fake-write Graph。"""
+
+    name = "fake_write_graph"
+
+    def __init__(
+        self, *, resume: str | None, database_url: str, checkpoint_database_url: str
+    ) -> None:
+        """保存一次 Worker 尝试所需的恢复决定和两类数据库连接配置。
+
+        Args:
+            resume: 已由审批 Outbox 冻结的 ``approved`` 或 ``rejected`` 决定；首次执行为空。
+            database_url: 业务事实库的 SQLAlchemy asyncpg URL。
+            checkpoint_database_url: LangGraph checkpointer 专用 psycopg URL。
+        """
+        self._resume = resume
+        self._database_url = database_url
+        self._checkpoint_database_url = checkpoint_database_url
+
+    async def execute(self, task: LeasedTask) -> None:
+        """在当前租约内运行或恢复同一 Graph checkpoint。
+
+        首次中断后，审批存储已将任务原子置为 ``WAITING_APPROVAL`` 并释放租约；本方法把
+        LangGraph 返回的 interrupt 转换为 Runner 控制流，避免把暂停误记为成功。恢复时用
+        新 owner 覆盖 checkpoint 中旧 owner，确保批准后的副作用认领继续受当前租约保护。
+
+        Args:
+            task: 已由 ``DurableTaskRunner`` 获取且包含当前 owner 的任务快照。
+
+        Raises:
+            TaskWaitingApproval: Graph 返回人工审批中断，调用方必须停止本次消息。
+        """
+        store = SqlAlchemyApprovalStore(build_session_factory(self._database_url))
+        graph = FakeWriteGraph(
+            approval_store=store,
+            clock=lambda: datetime.now(UTC),
+            approval_ttl=timedelta(minutes=5),
+            fake_tool=_fake_write_tool,
+        )
+        async with postgres_checkpointer(self._checkpoint_database_url) as saver:
+            compiled = graph.compile(checkpointer=saver)
+            config = {"configurable": {"thread_id": str(task.task_id)}}
+            if self._resume is None:
+                result = await compiled.ainvoke(
+                    {
+                        "task_id": str(task.task_id),
+                        "lease_owner": task.lease_owner or "",
+                        "proposal_payload": task.input_payload,
+                        "approval_decision": None,
+                        "tool_called": False,
+                        "messages": [],
+                    },
+                    config=config,
+                )
+            else:
+                result = await compiled.ainvoke(
+                    Command(resume=self._resume, update={"lease_owner": task.lease_owner or ""}),
+                    config=config,
+                )
+        if isinstance(result, dict) and "__interrupt__" in result:
+            raise TaskWaitingApproval
 
 
 @lru_cache
@@ -103,35 +170,28 @@ async def execute_task(
             approval_store: ApprovalProposalStore = SqlAlchemyApprovalStore(session_factory)
             try:
                 task = await approval_store.get_fake_write_task(task_id=parsed_task_id)
-            except Exception:  # noqa: BLE001 - 非 fake 任务仍交给既有 DurableTaskRunner 路径。
+            except Exception:  # noqa: BLE001 - 非 fake 任务和测试替身继续走通用持久执行边界。
                 task = None
-            if task is not None and task.kind == "fake_write":
-                graph = FakeWriteGraph(
-                    approval_store=approval_store,
-                    clock=lambda: datetime.now(UTC),
-                    approval_ttl=timedelta(minutes=5),
-                    fake_tool=_fake_write_tool,
-                )
-                async with postgres_checkpointer(settings.database_url) as saver:
-                    compiled = graph.compile(checkpointer=saver)
-                    config = {"configurable": {"thread_id": str(parsed_task_id)}}
-                    if resume is None:
-                        await compiled.ainvoke(
-                            {
-                                "task_id": str(parsed_task_id),
-                                "proposal_payload": task.input_payload,
-                                "approval_decision": None,
-                                "tool_called": False,
-                                "messages": [],
-                            },
-                            config=config,
-                        )
-                    else:
-                        await compiled.ainvoke(Command(resume=resume), config=config)
-                return
         finally:
             await session_factory.dispose()
-        runner = build_task_runner()
+        if task is not None and task.kind == "fake_write":
+            runner = DurableTaskRunner(
+                store=SqlAlchemyTaskExecutionStore(build_session_factory(settings.database_url)),
+                clock=lambda: datetime.now(UTC),
+                lease_duration=timedelta(seconds=settings.task_lease_seconds),
+                task_timeout_seconds=settings.task_timeout_seconds,
+                task_step_timeout_seconds=settings.task_step_timeout_seconds,
+                max_transient_retries=DEFAULT_RETRY_COUNT,
+                resolve_steps=lambda _task: (
+                    _FakeWriteStep(
+                        resume=resume,
+                        database_url=settings.database_url,
+                        checkpoint_database_url=settings.checkpoint_database_url,
+                    ),
+                ),
+            )
+        else:
+            runner = build_task_runner()
         await runner.run(
             parsed_task_id,
             may_retry_transient=True,

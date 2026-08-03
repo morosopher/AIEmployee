@@ -20,6 +20,14 @@ class FakeWriteTask:
     input_payload: dict[str, JsonValue]
 
 
+@dataclass(frozen=True, slots=True)
+class FakeToolClaim:
+    """副作用前持久幂等认领返回的冻结工具输入。"""
+
+    payload: dict[str, JsonValue]
+    should_call: bool
+
+
 class PendingApproval:
     """图节点显示并中断时需要的已持久审批最小快照。"""
 
@@ -47,12 +55,22 @@ class ApprovalProposalStore(Protocol):
         """返回同一冻结提案的现有审批，供 checkpoint 重放识别终态。"""
 
     async def finish_fake_write(
-        self, *, task_id: UUID, decision: str, payload_hash: str, now: datetime
+        self, *, task_id: UUID, lease_owner: str, decision: str, payload_hash: str, now: datetime
     ) -> None:
         """在 Graph 终点把已恢复的假写任务持久化为成功。"""
 
     async def get_fake_write_task(self, *, task_id: UUID) -> FakeWriteTask | None:
         """返回恢复假写审批图需要的任务快照，不暴露持久化实现类型。"""
+
+    async def claim_fake_tool_execution(
+        self, *, task_id: UUID, lease_owner: str, expected_payload_hash: str
+    ) -> FakeToolClaim:
+        """在批准与冻结哈希校验后原子认领假工具副作用。"""
+
+    async def complete_fake_tool_execution(
+        self, *, task_id: UUID, lease_owner: str, expected_payload_hash: str
+    ) -> None:
+        """把当前 owner 已调用完成的假工具执行记录为成功。"""
 
 
 class ApprovalStore(Protocol):

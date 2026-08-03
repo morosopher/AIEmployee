@@ -7,6 +7,7 @@ class FakeWriteState(TypedDict):
     """在 checkpoint 中保存假写提案、决定与无敏感执行标记。"""
 
     task_id: str
+    lease_owner: str
     proposal_payload: dict[str, object]
     approval_decision: str | None
     tool_called: bool

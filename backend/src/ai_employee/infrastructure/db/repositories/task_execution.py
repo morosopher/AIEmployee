@@ -164,6 +164,7 @@ class SqlAlchemyTaskExecutionStore:
                 input_payload=row.input_payload,
                 started_at=row.started_at,
                 attempt_count=row.attempt_count,
+                lease_owner=lease_owner,
             )
 
     async def renew(

@@ -234,7 +234,9 @@ class ApprovalProposal:
             raise TypeError("approval payload root must be a JSON object")
 
         canonical_payload = _canonicalize_payload(payload)
-        payload_hash = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+        # 审批授权的是动作与参数的完整命令，动作名也必须进入稳定哈希输入。
+        canonical_command = _canonicalize_payload({"action": action, "payload": payload})
+        payload_hash = hashlib.sha256(canonical_command.encode("utf-8")).hexdigest()
         proposal = object.__new__(cls)
         object.__setattr__(proposal, "action", action)
         object.__setattr__(proposal, "payload_hash", payload_hash)

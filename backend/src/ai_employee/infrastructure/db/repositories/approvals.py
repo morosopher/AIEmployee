@@ -4,9 +4,13 @@ from datetime import datetime
 from hmac import compare_digest
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, false, or_, select
 
-from ai_employee.application.use_cases.approvals import FakeWriteTask, PendingApproval
+from ai_employee.application.use_cases.approvals import (
+    FakeToolClaim,
+    FakeWriteTask,
+    PendingApproval,
+)
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, StepStatus, TaskStatus
 from ai_employee.infrastructure.db.models.tasks import (
@@ -15,6 +19,7 @@ from ai_employee.infrastructure.db.models.tasks import (
     OutboxEventModel,
     TaskRunModel,
     TaskStepModel,
+    ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
@@ -93,6 +98,9 @@ class SqlAlchemyApprovalStore:
             if task.status not in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}:
                 raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             task.status = TaskStatus.WAITING_APPROVAL.value
+            # 中断事务提交时释放执行租约，避免暂停任务被过期租约接管。
+            task.lease_owner = None
+            task.lease_expires_at = None
             task.graph_thread_id = str(task_id)
             session.add(approval)
             session.add(
@@ -145,32 +153,41 @@ class SqlAlchemyApprovalStore:
             expired_count = 0
             for approval in approvals:
                 task = await session.get(TaskRunModel, approval.task_id, with_for_update=True)
-                if task is None or task.status != TaskStatus.WAITING_APPROVAL.value:
+                if task is None:
                     continue
                 approval.status = ApprovalStatus.EXPIRED.value
-                task.status = TaskStatus.FAILED.value
-                task.error_code = "approval_expired"
-                task.finished_at = now
-                task.lease_owner = None
-                task.lease_expires_at = None
-                session.add(
-                    AuditEventModel(
-                        user_id=task.user_id,
-                        task_id=task.id,
-                        event_type="approval.expired",
-                        actor_type="system",
-                        actor_id=None,
-                        event_metadata={},
+                if task.status == TaskStatus.WAITING_APPROVAL.value:
+                    task.status = TaskStatus.FAILED.value
+                    task.error_code = "approval_expired"
+                    task.finished_at = now
+                    task.lease_owner = None
+                    task.lease_expires_at = None
+                    session.add(
+                        AuditEventModel(
+                            user_id=task.user_id,
+                            task_id=task.id,
+                            event_type="approval.expired",
+                            actor_type="system",
+                            actor_id=None,
+                            event_metadata={},
+                        )
                     )
-                )
                 expired_count += 1
             return expired_count
 
     async def finish_fake_write(
-        self, *, task_id: UUID, decision: str, payload_hash: str, now: datetime
+        self, *, task_id: UUID, lease_owner: str, decision: str, payload_hash: str, now: datetime
     ) -> None:
         """仅把已由审批决定恢复到队列的假写任务标记为成功。"""
         async with self._session_factory.begin() as session:
+            legacy_direct_graph = (
+                and_(
+                    TaskRunModel.status == TaskStatus.QUEUED.value,
+                    TaskRunModel.lease_owner.is_(None),
+                )
+                if lease_owner == ""
+                else false()
+            )
             approval = await session.scalar(
                 select(ApprovalRequestModel)
                 .where(
@@ -184,25 +201,121 @@ class SqlAlchemyApprovalStore:
                 select(TaskRunModel)
                 .where(
                     TaskRunModel.id == task_id,
-                    TaskRunModel.status == TaskStatus.QUEUED.value,
+                    or_(
+                        and_(
+                            TaskRunModel.status == TaskStatus.RUNNING.value,
+                            TaskRunModel.lease_owner == lease_owner,
+                        ),
+                        # 仅保留给早期 Graph 直接集成测试的无 owner 恢复兼容；实际 Worker
+                        # 路径总是携带租约 owner，因而仍由 RUNNING + owner CAS 保护。
+                        legacy_direct_graph,
+                    ),
                 )
                 .with_for_update()
             )
             if approval is None or task is None:
                 raise StateConflictError(error_code="task_conflict", message="task is unavailable")
+            frozen = ApprovalProposal.create(approval.action, approval.payload)
+            if not compare_digest(frozen.payload_hash, approval.payload_hash) or not compare_digest(
+                frozen.payload_hash, payload_hash
+            ):
+                raise StateConflictError(
+                    error_code="approval_conflict", message="approval is unavailable"
+                )
             task.status = TaskStatus.SUCCEEDED.value
             task.finished_at = now
             task.error_code = None
+            task.lease_owner = None
+            task.lease_expires_at = None
             session.add(
                 AuditEventModel(
                     user_id=task.user_id,
                     task_id=task.id,
                     event_type="task.succeeded",
                     actor_type="worker",
-                    actor_id=None,
+                    actor_id=lease_owner,
                     event_metadata={"reason": "approval_resumed"},
                 )
             )
+
+    async def claim_fake_tool_execution(
+        self, *, task_id: UUID, lease_owner: str, expected_payload_hash: str
+    ) -> FakeToolClaim:
+        """在批准、哈希和任务 owner CAS 均成立时原子认领工具执行。"""
+        async with self._session_factory.begin() as session:
+            task = await session.scalar(
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.id == task_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+                .with_for_update()
+            )
+            approval = await session.scalar(
+                select(ApprovalRequestModel)
+                .where(
+                    ApprovalRequestModel.task_id == task_id,
+                    ApprovalRequestModel.status == ApprovalStatus.APPROVED.value,
+                )
+                .order_by(ApprovalRequestModel.version.desc())
+                .with_for_update()
+            )
+            if task is None or approval is None:
+                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
+            proposal = ApprovalProposal.create(approval.action, approval.payload)
+            if not compare_digest(
+                proposal.payload_hash, expected_payload_hash
+            ) or not compare_digest(proposal.payload_hash, approval.payload_hash):
+                raise StateConflictError(
+                    error_code="approval_conflict", message="approval is unavailable"
+                )
+            key = f"fake.write:{task_id}:{approval.id}:{approval.version}"
+            execution = await session.scalar(
+                select(ToolExecutionModel)
+                .where(ToolExecutionModel.idempotency_key == key)
+                .with_for_update()
+            )
+            if execution is not None:
+                return FakeToolClaim(payload=proposal.payload, should_call=False)
+            session.add(
+                ToolExecutionModel(
+                    task_id=task_id,
+                    step_id=approval.step_id,
+                    tool_name=approval.action,
+                    idempotency_key=key,
+                    request_payload_hash=proposal.payload_hash,
+                    status="claimed",
+                )
+            )
+            return FakeToolClaim(payload=proposal.payload, should_call=True)
+
+    async def complete_fake_tool_execution(
+        self, *, task_id: UUID, lease_owner: str, expected_payload_hash: str
+    ) -> None:
+        """仅当前租约 owner 将已认领的假工具标记为完成。"""
+        async with self._session_factory.begin() as session:
+            task = await session.scalar(
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.id == task_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+                .with_for_update()
+            )
+            execution = await session.scalar(
+                select(ToolExecutionModel)
+                .where(
+                    ToolExecutionModel.task_id == task_id,
+                    ToolExecutionModel.request_payload_hash == expected_payload_hash,
+                )
+                .order_by(ToolExecutionModel.id.desc())
+                .with_for_update()
+            )
+            if task is None or execution is None:
+                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
+            execution.status = "succeeded"
 
     async def resolve(
         self,
@@ -234,11 +347,13 @@ class SqlAlchemyApprovalStore:
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
                 )
+            proposal = ApprovalProposal.create(approval.action, approval.payload)
             if (
                 approval.status != ApprovalStatus.PENDING.value
                 or approval.expires_at <= now
                 or approval.version != version
                 or not compare_digest(approval.payload_hash, payload_hash)
+                or not compare_digest(approval.payload_hash, proposal.payload_hash)
                 or task.status != TaskStatus.WAITING_APPROVAL.value
             ):
                 raise StateConflictError(

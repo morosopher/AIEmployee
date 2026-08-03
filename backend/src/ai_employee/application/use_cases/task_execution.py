@@ -25,6 +25,7 @@ class LeasedTask:
     input_payload: dict[str, JsonValue]
     started_at: datetime
     attempt_count: int = 1
+    lease_owner: str | None = None
 
 
 class TaskExecutionStep(Protocol):
@@ -102,6 +103,10 @@ class _StepDeadlineExceeded(Exception):
 
 class _LeaseLost(Exception):
     """标记续租 CAS 未命中；旧 Worker 必须立即停止且不写终态。"""
+
+
+class TaskWaitingApproval(Exception):
+    """表示节点已原子转入等待审批，Runner 不得再写成功或失败终态。"""
 
 
 def utc_instant(value: datetime, *, field: str) -> datetime:
@@ -237,6 +242,8 @@ class DurableTaskRunner:
                 await self._run_steps(leased, lease_owner=owner)
         except _LeaseLost:
             return False
+        except TaskWaitingApproval:
+            return True
         except _StepDeadlineExceeded:
             return await self._finish(
                 leased,
