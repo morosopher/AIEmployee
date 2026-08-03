@@ -4,7 +4,7 @@ from datetime import datetime
 from hmac import compare_digest
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from ai_employee.application.use_cases.approvals import (
     FakeToolClaim,
@@ -358,6 +358,31 @@ class SqlAlchemyApprovalStore:
                 or not compare_digest(approval.payload_hash, proposal.payload_hash)
                 or task.status != TaskStatus.WAITING_APPROVAL.value
             ):
+                raise StateConflictError(
+                    error_code="approval_conflict", message="approval is unavailable"
+                )
+            durable_interrupt = await session.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM checkpoint_writes AS checkpoint_write
+                        INNER JOIN checkpoints AS checkpoint
+                            ON checkpoint.thread_id = checkpoint_write.thread_id
+                            AND checkpoint.checkpoint_ns = checkpoint_write.checkpoint_ns
+                            AND checkpoint.checkpoint_id = checkpoint_write.checkpoint_id
+                        WHERE checkpoint_write.thread_id = :thread_id
+                            AND checkpoint_write.channel = '__interrupt__'
+                    )
+                    """
+                ),
+                {"thread_id": str(task.id)},
+            )
+            if durable_interrupt is not True:
+                # ApprovalRequest 先于 LangGraph checkpoint 创建；若用户恰在 interrupt 被保存前
+                # 决议，允许该写入会让数据库终态先于暂停 checkpoint，之后的旧图调用会再次
+                # 暂停。只接受已由同一 PostgreSQL 提交确认的 interrupt，令 API 与图恢复都以
+                # 持久事实排序；客户端可安全重试这个冲突请求。
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
                 )

@@ -1,7 +1,8 @@
 """在真实 PostgreSQL checkpoint 上验证假写审批中断与恢复。"""
 
+import asyncio
 from datetime import UTC, datetime, time, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from langgraph.types import Command
@@ -9,9 +10,9 @@ from sqlalchemy import select
 
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
-from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
+from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase, PendingApproval
 from ai_employee.domain.errors import StateConflictError
-from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
+from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
@@ -205,6 +206,124 @@ async def test_stale_graph_owner_cannot_pause_new_task_lease(database_url: str) 
         assert task.status == TaskStatus.RUNNING.value
         assert task.lease_owner == "new-worker"
         assert approval is None
+    finally:
+        await session_factory.dispose()
+
+
+async def test_decision_waits_until_first_interrupt_checkpoint_is_durable(
+    database_url: str,
+) -> None:
+    """决议不能在图已读到 pending、但首次 interrupt 尚未落库时抢先提交。
+
+    此交错模拟初始 Worker 先冻结审批，重投 Worker 随后读取同一 pending 审批，而用户
+    恰好在该读取和 LangGraph 持久化 interrupt 之间提交决定。PostgreSQL 的决议事务必须
+    以实际 ``__interrupt__`` checkpoint 为门槛；否则旧图调用会在已批准或拒绝的业务事实
+    之后写入一个新的暂停 checkpoint。
+    """
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    task_id = uuid4()
+    now = datetime.now(UTC)
+    pending_read = asyncio.Event()
+    release_graph = asyncio.Event()
+    store = SqlAlchemyApprovalStore(session_factory)
+
+    class PausingApprovalStore(SqlAlchemyApprovalStore):
+        """仅在 find 返回后暂停测试协程，稳定复现数据库与 checkpoint 的交错。"""
+
+        async def find_for_graph(
+            self, *, task_id: UUID, payload_hash: str
+        ) -> PendingApproval | None:
+            """在拿到 pending 快照后交出执行权，绝不改变生产决策路径。"""
+            result = await super().find_for_graph(task_id=task_id, payload_hash=payload_hash)
+            pending_read.set()
+            await release_graph.wait()
+            return result
+
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="checkpoint-ordering@example.test",
+                    display_name="Checkpoint Ordering",
+                    password_hash="fake",
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="initial-worker",
+                    idempotency_key="checkpoint-ordering",
+                    input_payload={"value": "synthetic"},
+                )
+            )
+
+        await store.create_or_get_pending(
+            task_id=task_id,
+            lease_owner="initial-worker",
+            proposal=ApprovalProposal.create("fake.write", {"value": "synthetic"}),
+            preview_markdown="将执行合成假写操作。",
+            expires_at=now + timedelta(minutes=5),
+        )
+        async with session_factory() as session:
+            approval = await session.scalar(select(ApprovalRequestModel))
+        assert approval is not None
+
+        graph = FakeWriteGraph(
+            approval_store=PausingApprovalStore(session_factory),
+            clock=lambda: now,
+            approval_ttl=timedelta(minutes=5),
+            fake_tool=lambda _payload: asyncio.sleep(0),
+        )
+        async with postgres_checkpointer(database_url) as saver:
+            invocation = asyncio.create_task(
+                graph.compile(checkpointer=saver).ainvoke(
+                    {
+                        "task_id": str(task_id),
+                        "lease_owner": "replayed-worker",
+                        "proposal_payload": {"value": "synthetic"},
+                        "approval_decision": None,
+                        "tool_called": False,
+                        "messages": [],
+                    },
+                    config={"configurable": {"thread_id": str(task_id)}},
+                )
+            )
+            await pending_read.wait()
+
+            with pytest.raises(StateConflictError) as conflict:
+                await ApprovalDecisionUseCase(store).execute(
+                    approval_id=approval.id,
+                    user_id=user_id,
+                    decision="rejected",
+                    version=approval.version,
+                    payload_hash=approval.payload_hash,
+                    now=now,
+                )
+            assert conflict.value.error_code == "approval_conflict"
+
+            release_graph.set()
+            result = await invocation
+            assert "__interrupt__" in result
+
+        await ApprovalDecisionUseCase(store).execute(
+            approval_id=approval.id,
+            user_id=user_id,
+            decision="rejected",
+            version=approval.version,
+            payload_hash=approval.payload_hash,
+            now=now,
+        )
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+        assert task is not None
+        assert task.status == TaskStatus.QUEUED.value
     finally:
         await session_factory.dispose()
 
