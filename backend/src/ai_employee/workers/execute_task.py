@@ -18,7 +18,7 @@ from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 
 RETRY_DELAY_MAX_SECONDS = 300
-RETRY_JITTER_MAX_SECONDS = 1
+RETRY_SCHEDULER_MARGIN_SECONDS = 60
 
 # Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
 # 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
@@ -49,13 +49,15 @@ def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
 def retry_recovery_delay(*, recovery_seconds: int) -> timedelta:
     """按 Worker 已锁定的 SmartRetry 上界计算 PostgreSQL 兜底等待时长。
 
-    Taskiq 的指数退避被 ``max_delay_exponent`` 限制为 300 秒，jitter 为 ``[0, 1)`` 秒。
-    默认 301 秒因此不会让正常 Redis 调度被恢复器抢先重复投递；配置可增大该保守期限，
-    但不能低于这条基础设施策略上界。
+    Taskiq 的指数退避被 ``max_delay_exponent`` 限制为 300 秒；异常上浮至 middleware、
+    向 Redis 写入计划与 scheduler 轮询仍需要额外交接时间。默认 360 秒显式保留一轮
+    60 秒扫描余量（亦覆盖 jitter），避免 PostgreSQL 恢复器抢先于正常 Redis 调度。
     """
-    minimum_seconds = RETRY_DELAY_MAX_SECONDS + RETRY_JITTER_MAX_SECONDS
+    minimum_seconds = RETRY_DELAY_MAX_SECONDS + RETRY_SCHEDULER_MARGIN_SECONDS
     if recovery_seconds < minimum_seconds:
-        raise ValueError("task_retry_recovery_seconds is below the SmartRetry delay upper bound")
+        raise ValueError(
+            "task_retry_recovery_seconds is below the SmartRetry delay and scheduler margin"
+        )
     return timedelta(seconds=recovery_seconds)
 
 

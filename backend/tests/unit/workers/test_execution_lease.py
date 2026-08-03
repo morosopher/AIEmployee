@@ -84,6 +84,20 @@ def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -
     assert execute_task_module.execute_task.labels["retry_on_error"] is True
 
 
+def test_retry_recovery_delay_covers_taskiq_max_delay_and_scheduler_margin() -> None:
+    """Redis 计划写入交接耗时不能让一分钟恢复扫描抢先于 SmartRetry。"""
+    settings = Settings()
+
+    assert settings.task_retry_recovery_seconds == 360
+    assert execute_task_module.retry_recovery_delay(
+        recovery_seconds=settings.task_retry_recovery_seconds
+    ) == timedelta(seconds=360)
+    with pytest.raises(ValidationError):
+        Settings(task_retry_recovery_seconds=359)
+    with pytest.raises(ValueError, match="scheduler margin"):
+        execute_task_module.retry_recovery_delay(recovery_seconds=359)
+
+
 @pytest.mark.parametrize(
     ("labels", "expected"),
     [
@@ -500,12 +514,12 @@ async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retr
             task_id=task.task_id,
             lease_owner="worker-a",
             may_retry_transient=True,
-            retry_recovery_delay=timedelta(seconds=301),
+            retry_recovery_delay=timedelta(seconds=360),
         )
 
     assert raised.value is transient
     assert store.finished == [(TaskStatus.RETRY_SCHEDULED, "provider_temporarily_unavailable")]
-    assert store.retry_recovery_deadlines == [now + timedelta(seconds=603)]
+    assert store.retry_recovery_deadlines == [now + timedelta(seconds=662)]
 
 
 @pytest.mark.asyncio

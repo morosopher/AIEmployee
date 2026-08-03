@@ -33,7 +33,7 @@ def upgrade() -> None:
     # 恢复器接管，既让旧任务最终可恢复，也不在正常调度前制造重复投递。
     op.execute(
         "UPDATE task_runs "
-        "SET retry_recovery_at = now() + interval '301 seconds' "
+        "SET retry_recovery_at = now() + interval '360 seconds' "
         "WHERE status = 'retry_scheduled' AND retry_recovery_at IS NULL"
     )
 
