@@ -177,6 +177,75 @@ async def test_event_route_uses_query_cursor_when_eventsource_cannot_set_header(
 
 
 @pytest.mark.asyncio
+async def test_event_route_prefers_standard_header_cursor_over_query_cursor(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """浏览器重连的标准 Header 必须覆盖主动订阅遗留的查询游标。"""
+    client, session_factory, user_id = task_client
+    async with session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status="queued",
+            idempotency_key="header-cursor-task",
+            input_payload={},
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+
+    class CapturingStream:
+        """捕获路由解析的游标，确保断言覆盖真实请求边界。"""
+
+        last_event_id: int | None = None
+
+        def response(self, *, last_event_id: int | None, **_: object) -> Response:
+            """保存传入基础设施的游标并结束测试响应。"""
+            self.last_event_id = last_event_id
+            return Response(status_code=204)
+
+    stream = CapturingStream()
+    transport = cast(httpx.ASGITransport, client._transport)
+    transport.app.state.task_event_stream = stream
+
+    response = await client.get(
+        f"/api/v1/tasks/{task_id}/events?last_event_id=3",
+        headers={"Last-Event-ID": "24"},
+    )
+
+    assert response.status_code == 204
+    assert stream.last_event_id == 24
+
+
+@pytest.mark.asyncio
+async def test_event_route_rejects_invalid_standard_header_cursor(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """非法 Last-Event-ID Header 必须返回既定的 RFC 9457 验证问题。"""
+    client, session_factory, user_id = task_client
+    async with session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status="queued",
+            idempotency_key="invalid-header-cursor-task",
+            input_payload={},
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+
+    response = await client.get(
+        f"/api/v1/tasks/{task_id}/events",
+        headers={"Last-Event-ID": "not-a-cursor"},
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/problem+json")
+    assert response.json()["error_code"] == "invalid_last_event_id"
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_idempotency_key_longer_than_persisted_column(
     task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
 ) -> None:
