@@ -1,6 +1,6 @@
 """用 SQLAlchemy 实现 Outbox claim、确认与失败恢复端口。"""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -19,9 +19,17 @@ class SqlAlchemyOutboxStore:
     超时并被另一 relay 重新 claim 的旧调用覆盖新结果。
     """
 
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
-        """保存进程级 Session factory，不提前占用连接。"""
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        *,
+        retry_recovery_delay: timedelta = timedelta(seconds=360),
+    ) -> None:
+        """保存进程级 Session factory 与已确认投递后的恢复等待时间。"""
+        if retry_recovery_delay <= timedelta(0):
+            raise ValueError("retry_recovery_delay must be positive")
         self._session_factory = session_factory
+        self._retry_recovery_delay = retry_recovery_delay
 
     async def claim_due(
         self,
@@ -91,10 +99,15 @@ class SqlAlchemyOutboxStore:
             return tuple(claimed)
 
     async def mark_published(self, claim: ClaimedOutboxEvent, *, published_at: datetime) -> bool:
-        """在新短事务中以 claim token CAS 写入发布时间。"""
+        """确认 enqueue，并在同一事务中为延迟重试启用 Redis 丢失恢复。
+
+        只有成功 enqueue 后才把 ``retry_recovery_at`` 写入 PostgreSQL。因此 relay 被阻塞、
+        Redis 调度慢或进程在确认前崩溃时，未发布 Outbox 仍是唯一待交接事实，恢复扫描不会
+        抢先复制它。
+        """
         published_at = utc_instant(published_at, field="published_at")
         async with self._session_factory.begin() as session:
-            event_id = await session.scalar(
+            aggregate_id = await session.scalar(
                 update(OutboxEventModel)
                 .where(
                     OutboxEventModel.id == claim.event_id,
@@ -102,9 +115,22 @@ class SqlAlchemyOutboxStore:
                     OutboxEventModel.available_at == claim.claim_until,
                 )
                 .values(published_at=published_at, last_error=None)
-                .returning(OutboxEventModel.id)
+                .returning(OutboxEventModel.aggregate_id)
             )
-        return event_id is not None
+            if aggregate_id is None:
+                return False
+            await session.execute(
+                update(TaskRunModel)
+                .where(
+                    TaskRunModel.id == aggregate_id,
+                    TaskRunModel.status == TaskStatus.RETRY_SCHEDULED.value,
+                )
+                .values(
+                    retry_recovery_at=published_at + self._retry_recovery_delay,
+                    updated_at=published_at,
+                )
+            )
+        return True
 
     async def mark_failed(
         self,

@@ -5,7 +5,6 @@ from uuid import UUID, uuid4
 
 import pytest
 from taskiq.schedule_sources import LabelScheduleSource
-from taskiq_redis import ListRedisScheduleSource
 
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.schedules import (
@@ -13,7 +12,7 @@ from ai_employee.application.use_cases.schedules import (
     DispatchDueDailyBriefsUseCase,
 )
 from ai_employee.domain.tasks import JsonValue
-from ai_employee.infrastructure.queue.broker import broker, retry_schedule_source
+from ai_employee.infrastructure.queue.broker import broker
 from ai_employee.infrastructure.queue.scheduler import scheduler
 from ai_employee.workers.schedules import (
     daily_brief_idempotency_key,
@@ -161,10 +160,8 @@ def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
         {"cron": "0 * * * *", "schedule_id": "expire-sessions"}
     ]
     assert scheduler.broker is broker
-    assert len(scheduler.sources) == 2
-    assert scheduler.sources[0] is retry_schedule_source
-    assert isinstance(scheduler.sources[0], ListRedisScheduleSource)
-    assert isinstance(scheduler.sources[1], LabelScheduleSource)
+    assert len(scheduler.sources) == 1
+    assert isinstance(scheduler.sources[0], LabelScheduleSource)
 
 
 @pytest.mark.asyncio

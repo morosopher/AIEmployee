@@ -33,7 +33,10 @@ def build_outbox_relay(
         只依赖应用端口的 Outbox relay 用例。
     """
     return OutboxRelay(
-        store=SqlAlchemyOutboxStore(session_factory),
+        store=SqlAlchemyOutboxStore(
+            session_factory,
+            retry_recovery_delay=timedelta(seconds=settings.task_retry_recovery_seconds),
+        ),
         enqueuer=TaskiqTaskEnqueuer(task_sender),
         clock=clock or _utc_now,
         claim_ttl=timedelta(seconds=settings.outbox_claim_seconds),

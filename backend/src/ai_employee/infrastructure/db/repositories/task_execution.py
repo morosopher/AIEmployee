@@ -7,7 +7,11 @@ from sqlalchemy import and_, func, or_, update
 
 from ai_employee.application.use_cases.task_execution import LeasedTask, utc_instant
 from ai_employee.domain.tasks import JsonValue, TaskStatus
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.infrastructure.db.models.tasks import (
+    AuditEventModel,
+    OutboxEventModel,
+    TaskRunModel,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 
@@ -129,6 +133,7 @@ class SqlAlchemyTaskExecutionStore:
                         TaskRunModel.kind,
                         TaskRunModel.input_payload,
                         TaskRunModel.started_at,
+                        TaskRunModel.attempt_count,
                     )
                 )
             ).one_or_none()
@@ -149,6 +154,7 @@ class SqlAlchemyTaskExecutionStore:
                 kind=row.kind,
                 input_payload=row.input_payload,
                 started_at=row.started_at,
+                attempt_count=row.attempt_count,
             )
 
     async def renew(
@@ -253,6 +259,73 @@ class SqlAlchemyTaskExecutionStore:
                     actor_type="worker",
                     actor_id=lease_owner,
                     event_metadata=event_metadata,
+                )
+            )
+            return True
+
+    async def schedule_retry(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        scheduled_at: datetime,
+        retry_available_at: datetime,
+        error_code: str,
+        attempt_count: int,
+    ) -> bool:
+        """在一个 owner-CAS 事务中保存延迟重试的全部业务事实。
+
+        ``retry_recovery_at`` 在此刻刻意保持为空：它只能在 Outbox relay 已成功把消息
+        交给 Redis 后写入，防止慢速但正常的交接被恢复扫描器误判为丢失。
+        """
+        scheduled_at = utc_instant(scheduled_at, field="scheduled_at")
+        retry_available_at = utc_instant(retry_available_at, field="retry_available_at")
+        if retry_available_at <= scheduled_at:
+            raise ValueError("retry_available_at must be later than scheduled_at")
+        if attempt_count <= 0:
+            raise ValueError("attempt_count must be positive")
+        async with self._session_factory.begin() as session:
+            row = (
+                await session.execute(
+                    update(TaskRunModel)
+                    .where(
+                        TaskRunModel.id == task_id,
+                        TaskRunModel.status == TaskStatus.RUNNING.value,
+                        TaskRunModel.lease_owner == lease_owner,
+                    )
+                    .values(
+                        status=TaskStatus.RETRY_SCHEDULED.value,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        error_code=error_code,
+                        retry_recovery_at=None,
+                        updated_at=scheduled_at,
+                    )
+                    .returning(TaskRunModel.user_id)
+                )
+            ).one_or_none()
+            if row is None:
+                return False
+            session.add_all(
+                (
+                    AuditEventModel(
+                        user_id=row.user_id,
+                        task_id=task_id,
+                        event_type="task.retry_scheduled",
+                        actor_type="worker",
+                        actor_id=lease_owner,
+                        event_metadata={
+                            "status": TaskStatus.RETRY_SCHEDULED.value,
+                            "error_code": error_code,
+                        },
+                    ),
+                    OutboxEventModel(
+                        topic="task.execute",
+                        aggregate_id=task_id,
+                        deduplication_key=f"task.execute:{task_id}:retry:{attempt_count}",
+                        payload={"task_id": str(task_id)},
+                        available_at=retry_available_at,
+                    ),
                 )
             )
             return True

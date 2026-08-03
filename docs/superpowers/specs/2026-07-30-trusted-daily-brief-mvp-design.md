@@ -165,7 +165,8 @@ api / agents / integrations / workers
 - FastAPI、Pydantic 2。
 - SQLAlchemy 2、Alembic、asyncpg。
 - LangGraph 1.x 和 `AsyncPostgresSaver`。
-- Taskiq、`taskiq-redis` 的 `RedisStreamBroker`、SmartRetryMiddleware 与 TaskiqScheduler。
+- Taskiq、`taskiq-redis` 的 `RedisStreamBroker` 与 TaskiqScheduler。延迟重试由 PostgreSQL
+  Outbox 的 `available_at` 表达，避免把不可恢复的计划事实保存在 Redis。
 - `httpx` 调用外部 HTTP API。
 - `uv` 管理 Python 环境、依赖和锁文件。
 
@@ -220,6 +221,8 @@ stateDiagram-v2
 - Outbox relay 把 `task_id` 投递到 Redis Stream。
 - Worker 收到消息后从 PostgreSQL 读取任务，获取有期限的执行租约并开始心跳。
 - Worker 崩溃后，租约过期的任务可以重新投递。
+- 临时故障在同一 PostgreSQL 事务中转换为 `RETRY_SCHEDULED`、写入审计事件和带
+  `available_at` 的重试 Outbox；只有 relay 成功交接到 Redis 后才设置 Redis 丢失恢复期限。
 - Taskiq 使用执行后确认；队列语义按至少一次处理。
 - Worker 重复收到同一消息时必须安全退出或恢复同一任务，不能创建第二份业务事实。
 - LangGraph 使用 `task_run_id` 作为主要 `thread_id`，并将 Checkpoint 保存到 PostgreSQL。

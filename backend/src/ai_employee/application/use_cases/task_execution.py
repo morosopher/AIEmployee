@@ -24,6 +24,7 @@ class LeasedTask:
     kind: str
     input_payload: dict[str, JsonValue]
     started_at: datetime
+    attempt_count: int = 1
 
 
 class TaskExecutionStep(Protocol):
@@ -59,6 +60,18 @@ class TaskExecutionStore(Protocol):
         lease_expires_at: datetime,
     ) -> bool:
         """仅当前 owner 能在节点边界续租。"""
+
+    async def schedule_retry(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        scheduled_at: datetime,
+        retry_available_at: datetime,
+        error_code: str,
+        attempt_count: int,
+    ) -> bool:
+        """原子写入 RETRY_SCHEDULED、审计与仅含 task_id 的延迟 Outbox。"""
 
     async def finish(
         self,
@@ -112,9 +125,9 @@ def utc_instant(value: datetime, *, field: str) -> datetime:
 class DurableTaskRunner:
     """用持久租约执行节点序列，并把所有非临时错误安全收敛到事实库。
 
-    用例只重新抛出 :class:`TransientProviderError`；Taskiq 的 SmartRetry 因而不会把
-    未知程序异常或用户操作错误误判为可重试。每个节点拥有独立预算，整个执行另受
-    从持久 ``started_at`` 计算的剩余总预算约束。节点之间必须续租，CAS 失败即放弃提交。
+    临时供应商错误会与延迟 Outbox 在同一 PostgreSQL 事务中写入，避免 Taskiq/Redis 在
+    业务事实之外另建不可审计的调度来源。每个节点拥有独立预算，整个执行另受从持久
+    ``started_at`` 计算的剩余总预算约束。节点之间必须续租，CAS 失败即放弃提交。
     """
 
     def __init__(
@@ -125,6 +138,7 @@ class DurableTaskRunner:
         lease_duration: timedelta,
         task_timeout_seconds: float,
         task_step_timeout_seconds: float,
+        max_transient_retries: int,
         resolve_steps: Callable[[LeasedTask], Sequence[TaskExecutionStep]],
     ) -> None:
         """注入持久化、确定性时钟、预算与任务节点解析器。
@@ -135,6 +149,7 @@ class DurableTaskRunner:
             lease_duration: 单次持有任务的租约时长。
             task_timeout_seconds: 从持久 ``started_at`` 起计算的总预算。
             task_step_timeout_seconds: 每个节点独立预算。
+            max_transient_retries: 首次执行之后允许自动重试的最大次数。
             resolve_steps: 按任务快照解析可重入节点序列的函数。
 
         Raises:
@@ -144,6 +159,8 @@ class DurableTaskRunner:
             raise ValueError("lease_duration must be positive")
         if task_timeout_seconds <= 0 or task_step_timeout_seconds <= 0:
             raise ValueError("task timeout budgets must be positive")
+        if max_transient_retries < 0:
+            raise ValueError("max_transient_retries must not be negative")
         if task_step_timeout_seconds > task_timeout_seconds:
             raise ValueError("task step timeout cannot exceed task timeout")
         if lease_duration.total_seconds() < task_step_timeout_seconds:
@@ -153,6 +170,7 @@ class DurableTaskRunner:
         self._lease_duration = lease_duration
         self._task_timeout_seconds = task_timeout_seconds
         self._task_step_timeout_seconds = task_step_timeout_seconds
+        self._max_transient_retries = max_transient_retries
         self._resolve_steps = resolve_steps
 
     async def run(
@@ -161,7 +179,7 @@ class DurableTaskRunner:
         lease_owner: str | None = None,
         *,
         may_retry_transient: bool = True,
-        retry_recovery_delay: timedelta | None = None,
+        retry_delay: timedelta | None = None,
     ) -> bool:
         """获取租约并执行一次持久任务尝试。
 
@@ -172,24 +190,21 @@ class DurableTaskRunner:
             may_retry_transient: 当前队列消息按基础设施重试规则仍可重新投递时为 ``True``。
                 application 层只消费这个已规范化的业务决定，绝不依赖 Taskiq 消息或标签类型；
                 默认值用于保持非队列调用方的既有临时错误重试语义。
-            retry_recovery_delay: Worker 根据队列策略计算的保守 PostgreSQL 恢复等待时长；
-                只在允许临时重试时使用。用例在实际捕获异常时才将它换算为 UTC 期限，不能
-                传入 Taskiq 类型或标签。
+            retry_delay: 重试 Outbox 的延迟时间；只在允许临时重试时使用。用例在实际捕获
+                异常时才将它换算为 UTC 可投递时刻，不能传入 Taskiq 类型或标签。
 
         Returns:
             当前执行者最终仍拥有并处理了任务时为 ``True``；未获租约、丢失 owner 或
             安全失败 CAS 未命中时为 ``False``。
 
         Raises:
-            TransientProviderError: 仅在 ``may_retry_transient`` 为 ``True`` 时，临时供应商
-                错误已经持久化为 RETRY_SCHEDULED，调用方应让队列重试中间件重新投递。
             Exception: 主失败后持久化端口也不可用时保留原异常，由 Worker 入口作为最后
-                防线吞掉，避免未知错误进入 SmartRetry。
+                防线吞掉，避免未知错误被队列层误判为可重试。
         """
         owner = lease_owner or f"worker:{os.getpid()}:{uuid4().hex}"
         now = utc_instant(self._clock(), field="clock")
-        if retry_recovery_delay is not None and retry_recovery_delay <= timedelta(0):
-            raise ValueError("retry_recovery_delay must be positive")
+        if retry_delay is not None and retry_delay <= timedelta(0):
+            raise ValueError("retry_delay must be positive")
         try:
             await self._store.prepare_retry(task_id=task_id, now=now)
             leased = await self._store.acquire(
@@ -237,38 +252,33 @@ class DurableTaskRunner:
                 error_code="task_timeout",
             )
         except TransientProviderError as error:
-            # Taskiq 达到重试上限后会 ACK 当前消息。此时若仍写 RETRY_SCHEDULED，PostgreSQL
-            # 中的任务将没有新的投递事实可恢复，故必须在同一个 owner-safe 终态写入中收敛。
-            if not may_retry_transient:
+            # 耐久 Outbox 消息不会携带上一轮 Taskiq 标签，因此上限必须由 PostgreSQL
+            # attempt_count 决定；否则每次新消息都会被误认为第一轮而无限重试。
+            if not may_retry_transient or leased.attempt_count > self._max_transient_retries:
                 return await self._finish(
                     leased,
                     lease_owner=owner,
                     status=TaskStatus.FAILED,
                     error_code="task_retries_exhausted",
                 )
-            if retry_recovery_delay is None:
-                # 没有 PostgreSQL 兜底期限时不能进入 RETRY_SCHEDULED；否则调用方遗漏队列
-                # 元数据或 Redis 丢失都会让任务永久悬挂。安全终态优于不可恢复的“重试”。
+            if retry_delay is None:
+                # 延迟 Outbox 的可用时刻缺失时不能进入 RETRY_SCHEDULED；否则没有可恢复的
+                # 投递事实。安全终态优于不可恢复的“重试”。
                 return await self._finish(
                     leased,
                     lease_owner=owner,
                     status=TaskStatus.FAILED,
-                    error_code="task_retry_recovery_deadline_missing",
+                    error_code="task_retry_delay_missing",
                 )
-            persisted = await self._finish(
-                leased,
+            scheduled_at = utc_instant(self._clock(), field="clock")
+            return await self._store.schedule_retry(
+                task_id=leased.task_id,
                 lease_owner=owner,
-                status=TaskStatus.RETRY_SCHEDULED,
+                scheduled_at=scheduled_at,
+                retry_available_at=scheduled_at + retry_delay,
                 error_code=error.error_code,
-                # 从捕获供应商临时错误的真实边界起算。Worker 接收消息后可能长时间执行，
-                # 不能让 PostgreSQL 兜底期限早于 SmartRetry 实际开始延迟调度的时刻。
-                retry_recovery_at=(
-                    utc_instant(self._clock(), field="clock") + retry_recovery_delay
-                ),
+                attempt_count=leased.attempt_count,
             )
-            if persisted:
-                raise
-            return False
         except DomainError as error:
             return await self._finish(
                 leased,

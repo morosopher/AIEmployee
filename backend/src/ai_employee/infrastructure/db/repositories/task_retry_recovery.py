@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 
 from ai_employee.application.use_cases.task_execution import utc_instant
 from ai_employee.domain.tasks import TaskStatus
@@ -25,9 +25,10 @@ class SqlAlchemyTaskRetryRecoveryStore:
         """锁定到期 RETRY_SCHEDULED 行并原子创建新的未发布执行事件。
 
         ``FOR UPDATE SKIP LOCKED`` 允许多个 scheduler 实例分担积压而不重复处理同一行。
-        状态、恢复期限清除、审计与 Outbox 在一个事务中提交；Redis 仅在后续 relay 成功后
-        承载任务 UUID。每个恢复事件的去重键使用持久到期瞬间，故崩溃重扫仍指向同一事实，
-        而后续一次新的重试周期会写新的到期瞬间并可独立恢复。
+        选择条件还要求不存在未发布的 ``task.execute`` Outbox：正常 relay 即使长时间停在
+        PostgreSQL 与 Redis 的交接中，已有事实仍会自行重试，扫描器不得抢先复制。状态、
+        恢复期限清除、审计与补发 Outbox 在一个事务中提交；Redis 仅在后续 relay 成功后承载
+        任务 UUID。每个恢复事件的去重键使用持久到期瞬间，故崩溃重扫仍指向同一事实。
         """
         now = utc_instant(now, field="now")
         async with self._session_factory.begin() as session:
@@ -38,6 +39,13 @@ class SqlAlchemyTaskRetryRecoveryStore:
                         TaskRunModel.status == TaskStatus.RETRY_SCHEDULED.value,
                         TaskRunModel.retry_recovery_at.is_not(None),
                         TaskRunModel.retry_recovery_at <= now,
+                        ~exists(
+                            select(OutboxEventModel.id).where(
+                                OutboxEventModel.aggregate_id == TaskRunModel.id,
+                                OutboxEventModel.topic == "task.execute",
+                                OutboxEventModel.published_at.is_(None),
+                            )
+                        ),
                     )
                     .order_by(TaskRunModel.retry_recovery_at, TaskRunModel.id)
                     .limit(limit)

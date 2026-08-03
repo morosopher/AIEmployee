@@ -1,64 +1,25 @@
 """把 Taskiq 执行入口组合到基础设施无关的持久任务执行用例。"""
 
-from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from typing import Any
 from uuid import UUID
 
 from taskiq import Context, TaskiqDepends
 
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.config import get_settings
-from ai_employee.domain.errors import InternalInvariantError, TransientProviderError
+from ai_employee.domain.errors import InternalInvariantError
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 
-RETRY_DELAY_MAX_SECONDS = 300
-RETRY_SCHEDULER_MARGIN_SECONDS = 60
+RETRY_DELAY_SECONDS = 5
 
 # Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
 # 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
 taskiq_context_dependency: Context = TaskiqDepends()
-
-
-def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
-    """按 Taskiq 0.12.4 的标签语义判断当前临时错误是否还可重新投递。
-
-    Args:
-        labels: 由 Taskiq ``Context`` 提供的原始消息标签；该第三方边界允许 ``Any``，并与
-            SmartRetryMiddleware 一样直接转换 ``_retries`` 与 ``max_retries``。
-
-    Returns:
-        当本次失败后仍满足 ``retries < max_retries`` 时返回 ``True``。默认上限复用 broker
-        模块供 SmartRetryMiddleware 配置使用的同一常量，避免两处策略发生漂移。
-    """
-    try:
-        retries = int(labels.get("_retries", 0)) + 1
-        max_retries = int(labels.get("max_retries", DEFAULT_RETRY_COUNT))
-    except (OverflowError, TypeError, ValueError):
-        # 队列损坏时不能在获取 PostgreSQL 租约前静默 ACK。保守地禁用后续自动重投，
-        # 使 Runner 能把任何临时错误收敛为 owner-safe 的 FAILED 终态。
-        return False
-    return retries < max_retries
-
-
-def retry_recovery_delay(*, recovery_seconds: int) -> timedelta:
-    """按 Worker 已锁定的 SmartRetry 上界计算 PostgreSQL 兜底等待时长。
-
-    Taskiq 的指数退避被 ``max_delay_exponent`` 限制为 300 秒；异常上浮至 middleware、
-    向 Redis 写入计划与 scheduler 轮询仍需要额外交接时间。默认 360 秒显式保留一轮
-    60 秒扫描余量（亦覆盖 jitter），避免 PostgreSQL 恢复器抢先于正常 Redis 调度。
-    """
-    minimum_seconds = RETRY_DELAY_MAX_SECONDS + RETRY_SCHEDULER_MARGIN_SECONDS
-    if recovery_seconds < minimum_seconds:
-        raise ValueError(
-            "task_retry_recovery_seconds is below the SmartRetry delay and scheduler margin"
-        )
-    return timedelta(seconds=recovery_seconds)
 
 
 class _MissingTaskHandlerStep:
@@ -100,25 +61,25 @@ def build_task_runner() -> DurableTaskRunner:
         lease_duration=timedelta(seconds=settings.task_lease_seconds),
         task_timeout_seconds=settings.task_timeout_seconds,
         task_step_timeout_seconds=settings.task_step_timeout_seconds,
+        max_transient_retries=DEFAULT_RETRY_COUNT,
         resolve_steps=lambda task: (_MissingTaskHandlerStep(),),
     )
 
 
-@broker.task(retry_on_error=True)
+@broker.task(retry_on_error=False)
 async def execute_task(
     task_id: str,
     context: Context = taskiq_context_dependency,
 ) -> None:
-    """解析 task_id，并只允许已持久化的临时供应商错误触发 Taskiq 重试。
+    """解析 task_id，并把临时供应商错误写为耐久延迟 Outbox 重试。
 
     Args:
         task_id: Outbox 发送的规范 UUID 字符串；消息不包含任务正文或结果。
-        context: Taskiq 注入的当前消息上下文；只在 Worker 层读取重试标签，不能传入
-            application 用例。
+        context: Taskiq 注入的当前消息上下文；只保留装饰任务的依赖兼容性，不传入
+            application 用例，也不作为重试状态来源。
 
-    Raises:
-        TransientProviderError: 执行用例已把状态写为 RETRY_SCHEDULED 后原样重新抛出，
-            交由 SmartRetryMiddleware 按固定策略重新投递。
+    Taskiq 只消费 Outbox relay 发送的 task_id。临时错误已由 Runner 在 PostgreSQL 事务内
+    写入延迟 Outbox，故本入口不能重新抛出它再让 SmartRetryMiddleware 绕过 Outbox 写 Redis。
     """
     try:
         parsed_task_id = UUID(task_id)
@@ -127,22 +88,14 @@ async def execute_task(
         return
 
     try:
-        settings = get_settings()
-        may_retry_transient = has_remaining_transient_retry_budget(context.message.labels)
+        del context
         runner = build_task_runner()
-        if not may_retry_transient:
-            await runner.run(parsed_task_id, may_retry_transient=False)
-            return
         await runner.run(
             parsed_task_id,
             may_retry_transient=True,
-            retry_recovery_delay=retry_recovery_delay(
-                recovery_seconds=settings.task_retry_recovery_seconds,
-            ),
+            retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
         )
-    except TransientProviderError:
-        raise
-    except Exception:  # noqa: BLE001 - 未知异常绝不能进入仅供应商错误允许的 SmartRetry。
+    except Exception:  # noqa: BLE001 - 未知异常绝不能绕过已持久化的失败边界。
         # 正常可写数据库路径已由应用用例持久化安全 FAILED/error_code。这里只处理主失败后
         # 数据库同样不可写或 composition 构建失败的最后防线，并且不记录可能敏感的原文。
         return

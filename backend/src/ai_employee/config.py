@@ -35,10 +35,10 @@ class Settings(BaseSettings):
     )
     task_retry_recovery_seconds: int = Field(
         default=360,
-        ge=360,
+        ge=1,
         description=(
-            "Redis 延迟重试事实丢失时，PostgreSQL 恢复扫描等待的保守秒数；至少覆盖 "
-            "300 秒 SmartRetry 最大延迟和一轮 60 秒 scheduler 扫描余量。"
+            "Outbox relay 已确认把延迟重试交给 Redis 后，PostgreSQL 在 Redis 丢失时等待的"
+            "恢复秒数；该期限不用于推断或限制 relay 的交接耗时。"
         ),
     )
     outbox_claim_seconds: int = Field(

@@ -1522,7 +1522,6 @@ Expected: FAIL because queue and worker modules do not exist.
 Create `backend/src/ai_employee/infrastructure/queue/broker.py`:
 
 ~~~python
-from taskiq.middlewares import SmartRetryMiddleware
 from taskiq_redis import RedisStreamBroker
 
 from ai_employee.config import get_settings
@@ -1533,18 +1532,12 @@ broker = RedisStreamBroker(
     url=settings.redis_url,
     queue_name="ai_employee_tasks",
     consumer_group_name="ai_employee_workers",
-).with_middlewares(
-    SmartRetryMiddleware(
-        default_retry_count=3,
-        default_delay=5,
-        use_jitter=True,
-        use_delay_exponent=True,
-        max_delay_exponent=300,
-    )
 )
 ~~~
 
 The enqueue adapter calls `execute_task.kiq(str(task_id))`. It does not use Redis as a result backend.
+Transient retries are scheduled by a PostgreSQL Outbox record with a delayed `available_at`, not by
+SmartRetryMiddleware, so the schedule remains recoverable after Redis loss.
 
 - [ ] **Step 4: Implement lease acquisition and the task entrypoint**
 
@@ -1564,7 +1557,7 @@ from uuid import UUID
 from ai_employee.infrastructure.queue.broker import broker
 
 
-@broker.task(retry_on_error=True)
+@broker.task(retry_on_error=False)
 async def execute_task(task_id: str) -> None:
     runner = build_task_runner()
     await runner.run(UUID(task_id))
@@ -1575,17 +1568,21 @@ each node in `asyncio.timeout(task_step_timeout_seconds)` and the complete run i
 `asyncio.timeout(task_timeout_seconds)`; task kinds may lower these budgets but cannot silently
 remove them.
 
-Catch the Task 5 error taxonomy at the entrypoint: only `TransientProviderError` transitions to
-RETRY_SCHEDULED and is re-raised for Taskiq retry; user-action, permanent, model-final, state, and
-unknown errors transition to the appropriate non-retrying terminal state after writing
-their safe error code. Never let an unknown exception reach SmartRetryMiddleware.
+Catch the Task 5 error taxonomy at the execution boundary: a `TransientProviderError` transitions
+to `RETRY_SCHEDULED` in the same PostgreSQL transaction that writes its audit event and a delayed
+`task.execute` Outbox record. The runner uses durable `attempt_count` for the three-retry limit;
+user-action, permanent, model-final, state, and unknown errors transition to the appropriate
+non-retrying terminal state after writing their safe error code. The entrypoint acknowledges every
+already-persisted result and never bypasses Outbox by asking Taskiq to retry directly.
 
 - [ ] **Step 5: Implement Outbox relay and fixed scheduler jobs**
 
 `relay_once(limit=100)` must use `SELECT FOR UPDATE SKIP LOCKED`, ordered by `available_at`.
 For each claimed record, transition CREATED to QUEUED, move `available_at` forward by a
 60-second delivery lease, and commit before calling Redis. After successful enqueue, set
-`published_at` in a new short transaction. If enqueue fails, retain QUEUED, record the error, and
+`published_at` in a new short transaction. For a delayed retry event, the same confirmation transaction
+also sets its PostgreSQL Redis-loss recovery deadline; before that confirmation the unpublished Outbox
+is itself the recovery fact and the retry scanner must not create a duplicate. If enqueue fails, retain QUEUED, record the error, and
 set `available_at` to the retry backoff. If the relay crashes after claiming, the row becomes due
 again after 60 seconds. A duplicate delivery is safe because the Worker leases from PostgreSQL and
 terminal tasks exit without work.

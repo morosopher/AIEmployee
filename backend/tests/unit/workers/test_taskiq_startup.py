@@ -115,8 +115,8 @@ scheduler.broker.is_scheduler_process = True
 import_tasks(sys.argv[2:], ["**/tasks.py"], False)
 
 async def main():
-    await scheduler.sources[1].startup()
-    schedules = await scheduler.sources[1].get_schedules()
+    await scheduler.sources[0].startup()
+    schedules = await scheduler.sources[0].get_schedules()
     print(json.dumps(sorted(task.schedule_id for task in schedules)))
 
 asyncio.run(main())

@@ -53,8 +53,19 @@ async def _create_retry_scheduled_task(
     *,
     database_url: str,
     recovery_at: datetime,
+    delayed_retry_submission_pending: bool = False,
 ) -> tuple[UUID, UUID]:
-    """写入已发布初始 Outbox 的 RETRY_SCHEDULED 任务，模拟 Redis 被清空后的事实。"""
+    """写入 RETRY_SCHEDULED 任务及其可控的重试投递交接状态。
+
+    Args:
+        database_url: 已隔离的 PostgreSQL 测试连接。
+        recovery_at: PostgreSQL 恢复扫描开始考虑该任务的时刻。
+        delayed_retry_submission_pending: 为 ``True`` 时额外写入尚未发布的延迟重试
+            Outbox，模拟 relay 正常但被暂时阻塞，尚未向 Redis 确认交接。
+
+    Returns:
+        新建用户与任务的稳定标识。
+    """
     session_factory = build_session_factory(database_url)
     try:
         async with session_factory.begin() as session:
@@ -62,27 +73,36 @@ async def _create_retry_scheduled_task(
             task_id = uuid4()
             session.add(user)
             await session.flush()
-            session.add_all(
-                (
-                    TaskRunModel(
-                        id=task_id,
-                        user_id=user.id,
-                        kind="daily_brief",
-                        status=TaskStatus.RETRY_SCHEDULED.value,
-                        idempotency_key=f"retry-recovery:{task_id}",
-                        input_payload={"local_date": "2030-08-01"},
-                        error_code="provider_temporarily_unavailable",
-                        retry_recovery_at=recovery_at,
-                    ),
+            events = [
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user.id,
+                    kind="daily_brief",
+                    status=TaskStatus.RETRY_SCHEDULED.value,
+                    idempotency_key=f"retry-recovery:{task_id}",
+                    input_payload={"local_date": "2030-08-01"},
+                    error_code="provider_temporarily_unavailable",
+                    retry_recovery_at=recovery_at,
+                ),
+                OutboxEventModel(
+                    topic="task.execute",
+                    aggregate_id=task_id,
+                    deduplication_key=f"task.execute:{task_id}:initial",
+                    payload={"task_id": str(task_id)},
+                    published_at=recovery_at - timedelta(minutes=1),
+                ),
+            ]
+            if delayed_retry_submission_pending:
+                events.append(
                     OutboxEventModel(
                         topic="task.execute",
                         aggregate_id=task_id,
-                        deduplication_key=f"task.execute:{task_id}:initial",
+                        deduplication_key=f"task.execute:{task_id}:retry:1",
                         payload={"task_id": str(task_id)},
-                        published_at=recovery_at - timedelta(minutes=1),
-                    ),
+                        available_at=recovery_at,
+                    )
                 )
-            )
+            session.add_all(events)
             return user.id, task_id
     finally:
         await session_factory.dispose()
@@ -198,6 +218,92 @@ async def test_not_due_retry_is_not_recovered(database_url: str) -> None:
         assert task.status == TaskStatus.RETRY_SCHEDULED.value
         assert task.retry_recovery_at == now + timedelta(minutes=1)
         assert len(events) == 1
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pending_durable_retry_submission_blocks_recovery_duplicate(
+    database_url: str,
+) -> None:
+    """正常延迟 Outbox 尚未交接给 Redis 时，扫描器不能抢先补发重复事件。
+
+    这模拟 relay 在已提交的延迟重试 Outbox 与 Redis ``enqueue`` 之间停顿。恢复事实
+    必须等待该既有 Outbox 的交接结果，而不能仅依据时间阈值再创建一个可投递事件。
+    """
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    _, task_id = await _create_retry_scheduled_task(
+        database_url=database_url,
+        recovery_at=now,
+        delayed_retry_submission_pending=True,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        recovered = await RecoverScheduledTaskRetriesUseCase(
+            store=SqlAlchemyTaskRetryRecoveryStore(session_factory)
+        ).execute(now=now + timedelta(hours=1), limit=10)
+
+        assert recovered == 0
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            events = (
+                await session.scalars(
+                    select(OutboxEventModel)
+                    .where(OutboxEventModel.aggregate_id == task_id)
+                    .order_by(OutboxEventModel.created_at, OutboxEventModel.id)
+                )
+            ).all()
+        assert task is not None
+        assert task.status == TaskStatus.RETRY_SCHEDULED.value
+        assert task.retry_recovery_at == now
+        assert {event.deduplication_key for event in events} == {
+            f"task.execute:{task_id}:initial",
+            f"task.execute:{task_id}:retry:1",
+        }
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_retry_recovery_deadline_is_armed_only_after_durable_outbox_is_published(
+    database_url: str,
+) -> None:
+    """Redis 丢失兜底期限必须以后续 enqueue 成功确认，而不是 Runner 预估为准。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    _, task_id = await _create_retry_scheduled_task(
+        database_url=database_url,
+        recovery_at=now,
+        delayed_retry_submission_pending=True,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    try:
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(
+                session_factory,
+                retry_recovery_delay=timedelta(seconds=30),
+            ),
+            enqueuer=enqueuer,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        assert await relay.relay_once(limit=10) == 1
+        assert enqueuer.task_ids == [task_id]
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            event = await session.scalar(
+                select(OutboxEventModel).where(
+                    OutboxEventModel.aggregate_id == task_id,
+                    OutboxEventModel.deduplication_key == f"task.execute:{task_id}:retry:1",
+                )
+            )
+        assert task is not None
+        assert task.retry_recovery_at == now + timedelta(seconds=30)
+        assert event is not None
+        assert event.published_at == now
     finally:
         await session_factory.dispose()
 

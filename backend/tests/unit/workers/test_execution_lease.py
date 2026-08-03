@@ -2,7 +2,6 @@
 
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -17,7 +16,7 @@ from ai_employee.application.use_cases.task_execution import (
 from ai_employee.config import Settings
 from ai_employee.domain.errors import TransientProviderError
 from ai_employee.domain.tasks import TaskStatus
-from ai_employee.infrastructure.queue.broker import broker, retry_schedule_source
+from ai_employee.infrastructure.queue.broker import broker
 from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
 
 
@@ -64,91 +63,57 @@ def test_runner_rejects_lease_shorter_than_step_timeout() -> None:
             lease_duration=timedelta(seconds=9),
             task_timeout_seconds=60,
             task_step_timeout_seconds=10,
+            max_transient_retries=3,
             resolve_steps=lambda leased: (),
         )
 
 
-def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -> None:
-    """队列将 SmartRetry 的延迟交给共享 Redis 调度源，而不是被 Stream 立即消费。"""
+def test_redis_stream_broker_uses_fixed_queue_group_without_redis_retry_scheduler() -> None:
+    """延迟重试只由 PostgreSQL Outbox 表达，Taskiq 不安装 Redis 重试中间件。"""
     assert broker.queue_name == "ai_employee_tasks"
     assert broker.consumer_group_name == "ai_employee_workers"
     assert broker.consumer_id == "0-0"
-    assert len(broker.middlewares) == 1
-    retry = broker.middlewares[0]
-    assert retry.default_retry_count == 3
-    assert retry.default_delay == 5
-    assert retry.use_jitter is True
-    assert retry.use_delay_exponent is True
-    assert retry.max_delay_exponent == 300
-    assert retry.schedule_source is retry_schedule_source
-    assert execute_task_module.execute_task.labels["retry_on_error"] is True
+    assert broker.middlewares == []
+    assert execute_task_module.execute_task.labels["retry_on_error"] is False
 
 
 def test_retry_recovery_delay_covers_taskiq_max_delay_and_scheduler_margin() -> None:
-    """Redis 计划写入交接耗时不能让一分钟恢复扫描抢先于 SmartRetry。"""
+    """耐久重试以固定短延迟投递，恢复期限由 relay 确认后另行处理。"""
     settings = Settings()
 
     assert settings.task_retry_recovery_seconds == 360
-    assert execute_task_module.retry_recovery_delay(
-        recovery_seconds=settings.task_retry_recovery_seconds
-    ) == timedelta(seconds=360)
-    with pytest.raises(ValidationError):
-        Settings(task_retry_recovery_seconds=359)
-    with pytest.raises(ValueError, match="scheduler margin"):
-        execute_task_module.retry_recovery_delay(recovery_seconds=359)
-
-
-@pytest.mark.parametrize(
-    ("labels", "expected"),
-    [
-        ({}, True),
-        ({"_retries": 2}, False),
-        ({"max_retries": 1}, False),
-        ({"_retries": 3, "max_retries": 5}, True),
-        ({"_retries": 4, "max_retries": 5}, False),
-    ],
-)
-def test_worker_uses_taskiq_retry_label_semantics(labels: dict[str, int], expected: bool) -> None:
-    """Worker 的预算判断必须与 Taskiq 0.12.4 的 ``_retries``/``max_retries`` 语义一致。"""
-    assert execute_task_module.has_remaining_transient_retry_budget(labels) is expected
-
-
-@pytest.mark.parametrize(
-    "labels",
-    [
-        {"_retries": float("inf")},
-        {"max_retries": float("inf")},
-    ],
-)
-def test_worker_treats_overflowing_retry_labels_as_exhausted(labels: dict[str, float]) -> None:
-    """无穷重试标签无效时必须保守返回 False，避免租约前 ACK 遗留任务。"""
-    assert execute_task_module.has_remaining_transient_retry_budget(labels) is False
+    assert execute_task_module.RETRY_DELAY_SECONDS == 5
 
 
 @pytest.mark.asyncio
-async def test_taskiq_entrypoint_treats_invalid_retry_labels_as_exhausted(
+async def test_taskiq_entrypoint_uses_durable_retry_without_reading_message_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """损坏标签必须保守进入 Runner，不能在租约前被 ACK 而遗留 RETRY_SCHEDULED。"""
+    """消息标签不再控制重试，Runner 使用 PostgreSQL attempt_count 保持上限。"""
     task_id = uuid4()
     received: list[tuple[UUID, bool]] = []
 
     class RecordingRunner:
         """记录 Worker 传递的基础设施无关重试预算。"""
 
-        async def run(self, received_task_id: UUID, *, may_retry_transient: bool) -> bool:
+        async def run(
+            self,
+            received_task_id: UUID,
+            *,
+            may_retry_transient: bool,
+            retry_delay: timedelta,
+        ) -> bool:
             """记录当前任务与保守预算决定，不连接任何持久化基础设施。"""
+            del retry_delay
             received.append((received_task_id, may_retry_transient))
             return True
 
     monkeypatch.setattr(execute_task_module, "build_task_runner", lambda: RecordingRunner())
-    context = SimpleNamespace(
-        message=SimpleNamespace(labels={"_retries": "not-an-int"}),
-    )
+    context = object()
 
     await execute_task_module.execute_task.original_func(str(task_id), context)
 
-    assert received == [(task_id, False)]
+    assert received == [(task_id, True)]
 
 
 @pytest.mark.asyncio
@@ -185,6 +150,7 @@ class RecordingLeaseStore:
         self.renewed: list[tuple[UUID, str, datetime]] = []
         self.finished: list[tuple[TaskStatus, str | None]] = []
         self.retry_recovery_deadlines: list[datetime | None] = []
+        self.scheduled_retries: list[tuple[UUID, str, datetime, datetime, str, int]] = []
         self.internal_failures: list[tuple[UUID, str, datetime, str]] = []
         self.allow_renew = True
         self.allow_finish = True
@@ -230,6 +196,29 @@ class RecordingLeaseStore:
         """记录带 owner 的终态 CAS；结果由测试开关控制。"""
         self.finished.append((status, error_code))
         self.retry_recovery_deadlines.append(retry_recovery_at)
+        return self.allow_finish
+
+    async def schedule_retry(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        scheduled_at: datetime,
+        retry_available_at: datetime,
+        error_code: str,
+        attempt_count: int,
+    ) -> bool:
+        """记录耐久重试 Outbox 的全部输入，避免测试依赖 Redis 或 Taskiq。"""
+        self.scheduled_retries.append(
+            (
+                task_id,
+                lease_owner,
+                scheduled_at,
+                retry_available_at,
+                error_code,
+                attempt_count,
+            )
+        )
         return self.allow_finish
 
     async def fail_internal(
@@ -350,6 +339,7 @@ def _runner(
         lease_duration=timedelta(seconds=30),
         task_timeout_seconds=task_timeout_seconds,
         task_step_timeout_seconds=task_step_timeout_seconds,
+        max_transient_retries=3,
         resolve_steps=lambda task: steps,
     )
 
@@ -410,7 +400,7 @@ async def test_runner_does_not_commit_terminal_state_after_renew_loses_lease() -
 
 @pytest.mark.asyncio
 async def test_step_timeout_is_persisted_as_stable_non_retryable_failure() -> None:
-    """单节点超过独立截止时间时写稳定错误码，且异常不会进入 Taskiq SmartRetry。"""
+    """单节点超过独立截止时间时写稳定错误码，且异常不会创建重试 Outbox。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     clock = MutableClock(now)
     task = _leased_task(started_at=now)
@@ -485,10 +475,10 @@ async def test_acquisition_latency_is_included_in_whole_task_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retry_state_is_durable() -> (
+async def test_transient_provider_error_creates_durable_retry_outbox_without_taskiq_rethrow() -> (
     None
 ):
-    """临时错误延后发生时，恢复期限仍从实际失败边界起算。"""
+    """临时错误只创建耐久延迟 Outbox，不能绕过 relay 交给 Taskiq。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     clock = MutableClock(now)
     task = _leased_task(started_at=now)
@@ -509,17 +499,26 @@ async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retr
         steps=(CallableStep("provider", fail_transiently),),
     )
 
-    with pytest.raises(TransientProviderError) as raised:
-        await runner.run(
-            task_id=task.task_id,
-            lease_owner="worker-a",
-            may_retry_transient=True,
-            retry_recovery_delay=timedelta(seconds=360),
-        )
+    owned = await runner.run(
+        task_id=task.task_id,
+        lease_owner="worker-a",
+        may_retry_transient=True,
+        retry_delay=timedelta(seconds=5),
+    )
 
-    assert raised.value is transient
-    assert store.finished == [(TaskStatus.RETRY_SCHEDULED, "provider_temporarily_unavailable")]
-    assert store.retry_recovery_deadlines == [now + timedelta(seconds=662)]
+    assert owned is True
+    assert store.finished == []
+    assert store.retry_recovery_deadlines == []
+    assert store.scheduled_retries == [
+        (
+            task.task_id,
+            "worker-a",
+            now + timedelta(seconds=302),
+            now + timedelta(seconds=307),
+            "provider_temporarily_unavailable",
+            1,
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -556,8 +555,8 @@ async def test_transient_provider_error_without_retry_budget_is_persisted_as_ter
 
 
 @pytest.mark.asyncio
-async def test_transient_retry_without_postgresql_recovery_deadline_safely_fails() -> None:
-    """遗漏恢复期限不能留下仅依赖 Redis 的 RETRY_SCHEDULED 悬挂任务。"""
+async def test_transient_retry_without_durable_delay_safely_fails() -> None:
+    """遗漏延迟 Outbox 的可投递时刻不能留下 RETRY_SCHEDULED 悬挂任务。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     task = _leased_task(started_at=now)
     store = RecordingLeaseStore(task)
@@ -582,7 +581,7 @@ async def test_transient_retry_without_postgresql_recovery_deadline_safely_fails
     )
 
     assert owned is True
-    assert store.finished == [(TaskStatus.FAILED, "task_retry_recovery_deadline_missing")]
+    assert store.finished == [(TaskStatus.FAILED, "task_retry_delay_missing")]
 
 
 @pytest.mark.asyncio
@@ -610,7 +609,7 @@ async def test_unknown_exception_is_safely_failed_without_reaching_retry() -> No
 
 @pytest.mark.asyncio
 async def test_prepare_retry_unknown_error_requests_safe_non_retry_failure() -> None:
-    """重试准备未知异常必须尝试写安全失败码，且不能逃逸到 SmartRetry。"""
+    """重试准备未知异常必须尝试写安全失败码，且不能绕过持久化边界。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     task = _leased_task(started_at=now)
     store = FailingPrepareStore(task)
@@ -672,7 +671,7 @@ async def test_internal_failure_cas_miss_does_not_fallback_to_overwrite_owner() 
 async def test_taskiq_entrypoint_swallows_unknown_when_failure_cannot_be_persisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """数据库也不可写时入口作为最后防线终止未知异常，不让 SmartRetry 接收它。"""
+    """数据库也不可写时入口作为最后防线终止未知异常，不创建无事实的重试。"""
     monkeypatch.setattr(
         execute_task_module,
         "build_task_runner",
