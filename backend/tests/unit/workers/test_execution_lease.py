@@ -2,6 +2,7 @@
 
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -96,6 +97,32 @@ def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -
 def test_worker_uses_taskiq_retry_label_semantics(labels: dict[str, int], expected: bool) -> None:
     """Worker 的预算判断必须与 Taskiq 0.12.4 的 ``_retries``/``max_retries`` 语义一致。"""
     assert execute_task_module.has_remaining_transient_retry_budget(labels) is expected
+
+
+@pytest.mark.asyncio
+async def test_taskiq_entrypoint_treats_invalid_retry_labels_as_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """损坏标签必须保守进入 Runner，不能在租约前被 ACK 而遗留 RETRY_SCHEDULED。"""
+    task_id = uuid4()
+    received: list[tuple[UUID, bool]] = []
+
+    class RecordingRunner:
+        """记录 Worker 传递的基础设施无关重试预算。"""
+
+        async def run(self, received_task_id: UUID, *, may_retry_transient: bool) -> bool:
+            """记录当前任务与保守预算决定，不连接任何持久化基础设施。"""
+            received.append((received_task_id, may_retry_transient))
+            return True
+
+    monkeypatch.setattr(execute_task_module, "build_task_runner", lambda: RecordingRunner())
+    context = SimpleNamespace(
+        message=SimpleNamespace(labels={"_retries": "not-an-int"}),
+    )
+
+    await execute_task_module.execute_task.original_func(str(task_id), context)
+
+    assert received == [(task_id, False)]
 
 
 @pytest.mark.asyncio

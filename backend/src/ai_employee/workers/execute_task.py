@@ -32,13 +32,14 @@ def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
     Returns:
         当本次失败后仍满足 ``retries < max_retries`` 时返回 ``True``。默认上限复用 broker
         模块供 SmartRetryMiddleware 配置使用的同一常量，避免两处策略发生漂移。
-
-    Raises:
-        ValueError: 标签值不能按 Taskiq 的整数规则转换时原样抛出，避免把损坏内部消息
-            误判成可安全重试。
     """
-    retries = int(labels.get("_retries", 0)) + 1
-    max_retries = int(labels.get("max_retries", DEFAULT_RETRY_COUNT))
+    try:
+        retries = int(labels.get("_retries", 0)) + 1
+        max_retries = int(labels.get("max_retries", DEFAULT_RETRY_COUNT))
+    except (TypeError, ValueError):
+        # 队列损坏时不能在获取 PostgreSQL 租约前静默 ACK。保守地禁用后续自动重投，
+        # 使 Runner 能把任何临时错误收敛为 owner-safe 的 FAILED 终态。
+        return False
     return retries < max_retries
 
 

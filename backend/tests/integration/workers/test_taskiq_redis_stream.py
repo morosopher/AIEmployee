@@ -210,13 +210,14 @@ async def test_smart_retry_waits_in_redis_schedule_source_before_scheduler_enque
             """
 import asyncio
 import json
+import sys
 
 from redis.asyncio import Redis
 from taskiq.message import TaskiqMessage
 from taskiq.result import TaskiqResult
 from taskiq.cli.scheduler.run import SchedulerLoop
 
-import taskiq.middlewares.smart_retry as smart_retry_module
+import taskiq.middlewares.smart_retry_middleware as smart_retry_module
 from ai_employee.domain.errors import TransientProviderError
 from ai_employee.infrastructure.queue.broker import broker, retry_schedule_source
 from ai_employee.infrastructure.queue.scheduler import scheduler
