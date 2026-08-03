@@ -7,8 +7,7 @@ describe('task API types', () => {
     expect(asEventCursor(value)).toBe(value)
   })
 
-  it.each(['', '+1', '-1', ' 1', '1 ', '01', '00'])
-  ('rejects noncanonical cursor %s', (value) => {
+  it.each(['', '+1', '-1', ' 1', '1 ', '01', '00'])('rejects noncanonical cursor %s', (value) => {
     expect(asEventCursor(value)).toBeNull()
   })
 
