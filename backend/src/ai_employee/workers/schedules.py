@@ -1,4 +1,4 @@
-"""把 Task 7 三个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
+"""把 Task 7 四个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
 
 from datetime import UTC, datetime
 

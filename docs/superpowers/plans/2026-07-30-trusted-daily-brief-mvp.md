@@ -2989,7 +2989,7 @@ Add an AppShell test that shows the overdue brief as a persistent red banner wit
 diagnostic task, and removes it after the alerts endpoint no longer returns it.
 
 Add a backend scheduler test that imports all task modules and finds exactly these schedule IDs:
-`outbox-relay`, `due-daily-briefs`, `expire-sessions`, `expire-approvals`,
+`outbox-relay`, `recover-task-retries`, `due-daily-briefs`, `expire-sessions`, `expire-approvals`,
 `google-incremental-sync`, `brief-overdue-diagnostics`, and `retention-cleanup`. Assert
 `retention-cleanup` uses cron `30 2 * * *`.
 
