@@ -37,6 +37,12 @@ class TaskRunModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "task_runs"
     __table_args__ = (
+        Index(
+            "ix_task_runs_approval_checkpoint_recovery",
+            "approval_checkpoint_recovery_at",
+            "id",
+            postgresql_where=text("approval_checkpoint_recovery_at IS NOT NULL"),
+        ),
         UniqueConstraint("id", "user_id", name="uq_task_runs_id_user_id"),
         UniqueConstraint(
             "user_id",
@@ -88,6 +94,10 @@ class TaskRunModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
     retry_recovery_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    approval_checkpoint_recovery_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

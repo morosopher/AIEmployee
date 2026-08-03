@@ -50,6 +50,7 @@ class TaskExecutionStore(Protocol):
         lease_owner: str,
         now: datetime,
         lease_expires_at: datetime,
+        recover_waiting_approval: bool = False,
     ) -> LeasedTask | None:
         """尝试获取任务租约，未命中时返回 ``None``。"""
 
@@ -185,6 +186,7 @@ class DurableTaskRunner:
         *,
         may_retry_transient: bool = True,
         retry_delay: timedelta | None = None,
+        recover_waiting_approval: bool = False,
     ) -> bool:
         """获取租约并执行一次持久任务尝试。
 
@@ -212,12 +214,21 @@ class DurableTaskRunner:
             raise ValueError("retry_delay must be positive")
         try:
             await self._store.prepare_retry(task_id=task_id, now=now)
-            leased = await self._store.acquire(
-                task_id=task_id,
-                lease_owner=owner,
-                now=now,
-                lease_expires_at=now + self._lease_duration,
-            )
+            if recover_waiting_approval:
+                leased = await self._store.acquire(
+                    task_id=task_id,
+                    lease_owner=owner,
+                    now=now,
+                    lease_expires_at=now + self._lease_duration,
+                    recover_waiting_approval=True,
+                )
+            else:
+                leased = await self._store.acquire(
+                    task_id=task_id,
+                    lease_owner=owner,
+                    now=now,
+                    lease_expires_at=now + self._lease_duration,
+                )
         except Exception:  # noqa: BLE001 - 前置数据库未知异常必须转成稳定非重试失败。
             # acquisition 可能已在数据库提交但响应丢失；安全失败端口同时接受本 owner，
             # 又以状态/owner CAS 拒绝覆盖另一个有效 Worker 或任何终态。

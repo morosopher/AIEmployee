@@ -101,6 +101,9 @@ class SqlAlchemyOutboxStore:
                             if event.payload.get("resume") in {"approved", "rejected"}
                             else None,
                         ),
+                        recover_approval_checkpoint=(
+                            event.payload.get("recover_approval_checkpoint") is True
+                        ),
                     )
                 )
             return tuple(claimed)

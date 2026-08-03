@@ -2,6 +2,9 @@
 
 from datetime import UTC, datetime
 
+from ai_employee.application.use_cases.approval_checkpoint_recovery import (
+    RecoverApprovalCheckpointsUseCase,
+)
 from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.outbox import OutboxRelay
@@ -16,6 +19,9 @@ from ai_employee.application.use_cases.task_retry_recovery import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.config import get_settings
+from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery import (
+    SqlAlchemyApprovalCheckpointRecoveryStore,
+)
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
@@ -36,6 +42,7 @@ __all__ = [
     "expire_approvals",
     "expire_sessions",
     "is_daily_brief_due",
+    "recover_approval_checkpoints",
     "recover_task_retries",
     "relay_outbox",
     "scheduled_daily_brief_instant",
@@ -95,4 +102,13 @@ async def expire_sessions() -> None:
 async def expire_approvals() -> None:
     """每分钟锁定有界过期待审批并原子写入失败及无内容审计。"""
     use_case = ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory))
+    await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
+
+
+@broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "recover-approval-checkpoints"}])
+async def recover_approval_checkpoints() -> None:
+    """每分钟补投 Redis 丢失前尚未保存 interrupt checkpoint 的冻结审批。"""
+    use_case = RecoverApprovalCheckpointsUseCase(
+        store=SqlAlchemyApprovalCheckpointRecoveryStore(session_factory)
+    )
     await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)

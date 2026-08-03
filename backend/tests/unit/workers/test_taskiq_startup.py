@@ -12,6 +12,7 @@ EXPECTED_TASK_NAMES = [
     "ai_employee.workers.schedules:dispatch_due_briefs",
     "ai_employee.workers.schedules:expire_approvals",
     "ai_employee.workers.schedules:expire_sessions",
+    "ai_employee.workers.schedules:recover_approval_checkpoints",
     "ai_employee.workers.schedules:recover_task_retries",
     "ai_employee.workers.schedules:relay_outbox",
 ]
@@ -20,6 +21,7 @@ EXPECTED_SCHEDULE_IDS = [
     "expire-approvals",
     "expire-sessions",
     "outbox-relay",
+    "recover-approval-checkpoints",
     "recover-task-retries",
 ]
 
@@ -67,7 +69,7 @@ def _run_clean_registration_probe(script: str, *arguments: str) -> list[str]:
 
 
 def test_worker_recipe_registers_all_tasks_in_a_clean_process() -> None:
-    """Worker 必须由真实启动命令显式加载执行入口与五个固定 job。"""
+    """Worker 必须由真实启动命令显式加载执行入口与六个固定 job。"""
     tokens = _dry_run_recipe("worker")
     broker_path = "ai_employee.infrastructure.queue.broker:broker"
     broker_index = tokens.index(broker_path)
@@ -96,7 +98,7 @@ print(json.dumps(sorted(broker.get_all_tasks())))
     assert registered == EXPECTED_TASK_NAMES
 
 
-def test_scheduler_recipe_exposes_five_stable_label_jobs_in_a_clean_process() -> None:
+def test_scheduler_recipe_exposes_six_stable_label_jobs_in_a_clean_process() -> None:
     """Scheduler 启动配置必须显式加载固定 job，并由 label source 返回稳定 ID。"""
     tokens = _dry_run_recipe("scheduler")
     scheduler_path = "ai_employee.infrastructure.queue.scheduler:scheduler"

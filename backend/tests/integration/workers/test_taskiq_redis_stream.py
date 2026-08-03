@@ -20,6 +20,7 @@ EXPECTED_TASK_NAMES = [
     "ai_employee.workers.schedules:dispatch_due_briefs",
     "ai_employee.workers.schedules:expire_approvals",
     "ai_employee.workers.schedules:expire_sessions",
+    "ai_employee.workers.schedules:recover_approval_checkpoints",
     "ai_employee.workers.schedules:recover_task_retries",
     "ai_employee.workers.schedules:relay_outbox",
 ]

@@ -72,6 +72,7 @@ class FakeWriteGraph:
                 proposal=proposal,
                 preview_markdown="将执行合成假写操作。",
                 expires_at=self._clock() + self._approval_ttl,
+                checkpoint_recovery_at=self._clock(),
             )
         if pending.status == "pending":
             decision = interrupt(

@@ -1,16 +1,22 @@
 """在真实 PostgreSQL checkpoint 上验证假写审批中断与恢复。"""
 
 import asyncio
+import os
 from datetime import UTC, datetime, time, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from langgraph.types import Command
+from redis.asyncio import Redis
 from sqlalchemy import select
 
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
+from ai_employee.application.use_cases.approval_checkpoint_recovery import (
+    RecoverApprovalCheckpointsUseCase,
+)
 from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase, PendingApproval
+from ai_employee.application.use_cases.task_execution import DurableTaskRunner
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
@@ -19,8 +25,137 @@ from ai_employee.infrastructure.db.models.tasks import (
     OutboxEventModel,
     TaskRunModel,
 )
+from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery import (
+    SqlAlchemyApprovalCheckpointRecoveryStore,
+)
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
+from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.queue.redis_url import validate_test_redis_url
+from ai_employee.workers.execute_task import _FakeWriteStep
+
+
+async def test_scanner_recovers_published_initial_message_lost_with_redis_before_interrupt_checkpoint(
+    database_url: str,
+) -> None:
+    """冻结审批后的崩溃可仅依靠 PostgreSQL 补投并完成一次安全决议。
+
+    初始 Outbox 已被 relay 标记 published 后模拟 Redis 清空，因此它不能再作为恢复来源。
+    扫描器必须从冻结事务留下的 PostgreSQL recovery anchor 创建新消息；恢复 Worker 保存
+    interrupt checkpoint 后清除该 anchor，用户随后才能通过 checkpoint 门槛提交决定。
+    """
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    task_id = uuid4()
+    now = datetime.now(UTC)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="checkpoint-recovery@example.test",
+                    display_name="Checkpoint Recovery",
+                    password_hash="fake",
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="initial-worker",
+                    idempotency_key="checkpoint-recovery",
+                    input_payload={"value": "synthetic"},
+                )
+            )
+
+        store = SqlAlchemyApprovalStore(session_factory)
+        await store.create_or_get_pending(
+            task_id=task_id,
+            lease_owner="initial-worker",
+            proposal=ApprovalProposal.create("fake.write", {"value": "synthetic"}),
+            preview_markdown="将执行合成假写操作。",
+            expires_at=now + timedelta(minutes=5),
+            checkpoint_recovery_at=now,
+        )
+        async with session_factory.begin() as session:
+            initial_event = OutboxEventModel(
+                topic="task.execute",
+                aggregate_id=task_id,
+                deduplication_key=f"task.execute:{task_id}:initial",
+                payload={"task_id": str(task_id)},
+                available_at=now,
+                published_at=now,
+            )
+            session.add(initial_event)
+
+        redis_value = os.environ.get("TEST_REDIS_URL")
+        assert redis_value is not None
+        redis_url = validate_test_redis_url(redis_value).value
+        redis = Redis.from_url(str(redis_url), decode_responses=False)
+        try:
+            await redis.flushdb()
+        finally:
+            await redis.aclose()
+
+        recovered = await RecoverApprovalCheckpointsUseCase(
+            store=SqlAlchemyApprovalCheckpointRecoveryStore(session_factory)
+        ).execute(now=now, limit=10)
+        assert recovered == 1
+        async with session_factory() as session:
+            recovery_event = await session.scalar(
+                select(OutboxEventModel).where(
+                    OutboxEventModel.aggregate_id == task_id,
+                    OutboxEventModel.published_at.is_(None),
+                )
+            )
+            assert recovery_event is not None
+            assert recovery_event.payload == {
+                "task_id": str(task_id),
+                "recover_approval_checkpoint": True,
+            }
+        runner = DurableTaskRunner(
+            store=SqlAlchemyTaskExecutionStore(session_factory),
+            clock=lambda: now,
+            lease_duration=timedelta(minutes=1),
+            task_timeout_seconds=60,
+            task_step_timeout_seconds=30,
+            max_transient_retries=0,
+            resolve_steps=lambda _task: (
+                _FakeWriteStep(
+                    approval_store=store,
+                    resume=None,
+                    checkpoint_database_url=database_url,
+                ),
+            ),
+        )
+        assert await runner.run(
+            task_id,
+            lease_owner="recovery-worker",
+            recover_waiting_approval=True,
+        )
+        async with session_factory() as session:
+            recovered_task = await session.get(TaskRunModel, task_id)
+        assert recovered_task is not None
+        assert recovered_task.status == TaskStatus.WAITING_APPROVAL.value
+        assert recovered_task.approval_checkpoint_recovery_at is None
+
+        async with session_factory() as session:
+            approval = await session.scalar(select(ApprovalRequestModel))
+        assert approval is not None
+        await ApprovalDecisionUseCase(store).execute(
+            approval_id=approval.id,
+            user_id=user_id,
+            decision="rejected",
+            version=approval.version,
+            payload_hash=approval.payload_hash,
+            now=now,
+        )
+    finally:
+        await session_factory.dispose()
 
 
 async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: str) -> None:
@@ -270,6 +405,7 @@ async def test_decision_waits_until_first_interrupt_checkpoint_is_durable(
             proposal=ApprovalProposal.create("fake.write", {"value": "synthetic"}),
             preview_markdown="将执行合成假写操作。",
             expires_at=now + timedelta(minutes=5),
+            checkpoint_recovery_at=now,
         )
         async with session_factory() as session:
             approval = await session.scalar(select(ApprovalRequestModel))

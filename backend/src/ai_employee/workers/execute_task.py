@@ -137,6 +137,10 @@ class _FakeWriteStep:
                     config=config,
                 )
         if isinstance(result, dict) and "__interrupt__" in result:
+            await self._approval_store.confirm_approval_checkpoint(
+                task_id=task.task_id,
+                lease_owner=task.lease_owner or "",
+            )
             raise TaskWaitingApproval
 
 
@@ -168,6 +172,7 @@ async def execute_task(
     task_id: str,
     context: Context = taskiq_context_dependency,
     resume: str | None = None,
+    recover_approval_checkpoint: bool = False,
 ) -> None:
     """解析 task_id，并把临时供应商错误写为耐久延迟 Outbox 重试。
 
@@ -229,6 +234,7 @@ async def execute_task(
                 parsed_task_id,
                 may_retry_transient=True,
                 retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
+                recover_waiting_approval=recover_approval_checkpoint,
             )
         finally:
             await session_factory.dispose()

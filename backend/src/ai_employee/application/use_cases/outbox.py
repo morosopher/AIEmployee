@@ -11,7 +11,13 @@ from ai_employee.domain.tasks import TaskStatus
 class TaskEnqueuer(Protocol):
     """定义只把稳定 task_id 发送到外部队列的窄端口。"""
 
-    async def enqueue(self, task_id: UUID, *, resume: str | None = None) -> None:
+    async def enqueue(
+        self,
+        task_id: UUID,
+        *,
+        resume: str | None = None,
+        recover_approval_checkpoint: bool = False,
+    ) -> None:
         """把任务标识投递到队列；实现不得携带业务正文或结果。"""
 
 
@@ -31,6 +37,7 @@ class ClaimedOutboxEvent:
     claim_until: datetime
     attempt_count: int
     resume: str | None = None
+    recover_approval_checkpoint: bool = False
 
 
 class OutboxStore(Protocol):
@@ -166,7 +173,13 @@ class OutboxRelay:
         for claim in claims:
             try:
                 if claim.resume is None:
-                    await self._enqueuer.enqueue(claim.task_id)
+                    if claim.recover_approval_checkpoint:
+                        await self._enqueuer.enqueue(
+                            claim.task_id,
+                            recover_approval_checkpoint=True,
+                        )
+                    else:
+                        await self._enqueuer.enqueue(claim.task_id)
                 else:
                     await self._enqueuer.enqueue(claim.task_id, resume=claim.resume)
             except Exception:  # noqa: BLE001 - 外部队列边界需统一转为安全持久失败。

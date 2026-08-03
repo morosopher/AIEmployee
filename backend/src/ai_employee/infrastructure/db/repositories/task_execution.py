@@ -84,6 +84,7 @@ class SqlAlchemyTaskExecutionStore:
         lease_owner: str,
         now: datetime,
         lease_expires_at: datetime,
+        recover_waiting_approval: bool = False,
     ) -> LeasedTask | None:
         """以一条条件 UPDATE 获取 QUEUED 或租约已过期 RUNNING 任务。
 
@@ -115,6 +116,14 @@ class SqlAlchemyTaskExecutionStore:
                 TaskRunModel.lease_expires_at <= now,
             ),
         )
+        if recover_waiting_approval:
+            eligible_status = or_(
+                eligible_status,
+                and_(
+                    TaskRunModel.status == TaskStatus.WAITING_APPROVAL.value,
+                    TaskRunModel.approval_checkpoint_recovery_at.is_not(None),
+                ),
+            )
         lease_available = or_(
             TaskRunModel.lease_expires_at.is_(None),
             TaskRunModel.lease_expires_at <= now,

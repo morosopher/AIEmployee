@@ -18,7 +18,13 @@ class TaskiqTaskEnqueuer:
         """保存只接受规范 UUID 字符串的窄发送函数。"""
         self._task_sender = task_sender
 
-    async def enqueue(self, task_id: UUID, *, resume: str | None = None) -> None:
+    async def enqueue(
+        self,
+        task_id: UUID,
+        *,
+        resume: str | None = None,
+        recover_approval_checkpoint: bool = False,
+    ) -> None:
         """调用 Taskiq decorated task 的 ``kiq`` 发送规范 UUID 字符串。
 
         Args:
@@ -28,7 +34,11 @@ class TaskiqTaskEnqueuer:
             Exception: Taskiq/Redis enqueue 失败原样交给 Outbox relay，以便在新事务中记录
                 固定安全错误码和下一次退避时间。
         """
-        if resume is None:
+        if resume is None and not recover_approval_checkpoint:
             await self._task_sender(str(task_id))
             return
-        await self._task_sender(str(task_id), resume=resume)
+        await self._task_sender(
+            str(task_id),
+            resume=resume,
+            recover_approval_checkpoint=recover_approval_checkpoint,
+        )

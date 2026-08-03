@@ -50,6 +50,7 @@ class SqlAlchemyApprovalStore:
         proposal: ApprovalProposal,
         preview_markdown: str,
         expires_at: datetime,
+        checkpoint_recovery_at: datetime,
     ) -> PendingApproval:
         """仅当前 ``RUNNING`` owner 能冻结提案并暂停任务。
 
@@ -111,6 +112,9 @@ class SqlAlchemyApprovalStore:
             task.lease_owner = None
             task.lease_expires_at = None
             task.graph_thread_id = str(task_id)
+            # Checkpoint 由 LangGraph 在本事务之后单独提交；在此之前必须保留 PG anchor，
+            # 以便初始 Redis 消息已确认但 Worker 崩溃时仍可由分钟扫描器恢复。
+            task.approval_checkpoint_recovery_at = checkpoint_recovery_at
             session.add(approval)
             session.add(
                 AuditEventModel(
@@ -126,6 +130,53 @@ class SqlAlchemyApprovalStore:
             return PendingApproval(
                 approval_id=approval.id, version=approval.version, status=approval.status
             )
+
+    async def confirm_approval_checkpoint(self, *, task_id: UUID, lease_owner: str) -> None:
+        """在已保存 ``__interrupt__`` 后清除冻结审批的恢复 anchor。
+
+        这一步允许在初始 Worker 崩溃于 checkpoint 提交之后安全重复：扫描器会先用同一
+        PostgreSQL checkpoint 事实确认，再收敛 anchor，绝不依赖 Redis Stream 是否保留。
+        """
+        async with self._session_factory.begin() as session:
+            task = await session.scalar(
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.id == task_id,
+                    (
+                        (TaskRunModel.status == TaskStatus.WAITING_APPROVAL.value)
+                        | (
+                            (TaskRunModel.status == TaskStatus.RUNNING.value)
+                            & (TaskRunModel.lease_owner == lease_owner)
+                        )
+                    ),
+                )
+                .with_for_update()
+            )
+            if task is None:
+                return
+            durable_interrupt = await session.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM checkpoint_writes AS checkpoint_write
+                        INNER JOIN checkpoints AS checkpoint
+                            ON checkpoint.thread_id = checkpoint_write.thread_id
+                            AND checkpoint.checkpoint_ns = checkpoint_write.checkpoint_ns
+                            AND checkpoint.checkpoint_id = checkpoint_write.checkpoint_id
+                        WHERE checkpoint_write.thread_id = :thread_id
+                            AND checkpoint_write.channel = '__interrupt__'
+                    )
+                    """
+                ),
+                {"thread_id": str(task_id)},
+            )
+            if durable_interrupt is True:
+                task.approval_checkpoint_recovery_at = None
+                if task.status == TaskStatus.RUNNING.value:
+                    task.status = TaskStatus.WAITING_APPROVAL.value
+                    task.lease_owner = None
+                    task.lease_expires_at = None
 
     async def find_for_graph(self, *, task_id: UUID, payload_hash: str) -> PendingApproval | None:
         """读取同一任务和哈希的审批快照，不把终态重新解释为待审批。"""

@@ -20,6 +20,7 @@ from ai_employee.workers.schedules import (
     expire_approvals,
     expire_sessions,
     is_daily_brief_due,
+    recover_approval_checkpoints,
     recover_task_retries,
     relay_outbox,
     scheduled_daily_brief_instant,
@@ -153,6 +154,9 @@ def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
     assert relay_outbox.labels["schedule"] == [{"cron": "* * * * *", "schedule_id": "outbox-relay"}]
     assert recover_task_retries.labels["schedule"] == [
         {"cron": "* * * * *", "schedule_id": "recover-task-retries"}
+    ]
+    assert recover_approval_checkpoints.labels["schedule"] == [
+        {"cron": "* * * * *", "schedule_id": "recover-approval-checkpoints"}
     ]
     assert dispatch_due_briefs.labels["schedule"] == [
         {"cron": "* * * * *", "schedule_id": "due-daily-briefs"}

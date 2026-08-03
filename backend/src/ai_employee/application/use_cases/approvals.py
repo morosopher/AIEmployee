@@ -49,8 +49,9 @@ class ApprovalProposalStore(Protocol):
         proposal: ApprovalProposal,
         preview_markdown: str,
         expires_at: datetime,
+        checkpoint_recovery_at: datetime,
     ) -> PendingApproval:
-        """以当前 ``RUNNING`` 租约原子创建审批、步骤、状态与审计事实。"""
+        """以当前 ``RUNNING`` 租约原子创建审批、步骤、状态、审计与恢复事实。"""
 
     async def find_for_graph(self, *, task_id: UUID, payload_hash: str) -> PendingApproval | None:
         """返回同一冻结提案的现有审批，供 checkpoint 重放识别终态。"""
@@ -72,6 +73,9 @@ class ApprovalProposalStore(Protocol):
         self, *, task_id: UUID, lease_owner: str, expected_payload_hash: str
     ) -> None:
         """把当前 owner 已调用完成的假工具执行记录为成功。"""
+
+    async def confirm_approval_checkpoint(self, *, task_id: UUID, lease_owner: str) -> None:
+        """确认 interrupt 已持久化后收敛审批恢复 anchor。"""
 
 
 class ApprovalStore(Protocol):
