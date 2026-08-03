@@ -19,6 +19,7 @@ EXPECTED_TASK_NAMES = [
     "ai_employee.workers.execute_task:execute_task",
     "ai_employee.workers.schedules:dispatch_due_briefs",
     "ai_employee.workers.schedules:expire_sessions",
+    "ai_employee.workers.schedules:recover_task_retries",
     "ai_employee.workers.schedules:relay_outbox",
 ]
 
@@ -44,7 +45,7 @@ async def _worker_command_parts() -> tuple[str, list[str]]:
 async def test_clean_worker_registry_and_enqueuer_write_real_redis_stream(
     empty_redis: RedisTestUrl,
 ) -> None:
-    """干净进程按真实启动模块注册四个任务，并把 task_id 写入临时 Redis Stream。"""
+    """干净进程按真实启动模块注册五个任务，并把 task_id 写入临时 Redis Stream。"""
     broker_path, modules = await _worker_command_parts()
     task_id = uuid4()
     environment = os.environ.copy()

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
         ge=1,
         description="Worker 执行租约与节点间续租使用的正整数秒数。",
     )
+    task_retry_recovery_seconds: int = Field(
+        default=301,
+        ge=301,
+        description="Redis 延迟重试事实丢失时，PostgreSQL 恢复扫描等待的保守秒数。",
+    )
     outbox_claim_seconds: int = Field(
         default=60,
         ge=1,

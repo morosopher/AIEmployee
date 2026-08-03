@@ -17,6 +17,9 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 
+RETRY_DELAY_MAX_SECONDS = 300
+RETRY_JITTER_MAX_SECONDS = 1
+
 # Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
 # 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
 taskiq_context_dependency: Context = TaskiqDepends()
@@ -41,6 +44,19 @@ def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
         # 使 Runner 能把任何临时错误收敛为 owner-safe 的 FAILED 终态。
         return False
     return retries < max_retries
+
+
+def retry_recovery_at(*, now: datetime, recovery_seconds: int) -> datetime:
+    """按 Worker 已锁定的 SmartRetry 上界计算 PostgreSQL 恢复期限。
+
+    Taskiq 的指数退避被 ``max_delay_exponent`` 限制为 300 秒，jitter 为 ``[0, 1)`` 秒。
+    默认 301 秒因此不会让正常 Redis 调度被恢复器抢先重复投递；配置可增大该保守期限，
+    但不能低于这条基础设施策略上界。
+    """
+    minimum_seconds = RETRY_DELAY_MAX_SECONDS + RETRY_JITTER_MAX_SECONDS
+    if recovery_seconds < minimum_seconds:
+        raise ValueError("task_retry_recovery_seconds is below the SmartRetry delay upper bound")
+    return now + timedelta(seconds=recovery_seconds)
 
 
 class _MissingTaskHandlerStep:
@@ -109,9 +125,19 @@ async def execute_task(
         return
 
     try:
-        await build_task_runner().run(
+        settings = get_settings()
+        may_retry_transient = has_remaining_transient_retry_budget(context.message.labels)
+        runner = build_task_runner()
+        if not may_retry_transient:
+            await runner.run(parsed_task_id, may_retry_transient=False)
+            return
+        await runner.run(
             parsed_task_id,
-            may_retry_transient=has_remaining_transient_retry_budget(context.message.labels),
+            may_retry_transient=True,
+            retry_recovery_at=retry_recovery_at(
+                now=datetime.now(UTC),
+                recovery_seconds=settings.task_retry_recovery_seconds,
+            ),
         )
     except TransientProviderError:
         raise

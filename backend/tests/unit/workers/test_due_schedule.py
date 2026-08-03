@@ -20,6 +20,7 @@ from ai_employee.workers.schedules import (
     dispatch_due_briefs,
     expire_sessions,
     is_daily_brief_due,
+    recover_task_retries,
     relay_outbox,
     scheduled_daily_brief_instant,
 )
@@ -147,9 +148,12 @@ def test_due_comparison_rejects_naive_now() -> None:
         raise AssertionError("naive datetime must be rejected")
 
 
-def test_only_task7_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
-    """M1 此阶段只注册 Outbox、到期简报与会话清理三个固定 label schedule。"""
+def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
+    """固定调度同时覆盖 Outbox、重试恢复、到期简报与会话清理。"""
     assert relay_outbox.labels["schedule"] == [{"cron": "* * * * *", "schedule_id": "outbox-relay"}]
+    assert recover_task_retries.labels["schedule"] == [
+        {"cron": "* * * * *", "schedule_id": "recover-task-retries"}
+    ]
     assert dispatch_due_briefs.labels["schedule"] == [
         {"cron": "* * * * *", "schedule_id": "due-daily-briefs"}
     ]

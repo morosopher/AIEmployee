@@ -46,6 +46,7 @@ class SqlAlchemyTaskExecutionStore:
                         status=TaskStatus.QUEUED.value,
                         lease_owner=None,
                         lease_expires_at=None,
+                        retry_recovery_at=None,
                         updated_at=now,
                     )
                     .returning(TaskRunModel.user_id)
@@ -180,6 +181,7 @@ class SqlAlchemyTaskExecutionStore:
         status: TaskStatus,
         finished_at: datetime,
         error_code: str | None,
+        retry_recovery_at: datetime | None = None,
     ) -> bool:
         """以 owner CAS 写入批准状态并清理租约。
 
@@ -208,6 +210,10 @@ class SqlAlchemyTaskExecutionStore:
         if status not in allowed:
             raise ValueError("finish status is not allowed")
         finished_at = utc_instant(finished_at, field="finished_at")
+        if retry_recovery_at is not None:
+            retry_recovery_at = utc_instant(retry_recovery_at, field="retry_recovery_at")
+            if status is not TaskStatus.RETRY_SCHEDULED:
+                raise ValueError("retry_recovery_at is only valid for retry_scheduled")
         terminal = status in {
             TaskStatus.SUCCEEDED,
             TaskStatus.FAILED,
@@ -228,6 +234,7 @@ class SqlAlchemyTaskExecutionStore:
                         lease_expires_at=None,
                         finished_at=finished_at if terminal else None,
                         error_code=error_code,
+                        retry_recovery_at=retry_recovery_at,
                         updated_at=finished_at,
                     )
                     .returning(TaskRunModel.user_id)

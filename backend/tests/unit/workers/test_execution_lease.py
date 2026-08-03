@@ -170,6 +170,7 @@ class RecordingLeaseStore:
         self.acquired: list[tuple[UUID, str, datetime, datetime]] = []
         self.renewed: list[tuple[UUID, str, datetime]] = []
         self.finished: list[tuple[TaskStatus, str | None]] = []
+        self.retry_recovery_deadlines: list[datetime | None] = []
         self.internal_failures: list[tuple[UUID, str, datetime, str]] = []
         self.allow_renew = True
         self.allow_finish = True
@@ -210,9 +211,11 @@ class RecordingLeaseStore:
         status: TaskStatus,
         finished_at: datetime,
         error_code: str | None,
+        retry_recovery_at: datetime | None = None,
     ) -> bool:
         """记录带 owner 的终态 CAS；结果由测试开关控制。"""
         self.finished.append((status, error_code))
+        self.retry_recovery_deadlines.append(retry_recovery_at)
         return self.allow_finish
 
     async def fail_internal(
@@ -495,10 +498,12 @@ async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retr
             task_id=task.task_id,
             lease_owner="worker-a",
             may_retry_transient=True,
+            retry_recovery_at=now + timedelta(seconds=301),
         )
 
     assert raised.value is transient
     assert store.finished == [(TaskStatus.RETRY_SCHEDULED, "provider_temporarily_unavailable")]
+    assert store.retry_recovery_deadlines == [now + timedelta(seconds=301)]
 
 
 @pytest.mark.asyncio
@@ -532,6 +537,36 @@ async def test_transient_provider_error_without_retry_budget_is_persisted_as_ter
 
     assert owned is True
     assert store.finished == [(TaskStatus.FAILED, "task_retries_exhausted")]
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_without_postgresql_recovery_deadline_safely_fails() -> None:
+    """遗漏恢复期限不能留下仅依赖 Redis 的 RETRY_SCHEDULED 悬挂任务。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+    transient = TransientProviderError(
+        error_code="provider_temporarily_unavailable",
+        message="provider temporarily unavailable",
+    )
+
+    async def fail_transiently() -> None:
+        raise transient
+
+    runner = _runner(
+        store=store,
+        clock=MutableClock(now),
+        steps=(CallableStep("provider", fail_transiently),),
+    )
+
+    owned = await runner.run(
+        task_id=task.task_id,
+        lease_owner="worker-a",
+        may_retry_transient=True,
+    )
+
+    assert owned is True
+    assert store.finished == [(TaskStatus.FAILED, "task_retry_recovery_deadline_missing")]
 
 
 @pytest.mark.asyncio

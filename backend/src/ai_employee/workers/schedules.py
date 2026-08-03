@@ -10,11 +10,17 @@ from ai_employee.application.use_cases.schedules import (
     is_daily_brief_due,
     scheduled_daily_brief_instant,
 )
+from ai_employee.application.use_cases.task_retry_recovery import (
+    RecoverScheduledTaskRetriesUseCase,
+)
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
     SqlAlchemySessionMaintenanceRepositoryFactory,
+)
+from ai_employee.infrastructure.db.repositories.task_retry_recovery import (
+    SqlAlchemyTaskRetryRecoveryStore,
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
@@ -27,6 +33,7 @@ __all__ = [
     "dispatch_due_briefs",
     "expire_sessions",
     "is_daily_brief_due",
+    "recover_task_retries",
     "relay_outbox",
     "scheduled_daily_brief_instant",
 ]
@@ -48,6 +55,15 @@ def _build_outbox_relay() -> OutboxRelay:
 async def relay_outbox() -> None:
     """每分钟 claim 并投递一批到期未发布 Outbox 事件。"""
     await _build_outbox_relay().relay_once(limit=settings.outbox_relay_batch_size)
+
+
+@broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "recover-task-retries"}])
+async def recover_task_retries() -> None:
+    """每分钟从 PostgreSQL 恢复 Redis 延迟调度丢失的到期重试，再由 relay 异步投递。"""
+    use_case = RecoverScheduledTaskRetriesUseCase(
+        store=SqlAlchemyTaskRetryRecoveryStore(session_factory)
+    )
+    await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "due-daily-briefs"}])

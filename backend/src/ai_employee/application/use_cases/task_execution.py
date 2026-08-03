@@ -68,6 +68,7 @@ class TaskExecutionStore(Protocol):
         status: TaskStatus,
         finished_at: datetime,
         error_code: str | None,
+        retry_recovery_at: datetime | None = None,
     ) -> bool:
         """仅当前 owner 能清理租约并写入终止或重试状态。"""
 
@@ -160,6 +161,7 @@ class DurableTaskRunner:
         lease_owner: str | None = None,
         *,
         may_retry_transient: bool = True,
+        retry_recovery_at: datetime | None = None,
     ) -> bool:
         """获取租约并执行一次持久任务尝试。
 
@@ -170,6 +172,8 @@ class DurableTaskRunner:
             may_retry_transient: 当前队列消息按基础设施重试规则仍可重新投递时为 ``True``。
                 application 层只消费这个已规范化的业务决定，绝不依赖 Taskiq 消息或标签类型；
                 默认值用于保持非队列调用方的既有临时错误重试语义。
+            retry_recovery_at: Worker 根据队列策略计算的保守 PostgreSQL 恢复期限；只在允许
+                临时重试时使用，不能传入 Taskiq 类型或标签。
 
         Returns:
             当前执行者最终仍拥有并处理了任务时为 ``True``；未获租约、丢失 owner 或
@@ -183,6 +187,10 @@ class DurableTaskRunner:
         """
         owner = lease_owner or f"worker:{os.getpid()}:{uuid4().hex}"
         now = utc_instant(self._clock(), field="clock")
+        if retry_recovery_at is not None:
+            retry_recovery_at = utc_instant(retry_recovery_at, field="retry_recovery_at")
+            if retry_recovery_at <= now:
+                raise ValueError("retry_recovery_at must be later than clock")
         try:
             await self._store.prepare_retry(task_id=task_id, now=now)
             leased = await self._store.acquire(
@@ -239,11 +247,21 @@ class DurableTaskRunner:
                     status=TaskStatus.FAILED,
                     error_code="task_retries_exhausted",
                 )
+            if retry_recovery_at is None:
+                # 没有 PostgreSQL 兜底期限时不能进入 RETRY_SCHEDULED；否则调用方遗漏队列
+                # 元数据或 Redis 丢失都会让任务永久悬挂。安全终态优于不可恢复的“重试”。
+                return await self._finish(
+                    leased,
+                    lease_owner=owner,
+                    status=TaskStatus.FAILED,
+                    error_code="task_retry_recovery_deadline_missing",
+                )
             persisted = await self._finish(
                 leased,
                 lease_owner=owner,
                 status=TaskStatus.RETRY_SCHEDULED,
                 error_code=error.error_code,
+                retry_recovery_at=retry_recovery_at,
             )
             if persisted:
                 raise
@@ -307,13 +325,25 @@ class DurableTaskRunner:
         lease_owner: str,
         status: TaskStatus,
         error_code: str | None,
+        retry_recovery_at: datetime | None = None,
     ) -> bool:
         """以当前 owner CAS 写状态并清租约，返回是否仍拥有提交权。"""
+        finished_at = utc_instant(self._clock(), field="clock")
+        # 只有 RETRY_SCHEDULED 需要此新恢复事实，避免让终态与既有端口调用承担无关字段。
+        if retry_recovery_at is not None:
+            return await self._store.finish(
+                task_id=task.task_id,
+                lease_owner=lease_owner,
+                status=status,
+                finished_at=finished_at,
+                error_code=error_code,
+                retry_recovery_at=retry_recovery_at,
+            )
         return await self._store.finish(
             task_id=task.task_id,
             lease_owner=lease_owner,
             status=status,
-            finished_at=utc_instant(self._clock(), field="clock"),
+            finished_at=finished_at,
             error_code=error_code,
         )
 
