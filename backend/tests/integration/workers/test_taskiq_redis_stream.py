@@ -105,6 +105,62 @@ asyncio.run(main())
 
 
 @pytest.mark.asyncio
+async def test_resume_envelope_carries_only_task_identifier_and_decision(
+    empty_redis: RedisTestUrl,
+) -> None:
+    """审批恢复消息进入真实 Stream 时不得泄露冻结载荷或预览正文。"""
+    broker_path, modules = await _worker_command_parts()
+    task_id = uuid4()
+    environment = os.environ.copy()
+    environment["REDIS_URL"] = str(empty_redis)
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import sys
+from uuid import UUID
+
+from taskiq.cli.utils import import_object, import_tasks
+from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
+
+broker = import_object(sys.argv[1])
+broker.is_worker_process = True
+import_tasks(sys.argv[2:-1], ["**/tasks.py"], False)
+
+async def main():
+    sender = broker.get_all_tasks()["ai_employee.workers.execute_task:execute_task"].kiq
+    await TaskiqTaskEnqueuer(sender).enqueue(UUID(sys.argv[-1]), resume="rejected")
+
+asyncio.run(main())
+""",
+            broker_path,
+            *modules,
+            str(task_id),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stderr == ""
+    client: Redis = Redis.from_url(str(empty_redis), decode_responses=False)
+    try:
+        entries = await client.xrange("ai_employee_tasks")
+    finally:
+        await client.aclose()
+    assert len(entries) == 1
+    envelope = entries[0][1][b"data"]
+    assert str(task_id).encode() in envelope
+    assert b"rejected" in envelope
+    assert b"proposal_payload" not in envelope
+    assert b"preview_markdown" not in envelope
+
+
+@pytest.mark.asyncio
 async def test_first_worker_start_consumes_message_enqueued_before_group_creation(
     empty_redis: RedisTestUrl,
 ) -> None:
