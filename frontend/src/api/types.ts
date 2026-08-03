@@ -31,15 +31,16 @@ export interface TaskSnapshot {
   status: TaskStatus
   retry_of_task_id: string | null
   error_code: string | null
-  event_cursor: number
+  /** 服务端快照对应的最大持久审计 ID；仅作为精确十进制游标使用。 */
+  event_cursor: string
   steps: TaskStep[]
 }
 
 /** SSE 传输的类型化信封；payload 保留给事件 reducer 再做事件级收窄。 */
 export interface TaskEvent {
-  id: number
+  id: string
   task_id: string
-  sequence: number
+  sequence: string
   event: string
   occurred_at: string
   step_id: string | null
@@ -107,6 +108,18 @@ export function asTaskStatus(value: unknown): TaskStatus | null {
 }
 
 /**
+ * 将审计 BIGINT 收窄为不丢失精度的十进制字符串。
+ *
+ * @param value 服务端 JSON 中的游标字段。
+ * @returns 规范化游标；不安全数字或非规范字符串返回空。
+ */
+export function asEventCursor(value: unknown): string | null {
+  return typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value)
+    ? value
+    : null
+}
+
+/**
  * 解析 REST/SSE 中的任务快照，缺失公开字段时拒绝该响应。
  *
  * @param value 不可信 API JSON。
@@ -120,13 +133,15 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
     !object ||
     typeof object.id !== 'string' ||
     typeof object.kind !== 'string' ||
-    !isEventCursor(object.event_cursor) ||
     !status
   ) {
     throw new Error('Invalid task snapshot response')
   }
   if (!Array.isArray(object.steps))
     throw new Error('Invalid task steps response')
+  const eventCursor = asEventCursor(object.event_cursor)
+  if (eventCursor === null)
+    throw new Error('Invalid task event cursor')
   return {
     id: object.id,
     kind: object.kind,
@@ -137,19 +152,9 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
         : null,
     error_code:
       typeof object.error_code === 'string' ? object.error_code : null,
-    event_cursor: object.event_cursor,
+    event_cursor: eventCursor,
     steps: object.steps.map(parseTaskStep),
   }
-}
-
-/**
- * 验证 REST 或 SSE 快照声明的 PostgreSQL 审计游标，拒绝无法安全用于重放的数值。
- *
- * @param value 不可信游标值。
- * @returns 是否为非负安全整数。
- */
-function isEventCursor(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
 /**
@@ -196,18 +201,18 @@ export function parseTaskEvent(value: string): TaskEvent | null {
     const object = asJsonObject(JSON.parse(value) as unknown)
     if (
       !object ||
-      typeof object.id !== 'number' ||
+      !asEventCursor(object.id) ||
       typeof object.task_id !== 'string' ||
-      typeof object.sequence !== 'number' ||
+      !asEventCursor(object.sequence) ||
       typeof object.event !== 'string' ||
       typeof object.occurred_at !== 'string'
     ) {
       return null
     }
     return {
-      id: object.id,
+      id: asEventCursor(object.id) as string,
       task_id: object.task_id,
-      sequence: object.sequence,
+      sequence: asEventCursor(object.sequence) as string,
       event: object.event,
       occurred_at: object.occurred_at,
       step_id: typeof object.step_id === 'string' ? object.step_id : null,

@@ -38,7 +38,7 @@ async function loadTask(nextTaskId: string | null): Promise<void> {
   if (!nextTaskId) return
   loading.value = true
   try {
-    const observedSequence = tasks.latestSequences[nextTaskId] ?? -1
+    const observedSequence = tasks.latestSequences[nextTaskId]
     const snapshot = await getTask(nextTaskId)
     if (generation === loadGeneration && taskId.value === nextTaskId)
       tasks.setTaskIfUnchangedSince(snapshot, observedSequence)

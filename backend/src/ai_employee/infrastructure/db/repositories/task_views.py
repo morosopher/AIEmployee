@@ -85,9 +85,22 @@ class SqlAlchemyTaskViewStore:
         return self._snapshot(task, steps, event_cursor or 0)
 
     async def get(self, *, task_id: UUID, user_id: UUID) -> TaskSnapshot | None:
-        """以单个可重复读 PostgreSQL 视图读取任务、时间线与事件游标。"""
+        """在同一个可重复读快照内读取用户拥有的任务与稳定排序时间线。
+
+        PostgreSQL 的 ``READ COMMITTED`` 会为每条 SELECT 建立新快照。任务、步骤和最大
+        审计 ID 分三次查询时，并发提交可能让旧状态与新游标混合，客户端随后以新游标重连会
+        永久漏掉状态事件。因此本只读事务显式固定为 ``REPEATABLE READ``；写入路径仍保持
+        默认隔离级别及其行锁语义。
+
+        Args:
+            task_id: 需要读取的任务标识。
+            user_id: 当前认证用户，用于隔离任务可见性。
+
+        Returns:
+            同一 PostgreSQL 快照内的任务投影；任务不属于该用户或不存在时返回 ``None``。
+        """
         async with self._session_factory.begin() as session:
-            # 首条查询前固定隔离级别，确保 REST 不会跳过已反映到任务状态的审计事件。
+            # 必须作为事务中第一条 SQL 执行，才会固定随后全部 SELECT 的 MVCC 视图。
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             return await self._get_in_session(session, task_id=task_id, user_id=user_id)
 

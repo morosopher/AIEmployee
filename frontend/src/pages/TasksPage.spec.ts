@@ -37,7 +37,7 @@ const queuedSnapshot: TaskSnapshot = {
   status: 'queued',
   retry_of_task_id: null,
   error_code: null,
-  event_cursor: 0,
+  event_cursor: '0',
   steps: [],
 }
 
@@ -70,9 +70,9 @@ describe('TasksPage', () => {
 
     await flushPromises()
     store.applyEvent({
-      id: 3,
+      id: '3',
       task_id: 'task-1',
-      sequence: 3,
+      sequence: '3',
       event: 'task.status_changed',
       occurred_at: '2026-08-03T00:00:03Z',
       step_id: null,

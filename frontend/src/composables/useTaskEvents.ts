@@ -36,15 +36,6 @@ export function useTaskEvents(
     }
   }
 
-  /** 对每条安全解析的事件更新任务投影，并将传输状态置为已连接。 */
-  const handleEvent = (message: MessageEvent<string>): void => {
-    const event = parseTaskEvent(message.data)
-    if (!event) return
-    connectionState.value = 'connected'
-    tasks.setConnectionState(event.task_id, 'connected')
-    tasks.applyEvent(event)
-  }
-
   /** 为当前任务创建 EventSource；浏览器负责协议级重连，错误只改变连接投影。 */
   const open = (nextTaskId: string): void => {
     connectionState.value = 'connecting'
@@ -52,15 +43,26 @@ export function useTaskEvents(
     // 审计 ID 在任务之间全局递增，任务专属流中的空洞不是漏事件；服务端按此游标
     // 重放同任务较新的事实，因此使用该任务已见的最大审计 ID。
     const cursor = tasks.latestSequences[nextTaskId]
-    const query =
-      cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0
-        ? `?last_event_id=${cursor}`
-        : ''
+    const query = cursor === undefined ? '' : `?last_event_id=${cursor}`
     const eventSource = new EventSource(
       `/api/v1/tasks/${encodeURIComponent(nextTaskId)}/events${query}`,
     )
     source = eventSource
     openedTaskId = nextTaskId
+    /**
+     * 将监听器绑定到创建它的 EventSource，防止浏览器在 close 后排队的旧回调污染新任务。
+     *
+     * @param message EventSource 交付的原始事件。
+     * @returns 无返回值；已失效连接的消息直接忽略。
+     */
+    const handleEvent = (message: MessageEvent<string>): void => {
+      if (source !== eventSource) return
+      const event = parseTaskEvent(message.data)
+      if (!event) return
+      connectionState.value = 'connected'
+      tasks.setConnectionState(event.task_id, 'connected')
+      tasks.applyEvent(event)
+    }
     eventSource.onopen = () => {
       if (source !== eventSource) return
       connectionState.value = 'connected'

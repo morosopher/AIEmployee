@@ -11,7 +11,7 @@ const failedTask: TaskSnapshot = {
   status: 'failed',
   retry_of_task_id: null,
   error_code: 'provider_unavailable',
-  event_cursor: 0,
+  event_cursor: '0',
   steps: [],
 }
 

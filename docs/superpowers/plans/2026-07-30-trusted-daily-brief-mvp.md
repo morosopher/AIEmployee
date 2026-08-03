@@ -1885,9 +1885,9 @@ export type TaskStatus =
   | 'cancelled'
 
 export interface TaskEvent {
-  id: number
+  id: string
   task_id: string
-  sequence: number
+  sequence: string
   event: string
   occurred_at: string
   step_id: string | null
@@ -1898,7 +1898,7 @@ export interface TaskSnapshot {
   id: string
   kind: string
   status: TaskStatus
-  event_cursor: number
+  event_cursor: string
   steps: Array<{
     id: string
     sequence: number

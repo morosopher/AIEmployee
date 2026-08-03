@@ -1,5 +1,6 @@
 """暴露用户隔离的任务创建、快照、取消与重试接口。"""
 
+import re
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -22,6 +23,8 @@ IdempotencyKeyHeader = Annotated[
     str | None,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
+POSTGRESQL_BIGINT_MAX = 2**63 - 1
+CANONICAL_EVENT_CURSOR = re.compile(r"^(0|[1-9][0-9]*)$")
 
 
 class CreateTaskRequest(BaseModel):
@@ -52,7 +55,7 @@ class TaskResponse(BaseModel):
     status: str
     retry_of_task_id: UUID | None
     error_code: str | None
-    event_cursor: int = Field(ge=0)
+    event_cursor: str
     steps: list[StepResponse]
 
 
@@ -71,7 +74,7 @@ def _task_response(snapshot: TaskSnapshot) -> TaskResponse:
         status=snapshot.status.value,
         retry_of_task_id=snapshot.retry_of_task_id,
         error_code=snapshot.error_code,
-        event_cursor=snapshot.event_cursor,
+        event_cursor=str(snapshot.event_cursor),
         steps=[
             StepResponse(
                 id=item.id,
@@ -98,27 +101,27 @@ def _event_cursor(*, header_value: str | None, query_value: str | None) -> int |
 
     主动创建的 ``EventSource`` 无法设置 ``Last-Event-ID`` Header，因此允许其把已知
     PostgreSQL 游标放在查询参数；一旦浏览器自动重连，Header 反映更近的已接收事件，必须
-    优先以免静态查询参数倒退回放。两种输入均仅接受非负十进制整数，避免把不可信值交给
-    持久事件查询。
+    优先以免静态查询参数倒退回放。两种输入只接受规范非负十进制字符串，即 ``0`` 或不以
+    ``0`` 开头的数字；这保证浏览器、API 与 PostgreSQL BIGINT 之间不存在多个等价文本
+    表示，并避免把不可信值交给持久事件查询。
     """
     value = header_value if header_value is not None else query_value
     if value is None:
         return None
-    try:
-        cursor = int(value)
-    except ValueError:
+    if CANONICAL_EVENT_CURSOR.fullmatch(value) is None:
         raise ApiProblem(
             422,
             "invalid_last_event_id",
             "Invalid event cursor",
-            "Last-Event-ID must be an integer.",
-        ) from None
-    if cursor < 0:
+            "Last-Event-ID must be a canonical non-negative decimal integer.",
+        )
+    cursor = int(value)
+    if cursor > POSTGRESQL_BIGINT_MAX:
         raise ApiProblem(
             422,
             "invalid_last_event_id",
             "Invalid event cursor",
-            "Last-Event-ID must be a non-negative integer.",
+            "Last-Event-ID exceeds the supported event ID range.",
         )
     return cursor
 

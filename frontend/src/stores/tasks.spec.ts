@@ -5,16 +5,22 @@ import type { TaskEvent } from '../api/types'
 import { useTasksStore } from './tasks'
 
 /** 构造合成持久事件，避免测试依赖真实任务或时间。 */
-function event(overrides: Partial<TaskEvent>): TaskEvent {
+function event(
+  overrides: Omit<Partial<TaskEvent>, 'id' | 'sequence'> & {
+    id?: string | number
+    sequence?: string | number
+  },
+): TaskEvent {
+  const { id = 1, sequence = 1, ...eventOverrides } = overrides
   return {
-    id: 1,
+    id: String(id),
     task_id: 'task-1',
-    sequence: 1,
+    sequence: String(sequence),
     event: 'step.started',
     occurred_at: '2026-08-03T00:00:00Z',
     step_id: 'step-1',
     payload: {},
-    ...overrides,
+    ...eventOverrides,
   }
 }
 
@@ -80,7 +86,7 @@ describe('tasks store', () => {
           status: 'succeeded',
           retry_of_task_id: 'original-task',
           error_code: 'provider_temporarily_unavailable',
-          event_cursor: 7,
+          event_cursor: '7',
           steps: [],
         },
       }),
@@ -117,7 +123,7 @@ describe('tasks store', () => {
           status: 'running',
           retry_of_task_id: null,
           error_code: null,
-          event_cursor: 7,
+          event_cursor: '7',
           steps: [],
         },
       }),
@@ -149,7 +155,7 @@ describe('tasks store', () => {
     )
 
     expect(store.tasks['task-1']?.status).toBe('succeeded')
-    expect(store.latestSequences['task-1']).toBe(8)
+    expect(store.latestSequences['task-1']).toBe('8')
   })
 
   it('does not regress a completed step when a started event arrives late', () => {
@@ -175,7 +181,7 @@ describe('tasks store', () => {
     )
 
     expect(store.tasks['task-1']?.steps[0]?.status).toBe('completed')
-    expect(store.latestSequences['task-1']).toBe(8)
+    expect(store.latestSequences['task-1']).toBe('8')
   })
 
   it('uses a REST snapshot cursor to reject older status and step replays', () => {
@@ -187,7 +193,7 @@ describe('tasks store', () => {
       status: 'succeeded',
       retry_of_task_id: null,
       error_code: null,
-      event_cursor: 8,
+      event_cursor: '8',
       steps: [
         {
           id: 'step-1',
@@ -219,8 +225,8 @@ describe('tasks store', () => {
 
     expect(store.tasks['task-1']?.status).toBe('succeeded')
     expect(store.tasks['task-1']?.steps[0]?.status).toBe('completed')
-    expect(store.latestSequences['task-1']).toBe(8)
-    expect(store.snapshotCursors['task-1']).toBe(8)
+    expect(store.latestSequences['task-1']).toBe('8')
+    expect(store.snapshotCursors['task-1']).toBe('8')
   })
 
   it('preserves public step start and finish timestamps from a snapshot', () => {
@@ -237,7 +243,7 @@ describe('tasks store', () => {
           status: 'succeeded',
           retry_of_task_id: null,
           error_code: null,
-          event_cursor: 7,
+          event_cursor: '7',
           steps: [
             {
               id: 'step-1',

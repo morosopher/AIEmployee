@@ -25,11 +25,11 @@ export const useTasksStore = defineStore('tasks', {
   state: () => ({
     tasks: {} as Record<string, TaskSnapshot>,
     connections: {} as Record<string, TaskConnectionState>,
-    seenSequences: {} as Record<string, Record<number, true>>,
-    snapshotCursors: {} as Record<string, number>,
-    latestSequences: {} as Record<string, number>,
-    projectedStatusSequences: {} as Record<string, number>,
-    projectedStepSequences: {} as Record<string, Record<string, number>>,
+    seenSequences: {} as Record<string, Record<string, true>>,
+    snapshotCursors: {} as Record<string, string>,
+    latestSequences: {} as Record<string, string>,
+    projectedStatusSequences: {} as Record<string, string>,
+    projectedStepSequences: {} as Record<string, Record<string, string>>,
   }),
   actions: {
     /**
@@ -39,6 +39,12 @@ export const useTasksStore = defineStore('tasks', {
      * @returns 无返回值；状态变化由 Pinia 响应式传播。
      */
     setTask(snapshot: TaskSnapshot): void {
+      const latestSequence = this.latestSequences[snapshot.id]
+      if (
+        latestSequence !== undefined &&
+        compareEventCursors(snapshot.event_cursor, latestSequence) < 0
+      )
+        return
       this.tasks[snapshot.id] = {
         ...snapshot,
         steps: orderSteps(snapshot.steps),
@@ -61,9 +67,9 @@ export const useTasksStore = defineStore('tasks', {
      */
     setTaskIfUnchangedSince(
       snapshot: TaskSnapshot,
-      observedSequence: number,
+      observedSequence: string | undefined,
     ): boolean {
-      if ((this.latestSequences[snapshot.id] ?? -1) !== observedSequence)
+      if (this.latestSequences[snapshot.id] !== observedSequence)
         return false
       this.setTask(snapshot)
       return true
@@ -85,23 +91,25 @@ export const useTasksStore = defineStore('tasks', {
      * @returns 无返回值；未知事件保留游标但不擅自推断业务状态。
      */
     applyEvent(event: TaskEvent): void {
-      const cursor = this.snapshotCursors[event.task_id] ?? -1
+      const cursor = this.snapshotCursors[event.task_id]
       if (event.event === 'task.snapshot') {
         this.applySnapshotEvent(event)
         return
       }
       if (
-        event.sequence <= cursor ||
+        (cursor !== undefined && compareEventCursors(event.sequence, cursor) <= 0) ||
         this.seenSequences[event.task_id]?.[event.sequence]
       )
         return
       const seen = this.seenSequences[event.task_id] ?? {}
       seen[event.sequence] = true
       this.seenSequences[event.task_id] = seen
-      this.latestSequences[event.task_id] = Math.max(
-        this.latestSequences[event.task_id] ?? -1,
-        event.sequence,
-      )
+      const latestSequence = this.latestSequences[event.task_id]
+      this.latestSequences[event.task_id] =
+        latestSequence === undefined ||
+        compareEventCursors(event.sequence, latestSequence) > 0
+          ? event.sequence
+          : latestSequence
 
       if (event.event === 'task.status_changed') {
         this.applyStatusEvent(event)
@@ -122,7 +130,11 @@ export const useTasksStore = defineStore('tasks', {
      */
     applySnapshotEvent(event: TaskEvent): void {
       try {
-        if (event.sequence <= (this.latestSequences[event.task_id] ?? -1))
+        const latestSequence = this.latestSequences[event.task_id]
+        if (
+          latestSequence !== undefined &&
+          compareEventCursors(event.sequence, latestSequence) <= 0
+        )
           return
         const snapshot = parseTaskSnapshot(event.payload)
         if (snapshot.id !== event.task_id) return
@@ -145,8 +157,10 @@ export const useTasksStore = defineStore('tasks', {
      * @returns 无返回值。
      */
     applyStatusEvent(event: TaskEvent): void {
+      const projectedSequence = this.projectedStatusSequences[event.task_id]
       if (
-        event.sequence < (this.projectedStatusSequences[event.task_id] ?? -1)
+        projectedSequence !== undefined &&
+        compareEventCursors(event.sequence, projectedSequence) < 0
       )
         return
       const status = asTaskStatus(event.payload.status)
@@ -171,9 +185,11 @@ export const useTasksStore = defineStore('tasks', {
       const existingStep = existingTask.steps.find(
         (step) => step.id === event.step_id,
       )
+      const projectedSequence =
+        this.projectedStepSequences[event.task_id]?.[event.step_id]
       if (
-        event.sequence <
-        (this.projectedStepSequences[event.task_id]?.[event.step_id] ?? -1)
+        projectedSequence !== undefined &&
+        compareEventCursors(event.sequence, projectedSequence) < 0
       )
         return
       const nextStep = mergeStep(existingStep, event)
@@ -208,7 +224,7 @@ function emptyTask(
     status,
     retry_of_task_id: null,
     error_code: null,
-    event_cursor: 0,
+    event_cursor: '0',
     steps: [],
   }
 }
@@ -234,8 +250,8 @@ function mergeStep(
     fromPayload?.sequence ??
     (typeof payload.sequence === 'number' ? payload.sequence : null) ??
     existing?.sequence ??
-    event.sequence
-  if (!name) return null
+    safeStepSequence(event.sequence)
+  if (!name || sequence === null) return null
   const status =
     fromPayload?.status ??
     statusForStepEvent(event.event) ??
@@ -299,4 +315,27 @@ function statusForStepEvent(eventName: string): string | null {
  */
 function orderSteps(steps: readonly TaskStep[]): TaskStep[] {
   return [...steps].sort((left, right) => left.sequence - right.sequence)
+}
+
+/**
+ * 比较两个规范化的非负十进制游标，不把 PostgreSQL BIGINT 交给 JavaScript number。
+ *
+ * @param left 左侧游标。
+ * @param right 右侧游标。
+ * @returns 负数、零或正数，分别表示左侧更小、相等或更大。
+ */
+function compareEventCursors(left: string, right: string): number {
+  if (left.length !== right.length) return left.length - right.length
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+/**
+ * 仅在事件未提供步骤序号时降级使用游标，拒绝不能安全显示的巨大值。
+ *
+ * @param cursor 精确十进制审计游标。
+ * @returns 可安全参与步骤排序的数值，或空值。
+ */
+function safeStepSequence(cursor: string): number | null {
+  const value = Number(cursor)
+  return Number.isSafeInteger(value) ? value : null
 }

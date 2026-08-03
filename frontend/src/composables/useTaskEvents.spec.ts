@@ -43,7 +43,7 @@ describe('useTaskEvents', () => {
   it('supplies the known durable cursor when reopening a task stream', () => {
     vi.stubGlobal('EventSource', FakeEventSource)
     setActivePinia(createPinia())
-    useTasksStore().latestSequences['task-1'] = 42
+    useTasksStore().latestSequences['task-1'] = '9223372036854775807'
     const Host = defineComponent({
       setup() {
         useTaskEvents('task-1')
@@ -54,7 +54,7 @@ describe('useTaskEvents', () => {
     const wrapper = mount(Host)
 
     expect(FakeEventSource.instances.at(-1)?.url).toBe(
-      '/api/v1/tasks/task-1/events?last_event_id=42',
+      '/api/v1/tasks/task-1/events?last_event_id=9223372036854775807',
     )
     wrapper.unmount()
     vi.unstubAllGlobals()
@@ -84,6 +84,39 @@ describe('useTaskEvents', () => {
     vi.unstubAllGlobals()
   })
 
+  it('ignores an event callback retained by the closed stream after switching tasks', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    const taskId = ref<string | null>('task-a')
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents(taskId)
+        return () => null
+      },
+    })
+
+    const wrapper = mount(Host)
+    const firstSource = FakeEventSource.instances.at(-1)
+    const staleStatusHandler = firstSource?.addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'task.status_changed',
+    )?.[1] as EventListener
+    taskId.value = 'task-b'
+    await nextTick()
+
+    staleStatusHandler(new MessageEvent('task.status_changed', {
+      data: JSON.stringify({
+        id: '1', task_id: 'task-a', sequence: '1', event: 'task.status_changed',
+        occurred_at: '2026-08-03T00:00:00Z', step_id: null, payload: { status: 'running' },
+      }),
+    }))
+
+    const store = useTasksStore()
+    expect(store.connections['task-a']).toBe('disconnected')
+    expect(store.connections['task-b']).toBe('connecting')
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
+
   it('reopens after the highest task event despite global audit ID gaps', () => {
     vi.stubGlobal('EventSource', FakeEventSource)
     setActivePinia(createPinia())
@@ -102,9 +135,9 @@ describe('useTaskEvents', () => {
     statusHandler(
       new MessageEvent('task.status_changed', {
         data: JSON.stringify({
-          id: 1,
+          id: '1',
           task_id: 'task-1',
-          sequence: 1,
+          sequence: '1',
           event: 'task.status_changed',
           occurred_at: '2026-08-03T00:00:00Z',
           step_id: null,
@@ -122,9 +155,9 @@ describe('useTaskEvents', () => {
     secondStatusHandler(
       new MessageEvent('task.status_changed', {
         data: JSON.stringify({
-          id: 3,
+          id: '3',
           task_id: 'task-1',
-          sequence: 3,
+          sequence: '3',
           event: 'task.status_changed',
           occurred_at: '2026-08-03T00:00:00Z',
           step_id: null,

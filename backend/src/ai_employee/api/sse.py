@@ -249,9 +249,9 @@ def _event(event: DurableTaskEvent) -> ServerSentEvent:
         event=event_type,
         data=json.dumps(
             {
-                "id": event.id,
+                "id": str(event.id),
                 "task_id": str(event.task_id),
-                "sequence": event.id,
+                "sequence": str(event.id),
                 "event": event_type,
                 "occurred_at": event.occurred_at.isoformat(),
                 "step_id": str(event.step_id) if event.step_id else None,
@@ -357,9 +357,9 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
         event="task.snapshot",
         data=json.dumps(
             {
-                "id": event_id,
+                "id": str(event_id),
                 "task_id": str(task_id),
-                "sequence": event_id,
+                "sequence": str(event_id),
                 "event": "task.snapshot",
                 "occurred_at": datetime.now(UTC).isoformat(),
                 "step_id": None,
@@ -371,7 +371,7 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                         str(snapshot.retry_of_task_id) if snapshot.retry_of_task_id else None
                     ),
                     "error_code": snapshot.error_code,
-                    "event_cursor": snapshot.event_cursor,
+                    "event_cursor": str(snapshot.event_cursor),
                     "steps": [
                         {
                             "id": str(step.id),

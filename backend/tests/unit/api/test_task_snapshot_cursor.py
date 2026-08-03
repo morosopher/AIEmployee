@@ -22,5 +22,5 @@ def test_task_response_exposes_only_snapshot_event_cursor() -> None:
         )
     )
 
-    assert response.event_cursor == 8
+    assert response.event_cursor == "8"
     assert "input_payload" not in response.model_dump()

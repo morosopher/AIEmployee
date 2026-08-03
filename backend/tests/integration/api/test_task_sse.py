@@ -4,10 +4,14 @@ import asyncio
 import json
 import os
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import ServerSentEvent
 
 from ai_employee.api.sse import (
@@ -144,6 +148,66 @@ async def _append_event(
         return event.id
 
 
+@pytest.mark.asyncio
+async def test_task_snapshot_uses_one_repeatable_read_view_during_concurrent_update(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """快照读取中并发提交的状态事件不得让旧任务状态携带新游标。
+
+    第一次任务读取后，另一会话提交状态更新及其审计事实。PostgreSQL 默认
+    ``READ COMMITTED`` 会让后续最大审计 ID 查询看见该事件，导致客户端以一个并未包含在
+    快照内的游标重连并永久跳过状态变化。读取事务必须固定为 ``REPEATABLE READ``，使整个
+    快照要么看见提交前事实，要么在下一次 GET 中整体看见提交后事实。
+    """
+    session_factory, user_id, _ = sse_store
+    task_id = await _create_task(session_factory, user_id)
+    original_scalar = AsyncSession.scalar
+
+    async def scalar_after_concurrent_commit(
+        session: AsyncSession, *args: Any, **kwargs: Any
+    ) -> Any:
+        """在读取任务行后精确插入一次并发提交，复现三次读取的时间窗口。"""
+        result = await original_scalar(session, *args, **kwargs)
+        if session.info.pop("commit_after_task_read", False):
+            async with session_factory.begin() as writer:
+                await writer.execute(
+                    update(TaskRunModel)
+                    .where(TaskRunModel.id == task_id)
+                    .values(status="running")
+                )
+                writer.add(
+                    AuditEventModel(
+                        user_id=user_id,
+                        task_id=task_id,
+                        event_type="task.running",
+                        actor_type="system",
+                        actor_id=None,
+                        event_metadata={"status": "running"},
+                    )
+                )
+        return result
+
+    class InterleavingSessionFactory:
+        """只为本回归用例在读取事务开始前标记一次受控并发提交。"""
+
+        @asynccontextmanager
+        async def begin(self) -> Any:
+            """沿用真实事务上下文，并让首次任务查询触发另一个会话提交。"""
+            async with session_factory.begin() as session:
+                session.info["commit_after_task_read"] = True
+                yield session
+
+    monkeypatch.setattr(AsyncSession, "scalar", scalar_after_concurrent_commit)
+    store = SqlAlchemyTaskViewStore(cast(ManagedAsyncSessionMaker, InterleavingSessionFactory()))
+
+    snapshot = await store.get(task_id=task_id, user_id=user_id)
+
+    assert snapshot is not None
+    assert snapshot.status is TaskStatus.QUEUED
+    assert snapshot.event_cursor == 0
+
+
 class _ObservedRedisTaskEventSubscription:
     """包装真实 Redis 订阅，在流完成初始回放并开始等待通知时打开测试门闩。"""
 
@@ -195,8 +259,8 @@ async def test_last_event_id_replays_only_later_durable_events(
     payload = _event_payload(await anext(events))
     await events.aclose()
 
-    assert payload["id"] == second_id
-    assert payload["sequence"] == second_id
+    assert payload["id"] == str(second_id)
+    assert payload["sequence"] == str(second_id)
     assert payload["event"] == "task.status_changed"
 
 
@@ -264,7 +328,7 @@ async def test_expired_approval_replays_as_canonical_approval_resolution(
     payload = _event_payload(await anext(events))
     await events.aclose()
 
-    assert payload["id"] == event_id
+    assert payload["id"] == str(event_id)
     assert payload["event"] == "approval.resolved"
     assert payload["payload"] == {
         "status": "expired",
@@ -305,15 +369,15 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
     await events.aclose()
 
     assert payload["event"] == "task.snapshot"
-    assert payload["id"] == event_id
-    assert payload["sequence"] == event_id
+    assert payload["id"] == str(event_id)
+    assert payload["sequence"] == str(event_id)
     assert payload["payload"] == {
         "id": str(task_id),
         "kind": "fake_write",
         "status": "running",
         "retry_of_task_id": str(original_task_id),
         "error_code": "provider_temporarily_unavailable",
-        "event_cursor": event_id,
+        "event_cursor": str(event_id),
         "steps": [
             {
                 "id": payload["payload"]["steps"][0]["id"],
@@ -350,7 +414,7 @@ async def test_dropped_pubsub_notification_is_recovered_by_next_postgres_tick(
     payload = _event_payload(await asyncio.wait_for(pending_event, timeout=1))
     await events.aclose()
 
-    assert payload["id"] == event_id
+    assert payload["id"] == str(event_id)
     assert payload["event"] == "task.status_changed"
 
 
@@ -394,7 +458,7 @@ async def test_redis_pubsub_notification_wakes_task_stream(
     await events.aclose()
     await session_factory.dispose()
 
-    assert payload["id"] == event_id
+    assert payload["id"] == str(event_id)
     assert payload["event"] == "task.status_changed"
 
 
