@@ -12,12 +12,28 @@ from ai_employee.api.deps import (
     handle_api_problem,
     handle_request_validation_error,
 )
+from ai_employee.api.routers.approvals import build_approvals_router
 from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.system import build_system_router
+from ai_employee.api.routers.tasks import build_tasks_router
+from ai_employee.api.sse import TaskEventStore, TaskEventStream
+from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
+from ai_employee.application.use_cases.task_views import (
+    CancelTaskUseCase,
+    GetTaskUseCase,
+    RetryTaskUseCase,
+)
+from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.config import get_settings
+from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyIdentityRepositoryFactory,
 )
+from ai_employee.infrastructure.db.repositories.task_views import (
+    PostgresQueuedTaskDispatcher,
+    SqlAlchemyTaskViewStore,
+)
+from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
@@ -55,11 +71,25 @@ def create_app(
     app.state.auth_token_factory = new_token
     app.state.auth_token_hasher = hash_token
     app.state.auth_password_verifier = PasswordHasher()
+    task_store = SqlAlchemyTaskViewStore(session_factory)
+    app.state.create_task_use_case = CreateTaskUseCase(
+        SqlAlchemyTaskRepositoryFactory(session_factory),
+        PostgresQueuedTaskDispatcher(session_factory),
+    )
+    app.state.get_task_use_case = GetTaskUseCase(task_store)
+    app.state.cancel_task_use_case = CancelTaskUseCase(task_store)
+    app.state.retry_task_use_case = RetryTaskUseCase(task_store)
+    app.state.approval_decision_use_case = ApprovalDecisionUseCase(
+        SqlAlchemyApprovalStore(session_factory)
+    )
+    app.state.task_event_stream = TaskEventStream(TaskEventStore(session_factory, task_store))
     app.add_exception_handler(ApiProblem, handle_api_problem)
     app.add_exception_handler(RequestValidationError, handle_request_validation_error)
     probe = readiness_probe or (lambda: {"postgres": True, "redis": True})
     app.include_router(build_system_router(probe))
     app.include_router(build_auth_router())
+    app.include_router(build_tasks_router())
+    app.include_router(build_approvals_router())
     return app
 
 

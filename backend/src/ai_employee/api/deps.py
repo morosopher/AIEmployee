@@ -157,6 +157,31 @@ def get_password_verifier(request: Request) -> PasswordVerifier:
     return cast(PasswordVerifier, request.app.state.auth_password_verifier)
 
 
+def get_create_task_use_case(request: Request):
+    """从组合根取得创建任务用例，路由不接触 ORM 或队列。"""
+    return request.app.state.create_task_use_case
+
+
+def get_get_task_use_case(request: Request):
+    """从组合根取得用户范围任务读取用例。"""
+    return request.app.state.get_task_use_case
+
+
+def get_cancel_task_use_case(request: Request):
+    """从组合根取得任务取消用例。"""
+    return request.app.state.cancel_task_use_case
+
+
+def get_retry_task_use_case(request: Request):
+    """从组合根取得任务重试用例。"""
+    return request.app.state.retry_task_use_case
+
+
+def get_approval_decision_use_case(request: Request):
+    """从组合根取得冻结审批决定用例。"""
+    return request.app.state.approval_decision_use_case
+
+
 def get_login_use_case(
     repositories: Annotated[IdentityRepositoryFactory, Depends(get_identity_repositories)],
     password_verifier: Annotated[PasswordVerifier, Depends(get_password_verifier)],
