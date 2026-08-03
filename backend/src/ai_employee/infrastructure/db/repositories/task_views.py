@@ -44,6 +44,8 @@ class SqlAlchemyTaskViewStore:
                     status=step.status,
                     output_summary=step.output_summary,
                     error_code=step.error_code,
+                    started_at=step.started_at,
+                    finished_at=step.finished_at,
                 )
                 for step in steps
             ),

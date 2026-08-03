@@ -10,7 +10,7 @@ from ai_employee.domain.tasks import JsonValue, TaskStatus
 
 @dataclass(frozen=True, slots=True)
 class TaskStepSnapshot:
-    """供 REST 与 SSE 快照共享的步骤视图。"""
+    """供 REST 与 SSE 快照共享的步骤视图，仅含可公开恢复时间线的字段。"""
 
     id: UUID
     sequence: int
@@ -18,6 +18,8 @@ class TaskStepSnapshot:
     status: str
     output_summary: dict[str, JsonValue] | None
     error_code: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)

@@ -374,6 +374,9 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                             "name": step.name,
                             "status": step.status,
                             "output_summary": step.output_summary,
+                            "error_code": step.error_code,
+                            "started_at": step.started_at.isoformat() if step.started_at else None,
+                            "finished_at": step.finished_at.isoformat() if step.finished_at else None,
                         }
                         for step in snapshot.steps
                     ],

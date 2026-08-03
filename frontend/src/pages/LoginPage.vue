@@ -48,11 +48,19 @@ async function submit(): Promise<void> {
 
 <template>
   <main class="login-page">
-    <form aria-label="管理员登录" @submit.prevent="submit">
+    <form
+      aria-label="管理员登录"
+      @submit.prevent="submit"
+    >
       <h1>登录 AI Employee</h1>
       <label>
         邮箱
-        <input v-model="email" type="email" autocomplete="username" required />
+        <input
+          v-model="email"
+          type="email"
+          autocomplete="username"
+          required
+        >
       </label>
       <label>
         密码
@@ -61,12 +69,20 @@ async function submit(): Promise<void> {
           type="password"
           autocomplete="current-password"
           required
-        />
+        >
       </label>
-      <button type="submit" :disabled="auth.loading">
+      <button
+        type="submit"
+        :disabled="auth.loading"
+      >
         {{ auth.loading ? '登录中…' : '登录' }}
       </button>
-      <p v-if="error" role="alert">{{ error }}</p>
+      <p
+        v-if="error"
+        role="alert"
+      >
+        {{ error }}
+      </p>
     </form>
   </main>
 </template>

@@ -20,7 +20,7 @@ from ai_employee.application.use_cases.task_views import RetryTaskUseCase
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel, TaskStepModel
 from ai_employee.infrastructure.db.repositories.task_views import (
     PostgresQueuedTaskDispatcher,
     SqlAlchemyTaskViewStore,
@@ -280,6 +280,19 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
     session_factory, user_id, build_stream = sse_store
     task_id = await _create_task(session_factory, user_id, status="running")
     event_id = await _append_event(session_factory, user_id, task_id, "task.running")
+    async with session_factory.begin() as session:
+        session.add(
+            TaskStepModel(
+                task_id=task_id,
+                sequence=1,
+                name="recoverable-step",
+                kind="test",
+                status="completed",
+                input_summary={},
+                started_at=datetime(2026, 8, 3, 0, 0, tzinfo=UTC),
+                finished_at=datetime(2026, 8, 3, 0, 0, 2, tzinfo=UTC),
+            )
+        )
 
     events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=0)
     payload = _event_payload(await anext(events))
@@ -292,7 +305,18 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
         "id": str(task_id),
         "kind": "fake_write",
         "status": "running",
-        "steps": [],
+        "steps": [
+            {
+                "id": payload["payload"]["steps"][0]["id"],
+                "sequence": 1,
+                "name": "recoverable-step",
+                "status": "completed",
+                "output_summary": None,
+                "error_code": None,
+                "started_at": "2026-08-03T00:00:00+00:00",
+                "finished_at": "2026-08-03T00:00:02+00:00",
+            }
+        ],
     }
 
 

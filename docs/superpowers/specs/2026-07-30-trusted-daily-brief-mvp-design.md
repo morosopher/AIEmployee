@@ -503,7 +503,12 @@ SSE 地址为 `GET /api/v1/tasks/{task_id}/events`，使用 Cookie 会话认证�
 - `assistant.delta`
 - `heartbeat`
 
-临时文本增量允许丢失，最终 AssistantMessage 必须持久化。客户端重连时使用 `Last-Event-ID` 请求遗漏事件；事件过期或间隙无法补齐时，客户端重新获取任务快照。客户端按 `sequence` 去重。
+临时文本增量允许丢失，最终 AssistantMessage 必须持久化。浏览器自动重连时使用
+`Last-Event-ID` 请求遗漏事件；主动新建 `EventSource` 无法设置该 Header 时，客户端可传
+非负整数查询参数 `last_event_id`。服务端优先 Header，以免自动重连被静态查询游标回退；事件
+过期或间隙无法补齐时，客户端重新获取任务快照。客户端按 `sequence` 去重。`task.snapshot`
+中的步骤只包含公开展示所需的 `started_at`、`finished_at`、状态、错误码和摘要，不暴露输入、
+租约或内部执行字段。
 
 SSE 约每 15 秒发送心跳。Caddy 和 API 必须关闭会破坏实时性的响应缓冲。
 

@@ -1,10 +1,12 @@
 """任务 REST 接口的集成验收测试。"""
 
-from datetime import time
+from datetime import UTC, datetime, time
+from typing import cast
 from uuid import UUID
 
 import httpx
 import pytest
+from fastapi import Response
 from sqlalchemy import select
 
 from ai_employee.config import get_settings
@@ -96,6 +98,8 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
                     kind="test",
                     status="pending",
                     input_summary={},
+                    started_at=datetime(2026, 8, 3, 0, 0, tzinfo=UTC),
+                    finished_at=datetime(2026, 8, 3, 0, 0, 2, tzinfo=UTC),
                 ),
                 TaskStepModel(
                     task_id=task_id,
@@ -109,6 +113,16 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
         )
     snapshot = await client.get(f"/api/v1/tasks/{task_id}")
     assert [step["sequence"] for step in snapshot.json()["steps"]] == [1, 2]
+    assert snapshot.json()["steps"][1] == {
+        "id": snapshot.json()["steps"][1]["id"],
+        "sequence": 2,
+        "name": "second",
+        "status": "pending",
+        "output_summary": None,
+        "error_code": None,
+        "started_at": "2026-08-03T00:00:00Z",
+        "finished_at": "2026-08-03T00:00:02Z",
+    }
     async with session_factory() as session:
         audit_events = (
             await session.scalars(
@@ -122,6 +136,44 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
         ("task.created", {"kind": "fake_write", "status": "created"}),
         ("task.queued", {"status": "queued"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_event_route_uses_query_cursor_when_eventsource_cannot_set_header(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """主动重订阅把已知游标作为查询参数传入，仍不改变 Cookie 认证边界。"""
+    client, session_factory, user_id = task_client
+    async with session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status="queued",
+            idempotency_key="query-cursor-task",
+            input_payload={},
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+
+    class CapturingStream:
+        """捕获路由传给 SSE 基础设施的游标，避免测试永久流。"""
+
+        last_event_id: int | None = None
+
+        def response(self, *, last_event_id: int | None, **_: object) -> Response:
+            """记录公开游标并返回可立即结束的测试响应。"""
+            self.last_event_id = last_event_id
+            return Response(status_code=204)
+
+    stream = CapturingStream()
+    transport = cast(httpx.ASGITransport, client._transport)
+    transport.app.state.task_event_stream = stream
+
+    response = await client.get(f"/api/v1/tasks/{task_id}/events?last_event_id=0")
+
+    assert response.status_code == 204
+    assert stream.last_event_id == 0
 
 
 @pytest.mark.asyncio

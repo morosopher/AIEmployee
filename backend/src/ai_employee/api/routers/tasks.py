@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, status
 from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession
@@ -40,6 +40,8 @@ class StepResponse(BaseModel):
     status: str
     output_summary: dict[str, JsonValue] | None
     error_code: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 class TaskResponse(BaseModel):
@@ -76,6 +78,8 @@ def _task_response(snapshot: TaskSnapshot) -> TaskResponse:
                 status=item.status,
                 output_summary=item.output_summary,
                 error_code=item.error_code,
+                started_at=item.started_at,
+                finished_at=item.finished_at,
             )
             for item in snapshot.steps
         ],
@@ -85,6 +89,36 @@ def _task_response(snapshot: TaskSnapshot) -> TaskResponse:
 def _missing_task() -> ApiProblem:
     """统一隐藏跨用户资源，返回与不存在相同的 404。"""
     return ApiProblem(404, "task_not_found", "Task not found", "The requested task was not found.")
+
+
+def _event_cursor(*, header_value: str | None, query_value: str | None) -> int | None:
+    """安全选择 SSE 重放游标，优先浏览器自动重连附加的标准 Header。
+
+    主动创建的 ``EventSource`` 无法设置 ``Last-Event-ID`` Header，因此允许其把已知
+    PostgreSQL 游标放在查询参数；一旦浏览器自动重连，Header 反映更近的已接收事件，必须
+    优先以免静态查询参数倒退回放。两种输入均仅接受非负十进制整数，避免把不可信值交给
+    持久事件查询。
+    """
+    value = header_value if header_value is not None else query_value
+    if value is None:
+        return None
+    try:
+        cursor = int(value)
+    except ValueError:
+        raise ApiProblem(
+            422,
+            "invalid_last_event_id",
+            "Invalid event cursor",
+            "Last-Event-ID must be an integer.",
+        ) from None
+    if cursor < 0:
+        raise ApiProblem(
+            422,
+            "invalid_last_event_id",
+            "Invalid event cursor",
+            "Last-Event-ID must be a non-negative integer.",
+        )
+    return cursor
 
 
 def build_tasks_router() -> APIRouter:
@@ -139,21 +173,16 @@ def build_tasks_router() -> APIRouter:
         request: Request,
         authenticated: CurrentSession,
         use_case: Annotated[GetTaskUseCase, Depends(get_get_task_use_case)],
+        query_last_event_id: Annotated[str | None, Query(alias="last_event_id", max_length=20)] = None,
     ):
         """建立事件流；认证后先验证任务存在，避免跨用户订阅。"""
         if await use_case.execute(task_id=task_id, user_id=authenticated.user.id) is None:
             raise _missing_task()
         stream = request.app.state.task_event_stream
-        last_value = request.headers.get("Last-Event-ID")
-        try:
-            last_event_id = int(last_value) if last_value is not None else None
-        except ValueError:
-            raise ApiProblem(
-                422,
-                "invalid_last_event_id",
-                "Invalid event cursor",
-                "Last-Event-ID must be an integer.",
-            ) from None
+        last_event_id = _event_cursor(
+            header_value=request.headers.get("Last-Event-ID"),
+            query_value=query_last_event_id,
+        )
         return stream.response(
             task_id=task_id, user_id=authenticated.user.id, last_event_id=last_event_id
         )

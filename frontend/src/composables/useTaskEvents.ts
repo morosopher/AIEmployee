@@ -47,8 +47,13 @@ export function useTaskEvents(
   const open = (nextTaskId: string): void => {
     connectionState.value = 'connecting'
     tasks.setConnectionState(nextTaskId, 'connecting')
+    const cursor = tasks.latestSequences[nextTaskId]
+    const query =
+      cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0
+        ? `?last_event_id=${cursor}`
+        : ''
     source = new EventSource(
-      `/api/v1/tasks/${encodeURIComponent(nextTaskId)}/events`,
+      `/api/v1/tasks/${encodeURIComponent(nextTaskId)}/events${query}`,
     )
     source.onopen = () => {
       connectionState.value = 'connected'

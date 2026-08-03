@@ -17,6 +17,9 @@ export default tseslint.config(
       parser: vueParser,
       parserOptions: { parser: tseslint.parser, extraFileExtensions: ['.vue'] },
     },
-    rules: { 'vue/multi-word-component-names': 'off' },
+    rules: {
+      'vue/multi-word-component-names': 'off',
+      'vue/one-component-per-file': 'off',
+    },
   },
 )

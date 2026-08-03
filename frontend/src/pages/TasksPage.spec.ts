@@ -1,6 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { ref } from 'vue'
+import { nextTick, reactive, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { TaskSnapshot } from '../api/types'
@@ -16,8 +16,10 @@ vi.mock('@/api/client', () => api)
 vi.mock('@/composables/useTaskEvents', () => ({
   useTaskEvents: () => ref('connected'),
 }))
+const route = reactive({ query: { task_id: 'task-1' as string } })
+
 vi.mock('vue-router', () => ({
-  useRoute: () => ({ query: { task_id: 'task-1' } }),
+  useRoute: () => route,
   useRouter: () => ({ replace: vi.fn() }),
 }))
 
@@ -47,7 +49,10 @@ function deferredSnapshot(): {
 describe('TasksPage', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
-    vi.clearAllMocks()
+    route.query.task_id = 'task-1'
+    api.cancelTask.mockReset()
+    api.getTask.mockReset()
+    api.retryTask.mockReset()
   })
 
   it('does not let an initial REST snapshot overwrite a newer SSE projection', async () => {
@@ -70,5 +75,57 @@ describe('TasksPage', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('当前状态：succeeded')
+    wrapper.unmount()
+  })
+
+  it('ignores an old task A response after navigating A to B to A', async () => {
+    const firstA = deferredSnapshot()
+    const taskB = deferredSnapshot()
+    const secondA = deferredSnapshot()
+    api.getTask
+      .mockReturnValueOnce(firstA.promise)
+      .mockReturnValueOnce(taskB.promise)
+      .mockReturnValueOnce(secondA.promise)
+    const wrapper = mount(TasksPage, { global: { plugins: [createPinia()] } })
+
+    route.query.task_id = 'task-2'
+    await nextTick()
+    await flushPromises()
+    route.query.task_id = 'task-1'
+    await nextTick()
+    await flushPromises()
+    expect(api.getTask).toHaveBeenCalledTimes(3)
+    secondA.resolve({ ...queuedSnapshot, status: 'running' })
+    await flushPromises()
+    firstA.resolve(queuedSnapshot)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('当前状态：running')
+    wrapper.unmount()
+  })
+
+  it('reuses a retry key after a timed-out retry request', async () => {
+    api.getTask.mockResolvedValue({ ...queuedSnapshot, status: 'failed' })
+    api.retryTask
+      .mockRejectedValueOnce(new Error('timeout'))
+      .mockResolvedValueOnce({
+        ...queuedSnapshot,
+        id: 'replacement-task',
+        status: 'queued',
+        retry_of_task_id: 'task-1',
+      })
+    const wrapper = mount(TasksPage, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+
+    await wrapper.get('aside button').trigger('click')
+    await flushPromises()
+    await wrapper.get('aside button').trigger('click')
+    await flushPromises()
+
+    expect(api.retryTask).toHaveBeenCalledTimes(2)
+    expect(api.retryTask.mock.calls[0]?.[1]).toBe(
+      api.retryTask.mock.calls[1]?.[1],
+    )
+    wrapper.unmount()
   })
 })

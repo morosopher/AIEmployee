@@ -13,6 +13,8 @@ const tasks = useTasksStore()
 const loading = ref(false)
 const error = ref<string | null>(null)
 const originalTaskId = ref<string | null>(null)
+const retryIntentKeys = new Map<string, string>()
+let loadGeneration = 0
 const taskId = computed(() =>
   typeof route.query.task_id === 'string' ? route.query.task_id : null,
 )
@@ -31,22 +33,31 @@ const canCancel = computed(
  * @returns Promise 在成功、空选择或错误显示后完成。
  */
 async function loadTask(nextTaskId: string | null): Promise<void> {
+  const generation = ++loadGeneration
   error.value = null
   if (!nextTaskId) return
   loading.value = true
   try {
     const observedSequence = tasks.latestSequences[nextTaskId] ?? -1
     const snapshot = await getTask(nextTaskId)
-    if (taskId.value === nextTaskId)
+    if (generation === loadGeneration && taskId.value === nextTaskId)
       tasks.setTaskIfUnchangedSince(snapshot, observedSequence)
   } catch {
-    error.value = '无法加载该任务，请刷新页面后重试。'
+    if (generation === loadGeneration)
+      error.value = '无法加载该任务，请刷新页面后重试。'
   } finally {
-    loading.value = false
+    if (generation === loadGeneration) loading.value = false
   }
 }
 
-watch(taskId, loadTask, { immediate: true })
+watch(
+  taskId,
+  (nextTaskId, previousTaskId) => {
+    if (nextTaskId !== previousTaskId) retryIntentKeys.clear()
+    void loadTask(nextTaskId)
+  },
+  { immediate: true },
+)
 
 /**
  * 仅对当前服务端允许取消的状态发起请求，并以返回快照覆盖本地投影。
@@ -69,11 +80,14 @@ async function cancelCurrentTask(): Promise<void> {
  * @param failedTaskId 当前失败任务标识。
  * @returns 新 replacement 的权威快照。
  */
-function retryFailedTask(failedTaskId: string) {
-  return retryTask(
-    failedTaskId,
-    `task-retry:${failedTaskId}:${crypto.randomUUID()}`,
-  )
+async function retryFailedTask(failedTaskId: string) {
+  const idempotencyKey =
+    retryIntentKeys.get(failedTaskId) ??
+    `task-retry:${failedTaskId}:${crypto.randomUUID()}`
+  retryIntentKeys.set(failedTaskId, idempotencyKey)
+  const replacement = await retryTask(failedTaskId, idempotencyKey)
+  retryIntentKeys.delete(failedTaskId)
+  return replacement
 }
 
 /**
@@ -95,19 +109,41 @@ function followReplacement(
 <template>
   <main class="tasks-page">
     <section aria-labelledby="tasks-title">
-      <h1 id="tasks-title">任务中心</h1>
-      <p v-if="!taskId">请从任务历史选择一个任务。</p>
+      <h1 id="tasks-title">
+        任务中心
+      </h1>
+      <p v-if="!taskId">
+        请从任务历史选择一个任务。
+      </p>
       <template v-else>
-        <p role="status">实时连接：{{ connectionState }}</p>
-        <p v-if="loading" role="status">正在恢复任务快照…</p>
-        <p v-if="error" role="alert">{{ error }}</p>
+        <p role="status">
+          实时连接：{{ connectionState }}
+        </p>
+        <p
+          v-if="loading"
+          role="status"
+        >
+          正在恢复任务快照…
+        </p>
+        <p
+          v-if="error"
+          role="alert"
+        >
+          {{ error }}
+        </p>
         <template v-if="task">
           <h2>{{ task.kind }}</h2>
           <p>当前状态：{{ task.status }}</p>
-          <button v-if="canCancel" type="button" @click="cancelCurrentTask">
+          <button
+            v-if="canCancel"
+            type="button"
+            @click="cancelCurrentTask"
+          >
             取消任务
           </button>
-          <p v-if="originalTaskId">此任务重试自：{{ originalTaskId }}</p>
+          <p v-if="originalTaskId">
+            此任务重试自：{{ originalTaskId }}
+          </p>
           <p v-else-if="task.retry_of_task_id">
             此任务重试自：{{ task.retry_of_task_id }}
           </p>

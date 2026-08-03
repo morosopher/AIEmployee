@@ -21,7 +21,7 @@ export interface TaskStep {
   output_summary: JsonObject | null
   error_code: string | null
   started_at?: string
-  completed_at?: string
+  finished_at?: string
 }
 
 /** 可从 REST 或 SSE 快照恢复的任务投影。 */
@@ -165,6 +165,10 @@ export function parseTaskStep(value: unknown): TaskStep {
     output_summary: asJsonObject(object.output_summary),
     error_code:
       typeof object.error_code === 'string' ? object.error_code : null,
+    started_at:
+      typeof object.started_at === 'string' ? object.started_at : undefined,
+    finished_at:
+      typeof object.finished_at === 'string' ? object.finished_at : undefined,
   }
 }
 

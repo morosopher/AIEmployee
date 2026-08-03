@@ -55,8 +55,8 @@ function summaryText(summary: TaskStep['output_summary']): string {
  * @returns 简短时长文本。
  */
 function durationText(step: TaskStep): string {
-  if (!step.started_at || !step.completed_at) return '耗时未知'
-  const duration = Date.parse(step.completed_at) - Date.parse(step.started_at)
+  if (!step.started_at || !step.finished_at) return '耗时未知'
+  const duration = Date.parse(step.finished_at) - Date.parse(step.started_at)
   return Number.isFinite(duration) && duration >= 0
     ? `耗时 ${Math.round(duration / 1000)} 秒`
     : '耗时未知'
@@ -64,33 +64,66 @@ function durationText(step: TaskStep): string {
 </script>
 
 <template>
-  <aside class="task-timeline" aria-label="执行时间线">
-    <p v-if="!task" role="status">请选择一个任务查看执行时间线。</p>
+  <aside
+    class="task-timeline"
+    aria-label="执行时间线"
+  >
+    <p
+      v-if="!task"
+      role="status"
+    >
+      请选择一个任务查看执行时间线。
+    </p>
     <template v-else>
       <header>
         <h2>执行时间线</h2>
         <p>任务状态：{{ task.status }}</p>
       </header>
-      <p v-if="task.error_code" class="error" role="alert">
+      <p
+        v-if="task.error_code"
+        class="error"
+        role="alert"
+      >
         错误代码：{{ task.error_code }}
       </p>
-      <ol v-if="task.steps.length" aria-label="任务步骤">
-        <li v-for="step in task.steps" :key="step.id">
+      <ol
+        v-if="task.steps.length"
+        aria-label="任务步骤"
+      >
+        <li
+          v-for="step in task.steps"
+          :key="step.id"
+        >
           <strong>{{ step.name }}</strong>
           <span>状态：{{ step.status }}</span>
           <span>{{ durationText(step) }}</span>
-          <span v-if="step.error_code" class="error"
-            >错误代码：{{ step.error_code }}</span
-          >
+          <span
+            v-if="step.error_code"
+            class="error"
+          >错误代码：{{ step.error_code }}</span>
           <details>
             <summary>查看摘要</summary>
             <pre>{{ summaryText(step.output_summary) }}</pre>
           </details>
         </li>
       </ol>
-      <p v-else>暂时没有可展示的步骤。</p>
-      <button v-if="canRetry" type="button" @click="retryTask">重试任务</button>
-      <p v-if="retryError" class="error" role="alert">{{ retryError }}</p>
+      <p v-else>
+        暂时没有可展示的步骤。
+      </p>
+      <button
+        v-if="canRetry"
+        type="button"
+        @click="retryTask"
+      >
+        重试任务
+      </button>
+      <p
+        v-if="retryError"
+        class="error"
+        role="alert"
+      >
+        {{ retryError }}
+      </p>
     </template>
   </aside>
 </template>

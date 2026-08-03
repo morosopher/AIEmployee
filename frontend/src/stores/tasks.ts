@@ -227,11 +227,11 @@ function mergeStep(
       existing?.error_code ??
       (typeof payload.error_code === 'string' ? payload.error_code : null),
     started_at: existing?.started_at,
-    completed_at: existing?.completed_at,
+    finished_at: existing?.finished_at,
   }
   if (event.event === 'step.started') base.started_at = event.occurred_at
   if (event.event === 'step.completed' || event.event === 'step.failed')
-    base.completed_at = event.occurred_at
+    base.finished_at = event.occurred_at
   return base
 }
 

@@ -119,4 +119,40 @@ describe('tasks store', () => {
 
     expect(store.tasks['task-1']?.status).toBe('succeeded')
   })
+
+  it('preserves public step start and finish timestamps from a snapshot', () => {
+    const store = useTasksStore()
+    store.applyEvent(
+      event({
+        id: 7,
+        sequence: 7,
+        event: 'task.snapshot',
+        step_id: null,
+        payload: {
+          id: 'task-1',
+          kind: 'daily_brief',
+          status: 'succeeded',
+          retry_of_task_id: null,
+          error_code: null,
+          steps: [
+            {
+              id: 'step-1',
+              sequence: 1,
+              name: '生成简报',
+              status: 'completed',
+              output_summary: null,
+              error_code: null,
+              started_at: '2026-08-03T00:00:00Z',
+              finished_at: '2026-08-03T00:00:02Z',
+            },
+          ],
+        },
+      }),
+    )
+
+    expect(store.tasks['task-1']?.steps[0]).toMatchObject({
+      started_at: '2026-08-03T00:00:00Z',
+      finished_at: '2026-08-03T00:00:02Z',
+    })
+  })
 })
