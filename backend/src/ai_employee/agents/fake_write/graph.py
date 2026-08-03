@@ -1,7 +1,8 @@
 """构建只验证审批协议、绝不访问真实外部资源的 LangGraph。"""
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
+from typing import Protocol, cast
 from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -13,6 +14,13 @@ from ai_employee.application.use_cases.approvals import ApprovalProposalStore
 from ai_employee.domain.tasks import ApprovalProposal, JsonValue
 
 FakeTool = Callable[[dict[str, object]], Awaitable[None]]
+
+
+class CompiledFakeWriteGraph(Protocol):
+    """收窄 Worker 调用的 LangGraph 异步运行边界。"""
+
+    async def ainvoke(self, input: object, *, config: Mapping[str, object]) -> object:
+        """运行初始状态或恢复命令，并返回由 LangGraph 管理的状态快照。"""
 
 
 def _as_json_payload(payload: dict[str, object]) -> dict[str, JsonValue]:
@@ -47,12 +55,17 @@ class FakeWriteGraph:
             "fake.write",
             _as_json_payload(state["proposal_payload"]),
         )
-        pending = await self._approval_store.create_or_get_pending(
-            task_id=UUID(state["task_id"]),
-            proposal=proposal,
-            preview_markdown="将执行合成假写操作。",
-            expires_at=self._clock() + self._approval_ttl,
+        task_id = UUID(state["task_id"])
+        pending = await self._approval_store.find_for_graph(
+            task_id=task_id, payload_hash=proposal.payload_hash
         )
+        if pending is None:
+            pending = await self._approval_store.create_or_get_pending(
+                task_id=task_id,
+                proposal=proposal,
+                preview_markdown="将执行合成假写操作。",
+                expires_at=self._clock() + self._approval_ttl,
+            )
         decision = interrupt(
             {
                 "approval_id": str(pending.approval_id),
@@ -69,7 +82,10 @@ class FakeWriteGraph:
 
     async def execute(self, state: FakeWriteState) -> dict[str, object]:
         """只在明确批准时调用假工具；拒绝是成功完成但绝不假写。"""
-        if state["approval_decision"] == "approved":
+        decision = state["approval_decision"]
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("approval decision is unavailable")
+        if decision == "approved":
             await self._fake_tool(state["proposal_payload"])
             tool_called = True
             message = "fake tool called"
@@ -77,11 +93,16 @@ class FakeWriteGraph:
             tool_called = False
             message = "proposal rejected"
         await self._approval_store.finish_fake_write(
-            task_id=UUID(state["task_id"]), now=self._clock()
+            task_id=UUID(state["task_id"]),
+            decision=decision,
+            payload_hash=ApprovalProposal.create(
+                "fake.write", _as_json_payload(state["proposal_payload"])
+            ).payload_hash,
+            now=self._clock(),
         )
         return {"tool_called": tool_called, "messages": [*state["messages"], message]}
 
-    def compile(self, *, checkpointer: BaseCheckpointSaver[str]) -> object:
+    def compile(self, *, checkpointer: BaseCheckpointSaver[str]) -> CompiledFakeWriteGraph:
         """使用调用方提供的 PostgreSQL checkpointer 编译固定三节点工作流。"""
         graph = StateGraph(FakeWriteState)
         graph.add_node("prepare", self.prepare)
@@ -91,4 +112,4 @@ class FakeWriteGraph:
         graph.add_edge("prepare", "approval")
         graph.add_edge("approval", "execute")
         graph.add_edge("execute", END)
-        return graph.compile(checkpointer=checkpointer)
+        return cast(CompiledFakeWriteGraph, graph.compile(checkpointer=checkpointer))

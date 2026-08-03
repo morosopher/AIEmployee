@@ -1,6 +1,7 @@
 """以 PostgreSQL 锁实现审批决定与过期终止。"""
 
 from datetime import datetime
+from hmac import compare_digest
 from uuid import UUID
 
 from sqlalchemy import select
@@ -49,7 +50,13 @@ class SqlAlchemyApprovalStore:
                 .with_for_update()
             )
             if existing is not None:
-                return PendingApproval(approval_id=existing.id, version=existing.version)
+                if existing.status != ApprovalStatus.PENDING.value:
+                    raise StateConflictError(
+                        error_code="approval_conflict", message="approval is unavailable"
+                    )
+                return PendingApproval(
+                    approval_id=existing.id, version=existing.version, status=existing.status
+                )
             sequence = 1
             step = TaskStepModel(
                 task_id=task_id,
@@ -72,6 +79,8 @@ class SqlAlchemyApprovalStore:
                 status=ApprovalStatus.PENDING.value,
                 expires_at=expires_at,
             )
+            if task.status not in {TaskStatus.QUEUED.value, TaskStatus.RUNNING.value}:
+                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             task.status = TaskStatus.WAITING_APPROVAL.value
             task.graph_thread_id = str(task_id)
             session.add(approval)
@@ -86,7 +95,24 @@ class SqlAlchemyApprovalStore:
                 )
             )
             await session.flush()
-            return PendingApproval(approval_id=approval.id, version=approval.version)
+            return PendingApproval(
+                approval_id=approval.id, version=approval.version, status=approval.status
+            )
+
+    async def find_for_graph(self, *, task_id: UUID, payload_hash: str) -> PendingApproval | None:
+        """读取同一任务和哈希的审批快照，不把终态重新解释为待审批。"""
+        async with self._session_factory() as session:
+            approval = await session.scalar(
+                select(ApprovalRequestModel).where(
+                    ApprovalRequestModel.task_id == task_id,
+                    ApprovalRequestModel.payload_hash == payload_hash,
+                )
+            )
+            if approval is None:
+                return None
+            return PendingApproval(
+                approval_id=approval.id, version=approval.version, status=approval.status
+            )
 
     async def expire_overdue(self, *, now: datetime, limit: int) -> int:
         """有界锁定过期待审批，追加无内容审计并终止关联任务。"""
@@ -129,9 +155,20 @@ class SqlAlchemyApprovalStore:
                 expired_count += 1
             return expired_count
 
-    async def finish_fake_write(self, *, task_id: UUID, now: datetime) -> None:
+    async def finish_fake_write(
+        self, *, task_id: UUID, decision: str, payload_hash: str, now: datetime
+    ) -> None:
         """仅把已由审批决定恢复到队列的假写任务标记为成功。"""
         async with self._session_factory.begin() as session:
+            approval = await session.scalar(
+                select(ApprovalRequestModel)
+                .where(
+                    ApprovalRequestModel.task_id == task_id,
+                    ApprovalRequestModel.payload_hash == payload_hash,
+                    ApprovalRequestModel.status == decision,
+                )
+                .with_for_update()
+            )
             task = await session.scalar(
                 select(TaskRunModel)
                 .where(
@@ -140,7 +177,7 @@ class SqlAlchemyApprovalStore:
                 )
                 .with_for_update()
             )
-            if task is None:
+            if approval is None or task is None:
                 raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             task.status = TaskStatus.SUCCEEDED.value
             task.finished_at = now
@@ -190,7 +227,7 @@ class SqlAlchemyApprovalStore:
                 approval.status != ApprovalStatus.PENDING.value
                 or approval.expires_at <= now
                 or approval.version != version
-                or approval.payload_hash != payload_hash
+                or not compare_digest(approval.payload_hash, payload_hash)
                 or task.status != TaskStatus.WAITING_APPROVAL.value
             ):
                 raise StateConflictError(

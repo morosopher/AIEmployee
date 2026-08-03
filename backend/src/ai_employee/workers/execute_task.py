@@ -4,11 +4,16 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from uuid import UUID
 
+from langgraph.types import Command
 from taskiq import Context, TaskiqDepends
 
+from ai_employee.agents.fake_write.graph import FakeWriteGraph
+from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.config import get_settings
 from ai_employee.domain.errors import InternalInvariantError
+from ai_employee.infrastructure.db.models.tasks import TaskRunModel
+from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
@@ -70,6 +75,7 @@ def build_task_runner() -> DurableTaskRunner:
 async def execute_task(
     task_id: str,
     context: Context = taskiq_context_dependency,
+    resume: str | None = None,
 ) -> None:
     """解析 task_id，并把临时供应商错误写为耐久延迟 Outbox 重试。
 
@@ -89,6 +95,42 @@ async def execute_task(
 
     try:
         del context
+        if resume is not None and resume not in {"approved", "rejected"}:
+            return
+        settings = get_settings()
+        session_factory = build_session_factory(settings.database_url)
+        try:
+            try:
+                async with session_factory() as session:
+                    task = await session.get(TaskRunModel, parsed_task_id)
+            except Exception:  # noqa: BLE001 - 非 fake 任务仍交给既有 DurableTaskRunner 路径。
+                task = None
+            if task is not None and task.kind == "fake_write":
+                graph = FakeWriteGraph(
+                    approval_store=SqlAlchemyApprovalStore(session_factory),
+                    clock=lambda: datetime.now(UTC),
+                    approval_ttl=timedelta(minutes=5),
+                    fake_tool=_fake_write_tool,
+                )
+                async with postgres_checkpointer(settings.database_url) as saver:
+                    compiled = graph.compile(checkpointer=saver)
+                    config = {"configurable": {"thread_id": str(parsed_task_id)}}
+                    if resume is None:
+                        await compiled.ainvoke(
+                            {
+                                "task_id": str(parsed_task_id),
+                                "proposal_payload": task.input_payload,
+                                "approval_decision": None,
+                                "tool_called": False,
+                                "messages": [],
+                            },
+                            config=config,
+                        )
+                    else:
+                        await compiled.ainvoke(Command(resume=resume), config=config)
+                return
+        finally:
+            await session_factory.dispose()
         runner = build_task_runner()
         await runner.run(
             parsed_task_id,
@@ -99,3 +141,8 @@ async def execute_task(
         # 正常可写数据库路径已由应用用例持久化安全 FAILED/error_code。这里只处理主失败后
         # 数据库同样不可写或 composition 构建失败的最后防线，并且不记录可能敏感的原文。
         return
+
+
+async def _fake_write_tool(payload: dict[str, object]) -> None:
+    """执行不访问外部系统的假写，并故意不记录输入正文。"""
+    del payload

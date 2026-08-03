@@ -1,6 +1,7 @@
 """用 SQLAlchemy 实现 Outbox claim、确认与失败恢复端口。"""
 
 from datetime import datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -94,6 +95,12 @@ class SqlAlchemyOutboxStore:
                         task_id=event.aggregate_id,
                         claim_until=claim_until,
                         attempt_count=event.attempt_count,
+                        resume=cast(
+                            str | None,
+                            event.payload.get("resume")
+                            if event.payload.get("resume") in {"approved", "rejected"}
+                            else None,
+                        ),
                     )
                 )
             return tuple(claimed)

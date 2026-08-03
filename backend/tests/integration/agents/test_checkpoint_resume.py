@@ -13,7 +13,11 @@ from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
-from ai_employee.infrastructure.db.models.tasks import ApprovalRequestModel, TaskRunModel
+from ai_employee.infrastructure.db.models.tasks import (
+    ApprovalRequestModel,
+    OutboxEventModel,
+    TaskRunModel,
+)
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.session import build_session_factory
 
@@ -105,6 +109,21 @@ async def test_rejected_checkpoint_resume_never_calls_fake_tool(database_url: st
                 payload_hash=approval.payload_hash,
                 now=now,
             )
+            async with session_factory() as session:
+                resume_event = await session.scalar(select(OutboxEventModel))
+            assert resume_event is not None
+            assert resume_event.topic == "task.execute"
+            assert resume_event.aggregate_id == task_id
+            assert resume_event.payload == {"task_id": str(task_id), "resume": "rejected"}
+            with pytest.raises(StateConflictError):
+                await ApprovalDecisionUseCase(store).execute(
+                    approval_id=approval.id,
+                    user_id=user_id,
+                    decision="rejected",
+                    version=approval.version,
+                    payload_hash=approval.payload_hash,
+                    now=now,
+                )
             result = await graph.ainvoke(Command(resume="rejected"), config=config)
 
         assert result["tool_called"] is False

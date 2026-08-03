@@ -10,10 +10,11 @@ from ai_employee.domain.tasks import ApprovalProposal
 class PendingApproval:
     """图节点显示并中断时需要的已持久审批最小快照。"""
 
-    def __init__(self, *, approval_id: UUID, version: int) -> None:
+    def __init__(self, *, approval_id: UUID, version: int, status: str) -> None:
         """保存不含敏感载荷副本的稳定审批标识和版本。"""
         self.approval_id = approval_id
         self.version = version
+        self.status = status
 
 
 class ApprovalProposalStore(Protocol):
@@ -29,7 +30,12 @@ class ApprovalProposalStore(Protocol):
     ) -> PendingApproval:
         """原子复用或创建审批、步骤、状态与审计事实。"""
 
-    async def finish_fake_write(self, *, task_id: UUID, now: datetime) -> None:
+    async def find_for_graph(self, *, task_id: UUID, payload_hash: str) -> PendingApproval | None:
+        """返回同一冻结提案的现有审批，供 checkpoint 重放识别终态。"""
+
+    async def finish_fake_write(
+        self, *, task_id: UUID, decision: str, payload_hash: str, now: datetime
+    ) -> None:
         """在 Graph 终点把已恢复的假写任务持久化为成功。"""
 
 
