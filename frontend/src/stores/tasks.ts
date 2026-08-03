@@ -27,6 +27,7 @@ export const useTasksStore = defineStore('tasks', {
     connections: {} as Record<string, TaskConnectionState>,
     seenSequences: {} as Record<string, Record<number, true>>,
     snapshotCursors: {} as Record<string, number>,
+    latestSequences: {} as Record<string, number>,
   }),
   actions: {
     /**
@@ -40,6 +41,22 @@ export const useTasksStore = defineStore('tasks', {
         ...snapshot,
         steps: orderSteps(snapshot.steps),
       }
+    },
+    /**
+     * 仅当 REST 请求期间没有抵达更晚的耐久事件时写入快照，避免初始加载回退 SSE 投影。
+     *
+     * @param snapshot 服务端验证后的任务快照。
+     * @param observedSequence 发起 REST 请求前该任务已知的最高事件序列。
+     * @returns 是否已写入快照；序列变化时返回 false。
+     */
+    setTaskIfUnchangedSince(
+      snapshot: TaskSnapshot,
+      observedSequence: number,
+    ): boolean {
+      if ((this.latestSequences[snapshot.id] ?? -1) !== observedSequence)
+        return false
+      this.setTask(snapshot)
+      return true
     },
     /**
      * 单独更新连接展示状态，绝不由断线修改任务持久状态。
@@ -71,6 +88,10 @@ export const useTasksStore = defineStore('tasks', {
       const seen = this.seenSequences[event.task_id] ?? {}
       seen[event.sequence] = true
       this.seenSequences[event.task_id] = seen
+      this.latestSequences[event.task_id] = Math.max(
+        this.latestSequences[event.task_id] ?? -1,
+        event.sequence,
+      )
 
       if (event.event === 'task.status_changed') {
         this.applyStatusEvent(event)
@@ -84,18 +105,21 @@ export const useTasksStore = defineStore('tasks', {
       }
     },
     /**
-     * 以服务端重放间隙快照覆盖局部投影，并拒绝该游标之前的迟到事件。
+     * 以服务端重放间隙快照覆盖局部投影，并拒绝会回退已知序列的迟到快照。
      *
      * @param event `task.snapshot` SSE 事件。
      * @returns 无返回值；无效 payload 被安全忽略。
      */
     applySnapshotEvent(event: TaskEvent): void {
       try {
+        if (event.sequence <= (this.latestSequences[event.task_id] ?? -1))
+          return
         const snapshot = parseTaskSnapshot(event.payload)
         if (snapshot.id !== event.task_id) return
         this.setTask(snapshot)
         this.snapshotCursors[event.task_id] = event.sequence
         this.seenSequences[event.task_id] = { [event.sequence]: true }
+        this.latestSequences[event.task_id] = event.sequence
       } catch {
         // 错误的临时传输数据不能清空既有可恢复投影。
       }

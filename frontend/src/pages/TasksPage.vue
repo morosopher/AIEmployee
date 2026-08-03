@@ -25,7 +25,7 @@ const canCancel = computed(
 )
 
 /**
- * 根据路由任务标识恢复 REST 快照，SSE 仅用于之后的增量投影。
+ * 根据路由任务标识恢复 REST 快照；请求期间抵达的 SSE 投影优先，避免旧响应回退状态。
  *
  * @param nextTaskId 当前路由中的任务标识。
  * @returns Promise 在成功、空选择或错误显示后完成。
@@ -35,7 +35,10 @@ async function loadTask(nextTaskId: string | null): Promise<void> {
   if (!nextTaskId) return
   loading.value = true
   try {
-    tasks.setTask(await getTask(nextTaskId))
+    const observedSequence = tasks.latestSequences[nextTaskId] ?? -1
+    const snapshot = await getTask(nextTaskId)
+    if (taskId.value === nextTaskId)
+      tasks.setTaskIfUnchangedSince(snapshot, observedSequence)
   } catch {
     error.value = '无法加载该任务，请刷新页面后重试。'
   } finally {

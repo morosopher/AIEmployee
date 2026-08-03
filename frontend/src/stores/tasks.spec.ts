@@ -88,4 +88,35 @@ describe('tasks store', () => {
     expect(store.tasks['task-1']?.status).toBe('succeeded')
     expect(store.connections['task-1']).toBe('reconnecting')
   })
+
+  it('ignores a stale snapshot after a newer durable event', () => {
+    const store = useTasksStore()
+    store.applyEvent(
+      event({
+        id: 8,
+        sequence: 8,
+        event: 'task.status_changed',
+        step_id: null,
+        payload: { status: 'succeeded' },
+      }),
+    )
+    store.applyEvent(
+      event({
+        id: 7,
+        sequence: 7,
+        event: 'task.snapshot',
+        step_id: null,
+        payload: {
+          id: 'task-1',
+          kind: 'daily_brief',
+          status: 'running',
+          retry_of_task_id: null,
+          error_code: null,
+          steps: [],
+        },
+      }),
+    )
+
+    expect(store.tasks['task-1']?.status).toBe('succeeded')
+  })
 })
