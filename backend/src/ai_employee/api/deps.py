@@ -60,7 +60,10 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
     trace_id = existing_trace_id if isinstance(existing_trace_id, str) else uuid4().hex
     request.state.trace_id = trace_id
     problem = ProblemDetails(
-        type=f"urn:ai-employee:error:{problem_error.error_code}",
+        type=(
+            "https://ai-employee.local/problems/"
+            f"{problem_error.error_code.replace('_', '-')}"
+        ),
         title=problem_error.title,
         status=problem_error.status_code,
         detail=problem_error.detail,

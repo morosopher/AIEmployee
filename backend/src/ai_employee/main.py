@@ -82,7 +82,9 @@ def create_app(
     app.state.approval_decision_use_case = ApprovalDecisionUseCase(
         SqlAlchemyApprovalStore(session_factory)
     )
-    app.state.task_event_stream = TaskEventStream(TaskEventStore(session_factory, task_store))
+    app.state.task_event_stream = TaskEventStream(
+        TaskEventStore(session_factory, task_store), redis_url=settings.redis_url
+    )
     app.add_exception_handler(ApiProblem, handle_api_problem)
     app.add_exception_handler(RequestValidationError, handle_request_validation_error)
     probe = readiness_probe or (lambda: {"postgres": True, "redis": True})

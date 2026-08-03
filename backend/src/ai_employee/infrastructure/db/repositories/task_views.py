@@ -1,6 +1,7 @@
 """以 PostgreSQL 实现任务 API 所需的用户隔离读写视图。"""
 
 from datetime import datetime
+from hashlib import sha256
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, update
@@ -109,7 +110,25 @@ class SqlAlchemyTaskViewStore:
     async def retry(
         self, *, task_id: UUID, user_id: UUID, idempotency_key: str, now: datetime
     ) -> TaskSnapshot | None:
-        """通过用户范围幂等键从失败任务复制输入并创建新的 Outbox 事实。"""
+        """通过原失败任务范围的幂等键复制输入并创建新的 Outbox 事实。
+
+        Args:
+            task_id: 必须处于失败终态的原始任务标识。
+            user_id: 当前认证用户，所有查询与新事实均绑定该用户。
+            idempotency_key: 调用方提供的重试请求键。
+            now: 用于新 Outbox 可投递时刻的显式 UTC 瞬间。
+
+        Returns:
+            新建或同一原任务既有的 replacement；原任务不存在时返回 ``None``。
+
+        Raises:
+            StateConflictError: 原任务不是失败状态，不能被重试。
+
+        同一用户的一般创建幂等键仍由 ``task_runs`` 原约束管理。重试将公开请求键编码为
+        包含原任务 UUID 的固定长度内部键，使同一键可安全重试两个不同失败任务，同时不会
+        让第二个任务错误复用第一个任务的 replacement。
+        """
+        retry_key = self._retry_idempotency_key(task_id=task_id, idempotency_key=idempotency_key)
         async with self._session_factory.begin() as session:
             original = await session.scalar(
                 select(TaskRunModel)
@@ -124,7 +143,9 @@ class SqlAlchemyTaskViewStore:
                 )
             existing = await session.scalar(
                 select(TaskRunModel).where(
-                    TaskRunModel.user_id == user_id, TaskRunModel.idempotency_key == idempotency_key
+                    TaskRunModel.user_id == user_id,
+                    TaskRunModel.retry_of_task_id == task_id,
+                    TaskRunModel.idempotency_key == retry_key,
                 )
             )
             if existing is not None:
@@ -138,7 +159,7 @@ class SqlAlchemyTaskViewStore:
                     retry_of_task_id=task_id,
                     kind=original.kind,
                     status=TaskStatus.QUEUED.value,
-                    idempotency_key=idempotency_key,
+                    idempotency_key=retry_key,
                     input_payload=original.input_payload,
                 )
                 .on_conflict_do_nothing(constraint="uq_task_runs_user_id_idempotency_key")
@@ -148,7 +169,8 @@ class SqlAlchemyTaskViewStore:
                 existing = await session.scalar(
                     select(TaskRunModel).where(
                         TaskRunModel.user_id == user_id,
-                        TaskRunModel.idempotency_key == idempotency_key,
+                        TaskRunModel.retry_of_task_id == task_id,
+                        TaskRunModel.idempotency_key == retry_key,
                     )
                 )
                 if existing is None:
@@ -175,6 +197,20 @@ class SqlAlchemyTaskViewStore:
             )
             await session.flush()
             return await self._get_in_session(session, task_id=replacement_id, user_id=user_id)
+
+    @staticmethod
+    def _retry_idempotency_key(*, task_id: UUID, idempotency_key: str) -> str:
+        """生成受原失败任务约束且不超出数据库列长度的内部幂等键。
+
+        Args:
+            task_id: 请求明确指定的失败任务。
+            idempotency_key: 外部调用方提供、可能接近列长度上限的键。
+
+        Returns:
+            固定长度的英文内部键；仅用于数据库唯一约束，不向 API 返回。
+        """
+        digest = sha256(idempotency_key.encode("utf-8")).hexdigest()
+        return f"retry:{task_id}:{digest}"
 
 
 class PostgresQueuedTaskDispatcher:

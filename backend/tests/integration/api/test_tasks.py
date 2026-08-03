@@ -141,3 +141,98 @@ async def test_cancel_and_retry_create_a_replacement(
     repeated = await client.post(f"/api/v1/tasks/{failed_id}/retry", headers=retry_headers)
     assert retry.json()["retry_of_task_id"] == str(failed_id)
     assert repeated.json()["id"] == retry.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_retry_idempotency_key_is_scoped_to_the_original_failed_task(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """同一用户复用重试键时，其他失败任务不得返回无关 replacement。"""
+    client, session_factory, user_id = task_client
+    async with session_factory.begin() as session:
+        first_failed = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status="failed",
+            idempotency_key="first-failed-task",
+            input_payload={},
+        )
+        second_failed = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status="failed",
+            idempotency_key="second-failed-task",
+            input_payload={},
+        )
+        session.add_all((first_failed, second_failed))
+        await session.flush()
+        first_failed_id = first_failed.id
+        second_failed_id = second_failed.id
+
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "shared-retry-key"}
+    first_retry = await client.post(f"/api/v1/tasks/{first_failed_id}/retry", headers=headers)
+    second_retry = await client.post(f"/api/v1/tasks/{second_failed_id}/retry", headers=headers)
+
+    assert first_retry.status_code == 200
+    assert second_retry.status_code == 200
+    assert first_retry.json()["retry_of_task_id"] == str(first_failed_id)
+    assert second_retry.json()["retry_of_task_id"] == str(second_failed_id)
+    assert first_retry.json()["id"] != second_retry.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_cross_user_task_is_hidden_as_not_found(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """另一个用户拥有的任务必须与不存在任务同样返回 404。"""
+    client, session_factory, _ = task_client
+    async with session_factory.begin() as session:
+        other_user = UserModel(
+            email="other-tasks@example.com",
+            display_name="Other task owner",
+            password_hash=PasswordHasher().hash("synthetic-password"),
+            timezone="Asia/Shanghai",
+            locale="zh-CN",
+            brief_time=time(8, 0),
+            is_active=True,
+        )
+        session.add(other_user)
+        await session.flush()
+        foreign_task = TaskRunModel(
+            user_id=other_user.id,
+            kind="fake_write",
+            status="queued",
+            idempotency_key="foreign-task",
+            input_payload={},
+        )
+        session.add(foreign_task)
+        await session.flush()
+        foreign_task_id = foreign_task.id
+
+    response = await client.get(f"/api/v1/tasks/{foreign_task_id}")
+
+    assert response.status_code == 404
+    assert response.json()["error_code"] == "task_not_found"
+
+
+@pytest.mark.asyncio
+async def test_task_and_approval_mutations_require_csrf(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """任务创建和审批决定均拒绝缺失 CSRF Header 的已登录 Cookie 请求。"""
+    client, _, _ = task_client
+    task_response = await client.post(
+        "/api/v1/tasks",
+        json={"kind": "fake_write", "input_payload": {}},
+        headers={"Idempotency-Key": "csrf-task"},
+    )
+    approval_response = await client.post(
+        f"/api/v1/approvals/{UUID(int=0)}/decision",
+        json={"decision": "approved", "version": 1, "payload_hash": "a" * 64},
+    )
+
+    assert task_response.status_code == 403
+    assert approval_response.status_code == 403
+    assert task_response.json()["error_code"] == "csrf_rejected"
+    assert approval_response.json()["error_code"] == "csrf_rejected"

@@ -135,6 +135,7 @@ def _assert_problem(response: httpx.Response, status_code: int, error_code: str)
     body = ProblemDetails.model_validate(response.json())
     assert body.status == status_code
     assert body.error_code == error_code
+    assert body.type == f"https://ai-employee.local/problems/{error_code.replace('_', '-')}"
     assert len(body.trace_id) >= 16
     return body
 
