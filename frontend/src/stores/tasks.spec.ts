@@ -126,6 +126,50 @@ describe('tasks store', () => {
     expect(store.tasks['task-1']?.status).toBe('succeeded')
   })
 
+  it('does not regress status or step state when a lower sequence arrives late', () => {
+    const store = useTasksStore()
+
+    store.applyEvent(
+      event({
+        id: 2,
+        sequence: 2,
+        event: 'task.status_changed',
+        step_id: null,
+        payload: { status: 'succeeded' },
+      }),
+    )
+    store.applyEvent(
+      event({
+        id: 1,
+        sequence: 1,
+        event: 'task.status_changed',
+        step_id: null,
+        payload: { status: 'queued' },
+      }),
+    )
+    store.applyEvent(
+      event({
+        id: 4,
+        sequence: 4,
+        event: 'step.completed',
+        step_id: 'step-1',
+        payload: { name: '同步邮件', status: 'completed' },
+      }),
+    )
+    store.applyEvent(
+      event({
+        id: 3,
+        sequence: 3,
+        event: 'step.started',
+        step_id: 'step-1',
+        payload: { name: '同步邮件', status: 'started' },
+      }),
+    )
+
+    expect(store.tasks['task-1']?.status).toBe('succeeded')
+    expect(store.tasks['task-1']?.steps[0]?.status).toBe('completed')
+  })
+
   it('uses a REST snapshot cursor to reject older status and step replays', () => {
     const store = useTasksStore()
 

@@ -49,6 +49,8 @@ export function useTaskEvents(
   const open = (nextTaskId: string): void => {
     connectionState.value = 'connecting'
     tasks.setConnectionState(nextTaskId, 'connecting')
+    // 审计 ID 在任务之间全局递增，任务专属流中的空洞不是漏事件；服务端按此游标
+    // 重放同任务较新的事实，因此使用该任务已见的最大审计 ID。
     const cursor = tasks.latestSequences[nextTaskId]
     const query =
       cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0

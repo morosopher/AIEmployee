@@ -83,4 +83,63 @@ describe('useTaskEvents', () => {
     wrapper.unmount()
     vi.unstubAllGlobals()
   })
+
+  it('reopens after the highest task event despite global audit ID gaps', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents('task-1')
+        return () => null
+      },
+    })
+
+    const firstWrapper = mount(Host)
+    const firstSource = FakeEventSource.instances.at(-1)
+    const statusHandler = firstSource?.addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'task.status_changed',
+    )?.[1] as EventListener
+    statusHandler(
+      new MessageEvent('task.status_changed', {
+        data: JSON.stringify({
+          id: 1,
+          task_id: 'task-1',
+          sequence: 1,
+          event: 'task.status_changed',
+          occurred_at: '2026-08-03T00:00:00Z',
+          step_id: null,
+          payload: { status: 'running' },
+        }),
+      }),
+    )
+    firstWrapper.unmount()
+
+    const secondWrapper = mount(Host)
+    const secondSource = FakeEventSource.instances.at(-1)
+    const secondStatusHandler = secondSource?.addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'task.status_changed',
+    )?.[1] as EventListener
+    secondStatusHandler(
+      new MessageEvent('task.status_changed', {
+        data: JSON.stringify({
+          id: 3,
+          task_id: 'task-1',
+          sequence: 3,
+          event: 'task.status_changed',
+          occurred_at: '2026-08-03T00:00:00Z',
+          step_id: null,
+          payload: { status: 'queued' },
+        }),
+      }),
+    )
+    secondWrapper.unmount()
+
+    const thirdWrapper = mount(Host)
+
+    expect(FakeEventSource.instances.at(-1)?.url).toBe(
+      '/api/v1/tasks/task-1/events?last_event_id=3',
+    )
+    thirdWrapper.unmount()
+    vi.unstubAllGlobals()
+  })
 })

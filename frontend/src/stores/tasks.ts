@@ -28,6 +28,8 @@ export const useTasksStore = defineStore('tasks', {
     seenSequences: {} as Record<string, Record<number, true>>,
     snapshotCursors: {} as Record<string, number>,
     latestSequences: {} as Record<string, number>,
+    projectedStatusSequences: {} as Record<string, number>,
+    projectedStepSequences: {} as Record<string, Record<string, number>>,
   }),
   actions: {
     /**
@@ -45,6 +47,10 @@ export const useTasksStore = defineStore('tasks', {
       this.snapshotCursors[snapshot.id] = snapshot.event_cursor
       this.latestSequences[snapshot.id] = snapshot.event_cursor
       this.seenSequences[snapshot.id] = { [snapshot.event_cursor]: true }
+      this.projectedStatusSequences[snapshot.id] = snapshot.event_cursor
+      this.projectedStepSequences[snapshot.id] = Object.fromEntries(
+        snapshot.steps.map((step) => [step.id, snapshot.event_cursor]),
+      )
     },
     /**
      * 仅当 REST 请求期间没有抵达更晚的耐久事件时写入快照，避免初始加载回退 SSE 投影。
@@ -124,17 +130,25 @@ export const useTasksStore = defineStore('tasks', {
         this.snapshotCursors[event.task_id] = event.sequence
         this.seenSequences[event.task_id] = { [event.sequence]: true }
         this.latestSequences[event.task_id] = event.sequence
+        this.projectedStatusSequences[event.task_id] = event.sequence
+        this.projectedStepSequences[event.task_id] = Object.fromEntries(
+          snapshot.steps.map((step) => [step.id, event.sequence]),
+        )
       } catch {
         // 错误的临时传输数据不能清空既有可恢复投影。
       }
     },
     /**
-     * 归并服务端显式状态转换；没有合法状态值时不猜测状态机结果。
+     * 归并服务端显式状态转换；较早事件不得回退已投影状态，缺少合法值时不猜测状态机结果。
      *
      * @param event `task.status_changed` SSE 事件。
      * @returns 无返回值。
      */
     applyStatusEvent(event: TaskEvent): void {
+      if (
+        event.sequence < (this.projectedStatusSequences[event.task_id] ?? -1)
+      )
+        return
       const status = asTaskStatus(event.payload.status)
       if (!status) return
       const task = this.tasks[event.task_id] ?? emptyTask(event.task_id, status)
@@ -142,6 +156,7 @@ export const useTasksStore = defineStore('tasks', {
       if (typeof event.payload.error_code === 'string')
         task.error_code = event.payload.error_code
       this.tasks[event.task_id] = task
+      this.projectedStatusSequences[event.task_id] = event.sequence
     },
     /**
      * 归并步骤生命周期并按耐久 sequence 排序，乱序抵达不影响最终显示。
@@ -156,6 +171,11 @@ export const useTasksStore = defineStore('tasks', {
       const existingStep = existingTask.steps.find(
         (step) => step.id === event.step_id,
       )
+      if (
+        event.sequence <
+        (this.projectedStepSequences[event.task_id]?.[event.step_id] ?? -1)
+      )
+        return
       const nextStep = mergeStep(existingStep, event)
       if (!nextStep) return
       const steps = existingStep
@@ -164,6 +184,9 @@ export const useTasksStore = defineStore('tasks', {
           )
         : [...existingTask.steps, nextStep]
       this.tasks[event.task_id] = { ...existingTask, steps: orderSteps(steps) }
+      const projectedSteps = this.projectedStepSequences[event.task_id] ?? {}
+      projectedSteps[event.step_id] = event.sequence
+      this.projectedStepSequences[event.task_id] = projectedSteps
     },
   },
 })
