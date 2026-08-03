@@ -4,16 +4,23 @@ import asyncio
 import json
 import os
 from collections.abc import Callable
-from datetime import time
+from datetime import UTC, datetime, time
 from uuid import UUID
 
 import pytest
 from sse_starlette import ServerSentEvent
 
 from ai_employee.api.sse import TaskEventStore, TaskEventStream
+from ai_employee.application.use_cases.task_views import RetryTaskUseCase
+from ai_employee.application.use_cases.tasks import CreateTaskUseCase
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
-from ai_employee.infrastructure.db.repositories.task_views import SqlAlchemyTaskViewStore
+from ai_employee.infrastructure.db.repositories.task_views import (
+    PostgresQueuedTaskDispatcher,
+    SqlAlchemyTaskViewStore,
+)
+from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 
@@ -164,6 +171,57 @@ async def test_last_event_id_replays_only_later_durable_events(
     assert payload["id"] == second_id
     assert payload["sequence"] == second_id
     assert payload["event"] == "task.status_changed"
+
+
+@pytest.mark.asyncio
+async def test_create_and_retry_queue_events_replay_the_queued_snapshot(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+) -> None:
+    """创建和重试都持久化 QUEUED 转换，重放末项必须与当前快照一致。"""
+    session_factory, user_id, build_stream = sse_store
+    task_store = SqlAlchemyTaskViewStore(session_factory)
+    created = await CreateTaskUseCase(
+        SqlAlchemyTaskRepositoryFactory(session_factory),
+        PostgresQueuedTaskDispatcher(session_factory),
+    ).execute(
+        user_id=user_id,
+        kind="fake_write",
+        input_payload={},
+        idempotency_key="sse-created-task",
+    )
+    async with session_factory.begin() as session:
+        failed = TaskRunModel(
+            user_id=user_id,
+            kind="fake_write",
+            status=TaskStatus.FAILED.value,
+            idempotency_key="sse-failed-task",
+            input_payload={},
+        )
+        session.add(failed)
+        await session.flush()
+        failed_id = failed.id
+    retried = await RetryTaskUseCase(task_store).execute(
+        task_id=failed_id,
+        user_id=user_id,
+        idempotency_key="sse-retry-task",
+        now=datetime.now(UTC),
+    )
+    assert retried is not None
+
+    for task_id in (created.task_id, retried.id):
+        snapshot = await task_store.get(task_id=task_id, user_id=user_id)
+        assert snapshot is not None
+        events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=None)
+        replayed = [_event_payload(await anext(events)), _event_payload(await anext(events))]
+        await events.aclose()
+
+        assert replayed[-1].get("event") == "task.status_changed"
+        assert replayed[0].get("payload") == (
+            {"kind": "fake_write", "status": "created"}
+            if task_id == created.task_id
+            else {"retry_of_task_id": str(failed_id), "status": "created"}
+        )
+        assert replayed[-1]["payload"] == {"status": snapshot.status.value}
 
 
 @pytest.mark.asyncio

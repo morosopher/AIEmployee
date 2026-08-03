@@ -5,10 +5,11 @@ from uuid import UUID
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.models.identity import UserModel
-from ai_employee.infrastructure.db.models.tasks import TaskRunModel, TaskStepModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel, TaskStepModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.main import create_app
@@ -108,6 +109,19 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
         )
     snapshot = await client.get(f"/api/v1/tasks/{task_id}")
     assert [step["sequence"] for step in snapshot.json()["steps"]] == [1, 2]
+    async with session_factory() as session:
+        audit_events = (
+            await session.scalars(
+                select(AuditEventModel)
+                .where(AuditEventModel.task_id == task_id)
+                .order_by(AuditEventModel.id)
+            )
+        ).all()
+
+    assert [(event.event_type, event.event_metadata) for event in audit_events] == [
+        ("task.created", {"kind": "fake_write", "status": "created"}),
+        ("task.queued", {"status": "queued"}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -141,6 +155,23 @@ async def test_cancel_and_retry_create_a_replacement(
     repeated = await client.post(f"/api/v1/tasks/{failed_id}/retry", headers=retry_headers)
     assert retry.json()["retry_of_task_id"] == str(failed_id)
     assert repeated.json()["id"] == retry.json()["id"]
+    retry_id = UUID(retry.json()["id"])
+    async with session_factory() as session:
+        audit_events = (
+            await session.scalars(
+                select(AuditEventModel)
+                .where(AuditEventModel.task_id == retry_id)
+                .order_by(AuditEventModel.id)
+            )
+        ).all()
+
+    assert [(event.event_type, event.event_metadata) for event in audit_events] == [
+        (
+            "task.created",
+            {"retry_of_task_id": str(failed_id), "status": "created"},
+        ),
+        ("task.queued", {"status": "queued"}),
+    ]
 
 
 @pytest.mark.asyncio

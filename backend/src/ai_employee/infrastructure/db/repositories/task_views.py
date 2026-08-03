@@ -158,7 +158,7 @@ class SqlAlchemyTaskViewStore:
                     user_id=user_id,
                     retry_of_task_id=task_id,
                     kind=original.kind,
-                    status=TaskStatus.QUEUED.value,
+                    status=TaskStatus.CREATED.value,
                     idempotency_key=retry_key,
                     input_payload=original.input_payload,
                 )
@@ -176,6 +176,12 @@ class SqlAlchemyTaskViewStore:
                 if existing is None:
                     raise RuntimeError("retry idempotency winner is not visible")
                 return await self._get_in_session(session, task_id=existing.id, user_id=user_id)
+            transition_task(TaskStatus.CREATED, TaskStatus.QUEUED)
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == replacement_id)
+                .values(status=TaskStatus.QUEUED.value)
+            )
             session.add_all(
                 (
                     AuditEventModel(
@@ -184,7 +190,18 @@ class SqlAlchemyTaskViewStore:
                         event_type="task.created",
                         actor_type="user",
                         actor_id=str(user_id),
-                        event_metadata={"retry_of_task_id": str(task_id)},
+                        event_metadata={
+                            "retry_of_task_id": str(task_id),
+                            "status": TaskStatus.CREATED.value,
+                        },
+                    ),
+                    AuditEventModel(
+                        user_id=user_id,
+                        task_id=replacement_id,
+                        event_type="task.queued",
+                        actor_type="user",
+                        actor_id=str(user_id),
+                        event_metadata={"status": TaskStatus.QUEUED.value},
                     ),
                     OutboxEventModel(
                         topic="task.execute",
@@ -225,13 +242,30 @@ class PostgresQueuedTaskDispatcher:
         self._session_factory = session_factory
 
     async def dispatch(self, task_id: UUID) -> TaskStatus:
-        """原子把新建任务归队，不执行任何队列网络 I/O。"""
+        """原子把新建任务归队，并追加可重放的状态转换审计事实。
+
+        ``task.queued`` 与状态更新必须使用同一个事务提交，防止 API 的 ``QUEUED`` 快照
+        已可见但 SSE 无法重放对应转换。重复幂等创建再次经过此方法时条件更新不命中，因而
+        不会伪造第二条状态转换事件。
+        """
         async with self._session_factory.begin() as session:
-            await session.execute(
+            transitioned_user_id = await session.scalar(
                 update(TaskRunModel)
                 .where(TaskRunModel.id == task_id, TaskRunModel.status == TaskStatus.CREATED.value)
                 .values(status=TaskStatus.QUEUED.value)
+                .returning(TaskRunModel.user_id)
             )
+            if transitioned_user_id is not None:
+                session.add(
+                    AuditEventModel(
+                        user_id=transitioned_user_id,
+                        task_id=task_id,
+                        event_type="task.queued",
+                        actor_type="system",
+                        actor_id=None,
+                        event_metadata={"status": TaskStatus.QUEUED.value},
+                    )
+                )
             status = await session.scalar(
                 select(TaskRunModel.status).where(TaskRunModel.id == task_id)
             )
