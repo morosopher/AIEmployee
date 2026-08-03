@@ -154,21 +154,30 @@ class DurableTaskRunner:
         self._task_step_timeout_seconds = task_step_timeout_seconds
         self._resolve_steps = resolve_steps
 
-    async def run(self, task_id: UUID, lease_owner: str | None = None) -> bool:
+    async def run(
+        self,
+        task_id: UUID,
+        lease_owner: str | None = None,
+        *,
+        may_retry_transient: bool = True,
+    ) -> bool:
         """获取租约并执行一次持久任务尝试。
 
         Args:
             task_id: PostgreSQL 中的稳定任务 UUID。
             lease_owner: 当前进程与投递尝试唯一的租约 owner；省略时生成不含主机资料的
                 进程与随机标识。
+            may_retry_transient: 当前队列消息按基础设施重试规则仍可重新投递时为 ``True``。
+                application 层只消费这个已规范化的业务决定，绝不依赖 Taskiq 消息或标签类型；
+                默认值用于保持非队列调用方的既有临时错误重试语义。
 
         Returns:
             当前执行者最终仍拥有并处理了任务时为 ``True``；未获租约、丢失 owner 或
             安全失败 CAS 未命中时为 ``False``。
 
         Raises:
-            TransientProviderError: 临时供应商错误已经持久化为 RETRY_SCHEDULED，调用方
-                应让队列重试中间件重新投递。
+            TransientProviderError: 仅在 ``may_retry_transient`` 为 ``True`` 时，临时供应商
+                错误已经持久化为 RETRY_SCHEDULED，调用方应让队列重试中间件重新投递。
             Exception: 主失败后持久化端口也不可用时保留原异常，由 Worker 入口作为最后
                 防线吞掉，避免未知错误进入 SmartRetry。
         """
@@ -221,6 +230,15 @@ class DurableTaskRunner:
                 error_code="task_timeout",
             )
         except TransientProviderError as error:
+            # Taskiq 达到重试上限后会 ACK 当前消息。此时若仍写 RETRY_SCHEDULED，PostgreSQL
+            # 中的任务将没有新的投递事实可恢复，故必须在同一个 owner-safe 终态写入中收敛。
+            if not may_retry_transient:
+                return await self._finish(
+                    leased,
+                    lease_owner=owner,
+                    status=TaskStatus.FAILED,
+                    error_code="task_retries_exhausted",
+                )
             persisted = await self._finish(
                 leased,
                 lease_owner=owner,

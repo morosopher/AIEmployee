@@ -16,7 +16,7 @@ from ai_employee.application.use_cases.task_execution import (
 from ai_employee.config import Settings
 from ai_employee.domain.errors import TransientProviderError
 from ai_employee.domain.tasks import TaskStatus
-from ai_employee.infrastructure.queue.broker import broker
+from ai_employee.infrastructure.queue.broker import broker, retry_schedule_source
 from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer
 
 
@@ -68,7 +68,7 @@ def test_runner_rejects_lease_shorter_than_step_timeout() -> None:
 
 
 def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -> None:
-    """队列只使用固定 Stream/group，SmartRetry 为三次、五秒、jitter 与封顶指数退避。"""
+    """队列将 SmartRetry 的延迟交给共享 Redis 调度源，而不是被 Stream 立即消费。"""
     assert broker.queue_name == "ai_employee_tasks"
     assert broker.consumer_group_name == "ai_employee_workers"
     assert broker.consumer_id == "0-0"
@@ -79,7 +79,23 @@ def test_redis_stream_broker_uses_fixed_queue_group_and_smart_retry_defaults() -
     assert retry.use_jitter is True
     assert retry.use_delay_exponent is True
     assert retry.max_delay_exponent == 300
+    assert retry.schedule_source is retry_schedule_source
     assert execute_task_module.execute_task.labels["retry_on_error"] is True
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({}, True),
+        ({"_retries": 2}, False),
+        ({"max_retries": 1}, False),
+        ({"_retries": 3, "max_retries": 5}, True),
+        ({"_retries": 4, "max_retries": 5}, False),
+    ],
+)
+def test_worker_uses_taskiq_retry_label_semantics(labels: dict[str, int], expected: bool) -> None:
+    """Worker 的预算判断必须与 Taskiq 0.12.4 的 ``_retries``/``max_retries`` 语义一致。"""
+    assert execute_task_module.has_remaining_transient_retry_budget(labels) is expected
 
 
 @pytest.mark.asyncio
@@ -413,8 +429,10 @@ async def test_acquisition_latency_is_included_in_whole_task_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_transient_provider_error_is_rethrown_after_retry_state_is_durable() -> None:
-    """临时供应商错误先持久化 RETRY_SCHEDULED，再原样抛给 SmartRetry。"""
+async def test_transient_provider_error_with_retry_budget_is_rethrown_after_retry_state_is_durable() -> (
+    None
+):
+    """尚有队列重试预算时临时错误先持久化 RETRY_SCHEDULED，再上浮给 Taskiq。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     clock = MutableClock(now)
     task = _leased_task(started_at=now)
@@ -434,10 +452,47 @@ async def test_only_transient_provider_error_is_rethrown_after_retry_state_is_du
     )
 
     with pytest.raises(TransientProviderError) as raised:
-        await runner.run(task_id=task.task_id, lease_owner="worker-a")
+        await runner.run(
+            task_id=task.task_id,
+            lease_owner="worker-a",
+            may_retry_transient=True,
+        )
 
     assert raised.value is transient
     assert store.finished == [(TaskStatus.RETRY_SCHEDULED, "provider_temporarily_unavailable")]
+
+
+@pytest.mark.asyncio
+async def test_transient_provider_error_without_retry_budget_is_persisted_as_terminal_failure() -> (
+    None
+):
+    """最后一次允许尝试遇到临时错误必须终止，避免 ACK 后永久停在 RETRY_SCHEDULED。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    clock = MutableClock(now)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+    transient = TransientProviderError(
+        error_code="provider_temporarily_unavailable",
+        message="provider temporarily unavailable",
+    )
+
+    async def fail_transiently() -> None:
+        raise transient
+
+    runner = _runner(
+        store=store,
+        clock=clock,
+        steps=(CallableStep("provider", fail_transiently),),
+    )
+
+    owned = await runner.run(
+        task_id=task.task_id,
+        lease_owner="worker-a",
+        may_retry_transient=False,
+    )
+
+    assert owned is True
+    assert store.finished == [(TaskStatus.FAILED, "task_retries_exhausted")]
 
 
 @pytest.mark.asyncio

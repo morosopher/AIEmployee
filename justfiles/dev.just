@@ -30,4 +30,4 @@ worker:
 
 [group('development')]
 scheduler:
-    uv run --project backend taskiq scheduler ai_employee.infrastructure.queue.scheduler:scheduler ai_employee.workers.schedules
+    uv run --project backend taskiq scheduler --update-interval 1 ai_employee.infrastructure.queue.scheduler:scheduler ai_employee.workers.schedules

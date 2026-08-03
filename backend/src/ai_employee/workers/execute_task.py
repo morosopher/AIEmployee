@@ -1,8 +1,12 @@
 """把 Taskiq 执行入口组合到基础设施无关的持久任务执行用例。"""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
+from typing import Any
 from uuid import UUID
+
+from taskiq import Context, TaskiqDepends
 
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.config import get_settings
@@ -11,7 +15,31 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
-from ai_employee.infrastructure.queue.broker import broker
+from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
+
+# Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
+# 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
+taskiq_context_dependency: Context = TaskiqDepends()
+
+
+def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
+    """按 Taskiq 0.12.4 的标签语义判断当前临时错误是否还可重新投递。
+
+    Args:
+        labels: 由 Taskiq ``Context`` 提供的原始消息标签；该第三方边界允许 ``Any``，并与
+            SmartRetryMiddleware 一样直接转换 ``_retries`` 与 ``max_retries``。
+
+    Returns:
+        当本次失败后仍满足 ``retries < max_retries`` 时返回 ``True``。默认上限复用 broker
+        模块供 SmartRetryMiddleware 配置使用的同一常量，避免两处策略发生漂移。
+
+    Raises:
+        ValueError: 标签值不能按 Taskiq 的整数规则转换时原样抛出，避免把损坏内部消息
+            误判成可安全重试。
+    """
+    retries = int(labels.get("_retries", 0)) + 1
+    max_retries = int(labels.get("max_retries", DEFAULT_RETRY_COUNT))
+    return retries < max_retries
 
 
 class _MissingTaskHandlerStep:
@@ -58,11 +86,16 @@ def build_task_runner() -> DurableTaskRunner:
 
 
 @broker.task(retry_on_error=True)
-async def execute_task(task_id: str) -> None:
+async def execute_task(
+    task_id: str,
+    context: Context = taskiq_context_dependency,
+) -> None:
     """解析 task_id，并只允许已持久化的临时供应商错误触发 Taskiq 重试。
 
     Args:
         task_id: Outbox 发送的规范 UUID 字符串；消息不包含任务正文或结果。
+        context: Taskiq 注入的当前消息上下文；只在 Worker 层读取重试标签，不能传入
+            application 用例。
 
     Raises:
         TransientProviderError: 执行用例已把状态写为 RETRY_SCHEDULED 后原样重新抛出，
@@ -75,7 +108,10 @@ async def execute_task(task_id: str) -> None:
         return
 
     try:
-        await build_task_runner().run(parsed_task_id)
+        await build_task_runner().run(
+            parsed_task_id,
+            may_retry_transient=has_remaining_transient_retry_budget(context.message.labels),
+        )
     except TransientProviderError:
         raise
     except Exception:  # noqa: BLE001 - 未知异常绝不能进入仅供应商错误允许的 SmartRetry。

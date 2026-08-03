@@ -193,3 +193,89 @@ asyncio.run(main())
         "pending_after_ack": 0,
         "tasks": EXPECTED_TASK_NAMES,
     }
+
+
+@pytest.mark.asyncio
+async def test_smart_retry_waits_in_redis_schedule_source_before_scheduler_enqueues_it(
+    empty_redis: RedisTestUrl,
+) -> None:
+    """真实 SmartRetry 必须先保存五秒延迟任务，只有调度器到期处理后才写入 Stream。"""
+    environment = os.environ.copy()
+    environment["REDIS_URL"] = str(empty_redis)
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [
+            sys.executable,
+            "-c",
+            """
+import asyncio
+import json
+
+from redis.asyncio import Redis
+from taskiq.message import TaskiqMessage
+from taskiq.result import TaskiqResult
+from taskiq.cli.scheduler.run import SchedulerLoop
+
+import taskiq.middlewares.smart_retry as smart_retry_module
+from ai_employee.domain.errors import TransientProviderError
+from ai_employee.infrastructure.queue.broker import broker, retry_schedule_source
+from ai_employee.infrastructure.queue.scheduler import scheduler
+
+async def main():
+    smart_retry_module.random.random = lambda: 0.0
+    retry = broker.middlewares[0]
+    message = TaskiqMessage(
+        task_id="retry-delay-test",
+        task_name="ai_employee.workers.execute_task:execute_task",
+        labels={"retry_on_error": True},
+        args=["synthetic-task-id"],
+        kwargs={},
+    )
+    result = TaskiqResult(
+        is_err=True,
+        return_value=None,
+        execution_time=0,
+    )
+    client = Redis.from_url(sys.argv[1], decode_responses=False)
+    try:
+        await retry.on_error(
+            message,
+            result,
+            TransientProviderError(
+                error_code="provider_temporarily_unavailable",
+                message="synthetic transient failure",
+            ),
+        )
+        before_due = await client.xlen("ai_employee_tasks")
+        await asyncio.sleep(5.2)
+        schedules = await retry_schedule_source.get_schedules()
+        loop = SchedulerLoop(scheduler)
+        due = [
+            task
+            for task in schedules
+            if loop._is_schedule_ready_to_send(task, task.time)
+        ]
+        for task in due:
+            await scheduler.on_ready(retry_schedule_source, task)
+        after_due = await client.xlen("ai_employee_tasks")
+        print(json.dumps({"before_due": before_due, "schedules": len(schedules), "after_due": after_due}))
+    finally:
+        await client.aclose()
+
+asyncio.run(main())
+""",
+            str(empty_redis),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "before_due": 0,
+        "schedules": 1,
+        "after_due": 1,
+    }
