@@ -1,11 +1,15 @@
 """Redis Pub/Sub 通知适配器：只提示重新读取 PostgreSQL 事实。"""
 
+import asyncio
 import logging
 from uuid import UUID
 
 from redis.exceptions import RedisError
 
 logger = logging.getLogger(__name__)
+
+# Redis 仅承担低延迟唤醒，单次 I/O 超过该预算应立即让 PostgreSQL 事实路径继续推进。
+REDIS_OPERATION_TIMEOUT_SECONDS = 1.0
 
 
 class TaskEventPublisher:
@@ -21,14 +25,30 @@ class TaskEventPublisher:
         return f"ai_employee:task-events:{task_id}"
 
     async def publish(self, *, task_id: UUID, event_id: int) -> None:
-        """发布可重建审计行 ID；Redis 故障交给调用方按通知失败处理。"""
+        """在有限时间内发布可重建审计行 ID，并释放临时客户端。
+
+        Args:
+            task_id: 已提交审计事件所属任务。
+            event_id: PostgreSQL 已分配的审计事件主键。
+
+        Raises:
+            TimeoutError: Redis 发布在固定预算内未完成。
+            RedisError: Redis 客户端报告的可恢复基础设施错误。
+            OSError: 网络连接建立或读取失败。
+        """
         from redis.asyncio import Redis
 
         client = Redis.from_url(self._redis_url, decode_responses=True)
         try:
-            await client.publish(self.channel(task_id), str(event_id))
+            async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                await client.publish(self.channel(task_id), str(event_id))
         finally:
-            await client.aclose()
+            try:
+                async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                    await client.aclose()
+            except (OSError, RedisError, TimeoutError):
+                # 关闭失败不能掩盖已提交事实或发布阶段的原始故障。
+                logger.warning("task event publisher cleanup unavailable")
 
     async def publish_after_commit(self, *, task_id: UUID, event_id: int) -> None:
         """在 PostgreSQL 提交成功后尽力发布瞬时唤醒，不影响已持久化的业务结果。
@@ -43,6 +63,6 @@ class TaskEventPublisher:
         """
         try:
             await self.publish(task_id=task_id, event_id=event_id)
-        except (OSError, RedisError):
+        except (OSError, RedisError, TimeoutError):
             # 业务事实已存在 PostgreSQL，禁止把 Redis 瞬时故障反向传播到请求或 Worker。
             logger.warning("task event notification unavailable", extra={"event_id": event_id})

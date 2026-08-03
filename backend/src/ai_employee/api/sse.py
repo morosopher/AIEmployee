@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,6 +22,10 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 
 HEARTBEAT_SECONDS = 15
+REDIS_OPERATION_TIMEOUT_SECONDS = 1.0
+REDIS_PUBSUB_POLL_SECONDS = 0.25
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,14 +64,14 @@ class RedisTaskEventSubscription:
         self._pubsub: PubSub | None = None
 
     async def open(self) -> None:
-        """连接 Redis 并先订阅任务频道，避免初始回放与实时通知之间丢信号。"""
+        """在固定预算内连接并订阅 Redis，避免初始回放与实时通知之间丢信号。"""
         client = Redis.from_url(self._redis_url, decode_responses=True)
         pubsub = client.pubsub()
         try:
-            await pubsub.subscribe(TaskEventPublisher.channel(self._task_id))
+            async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                await pubsub.subscribe(TaskEventPublisher.channel(self._task_id))
         except BaseException:
-            await pubsub.aclose()
-            await client.aclose()
+            await self._close_resources(pubsub=pubsub, client=client)
             raise
         self._client = client
         self._pubsub = pubsub
@@ -81,7 +86,12 @@ class RedisTaskEventSubscription:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return False
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining)
+            read_timeout = min(remaining, REDIS_PUBSUB_POLL_SECONDS)
+            async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=read_timeout,
+                )
             if message is not None:
                 return True
 
@@ -91,10 +101,27 @@ class RedisTaskEventSubscription:
         client = self._client
         self._pubsub = None
         self._client = None
+        await self._close_resources(pubsub=pubsub, client=client)
+
+    async def _close_resources(self, *, pubsub: PubSub | None, client: Redis | None) -> None:
+        """在有限时间内释放 Redis 资源，清理失败不破坏 PostgreSQL 轮询降级。
+
+        Args:
+            pubsub: 可能已建立的 Pub/Sub 专用连接。
+            client: 创建 Pub/Sub 的 Redis 客户端。
+        """
         if pubsub is not None:
-            await pubsub.aclose()
+            try:
+                async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                    await pubsub.aclose()
+            except (OSError, RedisError, TimeoutError):
+                logger.warning("task event subscription pubsub cleanup unavailable")
         if client is not None:
-            await client.aclose()
+            try:
+                async with asyncio.timeout(REDIS_OPERATION_TIMEOUT_SECONDS):
+                    await client.aclose()
+            except (OSError, RedisError, TimeoutError):
+                logger.warning("task event subscription client cleanup unavailable")
 
 
 class PollingTaskEventSubscription:
@@ -266,7 +293,7 @@ class TaskEventStream:
         try:
             try:
                 await subscription.open()
-            except (OSError, RedisError):
+            except (OSError, RedisError, TimeoutError):
                 await subscription.aclose()
                 subscription = PollingTaskEventSubscription()
                 await subscription.open()
