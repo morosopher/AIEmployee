@@ -79,17 +79,22 @@ class _FakeWriteStep:
     name = "fake_write_graph"
 
     def __init__(
-        self, *, resume: str | None, database_url: str, checkpoint_database_url: str
+        self,
+        *,
+        approval_store: ApprovalProposalStore,
+        resume: str | None,
+        checkpoint_database_url: str,
     ) -> None:
         """保存一次 Worker 尝试所需的恢复决定和两类数据库连接配置。
 
         Args:
+            approval_store: 由消息组合层创建并负责释放连接池的审批事实端口；Graph 必须
+                复用它，避免每次 fake-write 再创建一个无法释放的 SQLAlchemy Engine。
             resume: 已由审批 Outbox 冻结的 ``approved`` 或 ``rejected`` 决定；首次执行为空。
-            database_url: 业务事实库的 SQLAlchemy asyncpg URL。
             checkpoint_database_url: LangGraph checkpointer 专用 psycopg URL。
         """
+        self._approval_store = approval_store
         self._resume = resume
-        self._database_url = database_url
         self._checkpoint_database_url = checkpoint_database_url
 
     async def execute(self, task: LeasedTask) -> None:
@@ -105,9 +110,8 @@ class _FakeWriteStep:
         Raises:
             TaskWaitingApproval: Graph 返回人工审批中断，调用方必须停止本次消息。
         """
-        store = SqlAlchemyApprovalStore(build_session_factory(self._database_url))
         graph = FakeWriteGraph(
-            approval_store=store,
+            approval_store=self._approval_store,
             clock=lambda: datetime.now(UTC),
             approval_ttl=timedelta(minutes=5),
             fake_tool=_fake_write_tool,
@@ -212,8 +216,8 @@ async def execute_task(
                         max_transient_retries=DEFAULT_RETRY_COUNT,
                         resolve_steps=lambda _task: (
                             _FakeWriteStep(
+                                approval_store=approval_store,
                                 resume=resume,
-                                database_url=settings.database_url,
                                 checkpoint_database_url=settings.checkpoint_database_url,
                             ),
                         ),

@@ -186,7 +186,6 @@ async def test_fake_write_graph_reuses_worker_message_session_factory(
 ) -> None:
     """Graph 审批存储必须复用 Worker 已管理的工厂，不能额外创建连接池。"""
     task_id = uuid4()
-    factory = object()
     stores: list[object] = []
     captured_steps: list[object] = []
 
@@ -210,11 +209,7 @@ async def test_fake_write_graph_reuses_worker_message_session_factory(
 
         async def run(self, received_task_id: UUID, **_kwargs: object) -> bool:
             """解析一次步骤，验证 Graph 持有同一审批存储实例。"""
-            captured_steps.extend(
-                self._resolve_steps(
-                    _leased_task(task_id=received_task_id, started_at=datetime.now(UTC))
-                )
-            )
+            captured_steps.extend(self._resolve_steps(_leased_task(started_at=datetime.now(UTC))))
             return True
 
     class Factory:
@@ -223,6 +218,7 @@ async def test_fake_write_graph_reuses_worker_message_session_factory(
         async def dispose(self) -> None:
             """满足 Worker 的 finally 释放协议。"""
 
+    factory = Factory()
     monkeypatch.setattr(execute_task_module, "build_session_factory", lambda _url: factory)
     monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", Store)
     monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
