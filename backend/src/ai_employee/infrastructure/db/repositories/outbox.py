@@ -107,18 +107,31 @@ class SqlAlchemyOutboxStore:
         """
         published_at = utc_instant(published_at, field="published_at")
         async with self._session_factory.begin() as session:
-            aggregate_id = await session.scalar(
-                update(OutboxEventModel)
-                .where(
-                    OutboxEventModel.id == claim.event_id,
-                    OutboxEventModel.published_at.is_(None),
-                    OutboxEventModel.available_at == claim.claim_until,
+            published_event = (
+                await session.execute(
+                    update(OutboxEventModel)
+                    .where(
+                        OutboxEventModel.id == claim.event_id,
+                        OutboxEventModel.published_at.is_(None),
+                        OutboxEventModel.available_at == claim.claim_until,
+                    )
+                    .values(published_at=published_at, last_error=None)
+                    .returning(
+                        OutboxEventModel.aggregate_id,
+                        OutboxEventModel.deduplication_key,
+                    )
                 )
-                .values(published_at=published_at, last_error=None)
-                .returning(OutboxEventModel.aggregate_id)
-            )
-            if aggregate_id is None:
+            ).one_or_none()
+            if published_event is None:
                 return False
+            aggregate_id = published_event.aggregate_id
+            retry_key_prefix = f"task.execute:{aggregate_id}:retry:"
+            retry_attempt = published_event.deduplication_key.removeprefix(retry_key_prefix)
+            if (
+                not published_event.deduplication_key.startswith(retry_key_prefix)
+                or not retry_attempt.isdecimal()
+            ):
+                return True
             await session.execute(
                 update(TaskRunModel)
                 .where(

@@ -265,6 +265,93 @@ async def test_pending_durable_retry_submission_blocks_recovery_duplicate(
 
 
 @pytest.mark.asyncio
+async def test_old_duplicate_message_cannot_bypass_unpublished_delayed_retry_outbox(
+    database_url: str,
+) -> None:
+    """旧 Stream 重复消息不能把仍在等待 relay 的下一轮重试提前归队执行。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    _, task_id = await _create_retry_scheduled_task(
+        database_url=database_url,
+        recovery_at=now,
+        delayed_retry_submission_pending=True,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        from ai_employee.infrastructure.db.repositories.task_execution import (
+            SqlAlchemyTaskExecutionStore,
+        )
+
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        await store.prepare_retry(task_id=task_id, now=now + timedelta(seconds=1))
+        leased = await store.acquire(
+            task_id=task_id,
+            lease_owner="old-stream-delivery",
+            now=now + timedelta(seconds=1),
+            lease_expires_at=now + timedelta(seconds=61),
+        )
+
+        assert leased is None
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            retry_event = await session.scalar(
+                select(OutboxEventModel).where(
+                    OutboxEventModel.aggregate_id == task_id,
+                    OutboxEventModel.deduplication_key == f"task.execute:{task_id}:retry:1",
+                )
+            )
+        assert task is not None
+        assert task.status == TaskStatus.RETRY_SCHEDULED.value
+        assert retry_event is not None
+        assert retry_event.published_at is None
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_suffix", ("initial", "retry-recovery:2030-08-01T00:00:00+00:00"))
+async def test_non_delayed_outbox_publication_does_not_arm_retry_recovery_deadline(
+    database_url: str,
+    event_suffix: str,
+) -> None:
+    """初始和恢复投递都不是延迟重试，发布后不得写入恢复期限。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    _, task_id = await _create_retry_scheduled_task(
+        database_url=database_url,
+        recovery_at=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    try:
+        async with session_factory.begin() as session:
+            event = await session.scalar(
+                select(OutboxEventModel).where(OutboxEventModel.aggregate_id == task_id)
+            )
+            assert event is not None
+            event.deduplication_key = f"task.execute:{task_id}:{event_suffix}"
+            event.published_at = None
+
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(
+                session_factory,
+                retry_recovery_delay=timedelta(seconds=30),
+            ),
+            enqueuer=enqueuer,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        assert await relay.relay_once(limit=10) == 1
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+        assert task is not None
+        assert task.retry_recovery_at == now
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 async def test_retry_recovery_deadline_is_armed_only_after_durable_outbox_is_published(
     database_url: str,
 ) -> None:

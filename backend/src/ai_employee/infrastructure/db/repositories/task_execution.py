@@ -3,7 +3,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, update
+from sqlalchemy import and_, exists, func, or_, select, update
 
 from ai_employee.application.use_cases.task_execution import LeasedTask, utc_instant
 from ai_employee.domain.tasks import JsonValue, TaskStatus
@@ -34,8 +34,10 @@ class SqlAlchemyTaskExecutionStore:
             task_id: 持久任务标识。
             now: 本次重试准备使用的带时区瞬间。
 
-        只有 RETRY_SCHEDULED 会命中；首次投递的 CREATED/QUEUED、正在运行及终态保持
-        原样。归队事务先于下一次租约 acquisition 提交，保证重试状态变化可恢复、可审计。
+        只有没有未发布 ``task.execute`` Outbox 的 RETRY_SCHEDULED 会命中；否则到达的
+        只能是旧 Redis Stream 重复消息，下一轮耐久延迟重试仍未完成 relay 交接，不能被
+        该旧消息提前执行。首次投递的 CREATED/QUEUED、正在运行及终态保持原样。归队事务
+        先于下一次租约 acquisition 提交，保证重试状态变化可恢复、可审计。
         """
         now = utc_instant(now, field="now")
         async with self._session_factory.begin() as session:
@@ -45,6 +47,13 @@ class SqlAlchemyTaskExecutionStore:
                     .where(
                         TaskRunModel.id == task_id,
                         TaskRunModel.status == TaskStatus.RETRY_SCHEDULED.value,
+                        ~exists(
+                            select(OutboxEventModel.id).where(
+                                OutboxEventModel.aggregate_id == TaskRunModel.id,
+                                OutboxEventModel.topic == "task.execute",
+                                OutboxEventModel.published_at.is_(None),
+                            )
+                        ),
                     )
                     .values(
                         status=TaskStatus.QUEUED.value,
