@@ -36,7 +36,7 @@ def has_remaining_transient_retry_budget(labels: Mapping[str, Any]) -> bool:
     try:
         retries = int(labels.get("_retries", 0)) + 1
         max_retries = int(labels.get("max_retries", DEFAULT_RETRY_COUNT))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         # 队列损坏时不能在获取 PostgreSQL 租约前静默 ACK。保守地禁用后续自动重投，
         # 使 Runner 能把任何临时错误收敛为 owner-safe 的 FAILED 终态。
         return False

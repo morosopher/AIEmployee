@@ -99,6 +99,18 @@ def test_worker_uses_taskiq_retry_label_semantics(labels: dict[str, int], expect
     assert execute_task_module.has_remaining_transient_retry_budget(labels) is expected
 
 
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"_retries": float("inf")},
+        {"max_retries": float("inf")},
+    ],
+)
+def test_worker_treats_overflowing_retry_labels_as_exhausted(labels: dict[str, float]) -> None:
+    """无穷重试标签无效时必须保守返回 False，避免租约前 ACK 遗留任务。"""
+    assert execute_task_module.has_remaining_transient_retry_budget(labels) is False
+
+
 @pytest.mark.asyncio
 async def test_taskiq_entrypoint_treats_invalid_retry_labels_as_exhausted(
     monkeypatch: pytest.MonkeyPatch,
