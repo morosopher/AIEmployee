@@ -313,6 +313,7 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
         "status": "running",
         "retry_of_task_id": str(original_task_id),
         "error_code": "provider_temporarily_unavailable",
+        "event_cursor": event_id,
         "steps": [
             {
                 "id": payload["payload"]["steps"][0]["id"],

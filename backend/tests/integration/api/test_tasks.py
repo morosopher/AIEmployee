@@ -112,6 +112,7 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
             )
         )
     snapshot = await client.get(f"/api/v1/tasks/{task_id}")
+    assert snapshot.json()["event_cursor"] > 0
     assert [step["sequence"] for step in snapshot.json()["steps"]] == [1, 2]
     assert snapshot.json()["steps"][1] == {
         "id": snapshot.json()["steps"][1]["id"],
@@ -136,6 +137,7 @@ async def test_create_is_idempotent_and_gets_ordered_steps(
         ("task.created", {"kind": "fake_write", "status": "created"}),
         ("task.queued", {"status": "queued"}),
     ]
+    assert snapshot.json()["event_cursor"] == audit_events[-1].id
 
 
 @pytest.mark.asyncio

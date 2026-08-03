@@ -24,7 +24,7 @@ class TaskStepSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class TaskSnapshot:
-    """任务当前状态及按序步骤的基础设施无关快照。"""
+    """任务当前状态、步骤及同一 PostgreSQL 读取视图的事件游标。"""
 
     id: UUID
     kind: str
@@ -32,6 +32,7 @@ class TaskSnapshot:
     retry_of_task_id: UUID | None
     input_payload: dict[str, JsonValue]
     error_code: str | None
+    event_cursor: int
     steps: tuple[TaskStepSnapshot, ...]
 
 

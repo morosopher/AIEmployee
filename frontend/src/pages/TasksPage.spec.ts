@@ -37,6 +37,7 @@ const queuedSnapshot: TaskSnapshot = {
   status: 'queued',
   retry_of_task_id: null,
   error_code: null,
+  event_cursor: 0,
   steps: [],
 }
 

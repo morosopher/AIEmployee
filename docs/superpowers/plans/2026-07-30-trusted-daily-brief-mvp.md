@@ -1898,6 +1898,7 @@ export interface TaskSnapshot {
   id: string
   kind: string
   status: TaskStatus
+  event_cursor: number
   steps: Array<{
     id: string
     sequence: number
@@ -1912,7 +1913,7 @@ The API client uses `credentials: 'include'`, attaches `X-CSRF-Token` to unsafe 
 
 - [ ] **Step 4: Implement EventSource cleanup and ordered task state**
 
-`useTaskEvents` opens `/api/v1/tasks/{id}/events`, updates a connection-state ref, parses TaskEvent data, passes events to Pinia, and calls `source.close()` inside `onUnmounted`.
+`useTaskEvents` opens `/api/v1/tasks/{id}/events`, uses the snapshot `event_cursor` as its reconnect cursor, updates a connection-state ref, parses TaskEvent data, passes events to Pinia, and calls `source.close()` inside `onUnmounted`. Switching tasks records the opened task ID so closing A marks only A disconnected before opening B.
 
 `TaskTimeline` renders step name, state, duration, error code, and expandable summaries without raw HTML.
 TasksPage exposes cancel only for cancellable states and retry only for failed tasks; after retry it

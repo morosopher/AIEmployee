@@ -4,7 +4,7 @@ from datetime import datetime
 from hashlib import sha256
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from ai_employee.application.use_cases.task_views import TaskSnapshot, TaskStepSnapshot
@@ -27,7 +27,9 @@ class SqlAlchemyTaskViewStore:
         self._session_factory = session_factory
 
     @staticmethod
-    def _snapshot(task: TaskRunModel, steps: tuple[TaskStepModel, ...]) -> TaskSnapshot:
+    def _snapshot(
+        task: TaskRunModel, steps: tuple[TaskStepModel, ...], event_cursor: int
+    ) -> TaskSnapshot:
         """显式白名单映射 ORM，阻止 API 暴露租约或内部图字段。"""
         return TaskSnapshot(
             id=task.id,
@@ -36,6 +38,7 @@ class SqlAlchemyTaskViewStore:
             retry_of_task_id=task.retry_of_task_id,
             input_payload=task.input_payload,
             error_code=task.error_code,
+            event_cursor=event_cursor,
             steps=tuple(
                 TaskStepSnapshot(
                     id=step.id,
@@ -54,7 +57,7 @@ class SqlAlchemyTaskViewStore:
     async def _get_in_session(
         self, session: object, *, task_id: UUID, user_id: UUID
     ) -> TaskSnapshot | None:
-        """在调用方事务中读取排序步骤；私有方法避免跨事务 ORM 泄漏。"""
+        """在调用方事务读取任务、步骤与最大审计游标，避免跨事务 ORM 泄漏。"""
         from sqlalchemy.ext.asyncio import AsyncSession
 
         typed_session = session if isinstance(session, AsyncSession) else None
@@ -74,11 +77,18 @@ class SqlAlchemyTaskViewStore:
                 )
             ).all()
         )
-        return self._snapshot(task, steps)
+        event_cursor = await typed_session.scalar(
+            select(func.max(AuditEventModel.id)).where(
+                AuditEventModel.task_id == task_id, AuditEventModel.user_id == user_id
+            )
+        )
+        return self._snapshot(task, steps, event_cursor or 0)
 
     async def get(self, *, task_id: UUID, user_id: UUID) -> TaskSnapshot | None:
-        """读取用户拥有的任务及稳定排序时间线。"""
-        async with self._session_factory() as session:
+        """以单个可重复读 PostgreSQL 视图读取任务、时间线与事件游标。"""
+        async with self._session_factory.begin() as session:
+            # 首条查询前固定隔离级别，确保 REST 不会跳过已反映到任务状态的审计事件。
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             return await self._get_in_session(session, task_id=task_id, user_id=user_id)
 
     async def cancel(self, *, task_id: UUID, user_id: UUID, now: datetime) -> TaskSnapshot | None:

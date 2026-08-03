@@ -31,6 +31,7 @@ export interface TaskSnapshot {
   status: TaskStatus
   retry_of_task_id: string | null
   error_code: string | null
+  event_cursor: number
   steps: TaskStep[]
 }
 
@@ -119,6 +120,7 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
     !object ||
     typeof object.id !== 'string' ||
     typeof object.kind !== 'string' ||
+    !isEventCursor(object.event_cursor) ||
     !status
   ) {
     throw new Error('Invalid task snapshot response')
@@ -135,8 +137,19 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
         : null,
     error_code:
       typeof object.error_code === 'string' ? object.error_code : null,
+    event_cursor: object.event_cursor,
     steps: object.steps.map(parseTaskStep),
   }
+}
+
+/**
+ * 验证 REST 或 SSE 快照声明的 PostgreSQL 审计游标，拒绝无法安全用于重放的数值。
+ *
+ * @param value 不可信游标值。
+ * @returns 是否为非负安全整数。
+ */
+function isEventCursor(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
 /**

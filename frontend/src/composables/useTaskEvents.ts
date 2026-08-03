@@ -22,15 +22,17 @@ export function useTaskEvents(
   const tasks = useTasksStore()
   const connectionState = ref<TaskConnectionState>('disconnected')
   let source: EventSource | null = null
+  let openedTaskId: string | null = null
 
   /** 关闭现有源并同步独立连接状态，避免旧任务事件写入新页面。 */
   const close = (): void => {
+    const closingTaskId = openedTaskId
     source?.close()
     source = null
-    const currentTaskId = toValue(taskId)
-    if (currentTaskId) {
+    openedTaskId = null
+    if (closingTaskId) {
       connectionState.value = 'disconnected'
-      tasks.setConnectionState(currentTaskId, 'disconnected')
+      tasks.setConnectionState(closingTaskId, 'disconnected')
     }
   }
 
@@ -52,14 +54,18 @@ export function useTaskEvents(
       cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0
         ? `?last_event_id=${cursor}`
         : ''
-    source = new EventSource(
+    const eventSource = new EventSource(
       `/api/v1/tasks/${encodeURIComponent(nextTaskId)}/events${query}`,
     )
-    source.onopen = () => {
+    source = eventSource
+    openedTaskId = nextTaskId
+    eventSource.onopen = () => {
+      if (source !== eventSource) return
       connectionState.value = 'connected'
       tasks.setConnectionState(nextTaskId, 'connected')
     }
-    source.onerror = () => {
+    eventSource.onerror = () => {
+      if (source !== eventSource) return
       // EventSource 自动重连；不可把短暂网络错误映射为任务业务失败。
       connectionState.value = 'reconnecting'
       tasks.setConnectionState(nextTaskId, 'reconnecting')
@@ -76,7 +82,7 @@ export function useTaskEvents(
       'assistant.delta',
       'heartbeat',
     ]) {
-      source.addEventListener(eventName, handleEvent as EventListener)
+      eventSource.addEventListener(eventName, handleEvent as EventListener)
     }
   }
 

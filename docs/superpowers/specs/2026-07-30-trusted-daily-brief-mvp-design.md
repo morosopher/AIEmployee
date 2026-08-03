@@ -506,10 +506,11 @@ SSE 地址为 `GET /api/v1/tasks/{task_id}/events`，使用 Cookie 会话认证�
 临时文本增量允许丢失，最终 AssistantMessage 必须持久化。浏览器自动重连时使用
 `Last-Event-ID` 请求遗漏事件；主动新建 `EventSource` 无法设置该 Header 时，客户端可传
 非负整数查询参数 `last_event_id`。服务端优先 Header，以免自动重连被静态查询游标回退；事件
-过期或间隙无法补齐时，客户端重新获取任务快照。客户端按 `sequence` 去重。`task.snapshot`
-与 REST 任务快照使用相同的公开任务字段（包括 `retry_of_task_id` 和任务级 `error_code`）；其中
-步骤只包含公开展示所需的 `started_at`、`finished_at`、状态、错误码和摘要，不暴露输入、租约或
-内部执行字段。
+过期或间隙无法补齐时，客户端重新获取任务快照。REST 与 `task.snapshot` 均携带同一 PostgreSQL
+读取视图中的最大 `AuditEvent.id`，公开字段名为非负整数 `event_cursor`。客户端以该游标建立状态、
+步骤与重连的基线，并拒绝较低 `sequence` 的重放。`task.snapshot` 与 REST 任务快照使用相同的公开
+任务字段（包括 `retry_of_task_id` 和任务级 `error_code`）；其中步骤只包含公开展示所需的
+`started_at`、`finished_at`、状态、错误码和摘要，不暴露输入、租约或内部执行字段。
 
 SSE 约每 15 秒发送心跳。Caddy 和 API 必须关闭会破坏实时性的响应缓冲。
 

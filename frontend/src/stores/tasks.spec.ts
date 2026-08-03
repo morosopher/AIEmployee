@@ -80,6 +80,7 @@ describe('tasks store', () => {
           status: 'succeeded',
           retry_of_task_id: 'original-task',
           error_code: 'provider_temporarily_unavailable',
+          event_cursor: 7,
           steps: [],
         },
       }),
@@ -116,12 +117,58 @@ describe('tasks store', () => {
           status: 'running',
           retry_of_task_id: null,
           error_code: null,
+          event_cursor: 7,
           steps: [],
         },
       }),
     )
 
     expect(store.tasks['task-1']?.status).toBe('succeeded')
+  })
+
+  it('uses a REST snapshot cursor to reject older status and step replays', () => {
+    const store = useTasksStore()
+
+    store.setTask({
+      id: 'task-1',
+      kind: 'daily_brief',
+      status: 'succeeded',
+      retry_of_task_id: null,
+      error_code: null,
+      event_cursor: 8,
+      steps: [
+        {
+          id: 'step-1',
+          sequence: 1,
+          name: '生成简报',
+          status: 'completed',
+          output_summary: null,
+          error_code: null,
+        },
+      ],
+    })
+    store.applyEvent(
+      event({
+        id: 7,
+        sequence: 7,
+        event: 'task.status_changed',
+        step_id: null,
+        payload: { status: 'queued' },
+      }),
+    )
+    store.applyEvent(
+      event({
+        id: 6,
+        sequence: 6,
+        event: 'step.started',
+        payload: { name: '生成简报', status: 'started' },
+      }),
+    )
+
+    expect(store.tasks['task-1']?.status).toBe('succeeded')
+    expect(store.tasks['task-1']?.steps[0]?.status).toBe('completed')
+    expect(store.latestSequences['task-1']).toBe(8)
+    expect(store.snapshotCursors['task-1']).toBe(8)
   })
 
   it('preserves public step start and finish timestamps from a snapshot', () => {
@@ -138,6 +185,7 @@ describe('tasks store', () => {
           status: 'succeeded',
           retry_of_task_id: null,
           error_code: null,
+          event_cursor: 7,
           steps: [
             {
               id: 'step-1',

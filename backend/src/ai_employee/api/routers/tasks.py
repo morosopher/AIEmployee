@@ -52,6 +52,7 @@ class TaskResponse(BaseModel):
     status: str
     retry_of_task_id: UUID | None
     error_code: str | None
+    event_cursor: int = Field(ge=0)
     steps: list[StepResponse]
 
 
@@ -70,6 +71,7 @@ def _task_response(snapshot: TaskSnapshot) -> TaskResponse:
         status=snapshot.status.value,
         retry_of_task_id=snapshot.retry_of_task_id,
         error_code=snapshot.error_code,
+        event_cursor=snapshot.event_cursor,
         steps=[
             StepResponse(
                 id=item.id,

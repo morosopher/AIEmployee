@@ -1,6 +1,6 @@
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { defineComponent } from 'vue'
+import { defineComponent, nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useTaskEvents } from './useTaskEvents'
@@ -56,6 +56,30 @@ describe('useTaskEvents', () => {
     expect(FakeEventSource.instances.at(-1)?.url).toBe(
       '/api/v1/tasks/task-1/events?last_event_id=42',
     )
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
+
+  it('marks only the previously opened task disconnected when switching streams', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    const taskId = ref<string | null>('task-a')
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents(taskId)
+        return () => null
+      },
+    })
+
+    const wrapper = mount(Host)
+    const firstSource = FakeEventSource.instances.at(-1)
+    taskId.value = 'task-b'
+    await nextTick()
+
+    const store = useTasksStore()
+    expect(firstSource?.close).toHaveBeenCalledOnce()
+    expect(store.connections['task-a']).toBe('disconnected')
+    expect(store.connections['task-b']).toBe('connecting')
     wrapper.unmount()
     vi.unstubAllGlobals()
   })

@@ -31,7 +31,7 @@ export const useTasksStore = defineStore('tasks', {
   }),
   actions: {
     /**
-     * 写入 REST 或 retry 返回的权威任务快照，并维持步骤顺序。
+     * 写入 REST 或 retry 返回的权威任务快照，并建立持久事件重放基线。
      *
      * @param snapshot 服务端验证后的任务快照。
      * @returns 无返回值；状态变化由 Pinia 响应式传播。
@@ -41,6 +41,10 @@ export const useTasksStore = defineStore('tasks', {
         ...snapshot,
         steps: orderSteps(snapshot.steps),
       }
+      // 快照已包含此游标之前的耐久状态，旧 SSE 重放不得倒退任务或步骤投影。
+      this.snapshotCursors[snapshot.id] = snapshot.event_cursor
+      this.latestSequences[snapshot.id] = snapshot.event_cursor
+      this.seenSequences[snapshot.id] = { [snapshot.event_cursor]: true }
     },
     /**
      * 仅当 REST 请求期间没有抵达更晚的耐久事件时写入快照，避免初始加载回退 SSE 投影。
@@ -181,6 +185,7 @@ function emptyTask(
     status,
     retry_of_task_id: null,
     error_code: null,
+    event_cursor: 0,
     steps: [],
   }
 }
