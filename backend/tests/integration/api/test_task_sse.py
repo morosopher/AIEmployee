@@ -8,10 +8,14 @@ from datetime import UTC, datetime, time
 from uuid import UUID
 
 import pytest
-from redis.asyncio import Redis
 from sse_starlette import ServerSentEvent
 
-from ai_employee.api.sse import TaskEventStore, TaskEventStream
+from ai_employee.api.sse import (
+    RedisTaskEventSubscription,
+    TaskEventStore,
+    TaskEventStream,
+    TaskEventSubscription,
+)
 from ai_employee.application.use_cases.task_views import RetryTaskUseCase
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.tasks import TaskStatus
@@ -140,27 +144,26 @@ async def _append_event(
         return event.id
 
 
-async def _wait_for_task_channel_subscriber(*, redis_url: str, task_id: UUID) -> None:
-    """等待 Redis 确认任务频道已有订阅者，避免依赖任意固定睡眠时间。
+class _ObservedRedisTaskEventSubscription:
+    """包装真实 Redis 订阅，在流完成初始回放并开始等待通知时打开测试门闩。"""
 
-    Args:
-        redis_url: 已由集成测试环境提供的隔离 Redis 地址。
-        task_id: SSE 流订阅的任务频道标识。
+    def __init__(self, delegate: TaskEventSubscription) -> None:
+        """保存生产订阅实现及仅用于观察其等待边界的事件。"""
+        self._delegate = delegate
+        self.waiting_for_notification = asyncio.Event()
 
-    Raises:
-        TimeoutError: Redis 未在合理测试预算内确认订阅，表示流未准备好接收唤醒通知。
-    """
-    client = Redis.from_url(redis_url, decode_responses=True)
-    channel = TaskEventPublisher.channel(task_id)
-    try:
-        async with asyncio.timeout(1):
-            while True:
-                subscriptions = await client.pubsub_numsub(channel)
-                if any(name == channel and count >= 1 for name, count in subscriptions):
-                    return
-                await asyncio.sleep(0.01)
-    finally:
-        await client.aclose()
+    async def open(self) -> None:
+        """按生产路径建立真实 Redis 订阅。"""
+        await self._delegate.open()
+
+    async def wait(self, timeout_seconds: float) -> bool:
+        """标记已进入等待，再委托生产订阅读取实际 Redis 通知。"""
+        self.waiting_for_notification.set()
+        return await self._delegate.wait(timeout_seconds)
+
+    async def aclose(self) -> None:
+        """沿用生产订阅的资源释放语义。"""
+        await self._delegate.aclose()
 
 
 @pytest.mark.asyncio
@@ -343,10 +346,16 @@ async def test_redis_pubsub_notification_wakes_task_stream(
         user_id = user.id
     task_id = await _create_task(session_factory, user_id)
     task_store = SqlAlchemyTaskViewStore(session_factory)
-    stream = TaskEventStream(TaskEventStore(session_factory, task_store), redis_url=redis_url)
+    subscription = _ObservedRedisTaskEventSubscription(
+        RedisTaskEventSubscription(redis_url, task_id)
+    )
+    stream = TaskEventStream(
+        TaskEventStore(session_factory, task_store),
+        subscription_factory=lambda _: subscription,
+    )
     events = stream.events(task_id=task_id, user_id=user_id, last_event_id=None)
     pending_event = asyncio.create_task(anext(events))
-    await _wait_for_task_channel_subscriber(redis_url=redis_url, task_id=task_id)
+    await asyncio.wait_for(subscription.waiting_for_notification.wait(), timeout=1)
     event_id = await _append_event(session_factory, user_id, task_id, "task.running")
     payload = _event_payload(await asyncio.wait_for(pending_event, timeout=2))
     await events.aclose()

@@ -42,6 +42,27 @@ class _HangingRedisClient:
         self.closed = True
 
 
+class _SubscribedHangingPubSub:
+    """模拟已确认订阅但读取通知永久阻塞的 Redis 连接。"""
+
+    def __init__(self) -> None:
+        """初始化订阅确认和资源关闭观察标记。"""
+        self.subscribed = False
+        self.closed = False
+
+    async def subscribe(self, *_channels: str) -> None:
+        """立即确认订阅，确保后续超时来自消息读取而非握手。"""
+        self.subscribed = True
+
+    async def get_message(self, **_kwargs: object) -> None:
+        """模拟已订阅连接在读取 Redis 消息时永久无响应。"""
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        """记录 Pub/Sub 清理。"""
+        self.closed = True
+
+
 class _TimedOutSubscription:
     """模拟连接 Redis 时超时的订阅，要求流降级为持久轮询。"""
 
@@ -114,3 +135,26 @@ async def test_subscription_open_timeout_falls_back_to_postgres_heartbeat(
 
     assert event.event == "heartbeat"
     assert timed_out.closed is True
+
+
+@pytest.mark.asyncio
+async def test_subscribed_message_read_timeout_closes_resources_and_falls_back_to_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已订阅 Redis 的消息读取超时后，流必须释放资源并持续 PostgreSQL 心跳兜底。"""
+    pubsub = _SubscribedHangingPubSub()
+    client = _HangingRedisClient(pubsub)  # type: ignore[arg-type]
+    monkeypatch.setattr(sse, "HEARTBEAT_SECONDS", 0)
+    monkeypatch.setattr(sse, "REDIS_OPERATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("redis.asyncio.Redis.from_url", lambda *_args, **_kwargs: client)
+    stream = TaskEventStream(_EmptyEventStore(), redis_url="redis://unused/15")  # type: ignore[arg-type]
+    events = stream.events(task_id=uuid4(), user_id=uuid4(), last_event_id=None)
+
+    first = await asyncio.wait_for(anext(events), timeout=0.1)
+    second = await asyncio.wait_for(anext(events), timeout=0.1)
+    await events.aclose()
+
+    assert pubsub.subscribed is True
+    assert pubsub.closed is True
+    assert client.closed is True
+    assert first.event == second.event == "heartbeat"
