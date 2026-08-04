@@ -644,6 +644,38 @@ async def test_transient_provider_error_creates_durable_retry_outbox_without_tas
 
 
 @pytest.mark.asyncio
+async def test_transient_provider_retry_after_overrides_worker_default_delay() -> None:
+    """供应商 Retry-After 必须覆盖 Worker 的固定回退，避免过早重试再次触发限流。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+    transient = TransientProviderError(
+        error_code="google_rate_limited",
+        message="Google Gmail is temporarily unavailable",
+        retry_after=37,
+    )
+
+    async def fail_rate_limited() -> None:
+        """模拟 Gmail 429，供 DurableTaskRunner 读取领域重试提示。"""
+        raise transient
+
+    runner = _runner(
+        store=store,
+        clock=MutableClock(now),
+        steps=(CallableStep("gmail", fail_rate_limited),),
+    )
+
+    await runner.run(
+        task_id=task.task_id,
+        lease_owner="worker-a",
+        may_retry_transient=True,
+        retry_delay=timedelta(seconds=5),
+    )
+
+    assert store.scheduled_retries[0][3] == now + timedelta(seconds=37)
+
+
+@pytest.mark.asyncio
 async def test_transient_provider_error_without_retry_budget_is_persisted_as_terminal_failure() -> (
     None
 ):

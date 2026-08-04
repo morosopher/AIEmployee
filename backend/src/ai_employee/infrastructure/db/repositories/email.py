@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.gmail import GmailConnectionState, GmailMessage
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
@@ -153,15 +154,16 @@ class SqlAlchemyGmailSyncRepository:
             thread_id=thread_id,
             provider_message_id=message.message_id,
             received_at=message.received_at,
-            sender=message.sender,
-            recipients=message.recipients,
+            sender=dict(message.sender),
+            recipients=[dict(recipient) for recipient in message.recipients],
             subject=message.subject,
-            snippet=message.snippet,
+            # Gmail snippet 是正文摘录；正文只能经 AAD 加密字段存储，明文列必须保持为空。
+            snippet="",
             body_ciphertext=encrypted_body.ciphertext,
             body_nonce=encrypted_body.nonce,
             body_key_version=encrypted_body.key_version,
             labels=list(message.labels),
-            headers=message.headers,
+            headers=dict(message.headers),
             provider_url=message.provider_url,
         )
         await self._session.execute(
@@ -199,6 +201,21 @@ class SqlAlchemyGmailSyncRepository:
         游标只在所有页的 upsert 已成功排入当前事务后更新；提交失败会一起回滚，从而使下次
         至少一次执行从旧游标安全重放。审计 metadata 只保存聚合计数和游标，不复制正文。
         """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.provider == "google",
+                OAuthConnectionModel.status == "connected",
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            raise StateConflictError(
+                error_code="gmail_connection_not_syncable",
+                message="Gmail connection is no longer available for sync",
+            )
         cursor = await self._session.scalar(
             select(SyncCursorModel)
             .where(SyncCursorModel.connection_id == connection_id, SyncCursorModel.resource_kind == "gmail")
@@ -299,7 +316,7 @@ class SqlAlchemyGmailSyncRepository:
     def _participants(message: GmailMessage) -> list[dict[str, str]]:
         """以邮箱作为稳定键合并 sender/recipient，避免每次 history 重放扩增参与者。"""
         participants: dict[str, dict[str, str]] = {}
-        for address in [message.sender, *message.recipients]:
+        for address in (message.sender, *message.recipients):
             email = address.get("email")
             if email:
                 participants[email.lower()] = {"name": address.get("name", ""), "email": email}

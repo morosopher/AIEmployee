@@ -118,16 +118,28 @@ class GmailAdapter:
                         headers={"Authorization": f"Bearer {self._access_token}"},
                     )
             except httpx.TimeoutException as error:
-                raise TransientProviderError() from error
+                raise TransientProviderError(
+                    error_code="google_timeout",
+                    message="Google Gmail request timed out",
+                ) from error
             if response.status_code == 401:
                 if attempt == 0 and self._refresh_access_token is not None:
                     self._access_token = await self._refresh_access_token()
                     continue
                 if self._mark_expired is not None:
                     await self._mark_expired()
-                raise UserActionRequiredError
+                raise UserActionRequiredError(
+                    error_code="google_reauthorization_required",
+                    message="Google Gmail authorization requires user action",
+                )
             if response.status_code == 429 or response.status_code >= 500:
-                raise TransientProviderError(self._retry_after(response))
+                raise TransientProviderError(
+                    error_code=(
+                        "google_rate_limited" if response.status_code == 429 else "google_service_unavailable"
+                    ),
+                    message="Google Gmail is temporarily unavailable",
+                    retry_after=self._retry_after(response),
+                )
             response.raise_for_status()
             return response.json()
         raise AssertionError("Gmail request retry loop exhausted")
@@ -204,7 +216,9 @@ class GmailAdapter:
             raise TypeError("Gmail message payload is invalid")
         headers = cls._headers(raw_payload.get("headers"))
         sender = cls._addresses(headers.get("from", ""))[0] if headers.get("from") else {"name": "", "email": ""}
-        recipients = cls._addresses(", ".join(headers.get(name, "") for name in ("to", "cc", "bcc")))
+        recipients = cls._addresses(
+            ", ".join(headers[name] for name in ("to", "cc", "bcc") if headers.get(name))
+        )
         subject = headers.get("subject", "")
         text, html = cls._body_parts(raw_payload)
         body = cls._clean_plain(text) if text else cls._clean_html(html)
@@ -252,9 +266,11 @@ class GmailAdapter:
         return "".join(pieces).replace("\r", " ").replace("\n", " ").strip()
 
     @staticmethod
-    def _addresses(value: str) -> list[dict[str, str]]:
+    def _addresses(value: str) -> tuple[dict[str, str], ...]:
         """把 RFC 地址列表规范为姓名和邮箱的有限字典。"""
-        return [{"name": name, "email": address} for name, address in getaddresses([value]) if address]
+        return tuple(
+            {"name": name, "email": address} for name, address in getaddresses([value]) if address
+        )
 
     @classmethod
     def _body_parts(cls, payload: dict[str, object]) -> tuple[str | None, str | None]:
@@ -317,7 +333,12 @@ class GmailAdapter:
         for image in soup.find_all("img"):
             width = str(image.get("width", ""))
             height = str(image.get("height", ""))
-            if width in {"1", "1px"} or height in {"1", "1px"}:
+            source = str(image.get("src", "")).lower()
+            if (
+                width in {"1", "1px"}
+                or height in {"1", "1px"}
+                or any(marker in source for marker in ("track", "pixel", "open?", "beacon"))
+            ):
                 image.decompose()
         for node in list(soup.find_all()):
             if not node.get_text(" ", strip=True) and node.name not in {"br"}:

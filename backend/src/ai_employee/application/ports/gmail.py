@@ -1,9 +1,26 @@
 """定义 Gmail 增量同步使用的不可变边界类型和已分类错误。"""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Protocol
+
+from ai_employee.domain.errors import (
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
+
+__all__ = [
+    "GmailConnectionState",
+    "GmailMessage",
+    "GmailReader",
+    "GmailSyncPage",
+    "HistoryCursorExpiredError",
+    "TransientProviderError",
+    "UserActionRequiredError",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,14 +35,24 @@ class GmailMessage:
     thread_id: str
     history_id: str
     received_at: datetime
-    sender: dict[str, str]
-    recipients: list[dict[str, str]]
+    sender: Mapping[str, str]
+    recipients: tuple[Mapping[str, str], ...]
     subject: str
     snippet: str
     normalized_body: str
     labels: tuple[str, ...]
-    headers: dict[str, str]
+    headers: Mapping[str, str]
     provider_url: str
+
+    def __post_init__(self) -> None:
+        """复制并冻结嵌套映射，避免适配器或测试调用方在消息创建后篡改同步事实。"""
+        object.__setattr__(self, "sender", MappingProxyType(dict(self.sender)))
+        object.__setattr__(
+            self,
+            "recipients",
+            tuple(MappingProxyType(dict(recipient)) for recipient in self.recipients),
+        )
+        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,25 +71,15 @@ class GmailConnectionState:
     cursor: str | None
 
 
-class UserActionRequiredError(Exception):
-    """表示授权连续失效，必须由用户重新完成 OAuth 授权。"""
+class HistoryCursorExpiredError(PermanentProviderError):
+    """表示 Gmail 已无法从指定 history cursor 提供增量变更，必须回退受限初始同步。"""
 
-
-class HistoryCursorExpiredError(Exception):
-    """表示 Gmail 已无法从指定 history cursor 提供增量变更。"""
-
-
-class TransientProviderError(Exception):
-    """表示可安全延迟重试的供应商限流、服务端或网络失败。
-
-    Args:
-        retry_after_seconds: Google 显式给出的最短延迟；缺失时为 ``None``，由任务重试策略决定。
-    """
-
-    def __init__(self, retry_after_seconds: int | None = None) -> None:
-        """保存不含供应商正文的可审计重试提示。"""
-        self.retry_after_seconds = retry_after_seconds
-        super().__init__("transient Gmail provider error")
+    def __init__(self) -> None:
+        """构造不含供应商正文的稳定 history 过期错误码。"""
+        super().__init__(
+            error_code="google_history_cursor_expired",
+            message="Google Gmail history cursor expired",
+        )
 
 
 class GmailReader(Protocol):

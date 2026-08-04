@@ -7,7 +7,7 @@ import httpx
 import pytest
 import respx
 
-from ai_employee.application.ports.gmail import UserActionRequiredError
+from ai_employee.application.ports.gmail import TransientProviderError, UserActionRequiredError
 from ai_employee.integrations.google.gmail import GmailAdapter
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -94,6 +94,33 @@ async def test_html_fallback_removes_unsafe_and_quoted_content() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_html_fallback_removes_tracking_pixel_without_dimensions() -> None:
+    """HTML 的远端像素即使没有宽高属性，也不得残留为同步正文。"""
+    html_message = _message("message-1", "thread-1", "101")
+    payload = html_message["payload"]
+    assert isinstance(payload, dict)
+    payload["parts"] = [
+        {
+            "mimeType": "text/html",
+            "body": {
+                "data": "PGRpdj5IZWxsbzwvZGl2PjxpbWcgYWx0PSJ0cmFja2VkIHBpeGVsIiBzcmM9Imh0dHBzOi8vdHJhY2suZXhhbXBsZS50ZXN0L29wZW4/dWlkPTEiPjxkaXY+Rm9sbG93LXVwPC9kaXY+"
+            },
+        }
+    ]
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "message-1"}], "historyId": "101"})
+    )
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages/message-1").mock(
+        return_value=httpx.Response(200, json=html_message)
+    )
+
+    pages = [page async for page in GmailAdapter(access_token="synthetic-access").initial_pages()]
+
+    assert pages[0].messages[0].normalized_body == "Hello\nFollow-up"
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_history_maps_added_messages_and_label_changes() -> None:
     """增量 history 同时产生新增邮件及标签变化涉及的消息读取。"""
     history = json.loads((FIXTURES / "gmail_history.json").read_text(encoding="utf-8"))
@@ -116,21 +143,58 @@ async def test_history_maps_added_messages_and_label_changes() -> None:
 async def test_first_401_refreshes_once_and_second_401_requires_user_action() -> None:
     """401 只触发一次刷新重试，重试仍拒绝时连接必须转为需用户操作。"""
     refreshed: list[str] = []
+    expired: list[str] = []
 
     async def refresh() -> str:
         """返回合成轮换后的 access token 并记录刷新次数。"""
         refreshed.append("called")
         return "rotated-access"
 
+    async def mark_expired() -> None:
+        """记录第二次 401 应持久化的连接过期回调。"""
+        expired.append("called")
+
     respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
         side_effect=[httpx.Response(401), httpx.Response(401)]
     )
-    adapter = GmailAdapter(access_token="synthetic-access", refresh_access_token=refresh)
+    adapter = GmailAdapter(
+        access_token="synthetic-access",
+        refresh_access_token=refresh,
+        mark_expired=mark_expired,
+    )
 
     with pytest.raises(UserActionRequiredError):
         [page async for page in adapter.initial_pages()]
 
     assert refreshed == ["called"]
+    assert expired == ["called"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_transient_google_failure_uses_domain_error_and_retry_after() -> None:
+    """429 必须映射为 Durable Worker 可捕获的领域临时错误及 Retry-After。"""
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "37"})
+    )
+
+    with pytest.raises(TransientProviderError) as raised:
+        await GmailAdapter(access_token="synthetic-access").execute_request("/messages", {})
+
+    assert raised.value.error_code == "google_rate_limited"
+    assert raised.value.retry_after == 37
+
+
+def test_normalized_message_collections_are_deeply_immutable() -> None:
+    """端口消息冻结 sender、recipient 和 header 映射，调用方不能事后篡改同步事实。"""
+    message = GmailAdapter._normalize_message(_message("message-1", "thread-1", "101"))
+
+    with pytest.raises(TypeError):
+        message.sender["email"] = "changed@example.test"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        message.recipients[0]["email"] = "changed@example.test"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        message.headers["subject"] = "Changed"  # type: ignore[index]
 
 
 @pytest.mark.asyncio

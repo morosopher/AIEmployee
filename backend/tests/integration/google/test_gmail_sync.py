@@ -6,15 +6,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from uuid import UUID
 
+import httpx
 import pytest
+import respx
 from sqlalchemy import func, select
 
 from ai_employee.application.ports.gmail import (
     GmailMessage,
     GmailSyncPage,
     HistoryCursorExpiredError,
+    UserActionRequiredError,
 )
 from ai_employee.application.use_cases.sync_gmail import SyncGmailUseCase
+from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
@@ -27,6 +32,8 @@ from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepository
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
+from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.workers.sync_gmail import GmailSyncTaskStep
 
 
 @dataclass(slots=True)
@@ -83,6 +90,21 @@ class FailingSecondMessageRepository(SqlAlchemyGmailSyncRepository):
         if self._message_writes == 2:
             raise RuntimeError("synthetic second message persistence failure")
         await super().upsert_message(**kwargs)
+
+
+class DisconnectBeforeFinishRepository(SqlAlchemyGmailSyncRepository):
+    """模拟网络读取期间用户断开连接，验证最终写事务会重新确认可同步状态。"""
+
+    async def finish_sync(self, **kwargs: object) -> None:
+        """先将当前连接标为断开，再委托真实游标推进以触发状态复核。"""
+        connection_id = kwargs["connection_id"]
+        assert isinstance(connection_id, UUID)
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel).where(OAuthConnectionModel.id == connection_id)
+        )
+        assert connection is not None
+        connection.status = "disconnected"
+        await super().finish_sync(**kwargs)
 
 
 @asynccontextmanager
@@ -180,12 +202,44 @@ async def test_sync_upserts_messages_and_advances_cursor_only_after_final_page(d
         assert cursor == "103"
         assert stored is not None
         assert b"Synthetic private body" not in stored.body_ciphertext
+        assert stored.snippet == ""
         assert cipher.decrypt(
             EncryptedValue(stored.body_ciphertext, stored.body_nonce, stored.body_key_version),
             f"{user_id}:{connection_id}:message-1:body".encode(),
         ) == b"Synthetic private body"
         assert audit is not None
         assert "body" not in str(audit.event_metadata).lower()
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_final_write_rejects_connection_disconnected_during_network_read(database_url: str) -> None:
+    """连接在页获取后断开时，消息、审计与游标必须全部回滚而不写入旧用户域。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"e" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher)
+
+        @asynccontextmanager
+        async def disconnecting_factory():
+            """使用真实单事务仓储，在 finish 前模拟并发断开。"""
+            async with sessions.begin() as session:
+                yield DisconnectBeforeFinishRepository(session)
+
+        with pytest.raises(StateConflictError, match="connection"):
+            await SyncGmailUseCase(
+                disconnecting_factory,
+                cipher,
+                FakeGmailReader(initial=(GmailSyncPage((_message(),), None, "102"),)),
+            ).execute(user_id=user_id, connection_id=connection_id)
+        async with sessions() as session:
+            cursor = await session.scalar(select(SyncCursorModel.cursor))
+            message_count = await session.scalar(select(func.count()).select_from(EmailMessageModel))
+            connection = await session.scalar(select(OAuthConnectionModel.status))
+        assert cursor is None
+        assert message_count == 0
+        assert connection == "connected"
     finally:
         await sessions.dispose()
 
@@ -265,5 +319,58 @@ async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitte
         assert cipher.decrypt(EncryptedValue(access.ciphertext, access.nonce, access.key_version), f"{user_id}:{connection_id}:access_token".encode()) == b"rotated-access"
         assert cipher.decrypt(EncryptedValue(refresh.ciphertext, refresh.nonce, refresh.key_version), f"{user_id}:{connection_id}:refresh_token".encode()) == b"synthetic-refresh"
         assert access.token_expires_at == datetime(2030, 1, 2, tzinfo=UTC)
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_worker_refreshes_once_then_marks_connection_expired_after_second_401(
+    database_url: str,
+) -> None:
+    """Worker 刷新闭包必须原子更新 access token，二次 401 后再持久化连接过期状态。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"f" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher)
+        token_route = respx.post("https://oauth2.googleapis.com/token").mock(
+            return_value=httpx.Response(
+                200, json={"access_token": "rotated-access", "expires_in": 3600}
+            )
+        )
+        gmail_route = respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+            side_effect=[httpx.Response(401), httpx.Response(401)]
+        )
+        step = GmailSyncTaskStep(
+            session_factory=sessions,
+            cipher=cipher,
+            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+        )
+
+        with pytest.raises(UserActionRequiredError):
+            await step.execute(
+                LeasedTask(
+                    task_id=UUID("00000000-0000-0000-0000-000000000001"),
+                    kind="sync_gmail",
+                    input_payload={"connection_id": str(connection_id)},
+                    started_at=datetime(2030, 1, 1, tzinfo=UTC),
+                    user_id=user_id,
+                )
+            )
+        async with sessions() as session:
+            connection = await session.scalar(select(OAuthConnectionModel))
+            access = await session.scalar(
+                select(EncryptedCredentialModel).where(
+                    EncryptedCredentialModel.credential_kind == "access_token"
+                )
+            )
+        assert token_route.called
+        assert gmail_route.call_count == 2
+        assert connection is not None and connection.status == "expired"
+        assert access is not None
+        assert cipher.decrypt(
+            EncryptedValue(access.ciphertext, access.nonce, access.key_version),
+            f"{user_id}:{connection_id}:access_token".encode(),
+        ) == b"rotated-access"
     finally:
         await sessions.dispose()

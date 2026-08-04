@@ -292,11 +292,16 @@ class DurableTaskRunner:
                     error_code="task_retry_delay_missing",
                 )
             scheduled_at = utc_instant(self._clock(), field="clock")
+            effective_delay = (
+                timedelta(seconds=error.retry_after)
+                if error.retry_after is not None
+                else retry_delay
+            )
             return await self._store.schedule_retry(
                 task_id=leased.task_id,
                 lease_owner=owner,
                 scheduled_at=scheduled_at,
-                retry_available_at=scheduled_at + retry_delay,
+                retry_available_at=scheduled_at + effective_delay,
                 error_code=error.error_code,
                 attempt_count=leased.attempt_count,
             )
