@@ -9,6 +9,7 @@ from ai_employee.domain.briefs import (
     BriefPriority,
     BriefSection,
     BriefSourceRef,
+    ConversationIntent,
     DailyBriefContent,
 )
 from ai_employee.domain.calendar import CalendarEvent, find_conflicts
@@ -18,6 +19,7 @@ from ai_employee.domain.email import (
     classify_by_rules,
     classify_urgency_by_rules,
 )
+from ai_employee.domain.model_redaction import redact_for_model
 
 
 class DailyBriefSourceFailure(RuntimeError):
@@ -188,6 +190,31 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
     return {"intent": "explain_capabilities", "confidence": 0.5, "reason_code": "ambiguous_request"}
 
 
+async def classify_ambiguous_conversation_intent(
+    text: str, *, model_gateway: Any, model_name: str, configured_patterns: tuple[str, ...] = ()
+) -> ConversationIntent:
+    """本地脱敏歧义文本后执行受限的三值意图模型分类。
+
+    确定性 allow/deny 规则仍优先；模型或输出校验失败时安全解释能力边界。
+    """
+    deterministic = classify_conversation_intent(text)
+    if deterministic["reason_code"] != "ambiguous_request":
+        return ConversationIntent.model_validate(deterministic)
+    redacted = redact_for_model(text, configured_patterns=configured_patterns)
+    try:
+        response = await model_gateway.complete(
+            model_name=model_name,
+            prompt_version="conversation_intent_v1",
+            messages=[{"role": "user", "content": redacted.text}],
+            response_model=ConversationIntent,
+        )
+        return ConversationIntent.model_validate(response.value)
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        return ConversationIntent(
+            intent="explain_capabilities", confidence=0.0, reason_code="intent_model_failed"
+        )
+
+
 def detect_calendar_conflicts_node(state: dict[str, Any]) -> dict[str, Any]:
     """使用确定性日历规则检测冲突，不向模型发送日历内容。"""
     _event(state, "detect_calendar_conflicts", "started")
@@ -241,7 +268,7 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
         )
     notification_refs = [
         BriefSourceRef(source_type="email_thread", source_id=item["thread_id"])
-        for item in state.get("classifications", [])
+        for item in state.get("classifications", []) + state.get("model_items", [])
         if item.get("category") == "notification"
     ]
     if notification_refs:
