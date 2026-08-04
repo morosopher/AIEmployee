@@ -201,4 +201,37 @@ describe('useTaskEvents', () => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
   })
+
+  it('renews the silent timeout when the server sends an empty heartbeat event', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    const initialSourceCount = FakeEventSource.instances.length
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents('task-1')
+        return () => null
+      },
+    })
+
+    const wrapper = mount(Host)
+    const source = FakeEventSource.instances.at(-1)
+    const heartbeatHandler = source?.addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'heartbeat',
+    )?.[1] as EventListener
+    source?.onopen?.(new Event('open'))
+    vi.advanceTimersByTime(29_000)
+
+    // 后端 heartbeat 的 data 固定为 {}，它不是可持久化的 TaskEvent。
+    heartbeatHandler(new MessageEvent('heartbeat', { data: '{}' }))
+    vi.advanceTimersByTime(29_999)
+
+    expect(source?.close).not.toHaveBeenCalled()
+    expect(FakeEventSource.instances).toHaveLength(initialSourceCount + 1)
+    vi.advanceTimersByTime(1)
+    expect(source?.close).toHaveBeenCalledOnce()
+    wrapper.unmount()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
 })

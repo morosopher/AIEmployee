@@ -85,9 +85,11 @@ export function useTaskEvents(
      */
     const handleEvent = (message: MessageEvent<string>): void => {
       if (source !== eventSource) return
+      // heartbeat 的 {} 不符合持久 TaskEvent，但其抵达仍证明当前传输链路存活，
+      // 必须在解析前续期，且已由上方身份判断隔离关闭流的滞后回调。
+      armHeartbeatTimeout()
       const event = parseTaskEvent(message.data)
       if (!event) return
-      armHeartbeatTimeout()
       connectionState.value = 'connected'
       tasks.setConnectionState(event.task_id, 'connected')
       tasks.applyEvent(event)
