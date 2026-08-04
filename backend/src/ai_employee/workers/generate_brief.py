@@ -41,12 +41,14 @@ class GenerateBriefTaskStep:
         session_factory: ManagedAsyncSessionMaker,
         *,
         model_gateway: ModelGateway | None = None,
+        model_name: str = "fake",
         sync_source: SyncSource | None = None,
         now: UtcNow | None = None,
     ) -> None:
         """注入可替换模型、同步步骤和 UTC 时钟，避免 Graph I/O 占用数据库事务。"""
         self._session_factory = session_factory
         self._model_gateway = model_gateway
+        self._model_name = model_name
         self._sync_source = sync_source
         self._now = now or (lambda: datetime.now(UTC))
 
@@ -83,7 +85,7 @@ class GenerateBriefTaskStep:
                 "calendar_events": calendar_events,
                 "warnings": warnings,
                 "model_gateway": self._model_gateway or build_model_gateway(),
-                "model_name": "fake",
+                "model_name": self._model_name,
                 "locale": user.locale,
             }
         )
@@ -263,7 +265,7 @@ class GenerateBriefTaskStep:
             analyses.append(
                 {
                     **item,
-                    "model_name": "fake",
+                    "model_name": result.get("model_name", ""),
                     "prompt_version": "daily_brief_v1",
                     "input_hash": sha256(str(item["thread_id"]).encode()).hexdigest(),
                 }
@@ -326,5 +328,6 @@ def build_generate_brief_task_step(
     return GenerateBriefTaskStep(
         session_factory,
         model_gateway=build_model_gateway(settings),
+        model_name=settings.model_name,
         sync_source=sync_source,
     )

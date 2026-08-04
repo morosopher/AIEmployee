@@ -40,7 +40,10 @@ class MessageModel(UUIDPrimaryKeyMixin, Base):
 class DailyBriefModel(UUIDPrimaryKeyMixin, Base):
     """保存一个本地日期的某个简报版本及渲染前结构化结果。"""
     __tablename__ = "daily_briefs"
-    __table_args__ = (UniqueConstraint("user_id", "local_date", "version", name="uq_daily_briefs_user_date_version"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "local_date", "version", name="uq_daily_briefs_user_date_version"),
+        UniqueConstraint("task_id", name="uq_daily_briefs_task_id"),
+    )
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     local_date: Mapped[date] = mapped_column(Date(), nullable=False)
     version: Mapped[int] = mapped_column(Integer(), nullable=False)

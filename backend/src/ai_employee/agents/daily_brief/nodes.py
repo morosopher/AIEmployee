@@ -334,6 +334,14 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
     """把确定性结果组装为带来源引用的简报。"""
     _event(state, "compose_structured_brief", "started")
     items = []
+    thread_urls = {
+        str(thread.get("thread_id", "")): thread.get("provider_url")
+        for thread in state.get("mail_threads", [])
+    }
+    event_urls = {
+        str(event.get("event_id", "")): event.get("provider_url")
+        for event in state.get("calendar_events", [])
+    }
     for item in state.get("classifications", []) + state.get("model_items", []):
         if item.get("category") == "notification":
             continue
@@ -343,7 +351,7 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
                 title=f"邮件线程 {item['thread_id']}",
                 body_markdown="已完成分类。",
                 source_refs=[
-                    BriefSourceRef(source_type="email_thread", source_id=item["thread_id"])
+                    BriefSourceRef(source_type="email_thread", source_id=item["thread_id"], provider_url=thread_urls.get(str(item["thread_id"])))
                 ],
                 priority=BriefPriority.HIGH
                 if item.get("urgency") == "urgent"
@@ -351,7 +359,7 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
             ).model_dump()
         )
     notification_refs = [
-        BriefSourceRef(source_type="email_thread", source_id=item["thread_id"])
+        BriefSourceRef(source_type="email_thread", source_id=item["thread_id"], provider_url=thread_urls.get(str(item["thread_id"])))
         for item in state.get("classifications", []) + state.get("model_items", [])
         if item.get("category") == "notification"
     ]
@@ -372,12 +380,12 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
                     section=BriefSection.SCHEDULE,
                     title="日程安排",
                     body_markdown="已同步日程。",
-                    source_refs=[BriefSourceRef(source_type="calendar_event", source_id=event_id)],
+                    source_refs=[BriefSourceRef(source_type="calendar_event", source_id=event_id, provider_url=event_urls.get(str(event_id)))],
                 ).model_dump()
             )
     for conflict in state.get("conflicts", []):
         refs = [
-            BriefSourceRef(source_type="calendar_event", source_id=event_id)
+            BriefSourceRef(source_type="calendar_event", source_id=event_id, provider_url=event_urls.get(str(event_id)))
             for event_id in conflict["event_ids"]
         ]
         items.append(

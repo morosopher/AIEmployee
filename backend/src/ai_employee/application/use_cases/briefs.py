@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from ai_employee.domain.briefs import DailyBriefContent
 from ai_employee.infrastructure.db.models.briefs import (
@@ -40,6 +40,12 @@ class PersistDailyBriefUseCase:
         已写入简报，防止至少一次投递创建第二个版本。
         """
         async with self._session_factory.begin() as session:
+            # PostgreSQL advisory transaction lock serializes version allocation for one user/date
+            # without locking unrelated users or days. The unique constraints remain the final guard.
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:brief_key))"),
+                {"brief_key": f"daily-brief:{user_id}:{content.local_date.isoformat()}"},
+            )
             existing = await session.scalar(
                 select(DailyBriefModel.id).where(
                     DailyBriefModel.user_id == user_id, DailyBriefModel.task_id == task_id
