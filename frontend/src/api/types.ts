@@ -65,6 +65,19 @@ export interface Message { id: string; role: string; content_markdown: string; t
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; is_current?: boolean }
 export interface Connection { id: string; provider: string; account_email: string; scopes: string[]; status: string; last_error_code: string | null }
 
+/** 运行时验证简报公开响应，拒绝数组及缺失核心字段。 */
+export function parseBrief(value: unknown): Brief {
+  const object = asJsonObject(value)
+  if (!object || typeof object.id !== 'string' || typeof object.local_date !== 'string' || typeof object.version !== 'number' || typeof object.completeness !== 'string' || !Array.isArray(object.warnings) || !Array.isArray(object.items)) throw new Error('Invalid brief response')
+  return object as unknown as Brief
+}
+/** 验证会话公开字段，避免未知 JSON 进入设置页面。 */
+export function parseSession(value: unknown): Session {
+  const object = asJsonObject(value)
+  if (!object || typeof object.id !== 'string' || typeof object.created_at !== 'string' || typeof object.last_seen_at !== 'string' || typeof object.expires_at !== 'string') throw new Error('Invalid session response')
+  return { id: object.id, created_at: object.created_at, last_seen_at: object.last_seen_at, expires_at: object.expires_at, is_current: object.is_current === true }
+}
+
 /** RFC 9457 扩展错误字段，提供稳定的恢复提示和追踪编号。 */
 export interface ProblemDetails {
   type: string

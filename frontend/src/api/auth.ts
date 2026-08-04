@@ -1,4 +1,4 @@
 import { requestJson } from './client'
-import type { Session } from './types'
-export const listSessions = () => requestJson('/auth/sessions', (v) => v as Session[])
+import { parseSession, type Session } from './types'
+export const listSessions = () => requestJson('/auth/sessions', (v) => { if (!Array.isArray(v)) throw new Error('Invalid sessions response'); return v.map(parseSession) })
 export const revokeSession = (id: string) => requestJson(`/auth/sessions/${encodeURIComponent(id)}`, () => null, { method: 'DELETE' })
