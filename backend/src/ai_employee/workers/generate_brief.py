@@ -28,6 +28,7 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.integrations.llm.fake import build_model_gateway
 
 SyncSource = Callable[[str, UUID, UUID], Awaitable[None]]
@@ -318,7 +319,7 @@ class GenerateBriefTaskStep:
 
 
 def build_generate_brief_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None, metrics: Metrics | None = None
 ) -> GenerateBriefTaskStep:
     """构造供 DurableTaskRunner 使用的实际 daily_brief 节点。"""
     if settings is None:
@@ -330,9 +331,13 @@ def build_generate_brief_task_step(
         from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
 
         step = (
-            build_gmail_sync_task_step(session_factory=session_factory, settings=settings)
+            build_gmail_sync_task_step(
+                session_factory=session_factory, settings=settings, metrics=metrics
+            )
             if resource_kind == "gmail"
-            else build_calendar_sync_task_step(session_factory=session_factory, settings=settings)
+            else build_calendar_sync_task_step(
+                session_factory=session_factory, settings=settings, metrics=metrics
+            )
         )
         await step.execute(
             LeasedTask(
@@ -346,7 +351,7 @@ def build_generate_brief_task_step(
 
     return GenerateBriefTaskStep(
         session_factory,
-        model_gateway=build_model_gateway(settings),
+        model_gateway=build_model_gateway(settings, metrics=metrics),
         model_name=settings.model_name,
         sync_source=sync_source,
     )

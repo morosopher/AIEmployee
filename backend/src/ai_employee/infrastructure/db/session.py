@@ -106,6 +106,15 @@ class ManagedAsyncSessionMaker(async_sessionmaker[TaskEventNotifyingAsyncSession
         """异步释放工厂拥有的连接池；重复调用保持安全。"""
         await self._owned_engine.dispose()
 
+    @property
+    def engine(self) -> AsyncEngine:
+        """返回由当前工厂唯一拥有的异步引擎，供进程级 tracing 初始化使用。
+
+        返回值不能被业务 Repository 用作绕过事务的通道；该属性仅暴露给组合根，避免
+        读取 SQLAlchemy 内部 ``kw`` 字典而失去升级兼容性。
+        """
+        return self._owned_engine
+
 
 def build_engine(database_url: str) -> AsyncEngine:
     """按给定异步 DSN 创建数据库引擎。

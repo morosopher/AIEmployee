@@ -1,27 +1,37 @@
 """创建 FastAPI 应用并暴露供 ASGI 服务器加载的进程级实例。"""
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from ai_employee.api.deps import (
     ApiProblem,
     SystemClock,
     handle_api_problem,
+    handle_domain_error,
     handle_request_validation_error,
+    handle_unexpected_error,
 )
 from ai_employee.api.routers.approvals import build_approvals_router
 from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.briefs import build_briefs_router
 from ai_employee.api.routers.connections import build_connections_router
 from ai_employee.api.routers.conversations import build_conversations_router
+from ai_employee.api.routers.privacy import build_privacy_router
 from ai_employee.api.routers.settings import build_settings_router
 from ai_employee.api.routers.system import build_system_router
 from ai_employee.api.routers.tasks import build_tasks_router
 from ai_employee.api.sse import TaskEventStore, TaskEventStream
 from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
+from ai_employee.application.use_cases.diagnostics import GetDailyBriefOverdueAlertUseCase
 from ai_employee.application.use_cases.task_views import (
     CancelTaskUseCase,
     GetTaskUseCase,
@@ -29,8 +39,10 @@ from ai_employee.application.use_cases.task_views import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.config import get_settings
+from ai_employee.domain.errors import DomainError
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStoreFactory
+from ai_employee.infrastructure.db.repositories.diagnostics import SqlAlchemyOverdueBriefReader
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyIdentityRepositoryFactory,
 )
@@ -41,6 +53,10 @@ from ai_employee.infrastructure.db.repositories.task_views import (
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
+from ai_employee.infrastructure.observability.logging import configure_json_logging
+from ai_employee.infrastructure.observability.metrics import create_metrics, run_periodic_heartbeat
+from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
+from ai_employee.infrastructure.observability.tracing import initialize_tracing
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
 
@@ -67,12 +83,42 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         """在 API 进程退出时释放认证数据库连接池。"""
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
+            if app.state.metrics is not None:
+                async def refresh_api_sync_age() -> None:
+                    """以 API 所有的只读连接池恢复重启后的同步新鲜度。"""
+                    await refresh_sync_age_metrics(
+                        session_factory=session_factory,
+                        metrics=app.state.metrics,
+                        now=datetime.now(UTC),
+                    )
+
+                heartbeat_task = asyncio.create_task(
+                    run_periodic_heartbeat(
+                        metrics=app.state.metrics,
+                        process="api",
+                        on_tick=refresh_api_sync_age,
+                    )
+                )
             yield
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
             await session_factory.dispose()
 
     app = FastAPI(title="AI Employee API", version="0.1.0", lifespan=lifespan)
+    app.state.metrics = create_metrics() if settings.metrics_enabled else None
+    configure_json_logging(tuple(settings.model_redaction_patterns))
+    initialize_tracing(
+        app=app,
+        async_engine=session_factory.engine,
+        enabled=settings.otel_enabled,
+        service_name=settings.otel_service_name,
+        endpoint=settings.otel_exporter_otlp_endpoint,
+    )
     app.state.auth_settings = settings
     app.state.auth_session_factory = session_factory
     app.state.auth_repository_factory = SqlAlchemyIdentityRepositoryFactory(session_factory)
@@ -92,15 +138,48 @@ def create_app(
     app.state.approval_decision_use_case = ApprovalDecisionUseCase(
         SqlAlchemyApprovalStore(session_factory)
     )
+    app.state.daily_brief_alerts_use_case = GetDailyBriefOverdueAlertUseCase(
+        reader=SqlAlchemyOverdueBriefReader(session_factory)
+    )
     app.state.task_event_stream = TaskEventStream(
-        TaskEventStore(session_factory, task_store), redis_url=settings.redis_url
+        TaskEventStore(session_factory, task_store),
+        redis_url=settings.redis_url,
+        metrics=app.state.metrics,
     )
     app.add_exception_handler(ApiProblem, handle_api_problem)
+    app.add_exception_handler(DomainError, handle_domain_error)
     app.add_exception_handler(RequestValidationError, handle_request_validation_error)
-    probe = readiness_probe or (lambda: {"postgres": True, "redis": True})
+    app.add_exception_handler(Exception, handle_unexpected_error)
+    async def real_readiness_probe() -> dict[str, bool]:
+        """以最小 SQL 与 Redis PING 检查真实依赖，不返回连接或异常原文。"""
+        postgres_healthy = False
+        redis_healthy = False
+        try:
+            async with session_factory() as session:
+                await session.execute(text("SELECT 1"))
+            postgres_healthy = True
+        except SQLAlchemyError:
+            pass
+        client = Redis.from_url(settings.redis_url)
+        try:
+            redis_healthy = bool(await client.ping())
+        except (OSError, RedisError, TimeoutError):
+            pass
+        finally:
+            await client.aclose()
+
+        return {"postgres": postgres_healthy, "redis": redis_healthy}
+
+    probe = readiness_probe or real_readiness_probe
     app.include_router(build_system_router(probe))
+    if app.state.metrics is not None:
+        @app.get("/metrics", include_in_schema=False)
+        async def metrics():
+            """暴露不含用户和内容标签的 Prometheus 指标。"""
+            return app.state.metrics.render()
     app.include_router(build_auth_router())
     app.include_router(build_connections_router())
+    app.include_router(build_privacy_router())
     app.include_router(build_briefs_router())
     app.include_router(build_conversations_router())
     app.include_router(build_settings_router())

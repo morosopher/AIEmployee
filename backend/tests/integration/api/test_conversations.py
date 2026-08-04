@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
-from conftest import AuthenticatedApiClients
 from sqlalchemy import func, select
 
 from ai_employee.application.use_cases.conversations import UNSUPPORTED_RESPONSE
@@ -13,6 +12,8 @@ from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, Message
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
 from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.conversation import ConversationTaskStep
+
+from .conftest import AuthenticatedApiClients
 
 
 async def _create_conversation(clients: AuthenticatedApiClients) -> UUID:

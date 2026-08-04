@@ -1,11 +1,13 @@
 """把 Taskiq 执行入口组合到基础设施无关的持久任务执行用例。"""
 
+import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from uuid import UUID
 
 from langgraph.types import Command
-from taskiq import Context, TaskiqDepends
+from taskiq import Context, TaskiqDepends, TaskiqEvents
 
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
@@ -23,9 +25,18 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
+from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
+from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 from ai_employee.workers.conversation import build_conversation_task_step
+from ai_employee.workers.diagnostics import build_overdue_brief_diagnostic_task_step
 from ai_employee.workers.generate_brief import build_generate_brief_task_step
+from ai_employee.workers.observability import (
+    build_process_session_factory,
+    initialize_process_observability,
+    refresh_stuck_task_metrics,
+)
+from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_deletion_worker
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
 
@@ -34,6 +45,56 @@ RETRY_DELAY_SECONDS = 5
 # Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
 # 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
 taskiq_context_dependency: Context = TaskiqDepends()
+_worker_metrics: Metrics | None = None
+_worker_observability_factory = None
+_worker_heartbeat_task: asyncio.Task[None] | None = None
+
+
+@broker.on_event(TaskiqEvents.WORKER_STARTUP)
+async def initialize_worker_observability(_: object) -> None:
+    """在 Taskiq 真正启动后开启 Worker tracing、日志与内部指标监听。
+
+    任务发现和单元测试只会导入此模块，不会触发 lifecycle 回调，因而不会占用 9101。连接
+    工厂由 shutdown 回调释放；任务执行路径不复用它，避免改变既有每消息资源生命周期。
+    """
+    global _worker_metrics, _worker_observability_factory, _worker_heartbeat_task
+    settings = get_settings()
+    factory = build_process_session_factory(settings)
+    _worker_observability_factory = factory
+    _worker_metrics = initialize_process_observability(
+        settings=settings, session_factory=factory, process="worker"
+    )
+    if _worker_metrics is not None:
+        async def refresh_worker_health() -> None:
+            """在空闲时继续扫描过期租约，保持 Gauge 与数据库事实一致。"""
+            await refresh_stuck_task_metrics(
+                session_factory=factory, metrics=_worker_metrics, now=datetime.now(UTC)
+            )
+            await refresh_sync_age_metrics(
+                session_factory=factory, metrics=_worker_metrics, now=datetime.now(UTC)
+            )
+
+        _worker_heartbeat_task = asyncio.create_task(
+            run_periodic_heartbeat(
+                metrics=_worker_metrics, process="worker", on_tick=refresh_worker_health
+            )
+        )
+
+
+@broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
+async def shutdown_worker_observability(_: object) -> None:
+    """释放仅供 Worker 启动观测使用的连接池，避免优雅退出泄漏连接。"""
+    global _worker_observability_factory, _worker_heartbeat_task
+    heartbeat_task = _worker_heartbeat_task
+    _worker_heartbeat_task = None
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+    factory = _worker_observability_factory
+    _worker_observability_factory = None
+    if factory is not None:
+        await factory.dispose()
 
 
 class _MissingTaskHandlerStep:
@@ -171,21 +232,32 @@ def build_task_runner() -> DurableTaskRunner:
         task_timeout_seconds=settings.task_timeout_seconds,
         task_step_timeout_seconds=settings.task_step_timeout_seconds,
         max_transient_retries=DEFAULT_RETRY_COUNT,
+        metrics=_worker_metrics,
         resolve_steps=lambda task: (
-            (build_gmail_sync_task_step(session_factory=session_factory, settings=settings),)
+            (
+                build_gmail_sync_task_step(
+                    session_factory=session_factory, settings=settings, metrics=_worker_metrics
+                ),
+            )
             if task.kind == "sync_gmail"
             else (
-                build_calendar_sync_task_step(session_factory=session_factory, settings=settings),
+                build_calendar_sync_task_step(
+                    session_factory=session_factory, settings=settings, metrics=_worker_metrics
+                ),
             )
             if task.kind == "sync_calendar"
             else (
-                build_generate_brief_task_step(session_factory=session_factory, settings=settings),
+                build_generate_brief_task_step(session_factory=session_factory, settings=settings, metrics=_worker_metrics),
             )
             if task.kind == "daily_brief"
             else (
-                build_conversation_task_step(session_factory=session_factory, settings=settings),
+                build_conversation_task_step(session_factory=session_factory, settings=settings, metrics=_worker_metrics),
             )
             if task.kind == "conversation.respond"
+            else (build_overdue_brief_diagnostic_task_step(session_factory=session_factory),)
+            if task.kind == "brief.overdue_diagnostic"
+            else (build_privacy_deletion_worker(),)
+            if task.kind in {"privacy.clear_source_cache", "privacy.delete_all_data"}
             else (_MissingTaskHandlerStep(),)
         ),
     )
@@ -222,6 +294,8 @@ async def execute_task(
         if resume is not None and resume not in {"approved", "rejected"}:
             return
         settings = get_settings()
+        if _worker_metrics is not None:
+            _worker_metrics.record_heartbeat(process="worker", age_seconds=0)
         session_factory = build_session_factory(
             settings.database_url,
             task_event_publisher=TaskEventPublisher(settings.redis_url),
@@ -238,6 +312,7 @@ async def execute_task(
                     task_timeout_seconds=settings.task_timeout_seconds,
                     task_step_timeout_seconds=settings.task_step_timeout_seconds,
                     max_transient_retries=DEFAULT_RETRY_COUNT,
+                    metrics=_worker_metrics,
                     resolve_steps=lambda _task: (_TaskKindLookupFailureStep(),),
                 )
             else:
@@ -249,6 +324,7 @@ async def execute_task(
                         task_timeout_seconds=settings.task_timeout_seconds,
                         task_step_timeout_seconds=settings.task_step_timeout_seconds,
                         max_transient_retries=DEFAULT_RETRY_COUNT,
+                        metrics=_worker_metrics,
                         resolve_steps=lambda _task: (
                             _FakeWriteStep(
                                 approval_store=approval_store,
@@ -260,12 +336,22 @@ async def execute_task(
                     if task is not None and task.kind == "fake_write"
                     else build_task_runner()
                 )
-            await runner.run(
-                parsed_task_id,
-                may_retry_transient=True,
-                retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
-                recover_waiting_approval=recover_approval_checkpoint,
-            )
+            if _worker_metrics is not None:
+                await refresh_stuck_task_metrics(
+                    session_factory=session_factory,
+                    metrics=_worker_metrics,
+                    now=datetime.now(UTC),
+                )
+            try:
+                await runner.run(
+                    parsed_task_id,
+                    may_retry_transient=True,
+                    retry_delay=timedelta(seconds=RETRY_DELAY_SECONDS),
+                    recover_waiting_approval=recover_approval_checkpoint,
+                )
+            except AllDataDeletionCompleted:
+                # 当前 TaskRun 已由全量删除事务移除；不能再经 Runner 写入终态。
+                return
         finally:
             await session_factory.dispose()
     except (OSError, RuntimeError, ValueError):

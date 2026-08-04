@@ -150,9 +150,10 @@ class EmailMessageModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     recipients: Mapped[list[dict[str, str]]] = mapped_column(JSONB(), nullable=False)
     subject: Mapped[str] = mapped_column(Text(), nullable=False)
     snippet: Mapped[str] = mapped_column(Text(), nullable=False)
-    body_ciphertext: Mapped[bytes] = mapped_column(LargeBinary(), nullable=False)
-    body_nonce: Mapped[bytes] = mapped_column(LargeBinary(12), nullable=False)
-    body_key_version: Mapped[int] = mapped_column(Integer(), nullable=False)
+    # 保留任务必须同时清除三元组；任何一个字段残留都可能形成可恢复的加密材料。
+    body_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
+    body_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
+    body_key_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     labels: Mapped[list[str]] = mapped_column(JSONB(), nullable=False)
     headers: Mapped[dict[str, str]] = mapped_column(JSONB(), nullable=False)
     provider_url: Mapped[str] = mapped_column(Text(), nullable=False)

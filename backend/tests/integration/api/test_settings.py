@@ -1,9 +1,10 @@
 """验证用户设置 API 的校验、CSRF 与调度读取闭环。"""
 
 import pytest
-from conftest import AuthenticatedApiClients
 
 from ai_employee.infrastructure.db.repositories.identity import SqlAlchemyActiveUserScheduleReader
+
+from .conftest import AuthenticatedApiClients
 
 
 @pytest.mark.asyncio

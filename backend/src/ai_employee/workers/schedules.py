@@ -1,11 +1,16 @@
 """把 Task 8 五个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
 
+import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime
+
+from taskiq import TaskiqEvents
 
 from ai_employee.application.use_cases.approval_checkpoint_recovery import (
     RecoverApprovalCheckpointsUseCase,
 )
 from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
+from ai_employee.application.use_cases.diagnostics import DispatchOverdueBriefDiagnosticsUseCase
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.schedules import (
@@ -24,6 +29,7 @@ from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery imp
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyConnectedGoogleReader
+from ai_employee.infrastructure.db.repositories.diagnostics import SqlAlchemyOverdueBriefReader
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
     SqlAlchemySessionMaintenanceRepositoryFactory,
@@ -34,20 +40,25 @@ from ai_employee.infrastructure.db.repositories.task_retry_recovery import (
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
+from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
 from ai_employee.infrastructure.queue.broker import broker
 from ai_employee.workers.execute_task import execute_task
+from ai_employee.workers.observability import initialize_process_observability
 from ai_employee.workers.outbox import build_outbox_relay
+from ai_employee.workers.retention import build_retention_cleanup_worker
 
 __all__ = [
     "daily_brief_idempotency_key",
     "dispatch_due_briefs",
     "dispatch_google_incremental_syncs",
+    "dispatch_overdue_brief_diagnostics",
     "expire_approvals",
     "expire_sessions",
     "is_daily_brief_due",
     "recover_approval_checkpoints",
     "recover_task_retries",
     "relay_outbox",
+    "run_retention_cleanup",
     "scheduled_daily_brief_instant",
 ]
 
@@ -56,6 +67,41 @@ session_factory = build_session_factory(
     settings.database_url,
     task_event_publisher=TaskEventPublisher(settings.redis_url),
 )
+_scheduler_metrics: Metrics | None = None
+_scheduler_heartbeat_task: asyncio.Task[None] | None = None
+
+
+@broker.on_event(TaskiqEvents.CLIENT_STARTUP)
+async def initialize_scheduler_observability(_: object) -> None:
+    """在 Scheduler broker 启动后初始化 tracing 和仅容器内部的指标 listener。
+
+    Taskiq scheduler 使用 CLIENT 生命周期而非 WORKER 生命周期。该注册在 Worker 导入本模块时
+    不会被调用，因此 9102 不会出现在 Worker 进程。
+    """
+    global _scheduler_metrics, _scheduler_heartbeat_task
+    if not broker.is_scheduler_process:
+        return
+    _scheduler_metrics = initialize_process_observability(
+        settings=settings, session_factory=session_factory, process="scheduler"
+    )
+    if _scheduler_metrics is not None:
+        _scheduler_heartbeat_task = asyncio.create_task(
+            run_periodic_heartbeat(metrics=_scheduler_metrics, process="scheduler")
+        )
+
+
+@broker.on_event(TaskiqEvents.CLIENT_SHUTDOWN)
+async def shutdown_scheduler_observability(_: object) -> None:
+    """Scheduler 退出时释放其模块级数据库引擎。"""
+    global _scheduler_heartbeat_task
+    heartbeat_task = _scheduler_heartbeat_task
+    _scheduler_heartbeat_task = None
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+    if broker.is_scheduler_process:
+        await session_factory.dispose()
 
 
 def _build_outbox_relay() -> OutboxRelay:
@@ -70,6 +116,8 @@ def _build_outbox_relay() -> OutboxRelay:
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "outbox-relay"}])
 async def relay_outbox() -> None:
     """每分钟 claim 并投递一批到期未发布 Outbox 事件。"""
+    if _scheduler_metrics is not None:
+        _scheduler_metrics.record_heartbeat(process="scheduler", age_seconds=0)
     await _build_outbox_relay().relay_once(limit=settings.outbox_relay_batch_size)
 
 
@@ -129,6 +177,23 @@ async def expire_approvals() -> None:
     """每分钟锁定有界过期待审批并原子写入失败及无内容审计。"""
     use_case = ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory))
     await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
+
+
+@broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "brief-overdue-diagnostics"}])
+async def dispatch_overdue_brief_diagnostics() -> None:
+    """每分钟扫描真实逾期用户，并通过事务型创建用例写入诊断任务。"""
+    creator = CreateTaskUseCase(
+        SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
+    )
+    await DispatchOverdueBriefDiagnosticsUseCase(
+        reader=SqlAlchemyOverdueBriefReader(session_factory), task_creator=creator
+    ).execute(now=datetime.now(UTC))
+
+
+@broker.task(schedule=[{"cron": "30 2 * * *", "schedule_id": "retention-cleanup"}])
+async def run_retention_cleanup() -> None:
+    """每天 UTC 02:30 调用 retention 角色执行有界保留清理。"""
+    await build_retention_cleanup_worker().execute(now=datetime.now(UTC))
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "recover-approval-checkpoints"}])

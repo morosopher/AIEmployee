@@ -61,6 +61,13 @@ class Settings(BaseSettings):
         ge=1,
         description="单次 Outbox relay 事务最多 claim 的未发布事件数。",
     )
+    otel_enabled: bool = False
+    otel_service_name: str = "ai-employee"
+    otel_exporter_otlp_endpoint: str = ""
+    metrics_enabled: bool = True
+    worker_metrics_port: int = Field(default=9101, ge=1, le=65535)
+    scheduler_metrics_port: int = Field(default=9102, ge=1, le=65535)
+    retention_database_url_file: Path = Path("/run/secrets/retention_database_url")
     session_cookie_name: str = "ai_employee_session"
     session_ttl_seconds: int = Field(
         default=604800,

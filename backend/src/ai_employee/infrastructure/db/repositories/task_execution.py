@@ -150,6 +150,7 @@ class SqlAlchemyTaskExecutionStore:
                         TaskRunModel.user_id,
                         TaskRunModel.kind,
                         TaskRunModel.input_payload,
+                        TaskRunModel.created_at,
                         TaskRunModel.started_at,
                         TaskRunModel.attempt_count,
                     )
@@ -171,6 +172,7 @@ class SqlAlchemyTaskExecutionStore:
                 task_id=row.id,
                 kind=row.kind,
                 input_payload=row.input_payload,
+                created_at=row.created_at,
                 started_at=row.started_at,
                 user_id=row.user_id,
                 attempt_count=row.attempt_count,

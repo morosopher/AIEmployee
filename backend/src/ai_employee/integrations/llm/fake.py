@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from collections.abc import Sequence
 from typing import Any, TypeVar
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.domain.briefs import ConversationIntent, EmailJudgement
 from ai_employee.domain.email import EmailCategory
+from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.integrations.llm.openai_compatible import ModelGatewayError
 
 T = TypeVar("T", bound=BaseModel)
@@ -18,10 +20,11 @@ T = TypeVar("T", bound=BaseModel)
 class FakeModelGateway:
     """按 source_id 生成稳定结果，可模拟两次非法 JSON。"""
 
-    def __init__(self, *, scenario: str | None = None) -> None:
+    def __init__(self, *, scenario: str | None = None, metrics: Metrics | None = None) -> None:
         self.scenario = scenario or os.getenv("FAKE_MODEL_SCENARIO", "normal")
         self.calls: list[Sequence[dict[str, str]]] = []
         self._invalid_attempts = 0
+        self._metrics = metrics
 
     async def complete(
         self,
@@ -31,10 +34,16 @@ class FakeModelGateway:
         messages: Sequence[dict[str, str]],
         response_model: type[T],
     ) -> ModelResponse[T]:
+        started = time.monotonic()
         self.calls.append(messages)
         if self.scenario is not None and self.scenario.startswith("invalid"):
             self._invalid_attempts += 1
             if self.scenario == "invalid_twice" or self._invalid_attempts <= 1:
+                if self._metrics is not None:
+                    self._metrics.record_model_schema_repair(model=model_name, outcome="requested")
+                    self._metrics.record_provider_error(
+                        provider="model", error_code="model_invalid_output"
+                    )
                 raise ModelGatewayError("model_invalid_output")
         if response_model is ConversationIntent:
             value: Any = ConversationIntent(
@@ -58,10 +67,18 @@ class FakeModelGateway:
         usage = ModelUsage(output_tokens=1 if self.scenario == "partial" else 0)
         if self.scenario == "partial" and isinstance(value, EmailJudgement):
             value = value.model_copy(update={"reason_codes": ["fake_partial"]})
+        if self._metrics is not None:
+            self._metrics.record_model_response(
+                model=model_name,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                estimated_cost_usd=0,
+                latency_seconds=time.monotonic() - started,
+            )
         return ModelResponse(value=value, usage=usage)
 
 
-def build_model_gateway(settings: Any | None = None) -> Any:
+def build_model_gateway(settings: Any | None = None, *, metrics: Metrics | None = None) -> Any:
     """按显式测试开关选择 Fake 或配置好的真实适配器。
 
     真实适配器只在调用方已经提供配置与 Secret 时构造，本函数不发起请求。
@@ -70,7 +87,7 @@ def build_model_gateway(settings: Any | None = None) -> Any:
     if test_mode is None:
         test_mode = os.getenv("APP_TEST_MODE", "false").lower() == "true"
     if test_mode:
-        return FakeModelGateway()
+        return FakeModelGateway(metrics=metrics)
     if settings is None:
         raise RuntimeError("normal model gateway requires settings")
     from ai_employee.integrations.llm.openai_compatible import OpenAICompatibleGateway
@@ -81,4 +98,5 @@ def build_model_gateway(settings: Any | None = None) -> Any:
         supports_json_schema=settings.model_supports_json_schema,
         input_cost_per_million_usd=settings.model_input_cost_per_million_usd,
         output_cost_per_million_usd=settings.model_output_cost_per_million_usd,
+        metrics=metrics,
     )

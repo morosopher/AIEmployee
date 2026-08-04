@@ -18,6 +18,8 @@ from ai_employee.config import Settings
 from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
+from ai_employee.infrastructure.observability.sync import observe_google_sync
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.google.fake import FakeGmailReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.gmail import GmailAdapter
@@ -36,12 +38,14 @@ class GmailSyncTaskStep:
         cipher: AeadCipher,
         oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
         reader: GmailReader | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """注入进程级资源；每个实际数据库操作仍由短事务 factory 创建。"""
         self._stores = SqlAlchemyGmailSyncRepositoryFactory(session_factory)
         self._cipher = cipher
         self._oauth = oauth
         self._reader = reader
+        self._metrics = metrics
 
     async def execute(self, task: LeasedTask) -> None:
         """解密当前连接 token，在事务外读取 Gmail，并以精确 AAD 加密落库。
@@ -146,8 +150,12 @@ class GmailSyncTaskStep:
             refresh_access_token=refresh_access_token if refresh_token is not None else None,
             mark_expired=mark_expired,
         )
-        await SyncGmailUseCase(cast(GmailSyncStoreFactory, self._stores), self._cipher, adapter).execute(
-            user_id=user_id, connection_id=connection_id
+        await observe_google_sync(
+            metrics=self._metrics,
+            resource="gmail",
+            operation=lambda: SyncGmailUseCase(
+                cast(GmailSyncStoreFactory, self._stores), self._cipher, adapter
+            ).execute(user_id=user_id, connection_id=connection_id),
         )
 
     @staticmethod
@@ -173,17 +181,18 @@ class GmailSyncTaskStep:
 
 
 def build_gmail_sync_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings, metrics: Metrics | None = None
 ) -> GmailSyncTaskStep:
     """从进程配置构造 Gmail durable task step，不向任务载荷泄露任何 Secret。"""
     cipher = AeadCipher.from_file(settings.app_master_key_file)
     if settings.app_test_mode:
         fixture = Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "gmail_initial.json"
-        return GmailSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeGmailReader(fixture))
+        return GmailSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeGmailReader(fixture), metrics=metrics)
     client_secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
     oauth = GoogleOAuthClient(settings.google_client_id, client_secret, settings.google_redirect_uri)
     return GmailSyncTaskStep(
         session_factory=session_factory,
         cipher=cipher,
         oauth=oauth,
+        metrics=metrics,
     )

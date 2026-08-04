@@ -20,6 +20,8 @@ from ai_employee.infrastructure.db.repositories.calendar import (
 )
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
+from ai_employee.infrastructure.observability.sync import observe_google_sync
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.google.calendar import CalendarAdapter
 from ai_employee.integrations.google.fake import FakeCalendarReader, FakeGoogleOAuthClient
@@ -38,12 +40,14 @@ class CalendarSyncTaskStep:
         cipher: AeadCipher,
         oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
         reader: CalendarReader | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """注入进程资源；凭据读取和同步写入始终使用各自短事务。"""
         self._credential_stores = SqlAlchemyGmailSyncRepositoryFactory(session_factory)
         self._stores = SqlAlchemyCalendarSyncRepositoryFactory(session_factory)
         self._cipher, self._oauth = cipher, oauth
         self._reader = reader
+        self._metrics = metrics
 
     async def execute(self, task: LeasedTask) -> None:
         """解密 token，构造只读适配器并把安全 AAD 留在应用/基础设施边界。"""
@@ -132,9 +136,13 @@ class CalendarSyncTaskStep:
             refresh_access_token=refresh_access_token if refresh else None,
             mark_expired=mark_expired,
         )
-        await SyncCalendarUseCase(
-            cast(CalendarSyncStoreFactory, self._stores), self._cipher, adapter
-        ).execute(user_id=user_id, connection_id=connection_id)
+        await observe_google_sync(
+            metrics=self._metrics,
+            resource="calendar",
+            operation=lambda: SyncCalendarUseCase(
+                cast(CalendarSyncStoreFactory, self._stores), self._cipher, adapter
+            ).execute(user_id=user_id, connection_id=connection_id),
+        )
 
     @staticmethod
     def _credential_aad(user_id: UUID, connection_id: UUID, kind: str) -> bytes:
@@ -143,16 +151,16 @@ class CalendarSyncTaskStep:
 
 
 def build_calendar_sync_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings, metrics: Metrics | None = None
 ) -> CalendarSyncTaskStep:
     """从受控配置构造日历任务步骤，不把 secret 放入队列输入。"""
     cipher = AeadCipher.from_file(settings.app_master_key_file)
     if settings.app_test_mode:
         fixture = Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "calendar_initial.json"
-        return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeCalendarReader(fixture))
+        return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeCalendarReader(fixture), metrics=metrics)
     oauth = GoogleOAuthClient(
         settings.google_client_id,
         settings.read_secret_file(settings.google_client_secret_file).get_secret_value(),
         settings.google_redirect_uri,
     )
-    return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=oauth)
+    return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=oauth, metrics=metrics)

@@ -1,10 +1,17 @@
 """提供 API 进程存活状态与外部依赖就绪状态端点。"""
 
-from collections.abc import Callable
-from typing import Literal
+from collections.abc import Awaitable, Callable
+from datetime import date
+from inspect import isawaitable
+from typing import Annotated, Literal
+from uuid import UUID
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel
+
+from ai_employee.api.deps import CurrentSession, get_auth_clock, get_daily_brief_alerts_use_case
+from ai_employee.application.use_cases.auth import Clock
+from ai_employee.application.use_cases.diagnostics import GetDailyBriefOverdueAlertUseCase
 
 
 class HealthResponse(BaseModel):
@@ -29,7 +36,24 @@ class ReadinessResponse(BaseModel):
     dependencies: dict[str, bool]
 
 
-def build_system_router(readiness_probe: Callable[[], dict[str, bool]]) -> APIRouter:
+class SystemAlertResponse(BaseModel):
+    """定义前端轮询使用的最小逾期告警，刻意不含邮件或日程来源内容。"""
+
+    code: Literal["daily_brief_overdue"]
+    severity: Literal["critical"]
+    local_date: date
+    diagnostic_task_id: UUID | None
+
+
+class SystemAlertsResponse(BaseModel):
+    """定义用户范围系统告警列表的稳定 API 容器。"""
+
+    alerts: list[SystemAlertResponse]
+
+
+def build_system_router(
+    readiness_probe: Callable[[], dict[str, bool] | Awaitable[dict[str, bool]]]
+) -> APIRouter:
     """构建可注入依赖探针的系统状态路由。
 
     Args:
@@ -55,7 +79,7 @@ def build_system_router(readiness_probe: Callable[[], dict[str, bool]]) -> APIRo
         response_model=ReadinessResponse,
         responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ReadinessResponse}},
     )
-    def readiness(response: Response) -> ReadinessResponse:
+    async def readiness(request: Request, response: Response) -> ReadinessResponse:
         """执行注入的依赖探针并映射为就绪状态响应。
 
         Args:
@@ -64,11 +88,48 @@ def build_system_router(readiness_probe: Callable[[], dict[str, bool]]) -> APIRo
         Returns:
             总体就绪状态及每项依赖的布尔探测结果组成的类型化响应。
         """
-        dependencies = readiness_probe()
+        probe_result = readiness_probe()
+        dependencies = await probe_result if isawaitable(probe_result) else probe_result
+        metrics = getattr(request.app.state, "metrics", None)
+        if metrics is not None:
+            for dependency, healthy in dependencies.items():
+                metrics.record_dependency_health(dependency=dependency, healthy=healthy)
         ready = all(dependencies.values())
         if not ready:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         readiness_status: Literal["ready", "not_ready"] = "ready" if ready else "not_ready"
         return ReadinessResponse(status=readiness_status, dependencies=dependencies)
+
+    @router.get("/alerts", response_model=SystemAlertsResponse)
+    async def alerts(
+        authenticated: CurrentSession,
+        use_case: Annotated[
+            GetDailyBriefOverdueAlertUseCase, Depends(get_daily_brief_alerts_use_case)
+        ],
+        clock: Annotated[Clock, Depends(get_auth_clock)],
+    ) -> SystemAlertsResponse:
+        """返回当前认证用户的派生逾期简报告警。
+
+        Args:
+            authenticated: 已验证 Cookie 会话，只从其中读取用户 UUID。
+            use_case: 已装配的用户隔离告警用例，不由路由访问数据库。
+            clock: 可替换的 UTC 时钟，避免请求进程依赖宿主机本地日期。
+
+        Returns:
+            空列表或一条 critical ``daily_brief_overdue`` 告警；不会返回来源正文。
+        """
+        alert = await use_case.execute(user_id=authenticated.user.id, now=clock.now())
+        if alert is None:
+            return SystemAlertsResponse(alerts=[])
+        return SystemAlertsResponse(
+            alerts=[
+                SystemAlertResponse(
+                    code="daily_brief_overdue",
+                    severity="critical",
+                    local_date=alert.local_date,
+                    diagnostic_task_id=alert.diagnostic_task_id,
+                )
+            ]
+        )
 
     return router

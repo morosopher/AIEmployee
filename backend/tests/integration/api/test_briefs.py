@@ -5,11 +5,12 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import AuthenticatedApiClients
 
 from ai_employee.infrastructure.db.models.briefs import DailyBriefItemModel, DailyBriefModel
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+
+from .conftest import AuthenticatedApiClients
 
 
 async def _insert_brief(

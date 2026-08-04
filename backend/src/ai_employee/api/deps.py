@@ -1,5 +1,6 @@
 """组合认证应用端口、请求依赖与 RFC 9457 Problem Details 映射。"""
 
+import logging
 from datetime import UTC, datetime
 from typing import Annotated, cast
 from uuid import uuid4
@@ -25,9 +26,19 @@ from ai_employee.application.use_cases.auth import (
     ValidateCsrfUseCase,
 )
 from ai_employee.config import Settings
+from ai_employee.domain.errors import (
+    DomainError,
+    InternalInvariantError,
+    ModelOutputError,
+    PermanentProviderError,
+    StateConflictError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.domain.identity import AuthenticatedSession
 
 CSRF_COOKIE_NAME = "ai_employee_csrf"
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProblemDetails(BaseModel):
@@ -56,9 +67,7 @@ class ApiProblem(Exception):
 
 def _problem_response(request: Request, problem_error: ApiProblem) -> JSONResponse:
     """生成统一 Problem Details 响应并为当前请求分配稳定 Trace ID。"""
-    existing_trace_id = getattr(request.state, "trace_id", None)
-    trace_id = existing_trace_id if isinstance(existing_trace_id, str) else uuid4().hex
-    request.state.trace_id = trace_id
+    trace_id = _request_trace_id(request)
     problem = ProblemDetails(
         type=(f"https://ai-employee.local/problems/{problem_error.error_code.replace('_', '-')}"),
         title=problem_error.title,
@@ -68,11 +77,63 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
         error_code=problem_error.error_code,
         trace_id=trace_id,
     )
+    metrics = getattr(request.app.state, "metrics", None)
+    if metrics is not None:
+        # 标签只使用模板路由和稳定错误码，绝不把用户、query 或异常消息送入 Prometheus。
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", request.url.path)
+        metrics.api_errors.labels(route=route_path, error_code=problem_error.error_code).inc()
+    headers: dict[str, str] = {}
+    if isinstance(problem_error, _TransientApiProblem) and problem_error.retry_after is not None:
+        headers["Retry-After"] = str(int(problem_error.retry_after))
     return JSONResponse(
         status_code=problem_error.status_code,
         content=problem.model_dump(mode="json"),
         media_type="application/problem+json",
+        headers=headers,
     )
+
+
+def _request_trace_id(request: Request) -> str:
+    """读取或创建仅用于客户端问题响应与内部日志关联的随机 trace ID。"""
+    existing_trace_id = getattr(request.state, "trace_id", None)
+    trace_id = existing_trace_id if isinstance(existing_trace_id, str) else uuid4().hex
+    request.state.trace_id = trace_id
+    return trace_id
+
+
+class _TransientApiProblem(ApiProblem):
+    """保存已规范化 Retry-After 的内部 Problem 表示，避免暴露供应商错误文本。"""
+
+    def __init__(self, error: TransientProviderError) -> None:
+        """把临时领域错误收敛为 503 及可选秒级重试提示。"""
+        super().__init__(503, error.error_code, "Service temporarily unavailable", "Retry later.")
+        self.retry_after = error.retry_after
+
+
+def _domain_problem(error: DomainError) -> ApiProblem:
+    """按公开领域类别创建 RFC 9457 Problem，永不回显领域 message 或 metadata。"""
+    if isinstance(error, UserActionRequiredError):
+        return ApiProblem(403, error.error_code, "User action required", "Complete the required action.")
+    if isinstance(error, TransientProviderError):
+        return _TransientApiProblem(error)
+    if isinstance(error, (PermanentProviderError, ModelOutputError)):
+        return ApiProblem(422, error.error_code, "Request cannot be completed", "The request cannot be completed.")
+    if isinstance(error, StateConflictError):
+        return ApiProblem(409, error.error_code, "State conflict", "The request conflicts with current state.")
+    if isinstance(error, InternalInvariantError):
+        return ApiProblem(500, error.error_code, "Internal server error", "An unexpected error occurred.")
+    return ApiProblem(500, "internal_error", "Internal server error", "An unexpected error occurred.")
+
+
+async def handle_domain_error(request: Request, exception: Exception) -> JSONResponse:
+    """把稳定领域错误映射为不含原文的 RFC 9457 响应。
+
+    未知 ``DomainError`` 被故意降级为 generic 500，防止新子类在未审查前意外公开语义。
+    """
+    if not isinstance(exception, DomainError):
+        raise exception
+    return _problem_response(request, _domain_problem(exception))
 
 
 async def handle_api_problem(request: Request, exception: Exception) -> JSONResponse:
@@ -115,6 +176,34 @@ async def handle_request_validation_error(request: Request, exception: Exception
             "request_validation_failed",
             "Request validation failed",
             "The request did not match the required schema.",
+        ),
+    )
+
+
+async def handle_unexpected_error(request: Request, exception: Exception) -> JSONResponse:
+    """把未分类异常收敛为不含内部细节的 RFC 9457 500 响应。
+
+    Args:
+        request: 当前 HTTP 请求，仅用于生成路径与稳定 trace ID。
+        exception: 未被业务层分类的异常；仅作为 logging 的 ``exc_info`` 来源，不能序列化消息、
+            参数、请求头、Cookie 或正文。
+
+    Returns:
+        固定 ``internal_error`` 问题响应，客户端可使用 trace ID 向运维侧关联日志。
+    """
+    trace_id = _request_trace_id(request)
+    _LOGGER.exception(
+        "unexpected_api_error",
+        exc_info=exception,
+        extra={"trace_id": trace_id, "error_code": "internal_error"},
+    )
+    return _problem_response(
+        request,
+        ApiProblem(
+            500,
+            "internal_error",
+            "Internal server error",
+            "An unexpected error occurred. Use the trace_id when contacting support.",
         ),
     )
 
@@ -210,6 +299,20 @@ def get_retry_task_use_case(request: Request):
 def get_approval_decision_use_case(request: Request):
     """从组合根取得冻结审批决定用例。"""
     return request.app.state.approval_decision_use_case
+
+
+def get_daily_brief_alerts_use_case(request: Request):
+    """从组合根取得用户范围的逾期简报告警用例。
+
+    路由只通过该依赖获取应用层端口，不能直接构造 SQL 查询或接触其他用户的数据。
+
+    Args:
+        request: 当前 FastAPI 请求，用于读取组合根预先注入的用例实例。
+
+    Returns:
+        只接受认证用户 UUID 与显式时钟的逾期告警用例。
+    """
+    return request.app.state.daily_brief_alerts_use_case
 
 
 def get_login_use_case(

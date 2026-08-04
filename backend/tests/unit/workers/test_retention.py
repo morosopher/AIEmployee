@@ -1,0 +1,198 @@
+"""验证保留清理的配置安全边界。"""
+
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+import pytest
+
+from ai_employee.config import get_settings
+from ai_employee.infrastructure.db.models.briefs import ConversationModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.workers.retention import RetentionCleanupWorker, build_retention_cleanup_worker
+
+
+class _NoopSession:
+    """提供旧实现仍会进入的最小事务接口，避免测试依赖 SQLAlchemy。"""
+
+    async def execute(self, statement: object) -> None:
+        """接受清理 SQL；本测试只验证 Worker 的策略编排顺序。"""
+        del statement
+
+    def add(self, item: object) -> None:
+        """接受审计对象；内容不属于本编排测试的断言边界。"""
+        del item
+
+
+class _NoopSessionFactory:
+    """返回可重复进入的空异步事务，隔离策略测试与数据库 I/O。"""
+
+    def begin(self) -> "_NoopSessionFactory":
+        """返回自身作为短事务上下文。"""
+        return self
+
+    async def __aenter__(self) -> _NoopSession:
+        """进入合成事务。"""
+        return _NoopSession()
+
+    async def __aexit__(self, *args: object) -> None:
+        """退出合成事务；测试不模拟提交错误。"""
+        del args
+
+
+class _RecordingRetentionWorker(RetentionCleanupWorker):
+    """记录每个用户保留阶段，证明历史清理不会被遗漏或排到审计之后。"""
+
+    def __init__(self) -> None:
+        """使用空工厂并初始化阶段记录。"""
+        super().__init__(_NoopSessionFactory())  # type: ignore[arg-type]
+        self.calls: list[str] = []
+
+    async def _scrub_email_bodies(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """记录正文擦除阶段。"""
+        del user_id, cutoff, batch_size
+        self.calls.append("body")
+
+    async def _delete_source_metadata(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """记录来源元数据阶段。"""
+        del user_id, cutoff, batch_size
+        self.calls.append("source")
+
+    async def _delete_workspace_history(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """记录工作区历史与终态任务图清理阶段。"""
+        del user_id, cutoff, batch_size
+        self.calls.append("workspace")
+
+    async def _clean_disconnected_credentials(self, user_id: UUID, batch_size: int) -> None:
+        """记录断开凭据及同步游标处理阶段。"""
+        del user_id, batch_size
+        self.calls.append("credentials")
+
+    async def _append_cleanup_audit(self, user_id: UUID, now: datetime) -> None:
+        """记录必须最后写入的本轮无内容审计事实。"""
+        del user_id, now
+        self.calls.append("audit")
+
+
+def test_production_retention_worker_rejects_missing_dedicated_dsn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """生产环境缺少 retention 专用连接串时不得静默使用普通应用角色。"""
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("RETENTION_DATABASE_URL_FILE", str(tmp_path / "missing"))
+    get_settings.cache_clear()
+    build_retention_cleanup_worker.cache_clear()
+
+    with pytest.raises(RuntimeError, match="RETENTION_DATABASE_URL_FILE"):
+        build_retention_cleanup_worker()
+
+    get_settings.cache_clear()
+    build_retention_cleanup_worker.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_workspace_history_and_disconnected_credentials_are_processed_before_run_audit() -> None:
+    """保留清理必须先删除到期工作区图、重置断开同步状态，最后才写当前轮审计。"""
+    worker = _RecordingRetentionWorker()
+    user = SimpleNamespace(
+        id=uuid4(),
+        email_body_retention_days=30,
+        source_metadata_retention_days=180,
+        workspace_history_retention_days=365,
+    )
+
+    await worker._clean_user(user, now=datetime(2026, 8, 4, tzinfo=UTC), batch_size=10)
+
+    assert worker.calls == ["body", "source", "workspace", "credentials", "audit"]
+
+
+class _AuditPreservingRetentionWorker(RetentionCleanupWorker):
+    """记录工作区清理选择的表，避免测试依赖真实 PostgreSQL。"""
+
+    def __init__(self) -> None:
+        """使用空会话工厂并保存被请求删除的 ORM 表。"""
+        super().__init__(_NoopSessionFactory())  # type: ignore[arg-type]
+        self.deleted_models: list[type[object]] = []
+
+    async def _delete_bounded(
+        self,
+        model: type[object],
+        user_id: UUID,
+        timestamp: object,
+        cutoff: datetime,
+        batch_size: int,
+    ) -> None:
+        """仅记录调用，隔离本测试与 SQLAlchemy 查询构造。"""
+        del user_id, timestamp, cutoff, batch_size
+        self.deleted_models.append(model)
+
+    async def _delete_terminal_task_graph(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """阻止进入真实任务图 SQL，仅验证上层表选择边界。"""
+        del user_id, cutoff, batch_size
+
+    async def _delete_empty_conversations(self, user_id: UUID, batch_size: int) -> None:
+        """阻止进入真实会话 SQL，子类可覆盖以观察该安全清理路径。"""
+        del user_id, batch_size
+
+
+@pytest.mark.asyncio
+async def test_workspace_retention_never_deletes_append_only_audit_events() -> None:
+    """工作区保留只能清理用户内容与终态任务图，审计事实必须永久保留。"""
+    worker = _AuditPreservingRetentionWorker()
+
+    await worker._delete_workspace_history(
+        uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10
+    )
+
+    assert AuditEventModel not in worker.deleted_models
+
+
+class _ConversationSafeRetentionWorker(_AuditPreservingRetentionWorker):
+    """记录会话清理路径，证明新消息不会被旧会话级联删除。"""
+
+    def __init__(self) -> None:
+        """初始化空调用记录。"""
+        super().__init__()
+        self.empty_conversation_calls = 0
+
+    async def _delete_empty_conversations(self, user_id: UUID, batch_size: int) -> None:
+        """记录仅删除已无消息的会话路径。"""
+        del user_id, batch_size
+        self.empty_conversation_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_retention_only_removes_empty_conversations() -> None:
+    """旧会话含有新消息时必须保留，不能由父行级联删除仍有效的消息。"""
+    worker = _ConversationSafeRetentionWorker()
+
+    await worker._delete_workspace_history(
+        uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10
+    )
+
+    assert ConversationModel not in worker.deleted_models
+    assert worker.empty_conversation_calls == 1
+
+
+def test_retention_database_role_cannot_update_append_only_audit_events() -> None:
+    """专用角色可为全量删除回收旧审计，但不得修改既有审计内容。"""
+    script = (
+        Path(__file__).resolve().parents[4] / "scripts" / "init-db-roles.sh"
+    ).read_text(encoding="utf-8")
+
+    assert re.search(
+        r"GRANT\\s+[^;]*UPDATE[^;]*ON\\s+[^;]*audit_events[^;]*ai_employee_retention",
+        script,
+        flags=re.DOTALL,
+    ) is None
+    assert "GRANT SELECT, INSERT, DELETE ON audit_events TO ai_employee_retention;" in script

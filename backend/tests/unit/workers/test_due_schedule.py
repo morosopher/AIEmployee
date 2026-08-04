@@ -17,12 +17,15 @@ from ai_employee.infrastructure.queue.scheduler import scheduler
 from ai_employee.workers.schedules import (
     daily_brief_idempotency_key,
     dispatch_due_briefs,
+    dispatch_google_incremental_syncs,
+    dispatch_overdue_brief_diagnostics,
     expire_approvals,
     expire_sessions,
     is_daily_brief_due,
     recover_approval_checkpoints,
     recover_task_retries,
     relay_outbox,
+    run_retention_cleanup,
     scheduled_daily_brief_instant,
 )
 
@@ -170,6 +173,35 @@ def test_fixed_jobs_are_registered_with_stable_schedule_ids() -> None:
     assert scheduler.broker is broker
     assert len(scheduler.sources) == 1
     assert isinstance(scheduler.sources[0], LabelScheduleSource)
+
+
+def test_task_18_scheduler_contract_contains_exact_fixed_job_ids() -> None:
+    """任务 18 的固定扫描入口必须完整且无遗留标签，避免重复调度同一维护操作。"""
+    scheduled_tasks = (
+        relay_outbox,
+        recover_task_retries,
+        dispatch_due_briefs,
+        dispatch_google_incremental_syncs,
+        expire_sessions,
+        expire_approvals,
+        dispatch_overdue_brief_diagnostics,
+        run_retention_cleanup,
+    )
+
+    assert {
+        schedule["schedule_id"]
+        for task in scheduled_tasks
+        for schedule in task.labels["schedule"]
+    } == {
+        "outbox-relay",
+        "recover-task-retries",
+        "due-daily-briefs",
+        "expire-sessions",
+        "expire-approvals",
+        "google-incremental-sync",
+        "brief-overdue-diagnostics",
+        "retention-cleanup",
+    }
 
 
 @pytest.mark.asyncio

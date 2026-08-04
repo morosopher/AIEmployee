@@ -21,6 +21,7 @@ from ai_employee.infrastructure.db.models.briefs import (
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.integrations.llm.fake import FakeModelGateway, build_model_gateway
 
 
@@ -117,14 +118,14 @@ class ConversationTaskStep:
 
 
 def build_conversation_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None, metrics: Metrics | None = None
 ) -> ConversationTaskStep:
     """构造供 DurableTaskRunner 注册的实际会话回复节点。"""
     if settings is None:
         return ConversationTaskStep(session_factory)
     return ConversationTaskStep(
         session_factory,
-        model_gateway=build_model_gateway(settings),
+        model_gateway=build_model_gateway(settings, metrics=metrics),
         model_name=settings.model_name,
         model_redaction_patterns=tuple(settings.model_redaction_patterns),
     )

@@ -20,6 +20,7 @@ from ai_employee.domain.tasks import JsonValue
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
+from ai_employee.infrastructure.observability.metrics import Metrics
 
 HEARTBEAT_SECONDS = 15
 REDIS_OPERATION_TIMEOUT_SECONDS = 1.0
@@ -270,6 +271,7 @@ class TaskEventStream:
         *,
         redis_url: str | None = None,
         subscription_factory: Callable[[UUID], TaskEventSubscription] | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """注入 PostgreSQL 事实库和可替换通知源。
 
@@ -283,6 +285,7 @@ class TaskEventStream:
             self._subscription_factory = lambda task_id: RedisTaskEventSubscription(redis_url, task_id)
         else:
             self._subscription_factory = lambda _: PollingTaskEventSubscription()
+        self._metrics = metrics
 
     async def events(
         self, *, task_id: UUID, user_id: UUID, last_event_id: int | None
@@ -290,6 +293,8 @@ class TaskEventStream:
         """产出重放、缺口快照、通知唤醒和 15 秒 PostgreSQL 心跳恢复事件。"""
         cursor = max(last_event_id or 0, 0)
         subscription = self._subscription_factory(task_id)
+        if self._metrics is not None:
+            self._metrics.record_sse_connection(connected=True)
         try:
             try:
                 await subscription.open()
@@ -339,6 +344,8 @@ class TaskEventStream:
                     yield ServerSentEvent(event="heartbeat", data={})
         finally:
             await subscription.aclose()
+            if self._metrics is not None:
+                self._metrics.record_sse_connection(connected=False)
 
     def response(
         self, *, task_id: UUID, user_id: UUID, last_event_id: int | None

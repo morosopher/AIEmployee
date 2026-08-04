@@ -184,6 +184,80 @@ async def test_fake_write_worker_disposes_every_message_scoped_session_factory(
 
 
 @pytest.mark.asyncio
+async def test_fake_write_and_kind_lookup_runners_receive_worker_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fake-write 和分类读取失败路径也必须注入同一安全指标端口。
+
+    两个 Runner 都绕过 ``build_task_runner`` 的缓存组合根；遗漏该参数会让高风险审批任务
+    与数据库异常路径丢失终态、重试和排队时间指标。
+    """
+    task_id = uuid4()
+    captured_metrics: list[object | None] = []
+    class WorkerMetrics:
+        """满足入口心跳与 Runner 注入所需的最小安全指标端口。"""
+
+        def record_heartbeat(self, *, process: str, age_seconds: float) -> None:
+            """忽略本测试不关注的进程心跳写入。"""
+            del process, age_seconds
+
+    worker_metrics = WorkerMetrics()
+
+    class Factory:
+        """提供入口 finally 所需的最小释放协议。"""
+
+        async def dispose(self) -> None:
+            """模拟消息生命周期结束。"""
+
+    class FakeWriteStore:
+        """令入口选择 fake-write 专用 Runner。"""
+
+        def __init__(self, _factory: Factory) -> None:
+            """接受组合根注入的工厂。"""
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> object:
+            """返回只含受控 kind 的快照。"""
+            del task_id
+            return type("FakeTask", (), {"kind": "fake_write"})()
+
+    class FailingLookupStore:
+        """令入口构造分类读取异常的安全失败 Runner。"""
+
+        def __init__(self, _factory: Factory) -> None:
+            """接受组合根注入的工厂。"""
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> None:
+            """模拟数据库分类读取失败。"""
+            del task_id
+            raise OSError("synthetic database failure")
+
+    class Runner:
+        """捕获构造参数而不触发真实耐久执行。"""
+
+        def __init__(self, **kwargs: object) -> None:
+            """记录受控的 metrics 端口引用。"""
+            captured_metrics.append(kwargs.get("metrics"))
+
+        async def run(self, *_args: object, **_kwargs: object) -> bool:
+            """模拟已处理的持久任务。"""
+            return True
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", lambda *_args, **_kwargs: Factory())
+    monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
+    monkeypatch.setattr(execute_task_module, "_worker_metrics", worker_metrics)
+    async def skip_stuck_probe(**_kwargs: object) -> None:
+        """组合测试不创建数据库时替代只读指标探针。"""
+
+    monkeypatch.setattr(execute_task_module, "refresh_stuck_task_metrics", skip_stuck_probe)
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", FakeWriteStore)
+    await execute_task_module.execute_task.original_func(str(task_id))
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", FailingLookupStore)
+    await execute_task_module.execute_task.original_func(str(task_id))
+
+    assert captured_metrics == [worker_metrics, worker_metrics]
+
+
+@pytest.mark.asyncio
 async def test_fake_write_graph_reuses_worker_message_session_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -464,6 +538,55 @@ def _runner(
         max_transient_retries=3,
         resolve_steps=lambda task: steps,
     )
+
+
+class RecordingTaskMetrics:
+    """记录 application 层安全指标端口调用，避免单元测试依赖 Prometheus。"""
+
+    def __init__(self) -> None:
+        """初始化所有聚合记录列表。"""
+        self.outcomes: list[tuple[str, str, float]] = []
+        self.retries: list[str] = []
+        self.queue_waits: list[tuple[str, float]] = []
+
+    def record_task_outcome(self, *, kind: str, status: str, duration_seconds: float) -> None:
+        """记录终态指标调用。"""
+        self.outcomes.append((kind, status, duration_seconds))
+
+    def record_task_retry(self, *, kind: str) -> None:
+        """记录重试指标调用。"""
+        self.retries.append(kind)
+
+    def record_queue_wait(self, *, kind: str, seconds: float) -> None:
+        """记录首次排队等待调用。"""
+        self.queue_waits.append((kind, seconds))
+
+
+@pytest.mark.asyncio
+async def test_runner_records_terminal_outcome_through_safe_metrics_port() -> None:
+    """Runner 成功 CAS 后才记录终态，且端口不接受任务正文。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    clock = MutableClock(now)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+    metrics = RecordingTaskMetrics()
+
+    async def complete() -> None:
+        """模拟不产生外部副作用的成功任务节点。"""
+
+    runner = DurableTaskRunner(
+        store=store,
+        clock=clock,
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=10,
+        max_transient_retries=3,
+        resolve_steps=lambda _task: (CallableStep("complete", complete),),
+        metrics=metrics,
+    )
+
+    assert await runner.run(task.task_id)
+    assert metrics.outcomes == [("daily_brief", "succeeded", 0.0)]
 
 
 @pytest.mark.asyncio

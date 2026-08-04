@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from ai_employee.application.ports.observability import TaskMetricsObserver
 from ai_employee.domain.errors import DomainError, TransientProviderError
 from ai_employee.domain.tasks import JsonValue, TaskStatus
 
@@ -26,6 +27,7 @@ class LeasedTask:
     kind: str
     input_payload: dict[str, JsonValue]
     started_at: datetime
+    created_at: datetime | None = None
     user_id: UUID | None = None
     attempt_count: int = 1
     lease_owner: str | None = None
@@ -149,6 +151,7 @@ class DurableTaskRunner:
         task_step_timeout_seconds: float,
         max_transient_retries: int,
         resolve_steps: Callable[[LeasedTask], Sequence[TaskExecutionStep]],
+        metrics: TaskMetricsObserver | None = None,
     ) -> None:
         """注入持久化、确定性时钟、预算与任务节点解析器。
 
@@ -160,6 +163,7 @@ class DurableTaskRunner:
             task_step_timeout_seconds: 每个节点独立预算。
             max_transient_retries: 首次执行之后允许自动重试的最大次数。
             resolve_steps: 按任务快照解析可重入节点序列的函数。
+            metrics: 可选聚合指标端口；不得接收任务载荷或个人数据。
 
         Raises:
             ValueError: 租约或超时参数不是正数，或单步预算超过任务总预算。
@@ -181,6 +185,7 @@ class DurableTaskRunner:
         self._task_step_timeout_seconds = task_step_timeout_seconds
         self._max_transient_retries = max_transient_retries
         self._resolve_steps = resolve_steps
+        self._metrics = metrics
 
     async def run(
         self,
@@ -238,6 +243,9 @@ class DurableTaskRunner:
             return await self._fail_internal(task_id=task_id, lease_owner=owner)
         if leased is None:
             return False
+
+        if leased.created_at is not None:
+            self._record_queue_wait(leased, now=now)
 
         started_at = utc_instant(leased.started_at, field="started_at")
         # acquisition 自首次写入 started_at 起也消耗总预算；读取新鲜时钟而非复用查询前 now。
@@ -297,7 +305,7 @@ class DurableTaskRunner:
                 if error.retry_after is not None
                 else retry_delay
             )
-            return await self._store.schedule_retry(
+            scheduled = await self._store.schedule_retry(
                 task_id=leased.task_id,
                 lease_owner=owner,
                 scheduled_at=scheduled_at,
@@ -305,6 +313,9 @@ class DurableTaskRunner:
                 error_code=error.error_code,
                 attempt_count=leased.attempt_count,
             )
+            if scheduled and self._metrics is not None:
+                self._metrics.record_task_retry(kind=leased.kind)
+            return scheduled
         except DomainError as error:
             return await self._finish(
                 leased,
@@ -370,7 +381,7 @@ class DurableTaskRunner:
         finished_at = utc_instant(self._clock(), field="clock")
         # 只有 RETRY_SCHEDULED 需要此新恢复事实，避免让终态与既有端口调用承担无关字段。
         if retry_recovery_at is not None:
-            return await self._store.finish(
+            completed = await self._store.finish(
                 task_id=task.task_id,
                 lease_owner=lease_owner,
                 status=status,
@@ -378,12 +389,35 @@ class DurableTaskRunner:
                 error_code=error_code,
                 retry_recovery_at=retry_recovery_at,
             )
-        return await self._store.finish(
-            task_id=task.task_id,
-            lease_owner=lease_owner,
-            status=status,
-            finished_at=finished_at,
-            error_code=error_code,
+        else:
+            completed = await self._store.finish(
+                task_id=task.task_id,
+                lease_owner=lease_owner,
+                status=status,
+                finished_at=finished_at,
+                error_code=error_code,
+            )
+        if completed and self._metrics is not None:
+            started_at = utc_instant(task.started_at, field="started_at")
+            self._metrics.record_task_outcome(
+                kind=task.kind,
+                status=status.value,
+                duration_seconds=(finished_at - started_at).total_seconds(),
+            )
+        return completed
+
+    def _record_queue_wait(self, task: LeasedTask, *, now: datetime) -> None:
+        """仅首次执行时记录从事实创建到获取租约的等待秒数。
+
+        重试沿用 ``started_at``，但每次队列重投不应再次计入首次排队时延；因此只在
+        ``attempt_count == 1`` 时报告。时间字段均来自 PostgreSQL，不使用消息到达时间。
+        """
+        if task.attempt_count != 1 or self._metrics is None or task.created_at is None:
+            return
+        created_at = utc_instant(task.created_at, field="created_at")
+        self._metrics.record_queue_wait(
+            kind=task.kind,
+            seconds=(now - created_at).total_seconds(),
         )
 
     async def _fail_internal(self, *, task_id: UUID, lease_owner: str) -> bool:
