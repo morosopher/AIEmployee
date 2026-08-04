@@ -16,6 +16,8 @@ export const useAuthStore = defineStore('auth', {
     isAuthenticated: (state): boolean => state.user !== null,
   },
   actions: {
+    /** 清除内存中的认证投影，服务端撤销当前会话后调用。 */
+    clear(): void { this.user = null; this.resolved = true; this.error = null },
     /**
      * 从持久 Cookie 会话恢复用户，401 是正常的未登录分支而非页面错误。
      *

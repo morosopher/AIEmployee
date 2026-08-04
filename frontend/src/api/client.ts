@@ -162,6 +162,11 @@ export function retryTask(
   )
 }
 
+/** 创建建议任务，所有动作仍由服务端审批协议约束。 */
+export function createTask(kind: string, input_payload: Record<string, unknown> = {}): Promise<{ task_id: string; status: string }> {
+  return requestJson('/tasks', (value) => value as { task_id: string; status: string }, { method: 'POST', body: JSON.stringify({ kind, input_payload }) })
+}
+
 /**
  * 收窄认证响应，避免未经验证的 API JSON 进入认证状态。
  *
