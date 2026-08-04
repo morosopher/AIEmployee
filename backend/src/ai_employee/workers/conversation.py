@@ -52,6 +52,17 @@ class ConversationTaskStep:
         if not isinstance(raw_conversation_id, str) or not isinstance(raw_content, str):
             raise TypeError("conversation.respond requires conversation_id and content")
         conversation_id = UUID(raw_conversation_id)
+        # 至少一次重复投递先在数据库短路，绝不在已完成任务上再次调用模型。
+        async with self._session_factory() as session:
+            existing = await session.scalar(
+                select(MessageModel.id).where(
+                    MessageModel.user_id == task.user_id,
+                    MessageModel.task_id == task.task_id,
+                    MessageModel.role == "assistant",
+                )
+            )
+        if existing is not None:
+            return
         deterministic = classify_conversation_intent(raw_content)
         intent = deterministic["intent"]
         invocation_metadata: list[dict[str, Any]] = []

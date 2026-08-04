@@ -15,6 +15,7 @@ from ai_employee.application.use_cases.briefs import PersistDailyBriefUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.briefs import DailyBriefContent
+from ai_employee.infrastructure.db.models.briefs import DailyBriefModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
@@ -56,6 +57,16 @@ class GenerateBriefTaskStep:
         """生成当日简报；无可用来源由 Graph 写稳定失败，不伪造成功。"""
         if task.user_id is None:
             raise ValueError("daily_brief requires user_id")
+        # 重放任务已有简报时必须在任何 Graph/模型调用前返回，避免遗漏调用审计。
+        async with self._session_factory() as session:
+            existing = await session.scalar(
+                select(DailyBriefModel.id).where(
+                    DailyBriefModel.user_id == task.user_id,
+                    DailyBriefModel.task_id == task.task_id,
+                )
+            )
+        if existing is not None:
+            return
         cutoff = self._cutoff(task.input_payload.get("source_cutoff"))
         async with self._session_factory() as session:
             user = await session.get(UserModel, task.user_id)
