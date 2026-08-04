@@ -1,5 +1,6 @@
 """构建每日简报 LangGraph，节点边界便于 checkpoint 恢复。"""
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
 from ai_employee.agents.daily_brief.nodes import (
@@ -13,8 +14,8 @@ from ai_employee.agents.daily_brief.nodes import (
 from ai_employee.agents.daily_brief.state import DailyBriefState
 
 
-def build_daily_brief_graph():
-    """返回编译后的每日简报图。"""
+def build_daily_brief_graph(*, checkpointer: BaseCheckpointSaver | None = None):
+    """返回编译后的每日简报图，可选注入 PostgreSQL 等持久 checkpoint。"""
     graph = StateGraph(DailyBriefState)
     graph.add_node("load_sources", load_sources)
     graph.add_node("apply_deterministic_rules", apply_deterministic_rules)
@@ -29,4 +30,4 @@ def build_daily_brief_graph():
     graph.add_edge("detect_calendar_conflicts", "compose_structured_brief")
     graph.add_edge("compose_structured_brief", "validate_and_render")
     graph.add_edge("validate_and_render", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

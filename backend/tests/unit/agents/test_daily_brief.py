@@ -154,3 +154,31 @@ async def test_mail_model_input_is_deduplicated_and_has_safe_facts() -> None:
     assert len(fake.calls) == 1
     assert fake.calls[0][0]["content"] == "daily_brief_v1; locale=zh-CN; only supplied facts"
     assert "secret" not in str(fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_mail_model_input_redacts_builtin_and_configured_values() -> None:
+    fake = FakeModelGateway()
+    await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [
+                {
+                    "thread_id": "safe-id",
+                    "sender": "api_key=private-value",
+                    "subject": "Bearer token-value 123456",
+                    "summary": "CUSTOM_SECRET",
+                }
+            ],
+            "calendar_events": [],
+            "model_gateway": fake,
+            "model_redaction_patterns": ["CUSTOM_SECRET"],
+        }
+    )
+    sent = str(fake.calls)
+    assert (
+        "private-value" not in sent
+        and "token-value" not in sent
+        and "123456" not in sent
+        and "CUSTOM_SECRET" not in sent
+    )
+    assert "safe-id" in sent

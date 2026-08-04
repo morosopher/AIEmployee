@@ -102,11 +102,19 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
             if thread_id in classified or thread_id in processed_thread_ids:
                 continue
             processed_thread_ids.add(thread_id)
+            # 线程 ID 是内部稳定来源键，绝不能被脱敏替换；其余可变供应商文本在本地清洗。
+            patterns = tuple(state.get("model_redaction_patterns", ()))
             facts = {
                 "thread_id": thread_id,
-                "subject": thread.get("subject", ""),
-                "sender": thread.get("sender", ""),
-                "summary": thread.get("summary", ""),
+                "subject": redact_for_model(
+                    thread.get("subject", ""), configured_patterns=patterns
+                ).text,
+                "sender": redact_for_model(
+                    thread.get("sender", ""), configured_patterns=patterns
+                ).text,
+                "summary": redact_for_model(
+                    thread.get("summary", ""), configured_patterns=patterns
+                ).text,
                 "known_urgency": None,
             }
             try:

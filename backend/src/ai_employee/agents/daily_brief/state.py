@@ -19,3 +19,4 @@ class DailyBriefState(TypedDict, total=False):
     step_events: list[dict[str, Any]]
     model_gateway: Any
     task_step_event_sink: Any
+    model_redaction_patterns: list[str]
