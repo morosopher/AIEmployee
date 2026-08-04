@@ -60,10 +60,7 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
     trace_id = existing_trace_id if isinstance(existing_trace_id, str) else uuid4().hex
     request.state.trace_id = trace_id
     problem = ProblemDetails(
-        type=(
-            "https://ai-employee.local/problems/"
-            f"{problem_error.error_code.replace('_', '-')}"
-        ),
+        type=(f"https://ai-employee.local/problems/{problem_error.error_code.replace('_', '-')}"),
         title=problem_error.title,
         status=problem_error.status_code,
         detail=problem_error.detail,
@@ -163,6 +160,29 @@ def get_password_verifier(request: Request) -> PasswordVerifier:
 def get_create_task_use_case(request: Request):
     """从组合根取得创建任务用例，路由不接触 ORM 或队列。"""
     return request.app.state.create_task_use_case
+
+
+def get_connections_use_case(request: Request):
+    """按当前受控 Secret 和数据库工厂装配 Google 连接用例。
+
+    加密主密钥与 Google client secret 只在请求装配时从挂载文件读取，不存入应用 state，
+    因而异常页面、调试工具和测试替身都无法通过 state 意外取得敏感原文。
+    """
+    from ai_employee.application.use_cases.connections import GoogleConnectionsUseCase
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+    from ai_employee.integrations.google.oauth import GoogleOAuthClient
+
+    settings = get_auth_settings(request)
+    cipher = AeadCipher.from_file(settings.app_master_key_file)
+    secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
+    return GoogleConnectionsUseCase(
+        request.app.state.connections_store_factory,
+        cipher,
+        GoogleOAuthClient(settings.google_client_id, secret, settings.google_redirect_uri),
+        get_auth_clock(request),
+        settings.google_client_id,
+        settings.google_redirect_uri,
+    )
 
 
 def get_get_task_use_case(request: Request):
