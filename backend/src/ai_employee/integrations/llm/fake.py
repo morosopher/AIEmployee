@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.domain.briefs import ConversationIntent, EmailJudgement
+from ai_employee.domain.email import EmailCategory
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -46,7 +47,7 @@ class FakeModelGateway:
                 pass
             value = EmailJudgement(
                 thread_id=source,
-                category="other",
+                category=EmailCategory.OTHER,
                 urgency="normal",
                 confidence=1,
                 reason_codes=["fake_deterministic"],
