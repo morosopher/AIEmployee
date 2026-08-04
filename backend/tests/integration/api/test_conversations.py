@@ -11,6 +11,7 @@ from ai_employee.application.use_cases.conversations import UNSUPPORTED_RESPONSE
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, MessageModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.conversation import ConversationTaskStep
 
 
@@ -72,6 +73,36 @@ async def test_worker_handles_supported_and_unsupported_intents_without_provider
     assert replies[1].content_markdown == "# Latest synthetic brief"
     assert replies[2].content_markdown == UNSUPPORTED_RESPONSE
     assert generated_count == 2
+
+
+@pytest.mark.asyncio
+async def test_replayed_ambiguous_conversation_skips_model_and_duplicate_reply(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """同一会话任务重放必须在网关调用前短路，且只保留一条 assistant 回复。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    async with clients.session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            idempotency_key="conversation-ambiguous-replay",
+            input_payload={"conversation_id": str(conversation_id), "content": "what should I focus on"},
+        )
+        session.add(task)
+        await session.flush()
+    gateway = FakeModelGateway()
+    step = ConversationTaskStep(clients.session_factory, model_gateway=gateway)
+    leased = LeasedTask(task_id=task.id, user_id=clients.owner_id, kind=task.kind, input_payload=task.input_payload, started_at=datetime.now(UTC))
+    await step.execute(leased)
+    calls_after_first = len(gateway.calls)
+    await step.execute(leased)
+    async with clients.session_factory() as session:
+        replies = (await session.scalars(select(MessageModel).where(MessageModel.task_id == task.id, MessageModel.role == "assistant"))).all()
+    assert calls_after_first == 1
+    assert len(gateway.calls) == calls_after_first
+    assert len(replies) == 1
 
 
 @pytest.mark.asyncio
