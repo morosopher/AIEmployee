@@ -21,7 +21,11 @@ def validate_locale(value: str) -> str:
     """验证有限 BCP47 风格语言标签，避免自由文本进入设置。"""
     if not _LOCALE.fullmatch(value) or not 2 <= len(value) <= 16:
         raise ValueError("locale must be a BCP47-style tag")
-    return value
+    parts = value.split("-")
+    normalized = [parts[0].lower()]
+    for part in parts[1:]:
+        normalized.append(part.upper() if len(part) == 2 and part.isalpha() else part.title())
+    return "-".join(normalized)
 
 
 def validate_brief_time(value: str) -> time:

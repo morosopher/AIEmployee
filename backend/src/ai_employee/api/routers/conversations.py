@@ -1,6 +1,6 @@
 """提供 M1 范围内的用户对话资源。"""
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -13,8 +13,12 @@ from ai_employee.api.deps import (
     CurrentSession,
     get_create_task_use_case,
 )
+from ai_employee.application.use_cases.conversations import (
+    ConversationNotFoundError,
+    CreateConversationMessageUseCase,
+)
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
-from ai_employee.infrastructure.db.models.briefs import ConversationModel, MessageModel
+from ai_employee.infrastructure.db.models.briefs import ConversationModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.conversations import (
     SqlAlchemyConversationRepository,
@@ -77,13 +81,12 @@ def build_conversations_router() -> APIRouter:
     @router.post("/{conversation_id}/messages", status_code=status.HTTP_202_ACCEPTED)
     async def create_message(conversation_id: UUID, payload: MessageRequest, authenticated: CurrentSession, request: Request, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
         """先持久化用户消息，再创建可恢复回复任务；重复 client id 复用任务。"""
-        async with request.app.state.auth_session_factory.begin() as session:
-            conversation = await SqlAlchemyConversationRepository(session).get(user_id=authenticated.user.id, conversation_id=conversation_id)
-            if conversation is None: raise ApiProblem(404, "conversation_not_found", "Conversation not found", "The requested conversation was not found.")
-            existing = await session.scalar(__import__("sqlalchemy").select(MessageModel).where(MessageModel.conversation_id == conversation_id, MessageModel.user_id == authenticated.user.id, MessageModel.task_id.is_not(None)))
-            if existing is None:
-                session.add(MessageModel(user_id=authenticated.user.id, conversation_id=conversation_id, role="user", content_markdown=payload.content_markdown, task_id=None, created_at=datetime.now(UTC)))
-        result = await tasks.execute(user_id=authenticated.user.id, kind="conversation.respond", input_payload={"conversation_id": str(conversation_id), "content": payload.content_markdown}, idempotency_key=f"conversation:{authenticated.user.id}:{payload.client_request_id}")
+        try:
+            result = await CreateConversationMessageUseCase(request.app.state.auth_session_factory).execute(user_id=authenticated.user.id, conversation_id=conversation_id, content_markdown=payload.content_markdown, client_request_id=payload.client_request_id)
+        except ConversationNotFoundError:
+            raise ApiProblem(404, "conversation_not_found", "Conversation not found", "The requested conversation was not found.") from None
+        # TaskRun 已与消息一同提交；再次按相同键调用只会投递既有任务，不会制造第二份事实。
+        await tasks.execute(user_id=authenticated.user.id, kind="conversation.respond", input_payload={"conversation_id": str(conversation_id), "content": payload.content_markdown}, idempotency_key=f"conversation:{authenticated.user.id}:{payload.client_request_id}")
         return {"task_id": result.task_id}
 
     @router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)

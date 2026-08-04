@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ai_employee.api.deps import ApiProblem, CurrentSession, get_create_task_use_case
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
+from ai_employee.infrastructure.db.models.briefs import DailyBriefItemModel
 from ai_employee.infrastructure.db.repositories.briefs import SqlAlchemyBriefRepository
 
 
@@ -22,11 +23,28 @@ class BriefResponse(BaseModel):
     headline: str
     markdown: str
     warnings: list[str]
+    items: list[dict[str, object]] = []
 
 
-def _brief_response(value: object) -> BriefResponse:
+def _brief_response(value: object, items: tuple[DailyBriefItemModel, ...] = ()) -> BriefResponse:
     """把 ORM 简报投影为稳定 API Schema。"""
-    return BriefResponse.model_validate(value, from_attributes=True)
+    response = BriefResponse.model_validate(value, from_attributes=True)
+    return response.model_copy(
+        update={
+            "items": [
+                {
+                    "position": item.position,
+                    "section": item.section,
+                    "priority": item.priority,
+                    "title": item.title,
+                    "body_markdown": item.body_markdown,
+                    "source_refs": item.source_refs,
+                    "suggested_action_kind": item.suggested_action_kind,
+                }
+                for item in items
+            ]
+        }
+    )
 
 
 def build_briefs_router() -> APIRouter:
@@ -39,26 +57,32 @@ def build_briefs_router() -> APIRouter:
         from datetime import UTC, datetime
         from zoneinfo import ZoneInfo
         async with request.app.state.auth_session_factory() as session:
-            value = await SqlAlchemyBriefRepository(session).latest(user_id=authenticated.user.id, local_date=datetime.now(UTC).astimezone(ZoneInfo(authenticated.user.timezone)).date())
+            repository = SqlAlchemyBriefRepository(session)
+            value = await repository.latest(user_id=authenticated.user.id, local_date=datetime.now(UTC).astimezone(ZoneInfo(authenticated.user.timezone)).date())
+            items = await repository.items(brief_id=value.id) if value else ()
         if value is None:
             raise ApiProblem(404, "brief_not_found", "Brief not found", "No brief is available for this date.")
-        return _brief_response(value)
+        return _brief_response(value, items)
 
     @router.get("", response_model=list[BriefResponse])
     async def list_briefs(local_date: Annotated[date, Query()], authenticated: CurrentSession, request: Request) -> list[BriefResponse]:
         """列出当前用户指定本地日期的版本，按版本倒序。"""
         async with request.app.state.auth_session_factory() as session:
-            values = await SqlAlchemyBriefRepository(session).list_for_date(user_id=authenticated.user.id, local_date=local_date)
-        return [_brief_response(value) for value in values]
+            repository = SqlAlchemyBriefRepository(session)
+            values = await repository.list_for_date(user_id=authenticated.user.id, local_date=local_date)
+            rendered = [(value, await repository.items(brief_id=value.id)) for value in values]
+        return [_brief_response(value, items) for value, items in rendered]
 
     @router.get("/{brief_id}", response_model=BriefResponse)
     async def get_brief(brief_id: UUID, authenticated: CurrentSession, request: Request) -> BriefResponse:
         """读取本人拥有的一个简报，跨用户与不存在均返回 404。"""
         async with request.app.state.auth_session_factory() as session:
-            value = await SqlAlchemyBriefRepository(session).get(user_id=authenticated.user.id, brief_id=brief_id)
+            repository = SqlAlchemyBriefRepository(session)
+            value = await repository.get(user_id=authenticated.user.id, brief_id=brief_id)
+            items = await repository.items(brief_id=value.id) if value else ()
         if value is None:
             raise ApiProblem(404, "brief_not_found", "Brief not found", "The requested brief was not found.")
-        return _brief_response(value)
+        return _brief_response(value, items)
 
     @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
     async def generate(authenticated: CurrentSession, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:

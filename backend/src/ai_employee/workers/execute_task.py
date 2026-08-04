@@ -24,6 +24,8 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
+from ai_employee.workers.conversation import build_conversation_task_step
+from ai_employee.workers.generate_brief import build_generate_brief_task_step
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
 
@@ -176,6 +178,14 @@ def build_task_runner() -> DurableTaskRunner:
                 build_calendar_sync_task_step(session_factory=session_factory, settings=settings),
             )
             if task.kind == "sync_calendar"
+            else (
+                build_generate_brief_task_step(session_factory=session_factory),
+            )
+            if task.kind == "daily_brief"
+            else (
+                build_conversation_task_step(session_factory=session_factory),
+            )
+            if task.kind == "conversation.respond"
             else (_MissingTaskHandlerStep(),)
         ),
     )

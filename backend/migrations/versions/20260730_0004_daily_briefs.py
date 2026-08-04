@@ -1,6 +1,6 @@
 """持久化每日简报、对话与用户保留设置。
 
-Revision ID: 20260730_0004_daily_briefs
+Revision ID: 20260730_0004
 Revises: 20260804_0008
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "20260730_0004_daily_briefs"
+revision: str = "20260730_0004"
 down_revision: str | Sequence[str] | None = "20260804_0008"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
