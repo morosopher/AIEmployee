@@ -179,7 +179,7 @@ def build_task_runner() -> DurableTaskRunner:
             )
             if task.kind == "sync_calendar"
             else (
-                build_generate_brief_task_step(session_factory=session_factory),
+                build_generate_brief_task_step(session_factory=session_factory, settings=settings),
             )
             if task.kind == "daily_brief"
             else (

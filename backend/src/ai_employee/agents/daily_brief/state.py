@@ -14,6 +14,7 @@ class DailyBriefState(TypedDict, total=False):
     conflicts: list[dict[str, Any]]
     deterministic_items: list[dict[str, Any]]
     model_items: list[dict[str, Any]]
+    model_invocations: list[dict[str, Any]]
     content: dict[str, Any]
     warnings: list[str]
     step_events: list[dict[str, Any]]

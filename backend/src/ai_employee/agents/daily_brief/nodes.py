@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 from ai_employee.application.ports.task_steps import TaskStepEvent
@@ -133,6 +134,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                         "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                     ).EmailJudgement,
                 )
+                _record_model_invocation(state, facts, response)
                 judgement = response.value.model_copy(update={"thread_id": thread_id})
                 if response.value.thread_id != thread_id:
                     state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
@@ -160,6 +162,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                             "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                         ).EmailJudgement,
                     )
+                    _record_model_invocation(state, facts, response)
                     judgement = response.value.model_copy(update={"thread_id": thread_id})
                     if response.value.thread_id != thread_id:
                         state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
@@ -171,6 +174,28 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
     state["model_items"] = outputs
     _event(state, "classify_ambiguous_threads", "completed")
     return state
+
+
+def _record_model_invocation(state: dict[str, Any], facts: dict[str, Any], response: Any) -> None:
+    """收集不含 Prompt 或模型正文的调用元数据，供事务性审计落库。"""
+    usage = response.usage
+    state.setdefault("model_invocations", []).append(
+        {
+            "provider": type(state["model_gateway"]).__name__.removesuffix("Gateway").lower(),
+            "model_name": state.get("model_name", ""),
+            "prompt_version": "daily_brief_v1",
+            "input_hash": sha256(
+                json.dumps(facts, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "output_schema": "EmailJudgement",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "estimated_cost_microusd": usage.estimated_cost_microusd,
+            "latency_ms": usage.latency_ms,
+            "status": "succeeded",
+            "error_code": None,
+        }
+    )
 
 
 def detect_calendar_conflicts(state: dict[str, Any]) -> dict[str, Any]:
