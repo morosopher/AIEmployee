@@ -298,7 +298,12 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
 
 
 async def classify_ambiguous_conversation_intent(
-    text: str, *, model_gateway: Any, model_name: str, configured_patterns: tuple[str, ...] = ()
+    text: str,
+    *,
+    model_gateway: Any,
+    model_name: str,
+    configured_patterns: tuple[str, ...] = (),
+    invocation_metadata: list[dict[str, Any]] | None = None,
 ) -> ConversationIntent:
     """本地脱敏歧义文本后执行受限的三值意图模型分类。
 
@@ -315,8 +320,40 @@ async def classify_ambiguous_conversation_intent(
             messages=[{"role": "user", "content": redacted.text}],
             response_model=ConversationIntent,
         )
+        if invocation_metadata is not None:
+            invocation_metadata.append(
+                {
+                    "provider": type(model_gateway).__name__.removesuffix("Gateway").lower(),
+                    "model_name": model_name,
+                    "prompt_version": "conversation_intent_v1",
+                    "input_hash": sha256(redacted.text.encode("utf-8")).hexdigest(),
+                    "output_schema": "ConversationIntent",
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                    "estimated_cost_microusd": response.usage.estimated_cost_microusd,
+                    "latency_ms": response.usage.latency_ms,
+                    "status": "succeeded",
+                    "error_code": None,
+                }
+            )
         return ConversationIntent.model_validate(response.value)
-    except (RuntimeError, ValueError, TypeError, KeyError):
+    except (RuntimeError, ValueError, TypeError, KeyError) as error:
+        if invocation_metadata is not None:
+            invocation_metadata.append(
+                {
+                    "provider": type(model_gateway).__name__.removesuffix("Gateway").lower(),
+                    "model_name": model_name,
+                    "prompt_version": "conversation_intent_v1",
+                    "input_hash": sha256(redacted.text.encode("utf-8")).hexdigest(),
+                    "output_schema": "ConversationIntent",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "estimated_cost_microusd": None,
+                    "latency_ms": 0,
+                    "status": "failed",
+                    "error_code": getattr(error, "code", "conversation_intent_failed"),
+                }
+            )
         return ConversationIntent(
             intent="explain_capabilities", confidence=0.0, reason_code="intent_model_failed"
         )
