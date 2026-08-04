@@ -30,6 +30,7 @@ class CalendarEvent:
     recurring_event_id: str | None
     etag: str
     provider_url: str
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

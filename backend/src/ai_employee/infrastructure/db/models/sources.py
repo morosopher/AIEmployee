@@ -124,6 +124,9 @@ class EmailThreadModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     participants: Mapped[list[dict[str, str]]] = mapped_column(JSONB(), nullable=False)
     latest_message_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     provider_url: Mapped[str] = mapped_column(Text(), nullable=False)
+    provider_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class EmailMessageModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):

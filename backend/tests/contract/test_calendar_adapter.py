@@ -44,7 +44,8 @@ async def test_initial_page_uses_primary_events_window_and_normalizes_all_day() 
     params = route.calls[0].request.url.params
     assert params["singleEvents"] == "true"
     assert params["showDeleted"] == "true"
-    assert params["timeMin"].startswith("2030-01-02T00:00:00+08:00")
+    assert params["timeMin"].startswith("2030-01-09T00:00:00+08:00")
+    assert params["timeMax"].startswith("2030-01-16T00:00:00+08:00")
     event = pages[0].events[0]
     assert event.all_day is True
     assert event.starts_at == datetime(2030, 1, 1, 16, tzinfo=UTC)

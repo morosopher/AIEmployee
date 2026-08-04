@@ -90,6 +90,7 @@ class SqlAlchemyCalendarSyncRepository:
             recurring_event_id=event.recurring_event_id,
             etag=event.etag,
             provider_url=event.provider_url,
+            provider_updated_at=event.updated_at,
         )
         await self._session.execute(
             stmt.on_conflict_do_update(
@@ -114,10 +115,33 @@ class SqlAlchemyCalendarSyncRepository:
                         "recurring_event_id",
                         "etag",
                         "provider_url",
+                        "provider_updated_at",
                     )
                 },
             )
         )
+
+    async def clear_cursor(
+        self, *, user_id: UUID, connection_id: UUID, expected_cursor: str
+    ) -> None:
+        """在 410 后以 CAS 清除失效 token，避免覆盖已完成的并发同步。"""
+        cursor = await self._session.scalar(
+            select(SyncCursorModel)
+            .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                OAuthConnectionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if cursor is None or cursor.cursor != expected_cursor:
+            raise TransientProviderError(
+                error_code="calendar_sync_cursor_conflict",
+                message="Calendar sync cursor changed during provider read",
+                retry_after=1,
+            )
+        cursor.cursor = None
 
     async def finish_sync(
         self,

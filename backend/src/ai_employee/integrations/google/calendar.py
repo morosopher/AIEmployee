@@ -42,12 +42,12 @@ class CalendarAdapter:
     async def initial_pages(self) -> AsyncIterator[CalendarSyncPage]:
         """读取用户当地午夜起的七天 horizon，并让最终页携带 nextSyncToken。"""
         local_now = self._now().astimezone(self._timezone)
-        start = (local_now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
         parameters = {
             "singleEvents": "true",
             "showDeleted": "true",
             "timeMin": start.isoformat(),
-            "timeMax": local_now.isoformat(),
+            "timeMax": (start + timedelta(days=7)).isoformat(),
         }
         async for page in self._pages(parameters):
             yield page
@@ -152,7 +152,16 @@ class CalendarAdapter:
             self._optional_string(payload.get("recurringEventId")),
             etag,
             self._optional_string(payload.get("htmlLink")) or "",
+            self._provider_updated_at(payload.get("updated")),
         )
+
+    @staticmethod
+    def _provider_updated_at(value: object) -> datetime | None:
+        """解析供应商 RFC3339 更新时间，保留增量事件的稳定版本事实。"""
+        if not isinstance(value, str):
+            return None
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
     @staticmethod
     def _event_time(value: dict[str, object], timezone: str, all_day: bool) -> datetime:

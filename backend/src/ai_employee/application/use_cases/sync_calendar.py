@@ -32,6 +32,9 @@ class CalendarSyncStore(Protocol):
         encrypted_description: EncryptedValue,
         encrypted_location: EncryptedValue,
     ) -> None: ...
+    async def clear_cursor(
+        self, *, user_id: UUID, connection_id: UUID, expected_cursor: str
+    ) -> None: ...
     async def finish_sync(
         self,
         *,
@@ -86,12 +89,18 @@ class SyncCalendarUseCase:
                 else self._calendar.sync_pages(state.cursor)
             )
         except CalendarCursorExpiredError:
+            if state.cursor is None:
+                raise RuntimeError("Calendar initial sync cannot have an expired cursor")
+            async with self._stores() as store:
+                await store.clear_cursor(
+                    user_id=user_id, connection_id=connection_id, expected_cursor=state.cursor
+                )
             used_full = True
             pages = await self._collect(self._calendar.initial_pages())
-        token = next(
-            (page.next_sync_token for page in reversed(pages) if page.next_sync_token),
-            state.cursor or "",
-        )
+            state = CalendarConnectionState(None)
+        token = pages[-1].next_sync_token if pages else None
+        if token is None:
+            raise RuntimeError("Calendar final page is missing nextSyncToken")
         count = 0
         async with self._stores() as store:
             for page in pages:
