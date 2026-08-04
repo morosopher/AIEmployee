@@ -5,6 +5,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator
 
+from ai_employee.domain.email import EmailCategory
+
 
 class BriefSection(StrEnum):
     ATTENTION = "attention"
@@ -26,7 +28,7 @@ class EmailJudgement(BaseModel):
     """模型对单个邮件线程的结构化判断。"""
 
     thread_id: str
-    category: str
+    category: EmailCategory
     urgency: str = "normal"
     needs_reply: bool = False
     deadline_at: datetime | None = None
