@@ -97,3 +97,27 @@ async def test_ambiguous_intent_redacts_before_model() -> None:
     )
     assert result.intent == "generate_daily_brief"
     assert "secret-value" not in fake.calls[0][0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("send mail now", "explain_capabilities"),
+        ("modify calendar", "explain_capabilities"),
+        ("search web", "explain_capabilities"),
+        ("upload files", "explain_capabilities"),
+        ("remember this", "explain_capabilities"),
+        ("plan my work", "explain_capabilities"),
+        ("generate today's brief", "generate_daily_brief"),
+        ("refresh today's brief", "generate_daily_brief"),
+        ("show today's brief", "show_latest_brief"),
+    ],
+)
+async def test_explicit_intents_never_call_model(text: str, expected: str) -> None:
+    fake = FakeModelGateway()
+    result = await classify_ambiguous_conversation_intent(
+        text, model_gateway=fake, model_name="fake"
+    )
+    assert result.intent == expected
+    assert fake.calls == []

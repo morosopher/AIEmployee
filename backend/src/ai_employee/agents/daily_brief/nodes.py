@@ -146,15 +146,24 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
         token in normalized
         for token in (
             "send email",
+            "send mail",
             "发送邮件",
             "modify calendar",
+            "change calendar",
             "修改日历",
             "web search",
+            "search web",
             "网页搜索",
             "upload",
+            "upload files",
             "上传",
             "memory",
+            "remember",
             "记忆",
+            "plan my work",
+            "work planning",
+            "规划工作",
+            "安排工作",
         )
     ):
         return {
@@ -176,6 +185,7 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
         for token in (
             "summarize today's mail",
             "generate daily brief",
+            "generate today's brief",
             "refresh today's brief",
             "生成今日简报",
             "刷新今日简报",
