@@ -185,6 +185,41 @@ async def test_mail_model_input_redacts_builtin_and_configured_values() -> None:
     assert "safe-id" in sent
 
 
+@pytest.mark.asyncio
+async def test_model_cannot_substitute_foreign_thread_id() -> None:
+    class ForeignThreadModel(FakeModelGateway):
+        async def complete(self, **kwargs):  # type: ignore[no-untyped-def]
+            from ai_employee.domain.briefs import EmailJudgement
+
+            return ModelResponse(
+                value=EmailJudgement(thread_id="foreign-thread", category="other", confidence=1),
+                usage=ModelUsage(),
+            )
+
+    result = await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [{"thread_id": "trusted", "sender": "x", "subject": "x"}],
+            "calendar_events": [],
+            "model_gateway": ForeignThreadModel(),
+        }
+    )
+    assert "foreign-thread" not in str(result["content"])
+    assert "model_thread_id_mismatch:trusted" in result["content"]["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_fake_partial_makes_rendered_brief_partial() -> None:
+    result = await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [{"thread_id": "t", "sender": "x", "subject": "x"}],
+            "calendar_events": [],
+            "model_gateway": FakeModelGateway(scenario="partial"),
+        }
+    )
+    assert result["content"]["completeness"] == "partial"
+    assert "model_partial:t" in result["content"]["warnings"]
+
+
 def test_graph_accepts_injected_checkpoint_saver() -> None:
     saver = MemorySaver()
     assert build_daily_brief_graph(checkpointer=saver).checkpointer is saver

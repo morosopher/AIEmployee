@@ -33,6 +33,7 @@ class OpenAICompatibleGateway:
         timeout: float = 120.0,
         input_cost_per_million_usd: float = 0,
         output_cost_per_million_usd: float = 0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -40,6 +41,7 @@ class OpenAICompatibleGateway:
         self.timeout = timeout
         self.input_rate = input_cost_per_million_usd
         self.output_rate = output_cost_per_million_usd
+        self.transport = transport
 
     async def complete(
         self,
@@ -69,7 +71,7 @@ class OpenAICompatibleGateway:
             ]
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
@@ -85,6 +87,9 @@ class OpenAICompatibleGateway:
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise ModelGatewayError("model_timeout") from exc
+        except httpx.HTTPStatusError as exc:
+            # 非临时 HTTP 拒绝也不能把供应商响应正文或 URL 泄漏给调用层。
+            raise ModelGatewayError("model_request_error") from exc
         except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValidationError) as exc:
             raise ModelGatewayError("model_invalid_output") from exc
         latency = int((time.monotonic() - started) * 1000)

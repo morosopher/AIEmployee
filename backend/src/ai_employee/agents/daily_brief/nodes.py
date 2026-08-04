@@ -132,7 +132,12 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                         "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                     ).EmailJudgement,
                 )
-                outputs.append(response.value.model_dump())
+                judgement = response.value.model_copy(update={"thread_id": thread_id})
+                if response.value.thread_id != thread_id:
+                    state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
+                if "fake_partial" in judgement.reason_codes:
+                    state["warnings"].append(f"model_partial:{thread_id}")
+                outputs.append(judgement.model_dump())
             except (RuntimeError, ValueError, TypeError, KeyError):
                 # 只允许一次明确修复请求；第二次失败保留确定性结果并标记 partial。
                 try:
@@ -151,7 +156,12 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                             "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                         ).EmailJudgement,
                     )
-                    outputs.append(response.value.model_dump())
+                    judgement = response.value.model_copy(update={"thread_id": thread_id})
+                    if response.value.thread_id != thread_id:
+                        state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
+                    if "fake_partial" in judgement.reason_codes:
+                        state["warnings"].append(f"model_partial:{thread_id}")
+                    outputs.append(judgement.model_dump())
                 except (RuntimeError, ValueError, TypeError, KeyError):
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
     state["model_items"] = outputs
