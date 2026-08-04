@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     LargeBinary,
+    SmallInteger,
     String,
     Time,
 )
@@ -34,6 +35,15 @@ class UserModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     locale: Mapped[str] = mapped_column(String(16), nullable=False, default="zh-CN")
     brief_time: Mapped[time] = mapped_column(Time(), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
+    email_body_retention_days: Mapped[int] = mapped_column(SmallInteger(), nullable=False, default=30)
+    source_metadata_retention_days: Mapped[int] = mapped_column(SmallInteger(), nullable=False, default=180)
+    workspace_history_retention_days: Mapped[int] = mapped_column(SmallInteger(), nullable=False, default=365)
+
+    __table_args__ = (
+        CheckConstraint("email_body_retention_days BETWEEN 1 AND 3650", name="ck_users_email_body_retention_days"),
+        CheckConstraint("source_metadata_retention_days BETWEEN 1 AND 3650", name="ck_users_source_metadata_retention_days"),
+        CheckConstraint("workspace_history_retention_days BETWEEN 1 AND 3650", name="ck_users_workspace_history_retention_days"),
+    )
 
 
 class UserSessionModel(UUIDPrimaryKeyMixin, Base):
