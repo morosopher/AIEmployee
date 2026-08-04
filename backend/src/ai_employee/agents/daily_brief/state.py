@@ -17,3 +17,4 @@ class DailyBriefState(TypedDict, total=False):
     warnings: list[str]
     step_events: list[dict[str, Any]]
     model_gateway: Any
+    task_step_event_sink: Any

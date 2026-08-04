@@ -48,7 +48,10 @@ class FakeModelGateway:
             )
         else:
             value = response_model.model_validate({})
-        return ModelResponse(value=value, usage=ModelUsage())
+        usage = ModelUsage(output_tokens=1 if self.scenario == "partial" else 0)
+        if self.scenario == "partial" and isinstance(value, EmailJudgement):
+            value = value.model_copy(update={"reason_codes": ["fake_partial"]})
+        return ModelResponse(value=value, usage=usage)
 
 
 def build_model_gateway(settings: Any | None = None) -> Any:

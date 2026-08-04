@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
+from ai_employee.application.ports.task_steps import TaskStepEvent
 from ai_employee.domain.briefs import (
     BriefItem,
     BriefPriority,
@@ -24,7 +25,15 @@ class DailyBriefSourceFailure(RuntimeError):
 
 
 def _event(state: dict[str, Any], name: str, status: str) -> None:
-    state.setdefault("step_events", []).append({"step": name, "status": status})
+    event = {"step": name, "status": status}
+    state.setdefault("step_events", []).append(event)
+    sink = state.get("task_step_event_sink")
+    if sink is not None:
+        sink.record(
+            TaskStepEvent(
+                task_run_id=str(state.get("task_run_id", "")), step_name=name, status=status
+            )
+        )
 
 
 def load_sources(state: dict[str, Any]) -> dict[str, Any]:
@@ -215,6 +224,8 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
     _event(state, "compose_structured_brief", "started")
     items = []
     for item in state.get("classifications", []) + state.get("model_items", []):
+        if item.get("category") == "notification":
+            continue
         items.append(
             BriefItem(
                 section=BriefSection.MAIL_SUMMARY,
