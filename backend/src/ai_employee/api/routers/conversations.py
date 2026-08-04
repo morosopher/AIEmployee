@@ -60,7 +60,7 @@ def build_conversations_router() -> APIRouter:
         return [ConversationResponse.model_validate(value, from_attributes=True) for value in values]
 
     @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
-    async def create_conversation(authenticated: CurrentSession, request: Request) -> ConversationResponse:
+    async def create_conversation(authenticated: CsrfProtectedSession, request: Request) -> ConversationResponse:
         """创建空会话，标题保持合成默认值且不推断隐私内容。"""
         async with request.app.state.auth_session_factory.begin() as session:
             value = ConversationModel(user_id=authenticated.user.id, title="New conversation")
@@ -79,7 +79,7 @@ def build_conversations_router() -> APIRouter:
         return {"conversation": ConversationResponse.model_validate(value, from_attributes=True).model_dump(), "messages": [MessageResponse.model_validate(message, from_attributes=True).model_dump() for message in messages]}
 
     @router.post("/{conversation_id}/messages", status_code=status.HTTP_202_ACCEPTED)
-    async def create_message(conversation_id: UUID, payload: MessageRequest, authenticated: CurrentSession, request: Request, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
+    async def create_message(conversation_id: UUID, payload: MessageRequest, authenticated: CsrfProtectedSession, request: Request, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
         """先持久化用户消息，再创建可恢复回复任务；重复 client id 复用任务。"""
         try:
             result = await CreateConversationMessageUseCase(request.app.state.auth_session_factory).execute(user_id=authenticated.user.id, conversation_id=conversation_id, content_markdown=payload.content_markdown, client_request_id=payload.client_request_id)

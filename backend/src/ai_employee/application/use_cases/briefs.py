@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from ai_employee.domain.briefs import DailyBriefContent
 from ai_employee.infrastructure.db.models.briefs import DailyBriefItemModel, DailyBriefModel
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 
@@ -32,5 +32,8 @@ class PersistDailyBriefUseCase:
             session.add(brief)
             await session.flush()
             session.add_all(DailyBriefItemModel(brief_id=brief.id, position=index, section=item.section.value, priority=item.priority.value, title=item.title, body_markdown=item.body_markdown, source_refs=[source.model_dump(mode="json") for source in item.source_refs], suggested_action_kind=item.suggested_action_kind) for index, item in enumerate(content.items))
+            task = await session.get(TaskRunModel, task_id, with_for_update=True)
+            if task is not None and task.user_id == user_id:
+                task.result_payload = {"brief_id": str(brief.id), "completeness": content.completeness}
             session.add(AuditEventModel(user_id=user_id, task_id=task_id, event_type="brief.ready", actor_type="system", actor_id=None, event_metadata={"brief_id": str(brief.id), "completeness": content.completeness}))
             return brief.id

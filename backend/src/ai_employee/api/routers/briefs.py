@@ -7,7 +7,12 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel
 
-from ai_employee.api.deps import ApiProblem, CurrentSession, get_create_task_use_case
+from ai_employee.api.deps import (
+    ApiProblem,
+    CsrfProtectedSession,
+    CurrentSession,
+    get_create_task_use_case,
+)
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.infrastructure.db.models.briefs import DailyBriefItemModel
 from ai_employee.infrastructure.db.repositories.briefs import SqlAlchemyBriefRepository
@@ -85,7 +90,7 @@ def build_briefs_router() -> APIRouter:
         return _brief_response(value, items)
 
     @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
-    async def generate(authenticated: CurrentSession, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
+    async def generate(authenticated: CsrfProtectedSession, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
         """创建手动刷新任务；幂等键每次不同，因此会生成下一版本。"""
         result = await tasks.execute(user_id=authenticated.user.id, kind="daily_brief", input_payload={"schedule_kind": "manual"}, idempotency_key=f"daily_brief:{authenticated.user.id}:manual:{uuid4()}")
         return {"task_id": result.task_id}

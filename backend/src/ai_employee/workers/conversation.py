@@ -9,6 +9,7 @@ from ai_employee.agents.daily_brief.nodes import classify_conversation_intent
 from ai_employee.application.use_cases.conversations import unsupported_response
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, MessageModel
+from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 
@@ -38,7 +39,13 @@ class ConversationTaskStep:
                 brief = await session.scalar(select(DailyBriefModel).where(DailyBriefModel.user_id == task.user_id).order_by(DailyBriefModel.local_date.desc(), DailyBriefModel.version.desc()))
                 text = brief.markdown if brief is not None else "尚无可查看的每日简报。"
             elif intent == "generate_daily_brief":
-                text = "已创建每日简报任务，请在任务完成后查看结果。"
+                generated = await SqlAlchemyTaskRepository(session).create_with_outbox(
+                    user_id=task.user_id,
+                    kind="daily_brief",
+                    input_payload={"schedule_kind": "conversation"},
+                    idempotency_key=f"daily_brief:{task.user_id}:conversation:{task.task_id}",
+                )
+                text = f"已创建每日简报任务：`{generated.task_id}`。"
             else:
                 text = unsupported_response()
             session.add(MessageModel(user_id=task.user_id, conversation_id=conversation_id, role="assistant", content_markdown=text, task_id=task.task_id, created_at=datetime.now(UTC)))
