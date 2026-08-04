@@ -10,6 +10,7 @@ class DailyBriefState(TypedDict, total=False):
     mail_threads: list[dict[str, Any]]
     calendar_events: list[dict[str, Any]]
     classifications: list[dict[str, Any]]
+    spam_thread_ids: set[str]
     conflicts: list[dict[str, Any]]
     deterministic_items: list[dict[str, Any]]
     model_items: list[dict[str, Any]]

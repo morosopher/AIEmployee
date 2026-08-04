@@ -1,5 +1,6 @@
 """测试用确定性模型，绝不连接网络。"""
 
+import json
 import os
 from collections.abc import Sequence
 from typing import Any, TypeVar
@@ -39,6 +40,10 @@ class FakeModelGateway:
             )
         elif response_model is EmailJudgement:
             source = next((m["content"] for m in messages if m.get("role") == "user"), "thread")
+            try:
+                source = str(json.loads(source).get("thread_id", source))
+            except json.JSONDecodeError:
+                pass
             value = EmailJudgement(
                 thread_id=source,
                 category="other",

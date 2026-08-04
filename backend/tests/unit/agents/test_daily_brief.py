@@ -121,3 +121,36 @@ async def test_explicit_intents_never_call_model(text: str, expected: str) -> No
     )
     assert result.intent == expected
     assert fake.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["发邮件给老板", "create calendar event", "delete calendar event", "plan tomorrow's work"],
+)
+async def test_write_and_planning_verbs_never_call_model(text: str) -> None:
+    fake = FakeModelGateway()
+    result = await classify_ambiguous_conversation_intent(
+        text, model_gateway=fake, model_name="fake"
+    )
+    assert result.intent == "explain_capabilities"
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mail_model_input_is_deduplicated_and_has_safe_facts() -> None:
+    fake = FakeModelGateway()
+    await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [
+                {"thread_id": "t", "sender": "a@x", "subject": "s", "summary": "ok"},
+                {"thread_id": "t", "sender": "a@x", "subject": "s"},
+                {"thread_id": "spam", "sender": "a@x", "subject": "secret", "labels": ["spam"]},
+            ],
+            "calendar_events": [],
+            "model_gateway": fake,
+        }
+    )
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0]["content"] == "daily_brief_v1; locale=zh-CN; only supplied facts"
+    assert "secret" not in str(fake.calls)

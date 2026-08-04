@@ -1,5 +1,6 @@
 """每日简报图节点：确定性规则先行，模型只处理脱敏歧义事实。"""
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -66,6 +67,7 @@ def apply_deterministic_rules(state: dict[str, Any]) -> dict[str, Any]:
         urgency = classify_urgency_by_rules(message)
         if classification and classification.category is EmailCategory.SPAM:
             spam_count += 1
+            state.setdefault("spam_thread_ids", set()).add(thread.get("thread_id", ""))
             continue
         if classification:
             result.append(
@@ -93,20 +95,31 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
     }
     gateway = state.get("model_gateway")
     outputs = []
+    processed_thread_ids: set[str] = set(state.get("spam_thread_ids", set()))
     if gateway:
         for thread in state.get("mail_threads", []):
             thread_id = thread.get("thread_id", "")
-            if (
-                thread_id in classified
-                or thread.get("labels", [])
-                and "SPAM" in thread.get("labels", [])
-            ):
+            if thread_id in classified or thread_id in processed_thread_ids:
                 continue
+            processed_thread_ids.add(thread_id)
+            facts = {
+                "thread_id": thread_id,
+                "subject": thread.get("subject", ""),
+                "sender": thread.get("sender", ""),
+                "summary": thread.get("summary", ""),
+                "known_urgency": None,
+            }
             try:
                 response = await gateway.complete(
                     model_name=state.get("model_name", ""),
                     prompt_version="daily_brief_v1",
-                    messages=[{"role": "user", "content": thread_id}],
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"daily_brief_v1; locale={state.get('locale', 'zh-CN')}; only supplied facts",
+                        },
+                        {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
+                    ],
                     response_model=__import__(
                         "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                     ).EmailJudgement,
@@ -119,7 +132,11 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                         model_name=state.get("model_name", ""),
                         prompt_version="daily_brief_v1",
                         messages=[
-                            {"role": "user", "content": thread_id},
+                            {
+                                "role": "system",
+                                "content": f"daily_brief_v1; locale={state.get('locale', 'zh-CN')}; only supplied facts",
+                            },
+                            {"role": "user", "content": json.dumps(facts, ensure_ascii=False)},
                             {"role": "user", "content": "请修复为严格 JSON"},
                         ],
                         response_model=__import__(
@@ -161,6 +178,16 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
             "remember",
             "记忆",
             "plan my work",
+            "plan tomorrow",
+            "create calendar",
+            "delete calendar",
+            "create event",
+            "delete event",
+            "发邮件",
+            "创建日历",
+            "删除日历",
+            "创建日程",
+            "删除日程",
             "work planning",
             "规划工作",
             "安排工作",
