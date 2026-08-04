@@ -216,3 +216,7 @@ class CalendarEventModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     recurring_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     etag: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_url: Mapped[str] = mapped_column(Text(), nullable=False)
+    # Google 的 ``updated`` 是供应商版本事实；最小删除墓碑可不带该字段，故必须可空。
+    provider_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
