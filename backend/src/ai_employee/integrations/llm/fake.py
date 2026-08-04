@@ -51,8 +51,24 @@ class FakeModelGateway:
         return ModelResponse(value=value, usage=ModelUsage())
 
 
-def build_model_gateway() -> FakeModelGateway:
-    """测试模式下构造 Fake，生产代码不应静默启用它。"""
-    if os.getenv("APP_TEST_MODE", "false").lower() != "true":
-        raise RuntimeError("FakeModelGateway requires APP_TEST_MODE=true")
-    return FakeModelGateway()
+def build_model_gateway(settings: Any | None = None) -> Any:
+    """按显式测试开关选择 Fake 或配置好的真实适配器。
+
+    真实适配器只在调用方已经提供配置与 Secret 时构造，本函数不发起请求。
+    """
+    test_mode = getattr(settings, "app_test_mode", None)
+    if test_mode is None:
+        test_mode = os.getenv("APP_TEST_MODE", "false").lower() == "true"
+    if test_mode:
+        return FakeModelGateway()
+    if settings is None:
+        raise RuntimeError("normal model gateway requires settings")
+    from ai_employee.integrations.llm.openai_compatible import OpenAICompatibleGateway
+
+    return OpenAICompatibleGateway(
+        base_url=settings.model_base_url,
+        api_key=settings.read_secret_file(settings.model_api_key_file).get_secret_value(),
+        supports_json_schema=settings.model_supports_json_schema,
+        input_cost_per_million_usd=settings.model_input_cost_per_million_usd,
+        output_cost_per_million_usd=settings.model_output_cost_per_million_usd,
+    )

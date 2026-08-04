@@ -19,6 +19,10 @@ from ai_employee.domain.email import (
 )
 
 
+class DailyBriefSourceFailure(RuntimeError):
+    """所有源均不可用时阻止写入空的成功简报。"""
+
+
 def _event(state: dict[str, Any], name: str, status: str) -> None:
     state.setdefault("step_events", []).append({"step": name, "status": status})
 
@@ -52,15 +56,15 @@ def apply_deterministic_rules(state: dict[str, Any]) -> dict[str, Any]:
         if classification and classification.category is EmailCategory.SPAM:
             spam_count += 1
             continue
-        result.append(
-            {
-                "thread_id": thread.get("thread_id", ""),
-                "category": classification.category.value if classification else None,
-                "urgency": urgency.urgency.value,
-                "reason_codes": (classification.reason_codes if classification else ())
-                + urgency.reason_codes,
-            }
-        )
+        if classification:
+            result.append(
+                {
+                    "thread_id": thread.get("thread_id", ""),
+                    "category": classification.category.value,
+                    "urgency": urgency.urgency.value,
+                    "reason_codes": classification.reason_codes + urgency.reason_codes,
+                }
+            )
     state["classifications"] = result
     if spam_count:
         state["warnings"].append(f"spam_count:{spam_count}")
@@ -71,7 +75,11 @@ def apply_deterministic_rules(state: dict[str, Any]) -> dict[str, Any]:
 async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
     """仅把歧义线程的最小事实交给模型，每个线程最多一次。"""
     _event(state, "classify_ambiguous_threads", "started")
-    classified = {item["thread_id"] for item in state.get("classifications", [])}
+    classified = {
+        item["thread_id"]
+        for item in state.get("classifications", [])
+        if item.get("category") is not None
+    }
     gateway = state.get("model_gateway")
     outputs = []
     if gateway:
@@ -177,11 +185,17 @@ def detect_calendar_conflicts_node(state: dict[str, Any]) -> dict[str, Any]:
     events = []
     for raw in state.get("calendar_events", []):
         try:
+            start_at = raw.get("start_at", raw.get("start"))
+            end_at = raw.get("end_at", raw.get("end"))
+            if isinstance(start_at, str):
+                start_at = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+            if isinstance(end_at, str):
+                end_at = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
             events.append(
                 CalendarEvent(
                     event_id=raw["event_id"],
-                    start_at=raw.get("start_at", raw.get("start")),
-                    end_at=raw.get("end_at", raw.get("end")),
+                    start_at=start_at,
+                    end_at=end_at,
                     status=raw.get("status", "confirmed"),
                     transparency=raw.get("transparency", "opaque"),
                     all_day=raw.get("all_day", False),
@@ -214,6 +228,45 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
                 else BriefPriority.NORMAL,
             ).model_dump()
         )
+    notification_refs = [
+        BriefSourceRef(source_type="email_thread", source_id=item["thread_id"])
+        for item in state.get("classifications", [])
+        if item.get("category") == "notification"
+    ]
+    if notification_refs:
+        items.append(
+            BriefItem(
+                section=BriefSection.NOTIFICATIONS,
+                title=f"{len(notification_refs)} 条通知",
+                body_markdown="通知已折叠汇总。",
+                source_refs=notification_refs,
+            ).model_dump()
+        )
+    for raw in state.get("calendar_events", []):
+        event_id = raw.get("event_id")
+        if event_id:
+            items.append(
+                BriefItem(
+                    section=BriefSection.SCHEDULE,
+                    title="日程安排",
+                    body_markdown="已同步日程。",
+                    source_refs=[BriefSourceRef(source_type="calendar_event", source_id=event_id)],
+                ).model_dump()
+            )
+    for conflict in state.get("conflicts", []):
+        refs = [
+            BriefSourceRef(source_type="calendar_event", source_id=event_id)
+            for event_id in conflict["event_ids"]
+        ]
+        items.append(
+            BriefItem(
+                section=BriefSection.CONFLICTS,
+                title="日程冲突",
+                body_markdown="两个忙碌日程发生重叠。",
+                priority=BriefPriority.HIGH,
+                source_refs=refs,
+            ).model_dump()
+        )
     state["deterministic_items"] = items
     _event(state, "compose_structured_brief", "completed")
     return state
@@ -222,6 +275,8 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
 def validate_and_render(state: dict[str, Any]) -> dict[str, Any]:
     """最终验证并在模型失败时保留部分确定性简报。"""
     _event(state, "validate_and_render", "started")
+    if not state.get("mail_threads") and not state.get("calendar_events"):
+        raise DailyBriefSourceFailure("daily_brief_no_usable_sources")
     content = DailyBriefContent(
         local_date=state.get("local_date", datetime.now(UTC).date()),
         source_cutoff=state.get("source_cutoff", datetime.now(UTC)),
