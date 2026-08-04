@@ -146,15 +146,15 @@ class _AuditPreservingRetentionWorker(RetentionCleanupWorker):
 
 
 @pytest.mark.asyncio
-async def test_workspace_retention_never_deletes_append_only_audit_events() -> None:
-    """工作区保留只能清理用户内容与终态任务图，审计事实必须永久保留。"""
+async def test_workspace_retention_deletes_expired_audit_events_in_bounded_batches() -> None:
+    """工作区保留必须回收 cutoff 前的审计内容，当前轮审计则在该阶段后写入。"""
     worker = _AuditPreservingRetentionWorker()
 
     await worker._delete_workspace_history(
         uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10
     )
 
-    assert AuditEventModel not in worker.deleted_models
+    assert AuditEventModel in worker.deleted_models
 
 
 class _ConversationSafeRetentionWorker(_AuditPreservingRetentionWorker):

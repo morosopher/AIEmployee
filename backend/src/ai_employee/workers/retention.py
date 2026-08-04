@@ -150,6 +150,9 @@ class RetentionCleanupWorker:
         await self._delete_empty_conversations(user_id, batch_size)
         await self._delete_bounded(DailyBriefModel, user_id, DailyBriefModel.created_at, cutoff, batch_size)
         await self._delete_terminal_task_graph(user_id, cutoff, batch_size)
+        # 审计表对普通应用角色保持追加写；retention 专用角色只在此明确保留用例中按用户和
+        # cutoff 删除历史内容。本轮 ``retention.cleanup_completed`` 在本方法返回后才追加。
+        await self._delete_bounded(AuditEventModel, user_id, AuditEventModel.created_at, cutoff, batch_size)
 
     async def _delete_empty_conversations(self, user_id: UUID, batch_size: int) -> None:
         """分批回收没有任何消息的会话，避免级联删除尚在保留期内的新消息。

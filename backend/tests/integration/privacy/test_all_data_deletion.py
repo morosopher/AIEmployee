@@ -41,9 +41,15 @@ class FailingRevoker:
 class CrashAfterCredentialCleanupWorker(PrivacyDeletionWorker):
     """仅供测试在已提交的首个删除阶段后模拟进程崩溃。"""
 
-    async def _delete_user_rows(self, model: type[object], user_id: UUID, batch_size: int) -> None:
-        """先保留真实的有界删除，再在凭据阶段后只失败一次。"""
-        await super()._delete_user_rows(model, user_id, batch_size)  # type: ignore[arg-type]
+    async def _after_user_row_batch(
+        self,
+        *,
+        model: type[object],
+        user_id: UUID,
+        deleted_count: int,
+    ) -> None:
+        """在首个凭据批已提交、下一批尚未开始时精确模拟进程崩溃。"""
+        del user_id, deleted_count
         if model is EncryptedCredentialModel:
             raise RuntimeError("synthetic mid-batch crash")
 
@@ -163,26 +169,77 @@ async def test_all_data_deletion_attempts_revocation_once_without_blocking_local
 async def test_all_data_deletion_retries_after_committed_batch_with_one_redacted_audit(
     database_url: str,
 ) -> None:
-    """中途崩溃后以相同 request ID 重试，最终只有一条不含内容的完成审计。"""
+    """中途崩溃后重试必须删除构造的本地数据并只保留一条脱敏完成审计。"""
     session_factory = build_session_factory(database_url)
     try:
         async with session_factory.begin() as session:
             user = UserModel(email="crash-owner@example.test", display_name="Crash", password_hash=None, timezone="UTC", locale="zh-CN", brief_time=time(8, 0), is_active=True)
             session.add(user)
             await session.flush()
-            connection = OAuthConnectionModel(user_id=user.id, provider="google", provider_account_id="crash", account_email="crash@example.test", scopes=[], status="connected", last_error_code=None)
-            session.add(connection)
+            connections = [
+                OAuthConnectionModel(user_id=user.id, provider="google", provider_account_id=f"crash-{index}", account_email=f"crash-{index}@example.test", scopes=[], status="connected", last_error_code=None)
+                for index in range(3)
+            ]
+            session.add_all(connections)
             await session.flush()
-            session.add(EncryptedCredentialModel(user_id=user.id, connection_id=connection.id, credential_kind="access_token", ciphertext=b"synthetic-token", nonce=b"123456789012", key_version=1, token_expires_at=None))
+            session.add_all(
+                EncryptedCredentialModel(user_id=user.id, connection_id=connection.id, credential_kind="access_token", ciphertext=b"synthetic-token", nonce=b"123456789012", key_version=1, token_expires_at=None)
+                for connection in connections
+            )
+            session.add(
+                UserSessionModel(
+                    user_id=user.id,
+                    token_hash=b"s" * 32,
+                    csrf_hash=b"f" * 32,
+                    created_at=datetime.now(UTC),
+                    expires_at=datetime(2031, 1, 1, tzinfo=UTC),
+                    last_seen_at=datetime.now(UTC),
+                )
+            )
             user_id = user.id
 
         with pytest.raises(RuntimeError, match="synthetic mid-batch crash"):
             await CrashAfterCredentialCleanupWorker(session_factory).delete_all_data(user_id=user_id, request_id="crash-request", batch_size=1)
+        async with session_factory() as session:
+            remaining_after_crash = await session.scalar(
+                select(func.count()).select_from(EncryptedCredentialModel).where(
+                    EncryptedCredentialModel.user_id == user_id
+                )
+            )
+        assert remaining_after_crash == 2
         await PrivacyDeletionWorker(session_factory).delete_all_data(user_id=user_id, request_id="crash-request", batch_size=1)
 
         async with session_factory() as session:
-            events = (await session.scalars(select(AuditEventModel).where(AuditEventModel.user_id == user_id, AuditEventModel.event_type == "privacy.deletion_completed"))).all()
+            credential_count = await session.scalar(
+                select(func.count())
+                .select_from(EncryptedCredentialModel)
+                .where(EncryptedCredentialModel.user_id == user_id)
+            )
+            connection_count = await session.scalar(
+                select(func.count())
+                .select_from(OAuthConnectionModel)
+                .where(OAuthConnectionModel.user_id == user_id)
+            )
+            session_count = await session.scalar(
+                select(func.count())
+                .select_from(UserSessionModel)
+                .where(UserSessionModel.user_id == user_id)
+            )
+            deleted_user = await session.get(UserModel, user_id)
+            events = (
+                await session.scalars(
+                    select(AuditEventModel).where(
+                        AuditEventModel.user_id == user_id,
+                        AuditEventModel.event_type == "privacy.deletion_completed",
+                    )
+                )
+            ).all()
 
+        assert credential_count == connection_count == session_count == 0
+        assert deleted_user is not None
+        assert deleted_user.email == f"deleted-{user_id}@invalid.local"
+        assert deleted_user.display_name == "Deleted User"
+        assert deleted_user.is_active is False
         assert len(events) == 1
         metadata = events[0].event_metadata
         assert set(metadata) == {"operation", "request_id", "completed_at", "trace_id"}

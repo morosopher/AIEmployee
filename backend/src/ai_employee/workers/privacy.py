@@ -261,7 +261,16 @@ class PrivacyDeletionWorker:
             ))
 
     async def _delete_user_rows(self, model: type[Any], user_id: UUID, batch_size: int) -> None:
-        """用主键子查询删除一个拥有 ``user_id`` 的表，保证每批独立提交。"""
+        """用主键子查询删除一个拥有 ``user_id`` 的表，保证每批独立提交。
+
+        每次循环的事务仅包含一批记录，提交成功后才进入下一批。该明确的提交边界既限制
+        删除时的锁范围，也让任务在进程中断后可以从剩余记录继续执行。
+
+        Args:
+            model: 仅在基础设施删除边界使用的 SQLAlchemy ORM 模型。
+            user_id: 待删除数据所属的用户标识。
+            batch_size: 单个事务允许删除的最大记录数。
+        """
         identifier = model.id
         ownership = model.user_id
         while True:
@@ -270,6 +279,28 @@ class PrivacyDeletionWorker:
                 if not ids:
                     return
                 await session.execute(delete(model).where(identifier.in_(ids)))  # type: ignore[arg-type]
+            # 只在事务成功提交后暴露批次边界，测试可以在这里模拟崩溃而不回滚已删除记录。
+            await self._after_user_row_batch(
+                model=model,
+                user_id=user_id,
+                deleted_count=len(ids),
+            )
+
+    async def _after_user_row_batch(
+        self,
+        *,
+        model: type[Any],
+        user_id: UUID,
+        deleted_count: int,
+    ) -> None:
+        """提供已提交删除批次的测试观察点，生产实现不引入额外副作用。
+
+        Args:
+            model: 刚完成删除的 ORM 模型，用于测试精确选择崩溃阶段。
+            user_id: 当前删除任务的用户标识。
+            deleted_count: 已在本次事务中持久删除的记录数量。
+        """
+        del model, user_id, deleted_count
 
     @staticmethod
     def _validate_batch_size(batch_size: int) -> None:
