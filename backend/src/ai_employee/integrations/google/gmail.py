@@ -1,9 +1,10 @@
 """实现 Gmail REST 只读访问、内容规范化与刷新感知错误映射。"""
 
 import base64
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from email.header import decode_header
+from email.message import EmailMessage
 from email.utils import getaddresses
 from html import unescape
 from typing import cast
@@ -274,18 +275,22 @@ class GmailAdapter:
 
     @classmethod
     def _body_parts(cls, payload: dict[str, object]) -> tuple[str | None, str | None]:
-        """递归收集 Gmail part，优先选择首个非空 text/plain 后回退 HTML。"""
+        """使用标准库 ``email`` 遍历 MIME，优先首个内联纯文本后回退 HTML。
+
+        Gmail REST 返回的 part tree 先转换为 ``EmailMessage``，使 charset、filename 和
+        Content-Disposition 均由标准库按 MIME 语义解析。仅使用响应内已经携带的数据，绝不
+        请求 attachment API；具有文件名或 ``attachment`` disposition 的文本部件一律跳过。
+        """
         plain: str | None = None
         html: str | None = None
-        for part in cls._walk_parts(payload):
-            mime_type = part.get("mimeType")
-            body = part.get("body")
-            if not isinstance(mime_type, str) or not isinstance(body, dict):
+        message = cls._as_email_message(payload)
+        for part in message.walk():
+            if part.is_multipart() or part.get_filename() or part.get_content_disposition() == "attachment":
                 continue
-            data = body.get("data")
-            if not isinstance(data, str):
+            mime_type = part.get_content_type()
+            if mime_type not in {"text/plain", "text/html"}:
                 continue
-            decoded = cls._decode_body(data)
+            decoded = cls._decode_mime_text(part)
             if mime_type == "text/plain" and plain is None:
                 plain = decoded
             elif mime_type == "text/html" and html is None:
@@ -293,20 +298,53 @@ class GmailAdapter:
         return plain, html
 
     @classmethod
-    def _walk_parts(cls, part: dict[str, object]) -> Iterator[dict[str, object]]:
-        """深度优先遍历嵌套 MIME parts，忽略没有 inline data 的附件元数据。"""
-        yield part
-        children = part.get("parts")
+    def _as_email_message(cls, payload: dict[str, object]) -> EmailMessage:
+        """将 Gmail JSON part tree 还原为标准库 MIME 结构，供统一处理 disposition 和 charset。"""
+        message = EmailMessage()
+        headers = payload.get("headers")
+        if isinstance(headers, list):
+            for header in headers:
+                if isinstance(header, dict) and isinstance(header.get("name"), str) and isinstance(
+                    header.get("value"), str
+                ):
+                    message[header["name"]] = header["value"]
+        children = payload.get("parts")
+        mime_type = payload.get("mimeType")
+        if not isinstance(mime_type, str):
+            mime_type = "multipart/mixed" if isinstance(children, list) else "text/plain"
+        if message.get_content_type() == "text/plain" and "Content-Type" not in message:
+            message.set_type(mime_type)
+        filename = payload.get("filename")
+        if isinstance(filename, str) and filename and message.get_filename() is None:
+            message.set_param("name", filename, header="Content-Type")
         if isinstance(children, list):
-            for child in children:
-                if isinstance(child, dict):
-                    yield from cls._walk_parts(cast(dict[str, object], child))
+            message.set_payload(
+                [cls._as_email_message(cast(dict[str, object], child)) for child in children if isinstance(child, dict)]
+            )
+            return message
+        body = payload.get("body")
+        data = body.get("data") if isinstance(body, dict) else None
+        if isinstance(data, str):
+            message.set_payload(cls._decode_body_bytes(data))
+        return message
 
     @staticmethod
-    def _decode_body(value: str) -> str:
-        """解码 Gmail URL-safe Base64 正文并替换畸形 UTF-8，避免传播原始 bytes。"""
+    def _decode_body_bytes(value: str) -> bytes:
+        """解码 Gmail URL-safe Base64 为原始 MIME bytes，不在此处猜测文本编码。"""
         padded = value + "=" * (-len(value) % 4)
-        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+        return base64.urlsafe_b64decode(padded)
+
+    @staticmethod
+    def _decode_mime_text(part: EmailMessage) -> str:
+        """按标准库解析出的 charset 解码内联文本；未知 charset 安全回退 UTF-8 替换。"""
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            return ""
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            return payload.decode(charset, errors="replace")
+        except LookupError:
+            return payload.decode("utf-8", errors="replace")
 
     @staticmethod
     def _clean_plain(value: str | None) -> str:

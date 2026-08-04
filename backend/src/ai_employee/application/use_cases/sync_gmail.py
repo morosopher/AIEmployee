@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
+from ai_employee.application.ports.encryption import EncryptedValue, Encryption
 from ai_employee.application.ports.gmail import (
     GmailConnectionState,
     GmailMessage,
@@ -14,7 +15,6 @@ from ai_employee.application.ports.gmail import (
     GmailSyncPage,
     HistoryCursorExpiredError,
 )
-from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 
 
 class GmailSyncStore(Protocol):
@@ -74,7 +74,7 @@ class SyncGmailUseCase:
     def __init__(
         self,
         stores: GmailSyncStoreFactory,
-        cipher: AeadCipher,
+        cipher: Encryption,
         gmail: GmailReader,
         clock: Clock | None = None,
     ) -> None:

@@ -121,6 +121,42 @@ async def test_html_fallback_removes_tracking_pixel_without_dimensions() -> None
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_text_attachment_is_not_normalized_as_message_body() -> None:
+    """具有 filename 或 attachment disposition 的文本 part 必须跳过，且不额外下载附件。"""
+    attachment_message = _message("message-1", "thread-1", "101")
+    payload = attachment_message["payload"]
+    assert isinstance(payload, dict)
+    payload["parts"] = [
+        {
+            "mimeType": "text/plain",
+            "filename": "private-notes.txt",
+            "headers": [
+                {"name": "Content-Disposition", "value": "attachment; filename=private-notes.txt"}
+            ],
+            "body": {"data": "QVRUQUNITUVOVF9TRU5USU5FTA=="},
+        },
+        {
+            "mimeType": "text/plain",
+            "headers": [{"name": "Content-Disposition", "value": "attachment"}],
+            "body": {"data": "RElTUE9TSVRJT05fU0VOVElORUw="},
+        },
+        {"mimeType": "text/plain", "body": {"data": "VmlzaWJsZSBtZXNzYWdlIGJvZHk="}},
+    ]
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "message-1"}], "historyId": "101"})
+    )
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages/message-1").mock(
+        return_value=httpx.Response(200, json=attachment_message)
+    )
+
+    pages = [page async for page in GmailAdapter(access_token="synthetic-access").initial_pages()]
+
+    assert pages[0].messages[0].normalized_body == "Visible message body"
+    assert all("attachments" not in str(call.request.url) for call in respx.calls)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_history_maps_added_messages_and_label_changes() -> None:
     """增量 history 同时产生新增邮件及标签变化涉及的消息读取。"""
     history = json.loads((FIXTURES / "gmail_history.json").read_text(encoding="utf-8"))

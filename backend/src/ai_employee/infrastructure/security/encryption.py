@@ -2,23 +2,11 @@
 
 import base64
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-
-@dataclass(frozen=True, slots=True)
-class EncryptedValue:
-    """保存可持久化的 AES-GCM 密文三元组。
-
-    ``ciphertext`` 已包含 GCM 认证标签；密钥本身绝不出现在该值或数据库中。
-    ``key_version`` 允许未来在不猜测历史密钥的前提下完成受控轮换。
-    """
-
-    ciphertext: bytes
-    nonce: bytes
-    key_version: int
+from ai_employee.application.ports.encryption import EncryptedValue
 
 
 class AeadCipher:
