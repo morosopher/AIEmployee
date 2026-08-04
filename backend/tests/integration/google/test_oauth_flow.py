@@ -1,7 +1,7 @@
 """验证 Google OAuth 连接流程的安全参数和一次性 state 语义。"""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -35,7 +35,7 @@ class FixedClock:
 @pytest.fixture
 async def oauth_context(
     database_url: str, monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> tuple[httpx.AsyncClient, ManagedAsyncSessionMaker]:
+) -> tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock]:
     """创建含临时 secret 文件、真实数据库和可控时钟的 OAuth API 上下文。"""
     master_key = tmp_path / "master_key"
     client_secret = tmp_path / "google_secret"
@@ -50,7 +50,8 @@ async def oauth_context(
     monkeypatch.setenv("GOOGLE_REDIRECT_URI", "https://example.test/callback")
     get_settings.cache_clear()
     app = create_app()
-    app.state.auth_clock = FixedClock(datetime(2030, 1, 1, tzinfo=UTC))
+    clock = FixedClock(datetime(2030, 1, 1, tzinfo=UTC))
+    app.state.auth_clock = clock
     queries = build_session_factory(database_url)
     async with queries.begin() as session:
         session.add(
@@ -66,7 +67,7 @@ async def oauth_context(
         )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
-        yield client, queries
+        yield client, queries, clock
     await queries.dispose()
     await app.state.auth_session_factory.dispose()
     get_settings.cache_clear()
@@ -74,10 +75,10 @@ async def oauth_context(
 
 @pytest.mark.asyncio
 async def test_oauth_callback_encrypts_tokens_and_rejects_reused_state(
-    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker],
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
 ) -> None:
     """认证+CSRF 启动后，mock callback 只能加密保存 token 且 state 不可重用。"""
-    client, queries = oauth_context
+    client, queries, _ = oauth_context
     login = await client.post(
         "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
     )
@@ -86,7 +87,10 @@ async def test_oauth_callback_encrypts_tokens_and_rejects_reused_state(
     assert csrf is not None
     started = await client.post("/api/v1/connections/google/start", headers={"X-CSRF-Token": csrf})
     assert started.status_code == 200
-    state = parse_qs(urlparse(started.json()["authorization_url"]).query)["state"][0]
+    start_query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    state = start_query["state"][0]
+    assert start_query["code_challenge_method"] == ["S256"]
+    assert len(start_query["code_challenge"][0]) == 43
     with respx.mock(assert_all_called=True) as mocked:
         mocked.post("https://oauth2.googleapis.com/token").respond(
             200,
@@ -122,6 +126,30 @@ async def test_oauth_callback_encrypts_tokens_and_rejects_reused_state(
         column.name in {"access_token", "refresh_token"}
         for column in EncryptedCredentialModel.__table__.columns
     )
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_rejects_state_after_ten_minute_expiry(
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
+) -> None:
+    """回调超过十分钟必须拒绝，且过期判断只依赖可控 UTC 时钟。"""
+    client, _, clock = oauth_context
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
+    )
+    assert login.status_code == 200
+    csrf = client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await client.post("/api/v1/connections/google/start", headers={"X-CSRF-Token": csrf})
+    state = parse_qs(urlparse(started.json()["authorization_url"]).query)["state"][0]
+
+    clock.current += timedelta(minutes=10, seconds=1)
+
+    expired = await client.get(
+        "/api/v1/connections/google/callback", params={"code": "synthetic-code", "state": state}
+    )
+    assert expired.status_code == 400
+    assert expired.json()["error_code"] == "oauth_state_rejected"
 
 
 def test_google_authorization_url_uses_minimal_readonly_scopes_and_pkce() -> None:
