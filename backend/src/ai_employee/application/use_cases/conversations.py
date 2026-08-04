@@ -40,5 +40,6 @@ class CreateConversationMessageUseCase:
             if existing is not None:
                 return CreateTaskResult(task_id=existing)
             task = await SqlAlchemyTaskRepository(session).create_with_outbox(user_id=user_id, kind="conversation.respond", input_payload={"conversation_id": str(conversation_id), "content": content_markdown}, idempotency_key=idempotency_key)
+            conversation.updated_at = datetime.now(UTC)
             session.add(MessageModel(user_id=user_id, conversation_id=conversation_id, role="user", content_markdown=content_markdown, task_id=task.task_id, created_at=datetime.now(UTC)))
             return task

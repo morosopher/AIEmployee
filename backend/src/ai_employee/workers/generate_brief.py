@@ -12,9 +12,12 @@ from sqlalchemy import select
 from ai_employee.agents.daily_brief.graph import build_daily_brief_graph
 from ai_employee.application.ports.model import ModelGateway
 from ai_employee.application.use_cases.briefs import PersistDailyBriefUseCase
+from ai_employee.application.use_cases.sync_calendar import CalendarConnectionNotFoundError
+from ai_employee.application.use_cases.sync_gmail import GmailConnectionNotFoundError
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.briefs import DailyBriefContent
+from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -166,7 +169,12 @@ class GenerateBriefTaskStep:
         for resource_kind, connection_id in stale:
             try:
                 await self._sync_source(resource_kind, connection_id, user_id)
-            except Exception:  # noqa: BLE001 - Worker 将单一来源错误降级为可审计 partial。
+            except (
+                TransientProviderError,
+                UserActionRequiredError,
+                GmailConnectionNotFoundError,
+                CalendarConnectionNotFoundError,
+            ):
                 warnings.append(f"source_sync_failed:{resource_kind}")
         return warnings
 

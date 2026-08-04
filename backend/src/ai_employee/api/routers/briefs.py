@@ -24,8 +24,10 @@ class BriefResponse(BaseModel):
     local_date: date
     version: int
     task_id: UUID
+    source_cutoff: object
     completeness: str
     headline: str
+    structured_content: dict[str, object]
     markdown: str
     warnings: list[str]
     items: list[dict[str, object]] = []
