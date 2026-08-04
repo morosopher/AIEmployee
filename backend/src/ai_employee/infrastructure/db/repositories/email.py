@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.gmail import GmailConnectionState, GmailMessage
-from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
@@ -190,16 +190,19 @@ class SqlAlchemyGmailSyncRepository:
         *,
         user_id: UUID,
         connection_id: UUID,
+        expected_cursor: str | None,
         latest_history_id: str,
         thread_count: int,
         message_count: int,
         used_full_resync: bool,
         completed_at: datetime,
     ) -> None:
-        """在同一事务中推进最终游标并追加不含正文的审计事实。
+        """在同一事务中 CAS 推进最终游标并追加不含正文的审计事实。
 
         游标只在所有页的 upsert 已成功排入当前事务后更新；提交失败会一起回滚，从而使下次
-        至少一次执行从旧游标安全重放。审计 metadata 只保存聚合计数和游标，不复制正文。
+        至少一次执行从旧游标安全重放。最终锁定后必须仍等于网络读取前的 ``expected_cursor``；
+        否则更晚同步已经提交，当前事务连同邮件写入一起回滚并交给 Durable Worker 重试。
+        审计 metadata 只保存聚合计数和游标，不复制正文。
         """
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
@@ -224,6 +227,12 @@ class SqlAlchemyGmailSyncRepository:
         if cursor is None:
             cursor = SyncCursorModel(connection_id=connection_id, resource_kind="gmail", cursor=None)
             self._session.add(cursor)
+        if cursor.cursor != expected_cursor:
+            raise TransientProviderError(
+                error_code="gmail_sync_cursor_conflict",
+                message="Gmail sync cursor changed during provider read",
+                retry_after=1,
+            )
         cursor.cursor = latest_history_id
         cursor.last_success_at = completed_at
         cursor.last_attempt_at = completed_at

@@ -123,6 +123,11 @@ class GmailAdapter:
                     error_code="google_timeout",
                     message="Google Gmail request timed out",
                 ) from error
+            except httpx.RequestError as error:
+                raise TransientProviderError(
+                    error_code="google_request_failed",
+                    message="Google Gmail request failed",
+                ) from error
             if response.status_code == 401:
                 if attempt == 0 and self._refresh_access_token is not None:
                     self._access_token = await self._refresh_access_token()

@@ -34,6 +34,7 @@ class GmailSyncStore(Protocol):
         *,
         user_id: UUID,
         connection_id: UUID,
+        expected_cursor: str | None,
         latest_history_id: str,
         thread_count: int,
         message_count: int,
@@ -120,6 +121,7 @@ class SyncGmailUseCase:
             await store.finish_sync(
                 user_id=user_id,
                 connection_id=connection_id,
+                expected_cursor=state.cursor,
                 latest_history_id=latest_history_id,
                 thread_count=len(thread_ids),
                 message_count=message_count,

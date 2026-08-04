@@ -1,5 +1,6 @@
 """在真实 PostgreSQL 上验证 Gmail 同步的幂等、游标和加密不变量。"""
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from ai_employee.application.ports.gmail import (
     GmailMessage,
     GmailSyncPage,
     HistoryCursorExpiredError,
+    TransientProviderError,
     UserActionRequiredError,
 )
 from ai_employee.application.use_cases.sync_gmail import SyncGmailUseCase
@@ -105,6 +107,34 @@ class DisconnectBeforeFinishRepository(SqlAlchemyGmailSyncRepository):
         assert connection is not None
         connection.status = "disconnected"
         await super().finish_sync(**kwargs)
+
+
+class BlockingHistoryGmailReader:
+    """在已读取旧 cursor 后暂停 history 响应，以构造两个真实同步协程的提交交错。"""
+
+    def __init__(
+        self,
+        *,
+        loaded: asyncio.Event,
+        release: asyncio.Event,
+        page: GmailSyncPage,
+    ) -> None:
+        """保存协调事件和旧读取完成后将返回的合成页。"""
+        self._loaded = loaded
+        self._release = release
+        self._page = page
+
+    async def initial_pages(self) -> AsyncIterator[GmailSyncPage]:
+        """该竞态只覆盖增量同步；初始分页不可达且不产生任何供应商事实。"""
+        if False:
+            yield self._page
+
+    async def history_pages(self, cursor: str) -> AsyncIterator[GmailSyncPage]:
+        """确认旧 cursor 已被读取，再等待另一同步提交更晚游标。"""
+        assert cursor == "100"
+        self._loaded.set()
+        await self._release.wait()
+        yield self._page
 
 
 @asynccontextmanager
@@ -297,6 +327,55 @@ async def test_cursor_is_not_advanced_when_a_later_page_write_fails(database_url
 
 
 @pytest.mark.asyncio
+async def test_concurrent_sync_cannot_roll_back_a_newer_history_cursor(database_url: str) -> None:
+    """旧请求在新 cursor 提交后结束时必须回滚自身写入并请求耐久重试。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"g" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher, cursor_value="100")
+        old_loaded = asyncio.Event()
+        release_old = asyncio.Event()
+        old_use_case = SyncGmailUseCase(
+            lambda: _repository_factory(sessions),
+            cipher,
+            BlockingHistoryGmailReader(
+                loaded=old_loaded,
+                release=release_old,
+                page=GmailSyncPage((_message("old-message"),), None, "200"),
+            ),
+        )
+        newer_use_case = SyncGmailUseCase(
+            lambda: _repository_factory(sessions),
+            cipher,
+            FakeGmailReader(
+                initial=(),
+                history=(GmailSyncPage((_message("new-message"),), None, "300"),),
+            ),
+        )
+
+        old_task = asyncio.create_task(
+            old_use_case.execute(user_id=user_id, connection_id=connection_id)
+        )
+        await old_loaded.wait()
+        newer_result = await newer_use_case.execute(user_id=user_id, connection_id=connection_id)
+        release_old.set()
+
+        with pytest.raises(TransientProviderError) as raised:
+            await old_task
+        async with sessions() as session:
+            cursor = await session.scalar(select(SyncCursorModel.cursor))
+            messages = tuple(
+                (await session.scalars(select(EmailMessageModel.provider_message_id))).all()
+            )
+        assert newer_result.cursor == "300"
+        assert raised.value.error_code == "gmail_sync_cursor_conflict"
+        assert cursor == "300"
+        assert messages == ("new-message",)
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
 async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitted(database_url: str) -> None:
     """刷新更新 access 密文和 expiry；Google 未轮换 refresh token 时仍保留既有密文。"""
     sessions = build_session_factory(database_url)
@@ -372,5 +451,86 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
             EncryptedValue(access.ciphertext, access.nonce, access.key_version),
             f"{user_id}:{connection_id}:access_token".encode(),
         ) == b"rotated-access"
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
+    database_url: str,
+) -> None:
+    """refresh token 的 400/invalid_grant 是可修复授权错误，不得作为内部 Worker 错误。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"h" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher)
+        respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+            return_value=httpx.Response(401)
+        )
+        respx.post("https://oauth2.googleapis.com/token").mock(
+            return_value=httpx.Response(400, json={"error": "invalid_grant"})
+        )
+        step = GmailSyncTaskStep(
+            session_factory=sessions,
+            cipher=cipher,
+            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+        )
+
+        with pytest.raises(UserActionRequiredError) as raised:
+            await step.execute(
+                LeasedTask(
+                    task_id=UUID("00000000-0000-0000-0000-000000000002"),
+                    kind="sync_gmail",
+                    input_payload={"connection_id": str(connection_id)},
+                    started_at=datetime(2030, 1, 1, tzinfo=UTC),
+                    user_id=user_id,
+                )
+            )
+        async with sessions() as session:
+            status = await session.scalar(select(OAuthConnectionModel.status))
+        assert raised.value.error_code == "google_reauthorization_required"
+        assert status == "expired"
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_worker_preserves_connected_state_when_refresh_is_rate_limited(
+    database_url: str,
+) -> None:
+    """refresh token 的 429 必须保留 Retry-After 供耐久重试，且不能错误过期连接。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"i" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher)
+        respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+            return_value=httpx.Response(401)
+        )
+        respx.post("https://oauth2.googleapis.com/token").mock(
+            return_value=httpx.Response(429, headers={"Retry-After": "41"})
+        )
+        step = GmailSyncTaskStep(
+            session_factory=sessions,
+            cipher=cipher,
+            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+        )
+
+        with pytest.raises(TransientProviderError) as raised:
+            await step.execute(
+                LeasedTask(
+                    task_id=UUID("00000000-0000-0000-0000-000000000003"),
+                    kind="sync_gmail",
+                    input_payload={"connection_id": str(connection_id)},
+                    started_at=datetime(2030, 1, 1, tzinfo=UTC),
+                    user_id=user_id,
+                )
+            )
+        async with sessions() as session:
+            status = await session.scalar(select(OAuthConnectionModel.status))
+        assert raised.value.error_code == "google_rate_limited"
+        assert raised.value.retry_after == 41
+        assert status == "connected"
     finally:
         await sessions.dispose()

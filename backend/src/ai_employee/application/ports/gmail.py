@@ -45,13 +45,14 @@ class GmailMessage:
     provider_url: str
 
     def __post_init__(self) -> None:
-        """复制并冻结嵌套映射，避免适配器或测试调用方在消息创建后篡改同步事实。"""
+        """复制并冻结嵌套集合，避免适配器或测试调用方在消息创建后篡改同步事实。"""
         object.__setattr__(self, "sender", MappingProxyType(dict(self.sender)))
         object.__setattr__(
             self,
             "recipients",
             tuple(MappingProxyType(dict(recipient)) for recipient in self.recipients),
         )
+        object.__setattr__(self, "labels", tuple(self.labels))
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
 
 
@@ -62,6 +63,10 @@ class GmailSyncPage:
     messages: tuple[GmailMessage, ...]
     next_page_token: str | None
     latest_history_id: str
+
+    def __post_init__(self) -> None:
+        """复制页消息集合，阻止分页生成器或调用方事后追加并改变已读取结果。"""
+        object.__setattr__(self, "messages", tuple(self.messages))
 
 
 @dataclass(frozen=True, slots=True)

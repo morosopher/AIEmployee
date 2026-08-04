@@ -7,7 +7,12 @@ import httpx
 import pytest
 import respx
 
-from ai_employee.application.ports.gmail import TransientProviderError, UserActionRequiredError
+from ai_employee.application.ports.gmail import (
+    GmailMessage,
+    GmailSyncPage,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.integrations.google.gmail import GmailAdapter
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -231,6 +236,52 @@ def test_normalized_message_collections_are_deeply_immutable() -> None:
         message.recipients[0]["email"] = "changed@example.test"  # type: ignore[index]
     with pytest.raises(TypeError):
         message.headers["subject"] = "Changed"  # type: ignore[index]
+
+
+def test_message_labels_and_page_messages_are_copied_to_tuples() -> None:
+    """即使不可信调用方传入列表，端口对象也必须复制为不可变 tuple。"""
+    labels = ["INBOX"]
+    messages = [GmailAdapter._normalize_message(_message("message-1", "thread-1", "101"))]
+    message = GmailAdapter._normalize_message(_message("message-2", "thread-2", "102"))
+    mutable_message = GmailMessage(
+        message_id=message.message_id,
+        thread_id=message.thread_id,
+        history_id=message.history_id,
+        received_at=message.received_at,
+        sender=message.sender,
+        recipients=message.recipients,
+        subject=message.subject,
+        snippet=message.snippet,
+        normalized_body=message.normalized_body,
+        labels=labels,
+        headers=message.headers,
+        provider_url=message.provider_url,
+    )
+    page = GmailSyncPage(
+        messages=messages,
+        next_page_token=None,
+        latest_history_id="102",
+    )
+
+    labels.append("STARRED")
+    messages.append(mutable_message)
+
+    assert mutable_message.labels == ("INBOX",)
+    assert page.messages == (messages[0],)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_non_timeout_http_request_error_is_transient_provider_error() -> None:
+    """连接、TLS 或协议错误同样必须映射为可重试且脱敏的领域供应商错误。"""
+    respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+        side_effect=httpx.ConnectError("synthetic connection failure")
+    )
+
+    with pytest.raises(TransientProviderError) as raised:
+        await GmailAdapter(access_token="synthetic-access").execute_request("/messages", {})
+
+    assert raised.value.error_code == "google_request_failed"
 
 
 @pytest.mark.asyncio

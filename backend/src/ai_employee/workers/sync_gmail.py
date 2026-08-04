@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
 
+import httpx
+
 from ai_employee.application.use_cases.sync_gmail import (
     GmailConnectionNotFoundError,
     GmailSyncStoreFactory,
@@ -11,6 +13,7 @@ from ai_employee.application.use_cases.sync_gmail import (
 )
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
+from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.encryption import AeadCipher
@@ -69,10 +72,43 @@ class GmailSyncTaskStep:
         )
 
         async def refresh_access_token() -> str:
-            """刷新并原子轮换密文；未返回 refresh 时保留数据库中原记录。"""
+            """刷新并原子轮换密文，同时把 OAuth 网络失败收窄为可恢复领域错误。
+
+            refresh token 被 Google 以 400/401 拒绝时，连接已不再可由后台自行恢复，必须
+            先持久化 ``expired`` 再提示用户重新授权。429、5xx 与全部 HTTP 传输异常则保留
+            连接状态，让 DurableTaskRunner 根据稳定错误码及 ``Retry-After`` 安排重试。
+            """
             if refresh_token is None:
                 raise GmailConnectionNotFoundError
-            refreshed = await self._oauth.refresh_token(refresh_token)
+            try:
+                refreshed = await self._oauth.refresh_token(refresh_token)
+            except httpx.HTTPStatusError as error:
+                status_code = error.response.status_code
+                if status_code in {400, 401}:
+                    await mark_expired()
+                    raise UserActionRequiredError(
+                        error_code="google_reauthorization_required",
+                        message="Google Gmail authorization requires user action",
+                    ) from error
+                if status_code == 429 or status_code >= 500:
+                    raise TransientProviderError(
+                        error_code=(
+                            "google_rate_limited"
+                            if status_code == 429
+                            else "google_service_unavailable"
+                        ),
+                        message="Google token refresh is temporarily unavailable",
+                        retry_after=self._retry_after(error.response),
+                    ) from error
+                raise UserActionRequiredError(
+                    error_code="google_reauthorization_required",
+                    message="Google Gmail authorization requires user action",
+                ) from error
+            except httpx.RequestError as error:
+                raise TransientProviderError(
+                    error_code="google_request_failed",
+                    message="Google token refresh request failed",
+                ) from error
             encrypted_access = self._cipher.encrypt(
                 refreshed.access_token.encode("utf-8"),
                 self._credential_aad(user_id, connection_id, "access_token"),
@@ -113,6 +149,22 @@ class GmailSyncTaskStep:
     def _credential_aad(user_id: UUID, connection_id: UUID, kind: str) -> bytes:
         """保持与 OAuth 回调一致的 token AAD，阻止跨连接密文替换。"""
         return f"{user_id}:{connection_id}:{kind}".encode("ascii")
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> int | None:
+        """解析 OAuth 响应的非负秒数提示，畸形值交由耐久退避策略使用默认等待。
+
+        Args:
+            response: 已由 httpx 绑定请求上下文的 Google OAuth 响应。
+
+        Returns:
+            合法 ``Retry-After`` 的秒数；缺失、日期格式或非法值时返回 ``None``。
+        """
+        try:
+            retry_after = int(response.headers.get("Retry-After", ""))
+        except ValueError:
+            return None
+        return retry_after if retry_after >= 0 else None
 
 
 def build_gmail_sync_task_step(
