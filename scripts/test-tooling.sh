@@ -4,7 +4,7 @@ set -euo pipefail
 # 该列表是仓库统一命令入口的最小契约，任何 recipe 缺失都应让脚手架检查立即失败。
 required_recipes=(
   doctor bootstrap dev infra-up infra-down web api worker scheduler
-  test test-backend test-frontend test-integration test-e2e
+  test test-backend test-frontend test-integration test-e2e e2e-backend
   lint format typecheck check ci db-upgrade db-revision db-reset
   create-admin logs ps health backup restore
 )

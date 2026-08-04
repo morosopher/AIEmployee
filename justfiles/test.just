@@ -19,6 +19,10 @@ test-e2e:
     pnpm --dir frontend test:e2e
 
 [group('quality')]
+e2e-backend:
+    bash scripts/run-e2e-backend.sh
+
+[group('quality')]
 lint:
     uv run --project backend ruff check backend
     pnpm --dir frontend lint

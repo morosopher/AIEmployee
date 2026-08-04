@@ -57,6 +57,14 @@ export interface AuthUser {
   brief_time: string
 }
 
+export interface BriefItem { position: number; section: string; priority: string; title: string; body_markdown: string; source_refs: Array<{ provider: string; object_id: string; label?: string }>; suggested_action_kind: string | null }
+export interface Brief { id: string; local_date: string; version: number; task_id: string; source_cutoff: string; completeness: string; headline: string; structured_content: JsonObject; markdown: string; warnings: string[]; items: BriefItem[] }
+export interface UserSettings { timezone: string; locale: string; brief_time: string; email_body_retention_days: number; source_metadata_retention_days: number; workspace_history_retention_days: number; updated_at: string }
+export interface Conversation { id: string; title: string; created_at: string; updated_at: string }
+export interface Message { id: string; role: string; content_markdown: string; task_id: string | null; created_at: string }
+export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string }
+export interface Connection { id: string; provider: string; account_email: string; scopes: string[]; status: string; last_error_code: string | null }
+
 /** RFC 9457 扩展错误字段，提供稳定的恢复提示和追踪编号。 */
 export interface ProblemDetails {
   type: string
