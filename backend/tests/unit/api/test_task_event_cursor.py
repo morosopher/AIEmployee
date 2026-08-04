@@ -41,12 +41,17 @@ def test_event_cursor_rejects_noncanonical_header_or_query_value(
 
 @pytest.mark.parametrize(
     ("header_value", "query_value"),
-    [("9223372036854775808", None), (None, "9223372036854775808")],
+    [
+        ("9223372036854775808", None),
+        (None, "9223372036854775808"),
+        ("9" * 5000, None),
+        (None, "9" * 5000),
+    ],
 )
 def test_event_cursor_rejects_value_larger_than_postgresql_bigint(
     header_value: str | None, query_value: str | None
 ) -> None:
-    """Header 与查询游标不得超过持久审计事件 ID 的 BIGINT 上限。"""
+    """Header 与查询游标不得超过 BIGINT 上限，且不得触发 Python 大整数解析错误。"""
     with pytest.raises(ApiProblem) as captured:
         _event_cursor(header_value=header_value, query_value=query_value)
 
