@@ -7,7 +7,7 @@ import {
   type Ref,
 } from 'vue'
 
-import { parseTaskEvent, type TaskConnectionState } from '@/api/types'
+import { parseTaskEvent, type TaskConnectionState, type TaskEvent } from '@/api/types'
 import { useTasksStore } from '@/stores/tasks'
 
 /** 服务端每 15 秒发送 heartbeat；连续两个周期无任何活动即主动建立新连接。 */
@@ -21,6 +21,7 @@ const HEARTBEAT_TIMEOUT_MS = 30_000
  */
 export function useTaskEvents(
   taskId: MaybeRefOrGetter<string | null>,
+  onEvent?: (event: TaskEvent) => void,
 ): Ref<TaskConnectionState> {
   const tasks = useTasksStore()
   const connectionState = ref<TaskConnectionState>('disconnected')
@@ -93,6 +94,7 @@ export function useTaskEvents(
       connectionState.value = 'connected'
       tasks.setConnectionState(event.task_id, 'connected')
       tasks.applyEvent(event)
+      onEvent?.(event)
     }
     eventSource.onopen = () => {
       if (source !== eventSource) return
