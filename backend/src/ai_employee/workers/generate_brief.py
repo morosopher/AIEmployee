@@ -54,12 +54,14 @@ class GenerateBriefTaskStep:
         """生成当日简报；无可用来源由 Graph 写稳定失败，不伪造成功。"""
         if task.user_id is None:
             raise ValueError("daily_brief requires user_id")
-        cutoff = self._utc_now()
+        cutoff = self._cutoff(task.input_payload.get("source_cutoff"))
         async with self._session_factory() as session:
             user = await session.get(UserModel, task.user_id)
             if user is None:
                 raise ValueError("daily_brief user not found")
-            local_date = self._local_date(task.input_payload.get("local_date"), user.timezone)
+            local_date = self._local_date(
+                task.input_payload.get("local_date"), user.timezone, cutoff
+            )
             stale = await self._stale_resources(session, task.user_id, cutoff)
         warnings = await self._refresh_stale_sources(task.user_id, stale)
         async with self._session_factory() as session:
@@ -67,7 +69,7 @@ class GenerateBriefTaskStep:
             if user is None:
                 raise ValueError("daily_brief user not found")
             mail_threads = await self._mail_threads_for_local_day(
-                session, task.user_id, local_date, user.timezone
+                session, task.user_id, local_date, user.timezone, cutoff
             )
             calendar_events = await self._events_for_local_day(
                 session, task.user_id, local_date, user.timezone
@@ -156,17 +158,23 @@ class GenerateBriefTaskStep:
         return warnings
 
     async def _mail_threads_for_local_day(
-        self, session: Any, user_id: UUID, local_date: date, timezone: str
+        self,
+        session: Any,
+        user_id: UUID,
+        local_date: date,
+        timezone: str,
+        cutoff: datetime,
     ) -> list[dict[str, object]]:
         """按邮件 received_at 的用户本地日去重线程，绝不以线程更新时间替代接收日期。"""
         start, end = self._day_bounds(local_date, timezone)
+        upper = min(end, cutoff)
         messages = (
             await session.scalars(
                 select(EmailMessageModel)
                 .where(
                     EmailMessageModel.user_id == user_id,
                     EmailMessageModel.received_at >= start,
-                    EmailMessageModel.received_at < end,
+                    EmailMessageModel.received_at < upper,
                 )
                 .order_by(EmailMessageModel.received_at.desc())
             )
@@ -270,13 +278,22 @@ class GenerateBriefTaskStep:
         return current.astimezone(UTC)
 
     @staticmethod
-    def _local_date(raw: object, timezone: str) -> date:
+    def _local_date(raw: object, timezone: str, cutoff: datetime) -> date:
         """优先使用任务中的明确本地日期，否则显式转换用户时区。"""
         return (
             date.fromisoformat(raw)
             if isinstance(raw, str)
-            else datetime.now(UTC).astimezone(ZoneInfo(timezone)).date()
+            else cutoff.astimezone(ZoneInfo(timezone)).date()
         )
+
+    def _cutoff(self, raw: object) -> datetime:
+        """使用任务冻结的 source cutoff；缺失时只在入口读取一次当前 UTC。"""
+        if isinstance(raw, str):
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("source_cutoff must be timezone-aware")
+            return parsed.astimezone(UTC)
+        return self._utc_now()
 
 
 def build_generate_brief_task_step(

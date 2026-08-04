@@ -1,7 +1,7 @@
 """暴露用户简报偏好设置，并以 CSRF 保护所有修改。"""
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ai_employee.api.deps import CsrfProtectedSession, CurrentSession
 from ai_employee.domain.settings import (
@@ -16,6 +16,7 @@ from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 
 class SettingsPatch(BaseModel):
     """只允许本任务定义的六项用户偏好进行部分更新。"""
+    model_config = ConfigDict(extra="forbid")
     timezone: str | None = None
     locale: str | None = None
     brief_time: str | None = None
