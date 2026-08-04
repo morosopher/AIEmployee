@@ -12,7 +12,16 @@ export DATABASE_URL="$TEST_DATABASE_URL" REDIS_URL="$TEST_REDIS_URL" APP_ENV=tes
 uv run --project backend alembic -c backend/alembic.ini upgrade head
 uv run --project backend python -m ai_employee.cli.create_admin --email "$E2E_ADMIN_EMAIL" --password-file "$E2E_ADMIN_PASSWORD_FILE" --if-absent
 worker_pid=''
-cleanup() { [[ -z "$worker_pid" ]] || kill "$worker_pid" 2>/dev/null || true; }
+api_pid=''
+cleanup() {
+  [[ -z "$api_pid" ]] || kill "$api_pid" 2>/dev/null || true
+  [[ -z "$worker_pid" ]] || kill "$worker_pid" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 uv run --project backend taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker & worker_pid=$!
-exec uv run --project backend uvicorn ai_employee.main:app --host 127.0.0.1 --port 8000
+uv run --project backend uvicorn ai_employee.main:app --host 127.0.0.1 --port 8000 & api_pid=$!
+set +e
+wait "$api_pid"
+api_status=$?
+set -e
+exit "$api_status"
