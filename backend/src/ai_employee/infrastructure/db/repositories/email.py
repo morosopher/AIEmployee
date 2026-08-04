@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.gmail import GmailConnectionState, GmailMessage
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
@@ -39,9 +40,7 @@ class SqlAlchemyGmailSyncRepository:
         """绑定由用例拥有的异步会话，禁止仓储跨边界提交。"""
         self._session = session
 
-    async def get_state(
-        self, *, user_id: UUID, connection_id: UUID
-    ) -> GmailConnectionState | None:
+    async def get_state(self, *, user_id: UUID, connection_id: UUID) -> GmailConnectionState | None:
         """按用户条件锁定连接及 Gmail 游标，阻止跨用户读取或游标竞争。
 
         Returns:
@@ -61,11 +60,16 @@ class SqlAlchemyGmailSyncRepository:
             return None
         cursor = await self._session.scalar(
             select(SyncCursorModel)
-            .where(SyncCursorModel.connection_id == connection_id, SyncCursorModel.resource_kind == "gmail")
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "gmail",
+            )
             .with_for_update()
         )
         if cursor is None:
-            cursor = SyncCursorModel(connection_id=connection_id, resource_kind="gmail", cursor=None)
+            cursor = SyncCursorModel(
+                connection_id=connection_id, resource_kind="gmail", cursor=None
+            )
             self._session.add(cursor)
             await self._session.flush()
         return GmailConnectionState(cursor.cursor)
@@ -90,7 +94,9 @@ class SqlAlchemyGmailSyncRepository:
                     select(EncryptedCredentialModel).where(
                         EncryptedCredentialModel.connection_id == connection_id,
                         EncryptedCredentialModel.user_id == user_id,
-                        EncryptedCredentialModel.credential_kind.in_(("access_token", "refresh_token")),
+                        EncryptedCredentialModel.credential_kind.in_(
+                            ("access_token", "refresh_token")
+                        ),
                     )
                 )
             ).all()
@@ -108,6 +114,10 @@ class SqlAlchemyGmailSyncRepository:
                 else None
             ),
         )
+
+    async def get_user_timezone(self, *, user_id: UUID) -> str | None:
+        """读取已验证用户 IANA 时区，Calendar 适配器不能退回宿主机或硬编码 UTC。"""
+        return await self._session.scalar(select(UserModel.timezone).where(UserModel.id == user_id))
 
     async def upsert_message(
         self,
@@ -221,11 +231,16 @@ class SqlAlchemyGmailSyncRepository:
             )
         cursor = await self._session.scalar(
             select(SyncCursorModel)
-            .where(SyncCursorModel.connection_id == connection_id, SyncCursorModel.resource_kind == "gmail")
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "gmail",
+            )
             .with_for_update()
         )
         if cursor is None:
-            cursor = SyncCursorModel(connection_id=connection_id, resource_kind="gmail", cursor=None)
+            cursor = SyncCursorModel(
+                connection_id=connection_id, resource_kind="gmail", cursor=None
+            )
             self._session.add(cursor)
         if cursor.cursor != expected_cursor:
             raise TransientProviderError(
@@ -283,7 +298,9 @@ class SqlAlchemyGmailSyncRepository:
         """把连续 401 的连接持久化为 expired，阻止后续 Worker 继续访问 Google。"""
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
-            .where(OAuthConnectionModel.id == connection_id, OAuthConnectionModel.user_id == user_id)
+            .where(
+                OAuthConnectionModel.id == connection_id, OAuthConnectionModel.user_id == user_id
+            )
             .with_for_update()
         )
         if connection is not None:

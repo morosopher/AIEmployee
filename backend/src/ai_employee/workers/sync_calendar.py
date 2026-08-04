@@ -1,7 +1,10 @@
 """将 durable ``sync_calendar`` 任务连接到 Calendar 同步用例。"""
 
+from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
+
+import httpx
 
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarSyncStoreFactory,
@@ -9,6 +12,7 @@ from ai_employee.application.use_cases.sync_calendar import (
 )
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
+from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepositoryFactory,
 )
@@ -44,11 +48,14 @@ class CalendarSyncTaskStep:
         connection_id, user_id = UUID(raw_connection), task.user_id
         async with self._credential_stores() as store:
             credentials = await store.get_credentials(user_id=user_id, connection_id=connection_id)
+            timezone = await store.get_user_timezone(user_id=user_id)
         if credentials is None:
             from ai_employee.application.use_cases.sync_calendar import (
                 CalendarConnectionNotFoundError,
             )
 
+            raise CalendarConnectionNotFoundError
+        if timezone is None:
             raise CalendarConnectionNotFoundError
         access = self._cipher.decrypt(
             credentials.access_token, self._credential_aad(user_id, connection_id, "access_token")
@@ -63,15 +70,62 @@ class CalendarSyncTaskStep:
         )
 
         async def refresh_access_token() -> str:
-            """通过现有 OAuth 端口刷新 token；worker 将 HTTP 分类交给耐久边界。"""
+            """严格对齐 Gmail：一次 refresh 后 AEAD 轮换，按状态分类失败。"""
             if refresh is None:
-                raise RuntimeError("Google Calendar refresh token unavailable")
-            return (await self._oauth.refresh_token(refresh)).access_token
+                raise CalendarConnectionNotFoundError
+            try:
+                refreshed = await self._oauth.refresh_token(refresh)
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code in {400, 401}:
+                    await mark_expired()
+                    raise UserActionRequiredError(
+                        error_code="google_reauthorization_required",
+                        message="Google Calendar authorization requires user action",
+                    ) from error
+                if error.response.status_code == 429 or error.response.status_code >= 500:
+                    raise TransientProviderError(
+                        error_code="google_rate_limited"
+                        if error.response.status_code == 429
+                        else "google_service_unavailable",
+                        message="Google token refresh is temporarily unavailable",
+                    ) from error
+                raise UserActionRequiredError(
+                    error_code="google_reauthorization_required",
+                    message="Google Calendar authorization requires user action",
+                ) from error
+            except httpx.RequestError as error:
+                raise TransientProviderError(
+                    error_code="google_request_failed",
+                    message="Google token refresh request failed",
+                ) from error
+            async with self._credential_stores() as store:
+                await store.rotate_access_token(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    access_token=self._cipher.encrypt(
+                        refreshed.access_token.encode(),
+                        self._credential_aad(user_id, connection_id, "access_token"),
+                    ),
+                    expires_at=datetime.now(UTC) + timedelta(seconds=refreshed.expires_in),
+                    refresh_token=self._cipher.encrypt(
+                        refreshed.refresh_token.encode(),
+                        self._credential_aad(user_id, connection_id, "refresh_token"),
+                    )
+                    if refreshed.refresh_token
+                    else None,
+                )
+            return refreshed.access_token
+
+        async def mark_expired() -> None:
+            """第二次资源 401 或 refresh 授权失效均独立提交 expired。"""
+            async with self._credential_stores() as store:
+                await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
         adapter = CalendarAdapter(
             access_token=access,
-            user_timezone="UTC",
+            user_timezone=timezone,
             refresh_access_token=refresh_access_token if refresh else None,
+            mark_expired=mark_expired,
         )
         await SyncCalendarUseCase(
             cast(CalendarSyncStoreFactory, self._stores), self._cipher, adapter

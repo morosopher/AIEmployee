@@ -206,6 +206,8 @@ class SqlAlchemyCalendarSyncRepository:
                     "events_upserted": event_count,
                     "cursor": next_sync_token,
                     "used_full_resync": used_full_resync,
+                    # 仅记录同步完成的 UTC cutoff，不复制 title、description 或地点。
+                    "cutoff": completed_at.isoformat(),
                 },
             )
         )
