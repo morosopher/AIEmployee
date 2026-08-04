@@ -45,7 +45,12 @@ def find_conflicts(events: Iterable[CalendarEvent]) -> tuple[tuple[CalendarEvent
     Raises:
         ValueError: 参与比较的定时事件没有带时区时间或结束不晚于开始。
     """
-    busy_events = [event for event in events if _participates_in_conflicts(event)]
+    # 同步分页或重复投递可能带来同一供应商事件的多份副本；先按稳定标识去重，
+    # 避免把事件自身误判为冲突，同时保留首次出现的规范化版本。
+    unique_events: dict[str, CalendarEvent] = {}
+    for event in events:
+        unique_events.setdefault(event.event_id, event)
+    busy_events = [event for event in unique_events.values() if _participates_in_conflicts(event)]
     normalized_events = sorted(busy_events, key=lambda event: _validated_start(event))
     conflicts: list[tuple[CalendarEvent, CalendarEvent]] = []
 

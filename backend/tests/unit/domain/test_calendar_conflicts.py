@@ -94,3 +94,14 @@ def test_cross_utc_midnight_events_compare_after_timezone_normalization() -> Non
     )
 
     assert find_conflicts((second, first)) == ((first, second),)
+
+
+def test_duplicate_event_id_is_not_compared_with_itself() -> None:
+    """重复同步同一稳定事件不得生成事件与自身的冲突对。"""
+    event = CalendarEvent(
+        event_id="duplicate",
+        start_at=datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+        end_at=datetime(2026, 8, 4, 10, 0, tzinfo=UTC),
+    )
+
+    assert find_conflicts((event, event)) == ()
