@@ -106,3 +106,9 @@ async def test_calendar_rate_limit_is_typed_transient_error() -> None:
     with pytest.raises(TransientProviderError) as raised:
         await CalendarAdapter(access_token="x", user_timezone="UTC").execute_request({})
     assert raised.value.error_code == "google_rate_limited" and raised.value.retry_after == 12
+
+
+def test_minimal_cancelled_tombstone_does_not_invent_event_times() -> None:
+    """Google 增量删除可只给 ID；适配器必须保留 tombstone 而不能伪造旧日程时段。"""
+    event = CalendarAdapter(access_token="x", user_timezone="UTC")._normalize({"id": "deleted-1", "status": "cancelled", "recurringEventId": "series-1"})
+    assert event.status == "cancelled" and event.starts_at is None and event.ends_at is None

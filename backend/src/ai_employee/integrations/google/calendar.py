@@ -127,7 +127,11 @@ class CalendarAdapter:
 
     def _normalize(self, payload: dict[str, object]) -> CalendarEvent:
         """收窄供应商字段，日期事件按源时区当地午夜转为 UTC。"""
-        event_id, etag = self._required(payload, "id"), self._required(payload, "etag")
+        event_id = self._required(payload, "id")
+        status = self._optional_string(payload.get("status")) or "confirmed"
+        if status == "cancelled" and (not isinstance(payload.get("start"), dict) or not isinstance(payload.get("end"), dict)):
+            return CalendarEvent(event_id, "primary", "", "", "", None, None, False, "opaque", status, str(self._timezone), self._optional_string(payload.get("recurringEventId")), self._optional_string(payload.get("etag")), self._optional_string(payload.get("htmlLink")) or "", self._provider_updated_at(payload.get("updated")))
+        etag = self._required(payload, "etag")
         start, end = self._record(payload.get("start")), self._record(payload.get("end"))
         timezone = (
             self._optional_string(start.get("timeZone"))
@@ -147,7 +151,7 @@ class CalendarAdapter:
             ends_at,
             all_day,
             self._optional_string(payload.get("transparency")) or "opaque",
-            self._optional_string(payload.get("status")) or "confirmed",
+            status,
             timezone,
             self._optional_string(payload.get("recurringEventId")),
             etag,

@@ -21,14 +21,14 @@ class CalendarEvent:
     title: str
     description: str
     location: str
-    starts_at: datetime
-    ends_at: datetime
+    starts_at: datetime | None
+    ends_at: datetime | None
     all_day: bool
     transparency: str
     status: str
     timezone: str
     recurring_event_id: str | None
-    etag: str
+    etag: str | None
     provider_url: str
     updated_at: datetime | None = None
 
