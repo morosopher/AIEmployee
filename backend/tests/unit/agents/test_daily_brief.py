@@ -1,6 +1,7 @@
 """每日简报图的合成数据契约测试。"""
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import ValidationError
 
 from ai_employee.agents.daily_brief.graph import build_daily_brief_graph
@@ -182,3 +183,8 @@ async def test_mail_model_input_redacts_builtin_and_configured_values() -> None:
         and "CUSTOM_SECRET" not in sent
     )
     assert "safe-id" in sent
+
+
+def test_graph_accepts_injected_checkpoint_saver() -> None:
+    saver = MemorySaver()
+    assert build_daily_brief_graph(checkpointer=saver).checkpointer is saver
