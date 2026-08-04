@@ -21,6 +21,7 @@ from ai_employee.domain.email import (
     classify_urgency_by_rules,
 )
 from ai_employee.domain.model_redaction import redact_for_model
+from ai_employee.integrations.llm.openai_compatible import ModelGatewayError
 
 
 class DailyBriefSourceFailure(RuntimeError):
@@ -138,7 +139,10 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                 if "fake_partial" in judgement.reason_codes:
                     state["warnings"].append(f"model_partial:{thread_id}")
                 outputs.append(judgement.model_dump())
-            except (RuntimeError, ValueError, TypeError, KeyError):
+            except ModelGatewayError as exc:
+                if exc.code != "model_invalid_output":
+                    state["warnings"].append(f"model_classification_failed:{thread_id}")
+                    continue
                 # 只允许一次明确修复请求；第二次失败保留确定性结果并标记 partial。
                 try:
                     response = await gateway.complete(
@@ -162,7 +166,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                     if "fake_partial" in judgement.reason_codes:
                         state["warnings"].append(f"model_partial:{thread_id}")
                     outputs.append(judgement.model_dump())
-                except (RuntimeError, ValueError, TypeError, KeyError):
+                except ModelGatewayError:
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
     state["model_items"] = outputs
     _event(state, "classify_ambiguous_threads", "completed")

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.domain.briefs import ConversationIntent, EmailJudgement
 from ai_employee.domain.email import EmailCategory
+from ai_employee.integrations.llm.openai_compatible import ModelGatewayError
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -34,7 +35,7 @@ class FakeModelGateway:
         if self.scenario is not None and self.scenario.startswith("invalid"):
             self._invalid_attempts += 1
             if self.scenario == "invalid_twice" or self._invalid_attempts <= 1:
-                raise ValueError("invalid model JSON")
+                raise ModelGatewayError("model_invalid_output")
         if response_model is ConversationIntent:
             value: Any = ConversationIntent(
                 intent="generate_daily_brief", confidence=1, reason_code="fake_deterministic"

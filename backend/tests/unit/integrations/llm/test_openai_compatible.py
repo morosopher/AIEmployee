@@ -63,3 +63,31 @@ async def test_http_failures_are_stable_errors(status: int) -> None:
         await gateway.complete(
             model_name="m", prompt_version="p", messages=[], response_model=ConversationIntent
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens", [{"prompt_tokens": "x"}, {"completion_tokens": -1}, "bad"])
+async def test_invalid_usage_is_stable_error(tokens: object) -> None:
+    gateway = OpenAICompatibleGateway(
+        base_url="https://example.invalid",
+        api_key="secret",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"intent":"show_latest_brief","confidence":1,"reason_code":"x"}'
+                            }
+                        }
+                    ],
+                    "usage": tokens,
+                },
+            )
+        ),
+    )
+    with pytest.raises(ModelGatewayError, match="model_invalid_output"):
+        await gateway.complete(
+            model_name="m", prompt_version="p", messages=[], response_model=ConversationIntent
+        )

@@ -94,8 +94,11 @@ class OpenAICompatibleGateway:
             raise ModelGatewayError("model_invalid_output") from exc
         latency = int((time.monotonic() - started) * 1000)
         usage_data = data.get("usage", {})
-        input_tokens = int(usage_data.get("prompt_tokens", 0))
-        output_tokens = int(usage_data.get("completion_tokens", 0))
+        try:
+            input_tokens = _validated_tokens(usage_data.get("prompt_tokens", 0))
+            output_tokens = _validated_tokens(usage_data.get("completion_tokens", 0))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ModelGatewayError("model_invalid_output") from exc
         cost: int | None = None
         if self.input_rate or self.output_rate:
             cost = round(
@@ -106,3 +109,10 @@ class OpenAICompatibleGateway:
         return ModelResponse(
             value=value, usage=ModelUsage(input_tokens, output_tokens, latency, cost)
         )
+
+
+def _validated_tokens(value: object) -> int:
+    """验证供应商 token 用量是非负整数，拒绝字符串和布尔值。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("invalid token usage")
+    return value
