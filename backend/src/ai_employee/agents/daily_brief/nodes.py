@@ -188,9 +188,9 @@ def detect_calendar_conflicts_node(state: dict[str, Any]) -> dict[str, Any]:
             start_at = raw.get("start_at", raw.get("start"))
             end_at = raw.get("end_at", raw.get("end"))
             if isinstance(start_at, str):
-                start_at = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+                start_at = datetime.fromisoformat(start_at)
             if isinstance(end_at, str):
-                end_at = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+                end_at = datetime.fromisoformat(end_at)
             events.append(
                 CalendarEvent(
                     event_id=raw["event_id"],
