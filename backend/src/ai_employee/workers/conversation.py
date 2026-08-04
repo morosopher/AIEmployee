@@ -5,21 +5,36 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from ai_employee.agents.daily_brief.nodes import classify_conversation_intent
+from ai_employee.agents.daily_brief.nodes import (
+    classify_ambiguous_conversation_intent,
+    classify_conversation_intent,
+)
+from ai_employee.application.ports.model import ModelGateway
 from ai_employee.application.use_cases.conversations import unsupported_response
 from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.config import Settings
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, MessageModel
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.integrations.llm.fake import FakeModelGateway, build_model_gateway
 
 
 class ConversationTaskStep:
     """只处理生成/查看简报，其他意图永远不调用工具或供应商。"""
     name = "conversation_respond"
 
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        *,
+        model_gateway: ModelGateway | None = None,
+        model_name: str = "fake",
+    ) -> None:
         """保存数据库工厂以在短事务中读取并写入消息。"""
         self._session_factory = session_factory
+        # 直接构造仅供单测与本地编排使用，必须保持无网络；生产 factory 显式注入配置网关。
+        self._model_gateway = model_gateway or FakeModelGateway()
+        self._model_name = model_name
 
     async def execute(self, task: LeasedTask) -> None:
         """按 Task15 确定性意图规则写入一个最终 assistant 消息。"""
@@ -30,7 +45,16 @@ class ConversationTaskStep:
         if not isinstance(raw_conversation_id, str) or not isinstance(raw_content, str):
             raise TypeError("conversation.respond requires conversation_id and content")
         conversation_id = UUID(raw_conversation_id)
-        intent = classify_conversation_intent(raw_content)["intent"]
+        deterministic = classify_conversation_intent(raw_content)
+        intent = deterministic["intent"]
+        if deterministic["reason_code"] == "ambiguous_request":
+            intent = (
+                await classify_ambiguous_conversation_intent(
+                    raw_content,
+                    model_gateway=self._model_gateway,
+                    model_name=self._model_name,
+                )
+            ).intent
         async with self._session_factory.begin() as session:
             existing = await session.scalar(select(MessageModel.id).where(MessageModel.user_id == task.user_id, MessageModel.task_id == task.task_id, MessageModel.role == "assistant"))
             if existing is not None:
@@ -51,6 +75,14 @@ class ConversationTaskStep:
             session.add(MessageModel(user_id=task.user_id, conversation_id=conversation_id, role="assistant", content_markdown=text, task_id=task.task_id, created_at=datetime.now(UTC)))
 
 
-def build_conversation_task_step(*, session_factory: ManagedAsyncSessionMaker) -> ConversationTaskStep:
+def build_conversation_task_step(
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None
+) -> ConversationTaskStep:
     """构造供 DurableTaskRunner 注册的实际会话回复节点。"""
-    return ConversationTaskStep(session_factory)
+    if settings is None:
+        return ConversationTaskStep(session_factory)
+    return ConversationTaskStep(
+        session_factory,
+        model_gateway=build_model_gateway(settings),
+        model_name=settings.model_name,
+    )

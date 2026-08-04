@@ -142,6 +142,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                     state["warnings"].append(f"model_partial:{thread_id}")
                 outputs.append(judgement.model_dump())
             except ModelGatewayError as exc:
+                _record_model_failure(state, facts, exc.code)
                 if exc.code != "model_invalid_output":
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
                     continue
@@ -169,7 +170,8 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                     if "fake_partial" in judgement.reason_codes:
                         state["warnings"].append(f"model_partial:{thread_id}")
                     outputs.append(judgement.model_dump())
-                except ModelGatewayError:
+                except ModelGatewayError as repair_error:
+                    _record_model_failure(state, facts, repair_error.code)
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
     state["model_items"] = outputs
     _event(state, "classify_ambiguous_threads", "completed")
@@ -194,6 +196,27 @@ def _record_model_invocation(state: dict[str, Any], facts: dict[str, Any], respo
             "latency_ms": usage.latency_ms,
             "status": "succeeded",
             "error_code": None,
+        }
+    )
+
+
+def _record_model_failure(state: dict[str, Any], facts: dict[str, Any], error_code: str) -> None:
+    """记录失败调用的最小审计元数据，绝不保存 prompt 或模型正文。"""
+    state.setdefault("model_invocations", []).append(
+        {
+            "provider": type(state["model_gateway"]).__name__.removesuffix("Gateway").lower(),
+            "model_name": state.get("model_name", ""),
+            "prompt_version": "daily_brief_v1",
+            "input_hash": sha256(
+                json.dumps(facts, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "output_schema": "EmailJudgement",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_microusd": None,
+            "latency_ms": 0,
+            "status": "failed",
+            "error_code": error_code,
         }
     )
 
