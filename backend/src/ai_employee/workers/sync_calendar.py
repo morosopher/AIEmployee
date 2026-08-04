@@ -1,0 +1,96 @@
+"""将 durable ``sync_calendar`` 任务连接到 Calendar 同步用例。"""
+
+from typing import cast
+from uuid import UUID
+
+from ai_employee.application.use_cases.sync_calendar import (
+    CalendarSyncStoreFactory,
+    SyncCalendarUseCase,
+)
+from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.config import Settings
+from ai_employee.infrastructure.db.repositories.calendar import (
+    SqlAlchemyCalendarSyncRepositoryFactory,
+)
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.integrations.google.calendar import CalendarAdapter
+from ai_employee.integrations.google.oauth import GoogleOAuthClient
+
+
+class CalendarSyncTaskStep:
+    """在 DurableTaskRunner 租约内读取凭据并执行 Calendar 同步。"""
+
+    name = "sync_calendar"
+
+    def __init__(
+        self,
+        *,
+        session_factory: ManagedAsyncSessionMaker,
+        cipher: AeadCipher,
+        oauth: GoogleOAuthClient,
+    ) -> None:
+        """注入进程资源；凭据读取和同步写入始终使用各自短事务。"""
+        self._credential_stores = SqlAlchemyGmailSyncRepositoryFactory(session_factory)
+        self._stores = SqlAlchemyCalendarSyncRepositoryFactory(session_factory)
+        self._cipher, self._oauth = cipher, oauth
+
+    async def execute(self, task: LeasedTask) -> None:
+        """解密 token，构造只读适配器并把安全 AAD 留在应用/基础设施边界。"""
+        raw_connection = task.input_payload.get("connection_id")
+        if not isinstance(raw_connection, str) or task.user_id is None:
+            raise ValueError("sync_calendar requires connection_id")
+        connection_id, user_id = UUID(raw_connection), task.user_id
+        async with self._credential_stores() as store:
+            credentials = await store.get_credentials(user_id=user_id, connection_id=connection_id)
+        if credentials is None:
+            from ai_employee.application.use_cases.sync_calendar import (
+                CalendarConnectionNotFoundError,
+            )
+
+            raise CalendarConnectionNotFoundError
+        access = self._cipher.decrypt(
+            credentials.access_token, self._credential_aad(user_id, connection_id, "access_token")
+        ).decode()
+        refresh = (
+            self._cipher.decrypt(
+                credentials.refresh_token,
+                self._credential_aad(user_id, connection_id, "refresh_token"),
+            ).decode()
+            if credentials.refresh_token
+            else None
+        )
+
+        async def refresh_access_token() -> str:
+            """通过现有 OAuth 端口刷新 token；worker 将 HTTP 分类交给耐久边界。"""
+            if refresh is None:
+                raise RuntimeError("Google Calendar refresh token unavailable")
+            return (await self._oauth.refresh_token(refresh)).access_token
+
+        adapter = CalendarAdapter(
+            access_token=access,
+            user_timezone="UTC",
+            refresh_access_token=refresh_access_token if refresh else None,
+        )
+        await SyncCalendarUseCase(
+            cast(CalendarSyncStoreFactory, self._stores), self._cipher, adapter
+        ).execute(user_id=user_id, connection_id=connection_id)
+
+    @staticmethod
+    def _credential_aad(user_id: UUID, connection_id: UUID, kind: str) -> bytes:
+        """保持 OAuth token 使用连接主键绑定的固定 AAD。"""
+        return f"{user_id}:{connection_id}:{kind}".encode("ascii")
+
+
+def build_calendar_sync_task_step(
+    *, session_factory: ManagedAsyncSessionMaker, settings: Settings
+) -> CalendarSyncTaskStep:
+    """从受控配置构造日历任务步骤，不把 secret 放入队列输入。"""
+    cipher = AeadCipher.from_file(settings.app_master_key_file)
+    oauth = GoogleOAuthClient(
+        settings.google_client_id,
+        settings.read_secret_file(settings.google_client_secret_file).get_secret_value(),
+        settings.google_redirect_uri,
+    )
+    return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=oauth)

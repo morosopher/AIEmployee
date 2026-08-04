@@ -18,7 +18,6 @@ from ai_employee.infrastructure.security.encryption import AeadCipher, Encrypted
 from ai_employee.integrations.google.oauth import (
     GOOGLE_SCOPES,
     GoogleAccount,
-    GoogleOAuthClient,
     GoogleTokenResponse,
     build_authorization_url,
 )
@@ -30,6 +29,15 @@ class Clock(Protocol):
     """定义连接流程所需的显式 UTC 时钟，测试可注入可控实现。"""
 
     def now(self) -> datetime: ...
+
+
+class GoogleOAuthPort(Protocol):
+    """定义连接用例所需 OAuth 行为，使测试模式可注入绝不联网的 fake。"""
+
+    async def exchange_code(self, code: str, verifier: str) -> GoogleTokenResponse: ...
+    async def fetch_account(self, access_token: str) -> GoogleAccount: ...
+    async def refresh_token(self, refresh_token: str) -> GoogleTokenResponse: ...
+    async def revoke(self, token: str) -> None: ...
 
 
 class ConnectionStoreFactory(Protocol):
@@ -112,7 +120,7 @@ class GoogleConnectionsUseCase:
         self,
         stores: ConnectionStoreFactory,
         cipher: AeadCipher,
-        oauth: GoogleOAuthClient,
+        oauth: GoogleOAuthPort,
         clock: Clock,
         client_id: str,
         redirect_uri: str,

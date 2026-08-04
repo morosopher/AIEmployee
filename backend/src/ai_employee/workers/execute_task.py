@@ -24,6 +24,7 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
+from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
 
 RETRY_DELAY_SECONDS = 5
@@ -171,6 +172,10 @@ def build_task_runner() -> DurableTaskRunner:
         resolve_steps=lambda task: (
             (build_gmail_sync_task_step(session_factory=session_factory, settings=settings),)
             if task.kind == "sync_gmail"
+            else (
+                build_calendar_sync_task_step(session_factory=session_factory, settings=settings),
+            )
+            if task.kind == "sync_calendar"
             else (_MissingTaskHandlerStep(),)
         ),
     )

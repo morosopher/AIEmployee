@@ -174,11 +174,18 @@ def get_connections_use_case(request: Request):
 
     settings = get_auth_settings(request)
     cipher = AeadCipher.from_file(settings.app_master_key_file)
-    secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
+    if settings.app_test_mode:
+        # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端，浏览器连接状态由固定 fake 驱动。
+        from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
+
+        oauth: GoogleOAuthClient | FakeGoogleOAuthClient = FakeGoogleOAuthClient()
+    else:
+        secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
+        oauth = GoogleOAuthClient(settings.google_client_id, secret, settings.google_redirect_uri)
     return GoogleConnectionsUseCase(
         request.app.state.connections_store_factory,
         cipher,
-        GoogleOAuthClient(settings.google_client_id, secret, settings.google_redirect_uri),
+        oauth,
         get_auth_clock(request),
         settings.google_client_id,
         settings.google_redirect_uri,

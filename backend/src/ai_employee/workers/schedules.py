@@ -23,6 +23,7 @@ from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery imp
     SqlAlchemyApprovalCheckpointRecoveryStore,
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
+from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyConnectedGoogleReader
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
     SqlAlchemySessionMaintenanceRepositoryFactory,
@@ -40,6 +41,7 @@ from ai_employee.workers.outbox import build_outbox_relay
 __all__ = [
     "daily_brief_idempotency_key",
     "dispatch_due_briefs",
+    "dispatch_google_incremental_syncs",
     "expire_approvals",
     "expire_sessions",
     "is_daily_brief_due",
@@ -93,6 +95,26 @@ async def dispatch_due_briefs() -> None:
         task_creator=creator,
     )
     await use_case.execute(now=datetime.now(UTC))
+
+
+@broker.task(schedule=[{"cron": "*/10 * * * *", "schedule_id": "google-incremental-sync"}])
+async def dispatch_google_incremental_syncs() -> None:
+    """每十分钟为每个健康连接创建 Gmail/Calendar 各一个耐久幂等任务。"""
+    now = datetime.now(UTC)
+    bucket = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
+    creator = CreateTaskUseCase(
+        SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
+    )
+    for user_id, connection_id in await SqlAlchemyConnectedGoogleReader(
+        session_factory
+    ).connected_connections():
+        for resource_kind, kind in (("gmail", "sync_gmail"), ("calendar", "sync_calendar")):
+            await creator.execute(
+                user_id=user_id,
+                kind=kind,
+                input_payload={"connection_id": str(connection_id)},
+                idempotency_key=f"sync:google:{connection_id}:{resource_kind}:{bucket.isoformat()}",
+            )
 
 
 @broker.task(schedule=[{"cron": "0 * * * *", "schedule_id": "expire-sessions"}])

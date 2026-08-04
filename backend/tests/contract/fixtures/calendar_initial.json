@@ -1,0 +1,1 @@
+{"items":[{"id":"synthetic-event-1","summary":"Synthetic meeting","start":{"dateTime":"2030-01-02T09:00:00+08:00","timeZone":"Asia/Shanghai"},"end":{"dateTime":"2030-01-02T10:00:00+08:00","timeZone":"Asia/Shanghai"},"status":"confirmed","etag":"etag-1","htmlLink":"https://calendar.example.test/e/1"}],"nextSyncToken":"calendar-token-1"}
