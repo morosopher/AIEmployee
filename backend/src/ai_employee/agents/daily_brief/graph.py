@@ -17,12 +17,12 @@ from ai_employee.agents.daily_brief.state import DailyBriefState
 def build_daily_brief_graph(*, checkpointer: BaseCheckpointSaver | None = None):
     """返回编译后的每日简报图，可选注入 PostgreSQL 等持久 checkpoint。"""
     graph = StateGraph(DailyBriefState)
-    graph.add_node("load_sources", load_sources)
-    graph.add_node("apply_deterministic_rules", apply_deterministic_rules)
-    graph.add_node("classify_ambiguous_threads", classify_ambiguous_threads)
-    graph.add_node("detect_calendar_conflicts", detect_calendar_conflicts_node)
-    graph.add_node("compose_structured_brief", compose_structured_brief)
-    graph.add_node("validate_and_render", validate_and_render)
+    graph.add_node("load_sources", load_sources)  # type: ignore[type-var]
+    graph.add_node("apply_deterministic_rules", apply_deterministic_rules)  # type: ignore[type-var]
+    graph.add_node("classify_ambiguous_threads", classify_ambiguous_threads)  # type: ignore[type-var]
+    graph.add_node("detect_calendar_conflicts", detect_calendar_conflicts_node)  # type: ignore[type-var]
+    graph.add_node("compose_structured_brief", compose_structured_brief)  # type: ignore[type-var]
+    graph.add_node("validate_and_render", validate_and_render)  # type: ignore[type-var]
     graph.set_entry_point("load_sources")
     graph.add_edge("load_sources", "apply_deterministic_rules")
     graph.add_edge("apply_deterministic_rules", "classify_ambiguous_threads")
