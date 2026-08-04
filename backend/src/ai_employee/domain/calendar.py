@@ -32,7 +32,7 @@ class CalendarEvent:
 def find_conflicts(events: Iterable[CalendarEvent]) -> tuple[tuple[CalendarEvent, CalendarEvent], ...]:
     """找出排序后忙碌定时事件之间唯一的重叠事件对。
 
-    取消、透明、全天和缺少完整精确时间的事件都不会参与 M1 冲突计算。带时区
+    取消、free、透明、全天和缺少完整精确时间的事件都不会参与 M1 冲突计算。带时区
     ``datetime`` 的比较以绝对时刻进行，因此跨 UTC 午夜和不同时区输入无需依赖
     字符串日期即可正确比较。相邻边界 ``end == start`` 不属于重叠。
 
@@ -68,7 +68,7 @@ def _participates_in_conflicts(event: CalendarEvent) -> bool:
     return (
         not event.all_day
         and event.status.casefold() != "cancelled"
-        and event.transparency.casefold() != "transparent"
+        and event.transparency.casefold() not in {"transparent", "free"}
         and event.start_at is not None
         and event.end_at is not None
     )

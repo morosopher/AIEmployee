@@ -62,6 +62,23 @@ def test_cancelled_transparent_and_all_day_events_are_ignored() -> None:
     assert find_conflicts((busy, cancelled, transparent, all_day)) == ()
 
 
+def test_free_events_are_ignored() -> None:
+    """明确标记为 free 的事件可展示但不应占用冲突时间。"""
+    busy = CalendarEvent(
+        event_id="busy",
+        start_at=datetime(2026, 8, 4, 9, 0, tzinfo=UTC),
+        end_at=datetime(2026, 8, 4, 10, 0, tzinfo=UTC),
+    )
+    free = CalendarEvent(
+        event_id="free",
+        start_at=datetime(2026, 8, 4, 9, 30, tzinfo=UTC),
+        end_at=datetime(2026, 8, 4, 10, 30, tzinfo=UTC),
+        transparency="free",
+    )
+
+    assert find_conflicts((busy, free)) == ()
+
+
 def test_cross_utc_midnight_events_compare_after_timezone_normalization() -> None:
     """跨 UTC 午夜的带时区事件必须按瞬时比较，而非按本地日期字符串比较。"""
     shanghai = ZoneInfo("Asia/Shanghai")
