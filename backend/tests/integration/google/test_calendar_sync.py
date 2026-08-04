@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ai_employee.application.ports.calendar import CalendarEvent, CalendarSyncPage
 from ai_employee.application.use_cases.sync_calendar import SyncCalendarUseCase
@@ -49,9 +49,13 @@ async def test_calendar_sync_encrypts_upserts_tombstone_and_advances_cursor(data
         async with sessions.begin() as session: yield SqlAlchemyCalendarSyncRepository(session)
     await SyncCalendarUseCase(stores, cipher, FakeCalendar(CalendarSyncPage((_event(),), None, "token-1"))).execute(user_id=user_id, connection_id=connection_id)
     await SyncCalendarUseCase(stores, cipher, FakeCalendar(CalendarSyncPage((_event("cancelled"),), None, "token-2"))).execute(user_id=user_id, connection_id=connection_id)
+    minimal_tombstone = CalendarEvent("event-1", "primary", "", "", "", None, None, False, "opaque", "cancelled", "UTC", "series-1", None, "")
+    await SyncCalendarUseCase(stores, cipher, FakeCalendar(CalendarSyncPage((minimal_tombstone,), None, "token-3"))).execute(user_id=user_id, connection_id=connection_id)
     async with sessions() as session:
         row = await session.scalar(select(CalendarEventModel).where(CalendarEventModel.connection_id == connection_id))
         cursor = await session.scalar(select(SyncCursorModel.cursor).where(SyncCursorModel.connection_id == connection_id, SyncCursorModel.resource_kind == "calendar"))
-    assert row is not None and row.status == "cancelled" and row.description_ciphertext != b"secret description"
-    assert cursor == "token-2"
+        count = await session.scalar(select(func.count()).select_from(CalendarEventModel).where(CalendarEventModel.connection_id == connection_id))
+    assert row is not None and row.status == "cancelled" and row.starts_at is None and row.ends_at is None
+    assert row.description_ciphertext != b"secret description" and count == 1
+    assert cursor == "token-3"
     await sessions.dispose()
