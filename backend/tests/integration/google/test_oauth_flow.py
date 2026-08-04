@@ -1,5 +1,6 @@
 """验证 Google OAuth 连接流程的安全参数和一次性 state 语义。"""
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +15,7 @@ from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     EncryptedCredentialModel,
     OAuthConnectionModel,
+    SyncCursorModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
@@ -150,6 +152,46 @@ async def test_oauth_callback_rejects_state_after_ten_minute_expiry(
     )
     assert expired.status_code == 400
     assert expired.json()["error_code"] == "oauth_state_rejected"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_callbacks_for_same_google_account_share_one_connection(
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
+) -> None:
+    """两个有效 state 并发回调同一帐号必须收敛为唯一连接、凭据和游标。"""
+    client, queries, _ = oauth_context
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
+    )
+    assert login.status_code == 200
+    csrf = client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    starts = await asyncio.gather(
+        *(
+            client.post("/api/v1/connections/google/start", headers={"X-CSRF-Token": csrf})
+            for _ in range(2)
+        )
+    )
+    states = [parse_qs(urlparse(item.json()["authorization_url"]).query)["state"][0] for item in starts]
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.post("https://oauth2.googleapis.com/token").respond(
+            200,
+            json={"access_token": "synthetic-access", "refresh_token": "synthetic-refresh", "expires_in": 3600},
+        )
+        mocked.get("https://openidconnect.googleapis.com/v1/userinfo").respond(
+            200, json={"sub": "same-subject", "email": "same@google.example"}
+        )
+        callbacks = await asyncio.gather(
+            *(client.get("/api/v1/connections/google/callback", params={"code": "synthetic-code", "state": state}) for state in states)
+        )
+    assert [item.status_code for item in callbacks] == [200, 200]
+    async with queries() as session:
+        connections = tuple((await session.scalars(select(OAuthConnectionModel))).all())
+        credentials = tuple((await session.scalars(select(EncryptedCredentialModel))).all())
+        cursors = tuple((await session.scalars(select(SyncCursorModel))).all())
+    assert len(connections) == 1
+    assert len(credentials) == 2
+    assert len(cursors) == 2
 
 
 def test_google_authorization_url_uses_minimal_readonly_scopes_and_pkce() -> None:

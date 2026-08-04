@@ -16,6 +16,15 @@ class CreateTaskResult:
     status: TaskStatus = TaskStatus.CREATED
 
 
+@dataclass(frozen=True, slots=True)
+class CreateTaskBatchItem:
+    """描述一个必须与同批任务共同提交或回滚的创建意图。"""
+
+    kind: str
+    input_payload: dict[str, JsonValue]
+    idempotency_key: str
+
+
 class TaskDispatcher(Protocol):
     """定义创建事务提交后立即 claim 并投递任务的应用端口。"""
 
@@ -39,6 +48,11 @@ class TaskRepository(Protocol):
         idempotency_key: str,
     ) -> CreateTaskResult:
         """创建任务、审计和初始 Outbox，或返回同用户已有任务。"""
+
+    async def create_many_with_outbox(
+        self, *, user_id: UUID, items: tuple[CreateTaskBatchItem, ...]
+    ) -> tuple[CreateTaskResult, ...]:
+        """在一个事务中创建整批任务，任一项失败必须回滚全部事实。"""
 
 
 class TaskRepositoryFactory(Protocol):
@@ -101,3 +115,32 @@ class CreateTaskUseCase:
         # 即使 Redis 失败也会返回已经持久化的 QUEUED 状态并把未发布事实留给 minute relay。
         status = await self._dispatcher.dispatch(result.task_id)
         return CreateTaskResult(task_id=result.task_id, status=status)
+
+    async def execute_many(
+        self, *, user_id: UUID, items: tuple[CreateTaskBatchItem, ...]
+    ) -> tuple[CreateTaskResult, ...]:
+        """原子创建一批任务，提交后才分别投递每个已持久化任务。
+
+        Args:
+            user_id: 该批全部任务的拥有者，参与每项幂等隔离。
+            items: 至少一项、每项包含种类、内部输入和稳定幂等键的创建意图。
+
+        Returns:
+            与输入相同顺序的稳定任务结果；每项均已完成提交后的首次投递尝试。
+
+        Raises:
+            ValueError: 调用方传入空批次时抛出，避免模糊的无副作用成功。
+        """
+        if not items:
+            raise ValueError("items must not be empty")
+        async with self._repositories() as repository:
+            created = await repository.create_many_with_outbox(user_id=user_id, items=items)
+        dispatched: list[CreateTaskResult] = []
+        for result in created:
+            dispatched.append(
+                CreateTaskResult(
+                    task_id=result.task_id,
+                    status=await self._dispatcher.dispatch(result.task_id),
+                )
+            )
+        return tuple(dispatched)

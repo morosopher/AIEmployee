@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.domain.connections import ConnectionStatus
@@ -110,34 +111,34 @@ class SqlAlchemyConnectionStore:
     async def ensure_connection(
         self, *, user_id: UUID, provider_account_id: str, account_email: str, scopes: list[str]
     ) -> UUID:
-        """按用户和 Google subject upsert 连接并返回可用于 AAD 的稳定 UUID。"""
-        connection = await self._session.scalar(
-            select(OAuthConnectionModel)
-            .where(
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.provider == "google",
-                OAuthConnectionModel.provider_account_id == provider_account_id,
-            )
-            .with_for_update()
+        """原子 upsert 连接并返回可用于 AAD 的稳定 UUID。
+
+        两个不同 OAuth state 可以同时映射到相同 Google subject。数据库的唯一约束是唯一
+        可信仲裁者，因此使用 ``ON CONFLICT DO UPDATE`` 让并发请求均返回同一连接，而不是
+        先读空值后各自 INSERT。更新仅覆盖可由最新 OAuth profile 安全刷新的一般元数据。
+        """
+        statement = insert(OAuthConnectionModel).values(
+            user_id=user_id,
+            provider="google",
+            provider_account_id=provider_account_id,
+            account_email=account_email,
+            scopes=scopes,
+            status=ConnectionStatus.CONNECTED.value,
         )
-        if connection is None:
-            connection = OAuthConnectionModel(
-                user_id=user_id,
-                provider="google",
-                provider_account_id=provider_account_id,
-                account_email=account_email,
-                scopes=scopes,
-                status=ConnectionStatus.CONNECTED.value,
-            )
-            self._session.add(connection)
-            await self._session.flush()
-        else:
-            connection.account_email = account_email
-            connection.scopes = scopes
-            connection.status = ConnectionStatus.CONNECTED.value
-            connection.last_error_code = None
-        await self._session.flush()
-        return connection.id
+        connection_id = await self._session.scalar(
+            statement.on_conflict_do_update(
+                constraint="uq_oauth_connections_user_provider_account",
+                set_={
+                    "account_email": statement.excluded.account_email,
+                    "scopes": statement.excluded.scopes,
+                    "status": ConnectionStatus.CONNECTED.value,
+                    "last_error_code": None,
+                },
+            ).returning(OAuthConnectionModel.id)
+        )
+        if connection_id is None:
+            raise RuntimeError("connection upsert did not return an ID")
+        return connection_id
 
     async def save_connection_tokens(
         self,
@@ -157,16 +158,12 @@ class SqlAlchemyConnectionStore:
                 connection_id, user_id, "refresh_token", refresh_token, None
             )
         for resource_kind in ("gmail", "calendar"):
-            exists = await self._session.scalar(
-                select(SyncCursorModel.id).where(
-                    SyncCursorModel.connection_id == connection_id,
-                    SyncCursorModel.resource_kind == resource_kind,
-                )
+            # 游标初始行没有应覆盖的业务字段；冲突时保持第一个已提交的同步事实即可。
+            await self._session.execute(
+                insert(SyncCursorModel)
+                .values(connection_id=connection_id, resource_kind=resource_kind)
+                .on_conflict_do_nothing(constraint="uq_sync_cursors_connection_resource")
             )
-            if exists is None:
-                self._session.add(
-                    SyncCursorModel(connection_id=connection_id, resource_kind=resource_kind)
-                )
         await self._session.flush()
 
     async def _upsert_credential(
@@ -177,32 +174,27 @@ class SqlAlchemyConnectionStore:
         encrypted: EncryptedValue,
         expires_at: datetime | None,
     ) -> None:
-        """以唯一连接/种类键覆写已旋转密文，不创建额外 Token 行。"""
-        credential = await self._session.scalar(
-            select(EncryptedCredentialModel)
-            .where(
-                EncryptedCredentialModel.connection_id == connection_id,
-                EncryptedCredentialModel.credential_kind == kind,
-            )
-            .with_for_update()
+        """原子覆写旋转 token 密文，避免并发 callback 产生第二条 credential 行。"""
+        statement = insert(EncryptedCredentialModel).values(
+            user_id=user_id,
+            connection_id=connection_id,
+            credential_kind=kind,
+            ciphertext=encrypted.ciphertext,
+            nonce=encrypted.nonce,
+            key_version=encrypted.key_version,
+            token_expires_at=expires_at,
         )
-        if credential is None:
-            self._session.add(
-                EncryptedCredentialModel(
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    credential_kind=kind,
-                    ciphertext=encrypted.ciphertext,
-                    nonce=encrypted.nonce,
-                    key_version=encrypted.key_version,
-                    token_expires_at=expires_at,
-                )
+        await self._session.execute(
+            statement.on_conflict_do_update(
+                constraint="uq_encrypted_credentials_connection_kind",
+                set_={
+                    "ciphertext": statement.excluded.ciphertext,
+                    "nonce": statement.excluded.nonce,
+                    "key_version": statement.excluded.key_version,
+                    "token_expires_at": statement.excluded.token_expires_at,
+                },
             )
-            return
-        credential.ciphertext = encrypted.ciphertext
-        credential.nonce = encrypted.nonce
-        credential.key_version = encrypted.key_version
-        credential.token_expires_at = expires_at
+        )
 
     async def list_connections(self, *, user_id: UUID) -> tuple[OAuthConnectionModel, ...]:
         """按当前用户过滤连接，避免 API 层遗漏多租户边界。"""

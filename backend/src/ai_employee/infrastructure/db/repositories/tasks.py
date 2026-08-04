@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.use_cases.tasks import (
+    CreateTaskBatchItem,
     CreateTaskResult,
     TaskRepository,
 )
@@ -104,6 +105,26 @@ class SqlAlchemyTaskRepository:
         self._session.add_all((audit, outbox))
         await self._session.flush()
         return CreateTaskResult(task_id=claimed_task_id)
+
+    async def create_many_with_outbox(
+        self, *, user_id: UUID, items: tuple[CreateTaskBatchItem, ...]
+    ) -> tuple[CreateTaskResult, ...]:
+        """在调用方已打开的单一事务中创建整批任务、审计与 Outbox。
+
+        本方法复用单项幂等创建的数据库约束；不自行提交，因此第二项任何持久化异常都会
+        由外围 ``sessionmaker.begin`` 回滚之前所有 TaskRun、AuditEvent 和 OutboxEvent。
+        """
+        results: list[CreateTaskResult] = []
+        for item in items:
+            results.append(
+                await self.create_with_outbox(
+                    user_id=user_id,
+                    kind=item.kind,
+                    input_payload=item.input_payload,
+                    idempotency_key=item.idempotency_key,
+                )
+            )
+        return tuple(results)
 
 
 class SqlAlchemyTaskRepositoryFactory:

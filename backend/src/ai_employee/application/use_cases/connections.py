@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import httpx
 from cryptography.exceptions import InvalidTag
 
-from ai_employee.domain.tasks import JsonValue
+from ai_employee.application.use_cases.tasks import CreateTaskBatchItem
 from ai_employee.infrastructure.db.repositories.connections import ConnectionStore
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 from ai_employee.integrations.google.oauth import (
@@ -41,14 +41,12 @@ class ConnectionStoreFactory(Protocol):
 class TaskCreator(Protocol):
     """定义手动同步创建两个可恢复任务的最小端口。"""
 
-    async def execute(
+    async def execute_many(
         self,
         *,
         user_id: UUID,
-        kind: str,
-        input_payload: dict[str, JsonValue],
-        idempotency_key: str,
-    ) -> "CreatedTask": ...
+        items: tuple[CreateTaskBatchItem, ...],
+    ) -> tuple["CreatedTask", ...]: ...
 
 
 class CreatedTask(Protocol):
@@ -257,16 +255,17 @@ class GoogleConnectionsUseCase:
             connection = await store.get_connection(user_id=user_id, connection_id=connection_id)
         if connection is None or connection.status != "connected":
             raise ConnectionNotFoundError
-        gmail = await tasks.execute(
+        created = await tasks.execute_many(
             user_id=user_id,
-            kind="sync_gmail",
-            input_payload={"connection_id": str(connection_id)},
-            idempotency_key=f"{idempotency_key}:gmail",
+            items=(
+                CreateTaskBatchItem(
+                    "sync_gmail", {"connection_id": str(connection_id)}, f"{idempotency_key}:gmail"
+                ),
+                CreateTaskBatchItem(
+                    "sync_calendar",
+                    {"connection_id": str(connection_id)},
+                    f"{idempotency_key}:calendar",
+                ),
+            ),
         )
-        calendar = await tasks.execute(
-            user_id=user_id,
-            kind="sync_calendar",
-            input_payload={"connection_id": str(connection_id)},
-            idempotency_key=f"{idempotency_key}:calendar",
-        )
-        return ManualSyncResult(gmail.task_id, calendar.task_id)
+        return ManualSyncResult(created[0].task_id, created[1].task_id)
