@@ -164,7 +164,7 @@ export function retryTask(
 
 /** 创建建议任务，所有动作仍由服务端审批协议约束。 */
 export function createTask(kind: string, input_payload: Record<string, unknown> = {}): Promise<{ task_id: string; status: string }> {
-  return requestJson('/tasks', (value) => value as { task_id: string; status: string }, { method: 'POST', body: JSON.stringify({ kind, input_payload }) })
+  return requestJson('/tasks', (value) => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid task response'); const o = value as Record<string, unknown>; if (typeof o.task_id !== 'string' || typeof o.status !== 'string') throw new Error('Invalid task response'); return { task_id: o.task_id, status: o.status } }, { method: 'POST', body: JSON.stringify({ kind, input_payload }) })
 }
 
 /**
