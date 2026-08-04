@@ -1,0 +1,8 @@
+{
+  "history": [{
+    "id": "102",
+    "messagesAdded": [{"message": {"id": "message-2"}}],
+    "labelsAdded": [{"message": {"id": "message-1"}}]
+  }],
+  "historyId": "102"
+}

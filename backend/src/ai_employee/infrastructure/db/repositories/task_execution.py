@@ -172,6 +172,7 @@ class SqlAlchemyTaskExecutionStore:
                 kind=row.kind,
                 input_payload=row.input_payload,
                 started_at=row.started_at,
+                user_id=row.user_id,
                 attempt_count=row.attempt_count,
                 lease_owner=lease_owner,
             )

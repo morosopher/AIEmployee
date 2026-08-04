@@ -123,6 +123,40 @@ class GoogleOAuthClient:
             raise TypeError("Google userinfo response is invalid")
         return GoogleAccount(subject, email)
 
+    async def refresh_token(self, refresh_token: str) -> GoogleTokenResponse:
+        """以已有 refresh token 交换新的 access token，不假设 Google 必定轮换 refresh token。
+
+        Args:
+            refresh_token: 仅在受控内存存在的 Google refresh token 明文。
+
+        Returns:
+            适配器已收窄的 access、可选 refresh 与有效期。
+
+        Raises:
+            httpx.HTTPStatusError: token 端点返回非成功状态时保留供调用方分类。
+            TypeError: 响应缺少 required access token 或 expires_in 时抛出。
+        """
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            response = await client.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        access_token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        rotated_refresh = payload.get("refresh_token")
+        if not isinstance(access_token, str) or not isinstance(expires_in, int):
+            raise TypeError("Google refresh response is invalid")
+        if rotated_refresh is not None and not isinstance(rotated_refresh, str):
+            raise TypeError("Google refresh response is invalid")
+        return GoogleTokenResponse(access_token, rotated_refresh, expires_in)
+
     async def revoke(self, token: str) -> None:
         """尽力撤销 token；调用方必须保证本地断开不依赖网络成功。"""
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:

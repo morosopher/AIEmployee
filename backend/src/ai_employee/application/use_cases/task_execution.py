@@ -17,13 +17,16 @@ class LeasedTask:
     """保存 Worker 已通过 PostgreSQL CAS 获得的最小任务快照。
 
     ``started_at`` 是跨 Taskiq 重投持久保留的总预算起点；执行用例不使用当前消息
-    接收时间重置它。输入只含内部 JSON 值，不携带 ORM 或队列 SDK 类型。
+    接收时间重置它。``user_id`` 由持久租约读取，为源同步等用户域节点提供强制归属条件；
+    旧的纯执行单测可留空，但真实 SQLAlchemy store 必须返回非空用户。输入只含内部 JSON 值，
+    不携带 ORM 或队列 SDK 类型。
     """
 
     task_id: UUID
     kind: str
     input_payload: dict[str, JsonValue]
     started_at: datetime
+    user_id: UUID | None = None
     attempt_count: int = 1
     lease_owner: str | None = None
 
