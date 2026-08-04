@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.domain.errors import TransientProviderError
 from ai_employee.infrastructure.db.models.briefs import (
     DailyBriefItemModel,
     DailyBriefModel,
@@ -139,7 +140,10 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
             """模拟 Gmail 同步失败，确保单源故障不会阻断可用日历。"""
             sync_attempts.append(resource_kind)
             if resource_kind == "gmail":
-                raise RuntimeError("synthetic sync failure")
+                raise TransientProviderError(
+                    error_code="synthetic_sync_failure",
+                    message="synthetic sync failure",
+                )
 
         step = GenerateBriefTaskStep(
             sessions,
