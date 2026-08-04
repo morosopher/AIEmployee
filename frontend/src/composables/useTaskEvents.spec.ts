@@ -175,4 +175,30 @@ describe('useTaskEvents', () => {
     thirdWrapper.unmount()
     vi.unstubAllGlobals()
   })
+  it('reopens a silent stream after the heartbeat timeout', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    const initialSourceCount = FakeEventSource.instances.length
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents('task-1')
+        return () => null
+      },
+    })
+
+    const wrapper = mount(Host)
+    const firstSource = FakeEventSource.instances.at(-1)
+    firstSource?.onopen?.(new Event('open'))
+
+    vi.advanceTimersByTime(30_000)
+
+    const store = useTasksStore()
+    expect(firstSource?.close).toHaveBeenCalledOnce()
+    expect(FakeEventSource.instances).toHaveLength(initialSourceCount + 2)
+    expect(store.connections['task-1']).toBe('connecting')
+    wrapper.unmount()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
 })

@@ -10,6 +10,9 @@ import {
 import { parseTaskEvent, type TaskConnectionState } from '@/api/types'
 import { useTasksStore } from '@/stores/tasks'
 
+/** 服务端每 15 秒发送 heartbeat；连续两个周期无任何活动即主动建立新连接。 */
+const HEARTBEAT_TIMEOUT_MS = 30_000
+
 /**
  * 订阅单个任务的可重放 SSE，并在组件销毁或任务切换时释放浏览器连接。
  *
@@ -23,9 +26,17 @@ export function useTaskEvents(
   const connectionState = ref<TaskConnectionState>('disconnected')
   let source: EventSource | null = null
   let openedTaskId: string | null = null
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** 清除旧流的静默监视器，避免卸载或切换后回调写入已失效任务。 */
+  const clearHeartbeatTimeout = (): void => {
+    if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
+    heartbeatTimer = null
+  }
 
   /** 关闭现有源并同步独立连接状态，避免旧任务事件写入新页面。 */
   const close = (): void => {
+    clearHeartbeatTimeout()
     const closingTaskId = openedTaskId
     source?.close()
     source = null
@@ -50,6 +61,23 @@ export function useTaskEvents(
     source = eventSource
     openedTaskId = nextTaskId
     /**
+     * 用所有传输活动续期。若代理或网络静默截断连接而未触发 onerror，主动关闭并
+     * 以已知持久游标重开，PostgreSQL 重放负责恢复遗漏事件。
+     */
+    const armHeartbeatTimeout = (): void => {
+      clearHeartbeatTimeout()
+      heartbeatTimer = setTimeout(() => {
+        if (source !== eventSource) return
+        connectionState.value = 'reconnecting'
+        tasks.setConnectionState(nextTaskId, 'reconnecting')
+        eventSource.close()
+        source = null
+        openedTaskId = null
+        open(nextTaskId)
+      }, HEARTBEAT_TIMEOUT_MS)
+    }
+    armHeartbeatTimeout()
+    /**
      * 将监听器绑定到创建它的 EventSource，防止浏览器在 close 后排队的旧回调污染新任务。
      *
      * @param message EventSource 交付的原始事件。
@@ -59,12 +87,14 @@ export function useTaskEvents(
       if (source !== eventSource) return
       const event = parseTaskEvent(message.data)
       if (!event) return
+      armHeartbeatTimeout()
       connectionState.value = 'connected'
       tasks.setConnectionState(event.task_id, 'connected')
       tasks.applyEvent(event)
     }
     eventSource.onopen = () => {
       if (source !== eventSource) return
+      armHeartbeatTimeout()
       connectionState.value = 'connected'
       tasks.setConnectionState(nextTaskId, 'connected')
     }
