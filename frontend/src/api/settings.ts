@@ -1,4 +1,5 @@
 import { requestJson } from './client'
 import type { UserSettings } from './types'
-export const getSettings = () => requestJson('/settings', (v) => v as UserSettings)
-export const updateSettings = (settings: Partial<UserSettings>) => requestJson('/settings', (v) => v as UserSettings, { method: 'PATCH', body: JSON.stringify(settings) })
+const parseSettings = (v: unknown): UserSettings => { if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('Invalid settings'); const o = v as Record<string, unknown>; if (typeof o.timezone !== 'string' || typeof o.locale !== 'string' || typeof o.brief_time !== 'string' || typeof o.email_body_retention_days !== 'number' || typeof o.source_metadata_retention_days !== 'number' || typeof o.workspace_history_retention_days !== 'number' || typeof o.updated_at !== 'string') throw new Error('Invalid settings'); return { timezone: o.timezone, locale: o.locale, brief_time: o.brief_time, email_body_retention_days: o.email_body_retention_days, source_metadata_retention_days: o.source_metadata_retention_days, workspace_history_retention_days: o.workspace_history_retention_days, updated_at: o.updated_at } }
+export const getSettings = () => requestJson('/settings', parseSettings)
+export const updateSettings = (settings: Partial<UserSettings>) => requestJson('/settings', parseSettings, { method: 'PATCH', body: JSON.stringify(settings) })
