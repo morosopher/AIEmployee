@@ -1,5 +1,5 @@
 import { requestJson } from './client'
-import { parseBrief, type Brief } from './types'
+import { parseBrief } from './types'
 export const getTodayBrief = () => requestJson('/briefs/today', parseBrief)
 export const listBriefs = (localDate: string) => requestJson(`/briefs?local_date=${encodeURIComponent(localDate)}`, (v) => { if (!Array.isArray(v)) throw new Error('Invalid briefs response'); return v.map(parseBrief) })
 export const getBrief = (id: string) => requestJson(`/briefs/${encodeURIComponent(id)}`, parseBrief)
