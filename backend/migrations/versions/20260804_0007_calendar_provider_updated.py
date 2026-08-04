@@ -4,7 +4,8 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260804_0007"
-down_revision = "20260803_0006"
+# 必须接在既有 Google sources 迁移之后，避免与其从同一父 revision 分叉为两个 head。
+down_revision = "20260804_0007_google_sources"
 branch_labels = None
 depends_on = None
 
