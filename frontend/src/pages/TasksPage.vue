@@ -12,7 +12,6 @@ const router = useRouter()
 const tasks = useTasksStore()
 const loading = ref(false)
 const error = ref<string | null>(null)
-const originalTaskId = ref<string | null>(null)
 const retryIntentKeys = new Map<string, string>()
 let loadGeneration = 0
 const taskId = computed(() =>
@@ -97,17 +96,12 @@ async function retryFailedTask(failedTaskId: string) {
 }
 
 /**
- * 跟随服务端返回的 replacement，并保留回原任务的可见关联。
+ * 跟随服务端返回的 replacement；重试来源始终由 replacement 快照提供。
  *
  * @param replacementTaskId 新任务标识。
- * @param failedTaskId 原始失败任务标识。
  * @returns 无返回值；路由变化会自动重建 SSE 订阅。
  */
-function followReplacement(
-  replacementTaskId: string,
-  failedTaskId: string,
-): void {
-  originalTaskId.value = failedTaskId
+function followReplacement(replacementTaskId: string): void {
   void router.replace({ path: '/tasks', query: { task_id: replacementTaskId } })
 }
 </script>
@@ -147,10 +141,7 @@ function followReplacement(
           >
             取消任务
           </button>
-          <p v-if="originalTaskId">
-            此任务重试自：{{ originalTaskId }}
-          </p>
-          <p v-else-if="task.retry_of_task_id">
+          <p v-if="task.retry_of_task_id">
             此任务重试自：{{ task.retry_of_task_id }}
           </p>
         </template>

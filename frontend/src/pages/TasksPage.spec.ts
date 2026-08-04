@@ -162,4 +162,40 @@ describe('TasksPage', () => {
     )
     wrapper.unmount()
   })
+
+  it('clears the followed retry origin after navigating to another task', async () => {
+    api.getTask
+      .mockResolvedValueOnce({ ...queuedSnapshot, status: 'failed' })
+      .mockResolvedValueOnce({
+        ...queuedSnapshot,
+        id: 'replacement-task',
+        retry_of_task_id: 'task-1',
+      })
+      .mockResolvedValueOnce({
+        ...queuedSnapshot,
+        id: 'manual-task',
+        retry_of_task_id: 'manual-origin',
+      })
+    api.retryTask.mockResolvedValueOnce({
+      ...queuedSnapshot,
+      id: 'replacement-task',
+      retry_of_task_id: 'task-1',
+    })
+    const wrapper = mount(TasksPage, { global: { plugins: [createPinia()] } })
+    await flushPromises()
+
+    await wrapper.get('aside button').trigger('click')
+    await flushPromises()
+    route.query.task_id = 'replacement-task'
+    await nextTick()
+    await flushPromises()
+    expect(wrapper.text()).toContain('此任务重试自：task-1')
+
+    route.query.task_id = 'manual-task'
+    await nextTick()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('此任务重试自：manual-origin')
+    wrapper.unmount()
+  })
 })

@@ -8,7 +8,7 @@ import type { TaskSnapshot, TaskStep } from '@/api/types'
 interface Props {
   task: TaskSnapshot | null
   retry: (taskId: string) => Promise<TaskSnapshot>
-  follow: (taskId: string, originalTaskId: string) => void
+  follow: (taskId: string) => void
 }
 
 const props = defineProps<Props>()
@@ -31,7 +31,7 @@ async function retryTask(): Promise<void> {
   retryError.value = null
   try {
     const replacement = await props.retry(props.task.id)
-    props.follow(replacement.id, props.task.id)
+    props.follow(replacement.id)
   } catch (error) {
     retryError.value =
       error instanceof ProblemError

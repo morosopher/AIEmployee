@@ -31,7 +31,7 @@ describe('TaskTimeline', () => {
     await wrapper.get('button').trigger('click')
 
     expect(retry).toHaveBeenCalledWith('failed-task')
-    expect(follow).toHaveBeenCalledWith('replacement-task', 'failed-task')
+    expect(follow).toHaveBeenCalledWith('replacement-task')
     expect(failedTask.status).toBe('failed')
   })
 
