@@ -65,18 +65,23 @@ class FakeCalendarReader:
 
 
 class FakeGmailReader:
-    """占位 Gmail fake，明确拒绝未提供的 fixture 读取而非回退真实网络。"""
+    """从脱敏 Gmail fixture 读取游标页，绝不构造 HTTP 客户端。"""
+
+    def __init__(self, fixture: Path) -> None:
+        """保存仓库内 fixture 路径，不允许任何外部 URL 输入。"""
+        self._fixture = fixture
 
     async def initial_pages(self) -> AsyncIterator[GmailSyncPage]:
-        """当前 fixture 由 Gmail 任务单独驱动；该 fake 不触发网络。"""
-        if False:
-            yield GmailSyncPage((), None, "")
+        """返回合成的空消息页和 fixture history ID，供 Playwright 预测连接状态。"""
+        payload = json.loads(self._fixture.read_text(encoding="utf-8"))
+        history_id = payload.get("historyId")
+        yield GmailSyncPage((), None, history_id if isinstance(history_id, str) else "")
 
     async def history_pages(self, cursor: str) -> AsyncIterator[GmailSyncPage]:
-        """保持端口完整性并拒绝使用真实 Gmail。"""
+        """增量模式同样只读取固定 fixture。"""
         del cursor
-        if False:
-            yield GmailSyncPage((), None, "")
+        async for page in self.initial_pages():
+            yield page
 
     async def execute_request(self, path: str, parameters: dict[str, str]) -> object:
         """明示测试模式不可联网。"""
