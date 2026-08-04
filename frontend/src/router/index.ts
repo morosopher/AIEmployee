@@ -17,7 +17,7 @@ import { useAuthStore } from '@/stores/auth'
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: '/', redirect: '/tasks' },
+    { path: '/', redirect: '/brief' },
     {
       path: '/login',
       name: 'login',
@@ -25,7 +25,7 @@ const router = createRouter({
       meta: { guestOnly: true },
     },
     {
-      path: '/tasks',
+      path: '/',
       name: 'tasks',
       component: AppShell,
       meta: { requiresAuth: true },
