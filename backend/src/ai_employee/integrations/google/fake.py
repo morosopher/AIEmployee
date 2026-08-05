@@ -137,7 +137,13 @@ class FakeGmailReader:
 
     async def initial_pages(self) -> AsyncIterator[GmailSyncPage]:
         """返回合成的空消息页和 fixture history ID，供 Playwright 预测连接状态。"""
-        if await self._consume_scenario() == "gmail_429":
+        scenario = await self._consume_scenario()
+        if scenario == "partial_source":
+            raise TransientProviderError(
+                error_code="synthetic_partial_source",
+                message="Synthetic Gmail source is temporarily unavailable",
+            )
+        if scenario == "gmail_429":
             raise TransientProviderError(
                 error_code="google_rate_limited",
                 message="Google Gmail is rate limited",

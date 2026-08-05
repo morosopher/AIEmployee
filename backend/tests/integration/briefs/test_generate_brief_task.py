@@ -164,7 +164,9 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
         async with sessions() as session:
             brief = await session.scalar(select(DailyBriefModel))
             assert brief is not None and brief.version == 1 and brief.completeness == "partial"
-            assert "source_sync_failed:gmail" in brief.warnings
+            assert brief.warnings == [
+                "missing:gmail;last_success:never;repair:retry",
+            ]
             items = tuple((await session.scalars(select(DailyBriefItemModel))).all())
             assert len(items) == 2
             assert any(item.source_refs[0]["source_type"] == "calendar_event" for item in items)

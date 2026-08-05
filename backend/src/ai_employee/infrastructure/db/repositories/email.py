@@ -295,7 +295,11 @@ class SqlAlchemyGmailSyncRepository:
             )
 
     async def mark_expired(self, *, user_id: UUID, connection_id: UUID) -> None:
-        """把连续 401 的连接持久化为 expired，阻止后续 Worker 继续访问 Google。"""
+        """把撤销授权持久化为可见的降级状态，阻止后续 Worker 继续读取 Google。
+
+        Gmail 与 Calendar 共用此凭据仓储；因此这里是两类只读资源发生永久授权失败时
+        的唯一事实写入点，连接列表能够以稳定错误码提示用户重新授权。
+        """
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -304,8 +308,8 @@ class SqlAlchemyGmailSyncRepository:
             .with_for_update()
         )
         if connection is not None:
-            connection.status = "expired"
-            connection.last_error_code = "google_unauthorized"
+            connection.status = "degraded"
+            connection.last_error_code = "oauth_revoked"
 
     async def _upsert_credential(
         self,

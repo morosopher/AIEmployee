@@ -152,6 +152,8 @@ class DurableTaskRunner:
         max_transient_retries: int,
         resolve_steps: Callable[[LeasedTask], Sequence[TaskExecutionStep]],
         metrics: TaskMetricsObserver | None = None,
+        retry_backoff_cap: timedelta = timedelta(minutes=5),
+        retry_jitter: Callable[[int], timedelta] | None = None,
     ) -> None:
         """注入持久化、确定性时钟、预算与任务节点解析器。
 
@@ -164,6 +166,8 @@ class DurableTaskRunner:
             max_transient_retries: 首次执行之后允许自动重试的最大次数。
             resolve_steps: 按任务快照解析可重入节点序列的函数。
             metrics: 可选聚合指标端口；不得接收任务载荷或个人数据。
+            retry_backoff_cap: 供应商临时失败的最大延迟，包含 Retry-After 的安全上限。
+            retry_jitter: 按持久尝试次数生成的可注入抖动；测试可注入确定性值。
 
         Raises:
             ValueError: 租约或超时参数不是正数，或单步预算超过任务总预算。
@@ -174,6 +178,8 @@ class DurableTaskRunner:
             raise ValueError("task timeout budgets must be positive")
         if max_transient_retries < 0:
             raise ValueError("max_transient_retries must not be negative")
+        if retry_backoff_cap <= timedelta(0):
+            raise ValueError("retry_backoff_cap must be positive")
         if task_step_timeout_seconds > task_timeout_seconds:
             raise ValueError("task step timeout cannot exceed task timeout")
         if lease_duration.total_seconds() < task_step_timeout_seconds:
@@ -186,6 +192,8 @@ class DurableTaskRunner:
         self._max_transient_retries = max_transient_retries
         self._resolve_steps = resolve_steps
         self._metrics = metrics
+        self._retry_backoff_cap = retry_backoff_cap
+        self._retry_jitter = retry_jitter or (lambda _: timedelta(0))
 
     async def run(
         self,
@@ -300,10 +308,10 @@ class DurableTaskRunner:
                     error_code="task_retry_delay_missing",
                 )
             scheduled_at = utc_instant(self._clock(), field="clock")
-            effective_delay = (
-                timedelta(seconds=error.retry_after)
-                if error.retry_after is not None
-                else retry_delay
+            effective_delay = self._transient_retry_delay(
+                attempt_count=leased.attempt_count,
+                retry_after=error.retry_after,
+                base_delay=retry_delay,
             )
             scheduled = await self._store.schedule_retry(
                 task_id=leased.task_id,
@@ -338,6 +346,24 @@ class DurableTaskRunner:
             status=TaskStatus.SUCCEEDED,
             error_code=None,
         )
+
+    def _transient_retry_delay(
+        self,
+        *,
+        attempt_count: int,
+        retry_after: int | None,
+        base_delay: timedelta,
+    ) -> timedelta:
+        """以 PostgreSQL 尝试次数计算封顶退避，避免队列重投重置等待。
+
+        ``Retry-After`` 是供应商给出的最低等待提示，但不允许将延迟扩展到配置上限之外；
+        普通故障按首次尝试为 base 的指数增长，并在封顶前叠加可替换抖动。
+        """
+        if retry_after is not None:
+            return min(timedelta(seconds=retry_after), self._retry_backoff_cap)
+        exponent = max(attempt_count - 1, 0)
+        delay = base_delay * (2**exponent) + self._retry_jitter(attempt_count)
+        return min(max(delay, timedelta(0)), self._retry_backoff_cap)
 
     async def _run_steps(self, task: LeasedTask, *, lease_owner: str) -> None:
         """按顺序执行节点，并只在仍有下一节点时续租。

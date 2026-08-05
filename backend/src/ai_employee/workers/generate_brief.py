@@ -182,7 +182,11 @@ class GenerateBriefTaskStep:
     async def _refresh_stale_sources(
         self, user_id: UUID, stale: tuple[tuple[str, UUID], ...]
     ) -> list[str]:
-        """逐资源刷新，单一只读同步失败仅降级本次简报而不取消其他来源。"""
+        """逐资源刷新，单一只读同步失败仅降级本次简报而不取消其他来源。
+
+        告警从 PostgreSQL 读取最后成功时刻而非使用 Worker 内存；进程崩溃或另一 Worker
+        接管后仍能向用户说明缺什么、数据新鲜度及可执行的修复动作。
+        """
         if self._sync_source is None:
             return []
         warnings: list[str] = []
@@ -194,9 +198,33 @@ class GenerateBriefTaskStep:
                 UserActionRequiredError,
                 GmailConnectionNotFoundError,
                 CalendarConnectionNotFoundError,
-            ):
-                warnings.append(f"source_sync_failed:{resource_kind}")
+            ) as error:
+                last_success = await self._last_source_success(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    resource_kind=resource_kind,
+                )
+                repair = "reconnect" if isinstance(error, UserActionRequiredError) else "retry"
+                rendered_success = last_success.isoformat() if last_success is not None else "never"
+                warnings.append(
+                    f"missing:{resource_kind};last_success:{rendered_success};repair:{repair}"
+                )
         return warnings
+
+    async def _last_source_success(
+        self, *, user_id: UUID, connection_id: UUID, resource_kind: str
+    ) -> datetime | None:
+        """读取当前用户连接的最后成功同步时刻，不把跨用户游标泄露到简报。"""
+        async with self._session_factory() as session:
+            return await session.scalar(
+                select(SyncCursorModel.last_success_at)
+                .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
+                .where(
+                    OAuthConnectionModel.user_id == user_id,
+                    SyncCursorModel.connection_id == connection_id,
+                    SyncCursorModel.resource_kind == resource_kind,
+                )
+            )
 
     async def _mail_threads_for_local_day(
         self,
