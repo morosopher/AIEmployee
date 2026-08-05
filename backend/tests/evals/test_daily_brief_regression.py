@@ -74,6 +74,8 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
                         "labels": case["labels"],
                         "headers": case["headers"],
                         "summary": case["summary_fact"],
+                        "needs_reply": case["needs_reply"],
+                        "deadline": case["deadline"],
                     }
                 ],
                 "calendar_events": [],
@@ -91,6 +93,26 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
             assert source_ids == set()
         else:
             assert source_ids == {case["id"]}
+            item_text = " ".join(
+                f"{item['title']} {item['body_markdown']}"
+                for item in result["content"]["items"]
+            )
+            # 条目文字只能来自本案例显式批准的摘要/主题事实，不能由图凭空杜撰来源文本。
+            allowed_tokens = (
+                set(case["summary_fact"].lower().split())
+                | set(case["subject"].lower().split())
+                | {
+                    case["id"].lower(), "邮件线程", "已完成分类。", "1", "条通知",
+                    "通知已折叠汇总。", "建议处理", "需要回复",
+                }
+            )
+            rendered_tokens = set(item_text.lower().replace("#", " ").split())
+            assert rendered_tokens <= allowed_tokens | {"-", "•"}
+        classifications = result.get("classifications", [])
+        if classifications:
+            judgement = classifications[0]
+            assert judgement["needs_reply"] is case["needs_reply"]
+            assert judgement["deadline_at"] == case["deadline"]
         if case.get("adversarial_html"):
             assert "<script" not in serialized and "<img" not in serialized
 

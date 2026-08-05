@@ -9,7 +9,12 @@ from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import CsrfProtectedSession
 from ai_employee.config import Settings
-from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel, SyncCursorModel
+from ai_employee.infrastructure.db.models.sources import (
+    EmailMessageModel,
+    EmailThreadModel,
+    OAuthConnectionModel,
+    SyncCursorModel,
+)
 
 TEST_SCENARIO_TTL_SECONDS = 600
 
@@ -114,6 +119,35 @@ def build_test_support_router() -> APIRouter:
                         cursor="synthetic-cursor",
                         last_success_at=datetime.now(UTC),
                     ),
+                )
+            )
+            thread = EmailThreadModel(
+                user_id=authenticated.user.id,
+                connection_id=connection_id,
+                provider_thread_id=f"e2e-thread-{connection_id}",
+                subject="Synthetic follow-up",
+                participants=[],
+                latest_message_at=datetime.now(UTC),
+                provider_url="https://example.test/e2e-thread",
+            )
+            session.add(thread)
+            await session.flush()
+            session.add(
+                EmailMessageModel(
+                    user_id=authenticated.user.id,
+                    thread_id=thread.id,
+                    provider_message_id=f"e2e-message-{connection_id}",
+                    received_at=datetime.now(UTC),
+                    sender={"email": "sender@example.test"},
+                    recipients=[],
+                    subject="Synthetic follow-up",
+                    snippet="Synthetic approved source fact",
+                    body_ciphertext=b"test",
+                    body_nonce=b"0" * 12,
+                    body_key_version=1,
+                    labels=[],
+                    headers={},
+                    provider_url="https://example.test/e2e-message",
                 )
             )
 
