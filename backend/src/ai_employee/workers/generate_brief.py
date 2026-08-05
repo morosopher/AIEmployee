@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from ai_employee.agents.daily_brief.graph import build_daily_brief_graph
+from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.ports.model import ModelGateway
 from ai_employee.application.use_cases.briefs import PersistDailyBriefUseCase
 from ai_employee.application.use_cases.sync_calendar import CalendarConnectionNotFoundError
@@ -49,6 +50,7 @@ class GenerateBriefTaskStep:
         model_name: str = "fake",
         sync_source: SyncSource | None = None,
         now: UtcNow | None = None,
+        checkpoint_database_url: str | None = None,
     ) -> None:
         """注入可替换模型、同步步骤和 UTC 时钟，避免 Graph I/O 占用数据库事务。"""
         self._session_factory = session_factory
@@ -56,6 +58,7 @@ class GenerateBriefTaskStep:
         self._model_name = model_name
         self._sync_source = sync_source
         self._now = now or (lambda: datetime.now(UTC))
+        self._checkpoint_database_url = checkpoint_database_url
 
     async def execute(self, task: LeasedTask) -> None:
         """生成当日简报；无可用来源由 Graph 写稳定失败，不伪造成功。"""
@@ -91,8 +94,7 @@ class GenerateBriefTaskStep:
             calendar_events = await self._events_for_local_day(
                 session, task.user_id, local_date, user.timezone
             )
-        result = await build_daily_brief_graph().ainvoke(
-            {
+        graph_input = {
                 "task_run_id": str(task.task_id),
                 "local_date": local_date.isoformat(),
                 "source_cutoff": cutoff.isoformat(),
@@ -102,8 +104,17 @@ class GenerateBriefTaskStep:
                 "model_gateway": self._model_gateway or build_model_gateway(),
                 "model_name": self._model_name,
                 "locale": user.locale,
-            }
-        )
+        }
+        # 任务 ID 是跨 Worker 接管不变的 thread_id。只有生产组合根提供 PostgreSQL
+        # checkpointer；纯单元测试仍可用内存 Graph 验证确定性节点，不偷偷建立数据库连接。
+        if self._checkpoint_database_url is None:
+            result = await build_daily_brief_graph().ainvoke(graph_input)
+        else:
+            async with postgres_checkpointer(self._checkpoint_database_url) as saver:
+                result = await build_daily_brief_graph(checkpointer=saver).ainvoke(
+                    graph_input,
+                    {"configurable": {"thread_id": str(task.task_id)}},
+                )
         content = DailyBriefContent.model_validate(result["content"])
         markdown = "\n".join(
             [f"# {content.headline}", *(f"- {item.title}" for item in content.items)]
@@ -354,4 +365,5 @@ def build_generate_brief_task_step(
         model_gateway=build_model_gateway(settings, metrics=metrics),
         model_name=settings.model_name,
         sync_source=sync_source,
+        checkpoint_database_url=settings.checkpoint_database_url,
     )
