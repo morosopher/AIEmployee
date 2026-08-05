@@ -71,8 +71,19 @@ class SqlAlchemyTaskRetryRecoveryStore:
             for task in tasks:
                 recovery_at = task.retry_recovery_at
                 is_retry_recovery = task.status == TaskStatus.RETRY_SCHEDULED.value
-                if is_retry_recovery and recovery_at is None:
-                    raise RuntimeError("locked retry task has no recovery deadline")
+                if is_retry_recovery:
+                    if recovery_at is None:
+                        raise RuntimeError("locked retry task has no recovery deadline")
+                    # 仅重试恢复路径在锁定行中要求截止时间；在此处收窄后，去重键可稳定
+                    # 绑定原始到期瞬间，避免后续清空 ORM 字段造成重复投递事实。
+                    retry_recovery_at: datetime = recovery_at
+                    deduplication_key = (
+                        f"task.execute:{task.id}:retry-recovery:{retry_recovery_at.isoformat()}"
+                    )
+                else:
+                    deduplication_key = (
+                        f"task.execute:{task.id}:recovery:{_five_minute_bucket(now)}"
+                    )
                 task.status = TaskStatus.QUEUED.value
                 task.lease_owner = None
                 task.lease_expires_at = None
@@ -91,11 +102,7 @@ class SqlAlchemyTaskRetryRecoveryStore:
                         OutboxEventModel(
                             topic="task.execute",
                             aggregate_id=task.id,
-                            deduplication_key=(
-                                f"task.execute:{task.id}:retry-recovery:{recovery_at.isoformat()}"
-                                if is_retry_recovery
-                                else f"task.execute:{task.id}:recovery:{_five_minute_bucket(now)}"
-                            ),
+                            deduplication_key=deduplication_key,
                             payload={"task_id": str(task.id)},
                         ),
                     )

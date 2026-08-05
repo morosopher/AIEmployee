@@ -800,6 +800,48 @@ async def test_transient_provider_retry_after_overrides_worker_default_delay() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_after", "retry_backoff_cap", "expected_delay"),
+    (
+        (0.5, timedelta(seconds=30), timedelta(milliseconds=500)),
+        (30.5, timedelta(seconds=30), timedelta(seconds=30)),
+    ),
+)
+async def test_transient_provider_retry_after_preserves_fractional_seconds_with_cap(
+    retry_after: float,
+    retry_backoff_cap: timedelta,
+    expected_delay: timedelta,
+) -> None:
+    """小数 Retry-After 应精确保留，且和整数提示一样受全局上限约束。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+
+    async def fail_rate_limited() -> None:
+        """模拟供应商返回带小数秒数的限流提示。"""
+        raise TransientProviderError(
+            error_code="google_rate_limited",
+            message="synthetic rate limit",
+            retry_after=retry_after,
+        )
+
+    runner = DurableTaskRunner(
+        store=store,
+        clock=MutableClock(now),
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=10,
+        max_transient_retries=5,
+        resolve_steps=lambda _: (CallableStep("gmail", fail_rate_limited),),
+        retry_backoff_cap=retry_backoff_cap,
+    )
+
+    await runner.run(task.task_id, lease_owner="worker-a", retry_delay=timedelta(seconds=5))
+
+    assert store.scheduled_retries[0][3] == now + expected_delay
+
+
+@pytest.mark.asyncio
 async def test_transient_provider_retry_uses_capped_exponential_delay_and_caps_retry_after() -> None:
     """持久 attempt_count 驱动指数退避，供应商提示也不得绕过安全上限。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)

@@ -351,7 +351,7 @@ class DurableTaskRunner:
         self,
         *,
         attempt_count: int,
-        retry_after: int | None,
+        retry_after: float | None,
         base_delay: timedelta,
     ) -> timedelta:
         """以 PostgreSQL 尝试次数计算封顶退避，避免队列重投重置等待。
