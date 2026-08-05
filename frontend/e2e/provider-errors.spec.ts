@@ -48,6 +48,15 @@ async function seedGoogleSource(page: Page): Promise<string> {
   return csrf.value
 }
 
+/** 通过仅在双测试开关下存在的端点执行当前用户已持久化的真实 Worker 路径。 */
+async function executeTask(page: Page, csrf: string, taskId: string): Promise<void> {
+  const response = await page.request.post('/api/v1/test-support/execute-task', {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { task_id: taskId },
+  })
+  expect(response.status()).toBe(204)
+}
+
 /** 测试模式端点可注入撤销 OAuth，界面必须给出重新连接操作。 */
 test('revoked OAuth shows reconnect action through the test-only scenario contract', async ({
   page,
@@ -58,8 +67,22 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
-  await seedGoogleSource(page)
+  const csrf = await seedGoogleSource(page)
   await injectScenario(page, 'oauth_revoked')
+  const connections = await page.request.get('/api/v1/connections')
+  const [connection] = (await connections.json()) as Array<{ id: string }>
+  const sync = await page.request.post(`/api/v1/connections/${connection.id}/sync`, {
+    headers: { 'X-CSRF-Token': csrf, 'Idempotency-Key': crypto.randomUUID() },
+  })
+  expect(sync.status()).toBe(202)
+  const { gmail_task_id: gmailTaskId } = (await sync.json()) as { gmail_task_id: string }
+  await executeTask(page, csrf, gmailTaskId)
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/connections')
+    return (await response.json()) as Array<{ status: string; last_error_code: string | null }>
+  }).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: 'degraded', last_error_code: 'oauth_revoked' }),
+  ]))
   await page.goto('/connections')
   await expect(page.getByRole('button', { name: '重新连接' })).toBeVisible()
 })
@@ -80,7 +103,20 @@ test('partial brief presents a single-source failure warning with repair context
     headers: { 'X-CSRF-Token': csrf },
   })
   expect(generated.status()).toBe(202)
+  const { task_id: taskId } = (await generated.json()) as { task_id: string }
+  await executeTask(page, csrf, taskId)
   await expect.poll(async () => (await page.request.get('/api/v1/briefs/today')).status()).toBe(200)
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/briefs/today')
+    return (await response.json()) as { completeness: string; warnings: string[] }
+  }).toEqual(expect.objectContaining({
+    completeness: 'partial',
+    warnings: expect.arrayContaining([
+      expect.stringContaining('missing:gmail'),
+      expect.stringContaining('last_success:'),
+      expect.stringContaining('repair:retry'),
+    ]),
+  }))
   await page.goto('/brief')
   await expect(page.getByRole('alert')).toContainText('missing:gmail')
   await expect(page.getByRole('alert')).toContainText(

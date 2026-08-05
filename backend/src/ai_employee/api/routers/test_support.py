@@ -6,8 +6,9 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
-from ai_employee.api.deps import CsrfProtectedSession
+from ai_employee.api.deps import ApiProblem, CsrfProtectedSession
 from ai_employee.config import Settings
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
@@ -16,6 +17,7 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.security.encryption import AeadCipher
 
 TEST_SCENARIO_TTL_SECONDS = 600
@@ -35,6 +37,12 @@ class TestScenarioRequest(BaseModel):
     """限制 test-only 注入值，禁止把任意供应商载荷塞进 Redis。"""
 
     scenario: str = Field(pattern=r"^(oauth_revoked|gmail_429|calendar_5xx|model_invalid_twice|partial_source)$")
+
+
+class ExecuteTestTaskRequest(BaseModel):
+    """限制 test-only 同步执行入口只能接收已经持久化的任务标识。"""
+
+    task_id: UUID
 
 
 class TestScenarioStore:
@@ -180,5 +188,38 @@ def build_test_support_router() -> APIRouter:
                     provider_url="https://example.test/e2e-message",
                 )
             )
+
+    @router.post("/execute-task", status_code=status.HTTP_204_NO_CONTENT)
+    async def execute_task_for_test(
+        payload: ExecuteTestTaskRequest,
+        authenticated: CsrfProtectedSession,
+        request: Request,
+    ) -> None:
+        """在双开关测试环境同步执行当前用户已排队的真实 Worker 路径。
+
+        正常 API 永远只创建异步任务；此端点不在非测试路由表中，专门让浏览器 E2E 不依赖
+        外部常驻 Taskiq 进程，同时仍复用 DurableTaskRunner、Fake adapter 与 PostgreSQL
+        持久化边界。先按 ``user_id`` 验证任务归属，避免测试工具成为跨用户执行通道。
+        """
+        async with request.app.state.auth_session_factory() as session:
+            owned_task = await session.scalar(
+                select(TaskRunModel.id).where(
+                    TaskRunModel.id == payload.task_id,
+                    TaskRunModel.user_id == authenticated.user.id,
+                )
+            )
+        if owned_task is None:
+            raise ApiProblem(
+                404,
+                "task_not_found",
+                "Task not found",
+                "The requested task is not available for this user.",
+            )
+        from ai_employee.workers.execute_task import build_task_runner
+
+        await build_task_runner().run(
+            payload.task_id,
+            lease_owner=f"test-support:{uuid4()}",
+        )
 
     return router

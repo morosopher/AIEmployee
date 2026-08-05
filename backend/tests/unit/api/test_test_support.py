@@ -52,13 +52,20 @@ async def test_scenario_store_uses_user_scoped_key_and_six_hundred_second_ttl() 
 
 
 def test_router_registers_a_csrf_protected_endpoint() -> None:
-    """场景设置属于写操作，必须使用认证和 CSRF 依赖。"""
+    """测试场景及同步执行均属于写操作，必须使用认证和 CSRF 依赖。"""
     from ai_employee.api.routers.test_support import build_test_support_router
 
     router = build_test_support_router()
     route = next(route for route in router.routes if getattr(route, "path", "") == "/api/v1/test-support/scenario")
     assert "POST" in route.methods
     assert route.dependant.dependencies
+    execute_route = next(
+        route
+        for route in router.routes
+        if getattr(route, "path", "") == "/api/v1/test-support/execute-task"
+    )
+    assert "POST" in execute_route.methods
+    assert execute_route.dependant.dependencies
 
 
 def test_main_registers_router_only_for_explicit_test_environment(
