@@ -6,7 +6,7 @@ required_recipes=(
   doctor bootstrap dev infra-up infra-down web api worker scheduler
   test test-backend test-frontend test-integration test-e2e e2e-backend
   lint format typecheck check ci db-upgrade db-revision db-reset
-  create-admin logs ps health backup restore
+  create-admin logs ps health backup restore observability-up observability-down
 )
 
 # 只读取 just 的摘要，避免测试依赖面向人的分组标题、颜色或详细帮助格式。

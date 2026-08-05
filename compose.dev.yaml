@@ -1,0 +1,63 @@
+# 本地开发覆盖层：仅允许使用未提交的本地 Secret 文件，并保留源代码热更新。
+services:
+  caddy:
+    build:
+      target: build
+    command: ["pnpm", "dev", "--host", "0.0.0.0"]
+    working_dir: /app
+    environment:
+      APP_DOMAIN: localhost
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+
+  api:
+    environment:
+      APP_ENV: development
+      APP_BASE_URL: http://localhost:5173
+      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
+      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
+    command: ["uvicorn", "ai_employee.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend:/app/backend
+
+  worker:
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
+      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
+    volumes:
+      - ./backend:/app/backend
+
+  scheduler:
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
+      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
+    volumes:
+      - ./backend:/app/backend
+
+secrets:
+  postgres_bootstrap_password:
+    file: ./secrets/development/postgres_bootstrap_password
+  app_database_password:
+    file: ./secrets/development/app_database_password
+  retention_database_password:
+    file: ./secrets/development/retention_database_password
+  retention_database_url:
+    file: ./secrets/development/retention_database_url
+  app_master_key:
+    file: ./secrets/development/app_master_key
+  google_client_secret:
+    file: ./secrets/development/google_client_secret
+  model_api_key:
+    file: ./secrets/development/model_api_key
+  backup_passphrase:
+    file: ./secrets/development/backup_passphrase
+  grafana_admin_password:
+    file: ./secrets/development/grafana_admin_password
+
+volumes:
+  frontend_node_modules:

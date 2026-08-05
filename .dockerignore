@@ -1,0 +1,15 @@
+# 根构建上下文会提供 backend、frontend 和初始化脚本，必须排除本机凭据与生成物。
+.git
+.env
+.env.*
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/coverage
+**/test-results
+**/playwright-report
+secrets
+*.pem
+*.key

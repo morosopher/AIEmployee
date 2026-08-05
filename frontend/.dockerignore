@@ -1,0 +1,11 @@
+# 前端生产构建不需要工作树元数据、本地环境或浏览器测试报告。
+.git
+.env
+.env.*
+node_modules
+coverage
+test-results
+playwright-report
+secrets
+*.pem
+*.key

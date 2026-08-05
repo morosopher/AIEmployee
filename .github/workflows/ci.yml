@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.5-alpine
+        env:
+          POSTGRES_DB: ai_employee_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-postgres-password
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_employee_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7.4-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.18"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+
+      - name: Install locked dependencies and browser
+        run: |
+          uv sync --project backend --all-groups --frozen
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend exec playwright install --with-deps chromium
+
+      - name: Create synthetic secret files and database roles
+        shell: bash
+        run: |
+          set -euo pipefail
+          secret_dir="${RUNNER_TEMP}/ai-employee-secrets"
+          mkdir -p "${secret_dir}"
+          printf '%s' 'ci-app-role-password' >"${secret_dir}/app_database_password"
+          printf '%s' 'ci-retention-role-password' >"${secret_dir}/retention_database_password"
+          printf '%s' 'ci-master-key-material-32-bytes-long' >"${secret_dir}/app_master_key"
+          printf '%s' 'ci-google-client-secret' >"${secret_dir}/google_client_secret"
+          printf '%s' 'ci-model-api-key' >"${secret_dir}/model_api_key"
+          printf '%s' 'ci-backup-passphrase' >"${secret_dir}/backup_passphrase"
+          export POSTGRES_DB=ai_employee_test
+          export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=ci-postgres-password
+          export APP_DATABASE_PASSWORD_FILE="${secret_dir}/app_database_password"
+          export RETENTION_DATABASE_PASSWORD_FILE="${secret_dir}/retention_database_password"
+          bash scripts/init-db-roles.sh
+          {
+            echo "TEST_DATABASE_URL=postgresql+asyncpg://postgres:ci-postgres-password@localhost:5432/ai_employee_test"
+            echo "TEST_REDIS_URL=redis://localhost:6379/15"
+            echo "E2E_ADMIN_EMAIL=ci-admin@example.test"
+            echo "E2E_ADMIN_PASSWORD_FILE=${secret_dir}/app_database_password"
+            echo "APP_MASTER_KEY_FILE=${secret_dir}/app_master_key"
+            echo "GOOGLE_CLIENT_SECRET_FILE=${secret_dir}/google_client_secret"
+            echo "MODEL_API_KEY_FILE=${secret_dir}/model_api_key"
+          } >>"${GITHUB_ENV}"
+
+      - name: Run repository quality gate
+        run: just ci
+
+      - name: Upload browser traces and coverage
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          if-no-files-found: ignore
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+            frontend/coverage
+            backend/coverage

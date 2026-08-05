@@ -17,7 +17,8 @@ restore file:
     app_env="${APP_ENV-}"
     case "${app_env}" in
       development|test) ;;
-      *) fail 'APP_ENV must be explicitly set to development or test' ;;
+      production) [[ "${ALLOW_PRODUCTION_RESTORE-}" == yes ]] || fail 'ALLOW_PRODUCTION_RESTORE=yes is required in production' ;;
+      *) fail 'APP_ENV must be explicitly set to development, test, or production' ;;
     esac
 
     restore_file="${1-}"
@@ -30,5 +31,5 @@ restore file:
     IFS= read -r confirmation || fail 'confirmation input is required'
     [[ "${confirmation}" == "${restore_file}" ]] || fail 'confirmation did not match restore target'
 
-    # Task 19 才提供真实恢复脚本；此处只冻结安全调用协议，不提前实现恢复逻辑。
+    # 恢复脚本会校验加密完整性并在生产环境再次检查 ALLOW_PRODUCTION_RESTORE。
     scripts/restore-postgres.sh "${restore_file}"

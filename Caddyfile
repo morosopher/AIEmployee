@@ -1,0 +1,26 @@
+{$APP_DOMAIN} {
+    encode zstd gzip
+
+    # API 的 SSE 流不能被代理缓冲，否则浏览器看不到实时任务进度。
+    handle /api/* {
+        reverse_proxy api:8000 {
+            flush_interval -1
+        }
+    }
+
+    # Prometheus 仅通过内部容器网络抓取，绝不经公共入口暴露。
+    handle /metrics {
+        respond "Not Found" 404
+    }
+
+    # Grafana 保留自身登录流程，并由 profile 启动时才有可用上游。
+    handle_path /ops/grafana/* {
+        reverse_proxy grafana:3000
+    }
+
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+}

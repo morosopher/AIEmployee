@@ -1,0 +1,245 @@
+# 生产 Compose：仅 Caddy 发布主机端口，其余服务保留在受限的内部网络。
+name: ai-employee
+
+x-backend-image: &backend-image "ai-employee-backend:${APP_IMAGE_TAG:?APP_IMAGE_TAG must name an immutable image tag}"
+x-backend-environment: &backend-environment
+  APP_ENV: production
+  APP_BASE_URL: "https://${APP_DOMAIN:?APP_DOMAIN is required}"
+  DATABASE_URL: "postgresql+asyncpg://ai_employee_app@postgres:5432/${POSTGRES_DB:-ai_employee}"
+  CHECKPOINT_DATABASE_URL: "postgresql://ai_employee_app@postgres:5432/${POSTGRES_DB:-ai_employee}"
+  REDIS_URL: redis://redis:6379/0
+  APP_MASTER_KEY_FILE: /run/secrets/app_master_key
+  GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
+  MODEL_API_KEY_FILE: /run/secrets/model_api_key
+  APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
+x-backend-common: &backend-common
+  image: *backend-image
+  restart: unless-stopped
+  environment: *backend-environment
+  secrets:
+    - app_master_key
+    - google_client_secret
+    - model_api_key
+    - app_database_password
+  depends_on:
+    migration:
+      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  caddy:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: "ai-employee-frontend:${APP_IMAGE_TAG:?APP_IMAGE_TAG must name an immutable image tag}"
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: "${APP_DOMAIN:?APP_DOMAIN is required}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17.5-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ai_employee}"
+      POSTGRES_USER: ai_employee_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+    secrets:
+      - postgres_bootstrap_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_employee_owner -d ${POSTGRES_DB:-ai_employee}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server --appendonly yes --appendfsync everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  role-bootstrap:
+    image: *backend-image
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: "no"
+    user: "0:0"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ai_employee}"
+      PGHOST: postgres
+      PGUSER: ai_employee_owner
+      APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
+      RETENTION_DATABASE_PASSWORD_FILE: /run/secrets/retention_database_password
+      POSTGRES_BOOTSTRAP_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+    secrets:
+      - postgres_bootstrap_password
+      - app_database_password
+      - retention_database_password
+    command:
+      - /bin/sh
+      - -ec
+      - "export PGPASSWORD=\"$$(cat /run/secrets/postgres_bootstrap_password)\"; exec bash /app/scripts/init-db-roles.sh"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migration:
+    image: *backend-image
+    restart: "no"
+    user: "0:0"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-ai_employee}"
+      PGHOST: postgres
+      PGUSER: ai_employee_owner
+      DATABASE_URL: "postgresql+asyncpg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
+      POSTGRES_BOOTSTRAP_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+      APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
+      RETENTION_DATABASE_PASSWORD_FILE: /run/secrets/retention_database_password
+    secrets:
+      - postgres_bootstrap_password
+      - app_database_password
+      - retention_database_password
+    command:
+      - /bin/sh
+      - -ec
+      - "export PGPASSWORD=\"$$(cat /run/secrets/postgres_bootstrap_password)\"; uv run --no-sync alembic -c alembic.ini upgrade head; exec bash /app/scripts/init-db-roles.sh"
+    depends_on:
+      role-bootstrap:
+        condition: service_completed_successfully
+
+  api:
+    <<: *backend-common
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec uvicorn ai_employee.main:app --host 0.0.0.0 --port 8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8000/api/v1/system/readiness >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  worker:
+    <<: *backend-common
+    environment:
+      <<: *backend-environment
+      RETENTION_DATABASE_URL_FILE: /run/secrets/retention_database_url
+    secrets:
+      - app_master_key
+      - google_client_secret
+      - model_api_key
+      - app_database_password
+      - retention_database_url
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:9101/metrics | grep -Eq 'ai_employee_process_heartbeat_age_seconds\\{process=\"worker\"\\} [0-5]?[0-9](\\.[0-9]+)?$$'"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  scheduler:
+    <<: *backend-common
+    environment:
+      <<: *backend-environment
+      RETENTION_DATABASE_URL_FILE: /run/secrets/retention_database_url
+    secrets:
+      - app_master_key
+      - google_client_secret
+      - model_api_key
+      - app_database_password
+      - retention_database_url
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec taskiq scheduler --update-interval 1 ai_employee.infrastructure.queue.scheduler:scheduler ai_employee.workers.schedules"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:9102/metrics | grep -Eq 'ai_employee_process_heartbeat_age_seconds\\{process=\"scheduler\"\\} [0-5]?[0-9](\\.[0-9]+)?$$'"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    image: prom/prometheus:v3.3.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./ops/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: "https://${APP_DOMAIN:?APP_DOMAIN is required}/ops/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets:
+      - grafana_admin_password
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  grafana_data:
+
+# 生产 Secret 必须由部署平台预先创建；Compose 仅以只读文件形式挂入相应容器。
+secrets:
+  postgres_bootstrap_password:
+    external: true
+  app_database_password:
+    external: true
+  retention_database_password:
+    external: true
+  retention_database_url:
+    external: true
+  app_master_key:
+    external: true
+  google_client_secret:
+    external: true
+  model_api_key:
+    external: true
+  backup_passphrase:
+    external: true
+  grafana_admin_password:
+    external: true

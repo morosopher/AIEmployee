@@ -1,0 +1,9 @@
+# 以内部 DNS 固定数据源，Grafana 配置不携带应用侧凭据。
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

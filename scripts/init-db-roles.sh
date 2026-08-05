@@ -39,26 +39,87 @@ SELECT format('ALTER ROLE ai_employee_retention PASSWORD %L', convert_from(decod
 SELECT format('GRANT CONNECT ON DATABASE %I TO ai_employee_app, ai_employee_retention', current_database()) \gexec
 GRANT USAGE ON SCHEMA public TO ai_employee_app, ai_employee_retention;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ai_employee_app;
-REVOKE UPDATE, DELETE ON audit_events FROM ai_employee_app;
+-- 预迁移首次启动时业务表尚不存在；每条针对表的授权均先检查 catalog，因此初始化可安全
+-- 运行，迁移完成后由 migration 服务重复执行本脚本以为新表授予权限。
+DO $$
+BEGIN
+  IF to_regclass('public.audit_events') IS NOT NULL THEN
+    REVOKE UPDATE, DELETE ON audit_events FROM ai_employee_app;
+  END IF;
+END
+$$;
 -- retention 角色仅获得保留 Worker 实际需要的表权限。全量隐私删除可删除旧审计后追加
 -- 唯一完成事实，但绝不允许修改既有审计行。
-GRANT SELECT ON users, oauth_connections, sync_cursors, task_runs TO ai_employee_retention;
+DO $$
+BEGIN
+  IF to_regclass('public.users') IS NOT NULL THEN
+    GRANT SELECT ON users TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.oauth_connections') IS NOT NULL THEN
+    GRANT SELECT ON oauth_connections TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.sync_cursors') IS NOT NULL THEN
+    GRANT SELECT ON sync_cursors TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.task_runs') IS NOT NULL THEN
+    GRANT SELECT ON task_runs TO ai_employee_retention;
+  END IF;
+END
+$$;
 -- 先撤销历史版本留下的整表 UPDATE，再按 Worker 实际赋值列回授，保证脚本可重复收紧。
-REVOKE UPDATE ON email_messages, users FROM ai_employee_retention;
-GRANT SELECT, DELETE ON email_messages TO ai_employee_retention;
-GRANT UPDATE (body_ciphertext, body_nonce, body_key_version) ON email_messages TO ai_employee_retention;
-GRANT SELECT, DELETE ON email_analyses, email_threads, calendar_events,
-  encrypted_credentials TO ai_employee_retention;
-REVOKE UPDATE ON sync_cursors FROM ai_employee_retention;
-GRANT UPDATE (cursor, last_success_at, last_attempt_at, last_error_code) ON sync_cursors TO ai_employee_retention;
+DO $$
+BEGIN
+  IF to_regclass('public.email_messages') IS NOT NULL THEN
+    REVOKE UPDATE ON email_messages FROM ai_employee_retention;
+    GRANT SELECT, DELETE ON email_messages TO ai_employee_retention;
+    GRANT UPDATE (body_ciphertext, body_nonce, body_key_version) ON email_messages TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.email_messages') IS NOT NULL
+    AND to_regclass('public.users') IS NOT NULL THEN
+    REVOKE UPDATE ON email_messages, users FROM ai_employee_retention;
+  END IF;
+  IF to_regclass('public.email_analyses') IS NOT NULL
+    AND to_regclass('public.email_threads') IS NOT NULL
+    AND to_regclass('public.calendar_events') IS NOT NULL
+    AND to_regclass('public.encrypted_credentials') IS NOT NULL THEN
+    GRANT SELECT, DELETE ON email_analyses, email_threads, calendar_events,
+      encrypted_credentials TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.sync_cursors') IS NOT NULL THEN
+    REVOKE UPDATE ON sync_cursors FROM ai_employee_retention;
+    GRANT UPDATE (cursor, last_success_at, last_attempt_at, last_error_code) ON sync_cursors TO ai_employee_retention;
+  END IF;
+END
+$$;
 -- 保留与隐私 Worker 以 "SELECT 主键/谓词 -> 有界 DELETE" 执行，DELETE 谓词也读取表列，
 -- 因此这些表必须同时授予 SELECT；不额外授予 INSERT 或 UPDATE。
-GRANT SELECT, DELETE ON messages, conversations, daily_brief_items, daily_briefs, llm_invocations,
-  approval_requests, tool_executions, task_steps, outbox_events, task_runs, user_sessions,
-  oauth_connections TO ai_employee_retention;
-GRANT UPDATE (email, display_name, password_hash, is_active, email_body_retention_days,
-  source_metadata_retention_days, workspace_history_retention_days) ON users TO ai_employee_retention;
-GRANT SELECT, INSERT, DELETE ON audit_events TO ai_employee_retention;
+DO $$
+BEGIN
+  IF to_regclass('public.messages') IS NOT NULL
+    AND to_regclass('public.conversations') IS NOT NULL
+    AND to_regclass('public.daily_brief_items') IS NOT NULL
+    AND to_regclass('public.daily_briefs') IS NOT NULL
+    AND to_regclass('public.llm_invocations') IS NOT NULL
+    AND to_regclass('public.approval_requests') IS NOT NULL
+    AND to_regclass('public.tool_executions') IS NOT NULL
+    AND to_regclass('public.task_steps') IS NOT NULL
+    AND to_regclass('public.outbox_events') IS NOT NULL
+    AND to_regclass('public.task_runs') IS NOT NULL
+    AND to_regclass('public.user_sessions') IS NOT NULL
+    AND to_regclass('public.oauth_connections') IS NOT NULL THEN
+    GRANT SELECT, DELETE ON messages, conversations, daily_brief_items, daily_briefs, llm_invocations,
+      approval_requests, tool_executions, task_steps, outbox_events, task_runs, user_sessions,
+      oauth_connections TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.users') IS NOT NULL THEN
+    GRANT UPDATE (email, display_name, password_hash, is_active, email_body_retention_days,
+      source_metadata_retention_days, workspace_history_retention_days) ON users TO ai_employee_retention;
+  END IF;
+  IF to_regclass('public.audit_events') IS NOT NULL THEN
+    GRANT SELECT, INSERT, DELETE ON audit_events TO ai_employee_retention;
+  END IF;
+END
+$$;
 -- 两个运行角色只通过 Identity 写入审计；USAGE 足以生成值，不允许读取序列状态。
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO ai_employee_app, ai_employee_retention;
 SQL

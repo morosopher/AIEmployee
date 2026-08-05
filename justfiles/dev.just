@@ -14,6 +14,7 @@ bootstrap:
 
 [group('development')]
 dev:
+    # 可观测性 profile 保持显式启动，避免默认开发环境增加 Prometheus/Grafana 资源消耗。
     docker compose -f compose.yaml -f compose.dev.yaml up --build
 
 [group('development')]

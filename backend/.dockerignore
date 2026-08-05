@@ -1,0 +1,15 @@
+# 构建上下文不应携带本地凭据、缓存或测试输出。
+.git
+.env
+.env.*
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+coverage
+htmlcov
+test-results
+playwright-report
+secrets
+*.pem
+*.key
