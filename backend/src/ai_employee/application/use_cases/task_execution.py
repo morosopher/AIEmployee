@@ -12,6 +12,8 @@ from ai_employee.application.ports.observability import TaskMetricsObserver
 from ai_employee.domain.errors import DomainError, TransientProviderError
 from ai_employee.domain.tasks import JsonValue, TaskStatus
 
+_MIN_PERSISTED_RETRY_DELAY = timedelta(microseconds=1)
+
 
 @dataclass(frozen=True, slots=True)
 class LeasedTask:
@@ -180,6 +182,8 @@ class DurableTaskRunner:
             raise ValueError("max_transient_retries must not be negative")
         if retry_backoff_cap <= timedelta(0):
             raise ValueError("retry_backoff_cap must be positive")
+        if retry_backoff_cap < _MIN_PERSISTED_RETRY_DELAY:
+            raise ValueError("retry_backoff_cap must support a positive persisted delay")
         if task_step_timeout_seconds > task_timeout_seconds:
             raise ValueError("task step timeout cannot exceed task timeout")
         if lease_duration.total_seconds() < task_step_timeout_seconds:
@@ -358,13 +362,15 @@ class DurableTaskRunner:
 
         正数 ``Retry-After`` 是供应商给出的最低等待提示，但不允许将延迟扩展到配置
         上限之外；零或负值不满足耐久重试必须晚于当前时刻的不变量，改用首次尝试为
-        base 的指数退避，并在封顶前叠加可替换抖动。
+        base 的指数退避，并在封顶前叠加可替换抖动。PostgreSQL 的时间精度为微秒，
+        因此任何有效路径都至少保留一个微秒，避免极小正数在转换时变为当前时刻。
         """
         if retry_after is not None and retry_after > 0:
-            return min(timedelta(seconds=retry_after), self._retry_backoff_cap)
-        exponent = max(attempt_count - 1, 0)
-        delay = base_delay * (2**exponent) + self._retry_jitter(attempt_count)
-        return min(max(delay, timedelta(0)), self._retry_backoff_cap)
+            delay = timedelta(seconds=retry_after)
+        else:
+            exponent = max(attempt_count - 1, 0)
+            delay = base_delay * (2**exponent) + self._retry_jitter(attempt_count)
+        return min(max(delay, _MIN_PERSISTED_RETRY_DELAY), self._retry_backoff_cap)
 
     async def _run_steps(self, task: LeasedTask, *, lease_owner: str) -> None:
         """按顺序执行节点，并只在仍有下一节点时续租。

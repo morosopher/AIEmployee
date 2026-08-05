@@ -1,6 +1,7 @@
 """把 Taskiq 执行入口组合到基础设施无关的持久任务执行用例。"""
 
 import asyncio
+import secrets
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -41,6 +42,7 @@ from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
 
 RETRY_DELAY_SECONDS = 5
+_MAX_RETRY_JITTER_MICROSECONDS = 1_000_000
 
 # Taskiq 以默认值实例识别依赖注入；保持为模块级单例既符合该框架约定，又避免每次模块检查
 # 误把函数调用默认值标记为副作用。该对象只提供当前消息 Context，不跨越 Worker 边界。
@@ -48,6 +50,21 @@ taskiq_context_dependency: Context = TaskiqDepends()
 _worker_metrics: Metrics | None = None
 _worker_observability_factory = None
 _worker_heartbeat_task: asyncio.Task[None] | None = None
+
+
+def _bounded_retry_jitter(_: int) -> timedelta:
+    """在 Worker 基础设施边界生成最多一秒的正随机抖动。
+
+    Args:
+        _: 当前持久尝试次数；随机策略目前不依赖它，但保留应用层注入协议。
+
+    Returns:
+        一至一百万微秒的正延迟；应用层仍负责同指数退避和全局上限合并。
+
+    随机性只在组合根产生，领域与应用测试可继续注入确定实现，避免不受控随机值
+    污染业务规则或测试结果。
+    """
+    return timedelta(microseconds=secrets.randbelow(_MAX_RETRY_JITTER_MICROSECONDS) + 1)
 
 
 @broker.on_event(TaskiqEvents.WORKER_STARTUP)
@@ -250,6 +267,7 @@ def build_task_runner_for_session(
         task_step_timeout_seconds=settings.task_step_timeout_seconds,
         max_transient_retries=DEFAULT_RETRY_COUNT,
         metrics=_worker_metrics,
+        retry_jitter=_bounded_retry_jitter,
         resolve_steps=lambda task: (
             (
                 build_gmail_sync_task_step(
@@ -330,6 +348,7 @@ async def execute_task(
                     task_step_timeout_seconds=settings.task_step_timeout_seconds,
                     max_transient_retries=DEFAULT_RETRY_COUNT,
                     metrics=_worker_metrics,
+                    retry_jitter=_bounded_retry_jitter,
                     resolve_steps=lambda _task: (_TaskKindLookupFailureStep(),),
                 )
             else:
@@ -342,6 +361,7 @@ async def execute_task(
                         task_step_timeout_seconds=settings.task_step_timeout_seconds,
                         max_transient_retries=DEFAULT_RETRY_COUNT,
                         metrics=_worker_metrics,
+                        retry_jitter=_bounded_retry_jitter,
                         resolve_steps=lambda _task: (
                             _FakeWriteStep(
                                 approval_store=approval_store,

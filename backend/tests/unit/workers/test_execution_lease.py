@@ -86,6 +86,30 @@ def test_retry_recovery_delay_covers_taskiq_max_delay_and_scheduler_margin() -> 
     assert execute_task_module.RETRY_DELAY_SECONDS == 5
 
 
+def test_worker_composition_injects_bounded_positive_retry_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 Worker 组合根必须为指数退避注入有上界的正抖动。"""
+    captured: dict[str, object] = {}
+
+    class Runner:
+        """记录组合根传给持久执行用例的参数，不创建数据库连接。"""
+
+        def __init__(self, **kwargs: object) -> None:
+            """保存组合根参数以验证生产重试策略。"""
+            captured.update(kwargs)
+
+    monkeypatch.setattr(execute_task_module, "DurableTaskRunner", Runner)
+
+    execute_task_module.build_task_runner_for_session(object(), settings=Settings())
+
+    jitter = captured["retry_jitter"]
+    assert callable(jitter)
+    delay = jitter(1)
+    assert isinstance(delay, timedelta)
+    assert timedelta(0) < delay <= timedelta(seconds=1)
+
+
 @pytest.mark.asyncio
 async def test_taskiq_entrypoint_uses_durable_retry_without_reading_message_labels(
     monkeypatch: pytest.MonkeyPatch,
@@ -838,6 +862,52 @@ async def test_transient_provider_retry_after_preserves_fractional_seconds_with_
 
     await runner.run(task.task_id, lease_owner="worker-a", retry_delay=timedelta(seconds=5))
 
+    assert store.scheduled_retries[0][3] == now + expected_delay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_after", "retry_jitter", "retry_backoff_cap", "expected_delay"),
+    (
+        (1e-9, lambda _: timedelta(0), timedelta(seconds=30), timedelta(microseconds=1)),
+        (0, lambda _: timedelta(seconds=-10), timedelta(seconds=30), timedelta(microseconds=1)),
+        (0, lambda _: timedelta(seconds=10), timedelta(microseconds=1), timedelta(microseconds=1)),
+    ),
+)
+async def test_transient_retry_persists_a_positive_delay_with_precision_and_cap(
+    retry_after: float,
+    retry_jitter: Callable[[int], timedelta],
+    retry_backoff_cap: timedelta,
+    expected_delay: timedelta,
+) -> None:
+    """任意可恢复路径都必须写入严格晚于当前时刻且不超过上限的重试事实。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+
+    async def fail_transiently() -> None:
+        """模拟携带极小或无效等待提示的临时供应商失败。"""
+        raise TransientProviderError(
+            error_code="google_rate_limited",
+            message="synthetic rate limit",
+            retry_after=retry_after,
+        )
+
+    runner = DurableTaskRunner(
+        store=store,
+        clock=MutableClock(now),
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=10,
+        max_transient_retries=5,
+        resolve_steps=lambda _: (CallableStep("gmail", fail_transiently),),
+        retry_backoff_cap=retry_backoff_cap,
+        retry_jitter=retry_jitter,
+    )
+
+    assert await runner.run(
+        task.task_id, lease_owner="worker-a", retry_delay=timedelta(microseconds=1)
+    )
     assert store.scheduled_retries[0][3] == now + expected_delay
 
 
