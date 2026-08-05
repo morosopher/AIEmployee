@@ -3,8 +3,9 @@
 import json
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, TypeVar
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -15,16 +16,26 @@ from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.integrations.llm.openai_compatible import ModelGatewayError
 
 T = TypeVar("T", bound=BaseModel)
+ScenarioConsumer = Callable[[UUID], Awaitable[str | None]]
 
 
 class FakeModelGateway:
     """按 source_id 生成稳定结果，可模拟两次非法 JSON。"""
 
-    def __init__(self, *, scenario: str | None = None, metrics: Metrics | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        scenario: str | None = None,
+        metrics: Metrics | None = None,
+        scenario_consumer: ScenarioConsumer | None = None,
+        user_id: UUID | None = None,
+    ) -> None:
         self.scenario = scenario or os.getenv("FAKE_MODEL_SCENARIO", "normal")
         self.calls: list[Sequence[dict[str, str]]] = []
         self._invalid_attempts = 0
         self._metrics = metrics
+        self._scenario_consumer = scenario_consumer
+        self._user_id = user_id
 
     async def complete(
         self,
@@ -36,9 +47,17 @@ class FakeModelGateway:
     ) -> ModelResponse[T]:
         started = time.monotonic()
         self.calls.append(messages)
+        if self._scenario_consumer is not None and self._user_id is not None:
+            injected = await self._scenario_consumer(self._user_id)
+            if injected == "model_invalid_twice":
+                self.scenario = "invalid_twice"
         if self.scenario is not None and self.scenario.startswith("invalid"):
             self._invalid_attempts += 1
-            if self.scenario == "invalid_twice" or self._invalid_attempts <= 1:
+            if (
+                self.scenario == "invalid_twice"
+                and self._invalid_attempts <= 2
+                or self._invalid_attempts <= 1
+            ):
                 if self._metrics is not None:
                     self._metrics.record_model_schema_repair(model=model_name, outcome="requested")
                     self._metrics.record_provider_error(
@@ -78,7 +97,13 @@ class FakeModelGateway:
         return ModelResponse(value=value, usage=usage)
 
 
-def build_model_gateway(settings: Any | None = None, *, metrics: Metrics | None = None) -> Any:
+def build_model_gateway(
+    settings: Any | None = None,
+    *,
+    metrics: Metrics | None = None,
+    scenario_consumer: ScenarioConsumer | None = None,
+    user_id: UUID | None = None,
+) -> Any:
     """按显式测试开关选择 Fake 或配置好的真实适配器。
 
     真实适配器只在调用方已经提供配置与 Secret 时构造，本函数不发起请求。
@@ -87,7 +112,9 @@ def build_model_gateway(settings: Any | None = None, *, metrics: Metrics | None 
     if test_mode is None:
         test_mode = os.getenv("APP_TEST_MODE", "false").lower() == "true"
     if test_mode:
-        return FakeModelGateway(metrics=metrics)
+        return FakeModelGateway(
+            metrics=metrics, scenario_consumer=scenario_consumer, user_id=user_id
+        )
     if settings is None:
         raise RuntimeError("normal model gateway requires settings")
     from ai_employee.integrations.llm.openai_compatible import OpenAICompatibleGateway

@@ -30,6 +30,7 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
+from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.llm.fake import build_model_gateway
 
 SyncSource = Callable[[str, UUID, UUID], Awaitable[None]]
@@ -47,6 +48,7 @@ class GenerateBriefTaskStep:
         session_factory: ManagedAsyncSessionMaker,
         *,
         model_gateway: ModelGateway | None = None,
+        model_gateway_factory: Callable[[UUID], ModelGateway] | None = None,
         model_name: str = "fake",
         sync_source: SyncSource | None = None,
         now: UtcNow | None = None,
@@ -55,6 +57,7 @@ class GenerateBriefTaskStep:
         """注入可替换模型、同步步骤和 UTC 时钟，避免 Graph I/O 占用数据库事务。"""
         self._session_factory = session_factory
         self._model_gateway = model_gateway
+        self._model_gateway_factory = model_gateway_factory
         self._model_name = model_name
         self._sync_source = sync_source
         self._now = now or (lambda: datetime.now(UTC))
@@ -95,15 +98,20 @@ class GenerateBriefTaskStep:
                 session, task.user_id, local_date, user.timezone
             )
         graph_input = {
-                "task_run_id": str(task.task_id),
-                "local_date": local_date.isoformat(),
-                "source_cutoff": cutoff.isoformat(),
-                "mail_threads": mail_threads,
-                "calendar_events": calendar_events,
-                "warnings": warnings,
-                "model_gateway": self._model_gateway or build_model_gateway(),
-                "model_name": self._model_name,
-                "locale": user.locale,
+            "task_run_id": str(task.task_id),
+            "local_date": local_date.isoformat(),
+            "source_cutoff": cutoff.isoformat(),
+            "mail_threads": mail_threads,
+            "calendar_events": calendar_events,
+            "warnings": warnings,
+            "model_gateway": self._model_gateway
+            or (
+                self._model_gateway_factory(task.user_id)
+                if self._model_gateway_factory is not None
+                else build_model_gateway()
+            ),
+            "model_name": self._model_name,
+            "locale": user.locale,
         }
         # 任务 ID 是跨 Worker 接管不变的 thread_id。只有生产组合根提供 PostgreSQL
         # checkpointer；纯单元测试仍可用内存 Graph 验证确定性节点，不偷偷建立数据库连接。
@@ -330,7 +338,10 @@ class GenerateBriefTaskStep:
 
 
 def build_generate_brief_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None, metrics: Metrics | None = None
+    *,
+    session_factory: ManagedAsyncSessionMaker,
+    settings: Settings | None = None,
+    metrics: Metrics | None = None,
 ) -> GenerateBriefTaskStep:
     """构造供 DurableTaskRunner 使用的实际 daily_brief 节点。"""
     if settings is None:
@@ -360,9 +371,24 @@ def build_generate_brief_task_step(
             )
         )
 
+    model_gateway_factory = lambda user_id: (
+        build_model_gateway(
+            settings,
+            metrics=metrics,
+            scenario_consumer=lambda current_user_id: consume_test_scenario(
+                redis_url=settings.redis_url, user_id=current_user_id
+            ),
+            user_id=user_id,
+        )
+        if settings.app_test_mode
+        else None
+    )
     return GenerateBriefTaskStep(
         session_factory,
-        model_gateway=build_model_gateway(settings, metrics=metrics),
+        model_gateway=None
+        if settings.app_test_mode
+        else build_model_gateway(settings, metrics=metrics),
+        model_gateway_factory=model_gateway_factory,
         model_name=settings.model_name,
         sync_source=sync_source,
         checkpoint_database_url=settings.checkpoint_database_url,

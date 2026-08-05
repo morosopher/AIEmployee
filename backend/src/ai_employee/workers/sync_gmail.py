@@ -21,6 +21,7 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.observability.sync import observe_google_sync
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.google.fake import FakeGmailReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.gmail import GmailAdapter
 from ai_employee.integrations.google.oauth import GoogleOAuthClient
@@ -145,7 +146,11 @@ class GmailSyncTaskStep:
             async with self._stores() as store:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
-        adapter: GmailReader = self._reader or GmailAdapter(
+        adapter: GmailReader = (
+            self._reader.for_user(user_id)
+            if isinstance(self._reader, FakeGmailReader)
+            else self._reader
+        ) or GmailAdapter(
             access_token=access_token,
             refresh_access_token=refresh_access_token if refresh_token is not None else None,
             mark_expired=mark_expired,
@@ -187,7 +192,18 @@ def build_gmail_sync_task_step(
     cipher = AeadCipher.from_file(settings.app_master_key_file)
     if settings.app_test_mode:
         fixture = Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "gmail_initial.json"
-        return GmailSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeGmailReader(fixture), metrics=metrics)
+        return GmailSyncTaskStep(
+            session_factory=session_factory,
+            cipher=cipher,
+            oauth=FakeGoogleOAuthClient(),
+            reader=FakeGmailReader(
+                fixture,
+                scenario_consumer=lambda user_id: consume_test_scenario(
+                    redis_url=settings.redis_url, user_id=user_id
+                ),
+            ),
+            metrics=metrics,
+        )
     client_secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
     oauth = GoogleOAuthClient(settings.google_client_id, client_secret, settings.google_redirect_uri)
     return GmailSyncTaskStep(

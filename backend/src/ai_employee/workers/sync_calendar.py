@@ -23,6 +23,7 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.observability.sync import observe_google_sync
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.google.calendar import CalendarAdapter
 from ai_employee.integrations.google.fake import FakeCalendarReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.oauth import GoogleOAuthClient
@@ -130,7 +131,11 @@ class CalendarSyncTaskStep:
             async with self._credential_stores() as store:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
-        adapter: CalendarReader = self._reader or CalendarAdapter(
+        adapter: CalendarReader = (
+            self._reader.for_user(user_id)
+            if isinstance(self._reader, FakeCalendarReader)
+            else self._reader
+        ) or CalendarAdapter(
             access_token=access,
             user_timezone=timezone,
             refresh_access_token=refresh_access_token if refresh else None,
@@ -156,11 +161,26 @@ def build_calendar_sync_task_step(
     """从受控配置构造日历任务步骤，不把 secret 放入队列输入。"""
     cipher = AeadCipher.from_file(settings.app_master_key_file)
     if settings.app_test_mode:
-        fixture = Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "calendar_initial.json"
-        return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=FakeGoogleOAuthClient(), reader=FakeCalendarReader(fixture), metrics=metrics)
+        fixture = (
+            Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "calendar_initial.json"
+        )
+        return CalendarSyncTaskStep(
+            session_factory=session_factory,
+            cipher=cipher,
+            oauth=FakeGoogleOAuthClient(),
+            reader=FakeCalendarReader(
+                fixture,
+                scenario_consumer=lambda user_id: consume_test_scenario(
+                    redis_url=settings.redis_url, user_id=user_id
+                ),
+            ),
+            metrics=metrics,
+        )
     oauth = GoogleOAuthClient(
         settings.google_client_id,
         settings.read_secret_file(settings.google_client_secret_file).get_secret_value(),
         settings.google_redirect_uri,
     )
-    return CalendarSyncTaskStep(session_factory=session_factory, cipher=cipher, oauth=oauth, metrics=metrics)
+    return CalendarSyncTaskStep(
+        session_factory=session_factory, cipher=cipher, oauth=oauth, metrics=metrics
+    )
