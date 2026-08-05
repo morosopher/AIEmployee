@@ -1,35 +1,72 @@
-"""覆盖丢失租约后禁止提交及过期租约接管。"""
+"""在真实 PostgreSQL 上覆盖丢失租约后禁止提交。"""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
-from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.models.identity import UserModel
+from ai_employee.infrastructure.db.models.tasks import TaskRunModel
+from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
+from ai_employee.infrastructure.db.session import build_session_factory
 
 
 @pytest.mark.asyncio
-async def test_worker_losing_lease_cannot_commit_terminal_result() -> None:
-    """节点之间续租 CAS 失败后 runner 返回 false，且不调用 finish。"""
+async def test_worker_losing_lease_cannot_commit_terminal_result(database_url: str) -> None:
+    """过期 owner 被接管后，其终态 CAS 不命中且不得覆盖新持有人。"""
     now = datetime(2026, 8, 5, tzinfo=UTC)
-    store = _LostLeaseStore(uuid4(), now)
-    runner = DurableTaskRunner(store=store, clock=lambda: now, lease_duration=timedelta(seconds=30), task_timeout_seconds=60, task_step_timeout_seconds=10, max_transient_retries=0, resolve_steps=lambda _: (_Noop(), _Noop()))
-    assert not await runner.run(store.task_id, lease_owner="expired-owner")
-    assert store.finished is False
-
-
-class _Noop:
-    """不产生副作用的检查点节点。"""
-    name = "checkpoint"
-    async def execute(self, task: LeasedTask) -> None: pass
-
-
-class _LostLeaseStore:
-    """让首个节点后的 owner 续租失败。"""
-    def __init__(self, task_id, now): self.task_id, self.now, self.finished = task_id, now, False
-    async def prepare_retry(self, **kwargs): pass
-    async def acquire(self, *, task_id, lease_owner, **kwargs): return LeasedTask(task_id=task_id, kind="fake", input_payload={}, started_at=self.now, lease_owner=lease_owner)
-    async def renew(self, **kwargs): return False
-    async def finish(self, **kwargs): self.finished = True; return True
-    async def schedule_retry(self, **kwargs): return False
-    async def fail_internal(self, **kwargs): return False
+    task_id = uuid4()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            user = UserModel(
+                email=f"lease-{uuid4().hex}@example.test",
+                display_name="Lease",
+                password_hash=None,
+                timezone="UTC",
+                locale="zh-CN",
+                brief_time=time(8),
+                is_active=True,
+            )
+            session.add(user)
+            await session.flush()
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user.id,
+                    kind="daily_brief",
+                    status=TaskStatus.RUNNING.value,
+                    lease_owner="expired-owner",
+                    lease_expires_at=now - timedelta(seconds=1),
+                    idempotency_key=f"lease:{task_id}",
+                    input_payload={},
+                )
+            )
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        assert (
+            await store.acquire(
+                task_id=task_id,
+                lease_owner="new-owner",
+                now=now,
+                lease_expires_at=now + timedelta(seconds=30),
+            )
+            is not None
+        )
+        assert not await store.finish(
+            task_id=task_id,
+            lease_owner="expired-owner",
+            status=TaskStatus.SUCCEEDED,
+            finished_at=now,
+            error_code=None,
+        )
+        async with session_factory() as session:
+            task = await session.scalar(select(TaskRunModel).where(TaskRunModel.id == task_id))
+        assert (
+            task is not None
+            and task.status == TaskStatus.RUNNING.value
+            and task.lease_owner == "new-owner"
+        )
+    finally:
+        await session_factory.dispose()

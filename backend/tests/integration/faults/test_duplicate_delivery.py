@@ -1,46 +1,97 @@
-"""验证至少一次 Taskiq 投递不会制造重复业务终态或工具执行。"""
+"""在真实 PostgreSQL 上验证重复投递的租约与业务事实边界。"""
 
-from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from datetime import UTC, datetime, time, timedelta
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import func, select
 
-from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.models.identity import UserModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
+from ai_employee.infrastructure.db.session import build_session_factory
 
 
 @pytest.mark.asyncio
-async def test_duplicate_delivery_has_one_completion_and_one_tool_execution() -> None:
-    """第二个 owner 未获得租约时必须完全无副作用。"""
+async def test_duplicate_delivery_has_one_terminal_business_fact(database_url: str) -> None:
+    """第二个 owner 未获 PostgreSQL 租约时不得写第二份终态审计事实。
+
+    此测试刻意不使用内存 Store：两个执行者分别经由独立短事务竞争同一个真实
+    ``UPDATE ... RETURNING`` 条件更新，证明 Redis/Taskiq 的至少一次消息不会成为
+    第二个业务结果来源。
+    """
     task_id = uuid4()
     now = datetime(2026, 8, 5, tzinfo=UTC)
-    store = _Store(task_id, now)
-    executions: list[str] = []
-    runner = DurableTaskRunner(store=store, clock=lambda: now, lease_duration=timedelta(seconds=30), task_timeout_seconds=60, task_step_timeout_seconds=10, max_transient_retries=1, resolve_steps=lambda _: (_Step(executions),))
-    assert await runner.run(task_id, lease_owner="first")
-    assert not await runner.run(task_id, lease_owner="duplicate")
-    assert executions == ["tool"]
-    assert store.finish_count == 1
+    session_factory = build_session_factory(database_url)
+    try:
+        await _create_queued_task(session_factory, task_id)
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        first = await store.acquire(
+            task_id=task_id,
+            lease_owner="first",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        duplicate = await store.acquire(
+            task_id=task_id,
+            lease_owner="duplicate",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        assert first is not None
+        assert duplicate is None
+        assert await store.finish(
+            task_id=task_id,
+            lease_owner="first",
+            status=TaskStatus.SUCCEEDED,
+            finished_at=now,
+            error_code=None,
+        )
+        assert not await store.finish(
+            task_id=task_id,
+            lease_owner="duplicate",
+            status=TaskStatus.SUCCEEDED,
+            finished_at=now,
+            error_code=None,
+        )
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            terminal_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type == "task.succeeded",
+                )
+            )
+        assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+        assert terminal_count == 1
+    finally:
+        await session_factory.dispose()
 
 
-class _Step:
-    """记录一次假工具执行。"""
-    name = "tool"
-    def __init__(self, calls: list[str]) -> None: self._calls = calls
-    async def execute(self, task: LeasedTask) -> None: self._calls.append(self.name)
-
-
-class _Store:
-    """最小内存租约事实，模拟数据库 owner CAS。"""
-    def __init__(self, task_id, now): self.task_id, self.now, self.status, self.owner, self.finish_count = task_id, now, "queued", None, 0
-    async def prepare_retry(self, **kwargs): pass
-    async def acquire(self, *, task_id, lease_owner, now, lease_expires_at, recover_waiting_approval=False):
-        if self.status != "queued": return None
-        self.status, self.owner = "running", lease_owner
-        return LeasedTask(task_id=task_id, kind="fake", input_payload={}, started_at=self.now, lease_owner=lease_owner)
-    async def renew(self, **kwargs): return True
-    async def finish(self, *, lease_owner, **kwargs):
-        if self.status != "running" or self.owner != lease_owner: return False
-        self.status, self.owner, self.finish_count = "succeeded", None, self.finish_count + 1
-        return True
-    async def schedule_retry(self, **kwargs): return False
-    async def fail_internal(self, **kwargs): return False
+async def _create_queued_task(session_factory: object, task_id: UUID) -> None:
+    """创建最小真实任务行；用户归属是 TaskRun 非空外键的一部分。"""
+    async with session_factory.begin() as session:  # type: ignore[union-attr]
+        user = UserModel(
+            email=f"duplicate-{uuid4().hex}@example.test",
+            display_name="Duplicate",
+            password_hash=None,
+            timezone="UTC",
+            locale="zh-CN",
+            brief_time=time(8),
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        session.add(
+            TaskRunModel(
+                id=task_id,
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.QUEUED.value,
+                idempotency_key=f"duplicate:{task_id}",
+                input_payload={},
+            )
+        )
