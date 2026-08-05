@@ -138,6 +138,11 @@ class FakeGmailReader:
     async def initial_pages(self) -> AsyncIterator[GmailSyncPage]:
         """返回合成的空消息页和 fixture history ID，供 Playwright 预测连接状态。"""
         scenario = await self._consume_scenario()
+        if scenario == "oauth_revoked":
+            raise UserActionRequiredError(
+                error_code="google_reauthorization_required",
+                message="Synthetic Google authorization was revoked",
+            )
         if scenario == "partial_source":
             raise TransientProviderError(
                 error_code="synthetic_partial_source",

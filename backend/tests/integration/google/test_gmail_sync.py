@@ -445,7 +445,8 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
             )
         assert token_route.called
         assert gmail_route.call_count == 2
-        assert connection is not None and connection.status == "expired"
+        assert connection is not None and connection.status == "degraded"
+        assert connection.last_error_code == "oauth_revoked"
         assert access is not None
         assert cipher.decrypt(
             EncryptedValue(access.ciphertext, access.nonce, access.key_version),
@@ -490,7 +491,7 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
         async with sessions() as session:
             status = await session.scalar(select(OAuthConnectionModel.status))
         assert raised.value.error_code == "google_reauthorization_required"
-        assert status == "expired"
+        assert status == "degraded"
     finally:
         await sessions.dispose()
 

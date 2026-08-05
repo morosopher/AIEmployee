@@ -155,13 +155,18 @@ class GmailSyncTaskStep:
             refresh_access_token=refresh_access_token if refresh_token is not None else None,
             mark_expired=mark_expired,
         )
-        await observe_google_sync(
-            metrics=self._metrics,
-            resource="gmail",
-            operation=lambda: SyncGmailUseCase(
-                cast(GmailSyncStoreFactory, self._stores), self._cipher, adapter
-            ).execute(user_id=user_id, connection_id=connection_id),
-        )
+        try:
+            await observe_google_sync(
+                metrics=self._metrics,
+                resource="gmail",
+                operation=lambda: SyncGmailUseCase(
+                    cast(GmailSyncStoreFactory, self._stores), self._cipher, adapter
+                ).execute(user_id=user_id, connection_id=connection_id),
+            )
+        except UserActionRequiredError:
+            # Fake 与真实适配器都经同一撤销事实入口，避免测试路径绕过持久化语义。
+            await mark_expired()
+            raise
 
     @staticmethod
     def _credential_aad(user_id: UUID, connection_id: UUID, kind: str) -> bytes:

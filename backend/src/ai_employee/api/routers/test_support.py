@@ -6,7 +6,6 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import update
 
 from ai_employee.api.deps import CsrfProtectedSession
 from ai_employee.config import Settings
@@ -83,14 +82,6 @@ def build_test_support_router() -> APIRouter:
         """为当前登录用户设置一次性 fake adapter 故障，拒绝跨用户写入。"""
         store = request.app.state.test_scenario_store
         await store.set(user_id=authenticated.user.id, scenario=payload.scenario)
-        if payload.scenario == "oauth_revoked":
-            # 测试模式没有真实 OAuth 回调；仍用真实 PostgreSQL 连接事实模拟已撤销授权。
-            async with request.app.state.auth_session_factory.begin() as session:
-                await session.execute(
-                    update(OAuthConnectionModel)
-                    .where(OAuthConnectionModel.user_id == authenticated.user.id)
-                    .values(status="degraded", last_error_code="oauth_revoked")
-                )
 
     @router.post("/seed-google-source", status_code=status.HTTP_204_NO_CONTENT)
     async def seed_google_source(authenticated: CsrfProtectedSession, request: Request) -> None:
