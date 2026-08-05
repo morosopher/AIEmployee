@@ -8,6 +8,7 @@ import {
 } from 'vue'
 
 import { parseTaskEvent, type TaskConnectionState, type TaskEvent } from '@/api/types'
+import { getTask } from '@/api/client'
 import { useTasksStore } from '@/stores/tasks'
 
 /** 服务端每 15 秒发送 heartbeat；连续两个周期无任何活动即主动建立新连接。 */
@@ -94,6 +95,14 @@ export function useTaskEvents(
       connectionState.value = 'connected'
       tasks.setConnectionState(event.task_id, 'connected')
       tasks.applyEvent(event)
+      if (event.event === 'task.status_changed' && isTerminalStatus(event.payload.status)) {
+        // 终态事件可能在代理断线边缘只携带状态；立即以 PostgreSQL 快照对账，补齐步骤、
+        // 错误码与最终游标，同时用事件前后的 sequence 防止慢响应回退新事件。
+        const observedSequence = tasks.latestSequences[event.task_id]
+        void getTask(event.task_id)
+          .then((snapshot) => tasks.setTaskIfUnchangedSince(snapshot, observedSequence))
+          .catch(() => undefined)
+      }
       onEvent?.(event)
     }
     eventSource.onopen = () => {
@@ -134,4 +143,9 @@ export function useTaskEvents(
   )
   onUnmounted(close)
   return connectionState
+}
+
+/** 判断 SSE 载荷给出的任务状态是否已不可再转换。 */
+function isTerminalStatus(value: unknown): boolean {
+  return value === 'succeeded' || value === 'failed' || value === 'cancelled'
 }

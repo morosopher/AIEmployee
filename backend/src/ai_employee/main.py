@@ -107,6 +107,11 @@ def create_app(
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await heartbeat_task
+            scenario_store = getattr(app.state, "test_scenario_store", None)
+            if scenario_store is not None:
+                # 此 Redis 客户端只在 test 双开关下创建；与主 readiness 客户端分开关闭，
+                # 防止 Playwright/pytest 多次建 app 时留下连接。
+                await scenario_store.aclose()
             await session_factory.dispose()
 
     app = FastAPI(title="AI Employee API", version="0.1.0", lifespan=lifespan)
@@ -185,6 +190,15 @@ def create_app(
     app.include_router(build_settings_router())
     app.include_router(build_tasks_router())
     app.include_router(build_approvals_router())
+    # 故障注入只能在两个显式测试开关同时打开后注册；生产路由表中完全不存在该入口。
+    if settings.app_env == "test" and settings.app_test_mode:
+        from ai_employee.api.routers.test_support import (
+            TestScenarioStore,
+            build_test_support_router,
+        )
+
+        app.state.test_scenario_store = TestScenarioStore(Redis.from_url(settings.redis_url))
+        app.include_router(build_test_support_router())
     return app
 
 
