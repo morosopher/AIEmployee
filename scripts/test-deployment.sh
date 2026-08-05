@@ -2,6 +2,8 @@
 # 验证生产编排、数据库权限和可观测性入口的最小部署契约，不连接外部账号或生产资源。
 set -euo pipefail
 
+[[ "${APP_IMAGE_TAG:-}" != latest ]] || { printf '%s\n' 'APP_IMAGE_TAG must not be latest' >&2; exit 1; }
+
 # 验收仅解析配置，不拉取或运行镜像；提供合成不可变标签和本地域名以通过生产必填变量校验。
 export APP_IMAGE_TAG="${APP_IMAGE_TAG:-ci-immutable-test}"
 export APP_DOMAIN="${APP_DOMAIN:-localhost}"

@@ -57,7 +57,8 @@ if [[ "${APP_ENV-}" == production && -z "${remote}" ]]; then
 fi
 if [[ -n "${remote}" ]]; then
   command -v rclone >/dev/null || fail 'rclone is required when BACKUP_RCLONE_REMOTE is set'
-  rclone copy "${artifact}" "${checksum}" "${remote}"
+  rclone copy "${artifact}" "${remote}"
+  rclone copy "${checksum}" "${remote}"
 fi
 
 printf 'encrypted backup created: %s\n' "$(basename "${artifact}")"

@@ -69,7 +69,7 @@ services:
   redis:
     image: redis:7.4-alpine
     restart: unless-stopped
-    command: ["redis-server --appendonly yes --appendfsync everysec"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -140,6 +140,11 @@ services:
       timeout: 5s
       retries: 8
       start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   worker:
     <<: *backend-common
@@ -188,6 +193,28 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  backup:
+    image: *backend-image
+    profiles: ["operations"]
+    restart: "no"
+    environment:
+      APP_ENV: "${APP_ENV:-production}"
+      BACKUP_DIR: /backups
+      BACKUP_RCLONE_REMOTE: "${BACKUP_RCLONE_REMOTE:-}"
+      PGHOST: postgres
+      PGUSER: ai_employee_app
+      PGDATABASE: "${POSTGRES_DB:-ai_employee}"
+      BACKUP_PASSPHRASE_FILE: /run/secrets/backup_passphrase
+    secrets:
+      - app_database_password
+      - backup_passphrase
+    volumes:
+      - "${BACKUP_DIR:-./var/backups}:/backups"
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec bash /app/scripts/backup-postgres.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   prometheus:
     image: prom/prometheus:v3.3.1

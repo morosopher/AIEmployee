@@ -1,7 +1,7 @@
 # 备份与恢复委托给可审计脚本；恢复操作保留交互确认和生产环境保护。
 [group('operations')]
 backup:
-    scripts/backup-postgres.sh
+    docker compose --profile operations run --rm backup
 
 [confirm]
 [group('operations')]
@@ -31,5 +31,7 @@ restore file:
     IFS= read -r confirmation || fail 'confirmation input is required'
     [[ "${confirmation}" == "${restore_file}" ]] || fail 'confirmation did not match restore target'
 
-    # 恢复脚本会校验加密完整性并在生产环境再次检查 ALLOW_PRODUCTION_RESTORE。
-    scripts/restore-postgres.sh "${restore_file}"
+    # 恢复容器同时获得 PostgreSQL 内网和受限 Secret 文件，宿主机无需安装数据库客户端。
+    docker compose --profile operations run --rm --no-deps \
+      -e APP_ENV="${app_env}" -e ALLOW_PRODUCTION_RESTORE="${ALLOW_PRODUCTION_RESTORE-}" \
+      --entrypoint /bin/sh backup -ec 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "/backups/'"$(basename -- "${restore_file}")"'"'

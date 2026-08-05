@@ -36,7 +36,7 @@ health:
       docker inspect "${container_id}" | grep -q '"Status": "healthy"' \
         || { printf 'health failed: %s is not healthy\n' "${service}" >&2; exit 1; }
     done
-    curl --fail --silent http://localhost:8000/api/v1/system/readiness >/dev/null
+    docker compose exec -T api curl --fail --silent http://localhost:8000/api/v1/system/readiness >/dev/null
 
 [group('docker')]
 observability-up:
