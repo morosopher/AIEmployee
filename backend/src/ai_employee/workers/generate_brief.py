@@ -78,6 +78,7 @@ class GenerateBriefTaskStep:
         if existing is not None:
             return
         cutoff = self._cutoff(task.input_payload.get("source_cutoff"))
+        connection_id = self._connection_scope(task.input_payload.get("connection_id"))
         async with self._session_factory() as session:
             user = await session.get(UserModel, task.user_id)
             if user is None:
@@ -85,17 +86,17 @@ class GenerateBriefTaskStep:
             local_date = self._local_date(
                 task.input_payload.get("local_date"), user.timezone, cutoff
             )
-            stale = await self._stale_resources(session, task.user_id, cutoff)
+            stale = await self._stale_resources(session, task.user_id, cutoff, connection_id)
         warnings = await self._refresh_stale_sources(task.user_id, stale)
         async with self._session_factory() as session:
             user = await session.get(UserModel, task.user_id)
             if user is None:
                 raise ValueError("daily_brief user not found")
             mail_threads = await self._mail_threads_for_local_day(
-                session, task.user_id, local_date, user.timezone, cutoff
+                session, task.user_id, local_date, user.timezone, cutoff, connection_id
             )
             calendar_events = await self._events_for_local_day(
-                session, task.user_id, local_date, user.timezone
+                session, task.user_id, local_date, user.timezone, connection_id
             )
         graph_input = {
             "task_run_id": str(task.task_id),
@@ -137,7 +138,7 @@ class GenerateBriefTaskStep:
         )
 
     async def _stale_resources(
-        self, session: Any, user_id: UUID, cutoff: datetime
+        self, session: Any, user_id: UUID, cutoff: datetime, connection_id: UUID | None
     ) -> tuple[tuple[str, UUID], ...]:
         """返回缺失或超过十五分钟未成功同步的已连接资源，始终带用户归属过滤。"""
         rows = await session.execute(
@@ -152,31 +153,41 @@ class GenerateBriefTaskStep:
                 OAuthConnectionModel.user_id == user_id,
                 OAuthConnectionModel.provider == "google",
                 OAuthConnectionModel.status == "connected",
+                *(
+                    (OAuthConnectionModel.id == connection_id,)
+                    if connection_id is not None
+                    else ()
+                ),
             )
         )
         stale: list[tuple[str, UUID]] = []
         found: set[tuple[UUID, str]] = set()
-        for connection_id, resource_kind, cursor, last_success_at in rows:
+        for row_connection_id, resource_kind, cursor, last_success_at in rows:
             if resource_kind in {"gmail", "calendar"}:
-                found.add((connection_id, resource_kind))
+                found.add((row_connection_id, resource_kind))
                 if (
                     cursor is None
                     or last_success_at is None
                     or last_success_at < cutoff - SYNC_FRESHNESS
                 ):
-                    stale.append((resource_kind, connection_id))
-        for (connection_id,) in (
+                    stale.append((resource_kind, row_connection_id))
+        for (row_connection_id,) in (
             await session.execute(
                 select(OAuthConnectionModel.id).where(
                     OAuthConnectionModel.user_id == user_id,
                     OAuthConnectionModel.provider == "google",
                     OAuthConnectionModel.status == "connected",
+                    *(
+                        (OAuthConnectionModel.id == connection_id,)
+                        if connection_id is not None
+                        else ()
+                    ),
                 )
             )
         ).all():
             for resource_kind in ("gmail", "calendar"):
-                if (connection_id, resource_kind) not in found:
-                    stale.append((resource_kind, connection_id))
+                if (row_connection_id, resource_kind) not in found:
+                    stale.append((resource_kind, row_connection_id))
         return tuple(stale)
 
     async def _refresh_stale_sources(
@@ -233,17 +244,25 @@ class GenerateBriefTaskStep:
         local_date: date,
         timezone: str,
         cutoff: datetime,
+        connection_id: UUID | None,
     ) -> list[dict[str, object]]:
         """按邮件 received_at 的用户本地日去重线程，绝不以线程更新时间替代接收日期。"""
         start, end = self._day_bounds(local_date, timezone)
         upper = min(end, cutoff)
         messages = (
             await session.scalars(
-                select(EmailMessageModel)
+                select(EmailMessageModel).join(
+                    EmailThreadModel, EmailThreadModel.id == EmailMessageModel.thread_id
+                )
                 .where(
                     EmailMessageModel.user_id == user_id,
                     EmailMessageModel.received_at >= start,
                     EmailMessageModel.received_at < upper,
+                    *(
+                        (EmailThreadModel.connection_id == connection_id,)
+                        if connection_id is not None
+                        else ()
+                    ),
                 )
                 .order_by(EmailMessageModel.received_at.desc())
             )
@@ -255,7 +274,10 @@ class GenerateBriefTaskStep:
                 continue
             thread = await session.scalar(
                 select(EmailThreadModel).where(
-                    EmailThreadModel.id == message.thread_id, EmailThreadModel.user_id == user_id
+                    EmailThreadModel.id == message.thread_id,
+                    EmailThreadModel.user_id == user_id,
+                    *((EmailThreadModel.connection_id == connection_id,)
+                      if connection_id is not None else ()),
                 )
             )
             if thread is None:
@@ -275,7 +297,12 @@ class GenerateBriefTaskStep:
         return result
 
     async def _events_for_local_day(
-        self, session: Any, user_id: UUID, local_date: date, timezone: str
+        self,
+        session: Any,
+        user_id: UUID,
+        local_date: date,
+        timezone: str,
+        connection_id: UUID | None,
     ) -> list[dict[str, object]]:
         """选择与用户本地日发生任何重叠的日程，包括当天稍后才开始的事件。"""
         start, end = self._day_bounds(local_date, timezone)
@@ -287,6 +314,11 @@ class GenerateBriefTaskStep:
                     CalendarEventModel.ends_at.is_not(None),
                     CalendarEventModel.starts_at < end,
                     CalendarEventModel.ends_at > start,
+                    *(
+                        (CalendarEventModel.connection_id == connection_id,)
+                        if connection_id is not None
+                        else ()
+                    ),
                 )
             )
         ).all()
@@ -364,6 +396,15 @@ class GenerateBriefTaskStep:
             return parsed.astimezone(UTC)
         return self._utc_now()
 
+    @staticmethod
+    def _connection_scope(raw: object) -> UUID | None:
+        """解析可选的单连接测试范围，拒绝不稳定值以免悄悄回退到全量来源。"""
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise TypeError("daily_brief connection_id must be a UUID string")
+        return UUID(raw)
+
 
 def build_generate_brief_task_step(
     *,
@@ -399,8 +440,9 @@ def build_generate_brief_task_step(
             )
         )
 
-    model_gateway_factory = lambda user_id: (
-        build_model_gateway(
+    model_gateway_factory: Callable[[UUID], ModelGateway] | None = None
+    if settings.app_test_mode:
+        model_gateway_factory = lambda user_id: build_model_gateway(
             settings,
             metrics=metrics,
             scenario_consumer=lambda current_user_id: consume_test_scenario(
@@ -408,9 +450,6 @@ def build_generate_brief_task_step(
             ),
             user_id=user_id,
         )
-        if settings.app_test_mode
-        else None
-    )
     return GenerateBriefTaskStep(
         session_factory,
         model_gateway=None

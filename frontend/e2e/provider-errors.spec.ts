@@ -58,6 +58,21 @@ async function executeTask(page: Page, csrf: string, taskId: string): Promise<vo
   expect(response.status()).toBe(204)
 }
 
+/** 创建只绑定本例合成连接的测试简报任务，避免历史来源影响故障结论。 */
+async function generateBriefForSource(
+  page: Page,
+  csrf: string,
+  connectionId: string,
+): Promise<string> {
+  const response = await page.request.post('/api/v1/test-support/generate-brief', {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { connection_id: connectionId },
+  })
+  expect(response.status()).toBe(202)
+  const { task_id: taskId } = await response.json() as { task_id: string }
+  return taskId
+}
+
 /** 测试模式端点可注入撤销 OAuth，界面必须给出重新连接操作。 */
 test('revoked OAuth shows reconnect action through the test-only scenario contract', async ({
   page,
@@ -99,13 +114,9 @@ test('partial brief presents a single-source failure warning with repair context
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
-  const { csrf } = await seedGoogleSource(page)
+  const { csrf, connectionId } = await seedGoogleSource(page)
   await injectScenario(page, 'partial_source')
-  const generated = await page.request.post('/api/v1/briefs/generate', {
-    headers: { 'X-CSRF-Token': csrf },
-  })
-  expect(generated.status()).toBe(202)
-  const { task_id: taskId } = (await generated.json()) as { task_id: string }
+  const taskId = await generateBriefForSource(page, csrf, connectionId)
   await executeTask(page, csrf, taskId)
   await expect.poll(async () => {
     const response = await page.request.get('/api/v1/briefs/today')

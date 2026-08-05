@@ -45,6 +45,18 @@ class ExecuteTestTaskRequest(BaseModel):
     task_id: UUID
 
 
+class GenerateTestBriefRequest(BaseModel):
+    """限制测试简报只能冻结当前测试刚创建的连接范围。"""
+
+    connection_id: UUID
+
+
+class GenerateTestBriefResponse(BaseModel):
+    """返回可由测试执行入口消费的耐久任务标识。"""
+
+    task_id: UUID
+
+
 class SeedGoogleSourceResponse(BaseModel):
     """返回本次创建的合成连接，使 E2E 不会误用历史测试数据。"""
 
@@ -201,6 +213,49 @@ def build_test_support_router() -> APIRouter:
                 )
             )
         return SeedGoogleSourceResponse(connection_id=connection_id)
+
+    @router.post(
+        "/generate-brief",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=GenerateTestBriefResponse,
+    )
+    async def generate_brief_for_test_source(
+        payload: GenerateTestBriefRequest,
+        authenticated: CsrfProtectedSession,
+        request: Request,
+    ) -> GenerateTestBriefResponse:
+        """创建仅读取指定合成连接的每日简报任务。
+
+        E2E 环境可能保留同一管理员以前运行留下的合成来源，因此测试必须把本例刚 seed
+        的连接 ID 冻结到耐久任务载荷。生产简报 API 不接受该测试范围参数；此路由只在
+        双测试开关下注册，并先以用户条件验证连接归属，不能借此读取另一用户来源。
+        """
+        async with request.app.state.auth_session_factory() as session:
+            connection = await session.scalar(
+                select(OAuthConnectionModel.id).where(
+                    OAuthConnectionModel.id == payload.connection_id,
+                    OAuthConnectionModel.user_id == authenticated.user.id,
+                    OAuthConnectionModel.provider == "google",
+                    OAuthConnectionModel.status == "connected",
+                )
+            )
+        if connection is None:
+            raise ApiProblem(
+                404,
+                "connection_not_found",
+                "Connection not found",
+                "The requested connection is not available for this user.",
+            )
+        result = await request.app.state.create_task_use_case.execute(
+            user_id=authenticated.user.id,
+            kind="daily_brief",
+            input_payload={
+                "schedule_kind": "test",
+                "connection_id": str(payload.connection_id),
+            },
+            idempotency_key=f"daily_brief:{authenticated.user.id}:test:{uuid4()}",
+        )
+        return GenerateTestBriefResponse(task_id=result.task_id)
 
     @router.post("/execute-task", status_code=status.HTTP_204_NO_CONTENT)
     async def execute_task_for_test(

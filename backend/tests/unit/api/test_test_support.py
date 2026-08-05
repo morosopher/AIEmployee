@@ -85,6 +85,26 @@ def test_seed_google_source_returns_the_new_connection_id() -> None:
     assert seed_route.response_model is SeedGoogleSourceResponse
 
 
+def test_test_brief_route_requires_a_connection_bound_payload() -> None:
+    """E2E 的 partial 场景必须创建冻结本例连接 ID 的耐久任务。"""
+    from ai_employee.api.routers.test_support import (
+        GenerateTestBriefRequest,
+        GenerateTestBriefResponse,
+        build_test_support_router,
+    )
+
+    router = build_test_support_router()
+    route = next(
+        route
+        for route in router.routes
+        if getattr(route, "path", "") == "/api/v1/test-support/generate-brief"
+    )
+    assert route.status_code == 202
+    assert route.response_model is GenerateTestBriefResponse
+    assert route.dependant.body_params[0].name == "payload"
+    assert "connection_id" in GenerateTestBriefRequest.model_fields
+
+
 def test_main_registers_router_only_for_explicit_test_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

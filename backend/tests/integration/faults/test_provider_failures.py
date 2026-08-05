@@ -12,8 +12,11 @@ from sqlalchemy import select
 from ai_employee.api.routers.test_support import TestScenarioStore
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, LLMInvocationModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
+    EmailMessageModel,
+    EmailThreadModel,
     EncryptedCredentialModel,
     OAuthConnectionModel,
     SyncCursorModel,
@@ -30,6 +33,8 @@ from ai_employee.integrations.google.fake import (
     FakeGoogleOAuthClient,
 )
 from ai_employee.integrations.google.gmail import GmailAdapter
+from ai_employee.integrations.llm.fake import FakeModelGateway
+from ai_employee.workers.generate_brief import GenerateBriefTaskStep
 from ai_employee.workers.sync_calendar import CalendarSyncTaskStep
 from ai_employee.workers.sync_gmail import GmailSyncTaskStep
 
@@ -344,6 +349,143 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
         assert retried_task.status == TaskStatus.SUCCEEDED.value
         assert retried_task.attempt_count == 2
         assert retried_task.error_code is None
+    finally:
+        await redis.delete(TestScenarioStore.key(user_id=user_id))
+        await redis.aclose()
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_model_invalid_twice_persists_partial_brief_through_real_runner(
+    database_url: str, redis_url: RedisTestUrl
+) -> None:
+    """两次无效模型输出必须经 Redis fake、Graph、Runner 写成 partial 而非伪造成功。
+
+    这条回归测试刻意不替换 ``GenerateBriefTaskStep`` 或 LangGraph：一次性 Redis 场景被
+    FakeModelGateway 消费后，真实节点只允许一次修复请求；第二次失败仍让确定性来源生成
+    可审计 partial 简报，并记录两个失败调用而没有任何成功模型调用。
+    """
+    sessions = build_session_factory(database_url)
+    redis = Redis.from_url(str(redis_url), decode_responses=False)
+    scenario_store = TestScenarioStore(redis)
+    now = datetime(2030, 1, 2, 9, tzinfo=UTC)
+    user_id, connection_id, task_id = uuid4(), uuid4(), uuid4()
+    try:
+        async with sessions.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="model-invalid-owner@example.test",
+                    display_name="Model Invalid Owner",
+                    password_hash=None,
+                    timezone="UTC",
+                    brief_time=time(8),
+                )
+            )
+            session.add(
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=user_id,
+                    provider="google",
+                    provider_account_id="synthetic-model-invalid",
+                    account_email="model-invalid-owner@example.test",
+                    scopes=[],
+                    status="connected",
+                    last_error_code=None,
+                )
+            )
+            # 显式 UUID 外键没有 ORM relationship 排序提示，先持久化连接再写入线程。
+            await session.flush()
+            thread = EmailThreadModel(
+                user_id=user_id,
+                connection_id=connection_id,
+                provider_thread_id="model-invalid-thread",
+                subject="Ambiguous synthetic follow-up",
+                participants=[],
+                latest_message_at=now,
+                provider_url="https://example.test/model-invalid-thread",
+            )
+            session.add(thread)
+            await session.flush()
+            session.add_all(
+                (
+                    EmailMessageModel(
+                        user_id=user_id,
+                        thread_id=thread.id,
+                        provider_message_id="model-invalid-message",
+                        received_at=now - timedelta(minutes=1),
+                        sender={"email": "sender@example.test"},
+                        recipients=[],
+                        subject="Ambiguous synthetic follow-up",
+                        snippet="Synthetic source fact requiring model classification.",
+                        body_ciphertext=b"test",
+                        body_nonce=b"0" * 12,
+                        body_key_version=1,
+                        labels=[],
+                        headers={},
+                        provider_url="https://example.test/model-invalid-message",
+                    ),
+                    TaskRunModel(
+                        id=task_id,
+                        user_id=user_id,
+                        kind="daily_brief",
+                        status=TaskStatus.QUEUED.value,
+                        idempotency_key=f"model-invalid:{task_id}",
+                        input_payload={
+                            "schedule_kind": "test",
+                            "connection_id": str(connection_id),
+                            "local_date": now.date().isoformat(),
+                            "source_cutoff": now.isoformat(),
+                        },
+                    ),
+                )
+            )
+        await scenario_store.set(user_id=user_id, scenario="model_invalid_twice")
+        step = GenerateBriefTaskStep(
+            sessions,
+            model_gateway=FakeModelGateway(
+                scenario_consumer=lambda current_user_id: scenario_store.consume(
+                    user_id=current_user_id
+                ),
+                user_id=user_id,
+            ),
+            now=lambda: now,
+        )
+        runner = DurableTaskRunner(
+            store=SqlAlchemyTaskExecutionStore(sessions),
+            clock=lambda: now,
+            lease_duration=timedelta(seconds=30),
+            task_timeout_seconds=60,
+            task_step_timeout_seconds=10,
+            max_transient_retries=3,
+            resolve_steps=lambda _: (step,),
+        )
+
+        assert await runner.run(task_id, lease_owner="model-invalid-worker")
+
+        async with sessions() as session:
+            task = await session.get(TaskRunModel, task_id)
+            brief = await session.scalar(
+                select(DailyBriefModel).where(DailyBriefModel.task_id == task_id)
+            )
+            invocations = list(
+                (
+                    await session.scalars(
+                        select(LLMInvocationModel)
+                        .where(LLMInvocationModel.task_id == task_id)
+                        .order_by(LLMInvocationModel.created_at)
+                    )
+                ).all()
+        )
+        assert task is not None
+        assert task.error_code is None
+        assert task.status == TaskStatus.SUCCEEDED.value
+        assert brief is not None
+        assert brief.completeness == "partial"
+        assert "model_classification_failed:" in "\n".join(brief.warnings)
+        assert len(invocations) == 2
+        assert all(invocation.status == "failed" for invocation in invocations)
+        assert all(invocation.error_code == "model_invalid_output" for invocation in invocations)
     finally:
         await redis.delete(TestScenarioStore.key(user_id=user_id))
         await redis.aclose()
