@@ -7,6 +7,6 @@ RUN pnpm install --frozen-lockfile
 COPY frontend ./
 RUN pnpm build
 
-FROM caddy:2.10-alpine AS runtime
+FROM docker.io/library/caddy:2.10-alpine AS runtime
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /app/dist /srv
