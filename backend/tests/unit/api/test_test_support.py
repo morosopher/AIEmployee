@@ -1,5 +1,7 @@
 """验证测试故障注入入口只在显式测试模式中存在。"""
 
+import inspect
+
 import pytest
 
 
@@ -66,6 +68,16 @@ def test_router_registers_a_csrf_protected_endpoint() -> None:
     )
     assert "POST" in execute_route.methods
     assert execute_route.dependant.dependencies
+
+
+def test_router_delegates_test_fixture_persistence_and_execution_resources() -> None:
+    """路由只映射 HTTP；ORM、加密和可关闭 Worker 资源必须由组合根服务拥有。"""
+    from ai_employee.api.routers import test_support
+
+    source = inspect.getsource(test_support)
+    assert "OAuthConnectionModel" not in source
+    assert "EncryptedCredentialModel" not in source
+    assert "build_task_runner" not in source
 
 
 def test_seed_google_source_returns_the_new_connection_id() -> None:

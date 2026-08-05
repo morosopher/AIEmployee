@@ -196,8 +196,21 @@ def create_app(
             TestScenarioStore,
             build_test_support_router,
         )
+        from ai_employee.infrastructure.testing.test_support import TestSupportFixtureService
+        from ai_employee.workers.execute_task import build_task_runner_for_session
 
         app.state.test_scenario_store = TestScenarioStore(Redis.from_url(settings.redis_url))
+        # 测试同步执行复用 API 生命周期拥有的 session factory；lifespan 统一释放引擎，
+        # 避免 E2E 每次请求经全局 Worker 缓存泄漏独立连接池。
+        app.state.test_task_runner = build_task_runner_for_session(
+            session_factory,
+            settings=settings,
+        )
+        app.state.test_support_fixture_service = TestSupportFixtureService(
+            session_factory,
+            app.state.create_task_use_case,
+            app_master_key_file=settings.app_master_key_file,
+        )
         app.include_router(build_test_support_router())
     return app
 

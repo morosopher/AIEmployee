@@ -195,6 +195,143 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
         await sessions.dispose()
 
 
+@pytest.mark.asyncio
+async def test_generate_brief_preserves_persisted_deterministic_reply_facts(
+    database_url: str,
+) -> None:
+    """真实简报步骤必须把既有确定性待回复与截止时间带入 Graph 并再次审计持久化。"""
+    sessions = build_session_factory(database_url)
+    user_id, task_id, connection_id = uuid4(), uuid4(), uuid4()
+    deadline = datetime(2026, 8, 1, 15, tzinfo=UTC)
+    received_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    try:
+        async with sessions.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="deterministic-owner@example.test",
+                    display_name="Deterministic Owner",
+                    password_hash=None,
+                    timezone="UTC",
+                    locale="en-US",
+                    brief_time=time(8),
+                    is_active=True,
+                )
+            )
+            session.add(
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=user_id,
+                    provider="google",
+                    provider_account_id="deterministic-subject",
+                    account_email="deterministic-owner@example.test",
+                    scopes=[],
+                    status="connected",
+                    last_error_code=None,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="gmail",
+                        cursor="fresh-gmail",
+                        last_success_at=received_at,
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        cursor="fresh-calendar",
+                        last_success_at=received_at,
+                    ),
+                    TaskRunModel(
+                        id=task_id,
+                        user_id=user_id,
+                        kind="daily_brief",
+                        status="running",
+                        idempotency_key="deterministic-facts-task",
+                        input_payload={"local_date": "2026-08-01", "schedule_kind": "manual"},
+                    ),
+                )
+            )
+            thread = EmailThreadModel(
+                user_id=user_id,
+                connection_id=connection_id,
+                provider_thread_id="deterministic-thread",
+                subject="Newsletter",
+                participants=[],
+                latest_message_at=received_at,
+                provider_url="https://example.test/deterministic-thread",
+            )
+            session.add(thread)
+            await session.flush()
+            session.add(
+                EmailMessageModel(
+                    user_id=user_id,
+                    thread_id=thread.id,
+                    provider_message_id="deterministic-message",
+                    received_at=received_at,
+                    sender={"email": "sender@example.test"},
+                    recipients=[],
+                    subject="Newsletter",
+                    snippet="Synthetic source fact",
+                    body_ciphertext=b"x",
+                    body_nonce=b"x" * 12,
+                    body_key_version=1,
+                    labels=[],
+                    headers={"List-Unsubscribe": "<https://example.test/unsubscribe>"},
+                    provider_url="https://example.test/deterministic-message",
+                )
+            )
+            session.add(
+                EmailAnalysisModel(
+                    user_id=user_id,
+                    thread_id=thread.id,
+                    category="notification",
+                    urgency="normal",
+                    needs_reply=True,
+                    deadline_at=deadline,
+                    confidence=1.0,
+                    reason_codes=["synthetic_deterministic_fact"],
+                    model_name="deterministic",
+                    prompt_version="email_rules_v1",
+                    input_hash="d" * 64,
+                    created_at=received_at,
+                )
+            )
+
+        await GenerateBriefTaskStep(
+            sessions,
+            model_gateway=FakeModelGateway(),
+            now=lambda: deadline,
+        ).execute(
+            LeasedTask(
+                task_id=task_id,
+                user_id=user_id,
+                kind="daily_brief",
+                input_payload={"local_date": "2026-08-01", "schedule_kind": "manual"},
+                started_at=received_at - timedelta(seconds=1),
+            )
+        )
+
+        async with sessions() as session:
+            analyses = list(
+                (
+                    await session.scalars(
+                        select(EmailAnalysisModel)
+                        .where(EmailAnalysisModel.thread_id == thread.id)
+                        .order_by(EmailAnalysisModel.created_at)
+                    )
+                ).all()
+            )
+        assert len(analyses) == 2
+        assert all(analysis.needs_reply for analysis in analyses)
+        assert all(analysis.deadline_at == deadline for analysis in analyses)
+    finally:
+        await sessions.dispose()
+
+
 def _event(
     user_id: UUID,
     connection_id: UUID,

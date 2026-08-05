@@ -23,6 +23,7 @@ from ai_employee.infrastructure.db.models.briefs import DailyBriefModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
+    EmailAnalysisModel,
     EmailMessageModel,
     EmailThreadModel,
     OAuthConnectionModel,
@@ -267,6 +268,19 @@ class GenerateBriefTaskStep:
                 .order_by(EmailMessageModel.received_at.desc())
             )
         ).all()
+        deterministic_facts: dict[UUID, EmailAnalysisModel] = {}
+        for analysis in (
+            await session.scalars(
+                select(EmailAnalysisModel)
+                .where(
+                    EmailAnalysisModel.user_id == user_id,
+                    EmailAnalysisModel.model_name == "deterministic",
+                )
+                .order_by(EmailAnalysisModel.created_at.desc())
+            )
+        ).all():
+            # 只采用同一线程最新的规则结果。模型输出不能覆盖 Graph 的可信确定性事实。
+            deterministic_facts.setdefault(analysis.thread_id, analysis)
         result: list[dict[str, object]] = []
         seen: set[UUID] = set()
         for message in messages:
@@ -283,6 +297,7 @@ class GenerateBriefTaskStep:
             if thread is None:
                 continue
             seen.add(message.thread_id)
+            facts = deterministic_facts.get(thread.id)
             result.append(
                 {
                     "thread_id": str(thread.id),
@@ -292,6 +307,8 @@ class GenerateBriefTaskStep:
                     "headers": message.headers,
                     "summary": message.snippet,
                     "provider_url": message.provider_url,
+                    "needs_reply": facts.needs_reply if facts is not None else False,
+                    "deadline_at": facts.deadline_at if facts is not None else None,
                 }
             )
         return result
@@ -353,7 +370,8 @@ class GenerateBriefTaskStep:
             analyses.append(
                 {
                     **item,
-                    "needs_reply": False,
+                    "needs_reply": bool(item.get("needs_reply", False)),
+                    "deadline_at": item.get("deadline_at"),
                     "confidence": 1.0,
                     "model_name": "deterministic",
                     "prompt_version": "email_rules_v1",

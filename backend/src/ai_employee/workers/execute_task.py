@@ -17,13 +17,13 @@ from ai_employee.application.use_cases.task_execution import (
     LeasedTask,
     TaskWaitingApproval,
 )
-from ai_employee.config import get_settings
+from ai_employee.config import Settings, get_settings
 from ai_employee.domain.errors import InternalInvariantError
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
-from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
 from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
@@ -225,6 +225,23 @@ def build_task_runner() -> DurableTaskRunner:
         settings.database_url,
         task_event_publisher=TaskEventPublisher(settings.redis_url),
     )
+    return build_task_runner_for_session(session_factory, settings=settings)
+
+
+def build_task_runner_for_session(
+    session_factory: ManagedAsyncSessionMaker,
+    *,
+    settings: Settings,
+) -> DurableTaskRunner:
+    """以调用方拥有的会话工厂构造真实任务 Runner，不创建无法关闭的额外连接池。
+
+    Args:
+        session_factory: API 或 Worker 生命周期负责释放的数据库会话工厂。
+        settings: 当前进程已验证的配置；测试双开关会据此注入离线 fake 适配器。
+
+    Returns:
+        使用给定会话工厂的 DurableTaskRunner。
+    """
     return DurableTaskRunner(
         store=SqlAlchemyTaskExecutionStore(session_factory),
         clock=lambda: datetime.now(UTC),

@@ -79,7 +79,7 @@ def apply_deterministic_rules(state: dict[str, Any]) -> dict[str, Any]:
                     "urgency": urgency.urgency.value,
                     # 上游已规范化的确定性提取事实可直接进入简报，不允许模型再猜测。
                     "needs_reply": bool(thread.get("needs_reply", False)),
-                    "deadline_at": thread.get("deadline"),
+                    "deadline_at": thread.get("deadline_at"),
                     "reason_codes": classification.reason_codes + urgency.reason_codes,
                 }
             )
