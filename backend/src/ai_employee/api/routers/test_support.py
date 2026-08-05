@@ -12,9 +12,11 @@ from ai_employee.config import Settings
 from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
+    EncryptedCredentialModel,
     OAuthConnectionModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.security.encryption import AeadCipher
 
 TEST_SCENARIO_TTL_SECONDS = 600
 
@@ -92,6 +94,14 @@ def build_test_support_router() -> APIRouter:
     async def seed_google_source(authenticated: CsrfProtectedSession, request: Request) -> None:
         """仅为 E2E 创建当前用户可消费的合成 Google 来源，不接受任意外部数据。"""
         connection_id = uuid4()
+        user_id = authenticated.user.id
+        cipher = AeadCipher.from_file(request.app.state.auth_settings.app_master_key_file)
+        access = cipher.encrypt(
+            b"fake-access", f"{user_id}:{connection_id}:access_token".encode("ascii")
+        )
+        refresh = cipher.encrypt(
+            b"fake-refresh", f"{user_id}:{connection_id}:refresh_token".encode("ascii")
+        )
         async with request.app.state.auth_session_factory.begin() as session:
             session.add(
                 OAuthConnectionModel(
@@ -103,6 +113,26 @@ def build_test_support_router() -> APIRouter:
                     scopes=[],
                     status="connected",
                     last_error_code=None,
+                )
+            )
+            session.add_all(
+                (
+                    EncryptedCredentialModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        credential_kind="access_token",
+                        ciphertext=access.ciphertext,
+                        nonce=access.nonce,
+                        key_version=access.key_version,
+                    ),
+                    EncryptedCredentialModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        credential_kind="refresh_token",
+                        ciphertext=refresh.ciphertext,
+                        nonce=refresh.nonce,
+                        key_version=refresh.key_version,
+                    ),
                 )
             )
             session.add_all(
