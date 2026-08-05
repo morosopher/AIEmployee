@@ -1,13 +1,15 @@
 """仅供受控测试环境注入合成故障场景的 API 路由。"""
 
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Request, status
 from pydantic import BaseModel, Field
 
 from ai_employee.api.deps import CsrfProtectedSession
 from ai_employee.config import Settings
+from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel, SyncCursorModel
 
 TEST_SCENARIO_TTL_SECONDS = 600
 
@@ -80,5 +82,39 @@ def build_test_support_router() -> APIRouter:
         """为当前登录用户设置一次性 fake adapter 故障，拒绝跨用户写入。"""
         store = request.app.state.test_scenario_store
         await store.set(user_id=authenticated.user.id, scenario=payload.scenario)
+
+    @router.post("/seed-google-source", status_code=status.HTTP_204_NO_CONTENT)
+    async def seed_google_source(authenticated: CsrfProtectedSession, request: Request) -> None:
+        """仅为 E2E 创建当前用户可消费的合成 Google 来源，不接受任意外部数据。"""
+        connection_id = uuid4()
+        async with request.app.state.auth_session_factory.begin() as session:
+            session.add(
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=authenticated.user.id,
+                    provider="google",
+                    provider_account_id=f"e2e-{connection_id}",
+                    account_email="e2e-source@example.test",
+                    scopes=[],
+                    status="connected",
+                    last_error_code=None,
+                )
+            )
+            session.add_all(
+                (
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="gmail",
+                        cursor="synthetic-cursor",
+                        last_success_at=datetime.now(UTC) - timedelta(hours=1),
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        cursor="synthetic-cursor",
+                        last_success_at=datetime.now(UTC),
+                    ),
+                )
+            )
 
     return router

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 from uuid import UUID, uuid4
 
 import pytest
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -33,6 +34,52 @@ from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemy
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.redis_url import validate_test_redis_url
 from ai_employee.workers.execute_task import _FakeWriteStep
+
+
+@pytest.mark.asyncio
+async def test_second_worker_resumes_postgres_checkpoint_without_rerunning_completed_node(
+    database_url: str,
+) -> None:
+    """第二个 Worker 用同一 task_id thread 恢复时，不得重跑已写 checkpoint 的前置节点。"""
+    task_id = uuid4()
+    calls = {"prepare": 0, "continue": 0}
+
+    async def prepare(state: dict[str, object]) -> dict[str, object]:
+        """模拟第一个 Worker 已完成的无副作用预处理节点。"""
+        del state
+        calls["prepare"] += 1
+        return {"prepared": True}
+
+    async def approval_gate(state: dict[str, object]) -> dict[str, object]:
+        """第一次持久化中断，恢复后只执行此后的继续节点。"""
+        del state
+        from langgraph.types import interrupt
+
+        interrupt("synthetic handoff")
+        calls["continue"] += 1
+        return {"continued": True}
+
+    graph_builder = StateGraph(dict)
+    graph_builder.add_node("prepare", prepare)
+    graph_builder.add_node("approval_gate", approval_gate)
+    graph_builder.add_edge(START, "prepare")
+    graph_builder.add_edge("prepare", "approval_gate")
+    graph_builder.add_edge("approval_gate", END)
+    config = {"configurable": {"thread_id": str(task_id)}}
+
+    async with postgres_checkpointer(database_url) as first_saver:
+        first_worker_graph = graph_builder.compile(checkpointer=first_saver)
+        first_result = await first_worker_graph.ainvoke({}, config=config)
+    assert "__interrupt__" in first_result
+    assert calls == {"prepare": 1, "continue": 0}
+
+    # 第二个 Saver 实例代表进程故障后的新 Worker；只共享 PostgreSQL checkpoint 事实。
+    async with postgres_checkpointer(database_url) as second_saver:
+        second_worker_graph = graph_builder.compile(checkpointer=second_saver)
+        resumed = await second_worker_graph.ainvoke(Command(resume="approved"), config=config)
+
+    assert resumed["continued"] is True
+    assert calls == {"prepare": 1, "continue": 1}
 
 
 async def test_scanner_recovers_published_initial_message_lost_with_redis_before_interrupt_checkpoint(
