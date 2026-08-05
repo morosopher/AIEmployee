@@ -125,8 +125,9 @@ test('EventSource reconnect replays from the durable cursor and reconciles termi
 })
 
 /**
- * 页面刷新会丢弃 Pinia 投影，因此必须先由 PostgreSQL 快照恢复运行步骤，再接受从该
- * 快照之后开始的耐久事件。流内重复的同 sequence 事件不得生成第二个时间线条目。
+ * 页面刷新会新建不能携带 Last-Event-ID 的 EventSource；服务端因此会从 cursor 0 重放
+ * 已被恢复快照覆盖的 sequence 1。测试先确认该 PostgreSQL 快照已渲染并建立 cursor 1，
+ * 才放行后续 sequence 2/3，证明重复重放不会生成第二个时间线条目或回退终态。
  */
 test('page reload restores durable snapshot and deduplicates replayed task events', async ({
   page,
@@ -174,6 +175,28 @@ test('page reload restores durable snapshot and deduplicates replayed task event
       })
       return
     }
+    if (eventRequests === 2) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache' },
+        body: [
+          // 让关闭后的 EventSource 立即按协议重连；下一条请求应携带本流已接收的 cursor 1。
+          'retry: 0',
+          'id: 1',
+          'event: step.started',
+          'data: {"id":"1","task_id":"task-1","sequence":"1","event":"step.started","occurred_at":"2026-08-05T00:00:00Z","step_id":"step-1","payload":{"name":"persist","status":"started"}}',
+          '',
+        ].join('\n'),
+      })
+      return
+    }
+    // 第三条请求是同一浏览器流的协议级重连。此时页面已从 PostgreSQL 快照恢复，故可
+    // 区分“快照基线去重”与仅依赖单一 EventSource 内存状态的偶然通过。
+    expect(route.request().headers()['last-event-id']).toBe('1')
+    await expect(page.getByText('当前状态： running')).toBeVisible()
+    await expect(page.getByRole('listitem').filter({ hasText: 'persist' })).toHaveCount(1)
+    expect(snapshotRequests).toBeGreaterThanOrEqual(2)
     await route.fulfill({
       status: 200,
       contentType: 'text/event-stream',
@@ -201,6 +224,6 @@ test('page reload restores durable snapshot and deduplicates replayed task event
 
   await expect(page.getByText('当前状态： succeeded')).toBeVisible()
   await expect(page.getByRole('listitem').filter({ hasText: 'persist' })).toHaveCount(1)
-  await expect.poll(() => eventRequests).toBe(2)
+  await expect.poll(() => eventRequests).toBe(3)
   expect(snapshotRequests).toBeGreaterThanOrEqual(3)
 })
