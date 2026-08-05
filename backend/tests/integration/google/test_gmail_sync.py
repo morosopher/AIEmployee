@@ -489,9 +489,11 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
                 )
             )
         async with sessions() as session:
-            status = await session.scalar(select(OAuthConnectionModel.status))
+            connection = await session.scalar(select(OAuthConnectionModel))
         assert raised.value.error_code == "google_reauthorization_required"
-        assert status == "degraded"
+        assert connection is not None
+        assert connection.status == "degraded"
+        assert connection.last_error_code == "oauth_revoked"
     finally:
         await sessions.dispose()
 
