@@ -45,6 +45,12 @@ class ExecuteTestTaskRequest(BaseModel):
     task_id: UUID
 
 
+class SeedGoogleSourceResponse(BaseModel):
+    """返回本次创建的合成连接，使 E2E 不会误用历史测试数据。"""
+
+    connection_id: UUID
+
+
 class TestScenarioStore:
     """以用户 ID 隔离、十分钟自动过期的一次性 fake adapter 场景存储。"""
 
@@ -98,9 +104,15 @@ def build_test_support_router() -> APIRouter:
         store = request.app.state.test_scenario_store
         await store.set(user_id=authenticated.user.id, scenario=payload.scenario)
 
-    @router.post("/seed-google-source", status_code=status.HTTP_204_NO_CONTENT)
-    async def seed_google_source(authenticated: CsrfProtectedSession, request: Request) -> None:
-        """仅为 E2E 创建当前用户可消费的合成 Google 来源，不接受任意外部数据。"""
+    @router.post(
+        "/seed-google-source",
+        status_code=status.HTTP_200_OK,
+        response_model=SeedGoogleSourceResponse,
+    )
+    async def seed_google_source(
+        authenticated: CsrfProtectedSession, request: Request
+    ) -> SeedGoogleSourceResponse:
+        """创建当前用户可消费的合成来源，并返回本次连接的稳定标识。"""
         connection_id = uuid4()
         user_id = authenticated.user.id
         cipher = AeadCipher.from_file(request.app.state.auth_settings.app_master_key_file)
@@ -188,6 +200,7 @@ def build_test_support_router() -> APIRouter:
                     provider_url="https://example.test/e2e-message",
                 )
             )
+        return SeedGoogleSourceResponse(connection_id=connection_id)
 
     @router.post("/execute-task", status_code=status.HTTP_204_NO_CONTENT)
     async def execute_task_for_test(

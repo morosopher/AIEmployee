@@ -37,15 +37,16 @@ async function injectScenario(
   expect(response.status()).toBe(204)
 }
 
-/** 创建当前用户自己的合成来源，后续由实际 Worker 与 Fake adapter 处理。 */
-async function seedGoogleSource(page: Page): Promise<string> {
+/** 创建当前用户自己的合成来源，返回 CSRF 与本次连接 ID 以隔离历史数据。 */
+async function seedGoogleSource(page: Page): Promise<{ csrf: string, connectionId: string }> {
   const csrf = (await page.context().cookies()).find((cookie) => cookie.name === 'ai_employee_csrf')
   if (!csrf) throw new Error('test login did not issue a CSRF cookie')
   const response = await page.request.post('/api/v1/test-support/seed-google-source', {
     headers: { 'X-CSRF-Token': csrf.value },
   })
-  expect(response.status()).toBe(204)
-  return csrf.value
+  expect(response.status()).toBe(200)
+  const { connection_id: connectionId } = await response.json() as { connection_id: string }
+  return { csrf: csrf.value, connectionId }
 }
 
 /** 通过仅在双测试开关下存在的端点执行当前用户已持久化的真实 Worker 路径。 */
@@ -67,11 +68,9 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
-  const csrf = await seedGoogleSource(page)
+  const { csrf, connectionId } = await seedGoogleSource(page)
   await injectScenario(page, 'oauth_revoked')
-  const connections = await page.request.get('/api/v1/connections')
-  const [connection] = (await connections.json()) as Array<{ id: string }>
-  const sync = await page.request.post(`/api/v1/connections/${connection.id}/sync`, {
+  const sync = await page.request.post(`/api/v1/connections/${connectionId}/sync`, {
     headers: { 'X-CSRF-Token': csrf, 'Idempotency-Key': crypto.randomUUID() },
   })
   expect(sync.status()).toBe(202)
@@ -79,10 +78,13 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
   await executeTask(page, csrf, gmailTaskId)
   await expect.poll(async () => {
     const response = await page.request.get('/api/v1/connections')
-    return (await response.json()) as Array<{ status: string; last_error_code: string | null }>
-  }).toEqual(expect.arrayContaining([
-    expect.objectContaining({ status: 'degraded', last_error_code: 'oauth_revoked' }),
-  ]))
+    const connections = (await response.json()) as Array<{
+      id: string
+      status: string
+      last_error_code: string | null
+    }>
+    return connections.find((connection) => connection.id === connectionId)
+  }).toEqual({ id: connectionId, status: 'degraded', last_error_code: 'oauth_revoked' })
   await page.goto('/connections')
   await expect(page.getByRole('button', { name: '重新连接' })).toBeVisible()
 })
@@ -97,7 +99,7 @@ test('partial brief presents a single-source failure warning with repair context
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
-  const csrf = await seedGoogleSource(page)
+  const { csrf } = await seedGoogleSource(page)
   await injectScenario(page, 'partial_source')
   const generated = await page.request.post('/api/v1/briefs/generate', {
     headers: { 'X-CSRF-Token': csrf },
@@ -105,11 +107,16 @@ test('partial brief presents a single-source failure warning with repair context
   expect(generated.status()).toBe(202)
   const { task_id: taskId } = (await generated.json()) as { task_id: string }
   await executeTask(page, csrf, taskId)
-  await expect.poll(async () => (await page.request.get('/api/v1/briefs/today')).status()).toBe(200)
   await expect.poll(async () => {
     const response = await page.request.get('/api/v1/briefs/today')
-    return (await response.json()) as { completeness: string; warnings: string[] }
+    if (response.status() !== 200) return null
+    return (await response.json()) as {
+      task_id: string
+      completeness: string
+      warnings: string[]
+    }
   }).toEqual(expect.objectContaining({
+    task_id: taskId,
     completeness: 'partial',
     warnings: expect.arrayContaining([
       expect.stringContaining('missing:gmail'),

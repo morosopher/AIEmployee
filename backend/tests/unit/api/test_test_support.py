@@ -68,6 +68,23 @@ def test_router_registers_a_csrf_protected_endpoint() -> None:
     assert execute_route.dependant.dependencies
 
 
+def test_seed_google_source_returns_the_new_connection_id() -> None:
+    """E2E 必须绑定本次创建的连接，不能从历史列表任取一项产生假阳性。"""
+    from ai_employee.api.routers.test_support import (
+        SeedGoogleSourceResponse,
+        build_test_support_router,
+    )
+
+    router = build_test_support_router()
+    seed_route = next(
+        route
+        for route in router.routes
+        if getattr(route, "path", "") == "/api/v1/test-support/seed-google-source"
+    )
+    assert seed_route.status_code == 200
+    assert seed_route.response_model is SeedGoogleSourceResponse
+
+
 def test_main_registers_router_only_for_explicit_test_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
