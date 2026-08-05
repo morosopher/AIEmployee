@@ -52,6 +52,13 @@ def test_daily_brief_synthetic_baseline_preserves_rules_sources_and_facts() -> N
         # 证明来源绑定，也会让恶意 HTML 意外成为“通过”的摘要内容。
         assert case["summary_fact"]
         assert "<" not in case["summary_fact"] and ">" not in case["summary_fact"]
+        allowed_facts = case["allowed_facts"]
+        assert allowed_facts["source_ref"] == case["source_ref"]
+        assert allowed_facts["headline"] == "今日办公简报"
+        assert allowed_facts["classification"] == {
+            "needs_reply": case["needs_reply"],
+            "deadline_at": case["deadline"],
+        }
         if case["deadline"] is not None:
             assert datetime.fromisoformat(case["deadline"]).tzinfo is not None
         assert isinstance(case["needs_reply"], bool)
@@ -84,6 +91,8 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
             }
         )
         serialized = json.dumps(result["content"], ensure_ascii=False)
+        allowed_facts = case["allowed_facts"]
+        assert result["content"]["headline"] == allowed_facts["headline"]
         source_ids = {
             reference["source_id"]
             for item in result["content"]["items"]
@@ -91,28 +100,21 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
         }
         if case["category"] == "spam":
             assert source_ids == set()
+            assert allowed_facts["item"] is None
         else:
             assert source_ids == {case["id"]}
-            item_text = " ".join(
-                f"{item['title']} {item['body_markdown']}"
-                for item in result["content"]["items"]
-            )
-            # 条目文字只能来自本案例显式批准的摘要/主题事实，不能由图凭空杜撰来源文本。
-            allowed_tokens = (
-                set(case["summary_fact"].lower().split())
-                | set(case["subject"].lower().split())
-                | {
-                    case["id"].lower(), "邮件线程", "已完成分类。", "1", "条通知",
-                    "通知已折叠汇总。", "建议处理", "需要回复",
-                }
-            )
-            rendered_tokens = set(item_text.lower().replace("#", " ").split())
-            assert rendered_tokens <= allowed_tokens | {"-", "•"}
+            assert len(result["content"]["items"]) == 1
+            item = result["content"]["items"][0]
+            # 每个面向用户的标题与摘要均逐例比对 fixture 许可值；这不仅绑定固定模板，
+            # 还把 source_id、分类事实和输出文本统一限制在该案例的合成事实集合内。
+            assert item["title"] == allowed_facts["item"]["title"]
+            assert item["body_markdown"] == allowed_facts["item"]["body_markdown"]
+            assert allowed_facts["source_ref"] == f"mail:{item['source_refs'][0]['source_id']}"
         classifications = result.get("classifications", [])
         if classifications:
             judgement = classifications[0]
-            assert judgement["needs_reply"] is case["needs_reply"]
-            assert judgement["deadline_at"] == case["deadline"]
+            assert judgement["needs_reply"] is allowed_facts["classification"]["needs_reply"]
+            assert judgement["deadline_at"] == allowed_facts["classification"]["deadline_at"]
         if case.get("adversarial_html"):
             assert "<script" not in serialized and "<img" not in serialized
 
