@@ -25,6 +25,37 @@ const terminalSnapshot = {
   event_cursor: '2',
 }
 
+const recoveredRunningSnapshot = {
+  ...runningSnapshot,
+  event_cursor: '1',
+  steps: [
+    {
+      id: 'step-1',
+      name: 'persist',
+      sequence: 1,
+      status: 'started',
+      started_at: '2026-08-05T00:00:00Z',
+      finished_at: null,
+      error_code: null,
+      output_summary: null,
+    },
+  ],
+}
+
+const reloadedTerminalSnapshot = {
+  ...recoveredRunningSnapshot,
+  status: 'succeeded',
+  event_cursor: '3',
+  steps: [
+    {
+      ...recoveredRunningSnapshot.steps[0],
+      sequence: 2,
+      status: 'completed',
+      finished_at: '2026-08-05T00:00:01Z',
+    },
+  ],
+}
+
 /**
  * 以浏览器真实 EventSource 请求模拟服务端关闭后的耐久事件重放。
  *
@@ -91,4 +122,85 @@ test('EventSource reconnect replays from the durable cursor and reconciles termi
   await expect(page.getByText('当前状态： succeeded')).toBeVisible()
   await expect.poll(() => eventRequests).toBeGreaterThanOrEqual(2)
   expect(snapshotRequests).toBeGreaterThanOrEqual(2)
+})
+
+/**
+ * 页面刷新会丢弃 Pinia 投影，因此必须先由 PostgreSQL 快照恢复运行步骤，再接受从该
+ * 快照之后开始的耐久事件。流内重复的同 sequence 事件不得生成第二个时间线条目。
+ */
+test('page reload restores durable snapshot and deduplicates replayed task events', async ({
+  page,
+}) => {
+  let eventRequests = 0
+  let snapshotRequests = 0
+  await page.route('**/api/v1/auth/me', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(user),
+    }),
+  )
+  await page.route('**/api/v1/tasks/task-1', (route) => {
+    snapshotRequests += 1
+    const snapshot =
+      snapshotRequests === 1
+        ? runningSnapshot
+        : snapshotRequests === 2
+          ? recoveredRunningSnapshot
+          : reloadedTerminalSnapshot
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(snapshot),
+    })
+  })
+  await page.route('**/api/v1/tasks/task-1/events*', async (route) => {
+    eventRequests += 1
+    const url = new URL(route.request().url())
+    expect(url.searchParams.get('last_event_id')).toBeNull()
+    expect(route.request().headers()['last-event-id']).toBeUndefined()
+    if (eventRequests === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache' },
+        body: [
+          'retry: 60000',
+          'id: 1',
+          'event: step.started',
+          'data: {"id":"1","task_id":"task-1","sequence":"1","event":"step.started","occurred_at":"2026-08-05T00:00:00Z","step_id":"step-1","payload":{"name":"persist","status":"started"}}',
+          '',
+        ].join('\n'),
+      })
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      headers: { 'Cache-Control': 'no-cache' },
+      body: [
+        'id: 2',
+        'event: step.completed',
+        'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
+        '',
+        'id: 2',
+        'event: step.completed',
+        'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
+        '',
+        'id: 3',
+        'event: task.status_changed',
+        'data: {"id":"3","task_id":"task-1","sequence":"3","event":"task.status_changed","occurred_at":"2026-08-05T00:00:02Z","step_id":null,"payload":{"status":"succeeded"}}',
+        '',
+      ].join('\n'),
+    })
+  })
+
+  await page.goto('/tasks?task_id=task-1')
+  await expect(page.getByText('当前状态： running')).toBeVisible()
+  await page.reload()
+
+  await expect(page.getByText('当前状态： succeeded')).toBeVisible()
+  await expect(page.getByRole('listitem').filter({ hasText: 'persist' })).toHaveCount(1)
+  await expect.poll(() => eventRequests).toBe(2)
+  expect(snapshotRequests).toBeGreaterThanOrEqual(3)
 })
