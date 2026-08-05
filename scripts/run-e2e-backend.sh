@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Playwright 从 frontend/ 调起本脚本；先锚定仓库根，避免相对的 uv 项目与 Alembic
+# 配置意外指向调用方目录。
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
 : "${TEST_DATABASE_URL:?TEST_DATABASE_URL is required}"
 : "${TEST_REDIS_URL:?TEST_REDIS_URL is required}"
 : "${E2E_ADMIN_EMAIL:?E2E_ADMIN_EMAIL is required}"

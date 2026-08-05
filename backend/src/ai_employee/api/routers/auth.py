@@ -84,8 +84,15 @@ def _session_response(session: ListedSession) -> SessionResponse:
 
 
 def _secure_cookies(settings: Settings) -> bool:
-    """仅本地 development 允许非 Secure Cookie，其他环境一律 fail-closed。"""
-    return settings.app_env != "development"
+    """仅本地开发与双开关测试 harness 允许非 Secure Cookie。
+
+    测试进程必须同时由 ``APP_ENV=test`` 与 ``APP_TEST_MODE=true`` 约束，且仅监听
+    本机 HTTP 端口；生产、预发布及误设为 test 的普通进程仍维持 Secure Cookie。
+    """
+    return not (
+        settings.app_env == "development"
+        or (settings.app_env == "test" and settings.app_test_mode)
+    )
 
 
 def _set_auth_cookies(response: Response, result: LoginResult, settings: Settings) -> None:

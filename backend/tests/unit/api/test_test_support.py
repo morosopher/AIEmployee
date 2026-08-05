@@ -13,6 +13,15 @@ def test_test_support_router_requires_both_test_switches() -> None:
     assert should_register_test_support(Settings(app_env="test", app_test_mode=True))
 
 
+def test_test_mode_uses_http_cookie_only_for_local_e2e_harness() -> None:
+    """测试双开关需要在本机 HTTP harness 中携带 Cookie，生产策略仍必须 Secure。"""
+    from ai_employee.api.routers.auth import _secure_cookies
+    from ai_employee.config import Settings
+
+    assert not _secure_cookies(Settings(app_env="test", app_test_mode=True))
+    assert _secure_cookies(Settings(app_env="production", app_test_mode=False))
+
+
 @pytest.mark.asyncio
 async def test_scenario_store_uses_user_scoped_key_and_six_hundred_second_ttl() -> None:
     """测试场景必须按用户隔离、原子消费，并在十分钟后自动失效。"""

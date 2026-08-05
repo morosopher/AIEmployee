@@ -3,7 +3,10 @@ import { createPinia, setActivePinia } from 'pinia'
 import { defineComponent, nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
+vi.mock('@/api/client', () => ({ getTask: vi.fn() }))
+
 import { useTaskEvents } from './useTaskEvents'
+import { getTask } from '@/api/client'
 import { useTasksStore } from '@/stores/tasks'
 
 /** 模拟浏览器 EventSource，验证 composable 的资源释放契约。 */
@@ -232,6 +235,46 @@ describe('useTaskEvents', () => {
     expect(source?.close).toHaveBeenCalledOnce()
     wrapper.unmount()
     vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('reconciles a terminal SSE event with its durable task snapshot', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    setActivePinia(createPinia())
+    vi.mocked(getTask).mockResolvedValue({
+      id: 'task-1',
+      kind: 'daily_brief',
+      status: 'succeeded',
+      retry_of_task_id: null,
+      error_code: null,
+      event_cursor: '8',
+      steps: [{ id: 'step-1', name: 'persist', sequence: 1, status: 'completed', error_code: null, output_summary: null }],
+    })
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents('task-1')
+        return () => null
+      },
+    })
+    const wrapper = mount(Host)
+    const source = FakeEventSource.instances.at(-1)
+    const statusHandler = source?.addEventListener.mock.calls.find(
+      ([eventName]) => eventName === 'task.status_changed',
+    )?.[1] as EventListener
+
+    statusHandler(new MessageEvent('task.status_changed', {
+      data: JSON.stringify({
+        id: '7', task_id: 'task-1', sequence: '7', event: 'task.status_changed',
+        occurred_at: '2026-08-05T00:00:00Z', step_id: null, payload: { status: 'succeeded' },
+      }),
+    }))
+    await Promise.resolve()
+    await nextTick()
+
+    expect(getTask).toHaveBeenCalledWith('task-1')
+    expect(useTasksStore().tasks['task-1']?.event_cursor).toBe('8')
+    expect(useTasksStore().tasks['task-1']?.steps).toHaveLength(1)
+    wrapper.unmount()
     vi.unstubAllGlobals()
   })
 })
