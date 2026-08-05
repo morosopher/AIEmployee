@@ -356,10 +356,11 @@ class DurableTaskRunner:
     ) -> timedelta:
         """以 PostgreSQL 尝试次数计算封顶退避，避免队列重投重置等待。
 
-        ``Retry-After`` 是供应商给出的最低等待提示，但不允许将延迟扩展到配置上限之外；
-        普通故障按首次尝试为 base 的指数增长，并在封顶前叠加可替换抖动。
+        正数 ``Retry-After`` 是供应商给出的最低等待提示，但不允许将延迟扩展到配置
+        上限之外；零或负值不满足耐久重试必须晚于当前时刻的不变量，改用首次尝试为
+        base 的指数退避，并在封顶前叠加可替换抖动。
         """
-        if retry_after is not None:
+        if retry_after is not None and retry_after > 0:
             return min(timedelta(seconds=retry_after), self._retry_backoff_cap)
         exponent = max(attempt_count - 1, 0)
         delay = base_delay * (2**exponent) + self._retry_jitter(attempt_count)

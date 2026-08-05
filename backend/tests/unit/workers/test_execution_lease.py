@@ -842,6 +842,44 @@ async def test_transient_provider_retry_after_preserves_fractional_seconds_with_
 
 
 @pytest.mark.asyncio
+async def test_zero_retry_after_persists_exponential_backoff_retry() -> None:
+    """零秒限流提示必须回退为指数延迟，避免持久重试落在当前时刻。"""
+    now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
+    task = _leased_task(started_at=now)
+    store = RecordingLeaseStore(task)
+
+    async def fail_rate_limited() -> None:
+        """模拟 Gmail 返回 ``Retry-After: 0`` 的可恢复限流错误。"""
+        raise TransientProviderError(
+            error_code="google_rate_limited",
+            message="synthetic rate limit",
+            retry_after=0,
+        )
+
+    runner = _runner(
+        store=store,
+        clock=MutableClock(now),
+        steps=(CallableStep("gmail", fail_rate_limited),),
+    )
+
+    assert await runner.run(
+        task.task_id,
+        lease_owner="worker-a",
+        retry_delay=timedelta(seconds=5),
+    )
+    assert store.scheduled_retries == [
+        (
+            task.task_id,
+            "worker-a",
+            now,
+            now + timedelta(seconds=5),
+            "google_rate_limited",
+            1,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_transient_provider_retry_uses_capped_exponential_delay_and_caps_retry_after() -> None:
     """持久 attempt_count 驱动指数退避，供应商提示也不得绕过安全上限。"""
     now = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
