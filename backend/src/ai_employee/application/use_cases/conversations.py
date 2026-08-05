@@ -1,15 +1,10 @@
-"""定义 M1 对话意图与原子消息创建用例。"""
+"""定义 M1 对话意图、原子消息创建用例及其应用端口。"""
 
-from datetime import UTC, datetime
+from contextlib import AbstractAsyncContextManager
+from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import select
-
 from ai_employee.application.use_cases.tasks import CreateTaskResult
-from ai_employee.infrastructure.db.models.briefs import ConversationModel, MessageModel
-from ai_employee.infrastructure.db.models.tasks import TaskRunModel
-from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
-from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 UNSUPPORTED_RESPONSE = "当前 M1 仅支持生成或查看每日简报，不会执行外部写操作或通用规划。"
 
@@ -23,23 +18,48 @@ class ConversationNotFoundError(Exception):
     """表示用户范围内不存在所请求会话。"""
 
 
-class CreateConversationMessageUseCase:
-    """同一事务写入用户消息和 ``conversation.respond`` 任务。"""
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
-        """注入事务工厂；后续投递由路由复用既有 task dispatcher。"""
-        self._session_factory = session_factory
+class ConversationMessageStore(Protocol):
+    """定义消息、任务和 Outbox 必须共同提交的原子持久化能力。"""
 
-    async def execute(self, *, user_id: UUID, conversation_id: UUID, content_markdown: str, client_request_id: str) -> CreateTaskResult:
-        """用稳定客户端键幂等创建消息与 TaskRun，绝不跨事务留下半条消息。"""
+    async def create_message_and_task(
+        self,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        content_markdown: str,
+        idempotency_key: str,
+    ) -> CreateTaskResult:
+        """按用户范围和稳定键原子创建消息及回复任务。"""
+
+
+class ConversationMessageStoreFactory(Protocol):
+    """为一次消息创建提供提交或回滚受控的事务上下文。"""
+
+    def __call__(self) -> AbstractAsyncContextManager[ConversationMessageStore]:
+        """创建仅覆盖当前对话写入的事务上下文。"""
+
+
+class CreateConversationMessageUseCase:
+    """协调同一事务中的用户消息和 ``conversation.respond`` 任务创建。"""
+
+    def __init__(self, stores: ConversationMessageStoreFactory) -> None:
+        """注入不暴露 SQLAlchemy 或 ORM 的对话事务端口。"""
+        self._stores = stores
+
+    async def execute(
+        self,
+        *,
+        user_id: UUID,
+        conversation_id: UUID,
+        content_markdown: str,
+        client_request_id: str,
+    ) -> CreateTaskResult:
+        """用稳定客户端键幂等创建消息与 TaskRun，绝不留下半条消息。"""
         idempotency_key = f"conversation:{user_id}:{client_request_id}"
-        async with self._session_factory.begin() as session:
-            conversation = await session.scalar(select(ConversationModel).where(ConversationModel.id == conversation_id, ConversationModel.user_id == user_id).with_for_update())
-            if conversation is None:
-                raise ConversationNotFoundError
-            existing = await session.scalar(select(TaskRunModel.id).where(TaskRunModel.user_id == user_id, TaskRunModel.idempotency_key == idempotency_key))
-            if existing is not None:
-                return CreateTaskResult(task_id=existing)
-            task = await SqlAlchemyTaskRepository(session).create_with_outbox(user_id=user_id, kind="conversation.respond", input_payload={"conversation_id": str(conversation_id), "content": content_markdown}, idempotency_key=idempotency_key)
-            conversation.updated_at = datetime.now(UTC)
-            session.add(MessageModel(user_id=user_id, conversation_id=conversation_id, role="user", content_markdown=content_markdown, task_id=task.task_id, created_at=datetime.now(UTC)))
-            return task
+        async with self._stores() as store:
+            return await store.create_message_and_task(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                content_markdown=content_markdown,
+                idempotency_key=idempotency_key,
+            )

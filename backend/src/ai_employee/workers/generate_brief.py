@@ -29,6 +29,9 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.db.repositories.briefs import (
+    SqlAlchemyDailyBriefPersistenceStoreFactory,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
@@ -129,7 +132,9 @@ class GenerateBriefTaskStep:
         markdown = "\n".join(
             [f"# {content.headline}", *(f"- {item.title}" for item in content.items)]
         )
-        await PersistDailyBriefUseCase(self._session_factory).execute(
+        await PersistDailyBriefUseCase(
+            SqlAlchemyDailyBriefPersistenceStoreFactory(self._session_factory)
+        ).execute(
             user_id=task.user_id,
             task_id=task.task_id,
             content=content,

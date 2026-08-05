@@ -28,6 +28,9 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.infrastructure.db.repositories.briefs import (
+    SqlAlchemyDailyBriefPersistenceStoreFactory,
+)
 from ai_employee.infrastructure.db.repositories.identity import SqlAlchemyActiveUserScheduleReader
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
@@ -146,7 +149,9 @@ async def test_manual_refresh_creates_next_version_and_persists_auditable_result
     try:
         user_id, first_task_id = await _create_user_and_task(session_factory, key="first")
         thread_id = await _create_email_thread(session_factory, user_id=user_id)
-        first_id = await PersistDailyBriefUseCase(session_factory).execute(
+        first_id = await PersistDailyBriefUseCase(
+            SqlAlchemyDailyBriefPersistenceStoreFactory(session_factory)
+        ).execute(
             user_id=user_id,
             task_id=first_task_id,
             content=_content(completeness="complete", headline="First version"),
@@ -180,7 +185,9 @@ async def test_manual_refresh_creates_next_version_and_persists_auditable_result
         _, second_task_id = await _create_user_and_task(
             session_factory, key="second", user_id=user_id
         )
-        second_id = await PersistDailyBriefUseCase(session_factory).execute(
+        second_id = await PersistDailyBriefUseCase(
+            SqlAlchemyDailyBriefPersistenceStoreFactory(session_factory)
+        ).execute(
             user_id=user_id,
             task_id=second_task_id,
             content=_content(completeness="partial", headline="Second version"),
@@ -217,7 +224,9 @@ async def test_replayed_task_and_scheduled_scan_are_idempotent(
     session_factory = build_session_factory(database_url)
     try:
         user_id, task_id = await _create_user_and_task(session_factory, key="replay")
-        use_case = PersistDailyBriefUseCase(session_factory)
+        use_case = PersistDailyBriefUseCase(
+            SqlAlchemyDailyBriefPersistenceStoreFactory(session_factory)
+        )
         first_id = await use_case.execute(user_id=user_id, task_id=task_id, content=_content(completeness="complete", headline="Replay"), markdown="# Replay")
         assert await use_case.execute(user_id=user_id, task_id=task_id, content=_content(completeness="complete", headline="Changed"), markdown="# Changed") == first_id
         creator = CreateTaskUseCase(SqlAlchemyTaskRepositoryFactory(session_factory), NoopDispatcher())

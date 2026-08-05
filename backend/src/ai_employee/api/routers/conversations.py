@@ -21,6 +21,7 @@ from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.infrastructure.db.models.briefs import ConversationModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.conversations import (
+    SqlAlchemyConversationMessageStoreFactory,
     SqlAlchemyConversationRepository,
 )
 
@@ -82,7 +83,16 @@ def build_conversations_router() -> APIRouter:
     async def create_message(conversation_id: UUID, payload: MessageRequest, authenticated: CsrfProtectedSession, request: Request, tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)]) -> dict[str, UUID]:
         """先持久化用户消息，再创建可恢复回复任务；重复 client id 复用任务。"""
         try:
-            result = await CreateConversationMessageUseCase(request.app.state.auth_session_factory).execute(user_id=authenticated.user.id, conversation_id=conversation_id, content_markdown=payload.content_markdown, client_request_id=payload.client_request_id)
+            result = await CreateConversationMessageUseCase(
+                SqlAlchemyConversationMessageStoreFactory(
+                    request.app.state.auth_session_factory
+                )
+            ).execute(
+                user_id=authenticated.user.id,
+                conversation_id=conversation_id,
+                content_markdown=payload.content_markdown,
+                client_request_id=payload.client_request_id,
+            )
         except ConversationNotFoundError:
             raise ApiProblem(404, "conversation_not_found", "Conversation not found", "The requested conversation was not found.") from None
         # TaskRun 已与消息一同提交；再次按相同键调用只会投递既有任务，不会制造第二份事实。
