@@ -16,11 +16,16 @@ async function injectScenario(
   if (!email || !passwordFile)
     throw new Error('E2E_ADMIN_EMAIL and E2E_ADMIN_PASSWORD_FILE are required')
   const password = readFileSync(passwordFile, 'utf8').trimEnd()
-  await page.goto('/login')
-  await page.getByLabel('邮箱').fill(email)
-  await page.getByLabel('密码').fill(password)
-  await page.getByRole('button', { name: '登录' }).click()
-  await expect(page).not.toHaveURL(/\/login/)
+  const existingSession = (await page.context().cookies()).some(
+    (cookie) => cookie.name === 'ai_employee_session',
+  )
+  if (!existingSession) {
+    await page.goto('/login')
+    await page.getByLabel('邮箱').fill(email)
+    await page.getByLabel('密码').fill(password)
+    await page.getByRole('button', { name: '登录' }).click()
+    await expect(page).not.toHaveURL(/\/login/)
+  }
   const csrfCookie = (await page.context().cookies()).find(
     (cookie) => cookie.name === 'ai_employee_csrf',
   )
@@ -32,27 +37,29 @@ async function injectScenario(
   expect(response.status()).toBe(204)
 }
 
+/** 创建当前用户自己的合成来源，后续由实际 Worker 与 Fake adapter 处理。 */
+async function seedGoogleSource(page: Page): Promise<string> {
+  const csrf = (await page.context().cookies()).find((cookie) => cookie.name === 'ai_employee_csrf')
+  if (!csrf) throw new Error('test login did not issue a CSRF cookie')
+  const response = await page.request.post('/api/v1/test-support/seed-google-source', {
+    headers: { 'X-CSRF-Token': csrf.value },
+  })
+  expect(response.status()).toBe(204)
+  return csrf.value
+}
+
 /** 测试模式端点可注入撤销 OAuth，界面必须给出重新连接操作。 */
 test('revoked OAuth shows reconnect action through the test-only scenario contract', async ({
   page,
 }) => {
+  await page.goto('/login')
+  const email = process.env.E2E_ADMIN_EMAIL!
+  const password = readFileSync(process.env.E2E_ADMIN_PASSWORD_FILE!, 'utf8').trimEnd()
+  await page.getByLabel('邮箱').fill(email)
+  await page.getByLabel('密码').fill(password)
+  await page.getByRole('button', { name: '登录' }).click()
+  await seedGoogleSource(page)
   await injectScenario(page, 'oauth_revoked')
-  await page.route('**/api/v1/connections', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify([
-        {
-          id: 'c1',
-          provider: 'google',
-          account_email: 'synthetic@example.test',
-          scopes: [],
-          status: 'degraded',
-          last_error_code: 'oauth_revoked',
-        },
-      ]),
-    }),
-  )
   await page.goto('/connections')
   await expect(page.getByRole('button', { name: '重新连接' })).toBeVisible()
 })
@@ -61,35 +68,23 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
 test('partial brief presents a single-source failure warning with repair context', async ({
   page,
 }) => {
+  await page.goto('/login')
+  const email = process.env.E2E_ADMIN_EMAIL!
+  const password = readFileSync(process.env.E2E_ADMIN_PASSWORD_FILE!, 'utf8').trimEnd()
+  await page.getByLabel('邮箱').fill(email)
+  await page.getByLabel('密码').fill(password)
+  await page.getByRole('button', { name: '登录' }).click()
+  const csrf = await seedGoogleSource(page)
   await injectScenario(page, 'partial_source')
-  await page.route('**/api/v1/briefs/today', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        id: 'b1',
-        local_date: '2026-08-05',
-        version: 1,
-        task_id: 't1',
-        source_cutoff: '2026-08-05T08:00:00Z',
-        completeness: 'partial',
-        headline: '今日简报',
-        structured_content: {},
-        markdown: '# 合成内容',
-        warnings: [
-          'missing:gmail;last_success:2026-08-05T07:00:00Z;repair:reconnect',
-        ],
-        items: [],
-      }),
-    }),
-  )
-  await page.route('**/api/v1/briefs?*', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }),
-  )
+  const generated = await page.request.post('/api/v1/briefs/generate', {
+    headers: { 'X-CSRF-Token': csrf },
+  })
+  expect(generated.status()).toBe(202)
+  await expect.poll(async () => (await page.request.get('/api/v1/briefs/today')).status()).toBe(200)
   await page.goto('/brief')
   await expect(page.getByRole('alert')).toContainText('missing:gmail')
   await expect(page.getByRole('alert')).toContainText(
-    'last_success:2026-08-05T07:00:00Z',
+    'last_success:',
   )
-  await expect(page.getByRole('alert')).toContainText('repair:reconnect')
+  await expect(page.getByRole('alert')).toContainText('repair:retry')
 })
