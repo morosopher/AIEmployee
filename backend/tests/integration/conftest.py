@@ -35,6 +35,8 @@ APPLICATION_TABLES: tuple[str, ...] = (
     "email_threads",
     "sync_cursors",
     "encrypted_credentials",
+    "connection_capabilities",
+    "provider_calendars",
     "oauth_connections",
     "oauth_attempts",
     "tool_executions",

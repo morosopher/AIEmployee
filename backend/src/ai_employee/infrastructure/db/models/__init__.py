@@ -10,12 +10,14 @@ from ai_employee.infrastructure.db.models.briefs import (
 from ai_employee.infrastructure.db.models.identity import UserModel, UserSessionModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
+    ConnectionCapabilityModel,
     EmailAnalysisModel,
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
     OAuthAttemptModel,
     OAuthConnectionModel,
+    ProviderCalendarModel,
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import (
@@ -31,6 +33,7 @@ __all__ = [
     "ApprovalRequestModel",
     "AuditEventModel",
     "CalendarEventModel",
+    "ConnectionCapabilityModel",
     "ConversationModel",
     "DailyBriefItemModel",
     "DailyBriefModel",
@@ -43,6 +46,7 @@ __all__ = [
     "OAuthAttemptModel",
     "OAuthConnectionModel",
     "OutboxEventModel",
+    "ProviderCalendarModel",
     "SyncCursorModel",
     "TaskRunModel",
     "TaskStepModel",

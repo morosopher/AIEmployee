@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, text
@@ -171,6 +172,127 @@ def _task_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool
     return asyncio.run(read_modes())
 
 
+def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
+    """读取 M2 连接、游标与用户设置约束的精确有序列集合。"""
+
+    async def read_columns() -> dict[str, tuple[str, ...]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT constraint_info.conname, "
+                        "ARRAY_AGG(attribute.attname ORDER BY key_info.position) "
+                        "FROM pg_catalog.pg_constraint AS constraint_info "
+                        "JOIN pg_catalog.pg_class AS table_info "
+                        "ON table_info.oid = constraint_info.conrelid "
+                        "JOIN unnest(constraint_info.conkey) WITH ORDINALITY "
+                        "AS key_info(attnum, position) ON TRUE "
+                        "JOIN pg_catalog.pg_attribute AS attribute "
+                        "ON attribute.attrelid = table_info.oid "
+                        "AND attribute.attnum = key_info.attnum "
+                        "WHERE constraint_info.conname IN ("
+                        "'uq_oauth_connections_id_user_id', "
+                        "'uq_sync_cursors_connection_resource', "
+                        "'uq_sync_cursors_connection_resource_scope', "
+                        "'uq_connection_capabilities_user_connection_capability', "
+                        "'uq_provider_calendars_connection_provider_calendar', "
+                        "'fk_users_default_mail_connection_id_user_id', "
+                        "'fk_users_default_calendar_connection_id_user_id'"
+                        ") GROUP BY constraint_info.conname"
+                    )
+                )
+                return {row[0]: tuple(str(column_name) for column_name in row[1]) for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_columns())
+
+
+def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]:
+    """读取 M2 组合归属外键是否可延迟且默认延迟。"""
+
+    async def read_modes() -> dict[str, tuple[bool, bool]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT conname, condeferrable, condeferred "
+                        "FROM pg_catalog.pg_constraint "
+                        "WHERE conname IN ("
+                        "'fk_connection_capabilities_connection_user', "
+                        "'fk_provider_calendars_connection_user', "
+                        "'fk_users_default_mail_connection_id_user_id', "
+                        "'fk_users_default_calendar_connection_id_user_id'"
+                        ")"
+                    )
+                )
+                return {row[0]: (row[1], row[2]) for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_modes())
+
+
+def _m2_owned_user_columns(database_url: URL) -> dict[str, str]:
+    """读取两个新增用户域表 ``user_id`` 的数据库可空元数据。"""
+
+    async def read_nullability() -> dict[str, str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT table_name, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND column_name = 'user_id' "
+                        "AND table_name IN ('connection_capabilities', 'provider_calendars')"
+                    )
+                )
+                return {row[0]: row[1] for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_nullability())
+
+
+def _m2_user_check_constraint_names(database_url: URL) -> set[str]:
+    """读取 M2 用户工作设置的有界数值检查约束。"""
+
+    async def read_names() -> set[str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT conname FROM pg_catalog.pg_constraint "
+                        "WHERE conrelid = 'users'::regclass AND contype = 'c'"
+                    )
+                )
+                return {row[0] for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_names())
+
+
+def _alembic_revisions(database_url: URL) -> set[str]:
+    """读取临时库当前 Alembic revision，证明空库实际升级到 M2 head。"""
+
+    async def read_revisions() -> set[str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(text("SELECT version_num FROM alembic_version"))
+                return {row[0] for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_revisions())
+
+
+@pytest.mark.filterwarnings("error:Cannot correctly sort tables")
 def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
     empty_migration_database: URL,
 ) -> None:
@@ -194,6 +316,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "checkpoint_migrations",
         "checkpoint_writes",
         "checkpoints",
+        "connection_capabilities",
         "conversations",
         "daily_brief_items",
         "daily_briefs",
@@ -206,6 +329,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "oauth_attempts",
         "oauth_connections",
         "outbox_events",
+        "provider_calendars",
         "sync_cursors",
         "task_runs",
         "task_steps",
@@ -213,6 +337,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
+    assert _alembic_revisions(empty_migration_database) == {"20260806_0011"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -236,6 +361,51 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "fk_approval_requests_step_id_task_id": (True, True),
         "fk_tool_executions_step_id_task_id": (True, True),
     }
+    assert _m2_constraint_columns(empty_migration_database) == {
+        "fk_users_default_calendar_connection_id_user_id": (
+            "default_calendar_connection_id",
+            "id",
+        ),
+        "fk_users_default_mail_connection_id_user_id": (
+            "default_mail_connection_id",
+            "id",
+        ),
+        "uq_connection_capabilities_user_connection_capability": (
+            "user_id",
+            "connection_id",
+            "capability",
+        ),
+        "uq_oauth_connections_id_user_id": ("id", "user_id"),
+        "uq_provider_calendars_connection_provider_calendar": (
+            "connection_id",
+            "provider_calendar_id",
+        ),
+        # 旧约束名只作为现有 M1 ON CONFLICT SQL 的三列兼容入口；此断言防止它退回
+        # 会阻断多 scope 的两列约束。
+        "uq_sync_cursors_connection_resource": (
+            "connection_id",
+            "resource_kind",
+            "scope_key",
+        ),
+        "uq_sync_cursors_connection_resource_scope": (
+            "connection_id",
+            "resource_kind",
+            "scope_key",
+        ),
+    }
+    assert _m2_ownership_guard_modes(empty_migration_database) == {
+        "fk_connection_capabilities_connection_user": (True, True),
+        "fk_provider_calendars_connection_user": (True, True),
+        "fk_users_default_calendar_connection_id_user_id": (True, True),
+        "fk_users_default_mail_connection_id_user_id": (True, True),
+    }
+    assert _m2_owned_user_columns(empty_migration_database) == {
+        "connection_capabilities": "NO",
+        "provider_calendars": "NO",
+    }
+    assert "ck_users_meeting_buffer_minutes" in _m2_user_check_constraint_names(
+        empty_migration_database
+    )
     command.check(alembic_config)
 
 
