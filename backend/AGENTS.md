@@ -2,11 +2,11 @@
 
 ## 适用范围
 
-本文件适用于 `backend/` 下所有代码、迁移和测试，并继承根目录 `AGENTS.md`。本文件只细化后端规则；根文件中的 M1 范围、人工审批、数据真实性、安全和 Git 约束不可放宽。
+本文件适用于 `backend/` 下所有代码、迁移和测试，并继承根目录 `AGENTS.md`。本文件只细化后端规则；根文件中的 M2 范围、继承自 M1 的可信执行不变量、人工审批、数据真实性、安全和 Git 约束不可放宽。
 
 ## 后端定位与目录边界
 
-后端负责身份与会话、REST/SSE 接口、可信任务状态、领域规则、Google 只读同步、模型调用、任务编排、持久化和后台进程。目标结构：
+后端负责身份与会话、REST/SSE 接口、可信任务与操作状态、领域规则、Google/Microsoft 邮件和日历同步、类型化真实写入、结果核对、模型调用、任务编排、持久化和后台进程。目标结构：
 
 ```text
 backend/
@@ -18,7 +18,7 @@ backend/
 │   ├── application/         # 用例和端口
 │   ├── domain/              # 纯领域类型、状态机和确定性规则
 │   ├── agents/              # LangGraph 图、状态和节点
-│   ├── integrations/        # Google 与模型供应商适配器
+│   ├── integrations/        # Google、Microsoft 与模型供应商适配器
 │   ├── infrastructure/      # 数据库、安全、队列、可观测性
 │   ├── workers/             # Taskiq 任务、调度、Outbox 和维护任务
 │   ├── prompts/             # 有版本的 Prompt
@@ -61,7 +61,7 @@ backend/
 
 ### Domain
 
-- `domain/` 不得导入 FastAPI、Pydantic API Schema、SQLAlchemy、LangGraph、Taskiq、Redis、Google SDK、HTTP 客户端或模型 SDK。
+- `domain/` 不得导入 FastAPI、Pydantic API Schema、SQLAlchemy、LangGraph、Taskiq、Redis、Google/Microsoft SDK、HTTP 客户端或模型 SDK。
 - 任务状态机、审批不变量、日程冲突、邮件确定性分类、幂等规则属于 Domain，并应能在无数据库和网络时测试。
 - 领域函数接收显式输入并返回确定结果；当前时间、ID 和随机性由调用方注入。
 
@@ -69,7 +69,7 @@ backend/
 
 - `application/` 定义用例和端口，协调领域对象、事务与外部能力，但不依赖具体供应商实现。
 - 一个用例表达一个业务意图，明确输入、输出、授权、事务边界和错误；路由与 Worker 只调用用例。
-- Repository、Clock、ID、Queue、Model、Encryption、Gmail 和 Calendar 能力通过端口注入，测试使用 Fake。
+- Repository、Clock、ID、Queue、Model、Encryption、OAuth、Mail、Calendar 和 TrustedAction 能力通过供应商无关端口注入，测试使用 Fake。
 
 ### API
 
@@ -90,9 +90,9 @@ backend/
 ### Integrations
 
 - 第三方 SDK、HTTP 请求和供应商字段只能存在于 `integrations/` 或相应基础设施适配器。
-- 所有外部请求设置明确连接/读取/总超时，遵守 `Retry-After`，只对 429、5xx、超时等已分类临时错误重试。
+- 所有外部请求设置明确连接/读取/总超时并遵守 `Retry-After`。只读请求可以按已分类临时错误重试；真实写请求必须返回 `confirmed_applied`、`confirmed_not_applied` 或 `unknown`，只有明确证明未应用时才允许再次调用写接口，超时、连接中断或语义不明的 5xx 必须先进入只读核对。
 - 供应商错误必须转换为内部错误类别，同时保存可审计但已脱敏的错误码。
-- Gmail 与 Calendar 只申请和调用只读能力；测试中禁止访问真实账号。
+- Google 与 Microsoft 只按 `mail.read`、`mail.send`、`calendar.read`、`calendar.write` 渐进申请最小委托权限。真实写适配器只接受四种 M2 命令，审批前必须证明供应商能够无损表达冻结载荷；自动化测试禁止访问真实账号。
 - 模型输出先按版本化 Pydantic Schema 验证；只允许一次结构化修复重试，失败后保留确定性结果并标记部分成功。
 
 ## 数据库与事务规则
@@ -104,7 +104,7 @@ backend/
 - 时间戳以带时区 UTC 保存；用户本地日期必须由显式 IANA 时区计算，并覆盖夏令时测试。
 - Schema 变更必须附 Alembic migration、模型更新和迁移测试。生产迁移使用 expand/contract，避免长锁、立即删除列和破坏性 downgrade 假设。
 - 任务状态迁移、业务结果、`AuditEvent` 和持久前端事件需要一致时，应在同一数据库事务中写入。
-- `AuditEvent` 追加写；OAuth Token、清洗后正文和敏感事件字段按规格加密。原始 MIME、附件和完整供应商响应不得落库。
+- `AuditEvent` 追加写；OAuth Token、邮件草稿正文、真实命令、日程描述/地点、补偿快照和其他敏感事件字段按规格加密。原始 MIME、附件和完整供应商响应不得落库。
 - Redis key 或 Stream entry 只能保存标识符、短期协调信息或可重建数据，不能保存唯一业务副本。
 
 ## 后端安全规则
@@ -119,9 +119,9 @@ backend/
 
 - `tests/unit/` 不依赖网络、PostgreSQL 或 Redis，覆盖领域状态、审批、分类、冲突、用例和 Graph 路由。
 - `tests/integration/` 使用真实 PostgreSQL/Redis 测试事务、迁移、Repository、Outbox、Taskiq、Checkpoint、SSE 重放和恢复。
-- `tests/contract/` 使用脱敏固定 Gmail/Calendar JSON 与 HTTP mock，覆盖分页、游标失效、429、5xx、撤销授权和异常字段。
+- `tests/contract/` 使用脱敏固定 Google/Microsoft 邮件与日历 JSON 和 HTTP mock，覆盖 OAuth、分页、游标失效、权限、429、5xx、未知写结果、结果核对、撤销能力和异常字段。
 - 每个缺陷修复必须新增能在修复前失败的回归测试；涉及重试/幂等时至少模拟重复请求或重复队列投递。
-- 关键必测不变量：非法状态迁移被拒绝、批准载荷不可篡改、跨用户不可见、Redis 清空可恢复、Worker 崩溃可续跑、部分失败不伪装为成功。
+- 关键必测不变量：非法状态迁移被拒绝、批准载荷不可篡改、跨用户不可见、重复投递不产生第二次写入、未知结果不盲重试、ETag 冲突不覆盖供应商修改、Redis 清空可恢复、Worker 崩溃可续跑、部分失败不伪装为成功。
 - Prompt 或模型变更必须运行脱敏/合成评测集，记录模型名、Prompt 版本和结构化输出差异；不得只凭主观样例判断质量。
 
 ## 修改与文档策略
@@ -136,5 +136,5 @@ backend/
 
 - 修改前先确认目标属于 Domain、Application 还是 Adapter，不得以“更快”为由跨层直连。
 - 诊断失败时先复现并区分业务错误、临时供应商错误、基础设施错误和程序不变量错误，再提出修复。
-- 不执行真实邮件发送、日程创建、OAuth scope 提升或生产数据库破坏性操作。
+- 不绕过类型化命令、三层写入开关、连接能力、适用环境要求的专用账户允许列表或精确人工审批执行真实邮件/日历写入；不得擅自提升 OAuth scope 或执行生产数据库破坏性操作。
 - 不以单元测试替代数据库/队列边界验证；声称迁移、恢复或幂等正确前必须运行对应集成测试。
