@@ -23,6 +23,8 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
     RETRY_SCHEDULED = "retry_scheduled"
+    RECONCILING = "reconciling"
+    NEEDS_ATTENTION = "needs_attention"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -45,21 +47,28 @@ class ApprovalStatus(StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    INVALIDATED = "invalidated"
 
 
 class InvalidTaskTransition(StateConflictError):
     """表示当前任务状态不允许迁移到请求目标状态。"""
 
-    def __init__(self, current: TaskStatus, target: TaskStatus) -> None:
-        """构造不含业务载荷的稳定任务状态冲突。
+    def __init__(self, current: object, target: object) -> None:
+        """构造不含业务载荷或未经验证输入的稳定任务状态冲突。
 
         Args:
-            current: 任务当前状态。
-            target: 调用方请求的目标状态。
+            current: 调用方提供的任务当前状态候选值。
+            target: 调用方请求的任务目标状态候选值。
         """
+        if type(current) is TaskStatus and type(target) is TaskStatus:
+            message = f"{current.value} cannot transition to {target.value}"
+        else:
+            # raw string、其他 StrEnum 或未知对象都不得进入消息，避免类型穿透时
+            # 回显未经验证的持久值、对象 repr 或未来敏感载荷。
+            message = "task state transition is not allowed"
         super().__init__(
             error_code="invalid_task_transition",
-            message=f"{current.value} cannot transition to {target.value}",
+            message=message,
         )
 
 
@@ -75,33 +84,82 @@ ALLOWED_TRANSITIONS: Final[Mapping[TaskStatus, frozenset[TaskStatus]]] = Mapping
                 TaskStatus.SUCCEEDED,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
+                TaskStatus.RECONCILING,
             }
         ),
         TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
         TaskStatus.RETRY_SCHEDULED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
+        TaskStatus.RECONCILING: frozenset(
+            {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.NEEDS_ATTENTION,
+            }
+        ),
+        TaskStatus.NEEDS_ATTENTION: frozenset(
+            {
+                TaskStatus.RECONCILING,
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+            }
+        ),
         TaskStatus.SUCCEEDED: frozenset(),
         TaskStatus.FAILED: frozenset(),
         TaskStatus.CANCELLED: frozenset(),
     }
 )
 
+# 这两条边只表示人工结果确认后的状态收敛，不能被普通 Worker 路径使用。
+MANUAL_RESOLUTION_TRANSITIONS: Final[frozenset[tuple[TaskStatus, TaskStatus]]] = frozenset(
+    {
+        (TaskStatus.NEEDS_ATTENTION, TaskStatus.SUCCEEDED),
+        (TaskStatus.NEEDS_ATTENTION, TaskStatus.FAILED),
+    }
+)
 
-def transition_task(current: TaskStatus, target: TaskStatus) -> TaskStatus:
+
+def transition_task(
+    current: TaskStatus,
+    target: TaskStatus,
+    *,
+    manual_resolution: bool = False,
+) -> TaskStatus:
     """校验并返回一次纯任务状态迁移。
 
     该函数不执行持久化或 I/O；应用层后续负责把合法迁移与审计、事件写入
     同一事务。终态和自迁移没有白名单条目，因此统一按状态冲突拒绝。
+    ``needs_attention`` 直接收敛到成功或失败只允许人工结果确认用例显式打开
+    ``manual_resolution``；开关打开后只接受这两条人工收敛边，普通迁移必须使用
+    默认值 ``False``，因此人工确认不会重新触发写入或其他任务流程。
 
     Args:
         current: 任务当前状态。
         target: 请求迁移到的目标状态。
+        manual_resolution: 是否来自已记录 actor 与确认来源的人工结果确认边界。
 
     Returns:
         已通过白名单校验的目标状态。
 
     Raises:
+        TypeError: ``manual_resolution`` 不是普通布尔值。
         InvalidTaskTransition: 当前到目标的迁移不在批准状态图中。
     """
+    # StrEnum 会与同值字符串或其他 StrEnum 相等，必须在访问映射前检查精确类型。
+    if type(current) is not TaskStatus or type(target) is not TaskStatus:
+        raise InvalidTaskTransition(current, target)
+    if type(manual_resolution) is not bool:
+        raise TypeError("manual_resolution must be a bool")
+
+    transition = (current, target)
+    if manual_resolution:
+        # 人工结果确认是独立调用边界；打开标志后只允许两条专用收敛边，不能
+        # 借同一个函数继续执行任何普通队列、运行或核对迁移。
+        if transition not in MANUAL_RESOLUTION_TRANSITIONS:
+            raise InvalidTaskTransition(current, target)
+        return target
+
+    if transition in MANUAL_RESOLUTION_TRANSITIONS:
+        raise InvalidTaskTransition(current, target)
     if target not in ALLOWED_TRANSITIONS[current]:
         raise InvalidTaskTransition(current, target)
     return target
