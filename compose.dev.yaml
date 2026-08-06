@@ -1,4 +1,13 @@
 # 本地开发覆盖层：仅允许使用未提交的本地 Secret 文件，并保留源代码热更新。
+x-m2-write-environment: &m2-write-environment
+  EXTERNAL_WRITES_ENABLED: "${EXTERNAL_WRITES_ENABLED:-false}"
+  GOOGLE_WRITES_ENABLED: "${GOOGLE_WRITES_ENABLED:-false}"
+  MICROSOFT_WRITES_ENABLED: "${MICROSOFT_WRITES_ENABLED:-false}"
+  WRITE_TEST_ACCOUNT_ALLOWLIST: "${WRITE_TEST_ACCOUNT_ALLOWLIST:-[]}"
+  MICROSOFT_CLIENT_ID: "${MICROSOFT_CLIENT_ID:-}"
+  MICROSOFT_CLIENT_SECRET_FILE: /run/secrets/microsoft_client_secret
+  MICROSOFT_REDIRECT_URI: "${MICROSOFT_REDIRECT_URI:-http://localhost:8000/api/v1/connections/microsoft/callback}"
+
 services:
   caddy:
     build:
@@ -16,6 +25,7 @@ services:
 
   api:
     environment:
+      <<: *m2-write-environment
       APP_ENV: development
       APP_BASE_URL: http://localhost:5173
       DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
@@ -26,6 +36,7 @@ services:
 
   worker:
     environment:
+      <<: *m2-write-environment
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
       CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
@@ -34,30 +45,44 @@ services:
 
   scheduler:
     environment:
+      <<: *m2-write-environment
       APP_ENV: development
       DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
       CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
     volumes:
       - ./backend:/app/backend
 
+# 生产基线把 Secret 标为 external；开发层必须显式复位，避免合并后同时出现 external 与 file。
 secrets:
   postgres_bootstrap_password:
+    external: false
     file: ./secrets/development/postgres_bootstrap_password
   app_database_password:
+    external: false
     file: ./secrets/development/app_database_password
   retention_database_password:
+    external: false
     file: ./secrets/development/retention_database_password
   retention_database_url:
+    external: false
     file: ./secrets/development/retention_database_url
   app_master_key:
+    external: false
     file: ./secrets/development/app_master_key
   google_client_secret:
+    external: false
     file: ./secrets/development/google_client_secret
+  microsoft_client_secret:
+    external: false
+    file: ./secrets/development/microsoft_client_secret
   model_api_key:
+    external: false
     file: ./secrets/development/model_api_key
   backup_passphrase:
+    external: false
     file: ./secrets/development/backup_passphrase
   grafana_admin_password:
+    external: false
     file: ./secrets/development/grafana_admin_password
 
 volumes:

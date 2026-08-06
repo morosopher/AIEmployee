@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-本文件适用于 `backend/` 下所有代码、迁移和测试，并继承根目录 `AGENTS.md`。本文件只细化后端规则；根文件中的 M2 范围、继承自 M1 的可信执行不变量、人工审批、数据真实性、安全和 Git 约束不可放宽。
+本文件适用于 `backend/` 下所有代码、迁移和测试，并继承根目录 `AGENTS.md`。当前已批准并正在实施的里程碑是 M2「可执行邮件与日历助手」；本文件只细化后端规则，根文件中的 M2 范围、继承自 M1 的可信执行不变量、人工审批、数据真实性、安全和 Git 约束不可放宽。
 
 ## 后端定位与目录边界
 
@@ -92,7 +92,7 @@ backend/
 - 第三方 SDK、HTTP 请求和供应商字段只能存在于 `integrations/` 或相应基础设施适配器。
 - 所有外部请求设置明确连接/读取/总超时并遵守 `Retry-After`。只读请求可以按已分类临时错误重试；真实写请求必须返回 `confirmed_applied`、`confirmed_not_applied` 或 `unknown`，只有明确证明未应用时才允许再次调用写接口，超时、连接中断或语义不明的 5xx 必须先进入只读核对。
 - 供应商错误必须转换为内部错误类别，同时保存可审计但已脱敏的错误码。
-- Google 与 Microsoft 只按 `mail.read`、`mail.send`、`calendar.read`、`calendar.write` 渐进申请最小委托权限。真实写适配器只接受四种 M2 命令，审批前必须证明供应商能够无损表达冻结载荷；自动化测试禁止访问真实账号。
+- Google 与 Microsoft 只按 `mail.read`、`mail.send`、`calendar.read`、`calendar.write` 渐进申请最小委托权限。真实写适配器只接受 `mail.send`、`calendar.create`、`calendar.update`、`calendar.restore` 四种 M2 命令，审批前必须证明供应商能够无损表达冻结载荷；附件、HTML 邮件、转发、日程删除/取消、重复日程写入、Contacts、通用工具、多用户和产品多 Agent 仍在范围外，自动化测试禁止访问真实账号。
 - 模型输出先按版本化 Pydantic Schema 验证；只允许一次结构化修复重试，失败后保留确定性结果并标记部分成功。
 
 ## 数据库与事务规则

@@ -5,11 +5,18 @@ x-backend-image: &backend-image "ai-employee-backend:${APP_IMAGE_TAG:?APP_IMAGE_
 x-backend-environment: &backend-environment
   APP_ENV: production
   APP_BASE_URL: "https://${APP_DOMAIN:?APP_DOMAIN is required}"
+  EXTERNAL_WRITES_ENABLED: "${EXTERNAL_WRITES_ENABLED:-false}"
+  GOOGLE_WRITES_ENABLED: "${GOOGLE_WRITES_ENABLED:-false}"
+  MICROSOFT_WRITES_ENABLED: "${MICROSOFT_WRITES_ENABLED:-false}"
+  WRITE_TEST_ACCOUNT_ALLOWLIST: "${WRITE_TEST_ACCOUNT_ALLOWLIST:-[]}"
   DATABASE_URL: "postgresql+asyncpg://ai_employee_app@postgres:5432/${POSTGRES_DB:-ai_employee}"
   CHECKPOINT_DATABASE_URL: "postgresql://ai_employee_app@postgres:5432/${POSTGRES_DB:-ai_employee}"
   REDIS_URL: redis://redis:6379/0
   APP_MASTER_KEY_FILE: /run/secrets/app_master_key
   GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
+  MICROSOFT_CLIENT_ID: "${MICROSOFT_CLIENT_ID:-}"
+  MICROSOFT_CLIENT_SECRET_FILE: /run/secrets/microsoft_client_secret
+  MICROSOFT_REDIRECT_URI: "${MICROSOFT_REDIRECT_URI:-http://localhost:8000/api/v1/connections/microsoft/callback}"
   MODEL_API_KEY_FILE: /run/secrets/model_api_key
   APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
 x-backend-common: &backend-common
@@ -19,6 +26,7 @@ x-backend-common: &backend-common
   secrets:
     - app_master_key
     - google_client_secret
+    - microsoft_client_secret
     - model_api_key
     - app_database_password
   depends_on:
@@ -154,6 +162,7 @@ services:
     secrets:
       - app_master_key
       - google_client_secret
+      - microsoft_client_secret
       - model_api_key
       - app_database_password
       - retention_database_url
@@ -180,6 +189,7 @@ services:
     secrets:
       - app_master_key
       - google_client_secret
+      - microsoft_client_secret
       - model_api_key
       - app_database_password
       - retention_database_url
@@ -265,6 +275,8 @@ secrets:
   app_master_key:
     external: true
   google_client_secret:
+    external: true
+  microsoft_client_secret:
     external: true
   model_api_key:
     external: true
