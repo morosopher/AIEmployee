@@ -162,7 +162,9 @@ async def test_due_retry_is_requeued_through_new_outbox_after_redis_schedule_los
         ]
         assert events[0].published_at is not None
         assert events[1].published_at == now
-        assert [event.event_metadata for event in audit] == [{"reason": "retry_recovery"}]
+        # RETRY、过期 QUEUED 与过期 RUNNING 共用统一恢复审计类型，避免消费者根据
+        # 具体恢复来源分叉；去重键仍保留各路径的精确语义。
+        assert [event.event_metadata for event in audit] == [{"reason": "task_recovery"}]
         assert audit[0].user_id == user_id
     finally:
         await session_factory.dispose()

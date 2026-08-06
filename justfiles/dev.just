@@ -27,7 +27,8 @@ api:
 
 [group('development')]
 worker:
-    uv run --project backend taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules
+    # 指标 listener 由单个 Taskiq 子进程独占；需要并发时启动多个 Worker 实例。
+    uv run --project backend taskiq worker --workers 1 --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules
 
 [group('development')]
 scheduler:

@@ -63,7 +63,8 @@ jobs:
           mkdir -p "${secret_dir}"
           printf '%s' 'ci-app-role-password' >"${secret_dir}/app_database_password"
           printf '%s' 'ci-retention-role-password' >"${secret_dir}/retention_database_password"
-          printf '%s' 'ci-master-key-material-32-bytes-long' >"${secret_dir}/app_master_key"
+          # 应用要求 Base64URL 解码后恰好 32 字节；随机合成密钥只在本次 CI Job 内存活。
+          openssl rand -base64 32 >"${secret_dir}/app_master_key"
           printf '%s' 'ci-google-client-secret' >"${secret_dir}/google_client_secret"
           printf '%s' 'ci-model-api-key' >"${secret_dir}/model_api_key"
           printf '%s' 'ci-backup-passphrase' >"${secret_dir}/backup_passphrase"

@@ -31,7 +31,12 @@ restore file:
     IFS= read -r confirmation || fail 'confirmation input is required'
     [[ "${confirmation}" == "${restore_file}" ]] || fail 'confirmation did not match restore target'
 
+    # basename 只能作为 Compose 环境参数传递，绝不能拼接进 /bin/sh -ec 的固定程序文本。
+    restore_basename="$(basename -- "${restore_file}")"
+
     # 恢复容器同时获得 PostgreSQL 内网和受限 Secret 文件，宿主机无需安装数据库客户端。
     docker compose --profile operations run --rm --no-deps \
       -e APP_ENV="${app_env}" -e ALLOW_PRODUCTION_RESTORE="${ALLOW_PRODUCTION_RESTORE-}" \
-      --entrypoint /bin/sh backup -ec 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "/backups/'"$(basename -- "${restore_file}")"'"'
+      -e "RESTORE_FILE=/backups/${restore_basename}" \
+      --entrypoint /bin/sh backup -ec \
+      'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"'

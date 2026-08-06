@@ -150,6 +150,7 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
             model_gateway=FakeModelGateway(),
             sync_source=sync_source,
             now=lambda: datetime(2026, 7, 31, 7, tzinfo=UTC),
+            checkpoint_database_url=database_url,
         )
         await step.execute(
             LeasedTask(

@@ -157,9 +157,11 @@ services:
       - model_api_key
       - app_database_password
       - retention_database_url
-    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec taskiq worker --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules"]
+    # 每个 Worker 容器只运行一个 Taskiq 子进程，确保其独占 9101 指标 listener；吞吐扩展
+    # 通过增加同构容器副本完成，至少一次语义仍由 PostgreSQL 租约与幂等边界保证。
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec taskiq worker --workers 1 --ack-type when_executed ai_employee.infrastructure.queue.broker:broker ai_employee.workers.execute_task ai_employee.workers.schedules"]
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://localhost:9101/metrics | grep -Eq 'ai_employee_process_heartbeat_age_seconds\\{process=\"worker\"\\} [0-5]?[0-9](\\.[0-9]+)?$$'"]
+      test: ["CMD", "bash", "/app/scripts/check-process-health.sh", "worker", "9101"]
       interval: 30s
       timeout: 5s
       retries: 4
@@ -183,7 +185,7 @@ services:
       - retention_database_url
     command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec taskiq scheduler --update-interval 1 ai_employee.infrastructure.queue.scheduler:scheduler ai_employee.workers.schedules"]
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://localhost:9102/metrics | grep -Eq 'ai_employee_process_heartbeat_age_seconds\\{process=\"scheduler\"\\} [0-5]?[0-9](\\.[0-9]+)?$$'"]
+      test: ["CMD", "bash", "/app/scripts/check-process-health.sh", "scheduler", "9102"]
       interval: 30s
       timeout: 5s
       retries: 4

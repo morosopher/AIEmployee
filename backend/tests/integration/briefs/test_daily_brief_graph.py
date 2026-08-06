@@ -16,11 +16,10 @@ async def test_no_sources_is_total_failure() -> None:
 @pytest.mark.asyncio
 async def test_ambiguous_thread_reaches_model() -> None:
     fake = FakeModelGateway()
-    result = await build_daily_brief_graph().ainvoke(
+    result = await build_daily_brief_graph(model_gateway=fake).ainvoke(
         {
             "mail_threads": [{"thread_id": "t", "sender": "a@x", "subject": "h"}],
             "calendar_events": [],
-            "model_gateway": fake,
         }
     )
     assert len(fake.calls) == 1

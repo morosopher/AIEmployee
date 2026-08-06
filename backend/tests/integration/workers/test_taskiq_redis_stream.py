@@ -18,11 +18,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 EXPECTED_TASK_NAMES = [
     "ai_employee.workers.execute_task:execute_task",
     "ai_employee.workers.schedules:dispatch_due_briefs",
+    "ai_employee.workers.schedules:dispatch_google_incremental_syncs",
+    "ai_employee.workers.schedules:dispatch_overdue_brief_diagnostics",
     "ai_employee.workers.schedules:expire_approvals",
     "ai_employee.workers.schedules:expire_sessions",
     "ai_employee.workers.schedules:recover_approval_checkpoints",
     "ai_employee.workers.schedules:recover_task_retries",
     "ai_employee.workers.schedules:relay_outbox",
+    "ai_employee.workers.schedules:run_retention_cleanup",
 ]
 
 

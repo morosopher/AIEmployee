@@ -9,6 +9,11 @@ class DailyBriefState(TypedDict, total=False):
     source_cutoff: str
     mail_threads: list[dict[str, Any]]
     calendar_events: list[dict[str, Any]]
+    # 这些输入必须显式声明在 LangGraph 状态契约中，否则入口会过滤掉工作域配置，
+    # 造成确定性分类失效；它们均为可安全 checkpoint 的合成/配置值。
+    work_email_domains: list[str]
+    locale: str
+    model_name: str
     classifications: list[dict[str, Any]]
     spam_thread_ids: set[str]
     conflicts: list[dict[str, Any]]
@@ -18,6 +23,5 @@ class DailyBriefState(TypedDict, total=False):
     content: dict[str, Any]
     warnings: list[str]
     step_events: list[dict[str, Any]]
-    model_gateway: Any
     task_step_event_sink: Any
     model_redaction_patterns: list[str]

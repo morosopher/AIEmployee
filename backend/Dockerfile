@@ -15,6 +15,7 @@ COPY backend/pyproject.toml backend/uv.lock ./backend/
 RUN uv sync --project ./backend --frozen --no-dev --no-install-project
 COPY backend ./backend
 COPY scripts/init-db-roles.sh ./scripts/init-db-roles.sh
+COPY scripts/check-process-health.sh ./scripts/check-process-health.sh
 RUN uv sync --project ./backend --frozen --no-dev
 
 WORKDIR /app/backend

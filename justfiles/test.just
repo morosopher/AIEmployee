@@ -12,7 +12,8 @@ test-frontend:
 
 [group('quality')]
 test-integration:
-    uv run --project backend pytest backend/tests/integration backend/tests/contract -q
+    # 发布门禁必须同时覆盖真实边界、供应商契约和已批准的简报评测基线。
+    uv run --project backend pytest backend/tests/integration backend/tests/contract backend/tests/evals -q
 
 [group('quality')]
 test-e2e:
@@ -42,5 +43,8 @@ check: lint typecheck test
 
 [group('quality')]
 ci: check test-integration
+    bash scripts/test-tooling.sh
+    bash scripts/test-run-e2e-backend.sh
+    bash scripts/test-ci-workflow.sh
     pnpm --dir frontend build
     pnpm --dir frontend test:e2e

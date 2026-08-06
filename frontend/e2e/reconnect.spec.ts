@@ -57,13 +57,12 @@ const reloadedTerminalSnapshot = {
 }
 
 /**
- * 以浏览器真实 EventSource 请求模拟服务端关闭后的耐久事件重放。
+ * 以浏览器真实 EventSource 验证页面离开后按已知耐久游标重新订阅。
  *
- * 第一条流故意在 running 事件后结束；浏览器协议级自动重连必须带 ``Last-Event-ID: 1``，
- * 并返回终态。应用收到终态后会主动读取 PostgreSQL 快照，测试用可控 REST 回应
- * 证明该补偿不是页面 reload 的静态替身。
+ * 第一条流在 running 后设置较长重连间隔；SPA 路由卸载并重建订阅时必须把 Pinia 中
+ * 已见的游标放进查询参数。终态事件随后触发 PostgreSQL 快照对账。
  */
-test('EventSource reconnect replays from the durable cursor and reconciles terminal snapshot', async ({
+test('EventSource reopens from the durable cursor and reconciles terminal snapshot', async ({
   page,
 }) => {
   let eventRequests = 0
@@ -81,30 +80,34 @@ test('EventSource reconnect replays from the durable cursor and reconciles termi
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(
-        snapshotRequests === 1 ? runningSnapshot : terminalSnapshot,
+        snapshotRequests <= 2 ? runningSnapshot : terminalSnapshot,
       ),
     })
   })
   await page.route('**/api/v1/tasks/task-1/events*', async (route) => {
     eventRequests += 1
     const url = new URL(route.request().url())
+    const headers = await route.request().allHeaders()
     if (eventRequests === 1) {
       expect(url.searchParams.get('last_event_id')).toBeNull()
+      expect(headers['last-event-id']).toBeUndefined()
       await route.fulfill({
         status: 200,
         contentType: 'text/event-stream',
         headers: { 'Cache-Control': 'no-cache' },
         body: [
+          'retry: 60000',
           'id: 1',
           'event: task.status_changed',
           'data: {"id":"1","task_id":"task-1","sequence":"1","event":"task.status_changed","occurred_at":"2026-08-05T00:00:00Z","step_id":null,"payload":{"status":"running"}}',
+          '',
           '',
         ].join('\n'),
       })
       return
     }
-    expect(url.searchParams.get('last_event_id')).toBeNull()
-    expect(route.request().headers()['last-event-id']).toBe('1')
+    expect(url.searchParams.get('last_event_id')).toBe('1')
+    expect(headers['last-event-id']).toBeUndefined()
     await route.fulfill({
       status: 200,
       contentType: 'text/event-stream',
@@ -114,20 +117,27 @@ test('EventSource reconnect replays from the durable cursor and reconciles termi
         'event: task.status_changed',
         'data: {"id":"2","task_id":"task-1","sequence":"2","event":"task.status_changed","occurred_at":"2026-08-05T00:00:01Z","step_id":null,"payload":{"status":"succeeded"}}',
         '',
+        '',
       ].join('\n'),
     })
   })
 
   await page.goto('/tasks?task_id=task-1')
-  await expect(page.getByText('当前状态： succeeded')).toBeVisible()
-  await expect.poll(() => eventRequests).toBeGreaterThanOrEqual(2)
-  expect(snapshotRequests).toBeGreaterThanOrEqual(2)
+  await expect(page.getByText('当前状态：running')).toBeVisible()
+  await expect.poll(() => eventRequests).toBe(1)
+  // 使用 Vue Router 链接与浏览器后退保持同一 SPA/Pinia 实例，模拟用户暂时离开任务页。
+  await page.getByRole('link', { name: '任务历史' }).click()
+  await expect(page).toHaveURL(/\/tasks$/)
+  await page.goBack()
+  await expect(page.getByText('当前状态：succeeded')).toBeVisible()
+  await expect.poll(() => eventRequests).toBe(2)
+  expect(snapshotRequests).toBeGreaterThanOrEqual(3)
 })
 
 /**
- * 页面刷新会新建不能携带 Last-Event-ID 的 EventSource；服务端因此会从 cursor 0 重放
- * 已被恢复快照覆盖的 sequence 1。测试先确认该 PostgreSQL 快照已渲染并建立 cursor 1，
- * 才放行后续 sequence 2/3，证明重复重放不会生成第二个时间线条目或回退终态。
+ * 页面刷新会丢失浏览器内存游标，因此服务端可能从 cursor 0 全量重放。测试先等待
+ * PostgreSQL 快照恢复 sequence 1，再发送重复 sequence 1/2 与终态 sequence 3，证明
+ * 快照基线和事件去重不会生成第二个时间线条目或回退终态。
  */
 test('page reload restores durable snapshot and deduplicates replayed task events', async ({
   page,
@@ -158,8 +168,9 @@ test('page reload restores durable snapshot and deduplicates replayed task event
   await page.route('**/api/v1/tasks/task-1/events*', async (route) => {
     eventRequests += 1
     const url = new URL(route.request().url())
+    const headers = await route.request().allHeaders()
     expect(url.searchParams.get('last_event_id')).toBeNull()
-    expect(route.request().headers()['last-event-id']).toBeUndefined()
+    expect(headers['last-event-id']).toBeUndefined()
     if (eventRequests === 1) {
       await route.fulfill({
         status: 200,
@@ -171,59 +182,58 @@ test('page reload restores durable snapshot and deduplicates replayed task event
           'event: step.started',
           'data: {"id":"1","task_id":"task-1","sequence":"1","event":"step.started","occurred_at":"2026-08-05T00:00:00Z","step_id":"step-1","payload":{"name":"persist","status":"started"}}',
           '',
-        ].join('\n'),
-      })
-      return
-    }
-    if (eventRequests === 2) {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        headers: { 'Cache-Control': 'no-cache' },
-        body: [
-          // 让关闭后的 EventSource 立即按协议重连；下一条请求应携带本流已接收的 cursor 1。
-          'retry: 0',
-          'id: 1',
-          'event: step.started',
-          'data: {"id":"1","task_id":"task-1","sequence":"1","event":"step.started","occurred_at":"2026-08-05T00:00:00Z","step_id":"step-1","payload":{"name":"persist","status":"started"}}',
           '',
         ].join('\n'),
       })
       return
     }
-    // 第三条请求是同一浏览器流的协议级重连。此时页面已从 PostgreSQL 快照恢复，故可
-    // 区分“快照基线去重”与仅依赖单一 EventSource 内存状态的偶然通过。
-    expect(route.request().headers()['last-event-id']).toBe('1')
-    await expect(page.getByText('当前状态： running')).toBeVisible()
-    await expect(page.getByRole('listitem').filter({ hasText: 'persist' })).toHaveCount(1)
-    expect(snapshotRequests).toBeGreaterThanOrEqual(2)
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/event-stream',
-      headers: { 'Cache-Control': 'no-cache' },
-      body: [
-        'id: 2',
-        'event: step.completed',
-        'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
-        '',
-        'id: 2',
-        'event: step.completed',
-        'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
-        '',
-        'id: 3',
-        'event: task.status_changed',
-        'data: {"id":"3","task_id":"task-1","sequence":"3","event":"task.status_changed","occurred_at":"2026-08-05T00:00:02Z","step_id":null,"payload":{"status":"succeeded"}}',
-        '',
-      ].join('\n'),
-    })
+    if (eventRequests === 2) {
+      await expect(page.getByText('当前状态：running')).toBeVisible()
+      await expect(
+        page.getByRole('main').last().getByRole('listitem').filter({ hasText: 'persist' }),
+      ).toHaveCount(1)
+      expect(snapshotRequests).toBeGreaterThanOrEqual(2)
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-cache' },
+        body: [
+          'retry: 60000',
+          'id: 1',
+          'event: step.started',
+          'data: {"id":"1","task_id":"task-1","sequence":"1","event":"step.started","occurred_at":"2026-08-05T00:00:00Z","step_id":"step-1","payload":{"name":"persist","status":"started"}}',
+          '',
+          '',
+          'id: 2',
+          'event: step.completed',
+          'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
+          '',
+          '',
+          'id: 2',
+          'event: step.completed',
+          'data: {"id":"2","task_id":"task-1","sequence":"2","event":"step.completed","occurred_at":"2026-08-05T00:00:01Z","step_id":"step-1","payload":{"name":"persist","status":"completed","finished_at":"2026-08-05T00:00:01Z"}}',
+          '',
+          '',
+          'id: 3',
+          'event: task.status_changed',
+          'data: {"id":"3","task_id":"task-1","sequence":"3","event":"task.status_changed","occurred_at":"2026-08-05T00:00:02Z","step_id":null,"payload":{"status":"succeeded"}}',
+          '',
+          '',
+        ].join('\n'),
+      })
+      return
+    }
+    throw new Error(`unexpected event request ${eventRequests}`)
   })
 
   await page.goto('/tasks?task_id=task-1')
-  await expect(page.getByText('当前状态： running')).toBeVisible()
+  await expect(page.getByText('当前状态：running')).toBeVisible()
   await page.reload()
 
-  await expect(page.getByText('当前状态： succeeded')).toBeVisible()
-  await expect(page.getByRole('listitem').filter({ hasText: 'persist' })).toHaveCount(1)
-  await expect.poll(() => eventRequests).toBe(3)
+  await expect(page.getByText('当前状态：succeeded')).toBeVisible()
+  await expect(
+    page.getByRole('main').last().getByRole('listitem').filter({ hasText: 'persist' }),
+  ).toHaveCount(1)
+  await expect.poll(() => eventRequests).toBe(2)
   expect(snapshotRequests).toBeGreaterThanOrEqual(3)
 })

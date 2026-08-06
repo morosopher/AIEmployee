@@ -71,7 +71,8 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
         (Path(__file__).parent / "daily_brief_cases.json").read_text(encoding="utf-8")
     )
     for case in cases:
-        result = await build_daily_brief_graph().ainvoke(
+        # 模型端口由 Graph 构建闭包注入，不能进入可持久化 state；评测必须复用生产边界。
+        result = await build_daily_brief_graph(model_gateway=FakeModelGateway()).ainvoke(
             {
                 "mail_threads": [
                     {
@@ -82,12 +83,11 @@ async def test_daily_brief_evaluation_binds_items_to_fixture_sources_without_htm
                         "headers": case["headers"],
                         "summary": case["summary_fact"],
                         "needs_reply": case["needs_reply"],
-                        "deadline": case["deadline"],
+                        "deadline_at": case["deadline"],
                     }
                 ],
                 "calendar_events": [],
                 "work_email_domains": ["work.example"],
-                "model_gateway": FakeModelGateway(),
             }
         )
         serialized = json.dumps(result["content"], ensure_ascii=False)

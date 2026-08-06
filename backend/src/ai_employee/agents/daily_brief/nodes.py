@@ -90,15 +90,25 @@ def apply_deterministic_rules(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
-    """仅把歧义线程的最小事实交给模型，每个线程最多一次。"""
+async def classify_ambiguous_threads(
+    state: dict[str, Any], *, model_gateway: Any | None = None
+) -> dict[str, Any]:
+    """仅把歧义线程的最小事实交给运行时模型端口，每个线程最多一次。
+
+    Args:
+        state: 只包含可被 checkpoint 序列化的每日简报事实。
+        model_gateway: 图构建时注入的模型端口，不写回 ``state``。
+
+    Returns:
+        增补模型分类与审计元数据后的可持久状态。
+    """
     _event(state, "classify_ambiguous_threads", "started")
     classified = {
         item["thread_id"]
         for item in state.get("classifications", [])
         if item.get("category") is not None
     }
-    gateway = state.get("model_gateway")
+    gateway = model_gateway
     outputs = []
     processed_thread_ids: set[str] = set(state.get("spam_thread_ids", set()))
     if gateway:
@@ -137,7 +147,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                         "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                     ).EmailJudgement,
                 )
-                _record_model_invocation(state, facts, response)
+                _record_model_invocation(state, facts, response, model_gateway=gateway)
                 judgement = response.value.model_copy(update={"thread_id": thread_id})
                 if response.value.thread_id != thread_id:
                     state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
@@ -145,7 +155,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                     state["warnings"].append(f"model_partial:{thread_id}")
                 outputs.append(judgement.model_dump())
             except ModelGatewayError as exc:
-                _record_model_failure(state, facts, exc.code)
+                _record_model_failure(state, facts, exc.code, model_gateway=gateway)
                 if exc.code != "model_invalid_output":
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
                     continue
@@ -166,7 +176,7 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                             "ai_employee.domain.briefs", fromlist=["EmailJudgement"]
                         ).EmailJudgement,
                     )
-                    _record_model_invocation(state, facts, response)
+                    _record_model_invocation(state, facts, response, model_gateway=gateway)
                     judgement = response.value.model_copy(update={"thread_id": thread_id})
                     if response.value.thread_id != thread_id:
                         state["warnings"].append(f"model_thread_id_mismatch:{thread_id}")
@@ -174,19 +184,27 @@ async def classify_ambiguous_threads(state: dict[str, Any]) -> dict[str, Any]:
                         state["warnings"].append(f"model_partial:{thread_id}")
                     outputs.append(judgement.model_dump())
                 except ModelGatewayError as repair_error:
-                    _record_model_failure(state, facts, repair_error.code)
+                    _record_model_failure(
+                        state, facts, repair_error.code, model_gateway=gateway
+                    )
                     state["warnings"].append(f"model_classification_failed:{thread_id}")
     state["model_items"] = outputs
     _event(state, "classify_ambiguous_threads", "completed")
     return state
 
 
-def _record_model_invocation(state: dict[str, Any], facts: dict[str, Any], response: Any) -> None:
+def _record_model_invocation(
+    state: dict[str, Any],
+    facts: dict[str, Any],
+    response: Any,
+    *,
+    model_gateway: Any,
+) -> None:
     """收集不含 Prompt 或模型正文的调用元数据，供事务性审计落库。"""
     usage = response.usage
     state.setdefault("model_invocations", []).append(
         {
-            "provider": type(state["model_gateway"]).__name__.removesuffix("Gateway").lower(),
+            "provider": type(model_gateway).__name__.removesuffix("Gateway").lower(),
             "model_name": state.get("model_name", ""),
             "prompt_version": "daily_brief_v1",
             "input_hash": sha256(
@@ -203,11 +221,17 @@ def _record_model_invocation(state: dict[str, Any], facts: dict[str, Any], respo
     )
 
 
-def _record_model_failure(state: dict[str, Any], facts: dict[str, Any], error_code: str) -> None:
+def _record_model_failure(
+    state: dict[str, Any],
+    facts: dict[str, Any],
+    error_code: str,
+    *,
+    model_gateway: Any,
+) -> None:
     """记录失败调用的最小审计元数据，绝不保存 prompt 或模型正文。"""
     state.setdefault("model_invocations", []).append(
         {
-            "provider": type(state["model_gateway"]).__name__.removesuffix("Gateway").lower(),
+            "provider": type(model_gateway).__name__.removesuffix("Gateway").lower(),
             "model_name": state.get("model_name", ""),
             "prompt_version": "daily_brief_v1",
             "input_hash": sha256(

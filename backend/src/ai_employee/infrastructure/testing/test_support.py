@@ -62,6 +62,9 @@ class TestSupportFixtureService:
                     last_error_code=None,
                 )
             )
+            # 连接模型未声明 relationship，先单独 flush 父表，保证后续凭据和游标
+            # 的外键在数据库中已有目标；仍处于同一事务，失败会整体回滚。
+            await session.flush()
             session.add_all(
                 (
                     EncryptedCredentialModel(
@@ -98,6 +101,8 @@ class TestSupportFixtureService:
                     ),
                 )
             )
+            # 凭据与游标共同依赖已经落库的连接，先完成这一批次，再创建邮件线程。
+            await session.flush()
             thread = EmailThreadModel(
                 user_id=user_id,
                 connection_id=connection_id,

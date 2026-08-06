@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 独立指标 listener 只允许每个 Worker 容器/进程组拥有一个 Taskiq 子进程；开发入口必须
+# 与生产及 E2E 保持同一约束，横向并发由多个容器提供。
+grep -Fq 'taskiq worker --workers 1 --ack-type when_executed' justfiles/dev.just
+
 # 该列表是仓库统一命令入口的最小契约，任何 recipe 缺失都应让脚手架检查立即失败。
 required_recipes=(
   doctor bootstrap dev infra-up infra-down web api worker scheduler
@@ -265,11 +269,12 @@ assert_contains "${logs_payload}" "${command_log}"
 assert_exact_line $'docker\tcompose\tlogs\t-f\t--\t'"${logs_payload}" "${command_log}"
 assert_line_count 1 "${command_log}"
 
-# restore file 也必须以一个原样参数到达假恢复脚本，并且经过自有精确确认。
+# restore file 必须经过自有精确确认；容器映射只取 basename，但仍要作为独立环境参数
+# 传给 Compose，不能插入固定的 /bin/sh -ec 程序文本。
 set_valid_database_environment
 clear_command_log
 restore_sentinel="${sandbox_dir}/restore-injection-sentinel"
-restore_payload="backup \"; : > \"${restore_sentinel}\"; #"
+restore_payload="${sandbox_dir}/backup \"; : > restore-injection-sentinel; #.dump"
 if ! run_just_with_input_capture "${restore_payload}" "${output_file}" just --yes restore "${restore_payload}"; then
   printf 'tooling behavior contract failed: safe restore invocation failed\n' >&2
   exit 1
@@ -278,8 +283,8 @@ if [[ -e "${restore_sentinel}" ]]; then
   printf 'tooling behavior contract failed: restore payload escaped into shell\n' >&2
   exit 1
 fi
-assert_contains "${restore_payload}" "${command_log}"
-assert_exact_line $'restore\t'"${restore_payload}" "${command_log}"
+restore_basename="$(basename -- "${restore_payload}")"
+assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\t--no-deps\t-e\tAPP_ENV=development\t-e\tALLOW_PRODUCTION_RESTORE=\t-e\tRESTORE_FILE=/backups/'"${restore_basename}"$'\t--entrypoint\t/bin/sh\tbackup\t-ec\texport PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"' "${command_log}"
 assert_line_count 1 "${command_log}"
 
 # 生产、缺失、拼错或未知环境一律 fail-closed；测试绕过 just 自身确认，但 recipe 仍应拒绝。
@@ -490,7 +495,8 @@ for allowed_environment in development test; do
   assert_contains "APP_ENV=${allowed_environment}" "${stderr_file}"
   assert_contains 'Compose service: postgres' "${stderr_file}"
   assert_contains "Restore target: ${restore_target}" "${stderr_file}"
-  assert_exact_line $'restore\t'"${restore_target}" "${command_log}"
+  restore_target_basename="$(basename -- "${restore_target}")"
+  assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\t--no-deps\t-e\tAPP_ENV='"${allowed_environment}"$'\t-e\tALLOW_PRODUCTION_RESTORE=\t-e\tRESTORE_FILE=/backups/'"${restore_target_basename}"$'\t--entrypoint\t/bin/sh\tbackup\t-ec\texport PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"' "${command_log}"
   assert_line_count 1 "${command_log}"
 done
 

@@ -31,17 +31,17 @@ def test_intent_rejects_unknown_value() -> None:
 
 @pytest.mark.asyncio
 async def test_graph_filters_spam_and_renders_sources() -> None:
+    fake = FakeModelGateway()
     state = {
         "local_date": "2026-08-04",
         "source_cutoff": "2026-08-04T00:00:00Z",
-        "model_gateway": FakeModelGateway(),
         "mail_threads": [
             {"thread_id": "spam", "sender": "x", "subject": "x", "labels": ["SPAM"]},
             {"thread_id": "normal", "sender": "x", "subject": "hello"},
         ],
         "calendar_events": [],
     }
-    result = await build_daily_brief_graph().ainvoke(state)
+    result = await build_daily_brief_graph(model_gateway=fake).ainvoke(state)
     assert all(item["source_refs"] for item in result["content"]["items"])
     assert "spam" not in {
         item["source_refs"][0]["source_id"] for item in result["content"]["items"]
@@ -80,11 +80,10 @@ async def test_model_notification_is_aggregated_not_mail_summary() -> None:
                 usage=ModelUsage(),
             )
 
-    result = await build_daily_brief_graph().ainvoke(
+    result = await build_daily_brief_graph(model_gateway=NotificationModel()).ainvoke(
         {
             "mail_threads": [{"thread_id": "t", "sender": "a@x", "subject": "x"}],
             "calendar_events": [],
-            "model_gateway": NotificationModel(),
         }
     )
     assert [item["section"] for item in result["content"]["items"]] == ["notifications"]
@@ -141,7 +140,7 @@ async def test_write_and_planning_verbs_never_call_model(text: str) -> None:
 @pytest.mark.asyncio
 async def test_mail_model_input_is_deduplicated_and_has_safe_facts() -> None:
     fake = FakeModelGateway()
-    await build_daily_brief_graph().ainvoke(
+    await build_daily_brief_graph(model_gateway=fake).ainvoke(
         {
             "mail_threads": [
                 {"thread_id": "t", "sender": "a@x", "subject": "s", "summary": "ok"},
@@ -149,7 +148,6 @@ async def test_mail_model_input_is_deduplicated_and_has_safe_facts() -> None:
                 {"thread_id": "spam", "sender": "a@x", "subject": "secret", "labels": ["spam"]},
             ],
             "calendar_events": [],
-            "model_gateway": fake,
         }
     )
     assert len(fake.calls) == 1
@@ -160,7 +158,7 @@ async def test_mail_model_input_is_deduplicated_and_has_safe_facts() -> None:
 @pytest.mark.asyncio
 async def test_mail_model_input_redacts_builtin_and_configured_values() -> None:
     fake = FakeModelGateway()
-    await build_daily_brief_graph().ainvoke(
+    await build_daily_brief_graph(model_gateway=fake).ainvoke(
         {
             "mail_threads": [
                 {
@@ -171,7 +169,6 @@ async def test_mail_model_input_redacts_builtin_and_configured_values() -> None:
                 }
             ],
             "calendar_events": [],
-            "model_gateway": fake,
             "model_redaction_patterns": ["CUSTOM_SECRET"],
         }
     )
@@ -196,11 +193,10 @@ async def test_model_cannot_substitute_foreign_thread_id() -> None:
                 usage=ModelUsage(),
             )
 
-    result = await build_daily_brief_graph().ainvoke(
+    result = await build_daily_brief_graph(model_gateway=ForeignThreadModel()).ainvoke(
         {
             "mail_threads": [{"thread_id": "trusted", "sender": "x", "subject": "x"}],
             "calendar_events": [],
-            "model_gateway": ForeignThreadModel(),
         }
     )
     assert "foreign-thread" not in str(result["content"])
@@ -209,11 +205,12 @@ async def test_model_cannot_substitute_foreign_thread_id() -> None:
 
 @pytest.mark.asyncio
 async def test_fake_partial_makes_rendered_brief_partial() -> None:
-    result = await build_daily_brief_graph().ainvoke(
+    result = await build_daily_brief_graph(
+        model_gateway=FakeModelGateway(scenario="partial")
+    ).ainvoke(
         {
             "mail_threads": [{"thread_id": "t", "sender": "x", "subject": "x"}],
             "calendar_events": [],
-            "model_gateway": FakeModelGateway(scenario="partial"),
         }
     )
     assert result["content"]["completeness"] == "partial"

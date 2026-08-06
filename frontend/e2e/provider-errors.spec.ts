@@ -83,6 +83,8 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
+  // 登录请求是异步的；先等待受保护路由完成导航，再读取服务端设置的 CSRF Cookie。
+  await expect(page).not.toHaveURL(/\/login/)
   const { csrf, connectionId } = await seedGoogleSource(page)
   await injectScenario(page, 'oauth_revoked')
   const sync = await page.request.post(`/api/v1/connections/${connectionId}/sync`, {
@@ -99,9 +101,14 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
       last_error_code: string | null
     }>
     return connections.find((connection) => connection.id === connectionId)
-  }).toEqual({ id: connectionId, status: 'degraded', last_error_code: 'oauth_revoked' })
+  }).toEqual(expect.objectContaining({
+    id: connectionId,
+    status: 'degraded',
+    last_error_code: 'oauth_revoked',
+  }))
   await page.goto('/connections')
-  await expect(page.getByRole('button', { name: '重新连接' })).toBeVisible()
+  // 本地重复验收可能保留多个已降级的合成连接；此处只验证恢复动作至少可见一次。
+  await expect(page.getByRole('button', { name: '重新连接' }).first()).toBeVisible()
 })
 
 /** 单来源失败须只呈现一个 partial 告警，并保留修复所需的脱敏信息。 */
@@ -114,6 +121,7 @@ test('partial brief presents a single-source failure warning with repair context
   await page.getByLabel('邮箱').fill(email)
   await page.getByLabel('密码').fill(password)
   await page.getByRole('button', { name: '登录' }).click()
+  await expect(page).not.toHaveURL(/\/login/)
   const { csrf, connectionId } = await seedGoogleSource(page)
   await injectScenario(page, 'partial_source')
   const taskId = await generateBriefForSource(page, csrf, connectionId)

@@ -102,6 +102,11 @@ class GenerateBriefTaskStep:
             calendar_events = await self._events_for_local_day(
                 session, task.user_id, local_date, user.timezone, connection_id
             )
+        model_gateway = self._model_gateway or (
+            self._model_gateway_factory(task.user_id)
+            if self._model_gateway_factory is not None
+            else build_model_gateway()
+        )
         graph_input = {
             "task_run_id": str(task.task_id),
             "local_date": local_date.isoformat(),
@@ -109,22 +114,18 @@ class GenerateBriefTaskStep:
             "mail_threads": mail_threads,
             "calendar_events": calendar_events,
             "warnings": warnings,
-            "model_gateway": self._model_gateway
-            or (
-                self._model_gateway_factory(task.user_id)
-                if self._model_gateway_factory is not None
-                else build_model_gateway()
-            ),
             "model_name": self._model_name,
             "locale": user.locale,
         }
-        # 任务 ID 是跨 Worker 接管不变的 thread_id。只有生产组合根提供 PostgreSQL
-        # checkpointer；纯单元测试仍可用内存 Graph 验证确定性节点，不偷偷建立数据库连接。
+        # 模型端口由 Graph 节点闭包持有，不能混入 checkpoint 状态；任务 ID 则是跨 Worker
+        # 接管不变的 thread_id。纯单元测试仍可不提供 PostgreSQL 保存器。
         if self._checkpoint_database_url is None:
-            result = await build_daily_brief_graph().ainvoke(graph_input)
+            result = await build_daily_brief_graph(model_gateway=model_gateway).ainvoke(graph_input)
         else:
             async with postgres_checkpointer(self._checkpoint_database_url) as saver:
-                result = await build_daily_brief_graph(checkpointer=saver).ainvoke(
+                result = await build_daily_brief_graph(
+                    model_gateway=model_gateway, checkpointer=saver
+                ).ainvoke(
                     graph_input,
                     {"configurable": {"thread_id": str(task.task_id)}},
                 )
