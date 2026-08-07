@@ -17,6 +17,7 @@ from ai_employee.application.use_cases.connections import (
     ConnectionStore,
     ConsumedOAuthAttempt,
     OAuthAttemptInvalidatedError,
+    OAuthAuthorizationScopeConflictError,
     StoredCapability,
     StoredConnection,
     StoredProviderCalendar,
@@ -237,13 +238,14 @@ class SqlAlchemyConnectionStore:
         ``provider_account_id`` 必须是 adapter 已规范化的稳定键；Task 10 会把 tenant 与
         Graph user ID 同时编码到该键中。两个 OAuth state 可以并发映射到同一规范键，因此
         这里先锁定已有连接，再处理竞争插入：同一用户、供应商和账户键的事务会在连接行锁
-        上串行化，后到的 connected callback 可以把 disjoint scope 合并，而不会覆盖先到
-        的能力事实。tenant/type 是不可变身份事实，任何不一致都 fail closed。
+        上串行化。后到的 connected callback 只有在新 token 的实际 scope 覆盖当前连接
+        scope 时才允许替换凭据；subset/disjoint token 必须 fail closed，避免本地能力并集
+        与最后保存的单个 token 不一致。tenant/type 是不可变身份事实，任何不一致都拒绝。
 
         targetless callback 命中 ``disconnected``（或其他非 connected）连接时仍执行精确
         reset：历史能力和 scope 不能越过断开重新复活。只有已经 connected 的同身份连接
-        走并集合并，并对既有 capability 行使用 ``DO NOTHING``，由应用层随后只更新本次
-        requested capabilities。
+        走 scope 单调覆盖校验，并对既有 capability 行使用 ``DO NOTHING``，由应用层随后
+        只更新本次 requested capabilities。
         """
         ordered_scopes = _ordered_scopes(scopes)
         connection = await self._session.scalar(
@@ -306,12 +308,17 @@ class SqlAlchemyConnectionStore:
         preserve_connected_state = (
             not inserted and connection.status == ConnectionStatus.CONNECTED.value
         )
+        if preserve_connected_state and not frozenset(connection.scopes).issubset(scopes):
+            # 一个连接只持久化一组 access/refresh token。若 incoming token 不覆盖当前
+            # scope，合并 JSON scope 或保留双 enabled 能力都会制造无法由最终凭据证明的
+            # 本地事实；必须在写邮箱、状态、能力或 credential 之前整体拒绝。
+            raise OAuthAuthorizationScopeConflictError
         connection.account_email = account_email
         connection.last_error_code = None
         if preserve_connected_state:
-            # 同一规范账户的首次授权可能各自只拿到一个读取 scope；连接事实保存并集，
-            # 让后续 callback 的 requested 能力逐项写入，而不抹掉并发事务已经确认的行。
-            connection.scopes = _ordered_scopes(frozenset(connection.scopes) | scopes)
+            # incoming token 已证明包含全部当前 scope；保存其精确事实，并让应用层只更新
+            # 本次 requested 能力，未请求行继续保留既有验证结果。
+            connection.scopes = ordered_scopes
         else:
             # 新建行已带入本次 scope；断开/过期等旧状态必须从本次 token 事实重新开始。
             connection.scopes = ordered_scopes

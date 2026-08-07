@@ -174,8 +174,9 @@ class ConnectionStore(Protocol):
     ) -> UUID:
         """按规范账户键建立或合并连接，并确保四项能力行存在。
 
-        同一用户的 connected 同身份 callback 合并实际 scope 并保留未请求能力；新建或
-        非 connected 连接则从本次 token 事实精确重置，tenant/type 不一致时拒绝。
+        同一用户的 connected 同身份 callback 只有在新 token scope 覆盖当前 scope 时才
+        原样替换并保留未请求能力；新建或非 connected 连接从本次 token 事实精确重置，
+        tenant/type 或 scope 单调性不满足时拒绝。
         """
         ...
 
@@ -434,6 +435,17 @@ class OAuthAttemptInvalidatedError(StateConflictError):
         super().__init__(
             error_code="oauth_attempt_invalidated",
             message="oauth authorization attempt is no longer valid",
+        )
+
+
+class OAuthAuthorizationScopeConflictError(StateConflictError):
+    """表示 targetless callback 的 token scope 无法覆盖当前 connected 权限事实。"""
+
+    def __init__(self) -> None:
+        """返回不包含账户、scope 或 token 的稳定冲突错误。"""
+        super().__init__(
+            error_code="oauth_authorization_scope_conflict",
+            message="oauth authorization scopes conflict with the connected account",
         )
 
 

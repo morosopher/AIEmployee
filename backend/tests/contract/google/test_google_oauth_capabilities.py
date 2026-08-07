@@ -76,6 +76,28 @@ def test_google_authorization_url_uses_requested_scopes_and_oidc_nonce() -> None
     assert "draft" not in query["scope"][0].lower()
 
 
+@pytest.mark.parametrize(
+    "invalid_scope",
+    (
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ),
+)
+def test_google_authorization_request_rejects_response_alias_and_unknown_scope(
+    invalid_scope: str,
+) -> None:
+    """响应兼容别名与 M2 外 scope 都不得进入授权请求扩大权限。"""
+    request = OAuthAuthorizationRequest(
+        state="synthetic-state",
+        code_challenge="synthetic-challenge",
+        requested_scopes=frozenset({"openid", "email", invalid_scope}),
+        oidc_nonce="synthetic-nonce",
+    )
+
+    with pytest.raises(ValueError, match="requested scopes are not allowed"):
+        _adapter().build_authorization_url(request)
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_token_scope_is_normalized_and_id_token_is_retained() -> None:

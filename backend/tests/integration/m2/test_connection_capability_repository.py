@@ -425,10 +425,10 @@ def _initial_google_adapter(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_targetless_google_callbacks_merge_disjoint_read_scopes(
+async def test_concurrent_targetless_google_callbacks_reject_disjoint_token_scopes(
     database_url: str,
 ) -> None:
-    """同一 Google 帐号的并发首次授权必须保留两个互不重叠的读取能力。"""
+    """同一帐号的 disjoint token 只能提交一个，最终能力必须与可用凭据一致。"""
     session_factory = build_session_factory(database_url)
     cipher = AeadCipher(b"w" * 32)
     email = "concurrent-disjoint-google@example.test"
@@ -483,47 +483,81 @@ async def test_concurrent_targetless_google_callbacks_merge_disjoint_read_scopes
         callbacks = asyncio.gather(
             use_case.callback(code="mail-code", state=mail_state),
             use_case.callback(code="calendar-code", state=calendar_state),
+            return_exceptions=True,
         )
         await asyncio.wait_for(adapter.exchange_started.wait(), timeout=5)
         adapter.release_exchange.set()
         await asyncio.wait_for(adapter.fetch_started.wait(), timeout=5)
         adapter.release_fetch.set()
-        connection_ids = await asyncio.wait_for(callbacks, timeout=5)
-        assert connection_ids[0] == connection_ids[1]
+        results = await asyncio.wait_for(callbacks, timeout=5)
+        successes = tuple(
+            (index, result) for index, result in enumerate(results) if isinstance(result, UUID)
+        )
+        conflicts = tuple(result for result in results if isinstance(result, StateConflictError))
+        assert len(successes) == 1
+        assert len(conflicts) == 1
+        assert conflicts[0].error_code == "oauth_authorization_scope_conflict"
+        success_index, connection_id = successes[0]
+        winner_code = ("mail-code", "calendar-code")[success_index]
+        winner_capability = (
+            ConnectionCapability.MAIL_READ,
+            ConnectionCapability.CALENDAR_READ,
+        )[success_index]
+        loser_capability = (
+            ConnectionCapability.CALENDAR_READ,
+            ConnectionCapability.MAIL_READ,
+        )[success_index]
+        winner_token = adapter.tokens_by_code[winner_code]
 
         async with session_factory() as session:
-            connection = await session.get(OAuthConnectionModel, connection_ids[0])
+            connection = await session.get(OAuthConnectionModel, connection_id)
             rows = tuple(
                 (
                     await session.scalars(
                         select(ConnectionCapabilityModel)
-                        .where(ConnectionCapabilityModel.connection_id == connection_ids[0])
+                        .where(ConnectionCapabilityModel.connection_id == connection_id)
                         .order_by(ConnectionCapabilityModel.capability)
+                    )
+                ).all()
+            )
+            credentials = tuple(
+                (
+                    await session.scalars(
+                        select(EncryptedCredentialModel)
+                        .where(EncryptedCredentialModel.connection_id == connection_id)
+                        .order_by(EncryptedCredentialModel.credential_kind)
                     )
                 ).all()
             )
 
         assert connection is not None
-        assert set(connection.scopes) == {"scope:mail.read", "scope:calendar.read"}
+        assert set(connection.scopes) == set(winner_token.granted_scopes)
         by_capability = {row.capability: row for row in rows}
-        assert by_capability[ConnectionCapability.MAIL_READ.value].status == (
-            CapabilityStatus.ENABLED.value
+        assert by_capability[winner_capability.value].status == (CapabilityStatus.ENABLED.value)
+        assert set(by_capability[winner_capability.value].actual_scopes) == set(
+            winner_token.granted_scopes
         )
-        assert by_capability[ConnectionCapability.CALENDAR_READ.value].status == (
-            CapabilityStatus.ENABLED.value
-        )
-        assert set(by_capability[ConnectionCapability.MAIL_READ.value].actual_scopes) == {
-            "scope:mail.read"
-        }
-        assert set(by_capability[ConnectionCapability.CALENDAR_READ.value].actual_scopes) == {
-            "scope:calendar.read"
-        }
+        assert by_capability[loser_capability.value].status == CapabilityStatus.DISABLED.value
+        assert by_capability[loser_capability.value].actual_scopes == []
         assert by_capability[ConnectionCapability.MAIL_SEND.value].status == (
             CapabilityStatus.DISABLED.value
         )
         assert by_capability[ConnectionCapability.CALENDAR_WRITE.value].status == (
             CapabilityStatus.DISABLED.value
         )
+        by_kind = {row.credential_kind: row for row in credentials}
+        assert set(by_kind) == {"access_token", "refresh_token"}
+        for kind, expected in (
+            ("access_token", winner_token.access_token),
+            ("refresh_token", winner_token.refresh_token),
+        ):
+            assert expected is not None
+            row = by_kind[kind]
+            decrypted = cipher.decrypt(
+                EncryptedValue(row.ciphertext, row.nonce, row.key_version),
+                f"{user_id}:{connection_id}:{kind}".encode("ascii"),
+            ).decode("utf-8")
+            assert decrypted == expected
     finally:
         await session_factory.dispose()
 
