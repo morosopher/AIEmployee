@@ -1,8 +1,9 @@
 """组合认证应用端口、请求依赖与 RFC 9457 Problem Details 映射。"""
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Annotated, cast
+from typing import Annotated, Protocol, cast
 from uuid import uuid4
 
 from fastapi import Depends, Request
@@ -10,6 +11,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ai_employee.application.ports.oauth import (
+    OAuthAccount,
+    OAuthAuthorizationRequest,
+    OAuthProvider,
+    OAuthProviderAdapter,
+    OAuthRevocationResult,
+    OAuthRevocationStatus,
+    OAuthTokenSet,
+)
 from ai_employee.application.use_cases.auth import (
     AuthenticateSessionUseCase,
     AuthenticationRequiredError,
@@ -26,6 +36,7 @@ from ai_employee.application.use_cases.auth import (
     ValidateCsrfUseCase,
 )
 from ai_employee.config import Settings
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import (
     DomainError,
     InternalInvariantError,
@@ -36,9 +47,131 @@ from ai_employee.domain.errors import (
     UserActionRequiredError,
 )
 from ai_employee.domain.identity import AuthenticatedSession
+from ai_employee.integrations.google.oauth import (
+    GOOGLE_SCOPES,
+    GoogleAccount,
+    GoogleTokenResponse,
+    build_authorization_url,
+)
 
 CSRF_COOKIE_NAME = "ai_employee_csrf"
 _LOGGER = logging.getLogger(__name__)
+
+
+class _LegacyGoogleOAuthClient(Protocol):
+    """描述 Task 8 兼容包装器可调用的旧 Google OAuth 客户端形状。"""
+
+    async def exchange_code(self, code: str, verifier: str) -> GoogleTokenResponse:
+        """交换授权码。"""
+        ...
+
+    async def fetch_account(self, access_token: str) -> GoogleAccount:
+        """读取 Google 账户。"""
+        ...
+
+    async def refresh_token(self, refresh_token: str) -> GoogleTokenResponse:
+        """刷新 access token。"""
+        ...
+
+    async def revoke(self, token: str) -> None:
+        """调用 Google 窄撤销端点。"""
+        ...
+
+
+class _GoogleOAuthAdapterCompat:
+    """在 API 组合边界把 M1 Google 客户端适配到供应商中立端口。
+
+    本兼容器只保持 M1 固定只读授权 URL 和 callback 行为；写能力的真实渐进 scope URL、
+    token-info 实际 scope 核对与缺失 scope 处理将在 Task 9 的 Google integration adapter
+    中实现。这里仍声明写能力所需 scope，使旧 URL 回调绝不会误把写能力标为 enabled。
+    """
+
+    provider = OAuthProvider.GOOGLE
+
+    _CAPABILITY_SCOPES: Mapping[ConnectionCapability, frozenset[str]] = {
+        ConnectionCapability.MAIL_READ: frozenset(
+            {"https://www.googleapis.com/auth/gmail.readonly"}
+        ),
+        ConnectionCapability.MAIL_SEND: frozenset({"https://www.googleapis.com/auth/gmail.send"}),
+        ConnectionCapability.CALENDAR_READ: frozenset(
+            {"https://www.googleapis.com/auth/calendar.readonly"}
+        ),
+        ConnectionCapability.CALENDAR_WRITE: frozenset(
+            {"https://www.googleapis.com/auth/calendar.events"}
+        ),
+    }
+
+    def __init__(
+        self,
+        client: _LegacyGoogleOAuthClient,
+        *,
+        client_id: str,
+        redirect_uri: str,
+    ) -> None:
+        """保存旧客户端和非敏感 OAuth 公共配置；client secret 仍只在客户端内部。"""
+        self._client = client
+        self._client_id = client_id
+        self._redirect_uri = redirect_uri
+
+    def scopes_for(
+        self,
+        capabilities: frozenset[ConnectionCapability],
+    ) -> frozenset[str]:
+        """返回身份 scope 与能力所需 scope 的不可变并集。"""
+        scopes = {"openid", "email"}
+        for capability in capabilities:
+            scopes.update(self._CAPABILITY_SCOPES[capability])
+        return frozenset(scopes)
+
+    def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
+        """复用 M1 固定只读 URL，避免在 Task 8 提前实现 Google progressive scope。"""
+        return build_authorization_url(
+            client_id=self._client_id,
+            redirect_uri=self._redirect_uri,
+            state=request.state,
+            code_challenge=request.code_challenge,
+        )
+
+    async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
+        """把旧 token 值对象规范化，并只声明 M1 已实际请求的只读 scope。"""
+        token = await self._client.exchange_code(code, verifier)
+        return OAuthTokenSet(
+            access_token=token.access_token,
+            refresh_token=token.refresh_token,
+            expires_in=token.expires_in,
+            granted_scopes=frozenset(GOOGLE_SCOPES),
+        )
+
+    async def fetch_account(
+        self,
+        token: OAuthTokenSet,
+        *,
+        expected_nonce_hash: bytes | None,
+    ) -> OAuthAccount:
+        """通过旧 userinfo 边界读取 Google subject，并规范化空 tenant 身份。"""
+        del expected_nonce_hash
+        account = await self._client.fetch_account(token.access_token)
+        return OAuthAccount(
+            provider_account_id=account.provider_account_id,
+            account_email=account.email,
+            provider_tenant_id="",
+            account_type="google",
+        )
+
+    async def refresh(self, refresh_token: str) -> OAuthTokenSet:
+        """规范化旧刷新结果；未轮换 refresh token 时保留 ``None``。"""
+        token = await self._client.refresh_token(refresh_token)
+        return OAuthTokenSet(
+            access_token=token.access_token,
+            refresh_token=token.refresh_token,
+            expires_in=token.expires_in,
+            granted_scopes=frozenset(GOOGLE_SCOPES),
+        )
+
+    async def revoke(self, token: str) -> OAuthRevocationResult:
+        """仅在 Google 端点成功返回后报告 ``REVOKED``；网络异常原样传播。"""
+        await self._client.revoke(token)
+        return OAuthRevocationResult(OAuthRevocationStatus.REVOKED)
 
 
 class ProblemDetails(BaseModel):
@@ -114,16 +247,26 @@ class _TransientApiProblem(ApiProblem):
 def _domain_problem(error: DomainError) -> ApiProblem:
     """按公开领域类别创建 RFC 9457 Problem，永不回显领域 message 或 metadata。"""
     if isinstance(error, UserActionRequiredError):
-        return ApiProblem(403, error.error_code, "User action required", "Complete the required action.")
+        return ApiProblem(
+            403, error.error_code, "User action required", "Complete the required action."
+        )
     if isinstance(error, TransientProviderError):
         return _TransientApiProblem(error)
     if isinstance(error, (PermanentProviderError, ModelOutputError)):
-        return ApiProblem(422, error.error_code, "Request cannot be completed", "The request cannot be completed.")
+        return ApiProblem(
+            422, error.error_code, "Request cannot be completed", "The request cannot be completed."
+        )
     if isinstance(error, StateConflictError):
-        return ApiProblem(409, error.error_code, "State conflict", "The request conflicts with current state.")
+        return ApiProblem(
+            409, error.error_code, "State conflict", "The request conflicts with current state."
+        )
     if isinstance(error, InternalInvariantError):
-        return ApiProblem(500, error.error_code, "Internal server error", "An unexpected error occurred.")
-    return ApiProblem(500, "internal_error", "Internal server error", "An unexpected error occurred.")
+        return ApiProblem(
+            500, error.error_code, "Internal server error", "An unexpected error occurred."
+        )
+    return ApiProblem(
+        500, "internal_error", "Internal server error", "An unexpected error occurred."
+    )
 
 
 async def handle_domain_error(request: Request, exception: Exception) -> JSONResponse:
@@ -252,32 +395,48 @@ def get_create_task_use_case(request: Request):
 
 
 def get_connections_use_case(request: Request):
-    """按当前受控 Secret 和数据库工厂装配 Google 连接用例。
+    """在组合边界构造固定 adapter mapping 的供应商中立连接用例。
 
-    加密主密钥与 Google client secret 只在请求装配时从挂载文件读取，不存入应用 state，
-    因而异常页面、调试工具和测试替身都无法通过 state 意外取得敏感原文。
+    集成测试可在 ``app.state.oauth_adapters`` 一次性放入 fake mapping；正常运行时只装配
+    Google 兼容 adapter。mapping 会由用例复制冻结，没有运行时注册或替换入口。真实
+    client secret 仍只在没有注入 fake 且非测试模式时从 Secret 文件读取。
     """
-    from ai_employee.application.use_cases.connections import GoogleConnectionsUseCase
+    from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.infrastructure.security.encryption import AeadCipher
     from ai_employee.integrations.google.oauth import GoogleOAuthClient
 
     settings = get_auth_settings(request)
     cipher = AeadCipher.from_file(settings.app_master_key_file)
-    if settings.app_test_mode:
-        # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端，浏览器连接状态由固定 fake 驱动。
-        from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
-
-        oauth: GoogleOAuthClient | FakeGoogleOAuthClient = FakeGoogleOAuthClient()
+    injected = getattr(request.app.state, "oauth_adapters", None)
+    if injected is not None:
+        adapters = cast(Mapping[str, OAuthProviderAdapter], injected)
     else:
-        secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
-        oauth = GoogleOAuthClient(settings.google_client_id, secret, settings.google_redirect_uri)
-    return GoogleConnectionsUseCase(
+        if settings.app_test_mode:
+            # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端，浏览器连接由固定 fake 驱动。
+            from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
+
+            oauth: _LegacyGoogleOAuthClient = FakeGoogleOAuthClient()
+        else:
+            secret = settings.read_secret_file(
+                settings.google_client_secret_file
+            ).get_secret_value()
+            oauth = GoogleOAuthClient(
+                settings.google_client_id,
+                secret,
+                settings.google_redirect_uri,
+            )
+        adapters = {
+            OAuthProvider.GOOGLE.value: _GoogleOAuthAdapterCompat(
+                oauth,
+                client_id=settings.google_client_id,
+                redirect_uri=settings.google_redirect_uri,
+            )
+        }
+    return ConnectionsUseCase(
         request.app.state.connections_store_factory,
         cipher,
-        oauth,
+        adapters,
         get_auth_clock(request),
-        settings.google_client_id,
-        settings.google_redirect_uri,
     )
 
 

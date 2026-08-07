@@ -68,7 +68,7 @@ def test_application_layer_does_not_import_sqlalchemy_taskiq_or_redis() -> None:
 
 
 def test_application_and_domain_do_not_add_provider_adapters_or_sdks() -> None:
-    """除已排入 Task 8 的 OAuth 兼容债务外，应用/领域层不得新增供应商依赖。"""
+    """应用/领域层不得导入任何供应商 adapter 或 SDK。"""
     forbidden_prefixes = (
         "ai_employee.integrations.google",
         "ai_employee.integrations.microsoft",
@@ -87,8 +87,4 @@ def test_application_and_domain_do_not_add_provider_adapters_or_sdks() -> None:
             if imports:
                 violations[str(path.relative_to(BACKEND_SOURCE))] = imports
 
-    # 现有 Google OAuth 用例将在批准计划 Task 8 改为 provider-neutral OAuth port；Task 7
-    # 不能提前修改该文件夹带后续能力 API。显式锁定唯一旧债务，任何其他导入仍立即失败。
-    assert violations == {
-        "application/use_cases/connections.py": ["ai_employee.integrations.google.oauth"]
-    }
+    assert violations == {}

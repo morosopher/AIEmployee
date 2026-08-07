@@ -86,6 +86,7 @@ def create_app(
         heartbeat_task: asyncio.Task[None] | None = None
         try:
             if app.state.metrics is not None:
+
                 async def refresh_api_sync_age() -> None:
                     """以 API 所有的只读连接池恢复重启后的同步新鲜度。"""
                     await refresh_sync_age_metrics(
@@ -132,6 +133,9 @@ def create_app(
     app.state.auth_token_hasher = hash_token
     app.state.auth_password_verifier = PasswordHasher()
     app.state.connections_store_factory = SqlAlchemyConnectionStoreFactory(session_factory)
+    # 正常运行由 deps 惰性构造固定供应商 mapping；测试可在请求前一次性替换为 fake mapping，
+    # 用例构造后会复制冻结，应用本身不暴露运行时注册或扩展供应商的入口。
+    app.state.oauth_adapters = None
     task_store = SqlAlchemyTaskViewStore(session_factory)
     app.state.create_task_use_case = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory),
@@ -155,6 +159,7 @@ def create_app(
     app.add_exception_handler(DomainError, handle_domain_error)
     app.add_exception_handler(RequestValidationError, handle_request_validation_error)
     app.add_exception_handler(Exception, handle_unexpected_error)
+
     async def real_readiness_probe() -> dict[str, bool]:
         """以最小 SQL 与 Redis PING 检查真实依赖，不返回连接或异常原文。"""
         postgres_healthy = False
@@ -178,10 +183,12 @@ def create_app(
     probe = readiness_probe or real_readiness_probe
     app.include_router(build_system_router(probe))
     if app.state.metrics is not None:
+
         @app.get("/metrics", include_in_schema=False)
         async def metrics():
             """暴露不含用户和内容标签的 Prometheus 指标。"""
             return app.state.metrics.render()
+
     app.include_router(build_auth_router())
     app.include_router(build_connections_router())
     app.include_router(build_privacy_router())

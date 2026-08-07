@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -79,6 +80,29 @@ class OAuthAttemptModel(UUIDPrimaryKeyMixin, Base):
         server_default=text("'[]'::jsonb"),
     )
     oidc_nonce_hash: Mapped[bytes | None] = mapped_column(LargeBinary(32), nullable=True)
+    # 断开连接时以事务内时间戳标记所有同用户/供应商的首次 state；即使 state 已消费，
+    # callback 保存阶段仍会重新锁定并检查该事实，防止旧授权复活已断开的连接。
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 渐进授权必须绑定发起时的连接与授权代际；首次连接保持 NULL，避免把新账户
+    # 的 state 误当作某个已有连接的回调。两列由配对检查约束共同维护。
+    target_connection_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    target_authorization_generation: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["target_connection_id", "user_id"],
+            ["oauth_connections.id", "oauth_connections.user_id"],
+            name="fk_oauth_attempts_target_connection_user",
+            ondelete="CASCADE",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "(target_connection_id IS NULL AND target_authorization_generation IS NULL) OR "
+            "(target_connection_id IS NOT NULL AND target_authorization_generation IS NOT NULL "
+            "AND target_authorization_generation > 0)",
+            name="ck_oauth_attempts_target_generation_pair",
+        ),
+    )
 
 
 class OAuthConnectionModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -105,6 +129,10 @@ class OAuthConnectionModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "AND account_type IN ('personal', 'work_school'))",
             name="ck_oauth_connections_microsoft_identity",
         ),
+        CheckConstraint(
+            "authorization_generation >= 0",
+            name="ck_oauth_connections_authorization_generation_nonnegative",
+        ),
     )
     user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
@@ -127,6 +155,10 @@ class OAuthConnectionModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     scopes: Mapped[list[str]] = mapped_column(JSONB(), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # 每次渐进授权、能力关闭或断开都会递增；旧 OAuth state 只能匹配创建时的代际。
+    authorization_generation: Mapped[int] = mapped_column(
+        BigInteger(), nullable=False, default=0, server_default=text("0")
+    )
 
 
 class ConnectionCapabilityModel(UUIDPrimaryKeyMixin, Base):

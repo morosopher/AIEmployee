@@ -30,7 +30,7 @@ from ai_employee.infrastructure.testing.test_support import (
     TestSupportFixtureService as SupportFixtureService,
 )
 
-M2_REVISION = "20260806_0011"
+M2_REVISION = "20260808_0015"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
@@ -908,7 +908,7 @@ def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
     cursors = {row.resource_kind: (row.id, row.scope_key, row.cursor) for row in result["cursors"]}
     assert cursors == {
         "calendar": (calendar_cursor_id, "primary", legacy_calendar_cursor),
-        "gmail": (gmail_cursor_id, "mailbox", "gmail-history-42"),
+        "mail": (gmail_cursor_id, "mailbox", "gmail-history-42"),
     }
     user_row = result["user"]
     assert user_row.working_hours == DEFAULT_WORKING_HOURS

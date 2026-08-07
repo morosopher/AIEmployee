@@ -192,6 +192,7 @@ def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
                         "ON attribute.attrelid = table_info.oid "
                         "AND attribute.attnum = key_info.attnum "
                         "WHERE constraint_info.conname IN ("
+                        "'fk_oauth_attempts_target_connection_user', "
                         "'uq_oauth_connections_id_user_id', "
                         "'uq_sync_cursors_connection_resource', "
                         "'uq_sync_cursors_connection_resource_scope', "
@@ -221,6 +222,7 @@ def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]
                         "SELECT conname, condeferrable, condeferred "
                         "FROM pg_catalog.pg_constraint "
                         "WHERE conname IN ("
+                        "'fk_oauth_attempts_target_connection_user', "
                         "'fk_connection_capabilities_connection_user', "
                         "'fk_provider_calendars_connection_user', "
                         "'fk_users_default_mail_connection_id_user_id', "
@@ -233,6 +235,63 @@ def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]
             await engine.dispose()
 
     return asyncio.run(read_modes())
+
+
+def _oauth_attempt_binding_columns(
+    database_url: URL,
+) -> dict[tuple[str, str], tuple[str, str, str | None]]:
+    """读取 OAuth attempt 目标绑定与连接授权代际列的类型、可空性和默认值。"""
+
+    async def read_columns() -> dict[tuple[str, str], tuple[str, str, str | None]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT table_name, column_name, data_type, is_nullable, column_default "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND ("
+                        "(table_name = 'oauth_attempts' AND column_name IN ("
+                        "'target_connection_id', 'target_authorization_generation', "
+                        "'invalidated_at')) OR "
+                        "(table_name = 'oauth_connections' "
+                        "AND column_name = 'authorization_generation'))"
+                    )
+                )
+                return {
+                    (row[0], row[1]): (
+                        str(row[2]),
+                        str(row[3]),
+                        row[4] if isinstance(row[4], str) else None,
+                    )
+                    for row in result
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_columns())
+
+
+def _oauth_attempt_binding_check_names(database_url: URL) -> set[str]:
+    """读取 OAuth 目标/代际配对与非负约束，防止半绑定持久事实。"""
+
+    async def read_names() -> set[str]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT conname FROM pg_catalog.pg_constraint "
+                        "WHERE conname IN ("
+                        "'ck_oauth_attempts_target_generation_pair', "
+                        "'ck_oauth_connections_authorization_generation_nonnegative')"
+                    )
+                )
+                return {str(row[0]) for row in result}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_names())
 
 
 def _m2_owned_user_columns(database_url: URL) -> dict[str, str]:
@@ -416,7 +475,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260806_0013"}
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0015"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -442,6 +501,10 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "fk_tool_executions_step_id_task_id": (True, True),
     }
     assert _m2_constraint_columns(empty_migration_database) == {
+        "fk_oauth_attempts_target_connection_user": (
+            "target_connection_id",
+            "user_id",
+        ),
         "fk_users_default_calendar_connection_id_user_id": (
             "default_calendar_connection_id",
             "id",
@@ -474,10 +537,30 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         ),
     }
     assert _m2_ownership_guard_modes(empty_migration_database) == {
+        "fk_oauth_attempts_target_connection_user": (True, True),
         "fk_connection_capabilities_connection_user": (True, True),
         "fk_provider_calendars_connection_user": (True, True),
         "fk_users_default_calendar_connection_id_user_id": (True, True),
         "fk_users_default_mail_connection_id_user_id": (True, True),
+    }
+    binding_columns = _oauth_attempt_binding_columns(empty_migration_database)
+    assert binding_columns[("oauth_attempts", "target_connection_id")] == ("uuid", "YES", None)
+    assert binding_columns[("oauth_attempts", "target_authorization_generation")] == (
+        "bigint",
+        "YES",
+        None,
+    )
+    assert binding_columns[("oauth_attempts", "invalidated_at")] == (
+        "timestamp with time zone",
+        "YES",
+        None,
+    )
+    generation_column = binding_columns[("oauth_connections", "authorization_generation")]
+    assert generation_column[:2] == ("bigint", "NO")
+    assert generation_column[2] is not None and generation_column[2].startswith("0")
+    assert _oauth_attempt_binding_check_names(empty_migration_database) == {
+        "ck_oauth_attempts_target_generation_pair",
+        "ck_oauth_connections_authorization_generation_nonnegative",
     }
     assert _m2_owned_user_columns(empty_migration_database) == {
         "connection_capabilities": "NO",

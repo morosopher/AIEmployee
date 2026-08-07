@@ -1,49 +1,287 @@
-"""实现 Google OAuth 连接、断开与手动同步的应用用例。"""
+"""编排供应商中立 OAuth、连接能力、断开与手动同步。"""
 
 import base64
+import binascii
 import hashlib
 import secrets
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Protocol
 from uuid import UUID, uuid4
 
-import httpx
-from cryptography.exceptions import InvalidTag
-
-from ai_employee.application.use_cases.tasks import CreateTaskBatchItem
-from ai_employee.infrastructure.db.repositories.connections import ConnectionStore
-from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
-from ai_employee.integrations.google.oauth import (
-    GOOGLE_SCOPES,
-    GoogleAccount,
-    GoogleTokenResponse,
-    build_authorization_url,
+from ai_employee.application.ports.encryption import EncryptedValue, Encryption
+from ai_employee.application.ports.oauth import (
+    OAuthAccount,
+    OAuthAuthorizationRequest,
+    OAuthProvider,
+    OAuthProviderAdapter,
+    OAuthRevocationResult,
+    OAuthRevocationStatus,
+    OAuthTokenSet,
 )
+from ai_employee.application.use_cases.tasks import CreateTaskBatchItem
+from ai_employee.domain.connections import (
+    CapabilityStatus,
+    ConnectionCapability,
+    ConnectionCapabilityDependencyConflict,
+    ConnectionStatus,
+    validate_capability_disable,
+    validate_capability_enable,
+)
+from ai_employee.domain.errors import StateConflictError
 
 OAUTH_ATTEMPT_TTL = timedelta(minutes=10)
+_READ_CAPABILITIES = frozenset({ConnectionCapability.MAIL_READ, ConnectionCapability.CALENDAR_READ})
 
 
 class Clock(Protocol):
     """定义连接流程所需的显式 UTC 时钟，测试可注入可控实现。"""
 
-    def now(self) -> datetime: ...
+    def now(self) -> datetime:
+        """返回带时区 UTC 时间。"""
+        ...
 
 
-class GoogleOAuthPort(Protocol):
-    """定义连接用例所需 OAuth 行为，使测试模式可注入绝不联网的 fake。"""
+@dataclass(frozen=True, slots=True)
+class StoredConnection:
+    """应用层可读取的连接投影，不包含 ORM 对象或凭据。"""
 
-    async def exchange_code(self, code: str, verifier: str) -> GoogleTokenResponse: ...
-    async def fetch_account(self, access_token: str) -> GoogleAccount: ...
-    async def refresh_token(self, refresh_token: str) -> GoogleTokenResponse: ...
-    async def revoke(self, token: str) -> None: ...
+    id: UUID
+    user_id: UUID
+    provider: str
+    provider_account_id: str
+    provider_tenant_id: str
+    account_type: str
+    account_email: str
+    scopes: tuple[str, ...]
+    status: str
+    last_error_code: str | None
+    # 仅渐进授权使用的单调代际；首次连接和旧测试投影默认为零。
+    authorization_generation: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCapability:
+    """单项连接能力的规范化持久状态。"""
+
+    capability: ConnectionCapability
+    status: CapabilityStatus
+    actual_scopes: tuple[str, ...]
+    last_verified_at: datetime | None
+    last_error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredProviderCalendar:
+    """供应商日历目录的显式公开投影，不包含 cursor 或原始 JSON。"""
+
+    id: str
+    name: str
+    timezone: str
+    is_primary: bool
+    access_role: str
+    can_write: bool
+    provider_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionCapabilitySnapshot:
+    """一个连接的能力与日历目录快照。"""
+
+    connection_id: UUID
+    provider: str
+    capabilities: tuple[StoredCapability, ...]
+    provider_calendars: tuple[StoredProviderCalendar, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumedOAuthAttempt:
+    """一次性 state 消费后可交给 OAuth callback 的最小事实。"""
+
+    id: UUID
+    user_id: UUID
+    provider: str
+    requested_capabilities: frozenset[ConnectionCapability]
+    verifier: EncryptedValue
+    oidc_nonce_hash: bytes | None
+    target_connection_id: UUID | None = None
+    target_authorization_generation: int | None = None
+
+
+class ConnectionStore(Protocol):
+    """限定连接用例可使用的持久化操作，并要求每项查询显式带用户。"""
+
+    async def create_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        user_id: UUID,
+        provider: str,
+        state_hash: bytes,
+        verifier: EncryptedValue,
+        requested_capabilities: frozenset[ConnectionCapability],
+        oidc_nonce_hash: bytes | None,
+        expires_at: datetime,
+        created_at: datetime,
+        target_connection_id: UUID | None = None,
+        target_authorization_generation: int | None = None,
+    ) -> UUID:
+        """保存不含明文 state、verifier 或 nonce 的 OAuth 尝试。"""
+        ...
+
+    async def consume_attempt(
+        self,
+        *,
+        state_hash: bytes,
+        now: datetime,
+    ) -> ConsumedOAuthAttempt | None:
+        """锁定并一次性消费有效 state。"""
+        ...
+
+    async def validate_unbound_attempt_for_callback(
+        self,
+        *,
+        attempt_id: UUID,
+        user_id: UUID,
+        provider: str,
+    ) -> None:
+        """在保存首次 OAuth 结果前重新锁定并核对持久失效事实。"""
+        ...
+
+    async def get_connection_for_update(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> StoredConnection | None:
+        """在当前事务内锁定目标连接，供授权代际与能力快照保持一致。"""
+        ...
+
+    async def ensure_connection(
+        self,
+        *,
+        user_id: UUID,
+        provider: str,
+        provider_account_id: str,
+        provider_tenant_id: str,
+        account_type: str,
+        account_email: str,
+        scopes: frozenset[str],
+    ) -> UUID:
+        """按规范账户键 upsert；tenant/type 不一致时拒绝，并确保四项能力行存在。"""
+        ...
+
+    async def save_connection_tokens(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        access_token: EncryptedValue,
+        refresh_token: EncryptedValue | None,
+        expires_at: datetime,
+    ) -> None:
+        """仅为当前用户 connected 连接保存 token；refresh 为 ``None`` 时保留既有密文。"""
+        ...
+
+    async def save_capability_state(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        capability: ConnectionCapability,
+        status: CapabilityStatus,
+        actual_scopes: frozenset[str],
+        last_verified_at: datetime | None,
+        last_error_code: str | None,
+    ) -> None:
+        """以替换语义保存一项能力的实际 scope 与状态。"""
+        ...
+
+    async def set_capabilities_authorizing(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        capabilities: frozenset[ConnectionCapability],
+    ) -> int:
+        """把本次授权并集置为 authorizing，并原子递增授权代际。"""
+        ...
+
+    async def ensure_bound_connection_for_callback(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        provider: str,
+        provider_account_id: str,
+        provider_tenant_id: str,
+        account_type: str,
+    ) -> UUID:
+        """锁定并核对渐进 OAuth 的冻结目标，失败时不得产生任何 token 写入。"""
+        ...
+
+    async def disable_capability(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        capability: ConnectionCapability,
+    ) -> None:
+        """仅本地关闭一项能力；Task 25 再补未认领动作失效。"""
+        ...
+
+    async def get_enabled_capabilities(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> frozenset[ConnectionCapability] | None:
+        """返回当前 enabled 集合；连接不存在或跨用户时返回 ``None``。"""
+        ...
+
+    async def get_capability_snapshot(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> ConnectionCapabilitySnapshot | None:
+        """返回用户范围能力/日历投影。"""
+        ...
+
+    async def list_connections(self, *, user_id: UUID) -> tuple[StoredConnection, ...]:
+        """列出当前用户连接。"""
+        ...
+
+    async def get_connection(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> StoredConnection | None:
+        """按用户与连接主键读取一行。"""
+        ...
+
+    async def disconnect(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        invalidated_at: datetime,
+    ) -> tuple[bool, EncryptedValue | None]:
+        """标记首次 state 失效、删除本地凭据并返回待尽力撤销的 refresh token 密文。"""
+        ...
 
 
 class ConnectionStoreFactory(Protocol):
-    """为一次连接用例提供事务边界，不让应用层直接依赖 ORM。"""
+    """为一次连接用例提供事务边界，不让路由或用例接触 ORM。"""
 
-    def __call__(self) -> AbstractAsyncContextManager[ConnectionStore]: ...
+    def __call__(self) -> AbstractAsyncContextManager[ConnectionStore]:
+        """创建自动提交或回滚的存储上下文。"""
+        ...
 
 
 class TaskCreator(Protocol):
@@ -54,7 +292,9 @@ class TaskCreator(Protocol):
         *,
         user_id: UUID,
         items: tuple[CreateTaskBatchItem, ...],
-    ) -> tuple["CreatedTask", ...]: ...
+    ) -> tuple["CreatedTask", ...]:
+        """原子创建邮件和日历同步任务。"""
+        ...
 
 
 class CreatedTask(Protocol):
@@ -63,6 +303,7 @@ class CreatedTask(Protocol):
     @property
     def task_id(self) -> UUID:
         """返回任务创建后可安全公开的稳定 UUID。"""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,25 +320,111 @@ class ConnectionSummary:
 
 @dataclass(frozen=True, slots=True)
 class OAuthStartResult:
-    """返回浏览器重定向用 URL，不把 state 写入 JSON 响应以外的持久化边界。"""
+    """返回浏览器重定向用 URL，不单独公开一次性 state。"""
 
     authorization_url: str
 
 
 @dataclass(frozen=True, slots=True)
+class CapabilityEnableResult:
+    """返回渐进授权 URL 与确定性排序后的完整能力并集。"""
+
+    authorization_url: str
+    requested_capabilities: tuple[ConnectionCapability, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityDisableResult:
+    """返回本地关闭后的精确能力状态。"""
+
+    capability: ConnectionCapability
+    status: CapabilityStatus
+
+
+@dataclass(frozen=True, slots=True)
 class ManualSyncResult:
-    """包含 Gmail 与 Calendar 各一个稳定任务标识的异步接受结果。"""
+    """包含邮件与 Calendar 各一个稳定任务标识的异步接受结果。"""
 
     gmail_task_id: UUID
     calendar_task_id: UUID
 
 
 class OAuthStateRejectedError(Exception):
-    """表示 state 不存在、已消费或已过期，统一映射为不泄露细节的 400。"""
+    """表示 state 格式非法、不存在、已消费或已过期，统一映射为不泄露细节的 400。"""
 
 
 class ConnectionNotFoundError(Exception):
     """表示指定连接不存在或不属于当前认证用户。"""
+
+
+class ConnectionIdentityConflictError(StateConflictError):
+    """表示同一规范供应商账户键试图改绑不可变 tenant 或账户类型。"""
+
+    def __init__(self) -> None:
+        """返回不含供应商 ID、租户或邮箱的稳定冲突错误。"""
+        super().__init__(
+            error_code="connection_identity_conflict",
+            message="connection identity conflicts with the normalized provider account key",
+        )
+
+
+class ConnectionCredentialOwnershipError(StateConflictError):
+    """表示 token 写入目标不是当前用户仍处于 connected 的连接。"""
+
+    def __init__(self) -> None:
+        """返回不区分跨用户、缺失或断开状态的稳定安全错误。"""
+        super().__init__(
+            error_code="connection_credential_ownership_conflict",
+            message="connection credential ownership cannot be verified",
+        )
+
+
+class UnsupportedConnectionProviderError(StateConflictError):
+    """表示调用方请求了组合根未固定装配的供应商。"""
+
+    def __init__(self) -> None:
+        """使用不回显原始 provider 的稳定错误码 fail closed。"""
+        super().__init__(
+            error_code="connection_provider_unsupported",
+            message="connection provider is not supported",
+        )
+
+
+class OAuthAttemptInvalidatedError(StateConflictError):
+    """表示渐进 OAuth state 已被关闭、断开或新授权代际安全失效。"""
+
+    def __init__(self) -> None:
+        """不回显连接、账户或供应商身份，统一收敛为稳定冲突码。"""
+        super().__init__(
+            error_code="oauth_attempt_invalidated",
+            message="oauth authorization attempt is no longer valid",
+        )
+
+
+def _oauth_state_hash(state: str) -> bytes:
+    """严格校验本应用生成的无 padding Base64URL state 并返回其摘要。
+
+    非 ASCII、非法字符、padding、错误长度或非规范编码都在访问数据库前统一收敛为
+    ``OAuthStateRejectedError``，避免编码异常变成 500，也避免把任意字符串当作 OAuth
+    CSRF 事实继续消费。
+    """
+    try:
+        encoded = state.encode("ascii")
+    except UnicodeEncodeError:
+        raise OAuthStateRejectedError from None
+    if len(encoded) != 43:
+        raise OAuthStateRejectedError
+    try:
+        decoded = base64.b64decode(
+            encoded + b"=" * (-len(encoded) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        raise OAuthStateRejectedError from None
+    if len(decoded) != 32 or _b64url(decoded) != state:
+        raise OAuthStateRejectedError
+    return hashlib.sha256(encoded).digest()
 
 
 def _utc_now(clock: Clock) -> datetime:
@@ -109,96 +436,295 @@ def _utc_now(clock: Clock) -> datetime:
 
 
 def _b64url(value: bytes) -> str:
-    """按 PKCE 规范输出无填充 Base64URL 文本。"""
+    """按 PKCE/OIDC 规范输出无填充 Base64URL 文本。"""
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-class GoogleConnectionsUseCase:
-    """协调记录绑定 AEAD、数据库事务和可替换 Google OAuth 客户端。"""
+def _sorted_capabilities(
+    capabilities: frozenset[ConnectionCapability],
+) -> tuple[ConnectionCapability, ...]:
+    """按稳定枚举值排序能力，保证 API、JSON 与测试输出确定。"""
+    return tuple(sorted(capabilities, key=lambda item: item.value))
+
+
+class ConnectionsUseCase:
+    """协调固定 OAuth adapter mapping、AEAD、能力规则与数据库事务。"""
 
     def __init__(
         self,
         stores: ConnectionStoreFactory,
-        cipher: AeadCipher,
-        oauth: GoogleOAuthPort,
+        cipher: Encryption,
+        adapters: Mapping[str, OAuthProviderAdapter],
         clock: Clock,
-        client_id: str,
-        redirect_uri: str,
     ) -> None:
-        """注入事务、加密、供应商和运行时配置；secret 仅保留在 OAuth 适配器中。"""
+        """复制并冻结 adapter mapping，阻止运行时注册新供应商或替换数据流向。
+
+        Args:
+            stores: 每次调用独占的连接事务工厂。
+            cipher: 对 PKCE verifier 与 OAuth token 执行记录绑定 AEAD 的端口。
+            adapters: 组合根一次性提供的受支持供应商 mapping。
+            clock: 返回显式 UTC 的可替换时钟。
+
+        Raises:
+            ValueError: mapping 含未知供应商、键值不一致或重复规范化键。
+        """
+        normalized: dict[str, OAuthProviderAdapter] = {}
+        for raw_provider, adapter in adapters.items():
+            try:
+                provider = OAuthProvider(raw_provider).value
+                adapter_provider = OAuthProvider(adapter.provider).value
+            except ValueError as error:
+                raise ValueError(
+                    "OAuth adapter mapping contains an unsupported provider"
+                ) from error
+            if provider != adapter_provider or provider in normalized:
+                raise ValueError("OAuth adapter mapping key does not match adapter provider")
+            normalized[provider] = adapter
         self._stores = stores
         self._cipher = cipher
-        self._oauth = oauth
+        self._adapters = MappingProxyType(normalized)
         self._clock = clock
-        self._client_id = client_id
-        self._redirect_uri = redirect_uri
 
-    async def start(self, *, user_id: UUID) -> OAuthStartResult:
-        """生成 32 字节 state 与 64 字节 verifier，持久化加密 verifier 并返回授权 URL。"""
-        now = _utc_now(self._clock)
-        state = _b64url(secrets.token_bytes(32))
-        verifier = _b64url(secrets.token_bytes(64))
-        state_hash = hashlib.sha256(state.encode("ascii")).digest()
-        # 预生成 attempt UUID 是 AAD 绑定所必需的，避免把 verifier 加密到无归属的临时 AAD。
-        attempt_id = uuid4()
-        verifier_value = self._cipher.encrypt(
-            verifier.encode("ascii"), self._aad(user_id, attempt_id, "pkce_verifier")
-        )
-        async with self._stores() as store:
-            await store.create_attempt(
-                attempt_id=attempt_id,
-                user_id=user_id,
-                state_hash=state_hash,
-                verifier=verifier_value,
-                expires_at=now + OAUTH_ATTEMPT_TTL,
-                created_at=now,
-            )
-        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-        return OAuthStartResult(
-            build_authorization_url(
-                client_id=self._client_id,
-                redirect_uri=self._redirect_uri,
-                state=state,
-                code_challenge=challenge,
-            )
-        )
+    def _adapter_for(self, provider: str | OAuthProvider) -> OAuthProviderAdapter:
+        """解析固定 adapter；未知或未装配供应商始终拒绝。"""
+        try:
+            normalized = OAuthProvider(provider).value
+        except ValueError:
+            raise UnsupportedConnectionProviderError from None
+        adapter = self._adapters.get(normalized)
+        if adapter is None:
+            raise UnsupportedConnectionProviderError
+        return adapter
 
     @staticmethod
     def _aad(user_id: UUID, record_id: UUID, secret_kind: str) -> bytes:
         """生成固定 ``user_id:record_id:secret_kind`` AAD，禁止跨记录替换密文。"""
         return f"{user_id}:{record_id}:{secret_kind}".encode("ascii")
 
-    async def callback(self, *, code: str, state: str) -> UUID:
-        """原子消费 state，交换授权码并保存加密 Token 与初始同步游标。
+    def _build_attempt(
+        self,
+        *,
+        provider: str | OAuthProvider,
+        requested_capabilities: frozenset[ConnectionCapability],
+    ) -> tuple[
+        UUID,
+        str,
+        bytes,
+        bytes,
+        OAuthAuthorizationRequest,
+        OAuthProviderAdapter,
+    ]:
+        """生成一次授权的随机值、摘要、密文与类型化适配器请求。
 
-        state 在供应商 I/O 前已消费，避免慢速或失败回调被攻击者重放；失败后用户必须重新
-        发起授权流程，优先保证授权码与 verifier 的一次性安全语义。
+        明文 state 只进入 URL；verifier 只进入 AEAD；OIDC nonce 原文只进入适配器请求，
+        数据库分别保存固定长度 state/nonce 摘要，避免日志或通用响应接触这些值。
         """
+        adapter = self._adapter_for(provider)
+        state = _b64url(secrets.token_bytes(32))
+        verifier = _b64url(secrets.token_bytes(64))
+        oidc_nonce = _b64url(secrets.token_bytes(32))
+        attempt_id = uuid4()
+        requested_scopes = adapter.scopes_for(requested_capabilities)
+        request = OAuthAuthorizationRequest(
+            state=state,
+            code_challenge=_b64url(hashlib.sha256(verifier.encode("ascii")).digest()),
+            requested_scopes=requested_scopes,
+            oidc_nonce=oidc_nonce,
+        )
+        return (
+            attempt_id,
+            verifier,
+            hashlib.sha256(state.encode("ascii")).digest(),
+            hashlib.sha256(oidc_nonce.encode("ascii")).digest(),
+            request,
+            adapter,
+        )
+
+    async def _persist_attempt(
+        self,
+        *,
+        store: ConnectionStore,
+        user_id: UUID,
+        provider: str | OAuthProvider,
+        requested_capabilities: frozenset[ConnectionCapability],
+        now: datetime,
+        target_connection_id: UUID | None = None,
+        target_authorization_generation: int | None = None,
+    ) -> str:
+        """在调用方事务内持久化授权尝试并返回适配器生成的 URL。"""
+        (
+            attempt_id,
+            verifier,
+            state_hash,
+            oidc_nonce_hash,
+            request,
+            adapter,
+        ) = self._build_attempt(
+            provider=provider,
+            requested_capabilities=requested_capabilities,
+        )
+        verifier_value = self._cipher.encrypt(
+            verifier.encode("ascii"),
+            self._aad(user_id, attempt_id, "pkce_verifier"),
+        )
+        await store.create_attempt(
+            attempt_id=attempt_id,
+            user_id=user_id,
+            provider=OAuthProvider(provider).value,
+            state_hash=state_hash,
+            verifier=verifier_value,
+            requested_capabilities=requested_capabilities,
+            oidc_nonce_hash=oidc_nonce_hash,
+            expires_at=now + OAUTH_ATTEMPT_TTL,
+            created_at=now,
+            target_connection_id=target_connection_id,
+            target_authorization_generation=target_authorization_generation,
+        )
+        return adapter.build_authorization_url(request)
+
+    async def start(
+        self,
+        *,
+        user_id: UUID,
+        provider: str | OAuthProvider,
+        capabilities: frozenset[ConnectionCapability],
+    ) -> OAuthStartResult:
+        """为调用方显式选择的非空读取能力集合发起首次 OAuth。"""
+        if not capabilities or not capabilities.issubset(_READ_CAPABILITIES):
+            raise ConnectionCapabilityDependencyConflict
         now = _utc_now(self._clock)
-        state_hash = hashlib.sha256(state.encode("ascii")).digest()
+        async with self._stores() as store:
+            authorization_url = await self._persist_attempt(
+                store=store,
+                user_id=user_id,
+                provider=provider,
+                requested_capabilities=frozenset(capabilities),
+                now=now,
+            )
+        return OAuthStartResult(authorization_url)
+
+    async def start_capability_enable(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        capability: ConnectionCapability,
+    ) -> CapabilityEnableResult:
+        """发起单项能力渐进授权，并请求依赖闭包与全部当前 enabled 能力。"""
+        now = _utc_now(self._clock)
+        async with self._stores() as store:
+            # 先锁连接再读取 enabled 快照；否则断开/关闭与授权发起可能观察到不同代际。
+            connection = await store.get_connection_for_update(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            enabled = await store.get_enabled_capabilities(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if (
+                connection is None
+                or enabled is None
+                or connection.status != ConnectionStatus.CONNECTED.value
+            ):
+                raise ConnectionNotFoundError
+            requested = validate_capability_enable(capability, enabled)
+            generation = await store.set_capabilities_authorizing(
+                user_id=user_id,
+                connection_id=connection_id,
+                capabilities=requested,
+            )
+            authorization_url = await self._persist_attempt(
+                store=store,
+                user_id=user_id,
+                provider=connection.provider,
+                requested_capabilities=requested,
+                now=now,
+                target_connection_id=connection.id,
+                target_authorization_generation=generation,
+            )
+        return CapabilityEnableResult(authorization_url, _sorted_capabilities(requested))
+
+    async def callback(self, *, code: str, state: str) -> UUID:
+        """一次性消费 state，按尝试记录选择 adapter，并保存实际 scope 与能力状态。"""
+        now = _utc_now(self._clock)
+        state_hash = _oauth_state_hash(state)
         async with self._stores() as store:
             consumed = await store.consume_attempt(state_hash=state_hash, now=now)
         if consumed is None:
             raise OAuthStateRejectedError
-        attempt_id, user_id, encrypted_verifier = consumed
-        verifier = self._cipher.decrypt(
-            encrypted_verifier, self._aad(user_id, attempt_id, "pkce_verifier")
-        ).decode("ascii")
-        token = await self._oauth.exchange_code(code, verifier)
-        account = await self._oauth.fetch_account(token.access_token)
-        return await self._save_tokens(user_id=user_id, account=account, token=token, now=now)
 
-    async def _save_tokens(
-        self, *, user_id: UUID, account: GoogleAccount, token: GoogleTokenResponse, now: datetime
+        adapter = self._adapter_for(consumed.provider)
+        verifier = self._cipher.decrypt(
+            consumed.verifier,
+            self._aad(consumed.user_id, consumed.id, "pkce_verifier"),
+        ).decode("ascii")
+        token = await adapter.exchange_code(code=code, verifier=verifier)
+        account = await adapter.fetch_account(
+            token,
+            expected_nonce_hash=consumed.oidc_nonce_hash,
+        )
+        return await self._save_tokens_and_capabilities(
+            user_id=consumed.user_id,
+            attempt_id=consumed.id,
+            provider=consumed.provider,
+            requested_capabilities=consumed.requested_capabilities,
+            target_connection_id=consumed.target_connection_id,
+            target_authorization_generation=consumed.target_authorization_generation,
+            account=account,
+            token=token,
+            now=now,
+            adapter=adapter,
+        )
+
+    async def _save_tokens_and_capabilities(
+        self,
+        *,
+        user_id: UUID,
+        attempt_id: UUID,
+        provider: str,
+        requested_capabilities: frozenset[ConnectionCapability],
+        target_connection_id: UUID | None,
+        target_authorization_generation: int | None,
+        account: OAuthAccount,
+        token: OAuthTokenSet,
+        now: datetime,
+        adapter: OAuthProviderAdapter,
     ) -> UUID:
-        """写入连接并用连接主键作为访问与刷新 token 的 AAD 归属记录。"""
+        """保存规范账户、token 与逐能力实际 scope 验证结果。"""
         async with self._stores() as store:
-            connection_id = await store.ensure_connection(
-                user_id=user_id,
-                provider_account_id=account.provider_account_id,
-                account_email=account.email,
-                scopes=GOOGLE_SCOPES,
-            )
+            if target_connection_id is None:
+                # 首次 OAuth 没有既有连接目标，沿用规范账户键 upsert。
+                if target_authorization_generation is not None:
+                    raise OAuthAttemptInvalidatedError
+                # 网络交换在事务外执行；这里必须重新锁定 attempt，防止断开事务在此期间
+                # 提交后仍让旧 callback 通过规范账户 upsert 复活断开的连接。
+                await store.validate_unbound_attempt_for_callback(
+                    attempt_id=attempt_id,
+                    user_id=user_id,
+                    provider=provider,
+                )
+                connection_id = await store.ensure_connection(
+                    user_id=user_id,
+                    provider=provider,
+                    provider_account_id=account.provider_account_id,
+                    provider_tenant_id=account.provider_tenant_id,
+                    account_type=account.account_type,
+                    account_email=account.account_email,
+                    scopes=token.granted_scopes,
+                )
+            else:
+                if target_authorization_generation is None:
+                    raise OAuthAttemptInvalidatedError
+                connection_id = await store.ensure_bound_connection_for_callback(
+                    user_id=user_id,
+                    connection_id=target_connection_id,
+                    authorization_generation=target_authorization_generation,
+                    provider=provider,
+                    provider_account_id=account.provider_account_id,
+                    provider_tenant_id=account.provider_tenant_id,
+                    account_type=account.account_type,
+                )
             access = self._cipher.encrypt(
                 token.access_token.encode("utf-8"),
                 self._aad(user_id, connection_id, "access_token"),
@@ -218,6 +744,23 @@ class GoogleConnectionsUseCase:
                 refresh_token=refresh,
                 expires_at=now + timedelta(seconds=token.expires_in),
             )
+            for capability in _sorted_capabilities(requested_capabilities):
+                # 回调核对必须复用领域依赖闭包；仅有粗粒度写 scope 不能证明回复读取或
+                # 日程 ETag/写后核对所需的读取能力仍然存在。
+                required_capabilities = validate_capability_enable(capability, frozenset())
+                required_scopes = adapter.scopes_for(required_capabilities)
+                enabled = required_scopes.issubset(token.granted_scopes)
+                await store.save_capability_state(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    capability=capability,
+                    status=(
+                        CapabilityStatus.ENABLED if enabled else CapabilityStatus.ACTION_REQUIRED
+                    ),
+                    actual_scopes=token.granted_scopes,
+                    last_verified_at=now,
+                    last_error_code=None if enabled else "connection_scope_missing",
+                )
         return connection_id
 
     async def list(self, *, user_id: UUID) -> tuple[ConnectionSummary, ...]:
@@ -229,34 +772,102 @@ class GoogleConnectionsUseCase:
                 row.id,
                 row.provider,
                 row.account_email,
-                tuple(row.scopes),
+                row.scopes,
                 row.status,
                 row.last_error_code,
             )
             for row in rows
         )
 
-    async def disconnect(self, *, user_id: UUID, connection_id: UUID) -> None:
-        """先删除本地密文并标记断开，再尽力撤销远端刷新 token。"""
+    async def get_capabilities(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> ConnectionCapabilitySnapshot:
+        """返回当前用户连接的能力与日历目录；跨用户与缺失统一为 404 语义。"""
         async with self._stores() as store:
-            found, refresh = await store.disconnect(user_id=user_id, connection_id=connection_id)
+            snapshot = await store.get_capability_snapshot(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+        if snapshot is None:
+            raise ConnectionNotFoundError
+        return snapshot
+
+    async def disable_capability(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        capability: ConnectionCapability,
+    ) -> CapabilityDisableResult:
+        """验证依赖后只修改本地状态，不提前实现 Task 25 动作取消。"""
+        async with self._stores() as store:
+            enabled = await store.get_enabled_capabilities(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if enabled is None:
+                raise ConnectionNotFoundError
+            validate_capability_disable(capability, enabled)
+            await store.disable_capability(
+                user_id=user_id,
+                connection_id=connection_id,
+                capability=capability,
+            )
+        return CapabilityDisableResult(capability, CapabilityStatus.DISABLED)
+
+    async def disconnect(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> OAuthRevocationResult | None:
+        """先删除本地密文并断开，再调用固定 adapter 撤销远端 refresh token。
+
+        供应商网络/分类异常会继续向上传递，不能伪装为撤销成功；即使远端失败，本地提交也
+        不会回滚恢复凭据。供应商明确不支持窄撤销时返回 ``UNSUPPORTED`` 供后续审计使用。
+        """
+        now = _utc_now(self._clock)
+        async with self._stores() as store:
+            connection = await store.get_connection(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if connection is None:
+                raise ConnectionNotFoundError
+            found, refresh = await store.disconnect(
+                user_id=user_id,
+                connection_id=connection_id,
+                invalidated_at=now,
+            )
         if not found:
             raise ConnectionNotFoundError
-        if refresh is None:
-            return
-        # 删除已提交后撤销远端，网络失败不能恢复本地访问能力或留下可用凭据。
+
+        # 本地断开事务已经提交；adapter 缺失或后续网络失败都不能让凭据复活。
         try:
-            raw = self._cipher.decrypt(
-                EncryptedValue(refresh.ciphertext, refresh.nonce, refresh.key_version),
-                self._aad(user_id, connection_id, "refresh_token"),
-            ).decode("utf-8")
-            await self._oauth.revoke(raw)
-        except (InvalidTag, UnicodeDecodeError, httpx.HTTPError):
-            # 供应商撤销为尽力操作；本地密文已删除，禁止泄露或掩盖为连接仍有效。
-            return
+            adapter = self._adapter_for(connection.provider)
+        except UnsupportedConnectionProviderError as error:
+            return OAuthRevocationResult(
+                OAuthRevocationStatus.UNSUPPORTED,
+                error.error_code,
+            )
+        if refresh is None:
+            return None
+        raw = self._cipher.decrypt(
+            refresh,
+            self._aad(user_id, connection_id, "refresh_token"),
+        ).decode("utf-8")
+        return await adapter.revoke(raw)
 
     async def start_manual_sync(
-        self, *, user_id: UUID, connection_id: UUID, idempotency_key: str, tasks: TaskCreator
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        idempotency_key: str,
+        tasks: TaskCreator,
     ) -> ManualSyncResult:
         """为已连接且归属当前用户的帐号幂等创建邮件、日历两项异步任务。
 
@@ -265,8 +876,11 @@ class GoogleConnectionsUseCase:
         只由 Worker 读取已持久化任务，不再从当前 API 创建。
         """
         async with self._stores() as store:
-            connection = await store.get_connection(user_id=user_id, connection_id=connection_id)
-        if connection is None or connection.status != "connected":
+            connection = await store.get_connection(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+        if connection is None or connection.status != ConnectionStatus.CONNECTED.value:
             raise ConnectionNotFoundError
         created = await tasks.execute_many(
             user_id=user_id,
@@ -287,3 +901,25 @@ class GoogleConnectionsUseCase:
             ),
         )
         return ManualSyncResult(created[0].task_id, created[1].task_id)
+
+
+class GoogleConnectionsUseCase(ConnectionsUseCase):
+    """保留 M1 导入名的兼容壳；当前 API 已改由组合根注入通用用例。
+
+    旧单元测试只通过该名字调用供应商中立的手动同步路径，因此兼容构造函数接受历史参数但
+    不把旧 Google 客户端重新引入 Application。OAuth 路由必须使用 ``ConnectionsUseCase``
+    与组合层 adapter，不能调用本兼容壳发起授权。
+    """
+
+    def __init__(
+        self,
+        stores: ConnectionStoreFactory,
+        cipher: Encryption,
+        oauth: object,
+        clock: Clock,
+        client_id: str,
+        redirect_uri: str,
+    ) -> None:
+        """接受历史签名并丢弃供应商参数，仅维持非 OAuth M1 调用方。"""
+        del oauth, client_id, redirect_uri
+        super().__init__(stores, cipher, {}, clock)
