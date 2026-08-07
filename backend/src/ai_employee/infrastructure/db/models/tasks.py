@@ -5,12 +5,14 @@ from uuid import UUID
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -151,7 +153,9 @@ class ApprovalRequestModel(UUIDPrimaryKeyMixin, Base):
     待审批记录尚无决定时间和决定人，因此二者允许为空；版本、哈希与过期时间必须始终
     存在，后续审批用例才能拒绝过期、篡改或陈旧决定。删除父任务或步骤会清理审批记录；
     组合外键额外保证 ``step_id`` 必须属于同一个 ``task_id``，并延迟到事务结束校验，避免
-    阻断既有单列级联 trigger。删除决定人身份时只置空引用，以保留不含个人资料的审批事实。
+    阻断既有单列级联 trigger。M1 的 ``payload`` 继续保存非空 JSONB；M2 完整真实命令只
+    进入可保留清理的 AEAD 三元组，JSONB 只留下无敏感 marker。删除决定人身份时只置空
+    引用，以保留不含个人资料的审批事实。
     """
 
     __tablename__ = "approval_requests"
@@ -162,6 +166,17 @@ class ApprovalRequestModel(UUIDPrimaryKeyMixin, Base):
             name="fk_approval_requests_step_id_task_id",
             deferrable=True,
             initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "(payload_ciphertext IS NULL AND payload_nonce IS NULL "
+            "AND payload_key_version IS NULL) OR (payload_ciphertext IS NOT NULL "
+            "AND payload_nonce IS NOT NULL AND payload_key_version IS NOT NULL)",
+            name="ck_approval_requests_payload_aead_all_or_none",
+        ),
+        # BYTEA 不执行声明长度，数据库检查是拒绝错误 nonce 的最终边界。
+        CheckConstraint(
+            "payload_nonce IS NULL OR octet_length(payload_nonce) = 12",
+            name="ck_approval_requests_payload_nonce_length_12",
         ),
     )
 
@@ -176,7 +191,15 @@ class ApprovalRequestModel(UUIDPrimaryKeyMixin, Base):
     version: Mapped[int] = mapped_column(Integer(), nullable=False)
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, JsonValue]] = mapped_column(JSONB(), nullable=False)
+    schema_version: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    risk_level: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payload_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
+    payload_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
+    payload_key_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    proposal_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    proposal_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    proposal_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     preview_markdown: Mapped[str] = mapped_column(Text(), nullable=False)
     status: Mapped[str] = mapped_column(
         String(32),
@@ -184,6 +207,10 @@ class ApprovalRequestModel(UUIDPrimaryKeyMixin, Base):
         default=ApprovalStatus.PENDING.value,
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    approved_execution_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_by_user_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
@@ -194,10 +221,10 @@ class ApprovalRequestModel(UUIDPrimaryKeyMixin, Base):
 class ToolExecutionModel(UUIDPrimaryKeyMixin, Base):
     """记录一次可幂等重放的工具调用及标准化结果摘要。
 
-    全局幂等键约束在数据库层阻止队列重投或 Graph 恢复创建第二次工具事实；组合外键
-    保证 ``step_id`` 属于记录声明的 ``task_id``，并延迟到事务结束校验，避免阻断既有单列
-    级联 trigger。供应商请求标识、结果和错误在调用结束前可能未知，因此允许为空；完整
-    供应商响应不得写入本表。
+    旧全局幂等键继续阻止 M1 队列重投；M2 另以 ``(task_id, operation_id)`` 认领精确真实
+    写操作，兼容历史行的 ``operation_id`` 可空。组合外键保证 ``step_id`` 属于声明任务。
+    供应商资源、请求和关联标识只保存规范化 ID，不保存完整供应商响应。人工结果必须同时
+    记录有界枚举、操作用户与带时区时间；写入和核对计数永远不能为负。
     """
 
     __tablename__ = "tool_executions"
@@ -206,12 +233,37 @@ class ToolExecutionModel(UUIDPrimaryKeyMixin, Base):
             "idempotency_key",
             name="uq_tool_executions_idempotency_key",
         ),
+        UniqueConstraint(
+            "task_id",
+            "operation_id",
+            name="uq_tool_executions_operation",
+        ),
         ForeignKeyConstraint(
             ["step_id", "task_id"],
             ["task_steps.id", "task_steps.task_id"],
             name="fk_tool_executions_step_id_task_id",
             deferrable=True,
             initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "write_attempt_count >= 0",
+            name="ck_tool_executions_write_attempt_count_non_negative",
+        ),
+        CheckConstraint(
+            "reconciliation_attempt_count >= 0",
+            name="ck_tool_executions_reconciliation_attempt_count_non_negative",
+        ),
+        CheckConstraint(
+            "(manual_resolution IS NULL AND manual_resolved_by_user_id IS NULL "
+            "AND manual_resolved_at IS NULL) OR (manual_resolution IS NOT NULL "
+            "AND manual_resolved_by_user_id IS NOT NULL "
+            "AND manual_resolved_at IS NOT NULL)",
+            name="ck_tool_executions_manual_resolution_all_or_none",
+        ),
+        CheckConstraint(
+            "manual_resolution IS NULL OR manual_resolution IN "
+            "('confirmed_executed', 'confirmed_not_executed')",
+            name="ck_tool_executions_manual_resolution_value",
         ),
     )
 
@@ -225,14 +277,49 @@ class ToolExecutionModel(UUIDPrimaryKeyMixin, Base):
     )
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     request_payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_resource_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     provider_request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     result_summary: Mapped[dict[str, JsonValue] | None] = mapped_column(
         JSONB(),
         nullable=True,
     )
     error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    request_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    write_attempt_count: Mapped[int] = mapped_column(
+        Integer(),
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    reconciliation_attempt_count: Mapped[int] = mapped_column(
+        Integer(),
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    manual_resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    manual_resolved_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    manual_resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
 
 class AuditEventModel(Base):

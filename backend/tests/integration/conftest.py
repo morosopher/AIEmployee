@@ -24,6 +24,10 @@ from ai_employee.infrastructure.db.session import build_engine
 
 # 清理范围只允许使用经过代码审查的应用表，顺序先子后父，且绝不包含 alembic_version。
 APPLICATION_TABLES: tuple[str, ...] = (
+    "mail_draft_versions",
+    "calendar_change_snapshots",
+    "mail_drafts",
+    "calendar_change_proposals",
     "llm_invocations",
     "messages",
     "daily_brief_items",

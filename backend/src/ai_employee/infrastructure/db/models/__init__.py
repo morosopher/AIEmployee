@@ -1,5 +1,11 @@
 """导出并注册基础设施层的 ORM 模型。"""
 
+from ai_employee.infrastructure.db.models.actions import (
+    CalendarChangeProposalModel,
+    CalendarChangeSnapshotModel,
+    MailDraftModel,
+    MailDraftVersionModel,
+)
 from ai_employee.infrastructure.db.models.briefs import (
     ConversationModel,
     DailyBriefItemModel,
@@ -32,6 +38,8 @@ from ai_employee.infrastructure.db.models.tasks import (
 __all__ = [
     "ApprovalRequestModel",
     "AuditEventModel",
+    "CalendarChangeProposalModel",
+    "CalendarChangeSnapshotModel",
     "CalendarEventModel",
     "ConnectionCapabilityModel",
     "ConversationModel",
@@ -42,6 +50,8 @@ __all__ = [
     "EmailThreadModel",
     "EncryptedCredentialModel",
     "LLMInvocationModel",
+    "MailDraftModel",
+    "MailDraftVersionModel",
     "MessageModel",
     "OAuthAttemptModel",
     "OAuthConnectionModel",

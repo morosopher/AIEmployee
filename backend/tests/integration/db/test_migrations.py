@@ -312,6 +312,8 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "approval_requests",
         "audit_events",
         "calendar_events",
+        "calendar_change_proposals",
+        "calendar_change_snapshots",
         "checkpoint_blobs",
         "checkpoint_migrations",
         "checkpoint_writes",
@@ -325,6 +327,8 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "email_threads",
         "encrypted_credentials",
         "llm_invocations",
+        "mail_draft_versions",
+        "mail_drafts",
         "messages",
         "oauth_attempts",
         "oauth_connections",
@@ -337,7 +341,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260806_0011"}
+    assert _alembic_revisions(empty_migration_database) == {"20260806_0012"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -349,6 +353,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "uq_task_steps_id_task_id",
         "uq_task_steps_task_id_sequence",
         "uq_tool_executions_idempotency_key",
+        "uq_tool_executions_operation",
     }
     assert "ix_audit_events_task_id_id" in _audit_index_names(empty_migration_database)
     assert _outbox_relay_index_definition(empty_migration_database) == (
