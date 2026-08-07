@@ -138,13 +138,13 @@ test('partial brief presents a single-source failure warning with repair context
     task_id: taskId,
     completeness: 'partial',
     warnings: expect.arrayContaining([
-      expect.stringContaining('missing:gmail'),
+      expect.stringContaining('missing:mail'),
       expect.stringContaining('last_success:'),
       expect.stringContaining('repair:retry'),
     ]),
   }))
   await page.goto('/brief')
-  await expect(page.getByRole('alert')).toContainText('missing:gmail')
+  await expect(page.getByRole('alert')).toContainText('missing:mail')
   await expect(page.getByRole('alert')).toContainText(
     'last_success:',
   )

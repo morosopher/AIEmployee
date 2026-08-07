@@ -27,7 +27,7 @@ from ai_employee.workers.privacy import PrivacyDeletionWorker
 
 @pytest.mark.asyncio
 async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(database_url: str) -> None:
-    """来源缓存删除清空邮件并复位 Gmail/Calendar 游标，不删连接或对话。"""
+    """来源缓存删除清空邮件并复位 mail/calendar 游标，不删连接或对话。"""
     session_factory = build_session_factory(database_url)
     try:
         async with session_factory.begin() as session:
@@ -47,7 +47,7 @@ async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(
             session.add(connection)
             await session.flush()
             session.add_all([
-                SyncCursorModel(connection_id=connection.id, resource_kind="gmail", cursor="100", last_success_at=datetime.now(UTC)),
+                SyncCursorModel(connection_id=connection.id, resource_kind="mail", scope_key="mailbox", cursor="100", last_success_at=datetime.now(UTC)),
                 SyncCursorModel(connection_id=connection.id, resource_kind="calendar", cursor="200", last_success_at=datetime.now(UTC)),
                 ConversationModel(user_id=user.id, title="Keep this workspace"),
             ])
@@ -94,7 +94,7 @@ async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(
             assert await session.scalar(select(func.count()).select_from(ConversationModel).where(ConversationModel.user_id == user_id)) == 1
             cursors = (await session.scalars(select(SyncCursorModel).where(SyncCursorModel.connection_id == connection.id))).all()
             assert {cursor.resource_kind: (cursor.cursor, cursor.last_success_at) for cursor in cursors} == {
-                "gmail": (None, None), "calendar": (None, None)
+                "mail": (None, None), "calendar": (None, None)
             }
             assert await session.scalar(select(func.count()).select_from(EmailMessageModel).where(EmailMessageModel.user_id == other.id)) == 1
     finally:

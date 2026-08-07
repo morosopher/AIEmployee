@@ -7,7 +7,6 @@ from uuid import UUID
 
 import httpx
 
-from ai_employee.application.ports.calendar import CalendarReader
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarSyncStoreFactory,
     SyncCalendarUseCase,
@@ -18,7 +17,7 @@ from ai_employee.domain.errors import TransientProviderError, UserActionRequired
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepositoryFactory,
 )
-from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepositoryFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.observability.sync import observe_google_sync
@@ -27,6 +26,10 @@ from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.google.calendar import CalendarAdapter
 from ai_employee.integrations.google.fake import FakeCalendarReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.integrations.registry import (
+    LegacyGoogleCalendarReader,
+    ProviderAdapterRegistry,
+)
 
 
 class CalendarSyncTaskStep:
@@ -40,11 +43,11 @@ class CalendarSyncTaskStep:
         session_factory: ManagedAsyncSessionMaker,
         cipher: AeadCipher,
         oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
-        reader: CalendarReader | None = None,
+        reader: LegacyGoogleCalendarReader | FakeCalendarReader | None = None,
         metrics: Metrics | None = None,
     ) -> None:
         """注入进程资源；凭据读取和同步写入始终使用各自短事务。"""
-        self._credential_stores = SqlAlchemyGmailSyncRepositoryFactory(session_factory)
+        self._credential_stores = SqlAlchemyMailSyncRepositoryFactory(session_factory)
         self._stores = SqlAlchemyCalendarSyncRepositoryFactory(session_factory)
         self._cipher, self._oauth = cipher, oauth
         self._reader = reader
@@ -55,6 +58,15 @@ class CalendarSyncTaskStep:
         raw_connection = task.input_payload.get("connection_id")
         if not isinstance(raw_connection, str) or task.user_id is None:
             raise ValueError("sync_calendar requires connection_id")
+        raw_scope_key = task.input_payload.get("scope_key")
+        # Task 7 前的 ``sync_calendar`` 任务来自固定 primary 架构；同一 kind 无法区分新旧，
+        # 因此仅在字段缺失时使用可证明的兼容 scope，显式空串仍拒绝。
+        if raw_scope_key is None:
+            scope_key = "primary"
+        elif isinstance(raw_scope_key, str) and raw_scope_key != "":
+            scope_key = raw_scope_key
+        else:
+            raise ValueError("sync_calendar requires scope_key")
         connection_id, user_id = UUID(raw_connection), task.user_id
         async with self._credential_stores() as store:
             credentials = await store.get_credentials(user_id=user_id, connection_id=connection_id)
@@ -131,7 +143,7 @@ class CalendarSyncTaskStep:
             async with self._credential_stores() as store:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
-        adapter: CalendarReader = (
+        adapter: LegacyGoogleCalendarReader = (
             self._reader.for_user(user_id)
             if isinstance(self._reader, FakeCalendarReader)
             else self._reader
@@ -141,12 +153,19 @@ class CalendarSyncTaskStep:
             refresh_access_token=refresh_access_token if refresh else None,
             mark_expired=mark_expired,
         )
+        registry = ProviderAdapterRegistry(google_calendar=adapter)
         await observe_google_sync(
             metrics=self._metrics,
             resource="calendar",
             operation=lambda: SyncCalendarUseCase(
-                cast(CalendarSyncStoreFactory, self._stores), self._cipher, adapter
-            ).execute(user_id=user_id, connection_id=connection_id),
+                cast(CalendarSyncStoreFactory, self._stores),
+                registry,
+                self._cipher,
+            ).execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key=scope_key,
+            ),
         )
 
     @staticmethod

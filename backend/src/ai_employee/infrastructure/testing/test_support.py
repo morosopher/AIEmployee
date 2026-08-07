@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
@@ -17,6 +18,9 @@ from ai_employee.infrastructure.db.models.sources import (
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.encryption import AeadCipher
+
+GOOGLE_MAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 
 
 class TestSupportFixtureService:
@@ -57,7 +61,7 @@ class TestSupportFixtureService:
                     provider="google",
                     provider_account_id=f"e2e-{connection_id}",
                     account_email="e2e-source@example.test",
-                    scopes=[],
+                    scopes=[GOOGLE_MAIL_READ_SCOPE, GOOGLE_CALENDAR_READ_SCOPE],
                     status="connected",
                     last_error_code=None,
                 )
@@ -83,19 +87,39 @@ class TestSupportFixtureService:
                         nonce=refresh.nonce,
                         key_version=refresh.key_version,
                     ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="mail.read",
+                        status="enabled",
+                        actual_scopes=[GOOGLE_MAIL_READ_SCOPE],
+                        last_verified_at=current,
+                        last_error_code=None,
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="calendar.read",
+                        status="enabled",
+                        actual_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                        last_verified_at=current,
+                        last_error_code=None,
+                    ),
                 )
             )
             session.add_all(
                 (
                     SyncCursorModel(
                         connection_id=connection_id,
-                        resource_kind="gmail",
+                        resource_kind="mail",
+                        scope_key="mailbox",
                         cursor="synthetic-cursor",
                         last_success_at=current - timedelta(hours=1),
                     ),
                     SyncCursorModel(
                         connection_id=connection_id,
                         resource_kind="calendar",
+                        scope_key="primary",
                         cursor="synthetic-cursor",
                         last_success_at=current,
                     ),

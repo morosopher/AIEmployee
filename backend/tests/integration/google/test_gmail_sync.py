@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from uuid import UUID
@@ -21,9 +21,10 @@ from ai_employee.application.ports.gmail import (
 )
 from ai_employee.application.use_cases.sync_gmail import SyncGmailUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
-from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.errors import InternalInvariantError, StateConflictError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
@@ -35,6 +36,7 @@ from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSync
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.sync_gmail import GmailSyncTaskStep
 
 
@@ -145,9 +147,13 @@ async def _repository_factory(sessions):
 
 
 async def _seed_connection(
-    sessions, cipher: AeadCipher, cursor_value: str | None = None
+    sessions,
+    cipher: AeadCipher,
+    cursor_value: str | None = None,
+    *,
+    create_cursor: bool = True,
 ) -> tuple[UUID, UUID]:
-    """写入合成用户、连接、游标和最小凭据，返回用户与连接标识。"""
+    """写入合成用户、连接、可选游标和最小凭据，返回用户与连接标识。"""
     async with sessions.begin() as session:
         user = UserModel(
             email="gmail-owner@example.test",
@@ -171,8 +177,12 @@ async def _seed_connection(
         )
         session.add(connection)
         await session.flush()
-        access = cipher.encrypt(b"synthetic-access", f"{user.id}:{connection.id}:access_token".encode())
-        refresh = cipher.encrypt(b"synthetic-refresh", f"{user.id}:{connection.id}:refresh_token".encode())
+        access = cipher.encrypt(
+            b"synthetic-access", f"{user.id}:{connection.id}:access_token".encode()
+        )
+        refresh = cipher.encrypt(
+            b"synthetic-refresh", f"{user.id}:{connection.id}:refresh_token".encode()
+        )
         session.add_all(
             [
                 EncryptedCredentialModel(
@@ -193,50 +203,144 @@ async def _seed_connection(
                     key_version=refresh.key_version,
                     token_expires_at=None,
                 ),
-                SyncCursorModel(connection_id=connection.id, resource_kind="gmail", cursor=cursor_value),
+                ConnectionCapabilityModel(
+                    user_id=user.id,
+                    connection_id=connection.id,
+                    capability="mail.read",
+                    status="enabled",
+                    actual_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+                ),
             ]
         )
+        if create_cursor:
+            session.add(
+                SyncCursorModel(
+                    connection_id=connection.id,
+                    resource_kind="mail",
+                    scope_key="mailbox",
+                    cursor=cursor_value,
+                )
+            )
         return user.id, connection.id
 
 
 @pytest.mark.asyncio
-async def test_sync_upserts_messages_and_advances_cursor_only_after_final_page(database_url: str) -> None:
-    """首同步写入一条线程/邮件，重放不重复，全部成功后才将 cursor 提交到末页值。"""
+async def test_initial_sync_missing_final_cursor_does_not_create_placeholder_state(
+    database_url: str,
+) -> None:
+    """初始读取缺最终游标时，不变量失败不得留下占位游标、消息或成功审计。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"j" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(
+            sessions,
+            cipher,
+            create_cursor=False,
+        )
+        use_case = SyncGmailUseCase(
+            lambda: _repository_factory(sessions),
+            ProviderAdapterRegistry(
+                google_mail=FakeGmailReader(
+                    initial=(GmailSyncPage((), None, None),),
+                )
+            ),
+            cipher,
+        )
+
+        with pytest.raises(InternalInvariantError) as raised:
+            await use_case.execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="mailbox",
+            )
+
+        async with sessions() as session:
+            cursor_rows = await session.scalar(
+                select(func.count())
+                .select_from(SyncCursorModel)
+                .where(
+                    SyncCursorModel.connection_id == connection_id,
+                    SyncCursorModel.resource_kind == "mail",
+                    SyncCursorModel.scope_key == "mailbox",
+                )
+            )
+            message_rows = await session.scalar(select(func.count()).select_from(EmailMessageModel))
+            audit_rows = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(AuditEventModel.event_type == "source.mail.synced")
+            )
+        assert raised.value.error_code == "mail_final_cursor_missing"
+        assert cursor_rows == 0
+        assert message_rows == 0
+        assert audit_rows == 0
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sync_upserts_messages_and_advances_cursor_only_after_final_page(
+    database_url: str,
+) -> None:
+    """无预存游标的首同步只在末页后创建一行，重放不重复且改走增量读取。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"a" * 32)
     try:
-        user_id, connection_id = await _seed_connection(sessions, cipher)
+        user_id, connection_id = await _seed_connection(
+            sessions,
+            cipher,
+            create_cursor=False,
+        )
         pages = (
             GmailSyncPage((_message(),), "next", "102"),
             GmailSyncPage((_message("message-2"),), None, "103"),
         )
         use_case = SyncGmailUseCase(
             lambda: _repository_factory(sessions),
+            ProviderAdapterRegistry(google_mail=FakeGmailReader(initial=pages, history=pages)),
             cipher,
-            FakeGmailReader(initial=pages, history=pages),
         )
 
-        first = await use_case.execute(user_id=user_id, connection_id=connection_id)
-        second = await use_case.execute(user_id=user_id, connection_id=connection_id)
+        first = await use_case.execute(
+            user_id=user_id, connection_id=connection_id, scope_key="mailbox"
+        )
+        second = await use_case.execute(
+            user_id=user_id, connection_id=connection_id, scope_key="mailbox"
+        )
 
         assert first.messages_upserted == 2
         assert second.messages_upserted == 2
+        assert first.used_full_resync
+        assert not second.used_full_resync
         async with sessions() as session:
             thread_count = await session.scalar(select(func.count()).select_from(EmailThreadModel))
-            message_count = await session.scalar(select(func.count()).select_from(EmailMessageModel))
-            cursor = await session.scalar(select(SyncCursorModel.cursor))
-            stored = await session.scalar(select(EmailMessageModel).where(EmailMessageModel.provider_message_id == "message-1"))
-            audit = await session.scalar(select(AuditEventModel).where(AuditEventModel.event_type == "source.gmail.synced"))
+            message_count = await session.scalar(
+                select(func.count()).select_from(EmailMessageModel)
+            )
+            cursors = tuple((await session.scalars(select(SyncCursorModel))).all())
+            stored = await session.scalar(
+                select(EmailMessageModel).where(
+                    EmailMessageModel.provider_message_id == "message-1"
+                )
+            )
+            audit = await session.scalar(
+                select(AuditEventModel).where(AuditEventModel.event_type == "source.mail.synced")
+            )
         assert thread_count == 1
         assert message_count == 2
-        assert cursor == "103"
+        assert len(cursors) == 1
+        assert cursors[0].cursor == "103"
+        assert cursors[0].last_success_at is not None
         assert stored is not None
         assert b"Synthetic private body" not in stored.body_ciphertext
         assert stored.snippet == ""
-        assert cipher.decrypt(
-            EncryptedValue(stored.body_ciphertext, stored.body_nonce, stored.body_key_version),
-            f"{user_id}:{connection_id}:message-1:body".encode(),
-        ) == b"Synthetic private body"
+        assert (
+            cipher.decrypt(
+                EncryptedValue(stored.body_ciphertext, stored.body_nonce, stored.body_key_version),
+                f"{user_id}:{connection_id}:message-1:body".encode(),
+            )
+            == b"Synthetic private body"
+        )
         assert audit is not None
         assert "body" not in str(audit.event_metadata).lower()
     finally:
@@ -244,7 +348,9 @@ async def test_sync_upserts_messages_and_advances_cursor_only_after_final_page(d
 
 
 @pytest.mark.asyncio
-async def test_final_write_rejects_connection_disconnected_during_network_read(database_url: str) -> None:
+async def test_final_write_rejects_connection_disconnected_during_network_read(
+    database_url: str,
+) -> None:
     """连接在页获取后断开时，消息、审计与游标必须全部回滚而不写入旧用户域。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"e" * 32)
@@ -260,12 +366,22 @@ async def test_final_write_rejects_connection_disconnected_during_network_read(d
         with pytest.raises(StateConflictError, match="connection"):
             await SyncGmailUseCase(
                 disconnecting_factory,
+                ProviderAdapterRegistry(
+                    google_mail=FakeGmailReader(
+                        initial=(GmailSyncPage((_message(),), None, "102"),)
+                    )
+                ),
                 cipher,
-                FakeGmailReader(initial=(GmailSyncPage((_message(),), None, "102"),)),
-            ).execute(user_id=user_id, connection_id=connection_id)
+            ).execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="mailbox",
+            )
         async with sessions() as session:
             cursor = await session.scalar(select(SyncCursorModel.cursor))
-            message_count = await session.scalar(select(func.count()).select_from(EmailMessageModel))
+            message_count = await session.scalar(
+                select(func.count()).select_from(EmailMessageModel)
+            )
             connection = await session.scalar(select(OAuthConnectionModel.status))
         assert cursor is None
         assert message_count == 0
@@ -275,7 +391,9 @@ async def test_final_write_rejects_connection_disconnected_during_network_read(d
 
 
 @pytest.mark.asyncio
-async def test_expired_history_cursor_falls_back_to_seven_day_initial_sync(database_url: str) -> None:
+async def test_expired_history_cursor_falls_back_to_seven_day_initial_sync(
+    database_url: str,
+) -> None:
     """Gmail 404 history cursor 后只回退初始七日读取，并提交该回退结果游标。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"b" * 32)
@@ -284,8 +402,14 @@ async def test_expired_history_cursor_falls_back_to_seven_day_initial_sync(datab
         reader = FakeGmailReader(
             initial=(GmailSyncPage((_message(),), None, "200"),), history_expired=True
         )
-        result = await SyncGmailUseCase(lambda: _repository_factory(sessions), cipher, reader).execute(
-            user_id=user_id, connection_id=connection_id
+        result = await SyncGmailUseCase(
+            lambda: _repository_factory(sessions),
+            ProviderAdapterRegistry(google_mail=reader),
+            cipher,
+        ).execute(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key="mailbox",
         )
         assert result.used_full_resync
         async with sessions() as session:
@@ -315,11 +439,19 @@ async def test_cursor_is_not_advanced_when_a_later_page_write_fails(database_url
 
         with pytest.raises(RuntimeError, match="second message persistence failure"):
             await SyncGmailUseCase(
-                failing_factory, cipher, FakeGmailReader(initial=pages)
-            ).execute(user_id=user_id, connection_id=connection_id)
+                failing_factory,
+                ProviderAdapterRegistry(google_mail=FakeGmailReader(initial=pages)),
+                cipher,
+            ).execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="mailbox",
+            )
         async with sessions() as session:
             cursor = await session.scalar(select(SyncCursorModel.cursor))
-            message_count = await session.scalar(select(func.count()).select_from(EmailMessageModel))
+            message_count = await session.scalar(
+                select(func.count()).select_from(EmailMessageModel)
+            )
         assert cursor is None
         assert message_count == 0
     finally:
@@ -337,27 +469,47 @@ async def test_concurrent_sync_cannot_roll_back_a_newer_history_cursor(database_
         release_old = asyncio.Event()
         old_use_case = SyncGmailUseCase(
             lambda: _repository_factory(sessions),
-            cipher,
-            BlockingHistoryGmailReader(
-                loaded=old_loaded,
-                release=release_old,
-                page=GmailSyncPage((_message("old-message"),), None, "200"),
+            ProviderAdapterRegistry(
+                google_mail=BlockingHistoryGmailReader(
+                    loaded=old_loaded,
+                    release=release_old,
+                    page=GmailSyncPage((_message("old-message"),), None, "200"),
+                )
             ),
+            cipher,
         )
         newer_use_case = SyncGmailUseCase(
             lambda: _repository_factory(sessions),
-            cipher,
-            FakeGmailReader(
-                initial=(),
-                history=(GmailSyncPage((_message("new-message"),), None, "300"),),
+            ProviderAdapterRegistry(
+                google_mail=FakeGmailReader(
+                    initial=(),
+                    history=(GmailSyncPage((_message("new-message"),), None, "300"),),
+                )
             ),
+            cipher,
         )
 
         old_task = asyncio.create_task(
-            old_use_case.execute(user_id=user_id, connection_id=connection_id)
+            old_use_case.execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="mailbox",
+            )
         )
         await old_loaded.wait()
-        newer_result = await newer_use_case.execute(user_id=user_id, connection_id=connection_id)
+        try:
+            newer_result = await newer_use_case.execute(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="mailbox",
+            )
+        except BaseException:
+            # RED 或未来回归可能让较新同步提前失败；仍须释放旧请求并回收协程，避免
+            # fixture 清库等待它持有的事务锁而把真实断言掩盖成测试死锁。
+            release_old.set()
+            with suppress(Exception):
+                await old_task
+            raise
         release_old.set()
 
         with pytest.raises(TransientProviderError) as raised:
@@ -368,7 +520,7 @@ async def test_concurrent_sync_cannot_roll_back_a_newer_history_cursor(database_
                 (await session.scalars(select(EmailMessageModel.provider_message_id))).all()
             )
         assert newer_result.cursor == "300"
-        assert raised.value.error_code == "gmail_sync_cursor_conflict"
+        assert raised.value.error_code == "mail_sync_cursor_conflict"
         assert cursor == "300"
         assert messages == ("new-message",)
     finally:
@@ -376,13 +528,17 @@ async def test_concurrent_sync_cannot_roll_back_a_newer_history_cursor(database_
 
 
 @pytest.mark.asyncio
-async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitted(database_url: str) -> None:
+async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitted(
+    database_url: str,
+) -> None:
     """刷新更新 access 密文和 expiry；Google 未轮换 refresh token 时仍保留既有密文。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"c" * 32)
     try:
         user_id, connection_id = await _seed_connection(sessions, cipher)
-        rotated = cipher.encrypt(b"rotated-access", f"{user_id}:{connection_id}:access_token".encode())
+        rotated = cipher.encrypt(
+            b"rotated-access", f"{user_id}:{connection_id}:access_token".encode()
+        )
         async with _repository_factory(sessions) as repository:
             await repository.rotate_access_token(
                 user_id=user_id,
@@ -395,8 +551,20 @@ async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitte
             credentials = tuple((await session.scalars(select(EncryptedCredentialModel))).all())
         access = next(item for item in credentials if item.credential_kind == "access_token")
         refresh = next(item for item in credentials if item.credential_kind == "refresh_token")
-        assert cipher.decrypt(EncryptedValue(access.ciphertext, access.nonce, access.key_version), f"{user_id}:{connection_id}:access_token".encode()) == b"rotated-access"
-        assert cipher.decrypt(EncryptedValue(refresh.ciphertext, refresh.nonce, refresh.key_version), f"{user_id}:{connection_id}:refresh_token".encode()) == b"synthetic-refresh"
+        assert (
+            cipher.decrypt(
+                EncryptedValue(access.ciphertext, access.nonce, access.key_version),
+                f"{user_id}:{connection_id}:access_token".encode(),
+            )
+            == b"rotated-access"
+        )
+        assert (
+            cipher.decrypt(
+                EncryptedValue(refresh.ciphertext, refresh.nonce, refresh.key_version),
+                f"{user_id}:{connection_id}:refresh_token".encode(),
+            )
+            == b"synthetic-refresh"
+        )
         assert access.token_expires_at == datetime(2030, 1, 2, tzinfo=UTC)
     finally:
         await sessions.dispose()
@@ -423,15 +591,20 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+            oauth=GoogleOAuthClient(
+                "synthetic-client", "synthetic-secret", "https://example.test/callback"
+            ),
         )
 
         with pytest.raises(UserActionRequiredError):
             await step.execute(
                 LeasedTask(
                     task_id=UUID("00000000-0000-0000-0000-000000000001"),
-                    kind="sync_gmail",
-                    input_payload={"connection_id": str(connection_id)},
+                    kind="sync_mail",
+                    input_payload={
+                        "connection_id": str(connection_id),
+                        "scope_key": "mailbox",
+                    },
                     started_at=datetime(2030, 1, 1, tzinfo=UTC),
                     user_id=user_id,
                 )
@@ -448,10 +621,13 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
         assert connection is not None and connection.status == "degraded"
         assert connection.last_error_code == "oauth_revoked"
         assert access is not None
-        assert cipher.decrypt(
-            EncryptedValue(access.ciphertext, access.nonce, access.key_version),
-            f"{user_id}:{connection_id}:access_token".encode(),
-        ) == b"rotated-access"
+        assert (
+            cipher.decrypt(
+                EncryptedValue(access.ciphertext, access.nonce, access.key_version),
+                f"{user_id}:{connection_id}:access_token".encode(),
+            )
+            == b"rotated-access"
+        )
     finally:
         await sessions.dispose()
 
@@ -475,15 +651,20 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+            oauth=GoogleOAuthClient(
+                "synthetic-client", "synthetic-secret", "https://example.test/callback"
+            ),
         )
 
         with pytest.raises(UserActionRequiredError) as raised:
             await step.execute(
                 LeasedTask(
                     task_id=UUID("00000000-0000-0000-0000-000000000002"),
-                    kind="sync_gmail",
-                    input_payload={"connection_id": str(connection_id)},
+                    kind="sync_mail",
+                    input_payload={
+                        "connection_id": str(connection_id),
+                        "scope_key": "mailbox",
+                    },
                     started_at=datetime(2030, 1, 1, tzinfo=UTC),
                     user_id=user_id,
                 )
@@ -517,15 +698,20 @@ async def test_worker_preserves_connected_state_when_refresh_is_rate_limited(
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient("synthetic-client", "synthetic-secret", "https://example.test/callback"),
+            oauth=GoogleOAuthClient(
+                "synthetic-client", "synthetic-secret", "https://example.test/callback"
+            ),
         )
 
         with pytest.raises(TransientProviderError) as raised:
             await step.execute(
                 LeasedTask(
                     task_id=UUID("00000000-0000-0000-0000-000000000003"),
-                    kind="sync_gmail",
-                    input_payload={"connection_id": str(connection_id)},
+                    kind="sync_mail",
+                    input_payload={
+                        "connection_id": str(connection_id),
+                        "scope_key": "mailbox",
+                    },
                     started_at=datetime(2030, 1, 1, tzinfo=UTC),
                     user_id=user_id,
                 )

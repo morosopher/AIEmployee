@@ -258,7 +258,12 @@ class GoogleConnectionsUseCase:
     async def start_manual_sync(
         self, *, user_id: UUID, connection_id: UUID, idempotency_key: str, tasks: TaskCreator
     ) -> ManualSyncResult:
-        """为已连接且归属当前用户的帐号幂等创建 Gmail、Calendar 两项异步任务。"""
+        """为已连接且归属当前用户的帐号幂等创建邮件、日历两项异步任务。
+
+        新任务必须使用供应商中立的 ``sync_mail`` 与显式 mailbox scope；幂等键仍保留
+        M1 的 ``gmail`` 后缀，使升级前后重复提交收敛到既有任务。旧 ``sync_gmail`` kind
+        只由 Worker 读取已持久化任务，不再从当前 API 创建。
+        """
         async with self._stores() as store:
             connection = await store.get_connection(user_id=user_id, connection_id=connection_id)
         if connection is None or connection.status != "connected":
@@ -267,7 +272,12 @@ class GoogleConnectionsUseCase:
             user_id=user_id,
             items=(
                 CreateTaskBatchItem(
-                    "sync_gmail", {"connection_id": str(connection_id)}, f"{idempotency_key}:gmail"
+                    "sync_mail",
+                    {
+                        "connection_id": str(connection_id),
+                        "scope_key": "mailbox",
+                    },
+                    f"{idempotency_key}:gmail",
                 ),
                 CreateTaskBatchItem(
                     "sync_calendar",

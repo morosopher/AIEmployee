@@ -6,12 +6,15 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from ai_employee.application.use_cases.connections import GoogleConnectionsUseCase
 from ai_employee.application.use_cases.tasks import (
     CreateTaskBatchItem,
     CreateTaskResult,
     CreateTaskUseCase,
 )
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel
+from ai_employee.infrastructure.security.encryption import AeadCipher
 
 
 @dataclass
@@ -82,9 +85,43 @@ class RecordingDispatcher:
         return TaskStatus.CREATED
 
 
+class ConnectedStore:
+    """只向手动同步用例返回一条归属正确且仍连接的合成连接。"""
+
+    def __init__(self, connection: OAuthConnectionModel) -> None:
+        """保存测试所需的唯一连接，不实现本用例不会调用的 OAuth 写操作。"""
+        self._connection = connection
+
+    async def get_connection(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> OAuthConnectionModel | None:
+        """仅在用户与连接标识同时匹配时返回连接，保留归属边界。"""
+        if self._connection.user_id != user_id or self._connection.id != connection_id:
+            return None
+        return self._connection
+
+
+@dataclass
+class CapturingTaskCreator:
+    """记录手动同步创建的精确任务种类、载荷与幂等键。"""
+
+    items: tuple[CreateTaskBatchItem, ...] = ()
+
+    async def execute_many(
+        self,
+        *,
+        user_id: UUID,
+        items: tuple[CreateTaskBatchItem, ...],
+    ) -> tuple[CreateTaskResult, ...]:
+        """保存批次并返回两个稳定结果，不执行数据库或队列副作用。"""
+        del user_id
+        self.items = items
+        return (CreateTaskResult(uuid4()), CreateTaskResult(uuid4()))
+
+
 @pytest.mark.asyncio
 async def test_batch_creation_rolls_back_both_tasks_when_second_persistence_fails() -> None:
-    """Calendar 写入失败时 Gmail 任务、审计和 Outbox 也不能提交或投递。"""
+    """Calendar 写入失败时邮件任务、审计和 Outbox 也不能提交或投递。"""
     repository = RecordingRepository(fail_on_second=True)
     dispatcher = RecordingDispatcher()
     use_case = CreateTaskUseCase(RecordingFactory(repository), dispatcher)
@@ -93,10 +130,65 @@ async def test_batch_creation_rolls_back_both_tasks_when_second_persistence_fail
         await use_case.execute_many(
             user_id=uuid4(),
             items=(
-                CreateTaskBatchItem("sync_gmail", {"connection_id": "one"}, "sync:gmail"),
+                CreateTaskBatchItem(
+                    "sync_mail",
+                    {"connection_id": "one", "scope_key": "mailbox"},
+                    "sync:gmail",
+                ),
                 CreateTaskBatchItem("sync_calendar", {"connection_id": "one"}, "sync:calendar"),
             ),
         )
 
     assert repository.committed == []
     assert dispatcher.dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_manual_sync_creates_canonical_mail_task_with_explicit_mailbox_scope() -> None:
+    """新手动同步只能创建 ``sync_mail``，旧 kind 仅供已持久化任务兼容读取。"""
+    user_id, connection_id = uuid4(), uuid4()
+    connection = OAuthConnectionModel(
+        id=connection_id,
+        user_id=user_id,
+        provider="google",
+        provider_account_id="manual-sync",
+        account_email="manual-sync@example.test",
+        scopes=[],
+        status="connected",
+        last_error_code=None,
+    )
+
+    @asynccontextmanager
+    async def stores():
+        """为单次调用提供只读连接存储上下文。"""
+        yield ConnectedStore(connection)
+
+    tasks = CapturingTaskCreator()
+    use_case = GoogleConnectionsUseCase(
+        stores,  # type: ignore[arg-type]
+        AeadCipher(b"k" * 32),
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        "synthetic-client",
+        "https://example.test/callback",
+    )
+
+    await use_case.start_manual_sync(
+        user_id=user_id,
+        connection_id=connection_id,
+        idempotency_key="manual-sync-key",
+        tasks=tasks,
+    )
+
+    assert tasks.items == (
+        CreateTaskBatchItem(
+            "sync_mail",
+            {"connection_id": str(connection_id), "scope_key": "mailbox"},
+            "manual-sync-key:gmail",
+        ),
+        CreateTaskBatchItem(
+            "sync_calendar",
+            {"connection_id": str(connection_id)},
+            "manual-sync-key:calendar",
+        ),
+    )

@@ -7,14 +7,14 @@ from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from ai_employee.agents.daily_brief.graph import build_daily_brief_graph
 from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.ports.model import ModelGateway
 from ai_employee.application.use_cases.briefs import PersistDailyBriefUseCase
 from ai_employee.application.use_cases.sync_calendar import CalendarConnectionNotFoundError
-from ai_employee.application.use_cases.sync_gmail import GmailConnectionNotFoundError
+from ai_employee.application.use_cases.sync_mail import MailConnectionNotFoundError
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.briefs import DailyBriefContent
@@ -23,6 +23,7 @@ from ai_employee.infrastructure.db.models.briefs import DailyBriefModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
+    ConnectionCapabilityModel,
     EmailAnalysisModel,
     EmailMessageModel,
     EmailThreadModel,
@@ -37,9 +38,19 @@ from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.llm.fake import build_model_gateway
 
-SyncSource = Callable[[str, UUID, UUID], Awaitable[None]]
+SyncSource = Callable[[str, UUID, UUID, str], Awaitable[None]]
 UtcNow = Callable[[], datetime]
 SYNC_FRESHNESS = timedelta(minutes=15)
+
+# stale 检测以能力事实为入口；只有缺失 M1 Google 游标行时才能推断规范默认 scope。
+_READ_CAPABILITY_BY_RESOURCE = {
+    "mail": "mail.read",
+    "calendar": "calendar.read",
+}
+_LEGACY_GOOGLE_SCOPE_BY_RESOURCE = {
+    "mail": "mailbox",
+    "calendar": "primary",
+}
 
 
 class GenerateBriefTaskStep:
@@ -146,81 +157,125 @@ class GenerateBriefTaskStep:
 
     async def _stale_resources(
         self, session: Any, user_id: UUID, cutoff: datetime, connection_id: UUID | None
-    ) -> tuple[tuple[str, UUID], ...]:
-        """返回缺失或超过十五分钟未成功同步的已连接资源，始终带用户归属过滤。"""
+    ) -> tuple[tuple[str, UUID, str | None], ...]:
+        """返回 enabled read capability 下缺失或过期的精确同步 scope。
+
+        已存在游标时，每个 mailbox/folder/calendar 都独立判断新鲜度。没有任何持久游标行时，
+        只有 Google M1 兼容连接能推断 ``mailbox`` 或 ``primary``；Microsoft 等多 scope
+        供应商无法安全猜测目录对象，以 ``None`` 标记缺口并 fail closed 告警，等待目录同步
+        建立精确游标。
+        """
         rows = await session.execute(
             select(
                 OAuthConnectionModel.id,
+                OAuthConnectionModel.provider,
+                ConnectionCapabilityModel.capability,
                 SyncCursorModel.resource_kind,
+                SyncCursorModel.scope_key,
                 SyncCursorModel.cursor,
                 SyncCursorModel.last_success_at,
             )
-            .outerjoin(SyncCursorModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
-            .where(
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.provider == "google",
-                OAuthConnectionModel.status == "connected",
-                *(
-                    (OAuthConnectionModel.id == connection_id,)
-                    if connection_id is not None
-                    else ()
+            .join(
+                ConnectionCapabilityModel,
+                and_(
+                    ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id,
+                    ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id,
                 ),
             )
-        )
-        stale: list[tuple[str, UUID]] = []
-        found: set[tuple[UUID, str]] = set()
-        for row_connection_id, resource_kind, cursor, last_success_at in rows:
-            if resource_kind in {"gmail", "calendar"}:
-                found.add((row_connection_id, resource_kind))
-                if (
-                    cursor is None
-                    or last_success_at is None
-                    or last_success_at < cutoff - SYNC_FRESHNESS
-                ):
-                    stale.append((resource_kind, row_connection_id))
-        for (row_connection_id,) in (
-            await session.execute(
-                select(OAuthConnectionModel.id).where(
-                    OAuthConnectionModel.user_id == user_id,
-                    OAuthConnectionModel.provider == "google",
-                    OAuthConnectionModel.status == "connected",
-                    *(
-                        (OAuthConnectionModel.id == connection_id,)
-                        if connection_id is not None
-                        else ()
+            .outerjoin(
+                SyncCursorModel,
+                and_(
+                    SyncCursorModel.connection_id == OAuthConnectionModel.id,
+                    or_(
+                        and_(
+                            ConnectionCapabilityModel.capability == "mail.read",
+                            SyncCursorModel.resource_kind == "mail",
+                        ),
+                        and_(
+                            ConnectionCapabilityModel.capability == "calendar.read",
+                            SyncCursorModel.resource_kind == "calendar",
+                        ),
                     ),
-                )
+                ),
             )
-        ).all():
-            for resource_kind in ("gmail", "calendar"):
-                if (row_connection_id, resource_kind) not in found:
-                    stale.append((resource_kind, row_connection_id))
+            .where(
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.status == "enabled",
+                ConnectionCapabilityModel.capability.in_(("mail.read", "calendar.read")),
+                *((OAuthConnectionModel.id == connection_id,) if connection_id is not None else ()),
+            )
+            .order_by(
+                OAuthConnectionModel.id,
+                ConnectionCapabilityModel.capability,
+                SyncCursorModel.scope_key,
+            )
+        )
+        stale: list[tuple[str, UUID, str | None]] = []
+        for (
+            row_connection_id,
+            provider,
+            capability,
+            resource_kind,
+            scope_key,
+            cursor,
+            last_success_at,
+        ) in rows:
+            expected_resource_kind = "mail" if capability == "mail.read" else "calendar"
+            if resource_kind is None or scope_key is None:
+                # 兼容补缺必须同时满足 connected + enabled capability；provider 只决定能否
+                # 无歧义推断 M1 默认 scope，不能替代能力授权。
+                if provider == "google":
+                    stale.append(
+                        (
+                            expected_resource_kind,
+                            row_connection_id,
+                            _LEGACY_GOOGLE_SCOPE_BY_RESOURCE[expected_resource_kind],
+                        )
+                    )
+                else:
+                    # Microsoft mailbox/folder/calendar 键只能来自目录同步。显式保留缺口
+                    # 才能让简报降级为 partial，同时阻止 Worker 猜测并调用错误 scope。
+                    stale.append((expected_resource_kind, row_connection_id, None))
+                continue
+            if (
+                cursor is None
+                or last_success_at is None
+                or last_success_at < cutoff - SYNC_FRESHNESS
+            ):
+                stale.append((expected_resource_kind, row_connection_id, scope_key))
         return tuple(stale)
 
     async def _refresh_stale_sources(
-        self, user_id: UUID, stale: tuple[tuple[str, UUID], ...]
+        self, user_id: UUID, stale: tuple[tuple[str, UUID, str | None], ...]
     ) -> list[str]:
         """逐资源刷新，单一只读同步失败仅降级本次简报而不取消其他来源。
 
         告警从 PostgreSQL 读取最后成功时刻而非使用 Worker 内存；进程崩溃或另一 Worker
-        接管后仍能向用户说明缺什么、数据新鲜度及可执行的修复动作。
+        接管后仍能向用户说明缺什么、数据新鲜度及可执行的修复动作。无法从供应商目录
+        证明 scope 的资源只告警而不调用同步端口，即使测试或降级组合根未注入端口也不能
+        把简报伪装为 complete。
         """
-        if self._sync_source is None:
-            return []
         warnings: list[str] = []
-        for resource_kind, connection_id in stale:
+        for resource_kind, connection_id, scope_key in stale:
+            if scope_key is None:
+                warnings.append(f"missing:{resource_kind};last_success:never;repair:retry")
+                continue
+            if self._sync_source is None:
+                continue
             try:
-                await self._sync_source(resource_kind, connection_id, user_id)
+                await self._sync_source(resource_kind, connection_id, user_id, scope_key)
             except (
                 TransientProviderError,
                 UserActionRequiredError,
-                GmailConnectionNotFoundError,
+                MailConnectionNotFoundError,
                 CalendarConnectionNotFoundError,
             ) as error:
                 last_success = await self._last_source_success(
                     user_id=user_id,
                     connection_id=connection_id,
                     resource_kind=resource_kind,
+                    scope_key=scope_key,
                 )
                 repair = "reconnect" if isinstance(error, UserActionRequiredError) else "retry"
                 rendered_success = last_success.isoformat() if last_success is not None else "never"
@@ -230,17 +285,38 @@ class GenerateBriefTaskStep:
         return warnings
 
     async def _last_source_success(
-        self, *, user_id: UUID, connection_id: UUID, resource_kind: str
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        resource_kind: str,
+        scope_key: str,
     ) -> datetime | None:
-        """读取当前用户连接的最后成功同步时刻，不把跨用户游标泄露到简报。"""
+        """按用户、enabled 能力和精确 scope 读取最后成功同步时刻。"""
+        capability = _READ_CAPABILITY_BY_RESOURCE.get(resource_kind)
+        if capability is None:
+            raise ValueError("brief source resource_kind must be mail or calendar")
         async with self._session_factory() as session:
             return await session.scalar(
                 select(SyncCursorModel.last_success_at)
-                .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
+                .join(
+                    OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id
+                )
+                .join(
+                    ConnectionCapabilityModel,
+                    and_(
+                        ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id,
+                        ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id,
+                    ),
+                )
                 .where(
                     OAuthConnectionModel.user_id == user_id,
+                    OAuthConnectionModel.status == "connected",
                     SyncCursorModel.connection_id == connection_id,
                     SyncCursorModel.resource_kind == resource_kind,
+                    SyncCursorModel.scope_key == scope_key,
+                    ConnectionCapabilityModel.capability == capability,
+                    ConnectionCapabilityModel.status == "enabled",
                 )
             )
 
@@ -256,15 +332,36 @@ class GenerateBriefTaskStep:
         """按邮件 received_at 的用户本地日去重线程，绝不以线程更新时间替代接收日期。"""
         start, end = self._day_bounds(local_date, timezone)
         upper = min(end, cutoff)
+        # EXISTS 把连接归属、连接状态与能力状态作为单一读取门；不会因能力表多行放大
+        # 消息结果，也不会让断开连接或撤销能力后的历史缓存继续进入 Graph/模型。
+        enabled_mail_read = (
+            select(ConnectionCapabilityModel.id)
+            .join(
+                OAuthConnectionModel,
+                and_(
+                    OAuthConnectionModel.id == ConnectionCapabilityModel.connection_id,
+                    OAuthConnectionModel.user_id == ConnectionCapabilityModel.user_id,
+                ),
+            )
+            .where(
+                OAuthConnectionModel.id == EmailThreadModel.connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.capability == "mail.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .exists()
+        )
         messages = (
             await session.scalars(
-                select(EmailMessageModel).join(
-                    EmailThreadModel, EmailThreadModel.id == EmailMessageModel.thread_id
-                )
+                select(EmailMessageModel)
+                .join(EmailThreadModel, EmailThreadModel.id == EmailMessageModel.thread_id)
                 .where(
                     EmailMessageModel.user_id == user_id,
                     EmailMessageModel.received_at >= start,
                     EmailMessageModel.received_at < upper,
+                    enabled_mail_read,
                     *(
                         (EmailThreadModel.connection_id == connection_id,)
                         if connection_id is not None
@@ -296,8 +393,12 @@ class GenerateBriefTaskStep:
                 select(EmailThreadModel).where(
                     EmailThreadModel.id == message.thread_id,
                     EmailThreadModel.user_id == user_id,
-                    *((EmailThreadModel.connection_id == connection_id,)
-                      if connection_id is not None else ()),
+                    enabled_mail_read,
+                    *(
+                        (EmailThreadModel.connection_id == connection_id,)
+                        if connection_id is not None
+                        else ()
+                    ),
                 )
             )
             if thread is None:
@@ -329,10 +430,32 @@ class GenerateBriefTaskStep:
     ) -> list[dict[str, object]]:
         """选择与用户本地日发生任何重叠的日程，包括当天稍后才开始的事件。"""
         start, end = self._day_bounds(local_date, timezone)
+        # 日历缓存与邮件缓存使用相同的 fail-closed 能力门；EXISTS 保持一条事件只返回
+        # 一次，并把用户归属同时绑定在连接与能力行上。
+        enabled_calendar_read = (
+            select(ConnectionCapabilityModel.id)
+            .join(
+                OAuthConnectionModel,
+                and_(
+                    OAuthConnectionModel.id == ConnectionCapabilityModel.connection_id,
+                    OAuthConnectionModel.user_id == ConnectionCapabilityModel.user_id,
+                ),
+            )
+            .where(
+                OAuthConnectionModel.id == CalendarEventModel.connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.capability == "calendar.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .exists()
+        )
         events = (
             await session.scalars(
                 select(CalendarEventModel).where(
                     CalendarEventModel.user_id == user_id,
+                    enabled_calendar_read,
                     CalendarEventModel.starts_at.is_not(None),
                     CalendarEventModel.ends_at.is_not(None),
                     CalendarEventModel.starts_at < end,
@@ -440,16 +563,25 @@ def build_generate_brief_task_step(
     if settings is None:
         return GenerateBriefTaskStep(session_factory)
 
-    async def sync_source(resource_kind: str, connection_id: UUID, user_id: UUID) -> None:
-        """复用既有只读同步 Worker，连接 ID 仅在本进程内传递且不进入模型输入。"""
+    async def sync_source(
+        resource_kind: str,
+        connection_id: UUID,
+        user_id: UUID,
+        scope_key: str,
+    ) -> None:
+        """复用规范只读同步 Worker，精确 scope 只在受控进程内传递。
+
+        简报刷新不是持久旧任务的兼容读取路径，因此只能新建 ``sync_mail`` 或
+        ``sync_calendar`` 合成租约；历史 ``sync_gmail`` 仍由 ``execute_task`` 路由兼容。
+        """
         from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
-        from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
+        from ai_employee.workers.sync_mail import build_mail_sync_task_step
 
         step = (
-            build_gmail_sync_task_step(
+            build_mail_sync_task_step(
                 session_factory=session_factory, settings=settings, metrics=metrics
             )
-            if resource_kind == "gmail"
+            if resource_kind == "mail"
             else build_calendar_sync_task_step(
                 session_factory=session_factory, settings=settings, metrics=metrics
             )
@@ -459,7 +591,10 @@ def build_generate_brief_task_step(
                 task_id=UUID(int=0),
                 user_id=user_id,
                 kind=f"sync_{resource_kind}",
-                input_payload={"connection_id": str(connection_id)},
+                input_payload={
+                    "connection_id": str(connection_id),
+                    "scope_key": scope_key,
+                },
                 started_at=datetime.now(UTC),
             )
         )

@@ -146,7 +146,8 @@ async def test_retention_role_runs_source_cleanup_and_application_cannot_mutate_
             await session.flush()
             sync_cursor = SyncCursorModel(
                 connection_id=connection.id,
-                resource_kind="gmail",
+                resource_kind="mail",
+                scope_key="mailbox",
                 cursor="synthetic-cursor",
                 last_success_at=datetime.now(UTC),
             )

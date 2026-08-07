@@ -1,6 +1,7 @@
 """把 Task 8 五个固定 Taskiq label 入口连接到应用用例与 PostgreSQL 适配器。"""
 
 import asyncio
+import hashlib
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -28,7 +29,9 @@ from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery imp
     SqlAlchemyApprovalCheckpointRecoveryStore,
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
-from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyConnectedGoogleReader
+from ai_employee.infrastructure.db.repositories.calendar import (
+    SqlAlchemyEnabledSyncScopeReader,
+)
 from ai_employee.infrastructure.db.repositories.diagnostics import SqlAlchemyOverdueBriefReader
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
@@ -147,22 +150,29 @@ async def dispatch_due_briefs() -> None:
 
 @broker.task(schedule=[{"cron": "*/10 * * * *", "schedule_id": "google-incremental-sync"}])
 async def dispatch_google_incremental_syncs() -> None:
-    """每十分钟为每个健康连接创建 Gmail/Calendar 各一个耐久幂等任务。"""
+    """每十分钟为每个 enabled read scope 创建一项耐久幂等同步任务。"""
     now = datetime.now(UTC)
     bucket = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
     creator = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
     )
-    for user_id, connection_id in await SqlAlchemyConnectedGoogleReader(
-        session_factory
-    ).connected_connections():
-        for resource_kind, kind in (("gmail", "sync_gmail"), ("calendar", "sync_calendar")):
-            await creator.execute(
-                user_id=user_id,
-                kind=kind,
-                input_payload={"connection_id": str(connection_id)},
-                idempotency_key=f"sync:google:{connection_id}:{resource_kind}:{bucket.isoformat()}",
-            )
+    for scope in await SqlAlchemyEnabledSyncScopeReader(session_factory).enabled_scopes():
+        kind = "sync_mail" if scope.resource_kind == "mail" else "sync_calendar"
+        # scope 可能是包含帐号标识的 512 字符 opaque ID；任务载荷必须保留精确值，但
+        # 幂等键只使用稳定摘要，既满足列长度上限，也避免在运维界面重复暴露该标识。
+        scope_digest = hashlib.sha256(scope.scope_key.encode("utf-8")).hexdigest()[:16]
+        await creator.execute(
+            user_id=scope.user_id,
+            kind=kind,
+            input_payload={
+                "connection_id": str(scope.connection_id),
+                "scope_key": scope.scope_key,
+            },
+            idempotency_key=(
+                f"sync:{scope.provider}:{scope.connection_id}:{scope.resource_kind}:"
+                f"{scope_digest}:{bucket.isoformat()}"
+            ),
+        )
 
 
 @broker.task(schedule=[{"cron": "0 * * * *", "schedule_id": "expire-sessions"}])

@@ -34,7 +34,7 @@ async def test_stuck_task_probe_groups_only_running_tasks_with_expired_lease(dat
             await session.flush()
             session.add_all(
                 (
-                    TaskRunModel(user_id=user.id, kind="sync_gmail", status=TaskStatus.RUNNING.value, idempotency_key="stuck-gmail", input_payload={}, lease_expires_at=now - timedelta(seconds=1)),
+                    TaskRunModel(user_id=user.id, kind="sync_mail", status=TaskStatus.RUNNING.value, idempotency_key="stuck-mail", input_payload={}, lease_expires_at=now - timedelta(seconds=1)),
                     TaskRunModel(user_id=user.id, kind="daily_brief", status=TaskStatus.RUNNING.value, idempotency_key="stuck-brief", input_payload={}, lease_expires_at=now - timedelta(seconds=1)),
                     TaskRunModel(user_id=user.id, kind="daily_brief", status=TaskStatus.QUEUED.value, idempotency_key="queued", input_payload={}),
                 )
@@ -45,7 +45,7 @@ async def test_stuck_task_probe_groups_only_running_tasks_with_expired_lease(dat
 
         rendered = metrics.render().body.decode()
         assert 'ai_employee_stuck_tasks{kind="daily_brief"} 1.0' in rendered
-        assert 'ai_employee_stuck_tasks{kind="sync_gmail"} 1.0' in rendered
+        assert 'ai_employee_stuck_tasks{kind="sync_mail"} 1.0' in rendered
         assert 'ai_employee_stuck_tasks{kind="queued"}' not in rendered
     finally:
         await sessions.dispose()
@@ -85,7 +85,8 @@ async def test_sync_age_probe_recovers_last_success_without_resetting_failed_att
             session.add(
                 SyncCursorModel(
                     connection_id=connection.id,
-                    resource_kind="gmail",
+                    resource_kind="mail",
+                    scope_key="mailbox",
                     cursor="unchanged-after-failure",
                     last_success_at=now - timedelta(minutes=20),
                     last_attempt_at=now - timedelta(minutes=1),
@@ -97,6 +98,6 @@ async def test_sync_age_probe_recovers_last_success_without_resetting_failed_att
         await refresh_sync_age_metrics(session_factory=sessions, metrics=metrics, now=now)
 
         rendered = metrics.render().body.decode()
-        assert 'ai_employee_sync_age_seconds{provider="google",resource="gmail"} 1200.0' in rendered
+        assert 'ai_employee_sync_age_seconds{provider="google",resource="mail"} 1200.0' in rendered
     finally:
         await sessions.dispose()

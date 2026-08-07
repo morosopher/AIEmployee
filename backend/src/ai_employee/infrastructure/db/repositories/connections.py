@@ -149,7 +149,12 @@ class SqlAlchemyConnectionStore:
         refresh_token: EncryptedValue | None,
         expires_at: datetime,
     ) -> None:
-        """写入记录绑定 token 密文并确保两类初始同步游标存在。"""
+        """写入记录绑定 token 密文并确保两类规范初始同步游标存在。
+
+        0013 已把历史 Gmail 资源原位迁移为 ``mail/mailbox``；OAuth 新建或重连必须复用
+        同一三列唯一键，不能再次创建 ``gmail`` 行把一个邮箱拆成两套恢复位置。Calendar
+        仍保持 M1 可证明的 ``calendar/primary`` 初始作用域。
+        """
         await self._upsert_credential(
             connection_id, user_id, "access_token", access_token, expires_at
         )
@@ -157,11 +162,18 @@ class SqlAlchemyConnectionStore:
             await self._upsert_credential(
                 connection_id, user_id, "refresh_token", refresh_token, None
             )
-        for resource_kind in ("gmail", "calendar"):
+        for resource_kind, scope_key in (
+            ("mail", "mailbox"),
+            ("calendar", "primary"),
+        ):
             # 游标初始行没有应覆盖的业务字段；冲突时保持第一个已提交的同步事实即可。
             await self._session.execute(
                 insert(SyncCursorModel)
-                .values(connection_id=connection_id, resource_kind=resource_kind)
+                .values(
+                    connection_id=connection_id,
+                    resource_kind=resource_kind,
+                    scope_key=scope_key,
+                )
                 .on_conflict_do_nothing(constraint="uq_sync_cursors_connection_resource")
             )
         await self._session.flush()

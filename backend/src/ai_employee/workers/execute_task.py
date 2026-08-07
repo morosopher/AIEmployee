@@ -39,7 +39,7 @@ from ai_employee.workers.observability import (
 )
 from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_deletion_worker
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
-from ai_employee.workers.sync_gmail import build_gmail_sync_task_step
+from ai_employee.workers.sync_mail import build_mail_sync_task_step
 
 RETRY_DELAY_SECONDS = 5
 _MAX_RETRY_JITTER_MICROSECONDS = 1_000_000
@@ -82,6 +82,7 @@ async def initialize_worker_observability(_: object) -> None:
         settings=settings, session_factory=factory, process="worker"
     )
     if _worker_metrics is not None:
+
         async def refresh_worker_health() -> None:
             """在空闲时继续扫描过期租约，保持 Gauge 与数据库事实一致。"""
             await refresh_stuck_task_metrics(
@@ -270,11 +271,11 @@ def build_task_runner_for_session(
         retry_jitter=_bounded_retry_jitter,
         resolve_steps=lambda task: (
             (
-                build_gmail_sync_task_step(
+                build_mail_sync_task_step(
                     session_factory=session_factory, settings=settings, metrics=_worker_metrics
                 ),
             )
-            if task.kind == "sync_gmail"
+            if task.kind in {"sync_mail", "sync_gmail"}
             else (
                 build_calendar_sync_task_step(
                     session_factory=session_factory, settings=settings, metrics=_worker_metrics
@@ -282,11 +283,15 @@ def build_task_runner_for_session(
             )
             if task.kind == "sync_calendar"
             else (
-                build_generate_brief_task_step(session_factory=session_factory, settings=settings, metrics=_worker_metrics),
+                build_generate_brief_task_step(
+                    session_factory=session_factory, settings=settings, metrics=_worker_metrics
+                ),
             )
             if task.kind == "daily_brief"
             else (
-                build_conversation_task_step(session_factory=session_factory, settings=settings, metrics=_worker_metrics),
+                build_conversation_task_step(
+                    session_factory=session_factory, settings=settings, metrics=_worker_metrics
+                ),
             )
             if task.kind == "conversation.respond"
             else (build_overdue_brief_diagnostic_task_step(session_factory=session_factory),)

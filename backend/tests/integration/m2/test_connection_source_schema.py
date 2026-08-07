@@ -14,15 +14,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.infrastructure.db import models as db_models
 from ai_employee.infrastructure.db.alembic import set_alembic_database_url
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
     OAuthAttemptModel,
     OAuthConnectionModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStore
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
+from ai_employee.infrastructure.testing.test_support import (
+    TestSupportFixtureService as SupportFixtureService,
+)
 
 M2_REVISION = "20260806_0011"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -246,6 +252,148 @@ async def test_sync_cursor_allows_distinct_scopes_for_one_resource(database_url:
                 )
             )
         assert cursor_count == 2
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.parametrize(
+    "existing_mail_cursor",
+    (None, "migrated-mail-cursor"),
+    ids=("new-connection", "reconnected-after-0013"),
+)
+@pytest.mark.asyncio
+async def test_connection_token_save_uses_only_canonical_source_cursor_names(
+    database_url: str,
+    existing_mail_cursor: str | None,
+) -> None:
+    """新建和重连都只能保留 ``mail/mailbox`` 与 ``calendar/primary`` 两个游标。
+
+    0013 已把历史 ``gmail`` 行原位迁移为 ``mail``。OAuth 回调若仍创建 Gmail 命名行，
+    重连会把同一邮箱拆成两套恢复位置；本测试同时锁定新连接的规范名称与迁移后重连的
+    游标保真，禁止生产调用方再次制造双游标。
+    """
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            user = _synthetic_user(ordinal=f"canonical-cursors-{existing_mail_cursor is not None}")
+            session.add(user)
+            await session.flush()
+            connection = OAuthConnectionModel(
+                user_id=user.id,
+                provider="google",
+                provider_account_id=f"canonical-cursors-{existing_mail_cursor is not None}",
+                account_email="canonical-cursors@example.test",
+                scopes=[],
+                status="connected",
+                last_error_code=None,
+            )
+            session.add(connection)
+            await session.flush()
+            if existing_mail_cursor is not None:
+                session.add(
+                    SyncCursorModel(
+                        connection_id=connection.id,
+                        resource_kind="mail",
+                        scope_key="mailbox",
+                        cursor=existing_mail_cursor,
+                    )
+                )
+                await session.flush()
+
+            await SqlAlchemyConnectionStore(session).save_connection_tokens(
+                user_id=user.id,
+                connection_id=connection.id,
+                access_token=EncryptedValue(b"synthetic-access", b"a" * 12, 1),
+                refresh_token=None,
+                expires_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+            )
+            connection_id = connection.id
+
+        async with session_factory() as session:
+            cursor_rows = tuple(
+                (
+                    await session.execute(
+                        select(
+                            SyncCursorModel.resource_kind,
+                            SyncCursorModel.scope_key,
+                            SyncCursorModel.cursor,
+                        )
+                        .where(SyncCursorModel.connection_id == connection_id)
+                        .order_by(SyncCursorModel.resource_kind, SyncCursorModel.scope_key)
+                    )
+                ).all()
+            )
+
+        assert cursor_rows == (
+            ("calendar", "primary", None),
+            ("mail", "mailbox", existing_mail_cursor),
+        )
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_test_support_source_uses_canonical_cursors_and_enabled_read_capabilities(
+    database_url: str,
+    tmp_path: Path,
+) -> None:
+    """E2E 合成来源必须满足真实同步仓储的规范游标与 enabled 能力前置条件。"""
+    session_factory = build_session_factory(database_url)
+    master_key_file = tmp_path / "master-key"
+    master_key_file.write_text(
+        "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+        encoding="utf-8",
+    )
+    try:
+        async with session_factory.begin() as session:
+            user = _synthetic_user(ordinal="test-support-source")
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+        service = SupportFixtureService(
+            session_factory,
+            object(),  # type: ignore[arg-type]
+            app_master_key_file=master_key_file,
+        )
+        connection_id = await service.seed_google_source(user_id=user_id)
+
+        async with session_factory() as session:
+            cursor_rows = tuple(
+                (
+                    await session.execute(
+                        select(
+                            SyncCursorModel.resource_kind,
+                            SyncCursorModel.scope_key,
+                            SyncCursorModel.cursor,
+                        )
+                        .where(SyncCursorModel.connection_id == connection_id)
+                        .order_by(SyncCursorModel.resource_kind, SyncCursorModel.scope_key)
+                    )
+                ).all()
+            )
+            capability_rows = tuple(
+                (
+                    await session.execute(
+                        select(
+                            ConnectionCapabilityModel.capability,
+                            ConnectionCapabilityModel.status,
+                            ConnectionCapabilityModel.actual_scopes,
+                        )
+                        .where(ConnectionCapabilityModel.connection_id == connection_id)
+                        .order_by(ConnectionCapabilityModel.capability)
+                    )
+                ).all()
+            )
+
+        assert cursor_rows == (
+            ("calendar", "primary", "synthetic-cursor"),
+            ("mail", "mailbox", "synthetic-cursor"),
+        )
+        assert capability_rows == (
+            ("calendar.read", "enabled", [GOOGLE_CALENDAR_READ_SCOPE]),
+            ("mail.read", "enabled", [GOOGLE_GMAIL_READ_SCOPE]),
+        )
     finally:
         await session_factory.dispose()
 

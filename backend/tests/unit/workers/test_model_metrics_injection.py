@@ -36,7 +36,7 @@ def test_model_task_builders_forward_worker_metrics_to_gateway(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource_kind", ("gmail", "calendar"))
+@pytest.mark.parametrize("resource_kind", ("mail", "calendar"))
 async def test_daily_brief_internal_sync_forwards_worker_metrics(
     monkeypatch: pytest.MonkeyPatch, resource_kind: str
 ) -> None:
@@ -56,9 +56,9 @@ async def test_daily_brief_internal_sync_forwards_worker_metrics(
         return SyncStep()
 
     monkeypatch.setattr(generate_brief, "build_model_gateway", lambda *_args, **_kwargs: object())
-    from ai_employee.workers import sync_calendar, sync_gmail
+    from ai_employee.workers import sync_calendar, sync_mail
 
-    monkeypatch.setattr(sync_gmail, "build_gmail_sync_task_step", build_sync_step)
+    monkeypatch.setattr(sync_mail, "build_mail_sync_task_step", build_sync_step)
     monkeypatch.setattr(sync_calendar, "build_calendar_sync_task_step", build_sync_step)
     step = generate_brief.build_generate_brief_task_step(
         session_factory=object(),
@@ -67,6 +67,11 @@ async def test_daily_brief_internal_sync_forwards_worker_metrics(
     )
 
     assert step._sync_source is not None
-    await step._sync_source(resource_kind, uuid4(), uuid4())
+    await step._sync_source(
+        resource_kind,
+        uuid4(),
+        uuid4(),
+        "mailbox" if resource_kind == "mail" else "primary",
+    )
 
     assert captured == [worker_metrics]

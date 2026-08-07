@@ -9,12 +9,13 @@ import pytest
 from redis.asyncio import Redis
 from sqlalchemy import select
 
-from ai_employee.api.routers.test_support import TestScenarioStore
+from ai_employee.api.routers.test_support import TestScenarioStore as ScenarioStore
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, LLMInvocationModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
@@ -22,7 +23,7 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import OutboxEventModel, TaskRunModel
-from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepositoryFactory
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepositoryFactory
 from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.queue.redis_url import RedisTestUrl
@@ -36,7 +37,7 @@ from ai_employee.integrations.google.gmail import GmailAdapter
 from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.generate_brief import GenerateBriefTaskStep
 from ai_employee.workers.sync_calendar import CalendarSyncTaskStep
-from ai_employee.workers.sync_gmail import GmailSyncTaskStep
+from ai_employee.workers.sync_mail import MailSyncTaskStep
 
 
 @pytest.mark.asyncio
@@ -53,7 +54,7 @@ async def test_gmail_429_honors_retry_after() -> None:
 
 @pytest.mark.asyncio
 async def test_google_revocation_is_persisted_as_degraded_connection(database_url: str) -> None:
-    """Gmail 与 Calendar 共用凭据仓储时必须写出同一可见撤销状态。"""
+    """邮件与 Calendar 共用凭据仓储时必须写出同一可见撤销状态。"""
     sessions = build_session_factory(database_url)
     user_id, connection_id = uuid4(), uuid4()
     try:
@@ -80,7 +81,7 @@ async def test_google_revocation_is_persisted_as_degraded_connection(database_ur
                     last_error_code=None,
                 )
             )
-        async with SqlAlchemyGmailSyncRepositoryFactory(sessions)() as store:
+        async with SqlAlchemyMailSyncRepositoryFactory(sessions)() as store:
             await store.mark_expired(user_id=user_id, connection_id=connection_id)
         async with sessions() as session:
             connection = await session.scalar(
@@ -103,7 +104,7 @@ async def test_gmail_429_persists_retry_scheduled_outbox_through_fake_reader(
     user_id, connection_id, task_id = uuid4(), uuid4(), uuid4()
     cipher = AeadCipher(b"g" * 32)
     redis = Redis.from_url(str(redis_url), decode_responses=False)
-    scenario_store = TestScenarioStore(redis)
+    scenario_store = ScenarioStore(redis)
     fixture = Path(__file__).parents[2] / "contract" / "fixtures" / "gmail_initial.json"
 
     try:
@@ -156,21 +157,34 @@ async def test_gmail_429_persists_retry_scheduled_outbox_through_fake_reader(
                         nonce=refresh.nonce,
                         key_version=refresh.key_version,
                     ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="mail.read",
+                        status="enabled",
+                        actual_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+                    ),
                     SyncCursorModel(
-                        connection_id=connection_id, resource_kind="gmail", cursor=None
+                        connection_id=connection_id,
+                        resource_kind="mail",
+                        scope_key="mailbox",
+                        cursor=None,
                     ),
                     TaskRunModel(
                         id=task_id,
                         user_id=user_id,
-                        kind="sync_gmail",
+                        kind="sync_mail",
                         status=TaskStatus.QUEUED.value,
                         idempotency_key=f"gmail-429:{task_id}",
-                        input_payload={"connection_id": str(connection_id)},
+                        input_payload={
+                            "connection_id": str(connection_id),
+                            "scope_key": "mailbox",
+                        },
                     ),
                 )
             )
         await scenario_store.set(user_id=user_id, scenario="gmail_429")
-        step = GmailSyncTaskStep(
+        step = MailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
             oauth=FakeGoogleOAuthClient(),
@@ -210,7 +224,7 @@ async def test_gmail_429_persists_retry_scheduled_outbox_through_fake_reader(
         assert outbox.available_at == now + timedelta(seconds=20)
         assert outbox.deduplication_key == f"task.execute:{task_id}:retry:1"
     finally:
-        await redis.delete(TestScenarioStore.key(user_id=user_id))
+        await redis.delete(ScenarioStore.key(user_id=user_id))
         await redis.aclose()
         await sessions.dispose()
 
@@ -225,7 +239,7 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
     user_id, connection_id, task_id = uuid4(), uuid4(), uuid4()
     cipher = AeadCipher(b"c" * 32)
     redis = Redis.from_url(str(redis_url), decode_responses=False)
-    scenario_store = TestScenarioStore(redis)
+    scenario_store = ScenarioStore(redis)
     fixture = Path(__file__).parents[2] / "contract" / "fixtures" / "calendar_initial.json"
 
     try:
@@ -280,8 +294,20 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
                         key_version=refresh.key_version,
                         token_expires_at=None,
                     ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="calendar.read",
+                        status="enabled",
+                        actual_scopes=[
+                            "https://www.googleapis.com/auth/calendar.readonly"
+                        ],
+                    ),
                     SyncCursorModel(
-                        connection_id=connection_id, resource_kind="calendar", cursor=None
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        scope_key="primary",
+                        cursor=None,
                     ),
                     TaskRunModel(
                         id=task_id,
@@ -289,7 +315,10 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
                         kind="sync_calendar",
                         status=TaskStatus.QUEUED.value,
                         idempotency_key=f"calendar-5xx:{task_id}",
-                        input_payload={"connection_id": str(connection_id)},
+                        input_payload={
+                            "connection_id": str(connection_id),
+                            "scope_key": "primary",
+                        },
                     ),
                 )
             )
@@ -350,7 +379,7 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
         assert retried_task.attempt_count == 2
         assert retried_task.error_code is None
     finally:
-        await redis.delete(TestScenarioStore.key(user_id=user_id))
+        await redis.delete(ScenarioStore.key(user_id=user_id))
         await redis.aclose()
         await sessions.dispose()
 
@@ -367,7 +396,7 @@ async def test_model_invalid_twice_persists_partial_brief_through_real_runner(
     """
     sessions = build_session_factory(database_url)
     redis = Redis.from_url(str(redis_url), decode_responses=False)
-    scenario_store = TestScenarioStore(redis)
+    scenario_store = ScenarioStore(redis)
     now = datetime(2030, 1, 2, 9, tzinfo=UTC)
     user_id, connection_id, task_id = uuid4(), uuid4(), uuid4()
     try:
@@ -409,6 +438,24 @@ async def test_model_invalid_twice_persists_partial_brief_through_real_runner(
             await session.flush()
             session.add_all(
                 (
+                    # 模型故障回归的邮件必须先通过与生产一致的连接能力和新鲜游标门，
+                    # 否则简报应正确拒绝把历史缓存送入 Graph，而不是测试模型修复路径。
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="mail.read",
+                        status="enabled",
+                        actual_scopes=[],
+                        last_verified_at=now,
+                        last_error_code=None,
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="mail",
+                        scope_key="mailbox",
+                        cursor="fresh-model-invalid-mail",
+                        last_success_at=now,
+                    ),
                     EmailMessageModel(
                         user_id=user_id,
                         thread_id=thread.id,
@@ -487,7 +534,7 @@ async def test_model_invalid_twice_persists_partial_brief_through_real_runner(
         assert all(invocation.status == "failed" for invocation in invocations)
         assert all(invocation.error_code == "model_invalid_output" for invocation in invocations)
     finally:
-        await redis.delete(TestScenarioStore.key(user_id=user_id))
+        await redis.delete(ScenarioStore.key(user_id=user_id))
         await redis.aclose()
         await sessions.dispose()
 

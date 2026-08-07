@@ -292,6 +292,81 @@ def _alembic_revisions(database_url: URL) -> set[str]:
     return asyncio.run(read_revisions())
 
 
+def _sync_cursor_rows(
+    database_url: URL,
+) -> tuple[tuple[str, str, str | None], ...]:
+    """读取迁移保真测试所需的资源种类、scope 与 opaque cursor。"""
+
+    async def read_rows() -> tuple[tuple[str, str, str | None], ...]:
+        """按固定 ID 排序读取，避免用 cursor 内容参与测试排序或日志。"""
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                rows = await connection.execute(
+                    text("SELECT resource_kind, scope_key, cursor FROM sync_cursors ORDER BY id")
+                )
+                return tuple((row[0], row[1], row[2]) for row in rows)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_rows())
+
+
+def _seed_provider_neutral_cursor_migration_rows(database_url: URL) -> None:
+    """在 0012 Schema 写入合成连接及三种游标，供 0013 前后逐行比较。"""
+
+    async def seed_rows() -> None:
+        """只向当前测试生成的临时库写入固定合成事实。"""
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO users ("
+                        "id, email, display_name, password_hash, timezone, locale, "
+                        "brief_time, is_active, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000101', "
+                        "'cursor-owner@example.test', 'Cursor Owner', NULL, 'UTC', "
+                        "'zh-CN', '08:00:00', true, now(), now()"
+                        ")"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO oauth_connections ("
+                        "id, user_id, provider, provider_account_id, account_email, scopes, "
+                        "status, last_error_code, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000102', "
+                        "'00000000-0000-0000-0000-000000000101', 'google', "
+                        "'synthetic-cursor-account', 'cursor-owner@example.test', "
+                        "'[]'::jsonb, 'connected', NULL, now(), now()"
+                        ")"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO sync_cursors ("
+                        "id, connection_id, resource_kind, scope_key, cursor"
+                        ") VALUES "
+                        "('00000000-0000-0000-0000-000000000111', "
+                        "'00000000-0000-0000-0000-000000000102', "
+                        "'gmail', 'mailbox', 'synthetic-gmail-cursor'), "
+                        "('00000000-0000-0000-0000-000000000112', "
+                        "'00000000-0000-0000-0000-000000000102', "
+                        "'calendar', 'primary', 'synthetic-calendar-cursor'), "
+                        "('00000000-0000-0000-0000-000000000113', "
+                        "'00000000-0000-0000-0000-000000000102', "
+                        "'directory', 'visible', 'synthetic-directory-cursor')"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_rows())
+
+
 @pytest.mark.filterwarnings("error:Cannot correctly sort tables")
 def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
     empty_migration_database: URL,
@@ -341,7 +416,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260806_0012"}
+    assert _alembic_revisions(empty_migration_database) == {"20260806_0013"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -412,6 +487,39 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         empty_migration_database
     )
     command.check(alembic_config)
+
+
+def test_provider_neutral_cursor_migration_renames_only_gmail_resource_kind(
+    empty_migration_database: URL,
+) -> None:
+    """0013 只重命名 Gmail 资源，逐行保留数量、scope 与 opaque cursor。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260806_0012")
+    _seed_provider_neutral_cursor_migration_rows(empty_migration_database)
+    before = _sync_cursor_rows(empty_migration_database)
+
+    command.upgrade(alembic_config, "20260806_0013")
+    after = _sync_cursor_rows(empty_migration_database)
+
+    assert len(after) == len(before) == 3
+    assert tuple((scope, cursor) for _, scope, cursor in after) == tuple(
+        (scope, cursor) for _, scope, cursor in before
+    )
+    assert before == (
+        ("gmail", "mailbox", "synthetic-gmail-cursor"),
+        ("calendar", "primary", "synthetic-calendar-cursor"),
+        ("directory", "visible", "synthetic-directory-cursor"),
+    )
+    assert after == (
+        ("mail", "mailbox", "synthetic-gmail-cursor"),
+        ("calendar", "primary", "synthetic-calendar-cursor"),
+        ("directory", "visible", "synthetic-directory-cursor"),
+    )
 
 
 def test_checkpoint_migration_matches_langgraph_setup_contract(

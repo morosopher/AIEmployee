@@ -50,7 +50,7 @@ class NoopDispatcher:
 
 @pytest.mark.asyncio
 async def test_second_batch_write_failure_rolls_back_all_task_facts(database_url: str) -> None:
-    """第二项失败时 Gmail TaskRun、审计、Outbox 也不能残留在 PostgreSQL。"""
+    """第二项失败时邮件 TaskRun、审计、Outbox 也不能残留在 PostgreSQL。"""
     sessions = build_session_factory(database_url)
     try:
         async with sessions.begin() as session:
@@ -78,7 +78,9 @@ async def test_second_batch_write_failure_rolls_back_all_task_facts(database_url
                 user_id=user_id,
                 items=(
                     CreateTaskBatchItem(
-                        "sync_gmail", {"connection_id": "synthetic"}, "batch:gmail"
+                        "sync_mail",
+                        {"connection_id": "synthetic", "scope_key": "mailbox"},
+                        "batch:gmail",
                     ),
                     CreateTaskBatchItem(
                         "sync_calendar", {"connection_id": "synthetic"}, "batch:calendar"

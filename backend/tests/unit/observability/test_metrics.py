@@ -94,10 +94,10 @@ def test_sync_freshness_age_advances_from_last_success_at_scrape_time() -> None:
 def test_clearing_stuck_metrics_resets_previously_seen_kind() -> None:
     """后续扫描没有过期任务时，旧 kind 必须归零而不能保留陈旧告警。"""
     metrics = create_metrics()
-    metrics.record_stuck_tasks(kind="sync_gmail", count=2)
+    metrics.record_stuck_tasks(kind="sync_mail", count=2)
     metrics.clear_stuck_tasks(active_kinds=set())
 
-    assert 'ai_employee_stuck_tasks{kind="sync_gmail"} 0.0' in metrics.render().body.decode("utf-8")
+    assert 'ai_employee_stuck_tasks{kind="sync_mail"} 0.0' in metrics.render().body.decode("utf-8")
 
 
 @pytest.mark.asyncio
