@@ -172,7 +172,11 @@ class ConnectionStore(Protocol):
         account_email: str,
         scopes: frozenset[str],
     ) -> UUID:
-        """按规范账户键 upsert；tenant/type 不一致时拒绝，并确保四项能力行存在。"""
+        """按规范账户键建立或合并连接，并确保四项能力行存在。
+
+        同一用户的 connected 同身份 callback 合并实际 scope 并保留未请求能力；新建或
+        非 connected 连接则从本次 token 事实精确重置，tenant/type 不一致时拒绝。
+        """
         ...
 
     async def update_connection_scopes(

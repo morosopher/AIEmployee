@@ -4,7 +4,7 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -232,67 +232,121 @@ class SqlAlchemyConnectionStore:
         account_email: str,
         scopes: frozenset[str],
     ) -> UUID:
-        """原子 upsert 供应商连接，并把首次/重连能力基线收敛为 disabled。
+        """按规范账户键安全建立或合并连接，并初始化/保留能力行。
 
         ``provider_account_id`` 必须是 adapter 已规范化的稳定键；Task 10 会把 tenant 与
-        Graph user ID 同时编码到该键中。两个 OAuth state 可以并发映射到同一规范键，但
-        tenant/type 是键对应的不可变身份事实：冲突更新只在两者完全一致时刷新邮箱、scope
-        和状态，否则 PostgreSQL 原子拒绝更新，避免 token 静默改绑到另一身份。该端口只由
-        targetless 首次 OAuth callback 使用；命中断开后的旧连接时，四项能力行必须重置，
-        随后应用层只按本次冻结读取意图重新启用，不能让历史写能力越过新 scope 复活。
+        Graph user ID 同时编码到该键中。两个 OAuth state 可以并发映射到同一规范键，因此
+        这里先锁定已有连接，再处理竞争插入：同一用户、供应商和账户键的事务会在连接行锁
+        上串行化，后到的 connected callback 可以把 disjoint scope 合并，而不会覆盖先到
+        的能力事实。tenant/type 是不可变身份事实，任何不一致都 fail closed。
+
+        targetless callback 命中 ``disconnected``（或其他非 connected）连接时仍执行精确
+        reset：历史能力和 scope 不能越过断开重新复活。只有已经 connected 的同身份连接
+        走并集合并，并对既有 capability 行使用 ``DO NOTHING``，由应用层随后只更新本次
+        requested capabilities。
         """
-        statement = insert(OAuthConnectionModel).values(
-            user_id=user_id,
-            provider=provider,
-            provider_account_id=provider_account_id,
-            provider_tenant_id=provider_tenant_id,
-            account_type=account_type,
-            account_email=account_email,
-            scopes=_ordered_scopes(scopes),
-            status=ConnectionStatus.CONNECTED.value,
+        ordered_scopes = _ordered_scopes(scopes)
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.provider == provider,
+                OAuthConnectionModel.provider_account_id == provider_account_id,
+            )
+            .with_for_update()
         )
-        connection_id = await self._session.scalar(
-            statement.on_conflict_do_update(
-                constraint="uq_oauth_connections_user_provider_account",
-                set_={
-                    "account_email": statement.excluded.account_email,
-                    "scopes": statement.excluded.scopes,
-                    "status": ConnectionStatus.CONNECTED.value,
-                    "last_error_code": None,
-                },
-                where=and_(
-                    OAuthConnectionModel.provider_tenant_id
-                    == statement.excluded.provider_tenant_id,
-                    OAuthConnectionModel.account_type == statement.excluded.account_type,
-                ),
-            ).returning(OAuthConnectionModel.id)
-        )
-        if connection_id is None:
+        inserted = False
+        if connection is None:
+            # 先查后插无法独占不存在的唯一键；DO NOTHING 让并发插入等待持有者提交，
+            # 随后重新按同一用户范围加行锁读取，避免重复连接或绕过身份核对。
+            statement = insert(OAuthConnectionModel).values(
+                user_id=user_id,
+                provider=provider,
+                provider_account_id=provider_account_id,
+                provider_tenant_id=provider_tenant_id,
+                account_type=account_type,
+                account_email=account_email,
+                scopes=ordered_scopes,
+                status=ConnectionStatus.CONNECTED.value,
+            )
+            inserted_id = await self._session.scalar(
+                statement.on_conflict_do_nothing(
+                    constraint="uq_oauth_connections_user_provider_account"
+                ).returning(OAuthConnectionModel.id)
+            )
+            if inserted_id is not None:
+                connection = await self._session.scalar(
+                    select(OAuthConnectionModel)
+                    .where(
+                        OAuthConnectionModel.id == inserted_id,
+                        OAuthConnectionModel.user_id == user_id,
+                    )
+                    .with_for_update()
+                )
+                inserted = True
+            else:
+                connection = await self._session.scalar(
+                    select(OAuthConnectionModel)
+                    .where(
+                        OAuthConnectionModel.user_id == user_id,
+                        OAuthConnectionModel.provider == provider,
+                        OAuthConnectionModel.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                )
+        if connection is None:
+            # 唯一键冲突后行被并发删除/回滚属于数据库不变量故障，不能静默创建第二个事实。
+            raise RuntimeError("OAuth connection disappeared during identity upsert")
+        if (
+            connection.provider_tenant_id != provider_tenant_id
+            or connection.account_type != account_type
+        ):
             raise ConnectionIdentityConflictError
+
+        preserve_connected_state = (
+            not inserted and connection.status == ConnectionStatus.CONNECTED.value
+        )
+        connection.account_email = account_email
+        connection.last_error_code = None
+        if preserve_connected_state:
+            # 同一规范账户的首次授权可能各自只拿到一个读取 scope；连接事实保存并集，
+            # 让后续 callback 的 requested 能力逐项写入，而不抹掉并发事务已经确认的行。
+            connection.scopes = _ordered_scopes(frozenset(connection.scopes) | scopes)
+        else:
+            # 新建行已带入本次 scope；断开/过期等旧状态必须从本次 token 事实重新开始。
+            connection.scopes = ordered_scopes
+            connection.status = ConnectionStatus.CONNECTED.value
 
         for capability in ConnectionCapability:
             capability_statement = insert(ConnectionCapabilityModel).values(
                 user_id=user_id,
-                connection_id=connection_id,
+                connection_id=connection.id,
                 capability=capability.value,
                 status=CapabilityStatus.DISABLED.value,
                 actual_scopes=[],
                 last_verified_at=None,
                 last_error_code=None,
             )
-            await self._session.execute(
-                capability_statement.on_conflict_do_update(
-                    constraint="uq_connection_capabilities_user_connection_capability",
-                    set_={
-                        "status": CapabilityStatus.DISABLED.value,
-                        "actual_scopes": [],
-                        "last_verified_at": None,
-                        "last_error_code": None,
-                    },
+            if preserve_connected_state:
+                await self._session.execute(
+                    capability_statement.on_conflict_do_nothing(
+                        constraint="uq_connection_capabilities_user_connection_capability"
+                    )
                 )
-            )
+            else:
+                await self._session.execute(
+                    capability_statement.on_conflict_do_update(
+                        constraint="uq_connection_capabilities_user_connection_capability",
+                        set_={
+                            "status": CapabilityStatus.DISABLED.value,
+                            "actual_scopes": [],
+                            "last_verified_at": None,
+                            "last_error_code": None,
+                        },
+                    )
+                )
         await self._session.flush()
-        return connection_id
+        return connection.id
 
     async def update_connection_scopes(
         self,

@@ -246,6 +246,65 @@ class InitialOAuthAdapter:
         return OAuthRevocationResult(OAuthRevocationStatus.REVOKED)
 
 
+@dataclass(slots=True)
+class DisjointInitialOAuthAdapter:
+    """让两个首次 Google callback 在保存前同时返回互不重叠的读取 scope。"""
+
+    account: OAuthAccount
+    tokens_by_code: dict[str, OAuthTokenSet]
+    provider: OAuthProvider = OAuthProvider.GOOGLE
+    exchange_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_exchange: asyncio.Event = field(default_factory=asyncio.Event)
+    fetch_started: asyncio.Event = field(default_factory=asyncio.Event)
+    release_fetch: asyncio.Event = field(default_factory=asyncio.Event)
+    authorization_states: list[str] = field(default_factory=list)
+    _exchange_count: int = 0
+    _fetch_count: int = 0
+
+    def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
+        """把本次首次授权意图映射为合成 scope，保持能力集合精确。"""
+        return frozenset(f"scope:{capability.value}" for capability in capabilities)
+
+    def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
+        """首次授权测试只需持久化 state，URL 内容不参与断言。"""
+        self.authorization_states.append(request.state)
+        return "https://provider.example.test/authorize"
+
+    async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
+        """等待两个 callback 都消费完 state，确保保存阶段存在并发竞争。"""
+        assert verifier != ""
+        self._exchange_count += 1
+        if self._exchange_count == 2:
+            self.exchange_started.set()
+        await self.release_exchange.wait()
+        return self.tokens_by_code[code]
+
+    async def fetch_account(
+        self,
+        token: OAuthTokenSet,
+        *,
+        expected_nonce_hash: bytes | None,
+    ) -> OAuthAccount:
+        """等待两个 callback 都完成供应商读取，再同时进入本地保存。"""
+        assert token in self.tokens_by_code.values()
+        assert expected_nonce_hash is not None
+        self._fetch_count += 1
+        if self._fetch_count == 2:
+            self.fetch_started.set()
+        await self.release_fetch.wait()
+        return self.account
+
+    async def refresh(self, refresh_token: str) -> OAuthTokenSet:
+        """首次 callback 不刷新 token。"""
+        del refresh_token
+        raise AssertionError("refresh must not be called")
+
+    async def revoke(self, token: str) -> OAuthRevocationResult:
+        """首次连接竞态测试不调用撤销端点。"""
+        del token
+        return OAuthRevocationResult(OAuthRevocationStatus.REVOKED)
+
+
 def _user(email: str) -> UserModel:
     """构造满足当前身份 Schema 的合成用户，不依赖认证或真实个人资料。"""
     return UserModel(
@@ -363,6 +422,110 @@ def _initial_google_adapter(
         exchange_started=exchange_started,
         release_exchange=release_exchange,
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_targetless_google_callbacks_merge_disjoint_read_scopes(
+    database_url: str,
+) -> None:
+    """同一 Google 帐号的并发首次授权必须保留两个互不重叠的读取能力。"""
+    session_factory = build_session_factory(database_url)
+    cipher = AeadCipher(b"w" * 32)
+    email = "concurrent-disjoint-google@example.test"
+    adapter = DisjointInitialOAuthAdapter(
+        account=OAuthAccount(
+            provider_account_id="google-disjoint-subject",
+            account_email=email,
+            provider_tenant_id="",
+            account_type="google",
+        ),
+        tokens_by_code={
+            "mail-code": OAuthTokenSet(
+                access_token="mail-access",
+                refresh_token="mail-refresh",
+                expires_in=3600,
+                granted_scopes=frozenset({"scope:mail.read"}),
+            ),
+            "calendar-code": OAuthTokenSet(
+                access_token="calendar-access",
+                refresh_token="calendar-refresh",
+                expires_in=3600,
+                granted_scopes=frozenset({"scope:calendar.read"}),
+            ),
+        },
+    )
+    try:
+        async with session_factory.begin() as session:
+            user = _user(email)
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+        use_case = ConnectionsUseCase(
+            SqlAlchemyConnectionStoreFactory(session_factory),
+            cipher,
+            {"google": adapter},
+            FixedClock(),
+        )
+        await use_case.start(
+            user_id=user_id,
+            provider=OAuthProvider.GOOGLE,
+            capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+        )
+        mail_state = adapter.authorization_states[-1]
+        await use_case.start(
+            user_id=user_id,
+            provider=OAuthProvider.GOOGLE,
+            capabilities=frozenset({ConnectionCapability.CALENDAR_READ}),
+        )
+        calendar_state = adapter.authorization_states[-1]
+
+        callbacks = asyncio.gather(
+            use_case.callback(code="mail-code", state=mail_state),
+            use_case.callback(code="calendar-code", state=calendar_state),
+        )
+        await asyncio.wait_for(adapter.exchange_started.wait(), timeout=5)
+        adapter.release_exchange.set()
+        await asyncio.wait_for(adapter.fetch_started.wait(), timeout=5)
+        adapter.release_fetch.set()
+        connection_ids = await asyncio.wait_for(callbacks, timeout=5)
+        assert connection_ids[0] == connection_ids[1]
+
+        async with session_factory() as session:
+            connection = await session.get(OAuthConnectionModel, connection_ids[0])
+            rows = tuple(
+                (
+                    await session.scalars(
+                        select(ConnectionCapabilityModel)
+                        .where(ConnectionCapabilityModel.connection_id == connection_ids[0])
+                        .order_by(ConnectionCapabilityModel.capability)
+                    )
+                ).all()
+            )
+
+        assert connection is not None
+        assert set(connection.scopes) == {"scope:mail.read", "scope:calendar.read"}
+        by_capability = {row.capability: row for row in rows}
+        assert by_capability[ConnectionCapability.MAIL_READ.value].status == (
+            CapabilityStatus.ENABLED.value
+        )
+        assert by_capability[ConnectionCapability.CALENDAR_READ.value].status == (
+            CapabilityStatus.ENABLED.value
+        )
+        assert set(by_capability[ConnectionCapability.MAIL_READ.value].actual_scopes) == {
+            "scope:mail.read"
+        }
+        assert set(by_capability[ConnectionCapability.CALENDAR_READ.value].actual_scopes) == {
+            "scope:calendar.read"
+        }
+        assert by_capability[ConnectionCapability.MAIL_SEND.value].status == (
+            CapabilityStatus.DISABLED.value
+        )
+        assert by_capability[ConnectionCapability.CALENDAR_WRITE.value].status == (
+            CapabilityStatus.DISABLED.value
+        )
+    finally:
+        await session_factory.dispose()
 
 
 @pytest.mark.asyncio
