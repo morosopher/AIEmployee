@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.use_cases.connections import (
+    OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
     ConnectionCapabilitySnapshot,
     ConnectionCredentialOwnershipError,
     ConnectionIdentityConflictError,
@@ -535,6 +536,55 @@ class SqlAlchemyConnectionStore:
             )
         await self._session.flush()
         return connection.authorization_generation
+
+    async def mark_progressive_authorization_failed(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        capabilities: frozenset[ConnectionCapability],
+        error_code: str,
+    ) -> None:
+        """在连接行锁与授权代际仍匹配时收敛失败能力，过时回调安全 no-op。
+
+        失败 callback 可能与新一轮授权、能力关闭或断开并发。先锁定连接并检查
+        ``connected``、用户归属和单调代际，再只更新仍为 ``authorizing`` 的本次能力；
+        因而旧失败不能覆盖新状态，也不会抹掉既有实际 scope 快照。
+        """
+        if not capabilities:
+            return
+        if error_code != OAUTH_AUTHORIZATION_FAILED_ERROR_CODE:
+            raise ValueError("progressive authorization failure code is invalid")
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if (
+            connection is None
+            or connection.status != ConnectionStatus.CONNECTED.value
+            or connection.authorization_generation != authorization_generation
+        ):
+            return
+        capability_values = tuple(capability.value for capability in capabilities)
+        await self._session.execute(
+            update(ConnectionCapabilityModel)
+            .where(
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.connection_id == connection_id,
+                ConnectionCapabilityModel.capability.in_(capability_values),
+                ConnectionCapabilityModel.status == CapabilityStatus.AUTHORIZING.value,
+            )
+            .values(
+                status=CapabilityStatus.ACTION_REQUIRED.value,
+                last_error_code=error_code,
+            )
+        )
+        await self._session.flush()
 
     async def ensure_bound_connection_for_callback(
         self,

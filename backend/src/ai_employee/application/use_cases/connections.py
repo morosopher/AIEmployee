@@ -31,9 +31,10 @@ from ai_employee.domain.connections import (
     validate_capability_disable,
     validate_capability_enable,
 )
-from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.errors import DomainError, StateConflictError
 
 OAUTH_ATTEMPT_TTL = timedelta(minutes=10)
+OAUTH_AUTHORIZATION_FAILED_ERROR_CODE = "oauth_authorization_failed"
 _READ_CAPABILITIES = frozenset({ConnectionCapability.MAIL_READ, ConnectionCapability.CALENDAR_READ})
 
 
@@ -227,6 +228,18 @@ class ConnectionStore(Protocol):
         capabilities: frozenset[ConnectionCapability],
     ) -> int:
         """把本次授权并集置为 authorizing，并原子递增授权代际。"""
+        ...
+
+    async def mark_progressive_authorization_failed(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        capabilities: frozenset[ConnectionCapability],
+        error_code: str,
+    ) -> None:
+        """在连接仍处于同一代际时，把本次 authorizing 能力收敛为 action_required。"""
         ...
 
     async def ensure_bound_connection_for_callback(
@@ -678,11 +691,21 @@ class ConnectionsUseCase:
             consumed.verifier,
             self._aad(consumed.user_id, consumed.id, "pkce_verifier"),
         ).decode("ascii")
-        token = await adapter.exchange_code(code=code, verifier=verifier)
-        account = await adapter.fetch_account(
-            token,
-            expected_nonce_hash=consumed.oidc_nonce_hash,
-        )
+        try:
+            token = await adapter.exchange_code(code=code, verifier=verifier)
+            account = await adapter.fetch_account(
+                token,
+                expected_nonce_hash=consumed.oidc_nonce_hash,
+            )
+        except DomainError as error:
+            if isinstance(error, StateConflictError):
+                # StateConflict/OAuthAttemptInvalidated 是本地状态事实，不是供应商授权
+                # 失败；绝不能把新一轮授权或断开竞争误记为本次 action_required。
+                raise
+            # 网络交换、token-info、userinfo 或 nonce 校验失败后，只有 target-bound
+            # 渐进授权需要收敛状态；targetless 首次失败不能创建连接，也没有本地能力行可更新。
+            await self._converge_failed_progressive_authorization(consumed)
+            raise
         return await self._save_tokens_and_capabilities(
             user_id=consumed.user_id,
             attempt_id=consumed.id,
@@ -695,6 +718,30 @@ class ConnectionsUseCase:
             now=now,
             adapter=adapter,
         )
+
+    async def _converge_failed_progressive_authorization(
+        self,
+        consumed: ConsumedOAuthAttempt,
+    ) -> None:
+        """按冻结连接与授权代际安全收敛失败的渐进能力。
+
+        失败 callback 与新授权、能力关闭或断开可能并发；仓储在连接行锁下再次核对
+        ``authorization_generation`` 与 ``connected`` 状态，过时代际只能 no-op，不能把
+        新授权重新覆盖为旧错误。targetless 首次 OAuth 没有连接目标，直接返回。
+        """
+        if (
+            consumed.target_connection_id is None
+            or consumed.target_authorization_generation is None
+        ):
+            return
+        async with self._stores() as store:
+            await store.mark_progressive_authorization_failed(
+                user_id=consumed.user_id,
+                connection_id=consumed.target_connection_id,
+                authorization_generation=consumed.target_authorization_generation,
+                capabilities=consumed.requested_capabilities,
+                error_code=OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+            )
 
     async def _save_tokens_and_capabilities(
         self,

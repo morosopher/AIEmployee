@@ -203,6 +203,204 @@ async def test_callback_marks_missing_requested_read_scope_action_required(
 
 
 @pytest.mark.asyncio
+async def test_progressive_callback_provider_failure_converges_authorizing_state(
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
+) -> None:
+    """真实 PG/API callback 失败后只把同代际渐进能力置为 action_required。"""
+    client, queries, _ = oauth_context
+    async with queries.begin() as session:
+        user = await session.scalar(select(UserModel).where(UserModel.email == "owner@example.com"))
+        assert user is not None
+        store = SqlAlchemyConnectionStore(session)
+        connection_id = await store.ensure_connection(
+            user_id=user.id,
+            provider="google",
+            provider_account_id="failure-convergence-subject",
+            provider_tenant_id="",
+            account_type="google",
+            account_email="failure-convergence@google.example",
+            scopes=frozenset({"openid", "email", "https://www.googleapis.com/auth/gmail.readonly"}),
+        )
+        await store.save_capability_state(
+            user_id=user.id,
+            connection_id=connection_id,
+            capability=ConnectionCapability.MAIL_READ,
+            status=CapabilityStatus.ENABLED,
+            actual_scopes=frozenset(
+                {"openid", "email", "https://www.googleapis.com/auth/gmail.readonly"}
+            ),
+            last_verified_at=datetime(2030, 1, 1, tzinfo=UTC),
+            last_error_code=None,
+        )
+
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
+    )
+    assert login.status_code == 200
+    csrf = client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await client.post(
+        f"/api/v1/connections/{connection_id}/capabilities/mail.send/enable",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.post("https://oauth2.googleapis.com/token").respond(
+            503,
+            text="synthetic provider failure body",
+        )
+        callback = await client.get(
+            "/api/v1/connections/google/callback",
+            params={"code": "failure-convergence-code", "state": query["state"][0]},
+        )
+    assert callback.status_code == 503
+    assert callback.json()["error_code"] == "google_oauth_unavailable"
+
+    async with queries() as session:
+        connection = await session.get(OAuthConnectionModel, connection_id)
+        rows = tuple(
+            (
+                await session.scalars(
+                    select(ConnectionCapabilityModel).where(
+                        ConnectionCapabilityModel.connection_id == connection_id
+                    )
+                )
+            ).all()
+        )
+    assert connection is not None
+    assert connection.status == "connected"
+    by_capability = {row.capability: row for row in rows}
+    for capability in (ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND):
+        row = by_capability[capability.value]
+        assert row.status == CapabilityStatus.ACTION_REQUIRED.value
+        assert row.last_error_code == "oauth_authorization_failed"
+
+
+@pytest.mark.asyncio
+async def test_targetless_callback_failure_does_not_create_connection(
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
+) -> None:
+    """首次 targetless OAuth 失败只返回分类错误，不创建半成品连接。"""
+    client, queries, _ = oauth_context
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
+    )
+    assert login.status_code == 200
+    csrf = client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await client.post("/api/v1/connections/google/start", headers={"X-CSRF-Token": csrf})
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.post("https://oauth2.googleapis.com/token").respond(
+            503,
+            text="synthetic provider failure body",
+        )
+        callback = await client.get(
+            "/api/v1/connections/google/callback",
+            params={"code": "targetless-failure-code", "state": query["state"][0]},
+        )
+    assert callback.status_code == 503
+    assert callback.json()["error_code"] == "google_oauth_unavailable"
+
+    async with queries() as session:
+        connections = tuple((await session.scalars(select(OAuthConnectionModel))).all())
+    assert connections == ()
+
+
+@pytest.mark.asyncio
+async def test_progressive_failure_convergence_noops_for_stale_generation_or_disconnected(
+    database_url: str,
+) -> None:
+    """真实仓储必须拒绝旧代际、断开连接和新授权覆盖当前能力状态。"""
+    sessions = build_session_factory(database_url)
+    try:
+        async with sessions.begin() as session:
+            user = UserModel(
+                email="failure-convergence-owner@example.test",
+                display_name="Failure Convergence Owner",
+                password_hash=None,
+                timezone="UTC",
+                locale="en-US",
+                brief_time=time(8, 0),
+                is_active=True,
+            )
+            session.add(user)
+            await session.flush()
+            store = SqlAlchemyConnectionStore(session)
+            connection_id = await store.ensure_connection(
+                user_id=user.id,
+                provider="google",
+                provider_account_id="failure-convergence-repository-subject",
+                provider_tenant_id="",
+                account_type="google",
+                account_email="failure-convergence-repository@google.example",
+                scopes=frozenset({"openid", "email"}),
+            )
+            connection = await session.get(OAuthConnectionModel, connection_id)
+            assert connection is not None
+            connection.authorization_generation = 4
+            await store.set_capabilities_authorizing(
+                user_id=user.id,
+                connection_id=connection_id,
+                capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+            )
+            current_generation = connection.authorization_generation
+            assert current_generation == 5
+
+        async with sessions.begin() as session:
+            store = SqlAlchemyConnectionStore(session)
+            await store.mark_progressive_authorization_failed(
+                user_id=user.id,
+                connection_id=connection_id,
+                authorization_generation=4,
+                capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+                error_code="oauth_authorization_failed",
+            )
+        async with sessions() as session:
+            row = await session.scalar(
+                select(ConnectionCapabilityModel).where(
+                    ConnectionCapabilityModel.connection_id == connection_id,
+                    ConnectionCapabilityModel.capability == ConnectionCapability.MAIL_READ.value,
+                )
+            )
+            assert row is not None
+            assert row.status == CapabilityStatus.AUTHORIZING.value
+            assert row.last_error_code is None
+
+        async with sessions.begin() as session:
+            connection = await session.get(OAuthConnectionModel, connection_id)
+            assert connection is not None
+            connection.status = "disconnected"
+            connection.authorization_generation = current_generation + 1
+
+        async with sessions.begin() as session:
+            store = SqlAlchemyConnectionStore(session)
+            await store.mark_progressive_authorization_failed(
+                user_id=user.id,
+                connection_id=connection_id,
+                authorization_generation=current_generation + 1,
+                capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+                error_code="oauth_authorization_failed",
+            )
+        async with sessions() as session:
+            row = await session.scalar(
+                select(ConnectionCapabilityModel).where(
+                    ConnectionCapabilityModel.connection_id == connection_id,
+                    ConnectionCapabilityModel.capability == ConnectionCapability.MAIL_READ.value,
+                )
+            )
+            assert row is not None
+            assert row.status == CapabilityStatus.AUTHORIZING.value
+            assert row.last_error_code is None
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
 async def test_callback_normalizes_google_userinfo_email_scope_alias(
     oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
 ) -> None:

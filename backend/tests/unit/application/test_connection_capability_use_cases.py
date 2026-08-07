@@ -21,6 +21,7 @@ from ai_employee.application.ports.oauth import (
 from ai_employee.application.use_cases.connections import (
     ConnectionsUseCase,
     ConsumedOAuthAttempt,
+    OAuthAttemptInvalidatedError,
     OAuthStateRejectedError,
     StoredConnection,
     UnsupportedConnectionProviderError,
@@ -30,6 +31,7 @@ from ai_employee.domain.connections import (
     ConnectionCapability,
     ConnectionCapabilityDependencyConflict,
 )
+from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.security.encryption import AeadCipher
 
 _VALID_OAUTH_STATE = base64.urlsafe_b64encode(b"s" * 32).rstrip(b"=").decode("ascii")
@@ -609,6 +611,8 @@ class CallbackOAuthAdapter:
     provider: OAuthProvider = OAuthProvider.GOOGLE
     expected_nonce_hash: bytes | None = None
     scope_requests: list[frozenset[ConnectionCapability]] = field(default_factory=list)
+    failure_stage: str | None = None
+    failure: Exception | None = None
 
     def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
         """按能力返回逐项可核对的合成 scope。"""
@@ -624,6 +628,9 @@ class CallbackOAuthAdapter:
         """验证 PKCE 明文只在解密后进入 adapter。"""
         assert code == "synthetic-code"
         assert verifier == "synthetic-verifier"
+        if self.failure_stage == "exchange":
+            assert self.failure is not None
+            raise self.failure
         return self.token
 
     async def fetch_account(
@@ -635,6 +642,9 @@ class CallbackOAuthAdapter:
         """记录用例传入的 nonce 摘要并返回规范账户。"""
         assert token is self.token
         self.expected_nonce_hash = expected_nonce_hash
+        if self.failure_stage == "fetch":
+            assert self.failure is not None
+            raise self.failure
         return OAuthAccount(
             provider_account_id="callback-account",
             account_email="callback-account@example.test",
@@ -665,6 +675,12 @@ class CallbackConnectionStore:
     capability_states: dict[ConnectionCapability, tuple[CapabilityStatus, str | None]] = field(
         default_factory=dict
     )
+    failed_authorization: tuple[
+        UUID,
+        int,
+        frozenset[ConnectionCapability],
+        str,
+    ] | None = None
 
     async def consume_attempt(
         self,
@@ -704,6 +720,25 @@ class CallbackConnectionStore:
         """捕获逐能力验证结果。"""
         del values
         self.capability_states[capability] = (status, last_error_code)
+
+    async def mark_progressive_authorization_failed(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        authorization_generation: int,
+        capabilities: frozenset[ConnectionCapability],
+        error_code: str,
+    ) -> None:
+        """记录失败收敛调用，模拟真实仓储的代际条件更新。"""
+        assert user_id == self.attempt.user_id
+        assert connection_id == self.connection_id
+        self.failed_authorization = (
+            connection_id,
+            authorization_generation,
+            capabilities,
+            error_code,
+        )
 
 
 @dataclass(slots=True)
@@ -930,3 +965,156 @@ async def test_callback_marks_missing_scope_action_required_and_keeps_refresh_no
             "connection_scope_missing",
         ),
     }
+
+
+@pytest.mark.asyncio
+async def test_progressive_callback_failure_converges_authorizing_capabilities() -> None:
+    """渐进 callback 在供应商失败后保留原错误并收敛本次能力状态。"""
+    user_id, attempt_id, connection_id = uuid4(), uuid4(), uuid4()
+    cipher = AeadCipher(b"f" * 32)
+    verifier = cipher.encrypt(
+        b"synthetic-verifier",
+        f"{user_id}:{attempt_id}:pkce_verifier".encode("ascii"),
+    )
+    requested = frozenset({ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND})
+    attempt = ConsumedOAuthAttempt(
+        id=attempt_id,
+        user_id=user_id,
+        provider="google",
+        requested_capabilities=requested,
+        verifier=verifier,
+        oidc_nonce_hash=b"n" * 32,
+        target_connection_id=connection_id,
+        target_authorization_generation=7,
+    )
+    store = CallbackConnectionStore(attempt, connection_id)
+
+    @asynccontextmanager
+    async def stores():
+        """让失败收敛事务可被 fake 记录。"""
+        yield store
+
+    failure = TransientProviderError(
+        error_code="google_oauth_timeout",
+        message="safe provider failure",
+    )
+    adapter = CallbackOAuthAdapter(
+        OAuthTokenSet(
+            access_token="synthetic-access",
+            refresh_token=None,
+            expires_in=3600,
+            granted_scopes=frozenset({"scope:mail.read"}),
+        ),
+        failure_stage="exchange",
+        failure=failure,
+    )
+    use_case = ConnectionsUseCase(stores, cipher, {"google": adapter}, FixedClock())
+
+    with pytest.raises(TransientProviderError) as raised:
+        await use_case.callback(code="synthetic-code", state=_VALID_OAUTH_STATE)
+
+    assert raised.value is failure
+    assert store.failed_authorization == (
+        connection_id,
+        7,
+        requested,
+        "oauth_authorization_failed",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    (
+        StateConflictError(
+            error_code="synthetic_state_conflict",
+            message="synthetic state conflict",
+        ),
+        OAuthAttemptInvalidatedError(),
+    ),
+)
+async def test_callback_does_not_converge_state_conflicts_from_adapter(
+    failure: StateConflictError,
+) -> None:
+    """adapter 边界的状态冲突必须原样传播，不能伪装成授权失败。"""
+    user_id, attempt_id, connection_id = uuid4(), uuid4(), uuid4()
+    cipher = AeadCipher(b"g" * 32)
+    verifier = cipher.encrypt(
+        b"synthetic-verifier",
+        f"{user_id}:{attempt_id}:pkce_verifier".encode("ascii"),
+    )
+    attempt = ConsumedOAuthAttempt(
+        id=attempt_id,
+        user_id=user_id,
+        provider="google",
+        requested_capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+        verifier=verifier,
+        oidc_nonce_hash=b"n" * 32,
+        target_connection_id=connection_id,
+        target_authorization_generation=8,
+    )
+    store = CallbackConnectionStore(attempt, connection_id)
+
+    @asynccontextmanager
+    async def stores():
+        """让 callback 的补偿调用可被断言。"""
+        yield store
+
+    adapter = CallbackOAuthAdapter(
+        OAuthTokenSet(
+            access_token="synthetic-access",
+            refresh_token=None,
+            expires_in=3600,
+            granted_scopes=frozenset({"scope:mail.read"}),
+        ),
+        failure_stage="exchange",
+        failure=failure,
+    )
+    use_case = ConnectionsUseCase(stores, cipher, {"google": adapter}, FixedClock())
+
+    with pytest.raises(StateConflictError) as raised:
+        await use_case.callback(code="synthetic-code", state=_VALID_OAUTH_STATE)
+
+    assert raised.value is failure
+    assert store.failed_authorization is None
+
+
+@pytest.mark.asyncio
+async def test_callback_does_not_converge_when_adapter_lookup_fails() -> None:
+    """未知或未装配 provider 在 lookup 阶段失败时不应触发渐进状态补偿。"""
+    user_id, attempt_id, connection_id = uuid4(), uuid4(), uuid4()
+    cipher = AeadCipher(b"h" * 32)
+    verifier = cipher.encrypt(
+        b"synthetic-verifier",
+        f"{user_id}:{attempt_id}:pkce_verifier".encode("ascii"),
+    )
+    attempt = ConsumedOAuthAttempt(
+        id=attempt_id,
+        user_id=user_id,
+        provider="microsoft",
+        requested_capabilities=frozenset({ConnectionCapability.MAIL_READ}),
+        verifier=verifier,
+        oidc_nonce_hash=b"n" * 32,
+        target_connection_id=connection_id,
+        target_authorization_generation=9,
+    )
+    store = CallbackConnectionStore(attempt, connection_id)
+
+    @asynccontextmanager
+    async def stores():
+        """让 callback 的补偿调用可被断言。"""
+        yield store
+
+    use_case = ConnectionsUseCase(stores, cipher, {"google": CallbackOAuthAdapter(
+        OAuthTokenSet(
+            access_token="synthetic-access",
+            refresh_token=None,
+            expires_in=3600,
+            granted_scopes=frozenset({"scope:mail.read"}),
+        )
+    )}, FixedClock())
+
+    with pytest.raises(UnsupportedConnectionProviderError):
+        await use_case.callback(code="synthetic-code", state=_VALID_OAUTH_STATE)
+
+    assert store.failed_authorization is None
