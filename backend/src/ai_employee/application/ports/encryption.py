@@ -19,3 +19,7 @@ class Encryption(Protocol):
     def encrypt(self, plaintext: bytes, aad: bytes) -> EncryptedValue:
         """返回与 AAD 绑定的密文、随机 nonce 和密钥版本。"""
         ...
+
+    def decrypt(self, value: EncryptedValue, aad: bytes) -> bytes:
+        """仅在密文、nonce 与 AAD 全部通过认证时返回原始字节。"""
+        ...
