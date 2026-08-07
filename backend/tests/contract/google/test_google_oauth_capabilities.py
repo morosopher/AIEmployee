@@ -1,6 +1,13 @@
 """Google 渐进授权适配器的脱敏供应商契约测试。"""
 
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -14,6 +21,7 @@ from ai_employee.domain.errors import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.infrastructure.observability.logging import configure_http_client_logging
 from ai_employee.integrations.google.oauth import (
     GOOGLE_BASE_SCOPES,
     GOOGLE_REVOKE_URL,
@@ -183,6 +191,424 @@ async def test_missing_token_scope_uses_token_info_boundary() -> None:
             "email",
             "https://www.googleapis.com/auth/calendar.readonly",
         }
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_oauth_request_logs_never_contain_credentials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """直接导入适配器时，HTTPX/HTTPCore 请求记录也不得输出任何 OAuth 凭据。"""
+    access_token = "synthetic-log-access-token"
+    id_token = "synthetic-log-id-token"
+    authorization_value = "Bearer synthetic-log-authorization"
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": access_token,
+                "expires_in": 3600,
+                "id_token": id_token,
+            },
+        )
+    )
+    respx.get(GOOGLE_TOKEN_INFO_URL).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={"scope": "openid email https://www.googleapis.com/auth/calendar.readonly"},
+            ),
+            httpx.Response(200, json={"nonce": "synthetic-log-nonce"}),
+        ]
+    )
+    respx.get("https://openidconnect.googleapis.com/v1/userinfo").mock(
+        return_value=httpx.Response(
+            200,
+            json={"sub": "synthetic-log-subject", "email": "owner@example.test"},
+        )
+    )
+
+    caplog.set_level(logging.INFO)
+    caplog.clear()
+    adapter = _adapter()
+    token = await adapter.exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+    await adapter.fetch_account(
+        token,
+        expected_nonce_hash=sha256(b"synthetic-log-nonce").digest(),
+    )
+    # 模拟第三方 logger 未来在异常或调试模式下记录 Authorization/header；安全默认必须
+    # 统一阻断，而不能只针对当前 HTTPX INFO 模板做字符串替换。
+    logging.getLogger("httpx").warning(
+        "HTTP Request: GET %s Authorization: %s id_token=%s",
+        f"{GOOGLE_TOKEN_INFO_URL}?id_token={id_token}",
+        authorization_value,
+        id_token,
+    )
+    logging.getLogger("httpcore.http11").warning(
+        "send_request_headers Authorization: %s", authorization_value
+    )
+    logging.getLogger("ai_employee.test").info("safe-structured-event")
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+
+    assert access_token not in rendered
+    assert id_token not in rendered
+    assert authorization_value not in rendered
+    assert "access_token=" not in rendered
+    assert "id_token=" not in rendered
+    assert any(record.name == "ai_employee.test" for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("namespace", "child_suffix"),
+    (("httpx", "_client"), ("httpcore", "http11")),
+)
+def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_handlers(
+    namespace: str,
+    child_suffix: str,
+) -> None:
+    """预先注册的第三方 handler 仍可接收记录，但只能看到固定安全事件。"""
+
+    class RecordingHandler(logging.Handler):
+        """记录 handler 实际接收的文本，验证每个第三方 sink 都得到安全事件。"""
+
+        def __init__(self) -> None:
+            """初始化空的合成记录列表。"""
+            super().__init__()
+            self.messages: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存格式化前消息，避免测试依赖 stdout/stderr。"""
+            self.messages.append(record.getMessage())
+
+    parent_logger = logging.getLogger(namespace)
+    child_name = f"{namespace}.{child_suffix}"
+    manager = logging.Logger.manager
+    child_entry = manager.loggerDict.get(child_name)
+    child_logger = logging.getLogger(child_name)
+    logger_states = {
+        logger: (
+            logger.level,
+            logger.propagate,
+            logger.disabled,
+            logger.handlers[:],
+            logger.filters[:],
+        )
+        for logger in (parent_logger, child_logger)
+    }
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    parent_sink = RecordingHandler()
+    child_sink = RecordingHandler()
+    parent_logger.addHandler(parent_sink)
+    child_logger.addHandler(child_sink)
+    try:
+        configure_http_client_logging()
+        child_logger.setLevel(logging.INFO)
+        child_logger.warning(
+            "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-handler-token"
+        )
+        assert parent_sink.messages == ["http_client_event"]
+        assert child_sink.messages == ["http_client_event"]
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        logging.Logger.makeRecord = original_make_record
+        for logger, state in logger_states.items():
+            for handler in tuple(logger.handlers):
+                logger.removeHandler(handler)
+            for handler in state[3]:
+                logger.addHandler(handler)
+            logger.setLevel(state[0])
+            logger.propagate = state[1]
+            logger.disabled = state[2]
+            logger.filters[:] = state[4]
+        if child_entry is None:
+            manager.loggerDict.pop(child_name, None)
+        else:
+            manager.loggerDict[child_name] = child_entry
+
+
+def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> None:
+    """记录级边界覆盖新子 logger、extra、异常和并发重复初始化。"""
+
+    class RecordingHandler(logging.Handler):
+        """保留 sink 接收的消息，确保断言覆盖每个 handler。"""
+
+        def __init__(self) -> None:
+            """初始化空消息列表。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存消息而不调用未知对象的格式化逻辑。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+
+    namespace = "httpx"
+    child_name = "httpx.future_sensitive_child"
+    app_name = "ai_employee.logging_boundary_test"
+    manager = logging.Logger.manager
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_entries = {
+        name: entry
+        for name, entry in tuple(manager.loggerDict.items())
+        if name == namespace or name.startswith(f"{namespace}.")
+    }
+    original_states: dict[
+        str,
+        tuple[int, bool, bool, list[logging.Handler], list[logging.Filter]],
+    ] = {}
+    for name, entry in original_entries.items():
+        if isinstance(entry, logging.Logger):
+            original_states[name] = (
+                entry.level,
+                entry.propagate,
+                entry.disabled,
+                entry.handlers[:],
+                entry.filters[:],
+            )
+    parent_logger = logging.getLogger(namespace)
+    app_entry = manager.loggerDict.get(app_name)
+    app_logger = logging.getLogger(app_name)
+    app_state = (
+        app_logger.level,
+        app_logger.propagate,
+        app_logger.disabled,
+        app_logger.handlers[:],
+        app_logger.filters[:],
+    )
+    parent_sink = RecordingHandler()
+    child_sink = RecordingHandler()
+    reattached_sink = RecordingHandler()
+    app_sink = RecordingHandler()
+    parent_logger.addHandler(parent_sink)
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+    app_logger.addHandler(app_sink)
+    try:
+        configure_http_client_logging()
+        # 该 child 在 helper 完成后才创建，模拟供应商未来新增 logger 并自行挂载 handler。
+        child_logger = logging.getLogger(child_name)
+        child_logger.setLevel(logging.INFO)
+        child_logger.propagate = True
+        child_logger.addHandler(child_sink)
+        try:
+            raise RuntimeError("Authorization: Bearer synthetic-record-exception")
+        except RuntimeError:
+            child_logger.warning(
+                "HTTP Request: GET %s Authorization: %s",
+                "https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-record-token",
+                "Bearer synthetic-record-header",
+                extra={
+                    "authorization": "Bearer synthetic-extra-secret",
+                    "opaque": "synthetic-extra-token",
+                },
+                exc_info=True,
+                stack_info=True,
+            )
+
+        # helper 完成后再挂第二个 handler，模拟第三方运行时自行扩展 sink；所有 handler
+        # 共享同一条已清理的记录，且不会把 extra 中的 token/header 原样序列化。
+        child_logger.addHandler(reattached_sink)
+        try:
+            raise RuntimeError("Cookie: synthetic-reconfigured-cookie")
+        except RuntimeError:
+            child_logger.warning(
+                "HTTP Request: GET %s Authorization: %s",
+                "https://oauth2.googleapis.com/tokeninfo?id_token=synthetic-record-id",
+                "Bearer synthetic-record-header",
+                extra={
+                    "authorization": "Bearer synthetic-reconfigured-extra-secret",
+                    "opaque": "synthetic-reconfigured-extra-token",
+                },
+                exc_info=True,
+            )
+
+        def configure_repeatedly(_index: int) -> None:
+            """并发重复配置只验证不抛错，不改变业务状态。"""
+            for _ in range(20):
+                configure_http_client_logging()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(configure_repeatedly, range(4)))
+
+        all_http_messages = (
+            parent_sink.messages
+            + child_sink.messages
+            + reattached_sink.messages
+        )
+        assert all_http_messages
+        assert set(all_http_messages) == {"http_client_event"}
+        all_http_snapshots = parent_sink.snapshots + child_sink.snapshots + reattached_sink.snapshots
+        assert all(
+            secret not in snapshot
+            for snapshot in all_http_snapshots
+            for secret in (
+                "synthetic-record-token",
+                "synthetic-record-header",
+                "synthetic-extra-secret",
+                "synthetic-extra-token",
+                "synthetic-reconfigured-extra-secret",
+                "synthetic-reconfigured-extra-token",
+                "synthetic-record-exception",
+                "synthetic-reconfigured-cookie",
+            )
+        )
+        app_logger.info(
+            "safe-application-event",
+            extra={"application_marker": "synthetic-app-extra"},
+        )
+        assert app_sink.messages == ["safe-application-event"]
+        assert any("synthetic-app-extra" in snapshot for snapshot in app_sink.snapshots)
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        logging.Logger.makeRecord = original_make_record
+        for logger in (app_logger,):
+            for handler in tuple(logger.handlers):
+                logger.removeHandler(handler)
+            for handler in app_state[3]:
+                logger.addHandler(handler)
+            logger.setLevel(app_state[0])
+            logger.propagate = app_state[1]
+            logger.disabled = app_state[2]
+            logger.filters[:] = app_state[4]
+        for name, _entry in tuple(manager.loggerDict.items()):
+            if (
+                name == namespace or name.startswith(f"{namespace}.")
+            ) and name not in original_entries:
+                manager.loggerDict.pop(name, None)
+        for name, entry in original_entries.items():
+            manager.loggerDict[name] = entry
+            state = original_states.get(name)
+            if state is not None and isinstance(entry, logging.Logger):
+                for handler in tuple(entry.handlers):
+                    entry.removeHandler(handler)
+                for handler in state[3]:
+                    entry.addHandler(handler)
+                entry.setLevel(state[0])
+                entry.propagate = state[1]
+                entry.disabled = state[2]
+                entry.filters[:] = state[4]
+        if app_entry is None:
+            manager.loggerDict.pop(app_name, None)
+        else:
+            manager.loggerDict[app_name] = app_entry
+
+
+def test_http_client_log_record_scrub_survives_dict_config_and_last_resort_in_subprocess() -> None:
+    """在隔离进程验证 dictConfig/lastResort，避免污染 pytest 进程的 logging 全局状态。"""
+    script = textwrap.dedent(
+        """
+        import io
+        import logging
+        import logging.config
+
+        from ai_employee.infrastructure.observability.logging import configure_http_client_logging
+
+        configure_http_client_logging()
+        child_name = "httpx.subprocess_sensitive_child"
+        configured_stream = io.StringIO()
+        logging.config.dictConfig(
+            {
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {
+                    "plain": {
+                        "format": "%(message)s %(authorization)s %(opaque)s",
+                        "defaults": {"authorization": None, "opaque": None},
+                    }
+                },
+                "handlers": {
+                    "configured_sink": {
+                        "class": "logging.StreamHandler",
+                        "stream": configured_stream,
+                        "formatter": "plain",
+                    }
+                },
+                "loggers": {
+                    child_name: {
+                        "handlers": ["configured_sink"],
+                        "level": "INFO",
+                        "propagate": False,
+                    }
+                },
+                "root": {"handlers": [], "level": "WARNING"},
+            }
+        )
+        child_logger = logging.getLogger(child_name)
+        try:
+            raise RuntimeError("Authorization: synthetic-subprocess-exception")
+        except RuntimeError:
+            child_logger.warning(
+                "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-subprocess-token",
+                extra={
+                    "authorization": "Bearer synthetic-subprocess-extra-secret",
+                    "opaque": "synthetic-subprocess-extra-token",
+                },
+                exc_info=True,
+                stack_info=True,
+            )
+
+        for handler in tuple(child_logger.handlers):
+            child_logger.removeHandler(handler)
+        last_resort_stream = io.StringIO()
+        logging.lastResort = logging.StreamHandler(last_resort_stream)
+        logging.lastResort.setLevel(logging.INFO)
+        logging.lastResort.setFormatter(
+            logging.Formatter(
+                "%(message)s %(authorization)s %(opaque)s",
+                defaults={"authorization": None, "opaque": None},
+            )
+        )
+        try:
+            raise RuntimeError("Cookie: synthetic-last-resort-exception")
+        except RuntimeError:
+            child_logger.warning(
+                "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?id_token=synthetic-last-resort-token",
+                extra={
+                    "authorization": "Bearer synthetic-last-resort-extra-secret",
+                    "opaque": "synthetic-last-resort-extra-token",
+                },
+                exc_info=True,
+                stack_info=True,
+            )
+
+        print("configured=" + configured_stream.getvalue().replace("\\n", "|"))
+        print("last_resort=" + last_resort_stream.getvalue().replace("\\n", "|"))
+        """
+    )
+    source_root = Path(__file__).resolve().parents[3] / "src"
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(source_root), existing_pythonpath) if path
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    rendered = completed.stdout + completed.stderr
+    assert "http_client_event" in completed.stdout
+    assert all(
+        secret not in rendered
+        for secret in (
+            "synthetic-subprocess-token",
+            "synthetic-subprocess-extra-secret",
+            "synthetic-subprocess-extra-token",
+            "synthetic-subprocess-exception",
+            "synthetic-last-resort-token",
+            "synthetic-last-resort-extra-secret",
+            "synthetic-last-resort-extra-token",
+            "synthetic-last-resort-exception",
+        )
     )
 
 
