@@ -50,6 +50,7 @@ from ai_employee.domain.identity import AuthenticatedSession
 from ai_employee.integrations.google.oauth import (
     GOOGLE_SCOPES,
     GoogleAccount,
+    GoogleOAuthAdapter,
     GoogleTokenResponse,
     build_authorization_url,
 )
@@ -81,9 +82,9 @@ class _LegacyGoogleOAuthClient(Protocol):
 class _GoogleOAuthAdapterCompat:
     """在 API 组合边界把 M1 Google 客户端适配到供应商中立端口。
 
-    本兼容器只保持 M1 固定只读授权 URL 和 callback 行为；写能力的真实渐进 scope URL、
-    token-info 实际 scope 核对与缺失 scope 处理将在 Task 9 的 Google integration adapter
-    中实现。这里仍声明写能力所需 scope，使旧 URL 回调绝不会误把写能力标为 enabled。
+    本兼容器只供测试模式和旧 fake 使用；它按请求传入的 scope 构造 URL，但交换结果仍
+    固定声明 M1 已实际覆盖的只读 scope，因此测试不会联网，也不会误把写能力标为 enabled。
+    生产组合根使用具备 token-info、nonce 和实际 scope 核验的 ``GoogleOAuthAdapter``。
     """
 
     provider = OAuthProvider.GOOGLE
@@ -124,12 +125,14 @@ class _GoogleOAuthAdapterCompat:
         return frozenset(scopes)
 
     def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
-        """复用 M1 固定只读 URL，避免在 Task 8 提前实现 Google progressive scope。"""
+        """为测试模式保留旧客户端，同时使用请求中的精确 scope 与 nonce。"""
         return build_authorization_url(
             client_id=self._client_id,
             redirect_uri=self._redirect_uri,
             state=request.state,
             code_challenge=request.code_challenge,
+            scopes=request.requested_scopes,
+            oidc_nonce=request.oidc_nonce,
         )
 
     async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
@@ -397,13 +400,13 @@ def get_create_task_use_case(request: Request):
 def get_connections_use_case(request: Request):
     """在组合边界构造固定 adapter mapping 的供应商中立连接用例。
 
-    集成测试可在 ``app.state.oauth_adapters`` 一次性放入 fake mapping；正常运行时只装配
-    Google 兼容 adapter。mapping 会由用例复制冻结，没有运行时注册或替换入口。真实
-    client secret 仍只在没有注入 fake 且非测试模式时从 Secret 文件读取。
+    集成测试可在 ``app.state.oauth_adapters`` 一次性放入 fake mapping；普通运行时装配
+    Task 9 的 ``GoogleOAuthAdapter``，测试模式才使用绝不联网的 M1 兼容 fake。mapping
+    会由用例复制冻结，没有运行时注册或替换入口。真实 client secret 仍只在非测试模式
+    从 Secret 文件读取。
     """
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.infrastructure.security.encryption import AeadCipher
-    from ai_employee.integrations.google.oauth import GoogleOAuthClient
 
     settings = get_auth_settings(request)
     cipher = AeadCipher.from_file(settings.app_master_key_file)
@@ -416,22 +419,26 @@ def get_connections_use_case(request: Request):
             from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
 
             oauth: _LegacyGoogleOAuthClient = FakeGoogleOAuthClient()
+            adapters = {
+                OAuthProvider.GOOGLE.value: _GoogleOAuthAdapterCompat(
+                    oauth,
+                    client_id=settings.google_client_id,
+                    redirect_uri=settings.google_redirect_uri,
+                )
+            }
         else:
             secret = settings.read_secret_file(
                 settings.google_client_secret_file
             ).get_secret_value()
-            oauth = GoogleOAuthClient(
-                settings.google_client_id,
-                secret,
-                settings.google_redirect_uri,
-            )
-        adapters = {
-            OAuthProvider.GOOGLE.value: _GoogleOAuthAdapterCompat(
-                oauth,
-                client_id=settings.google_client_id,
-                redirect_uri=settings.google_redirect_uri,
-            )
-        }
+            # 生产 OAuth 必须经过具备 token-info 与 nonce 校验的真实 adapter；旧客户端仅
+            # 由同步 Worker/隐私 Worker 使用，不能继续承担渐进授权组合根职责。
+            adapters = {
+                OAuthProvider.GOOGLE.value: GoogleOAuthAdapter(
+                    settings.google_client_id,
+                    secret,
+                    settings.google_redirect_uri,
+                )
+            }
     return ConnectionsUseCase(
         request.app.state.connections_store_factory,
         cipher,

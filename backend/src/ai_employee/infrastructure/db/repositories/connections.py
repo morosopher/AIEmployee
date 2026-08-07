@@ -35,6 +35,10 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
+# 运行时回填只识别 M2 已批准的两个 Google read scope；写 scope 绝不用于自动启用能力。
+_GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+
 
 def _scope_sort_key(scope: str) -> tuple[int, int, str]:
     """把无序实际 scope 规范为稳定的身份、邮件、日历展示顺序。
@@ -227,12 +231,14 @@ class SqlAlchemyConnectionStore:
         account_email: str,
         scopes: frozenset[str],
     ) -> UUID:
-        """原子 upsert 供应商连接，并为四项 M2 能力建立唯一 disabled 初始行。
+        """原子 upsert 供应商连接，并把首次/重连能力基线收敛为 disabled。
 
         ``provider_account_id`` 必须是 adapter 已规范化的稳定键；Task 10 会把 tenant 与
         Graph user ID 同时编码到该键中。两个 OAuth state 可以并发映射到同一规范键，但
         tenant/type 是键对应的不可变身份事实：冲突更新只在两者完全一致时刷新邮箱、scope
-        和状态，否则 PostgreSQL 原子拒绝更新，避免 token 静默改绑到另一身份。
+        和状态，否则 PostgreSQL 原子拒绝更新，避免 token 静默改绑到另一身份。该端口只由
+        targetless 首次 OAuth callback 使用；命中断开后的旧连接时，四项能力行必须重置，
+        随后应用层只按本次冻结读取意图重新启用，不能让历史写能力越过新 scope 复活。
         """
         statement = insert(OAuthConnectionModel).values(
             user_id=user_id,
@@ -264,21 +270,106 @@ class SqlAlchemyConnectionStore:
             raise ConnectionIdentityConflictError
 
         for capability in ConnectionCapability:
+            capability_statement = insert(ConnectionCapabilityModel).values(
+                user_id=user_id,
+                connection_id=connection_id,
+                capability=capability.value,
+                status=CapabilityStatus.DISABLED.value,
+                actual_scopes=[],
+                last_verified_at=None,
+                last_error_code=None,
+            )
+            await self._session.execute(
+                capability_statement.on_conflict_do_update(
+                    constraint="uq_connection_capabilities_user_connection_capability",
+                    set_={
+                        "status": CapabilityStatus.DISABLED.value,
+                        "actual_scopes": [],
+                        "last_verified_at": None,
+                        "last_error_code": None,
+                    },
+                )
+            )
+        await self._session.flush()
+        return connection_id
+
+    async def update_connection_scopes(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        scopes: frozenset[str],
+    ) -> None:
+        """在渐进 callback 的绑定锁内更新实际 scope，并拒绝跨用户或断开连接。"""
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == ConnectionStatus.CONNECTED.value,
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            raise ConnectionCredentialOwnershipError
+        connection.scopes = _ordered_scopes(scopes)
+        await self._session.flush()
+
+    async def ensure_google_capability_rows(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> None:
+        """按连接保存的 scope 幂等补齐 Google 能力行，且不覆盖已有人工状态。
+
+        该方法用于迁移 0011 后仍缺少子行的开发数据库。所有新行复制同一份规范化
+        ``actual_scopes``；两个写能力固定 ``disabled``，即使连接保存了粗粒度写 scope
+        也不会因配置或回填被自动打开。
+        """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.provider == "google",
+                OAuthConnectionModel.status == ConnectionStatus.CONNECTED.value,
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            # 缺失、跨用户或已断开的连接都保持幂等 no-op；调用方随后读取快照并统一映射
+            # 404，不能让维护回填改变原有资源隐藏边界。
+            return
+        normalized_scopes = frozenset(connection.scopes)
+        actual_scopes = _ordered_scopes(normalized_scopes)
+        read_status = {
+            ConnectionCapability.MAIL_READ: (
+                CapabilityStatus.ENABLED.value
+                if _GOOGLE_GMAIL_READ_SCOPE in normalized_scopes
+                else CapabilityStatus.DISABLED.value
+            ),
+            ConnectionCapability.CALENDAR_READ: (
+                CapabilityStatus.ENABLED.value
+                if _GOOGLE_CALENDAR_READ_SCOPE in normalized_scopes
+                else CapabilityStatus.DISABLED.value
+            ),
+        }
+        for capability in ConnectionCapability:
             await self._session.execute(
                 insert(ConnectionCapabilityModel)
                 .values(
                     user_id=user_id,
                     connection_id=connection_id,
                     capability=capability.value,
-                    status=CapabilityStatus.DISABLED.value,
-                    actual_scopes=[],
+                    status=read_status.get(capability, CapabilityStatus.DISABLED.value),
+                    actual_scopes=actual_scopes,
                 )
                 .on_conflict_do_nothing(
                     constraint="uq_connection_capabilities_user_connection_capability"
                 )
             )
         await self._session.flush()
-        return connection_id
 
     async def save_connection_tokens(
         self,

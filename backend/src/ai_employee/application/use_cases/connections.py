@@ -174,6 +174,25 @@ class ConnectionStore(Protocol):
         """按规范账户键 upsert；tenant/type 不一致时拒绝，并确保四项能力行存在。"""
         ...
 
+    async def update_connection_scopes(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        scopes: frozenset[str],
+    ) -> None:
+        """更新已绑定渐进连接的规范化实际 scope，并再次核对用户归属。"""
+        ...
+
+    async def ensure_google_capability_rows(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> None:
+        """为旧 Google 连接幂等补齐能力行，不覆盖已有人工状态。"""
+        ...
+
     async def save_connection_tokens(
         self,
         *,
@@ -725,6 +744,13 @@ class ConnectionsUseCase:
                     provider_tenant_id=account.provider_tenant_id,
                     account_type=account.account_type,
                 )
+                # 渐进 callback 的目标连接已通过代际与身份锁定；此处才替换实际 scope，
+                # 避免旧 state 在网络调用期间覆盖更新后的连接权限事实。
+                await store.update_connection_scopes(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    scopes=token.granted_scopes,
+                )
             access = self._cipher.encrypt(
                 token.access_token.encode("utf-8"),
                 self._aad(user_id, connection_id, "access_token"),
@@ -794,6 +820,23 @@ class ConnectionsUseCase:
         if snapshot is None:
             raise ConnectionNotFoundError
         return snapshot
+
+    async def verify_google_capabilities(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> None:
+        """显式执行一次 Google 历史能力回填/核验，供启动维护任务调用。
+
+        Repository 方法本身以 ``ON CONFLICT DO NOTHING`` 保证幂等；用例仍把用户与连接
+        作为必需参数传入，避免维护调用绕过跨用户隔离。
+        """
+        async with self._stores() as store:
+            await store.ensure_google_capability_rows(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
 
     async def disable_capability(
         self,
