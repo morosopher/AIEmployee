@@ -9,6 +9,11 @@ import respx
 
 from ai_employee.application.ports.oauth import OAuthAuthorizationRequest, OAuthTokenSet
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.errors import (
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.integrations.google.oauth import (
     GOOGLE_BASE_SCOPES,
     GOOGLE_REVOKE_URL,
@@ -103,6 +108,35 @@ async def test_token_scope_is_normalized_and_id_token_is_retained() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_google_response_userinfo_email_alias_is_canonicalized() -> None:
+    """Google 响应可能返回 userinfo.email 别名，但本地事实必须归一为 email。"""
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "synthetic-access",
+                "expires_in": 3600,
+                "scope": (
+                    "openid email https://www.googleapis.com/auth/userinfo.email "
+                    "https://www.googleapis.com/auth/gmail.readonly"
+                ),
+            },
+        )
+    )
+
+    token = await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+
+    assert token.granted_scopes == frozenset(
+        {
+            "openid",
+            "email",
+            "https://www.googleapis.com/auth/gmail.readonly",
+        }
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_missing_token_scope_uses_token_info_boundary() -> None:
     """scope 缺失时必须通过 token-info 核验，而不是假设请求被授予。"""
     respx.post("https://oauth2.googleapis.com/token").mock(
@@ -178,13 +212,11 @@ async def test_token_info_http_failure_does_not_retain_access_token() -> None:
         return_value=httpx.Response(400, json={"error": "synthetic-invalid-token"})
     )
 
-    with pytest.raises(httpx.HTTPStatusError) as raised:
+    with pytest.raises(UserActionRequiredError) as raised:
         await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
 
     assert sensitive_access_token not in str(raised.value)
-    assert sensitive_access_token not in str(raised.value.request.url)
-    assert sensitive_access_token not in str(raised.value.response.request.url)
-    assert raised.value.response.status_code == 400
+    assert raised.value.error_code == "google_reauthorization_required"
     assert raised.value.__context__ is None
 
 
@@ -206,11 +238,129 @@ async def test_token_info_transport_failure_does_not_retain_access_token() -> No
 
     respx.get(GOOGLE_TOKEN_INFO_URL).mock(side_effect=fail_token_info)
 
-    with pytest.raises(httpx.ConnectError) as raised:
+    with pytest.raises(TransientProviderError) as raised:
         await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
 
-    assert sensitive_access_token not in str(raised.value.request.url)
+    assert sensitive_access_token not in str(raised.value)
     assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_oauth_http_and_payload_failures_are_classified_without_provider_text() -> None:
+    """token 端点的 503 与 malformed JSON 必须变成稳定脱敏领域错误。"""
+    sensitive_token = "synthetic-sensitive-access-token"
+    token_route = respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(503, text=f"provider body {sensitive_token}")
+    )
+    with pytest.raises(TransientProviderError) as transient:
+        await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+    assert token_route.called
+    assert transient.value.error_code == "google_oauth_unavailable"
+    assert sensitive_token not in str(transient.value)
+    assert transient.value.__context__ is None
+
+    respx.reset()
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "only-access"})
+    )
+    with pytest.raises(PermanentProviderError) as malformed:
+        await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+    assert malformed.value.error_code == "google_oauth_invalid_response"
+    assert malformed.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_http_status_error_from_transport_is_converted_without_request_details() -> None:
+    """httpx 直接抛出的 HTTPStatusError 也必须在 adapter 边界脱敏分类。"""
+    sensitive_token = "synthetic-sensitive-token"
+
+    def raise_status(request: httpx.Request) -> httpx.Response:
+        """模拟底层 transport 抛出携带请求/供应商正文的 HTTPStatusError。"""
+        response = httpx.Response(
+            503,
+            request=request,
+            text=f"provider response {sensitive_token}",
+            headers={"Retry-After": "7"},
+        )
+        raise httpx.HTTPStatusError(
+            f"provider status {sensitive_token} at {request.url}",
+            request=request,
+            response=response,
+        )
+
+    respx.post("https://oauth2.googleapis.com/token").mock(side_effect=raise_status)
+
+    with pytest.raises(TransientProviderError) as raised:
+        await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+
+    error = raised.value
+    assert error.error_code == "google_oauth_unavailable"
+    assert error.retry_after == 7
+    assert sensitive_token not in str(error)
+    assert "oauth2.googleapis.com/token" not in str(error)
+    assert error.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_malformed_retry_after_does_not_escape_domain_error_boundary() -> None:
+    """异常大的 Retry-After 不能让错误构造溢出为裸 ValueError。"""
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(
+            503,
+            headers={"Retry-After": "1" + ("0" * 1000)},
+            text="synthetic provider body",
+        )
+    )
+
+    with pytest.raises(TransientProviderError) as raised:
+        await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+
+    assert raised.value.error_code == "google_oauth_unavailable"
+    assert raised.value.retry_after is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_oauth_unauthorized_and_nonce_mismatch_require_user_action() -> None:
+    """401 与 OIDC nonce 不匹配都必须要求用户重新授权且不回显 token。"""
+    sensitive_token = "synthetic-sensitive-access-token"
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(401, text=f"provider body {sensitive_token}")
+    )
+    with pytest.raises(UserActionRequiredError) as unauthorized:
+        await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+    assert unauthorized.value.error_code == "google_reauthorization_required"
+    assert sensitive_token not in str(unauthorized.value)
+
+    nonce = "synthetic-nonce"
+    respx.reset()
+    respx.get(GOOGLE_TOKEN_INFO_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "different-nonce"})
+    )
+    respx.get("https://openidconnect.googleapis.com/v1/userinfo").mock(
+        return_value=httpx.Response(
+            200, json={"sub": "synthetic-subject", "email": "owner@example.test"}
+        )
+    )
+    token = OAuthTokenSet(
+        access_token=sensitive_token,
+        refresh_token=None,
+        expires_in=3600,
+        granted_scopes=frozenset({"openid", "email"}),
+        id_token="synthetic-id-token",
+    )
+    with pytest.raises(UserActionRequiredError) as nonce_error:
+        await _adapter().fetch_account(
+            token,
+            expected_nonce_hash=sha256(nonce.encode("utf-8")).digest(),
+        )
+    assert nonce_error.value.error_code == "google_oidc_nonce_mismatch"
+    assert sensitive_token not in str(nonce_error.value)
+    assert nonce_error.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -252,6 +402,31 @@ async def test_nonce_requires_verified_token_info_claim() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_malformed_expected_nonce_hash_requires_user_action() -> None:
+    """本地 nonce 摘要损坏时也必须 fail closed，而不能让 compare_digest 抛裸 TypeError。"""
+    respx.get(GOOGLE_TOKEN_INFO_URL).mock(
+        return_value=httpx.Response(200, json={"nonce": "synthetic-nonce"})
+    )
+    token = OAuthTokenSet(
+        access_token="synthetic-access",
+        refresh_token=None,
+        expires_in=3600,
+        granted_scopes=frozenset({"openid", "email"}),
+        id_token="synthetic-id-token",
+    )
+
+    with pytest.raises(UserActionRequiredError) as raised:
+        await _adapter().fetch_account(
+            token,
+            expected_nonce_hash="synthetic-malformed-hash",  # type: ignore[arg-type]
+        )
+
+    assert raised.value.error_code == "google_oidc_nonce_mismatch"
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_malformed_scope_is_rejected_without_token_info_fallback() -> None:
     """非字符串、空白、控制字符或超长 scope 必须 fail closed。"""
     respx.post("https://oauth2.googleapis.com/token").mock(
@@ -268,6 +443,8 @@ async def test_malformed_scope_is_rejected_without_token_info_fallback() -> None
         return_value=httpx.Response(200, json={"scope": "openid"})
     )
 
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises(PermanentProviderError) as raised:
         await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
+    assert raised.value.error_code == "google_oauth_invalid_response"
+    assert raised.value.__context__ is None
     assert not info.called

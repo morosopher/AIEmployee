@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Final, cast
+from typing import Any, Final, cast
 from unicodedata import category
 from urllib.parse import urlencode
 
@@ -26,6 +26,12 @@ from ai_employee.application.ports.oauth import (
     OAuthTokenSet,
 )
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.errors import (
+    DomainError,
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 
 GOOGLE_AUTHORIZATION_URL: Final = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL: Final = "https://oauth2.googleapis.com/token"
@@ -52,6 +58,11 @@ GOOGLE_CAPABILITY_SCOPES: Final[Mapping[ConnectionCapability, frozenset[str]]] =
 )
 GOOGLE_ALLOWED_SCOPES: Final[frozenset[str]] = frozenset(
     set(GOOGLE_BASE_SCOPES).union(*GOOGLE_CAPABILITY_SCOPES.values())
+)
+# Google token/token-info 响应在部分文档示例中把 ``email`` 回显为旧的 userinfo.email
+# URI。该兼容别名只允许出现在响应归一化边界，授权 URL 仍严格使用冻结的 ``email``。
+GOOGLE_RESPONSE_SCOPE_ALIASES: Final[Mapping[str, str]] = MappingProxyType(
+    {"https://www.googleapis.com/auth/userinfo.email": "email"}
 )
 
 # M1 旧导入和同步代码仍读取该名称；保留稳定顺序而不是把 frozenset 直接暴露给旧调用方。
@@ -136,9 +147,10 @@ def _normalize_google_scope_string(value: object, field_name: str = "scope") -> 
         raise ValueError(f"Google {field_name} is invalid")
     if any(category(char).startswith("C") or (char.isspace() and char != " ") for char in value):
         raise ValueError(f"Google {field_name} is invalid")
-    scopes = frozenset(value.split())
-    if not scopes or any(len(scope) > MAX_OAUTH_SCOPE_LENGTH for scope in scopes):
+    raw_scopes = frozenset(value.split())
+    if not raw_scopes or any(len(scope) > MAX_OAUTH_SCOPE_LENGTH for scope in raw_scopes):
         raise ValueError(f"Google {field_name} is invalid")
+    scopes = frozenset(GOOGLE_RESPONSE_SCOPE_ALIASES.get(scope, scope) for scope in raw_scopes)
     if not scopes.issubset(GOOGLE_ALLOWED_SCOPES):
         raise ValueError(f"Google {field_name} is not allowed")
     return scopes
@@ -173,6 +185,143 @@ def _ordered_google_scopes(scopes: frozenset[str]) -> tuple[str, ...]:
 def _google_timeout() -> httpx.Timeout:
     """为所有 Google OAuth 请求提供显式连接与总超时。"""
     return httpx.Timeout(10.0, connect=3.0)
+
+
+def _google_retry_after(response: httpx.Response) -> int | None:
+    """只解析有限的整数 Retry-After，不把供应商响应正文带入领域错误。"""
+    try:
+        value = int(response.headers.get("Retry-After", ""))
+        # DomainError 会把该值规范为有限浮点；先在适配器边界过滤超大整数，
+        # 避免供应商畸形 Header 令错误分类本身抛出 OverflowError/ValueError。
+        if value >= 0:
+            float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if value >= 0 else None
+
+
+def _google_http_error(
+    *,
+    status_code: int,
+    operation: str,
+    retry_after: int | None,
+) -> DomainError:
+    """把 Google HTTP 状态转换为固定、脱敏的领域错误。
+
+    Args:
+        status_code: 供应商 HTTP 状态码；只保留整数状态，不传递响应对象。
+        operation: 内部固定操作名，不得包含 URL、请求参数或供应商正文。
+        retry_after: 已收窄的 Retry-After 秒数。
+
+    Returns:
+        面向应用层的稳定错误分类；错误消息和元数据不含供应商原文。
+    """
+    if status_code in {401, 403} or (operation in {"token info", "id_token info"} and status_code == 400):
+        return UserActionRequiredError(
+            error_code="google_reauthorization_required",
+            message="Google authorization requires user action",
+        )
+    if status_code == 429 or status_code >= 500:
+        return TransientProviderError(
+            error_code="google_oauth_unavailable",
+            message="Google OAuth is temporarily unavailable",
+            retry_after=retry_after,
+        )
+    return PermanentProviderError(
+        error_code="google_oauth_rejected",
+        message="Google OAuth request was rejected",
+    )
+
+
+async def _google_request(
+    client: httpx.AsyncClient,
+    *,
+    method: str,
+    url: str,
+    operation: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """执行单次 OAuth HTTP 请求并在脱离异常上下文后返回安全领域错误。
+
+    ``kwargs`` 只在这个第三方 HTTP 客户端边界使用 ``Any``，调用方仍传入固定的
+    ``params``、``headers`` 或表单字段；不让该类型穿过适配器返回值。
+
+    ``httpx`` 异常会保存完整 request（可能含 query token、Authorization header 或
+    refresh token body）。先记录固定分类，再在 ``except`` 块外抛出新的领域错误，避免
+    这些对象通过 traceback、``__context__`` 或 API generic 500 逸出。
+    """
+    request_error: DomainError | None = None
+    response: httpx.Response | None = None
+    try:
+        if method == "GET":
+            response = await client.get(url, **kwargs)
+        elif method == "POST":
+            response = await client.post(url, **kwargs)
+        else:  # pragma: no cover - 调用方只使用固定 GET/POST，防御未来误用。
+            request_error = PermanentProviderError(
+                error_code="google_oauth_invalid_operation",
+                message="Google OAuth operation is invalid",
+            )
+    except httpx.HTTPStatusError as error:
+        # 某些 transport/测试 double 会在返回响应前直接抛出 HTTPStatusError；不能让其
+        # request、query、正文或异常文本越过 adapter。只读取状态与已收窄的 Retry-After，
+        # 并在离开 except 后再抛出新的领域错误以清除原始 ``__context__``。
+        error_response = error.response
+        if error_response is None:
+            request_error = PermanentProviderError(
+                error_code="google_oauth_invalid_response",
+                message="Google OAuth response is invalid",
+            )
+        else:
+            request_error = _google_http_error(
+                status_code=error_response.status_code,
+                operation=operation,
+                retry_after=_google_retry_after(error_response),
+            )
+    except httpx.TimeoutException:
+        request_error = TransientProviderError(
+            error_code="google_oauth_timeout",
+            message="Google OAuth request timed out",
+        )
+    except httpx.RequestError:
+        request_error = TransientProviderError(
+            error_code="google_oauth_request_failed",
+            message="Google OAuth request failed",
+        )
+
+    if request_error is not None:
+        raise request_error
+    if response is None:  # pragma: no cover - 仅防御未来分支遗漏。
+        raise PermanentProviderError(
+            error_code="google_oauth_invalid_response",
+            message="Google OAuth response is invalid",
+        )
+    if not response.is_success:
+        raise _google_http_error(
+            status_code=response.status_code,
+            operation=operation,
+            retry_after=_google_retry_after(response),
+        )
+    return response
+
+
+def _read_google_json_object_safe(
+    response: httpx.Response,
+    operation: str,
+) -> Mapping[str, object]:
+    """把成功响应收窄为 JSON object，并丢弃 malformed 异常上下文。"""
+    payload: Mapping[str, object] | None = None
+    malformed = False
+    try:
+        payload = _read_google_json_object(response, operation)
+    except (TypeError, ValueError):
+        malformed = True
+    if malformed or payload is None:
+        raise PermanentProviderError(
+            error_code="google_oauth_invalid_response",
+            message="Google OAuth response is invalid",
+        )
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,8 +458,11 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         normalized_code = _require_google_text(code, "authorization code")
         normalized_verifier = _require_google_text(verifier, "PKCE verifier")
         async with httpx.AsyncClient(timeout=_google_timeout()) as client:
-            response = await client.post(
-                GOOGLE_TOKEN_URL,
+            response = await _google_request(
+                client,
+                method="POST",
+                url=GOOGLE_TOKEN_URL,
+                operation="token exchange",
                 data={
                     "code": normalized_code,
                     "client_id": self._client_id,
@@ -320,8 +472,7 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
                     "code_verifier": normalized_verifier,
                 },
             )
-            response.raise_for_status()
-            payload = _read_google_json_object(response, "token")
+            payload = _read_google_json_object_safe(response, "token")
             return await self._token_set_from_payload(payload, client=client)
 
     async def fetch_account(
@@ -336,8 +487,18 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         验证令牌签名并返回 nonce claim；缺少 id_token、claim 或摘要不匹配时直接拒绝。
         """
         if expected_nonce_hash is not None:
+            # 摘要来自一次性 OAuth attempt 的数据库事实；先验证固定字节长度，避免
+            # ``hmac.compare_digest`` 对损坏的类型抛出裸 TypeError 或接受可变对象。
+            if type(expected_nonce_hash) is not bytes or len(expected_nonce_hash) != sha256().digest_size:
+                raise UserActionRequiredError(
+                    error_code="google_oidc_nonce_mismatch",
+                    message="Google OIDC verification requires user action",
+                )
             if token.id_token is None:
-                raise ValueError("Google OIDC nonce cannot be verified")
+                raise UserActionRequiredError(
+                    error_code="google_oidc_nonce_missing",
+                    message="Google OIDC verification requires user action",
+                )
             async with httpx.AsyncClient(timeout=_google_timeout()) as client:
                 info = await self._fetch_token_info(
                     client,
@@ -345,26 +506,54 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
                     parameter_value=token.id_token,
                     operation="id_token info",
                 )
-                nonce = _require_google_text(info.get("nonce"), "OIDC nonce")
+                nonce: str | None = None
+                nonce_malformed = False
+                try:
+                    nonce = _require_google_text(info.get("nonce"), "OIDC nonce")
+                except (TypeError, ValueError):
+                    nonce_malformed = True
+                if nonce_malformed or nonce is None:
+                    raise UserActionRequiredError(
+                        error_code="google_oidc_nonce_mismatch",
+                        message="Google OIDC verification requires user action",
+                    )
                 observed_hash = sha256(nonce.encode("utf-8")).digest()
                 if not hmac.compare_digest(observed_hash, expected_nonce_hash):
-                    raise ValueError("Google OIDC nonce cannot be verified")
+                    raise UserActionRequiredError(
+                        error_code="google_oidc_nonce_mismatch",
+                        message="Google OIDC verification requires user action",
+                    )
 
         normalized_access = _require_google_text(token.access_token, "access_token")
         async with httpx.AsyncClient(timeout=_google_timeout()) as client:
-            response = await client.get(
-                GOOGLE_USERINFO_URL,
+            response = await _google_request(
+                client,
+                method="GET",
+                url=GOOGLE_USERINFO_URL,
+                operation="userinfo",
                 headers={"Authorization": f"Bearer {normalized_access}"},
             )
-            response.raise_for_status()
-            payload = _read_google_json_object(response, "userinfo")
-        account = OAuthAccount(
-            provider_account_id=_require_google_text(
+            payload = _read_google_json_object_safe(response, "userinfo")
+        identity_malformed = False
+        provider_account_id: str | None = None
+        account_email: str | None = None
+        try:
+            provider_account_id = _require_google_text(
                 payload.get("sub"),
                 "userinfo subject",
                 max_length=MAX_PROVIDER_ACCOUNT_ID_LENGTH,
-            ),
-            account_email=_require_google_email(payload.get("email"), "userinfo email"),
+            )
+            account_email = _require_google_email(payload.get("email"), "userinfo email")
+        except (TypeError, ValueError):
+            identity_malformed = True
+        if identity_malformed or provider_account_id is None or account_email is None:
+            raise PermanentProviderError(
+                error_code="google_oauth_invalid_response",
+                message="Google OAuth response is invalid",
+            )
+        account = OAuthAccount(
+            provider_account_id=provider_account_id,
+            account_email=account_email,
             provider_tenant_id="",
             account_type="google",
         )
@@ -374,8 +563,11 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         """刷新 access token；Google 未轮换 refresh token 时返回 ``None``。"""
         normalized_refresh = _require_google_text(refresh_token, "refresh_token")
         async with httpx.AsyncClient(timeout=_google_timeout()) as client:
-            response = await client.post(
-                GOOGLE_TOKEN_URL,
+            response = await _google_request(
+                client,
+                method="POST",
+                url=GOOGLE_TOKEN_URL,
+                operation="token refresh",
                 data={
                     "client_id": self._client_id,
                     "client_secret": self._client_secret,
@@ -383,16 +575,20 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
                     "refresh_token": normalized_refresh,
                 },
             )
-            response.raise_for_status()
-            payload = _read_google_json_object(response, "token")
+            payload = _read_google_json_object_safe(response, "token")
             return await self._token_set_from_payload(payload, client=client)
 
     async def revoke(self, token: str) -> OAuthRevocationResult:
         """调用 Google 撤销端点；只有明确 2xx 成功才返回 ``REVOKED``。"""
         normalized_token = _require_google_text(token, "revoke token")
         async with httpx.AsyncClient(timeout=_google_timeout()) as client:
-            response = await client.post(GOOGLE_REVOKE_URL, data={"token": normalized_token})
-            response.raise_for_status()
+            await _google_request(
+                client,
+                method="POST",
+                url=GOOGLE_REVOKE_URL,
+                operation="revoke",
+                data={"token": normalized_token},
+            )
         return OAuthRevocationResult(OAuthRevocationStatus.REVOKED)
 
     async def _token_set_from_payload(
@@ -401,36 +597,56 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         *,
         client: httpx.AsyncClient,
     ) -> OAuthTokenSet:
-        """把 token JSON 与 token-info 实际 scope 收窄为端口值对象。"""
-        access_token = _require_google_text(payload.get("access_token"), "access_token")
-        expires_in = _require_positive_expiry(payload.get("expires_in"))
-        refresh_token_value = payload.get("refresh_token")
-        refresh_token = (
-            _require_google_text(refresh_token_value, "refresh_token")
-            if refresh_token_value is not None
-            else None
-        )
-        if "scope" in payload:
-            granted_scopes = _normalize_google_scope_string(payload.get("scope"))
-        else:
-            info = await self._fetch_token_info(
-                client,
-                parameter_name="access_token",
-                parameter_value=access_token,
-                operation="token info",
+        """把 token JSON 与 token-info 实际 scope 收窄为端口值对象。
+
+        供应商可以返回任意 JSON 类型；所有 ``TypeError``/``ValueError`` 只在适配器内
+        作为 malformed 响应处理。故意在 ``except`` 块结束后再创建领域错误，避免 Python
+        把原始异常（其中可能包含 token 的局部上下文）挂到 ``__context__`` 上。
+        """
+        token_set: OAuthTokenSet | None = None
+        malformed = False
+        try:
+            access_token = _require_google_text(payload.get("access_token"), "access_token")
+            expires_in = _require_positive_expiry(payload.get("expires_in"))
+            refresh_token_value = payload.get("refresh_token")
+            refresh_token = (
+                _require_google_text(refresh_token_value, "refresh_token")
+                if refresh_token_value is not None
+                else None
             )
-            granted_scopes = _normalize_google_scope_string(info.get("scope"), "token-info scope")
-        id_token_value = payload.get("id_token")
-        id_token = (
-            _require_google_text(id_token_value, "id_token") if id_token_value is not None else None
-        )
-        return OAuthTokenSet(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_in=expires_in,
-            granted_scopes=granted_scopes,
-            id_token=id_token,
-        )
+            if "scope" in payload:
+                granted_scopes = _normalize_google_scope_string(payload.get("scope"))
+            else:
+                info = await self._fetch_token_info(
+                    client,
+                    parameter_name="access_token",
+                    parameter_value=access_token,
+                    operation="token info",
+                )
+                granted_scopes = _normalize_google_scope_string(
+                    info.get("scope"), "token-info scope"
+                )
+            id_token_value = payload.get("id_token")
+            id_token = (
+                _require_google_text(id_token_value, "id_token")
+                if id_token_value is not None
+                else None
+            )
+            token_set = OAuthTokenSet(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_in=expires_in,
+                granted_scopes=granted_scopes,
+                id_token=id_token,
+            )
+        except (TypeError, ValueError):
+            malformed = True
+        if malformed or token_set is None:
+            raise PermanentProviderError(
+                error_code="google_oauth_invalid_response",
+                message="Google OAuth response is invalid",
+            )
+        return token_set
 
     async def _fetch_token_info(
         self,
@@ -447,35 +663,14 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         重新绑定到无查询串的 request；供应商正文、token 和原异常上下文都不会上浮。
         """
         normalized = _require_google_text(parameter_value, parameter_name)
-        request_error_type: type[httpx.RequestError] | None = None
-        status_code: int | None = None
-        try:
-            response = await client.get(
-                GOOGLE_TOKEN_INFO_URL,
-                params={parameter_name: normalized},
-            )
-        except httpx.RequestError as error:
-            # 只复制异常类别，离开 ``except`` 后再抛出，避免 ``__context__`` 保留原始 URL。
-            request_error_type = type(error)
-        else:
-            if response.is_success:
-                return _read_google_json_object(response, operation)
-            status_code = response.status_code
-
-        safe_request = httpx.Request("GET", GOOGLE_TOKEN_INFO_URL)
-        if request_error_type is not None:
-            raise request_error_type(
-                f"Google {operation} request failed",
-                request=safe_request,
-            )
-        if status_code is None:  # pragma: no cover - 上述分支已穷尽，防御未来 httpx 行为变化。
-            raise RuntimeError(f"Google {operation} request outcome is invalid")
-        safe_response = httpx.Response(status_code, request=safe_request)
-        raise httpx.HTTPStatusError(
-            f"Google {operation} request failed",
-            request=safe_request,
-            response=safe_response,
+        response = await _google_request(
+            client,
+            method="GET",
+            url=GOOGLE_TOKEN_INFO_URL,
+            operation=operation,
+            params={parameter_name: normalized},
         )
+        return _read_google_json_object_safe(response, operation)
 
 
 class GoogleOAuthClient:

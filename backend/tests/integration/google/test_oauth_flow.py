@@ -203,6 +203,70 @@ async def test_callback_marks_missing_requested_read_scope_action_required(
 
 
 @pytest.mark.asyncio
+async def test_callback_normalizes_google_userinfo_email_scope_alias(
+    oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
+) -> None:
+    """真实 callback fixture 将 Google userinfo.email 响应别名归一为冻结 email。"""
+    client, queries, _ = oauth_context
+    login = await client.post(
+        "/api/v1/auth/login", json={"email": "owner@example.com", "password": "synthetic-password"}
+    )
+    assert login.status_code == 200
+    csrf = client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await client.post("/api/v1/connections/google/start", headers={"X-CSRF-Token": csrf})
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    alias_scope = (
+        "openid email https://www.googleapis.com/auth/userinfo.email "
+        "https://www.googleapis.com/auth/gmail.readonly "
+        "https://www.googleapis.com/auth/calendar.readonly"
+    )
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.post("https://oauth2.googleapis.com/token").respond(
+            200,
+            json={
+                "access_token": "alias-access",
+                "refresh_token": "alias-refresh",
+                "expires_in": 3600,
+                "scope": alias_scope,
+                "id_token": "alias-id-token",
+            },
+        )
+        mocked.get(GOOGLE_TOKEN_INFO_URL).respond(200, json={"nonce": query["nonce"][0]})
+        mocked.get("https://openidconnect.googleapis.com/v1/userinfo").respond(
+            200, json={"sub": "alias-subject", "email": "alias@google.example"}
+        )
+        callback = await client.get(
+            "/api/v1/connections/google/callback",
+            params={"code": "alias-code", "state": query["state"][0]},
+        )
+    assert callback.status_code == 200
+
+    async with queries() as session:
+        connection = await session.scalar(
+            select(OAuthConnectionModel).where(
+                OAuthConnectionModel.provider_account_id == "alias-subject"
+            )
+        )
+        rows = tuple(
+            (
+                await session.scalars(
+                    select(ConnectionCapabilityModel).where(
+                        ConnectionCapabilityModel.connection_id == connection.id  # type: ignore[union-attr]
+                    )
+                )
+            ).all()
+            if connection is not None
+            else ()
+        )
+    assert connection is not None
+    assert "https://www.googleapis.com/auth/userinfo.email" not in connection.scopes
+    assert "email" in connection.scopes
+    assert all("https://www.googleapis.com/auth/userinfo.email" not in row.actual_scopes for row in rows)
+
+
+@pytest.mark.asyncio
 async def test_readonly_reconnect_clears_stale_enabled_write_capabilities(
     oauth_context: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, FixedClock],
 ) -> None:
