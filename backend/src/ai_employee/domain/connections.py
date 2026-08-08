@@ -163,8 +163,10 @@ def parse_provider_identity_key(value: str) -> tuple[str, str, str]:
     """验证 allowlist 中的三段键，并还原连接字段的既有持久化表示。
 
     Args:
-        value: 预期为 ``provider:tenant:account`` 的完整键；该值不会被 trim 或
-            以宽松 split 规则静默修复。
+        value: 预期为严格三段 ``provider:encoded_tenant:encoded_account`` 的
+            canonical 键；逻辑上仍表示 provider、tenant 与稳定 account 三部分，opaque
+            非 unreserved 字符使用大写 ``%HH`` percent-encoding。该值不会被 trim 或以
+            宽松 split 规则静默修复。
 
     Returns:
         ``(provider, provider_tenant_id, provider_account_id)``，其中 Microsoft 的
