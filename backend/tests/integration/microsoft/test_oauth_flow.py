@@ -69,6 +69,9 @@ async def microsoft_oauth_context(
     client_secret.write_text("synthetic-microsoft-secret", encoding="utf-8")
     google_secret.write_text("synthetic-google-secret", encoding="utf-8")
     monkeypatch.setenv("APP_ENV", "test")
+    # 这些测试刻意覆盖真实 Microsoft adapter 的 respx HTTP 契约；显式关闭
+    # APP_TEST_MODE，避免测试环境变量继承时误装配离线 fake。
+    monkeypatch.setenv("APP_TEST_MODE", "false")
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("SESSION_COOKIE_NAME", "microsoft_oauth_test_session")
     monkeypatch.setenv("APP_MASTER_KEY_FILE", str(master_key))
@@ -155,6 +158,85 @@ async def test_microsoft_start_and_callback_use_common_endpoint_and_state_once(
     async with context.queries() as session:
         connections = tuple((await session.scalars(select(OAuthConnectionModel))).all())
     assert connections == ()
+
+
+@pytest.mark.asyncio
+async def test_microsoft_start_can_request_mail_read_only(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """首次连接只选邮件时，授权 URL 不得带 Calendars.Read。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start",
+        json={"capabilities": ["mail.read"]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    assert query["scope"][0].split() == [
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        "Mail.Read",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_microsoft_start_can_request_calendar_read_only_via_query(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """query 形式只选日历时，授权 URL 不得带 Mail.Read。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start?capabilities=calendar.read",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    assert query["scope"][0].split() == [
+        "openid",
+        "profile",
+        "email",
+        "offline_access",
+        "Calendars.Read",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_microsoft_start_rejects_write_capability(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """首次连接不能借请求体直接申请写能力。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start",
+        json={"capabilities": ["mail.send"]},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 422
+    assert started.json()["error_code"] == "request_validation_failed"
 
 
 @pytest.mark.asyncio
@@ -272,7 +354,7 @@ async def test_microsoft_admin_consent_callback_never_echoes_raw_description(
             "state": state,
         },
     )
-    assert response.status_code == 403
+    assert response.status_code == 409
     assert response.json()["error_code"] == "microsoft_admin_consent_required"
     assert raw_description not in response.text
     replay = await context.client.get(
@@ -282,6 +364,49 @@ async def test_microsoft_admin_consent_callback_never_echoes_raw_description(
             "error_codes": "65001",
             "state": state,
         },
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error_code"] == "oauth_state_rejected"
+
+
+@pytest.mark.asyncio
+async def test_microsoft_token_admin_consent_maps_to_conflict_and_consumes_state(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """token endpoint AADSTS65001 应返回 409，且 raw description 与 state 都不可重放。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start",
+        headers={"X-CSRF-Token": csrf},
+    )
+    state = parse_qs(urlparse(started.json()["authorization_url"]).query)["state"][0]
+    raw_description = "AADSTS65001: synthetic token administrator detail"
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.post(MICROSOFT_TOKEN_URL).respond(
+            400,
+            json={
+                "error": "invalid_grant",
+                "error_codes": [65001],
+                "error_description": raw_description,
+            },
+        )
+        response = await context.client.get(
+            "/api/v1/connections/microsoft/callback",
+            params={"code": "synthetic-code", "state": state},
+        )
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "microsoft_admin_consent_required"
+    assert raw_description not in response.text
+    replay = await context.client.get(
+        "/api/v1/connections/microsoft/callback",
+        params={"code": "synthetic-code", "state": state},
     )
     assert replay.status_code == 400
     assert replay.json()["error_code"] == "oauth_state_rejected"

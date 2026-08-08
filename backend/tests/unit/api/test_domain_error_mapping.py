@@ -19,6 +19,14 @@ from ai_employee.domain.errors import (
     ("error", "status", "retry_after"),
     [
         (UserActionRequiredError(error_code="reauth_required", message="secret token"), 403, None),
+        (
+            UserActionRequiredError(
+                error_code="microsoft_admin_consent_required",
+                message="secret administrator detail",
+            ),
+            409,
+            None,
+        ),
         (TransientProviderError(error_code="provider_busy", message="secret token", retry_after=12), 503, "12"),
         (PermanentProviderError(error_code="provider_denied", message="secret token"), 422, None),
         (ModelOutputError(error_code="model_invalid", message="secret prompt"), 422, None),

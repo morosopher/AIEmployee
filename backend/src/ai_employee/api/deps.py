@@ -250,6 +250,15 @@ class _TransientApiProblem(ApiProblem):
 
 def _domain_problem(error: DomainError) -> ApiProblem:
     """按公开领域类别创建 RFC 9457 Problem，永不回显领域 message 或 metadata。"""
+    # Microsoft 管理员同意是组织侧冲突而非普通个人 re-auth；规格固定要求 409，
+    # 因此必须在 UserActionRequiredError 的通用 403 分支之前做稳定错误码特判。
+    if error.error_code == "microsoft_admin_consent_required":
+        return ApiProblem(
+            409,
+            error.error_code,
+            "Administrator consent required",
+            "An organization administrator must approve the requested access.",
+        )
     if isinstance(error, UserActionRequiredError):
         return ApiProblem(
             403, error.error_code, "User action required", "Complete the required action."
@@ -417,8 +426,9 @@ def get_connections_use_case(request: Request):
     else:
         if settings.app_test_mode:
             # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端；浏览器连接由固定 fake
-            # 驱动。Microsoft adapter 仅保存合成配置，HTTP 调用仍需由测试显式注入 fake。
+            # 驱动。真实 Microsoft adapter 只能在非测试组合根或显式 state 注入中出现。
             from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
+            from ai_employee.integrations.microsoft.fake import FakeMicrosoftOAuthAdapter
 
             oauth: _LegacyGoogleOAuthClient = FakeGoogleOAuthClient()
             adapters = {
@@ -427,11 +437,12 @@ def get_connections_use_case(request: Request):
                     client_id=settings.google_client_id,
                     redirect_uri=settings.google_redirect_uri,
                 ),
-                OAuthProvider.MICROSOFT.value: MicrosoftOAuthAdapter(
-                    settings.microsoft_client_id or "test-mode-microsoft-client",
-                    "test-mode-microsoft-secret",
-                    settings.microsoft_redirect_uri
-                    or "https://app.example.test/api/v1/connections/microsoft/callback",
+                OAuthProvider.MICROSOFT.value: FakeMicrosoftOAuthAdapter(
+                    client_id=settings.microsoft_client_id or "test-mode-microsoft-client",
+                    redirect_uri=(
+                        settings.microsoft_redirect_uri
+                        or "https://app.example.test/api/v1/connections/microsoft/callback"
+                    ),
                 ),
             }
         else:

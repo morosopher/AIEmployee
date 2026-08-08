@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Query, Response, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession
 from ai_employee.application.ports.oauth import OAuthProvider
@@ -38,6 +38,47 @@ class StartConnectionResponse(BaseModel):
     """返回前端可安全跳转的授权地址。"""
 
     authorization_url: str
+
+
+_MICROSOFT_INITIAL_READ_CAPABILITIES = frozenset(
+    {
+        ConnectionCapability.MAIL_READ,
+        ConnectionCapability.CALENDAR_READ,
+    }
+)
+
+
+class MicrosoftStartConnectionRequest(BaseModel):
+    """校验 Microsoft 首次授权可选择的读取数据源。
+
+    ``None`` 兼容旧版无 body 调用并表示两项读取能力；一旦调用方显式提供列表，
+    列表必须非空且只能包含 ``mail.read``/``calendar.read``。写能力只能通过连接已建立
+    后的独立渐进授权入口取得，不能借此请求绕过依赖闭包。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    capabilities: list[ConnectionCapability] | None = Field(default=None, min_length=1)
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_read_capabilities(
+        cls,
+        value: list[ConnectionCapability] | None,
+    ) -> list[ConnectionCapability] | None:
+        """拒绝写能力和未知枚举，避免请求边界扩大 delegated scope。"""
+        if value is None:
+            return None
+        selected = frozenset(value)
+        if not selected or not selected.issubset(_MICROSOFT_INITIAL_READ_CAPABILITIES):
+            raise ValueError("Microsoft initial capabilities must be a non-empty read subset")
+        return value
+
+    def capability_set(self) -> frozenset[ConnectionCapability]:
+        """返回 provider-neutral use case 所需的不可变能力集合。"""
+        if self.capabilities is None:
+            return _MICROSOFT_INITIAL_READ_CAPABILITIES
+        return frozenset(self.capabilities)
 
 
 class CapabilityEnableResponse(BaseModel):
@@ -211,17 +252,44 @@ def build_connections_router() -> APIRouter:
     async def start_microsoft_connection(
         authenticated: CsrfProtectedSession,
         use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+        request_body: Annotated[MicrosoftStartConnectionRequest | None, Body()] = None,
+        query_capabilities: Annotated[
+            list[ConnectionCapability] | None,
+            Query(alias="capabilities", min_length=1),
+        ] = None,
     ) -> StartConnectionResponse:
-        """发起 Microsoft common v2 首次授权，仅请求两项明确选择的读取能力。"""
+        """发起 Microsoft common v2 首次授权，仅请求非空读取能力子集。
+
+        旧版无 body 调用仍默认两项读取能力；body 与 query 同时提供时拒绝歧义输入。
+        写能力与未知值在 API Schema/枚举边界失败，不会传给 provider-neutral use case。
+        """
+        if request_body is not None and query_capabilities is not None:
+            raise ApiProblem(
+                422,
+                "request_validation_failed",
+                "Request validation failed",
+                "The request did not match the required schema.",
+            )
+        if query_capabilities is not None:
+            selected = frozenset(query_capabilities)
+            if not selected or not selected.issubset(_MICROSOFT_INITIAL_READ_CAPABILITIES):
+                raise ApiProblem(
+                    422,
+                    "request_validation_failed",
+                    "Request validation failed",
+                    "The request did not match the required schema.",
+                )
+            capabilities = selected
+        else:
+            capabilities = (
+                request_body.capability_set()
+                if request_body is not None
+                else MicrosoftStartConnectionRequest().capability_set()
+            )
         result = await use_case.start(
             user_id=authenticated.user.id,
             provider=OAuthProvider.MICROSOFT,
-            capabilities=frozenset(
-                {
-                    ConnectionCapability.MAIL_READ,
-                    ConnectionCapability.CALENDAR_READ,
-                }
-            ),
+            capabilities=capabilities,
         )
         return StartConnectionResponse(authorization_url=result.authorization_url)
 

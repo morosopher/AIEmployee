@@ -15,6 +15,7 @@ import jwt
 import pytest
 import respx
 from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.exceptions import InvalidKeyError
 
 from ai_employee.application.ports.oauth import (
     OAuthAuthorizationRequest,
@@ -35,6 +36,7 @@ from ai_employee.integrations.microsoft.oauth import (
     MICROSOFT_JWKS_URL,
     MICROSOFT_TOKEN_URL,
     MicrosoftOAuthAdapter,
+    _parse_discovery,
     classify_microsoft_callback_error,
 )
 
@@ -334,6 +336,76 @@ async def test_microsoft_oidc_wrong_audience_and_signature_fail_before_graph() -
 
 
 @pytest.mark.asyncio
+async def test_microsoft_malformed_jwks_is_stable_and_redacted() -> None:
+    """JWKS RSA 参数损坏时必须返回稳定 OIDC 错误，不泄漏 PyJWT 异常文本。"""
+    _, private_key = _jwk_and_private_key()
+    tenant = "tenant-malformed-jwks"
+    nonce = "malformed-jwks-nonce"
+    id_token = _id_token(private_key, tenant=tenant, nonce=nonce)
+    from ai_employee.application.ports.oauth import OAuthTokenSet
+
+    token = OAuthTokenSet(
+        access_token="synthetic-malformed-jwks-access",
+        refresh_token=None,
+        expires_in=3600,
+        granted_scopes=frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read"}),
+        id_token=id_token,
+    )
+    malformed_jwk = {
+        "kty": "RSA",
+        "use": "sig",
+        "kid": "synthetic-runtime-key",
+        "alg": "RS256",
+        "n": "not-a-base64url-rsa-modulus",
+        "e": "AQAB",
+    }
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.get(MICROSOFT_DISCOVERY_URL).respond(200, json=_openid_configuration())
+        mocked.get(MICROSOFT_JWKS_URL).respond(200, json={"keys": [malformed_jwk]})
+        with pytest.raises(PermanentProviderError) as raised:
+            await _adapter().fetch_account(
+                token,
+                expected_nonce_hash=sha256(nonce.encode()).digest(),
+            )
+    assert raised.value.error_code == "microsoft_oidc_invalid_response"
+    assert "not-a-base64url-rsa-modulus" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_microsoft_pyjwt_invalid_key_is_stable_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """底层 PyJWT InvalidKeyError 也必须收敛为无原文的 OIDC 错误。"""
+    _, private_key = _jwk_and_private_key()
+    tenant = "tenant-invalid-key"
+    nonce = "invalid-key-nonce"
+    id_token = _id_token(private_key, tenant=tenant, nonce=nonce)
+    from ai_employee.application.ports.oauth import OAuthTokenSet
+
+    token = OAuthTokenSet(
+        access_token="synthetic-invalid-key-access",
+        refresh_token=None,
+        expires_in=3600,
+        granted_scopes=frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read"}),
+        id_token=id_token,
+    )
+    monkeypatch.setattr(
+        "ai_employee.integrations.microsoft.oauth.RSAAlgorithm.from_jwk",
+        lambda _: (_ for _ in ()).throw(InvalidKeyError("synthetic-invalid-key-detail")),
+    )
+    with respx.mock(assert_all_called=False) as mocked:
+        _install_oidc_routes(mocked, private_key)
+        with pytest.raises(PermanentProviderError) as raised:
+            await _adapter().fetch_account(
+                token,
+                expected_nonce_hash=sha256(nonce.encode()).digest(),
+            )
+    assert raised.value.error_code == "microsoft_oidc_invalid_response"
+    assert "synthetic-invalid-key-detail" not in str(raised.value)
+    assert not any(call.request.url.path == "/v1.0/me" for call in mocked.calls)
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_microsoft_personal_tenant_is_normalized() -> None:
     """消费者租户应归一为 personal，身份键仍包含 tenant 与 Graph ID。"""
@@ -427,6 +499,47 @@ def test_microsoft_admin_consent_error_is_stable_and_content_free() -> None:
         )
         is None
     )
+
+
+def test_microsoft_plain_interaction_required_is_not_admin_consent() -> None:
+    """没有明确管理员同意证据的 interaction_required 不得误报组织冲突。"""
+    assert (
+        classify_microsoft_callback_error(
+            error="interaction_required",
+            error_description="The user must sign in again.",
+            error_codes=None,
+        )
+        is None
+    )
+
+
+def test_microsoft_interaction_required_with_consent_evidence_is_admin_consent() -> None:
+    """interaction_required 只有携带固定同意证据时才映射管理员同意错误。"""
+    classified = classify_microsoft_callback_error(
+        error="interaction_required",
+        error_description="AADSTS65001: admin consent is required",
+        error_codes=None,
+    )
+    assert isinstance(classified, UserActionRequiredError)
+    assert classified.error_code == "microsoft_admin_consent_required"
+
+
+@pytest.mark.parametrize(
+    "jwks_uri",
+    [
+        f"{MICROSOFT_JWKS_URL}?tenant=synthetic",
+        "https://login.microsoftonline.com/common/alternate/discovery/v2.0/keys",
+        f"{MICROSOFT_JWKS_URL}#fragment",
+    ],
+)
+def test_microsoft_discovery_rejects_non_fixed_jwks_uri(jwks_uri: str) -> None:
+    """discovery 只能指向固定 Microsoft JWKS 端点，不能驱动任意路径或 query。"""
+    payload = _openid_configuration()
+    payload["jwks_uri"] = jwks_uri
+    with pytest.raises(PermanentProviderError) as raised:
+        _parse_discovery(payload)
+    assert raised.value.error_code == "microsoft_oidc_invalid_response"
+    assert "synthetic" not in str(raised.value)
 
 
 @pytest.mark.asyncio

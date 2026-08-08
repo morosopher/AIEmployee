@@ -24,6 +24,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from jwt import InvalidTokenError
 from jwt.algorithms import RSAAlgorithm
+from jwt.exceptions import InvalidKeyError, PyJWTError
 
 from ai_employee.application.ports.oauth import (
     MAX_ACCOUNT_EMAIL_LENGTH,
@@ -57,6 +58,7 @@ MICROSOFT_DISCOVERY_URL: Final = (
 )
 MICROSOFT_GRAPH_ME_URL: Final = "https://graph.microsoft.com/v1.0/me"
 MICROSOFT_JWKS_URL: Final = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
+_MICROSOFT_LIVE_JWKS_URL: Final = "https://login.live.com/common/discovery/v2.0/keys"
 
 # Microsoft v2 delegated OAuth 的基础身份与离线访问 scope。集合和映射均冻结，防止
 # 组合根或测试在运行时追加 Contacts、应用权限或 Mail.ReadWrite 等越界数据源。
@@ -597,6 +599,14 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
                 RSAPublicKey,
                 RSAAlgorithm.from_jwk(json.dumps(key_payload, separators=(",", ":"))),
             )
+        except (InvalidKeyError, PyJWTError, TypeError, ValueError):
+            # JWKS 本身是供应商响应，不可信 key 参数不能变成 500 或把 PyJWT 原文
+            # 暴露给 API；在验签前统一归类为固定的 invalid_response。
+            raise PermanentProviderError(
+                error_code="microsoft_oidc_invalid_response",
+                message="Microsoft OIDC response is invalid",
+            ) from None
+        try:
             # 先验证签名、audience、exp 和必需 claims；不使用未验证 payload。issuer 需要
             # 从已验证的 tid 计算模板，因此暂时关闭 issuer 检查，随后立即做精确白名单比对。
             claims = jwt.decode(
@@ -633,7 +643,7 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
                 error_code="microsoft_oidc_nonce_mismatch",
                 message="Microsoft OIDC verification requires user action",
             ) from None
-        except InvalidTokenError:
+        except (InvalidTokenError, PyJWTError):
             raise UserActionRequiredError(
                 error_code="microsoft_oidc_signature_invalid",
                 message="Microsoft OIDC verification requires user action",
@@ -677,7 +687,24 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
         keys: list[Mapping[str, object]] = []
         for raw in raw_keys:
             if isinstance(raw, Mapping) and raw.get("kty") == "RSA" and raw.get("alg") == "RS256":
-                keys.append(cast(Mapping[str, object], raw))
+                normalized_key = cast(Mapping[str, object], raw)
+                try:
+                    public_key = cast(
+                        RSAPublicKey,
+                        RSAAlgorithm.from_jwk(
+                            json.dumps(normalized_key, separators=(",", ":"))
+                        ),
+                    )
+                    # Microsoft 生产 OIDC RSA key 至少应达到 2048 bit；过短或非 RSA
+                    # 参数即使 cryptography 勉强接受，也不应进入可缓存的信任集合。
+                    if not isinstance(public_key, RSAPublicKey) or public_key.key_size < 2048:
+                        raise ValueError("RSA key size is invalid")
+                except (InvalidKeyError, PyJWTError, TypeError, ValueError):
+                    raise PermanentProviderError(
+                        error_code="microsoft_oidc_invalid_response",
+                        message="Microsoft OIDC response is invalid",
+                    ) from None
+                keys.append(normalized_key)
         if not keys:
             raise PermanentProviderError(
                 error_code="microsoft_oidc_invalid_response",
@@ -694,10 +721,15 @@ def _parse_discovery(payload: Mapping[str, object]) -> _DiscoveryDocument:
         issuer = _require_microsoft_text(payload.get("issuer"), "issuer", max_length=512)
         jwks_uri = _require_microsoft_text(payload.get("jwks_uri"), "jwks_uri", max_length=512)
         parsed = httpx.URL(jwks_uri)
-        if parsed.scheme != "https" or parsed.host not in _ALLOWED_JWKS_HOSTS:
-            raise ValueError("JWKS host is not allowed")
-        if not parsed.path.endswith("/discovery/v2.0/keys"):
-            raise ValueError("JWKS path is not allowed")
+        # Discovery 是供应商响应驱动的网络边界；只接受规格固定的 common JWKS URL，
+        # 从而同时拒绝信任主机上的任意路径、query、fragment、端口或 userinfo。保留
+        # login.live.com 的同构固定端点以支持个人账户 issuer，但不接受动态 tenant 路径。
+        if (
+            parsed.scheme != "https"
+            or parsed.host not in _ALLOWED_JWKS_HOSTS
+            or jwks_uri not in {MICROSOFT_JWKS_URL, _MICROSOFT_LIVE_JWKS_URL}
+        ):
+            raise ValueError("JWKS URI is not an allowed fixed endpoint")
         if "{tenantid}" in issuer:
             if not re.fullmatch(
                 r"https://(?:login\.microsoftonline\.com|login\.live\.com)/\{tenantid\}/v2\.0/?",
@@ -761,19 +793,33 @@ def classify_microsoft_callback_error(
     不进入异常消息、metadata、数据库或日志。未知 callback error 交给上层通用失败处理。
     """
     normalized_error = error.casefold() if isinstance(error, str) else ""
-    normalized_codes = error_codes or ""
+    normalized_codes = error_codes.casefold() if isinstance(error_codes, str) else ""
     normalized_description = (
         error_description.casefold() if isinstance(error_description, str) else ""
     )
-    if (
+    # ``interaction_required`` 既可能表示普通登录交互，也可能表示租户管理员同意缺失。
+    # 只有固定代码或明确的 consent/admin-consent 词组才能证明后者，避免把普通重新登录
+    # 错误错误地升级为组织级 409；原始 description 仍只用于本地分类，永不回显。
+    explicit_consent_evidence = (
         "65001" in normalized_codes
-        or "65001" in normalized_error
         or "65001" in normalized_description
+        or any(
+            marker in normalized_codes or marker in normalized_description
+            for marker in (
+                "admin consent",
+                "administrator consent",
+                "consent required",
+                "consent_required",
+            )
+        )
+    )
+    if (
+        explicit_consent_evidence
+        or "65001" in normalized_error
         or normalized_error
         in {
             "consent_required",
             "admin_consent_required",
-            "interaction_required",
         }
     ):
         return UserActionRequiredError(
