@@ -259,6 +259,13 @@ def _domain_problem(error: DomainError) -> ApiProblem:
             "Administrator consent required",
             "An organization administrator must approve the requested access.",
         )
+    if error.error_code == "connection_scope_missing":
+        return ApiProblem(
+            409,
+            error.error_code,
+            "Connection scope missing",
+            "Reconnect the provider to grant the required access.",
+        )
     if isinstance(error, UserActionRequiredError):
         return ApiProblem(
             403, error.error_code, "User action required", "Complete the required action."

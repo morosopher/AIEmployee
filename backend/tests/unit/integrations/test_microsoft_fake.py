@@ -102,6 +102,7 @@ async def test_fake_microsoft_oauth_exchange_refresh_and_account_are_offline() -
     assert account.provider_account_id == "synthetic-tenant:synthetic-microsoft-user"
     assert account.account_email == "test-mode@microsoft.example.test"
     assert exchanged.access_token == "fake-microsoft-access"
+    assert "User.Read" in exchanged.granted_scopes
     assert exchanged.granted_scopes == frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read"})
     assert refreshed.access_token == "fake-microsoft-refreshed-access"
     assert refreshed.granted_scopes == exchanged.granted_scopes

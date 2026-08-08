@@ -29,6 +29,14 @@ from ai_employee.domain.errors import (
         ),
         (
             UserActionRequiredError(
+                error_code="connection_scope_missing",
+                message="secret scope detail",
+            ),
+            409,
+            None,
+        ),
+        (
+            UserActionRequiredError(
                 error_code="microsoft_admin_consent_required",
                 message="secret administrator detail",
             ),

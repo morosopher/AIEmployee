@@ -34,6 +34,7 @@ from ai_employee.integrations.microsoft.oauth import (
     MICROSOFT_DISCOVERY_URL,
     MICROSOFT_GRAPH_ME_URL,
     MICROSOFT_JWKS_URL,
+    MICROSOFT_SCOPES,
     MICROSOFT_TOKEN_URL,
     MicrosoftOAuthAdapter,
     _parse_discovery,
@@ -136,8 +137,20 @@ def test_microsoft_scope_union_is_minimal_and_deterministic() -> None:
     )
     assert requested == frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read", "Mail.Send"})
     assert requested.issubset(MICROSOFT_ALLOWED_SCOPES)
+    assert "User.Read" in requested
+    assert MICROSOFT_SCOPES == [
+        "openid",
+        "profile",
+        "email",
+        "User.Read",
+        "offline_access",
+        "Mail.Read",
+        "Calendars.Read",
+    ]
     assert "Mail.ReadWrite" not in requested
     assert "Contacts.Read" not in requested
+    assert "Directory.Read.All" not in requested
+    assert "Application.Read.All" not in requested
     assert type(requested) is frozenset
 
 
@@ -156,6 +169,7 @@ def test_microsoft_authorization_url_uses_common_v2_pkce_nonce_and_offline_scope
         "openid",
         "profile",
         "email",
+        "User.Read",
         "offline_access",
         "Mail.Read",
         "Mail.Send",
@@ -178,7 +192,7 @@ async def test_microsoft_token_exchange_normalizes_scope_and_id_token() -> None:
                 "access_token": "synthetic-access",
                 "refresh_token": "synthetic-refresh",
                 "expires_in": 3600,
-                "scope": "openid profile email offline_access Mail.Read Mail.Send",
+                "scope": "openid profile email User.Read offline_access Mail.Read Mail.Send",
                 "id_token": "synthetic-id-token",
                 "token_type": "Bearer",
             },
@@ -203,12 +217,47 @@ async def test_microsoft_refresh_without_rotation_returns_none_refresh_token() -
         json={
             "access_token": "synthetic-refreshed-access",
             "expires_in": 3600,
-            "scope": "openid profile email offline_access Mail.Read",
+            "scope": "openid profile email User.Read offline_access Mail.Read",
         },
     )
     token = await _adapter().refresh("synthetic-existing-refresh")
     assert token.refresh_token is None
     assert token.granted_scopes == frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read"})
+
+
+@pytest.mark.asyncio
+async def test_microsoft_graph_identity_requires_user_read_scope_before_graph() -> None:
+    """token 缺少 User.Read 时必须在 Graph /me 前返回稳定 scope 缺失错误。"""
+    _, private_key = _jwk_and_private_key()
+    tenant = "tenant-user-read-missing"
+    nonce = "user-read-missing-nonce"
+    id_token = _id_token(private_key, tenant=tenant, nonce=nonce)
+    with respx.mock(assert_all_called=False) as mocked:
+        mocked.post(MICROSOFT_TOKEN_URL).respond(
+            200,
+            json={
+                "access_token": "synthetic-user-read-missing-access",
+                "refresh_token": "synthetic-user-read-missing-refresh",
+                "expires_in": 3600,
+                "scope": "openid profile email offline_access Mail.Read",
+                "id_token": id_token,
+            },
+        )
+        _install_oidc_routes(mocked, private_key)
+        token = await _adapter().exchange_code(
+            code="synthetic-user-read-missing-code",
+            verifier="synthetic-user-read-missing-verifier",
+        )
+        with pytest.raises(UserActionRequiredError) as raised:
+            await _adapter().fetch_account(
+                token,
+                expected_nonce_hash=sha256(nonce.encode()).digest(),
+            )
+        assert raised.value.error_code == "connection_scope_missing"
+        assert "User.Read" not in str(raised.value)
+        assert not any(call.request.url.path == "/v1.0/me" for call in mocked.calls)
+        assert any(call.request.url == MICROSOFT_DISCOVERY_URL for call in mocked.calls)
+        assert any(call.request.url == MICROSOFT_JWKS_URL for call in mocked.calls)
 
 
 @pytest.mark.asyncio

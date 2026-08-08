@@ -60,10 +60,11 @@ MICROSOFT_GRAPH_ME_URL: Final = "https://graph.microsoft.com/v1.0/me"
 MICROSOFT_JWKS_URL: Final = "https://login.microsoftonline.com/common/discovery/v2.0/keys"
 _MICROSOFT_LIVE_JWKS_URL: Final = "https://login.live.com/common/discovery/v2.0/keys"
 
-# Microsoft v2 delegated OAuth 的基础身份与离线访问 scope。集合和映射均冻结，防止
+# Microsoft v2 delegated OAuth 的基础身份与离线访问 scope。``User.Read`` 是调用 Graph
+# ``/me`` 获取稳定用户 ID/邮箱所需的最小 delegated permission；集合和映射均冻结，防止
 # 组合根或测试在运行时追加 Contacts、应用权限或 Mail.ReadWrite 等越界数据源。
 MICROSOFT_BASE_SCOPES: Final[frozenset[str]] = frozenset(
-    {"openid", "profile", "email", "offline_access"}
+    {"openid", "profile", "email", "User.Read", "offline_access"}
 )
 MICROSOFT_CAPABILITY_SCOPES: Final[Mapping[ConnectionCapability, frozenset[str]]] = (
     MappingProxyType(
@@ -83,6 +84,7 @@ MICROSOFT_SCOPES: Final[list[str]] = [
     "openid",
     "profile",
     "email",
+    "User.Read",
     "offline_access",
     "Mail.Read",
     "Calendars.Read",
@@ -183,11 +185,12 @@ def _ordered_scopes(scopes: frozenset[str]) -> tuple[str, ...]:
         "openid": 0,
         "profile": 1,
         "email": 2,
-        "offline_access": 3,
-        "Mail.Read": 4,
-        "Mail.Send": 5,
-        "Calendars.Read": 6,
-        "Calendars.ReadWrite": 7,
+        "User.Read": 3,
+        "offline_access": 4,
+        "Mail.Read": 5,
+        "Mail.Send": 6,
+        "Calendars.Read": 7,
+        "Calendars.ReadWrite": 8,
     }
     return tuple(sorted(scopes, key=lambda item: (order.get(item, 99), item)))
 
@@ -454,6 +457,14 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
                 message="Microsoft OIDC verification requires user action",
             )
         claims = await self._verify_id_token(token.id_token, expected_nonce_hash)
+        if "User.Read" not in token.granted_scopes:
+            # Graph /me 的稳定身份字段受 User.Read delegated scope 保护；即使 OIDC
+            # claims 已验签，也不能在实际授予 scope 缺失时发出 Graph 请求或创建连接。
+            # 使用 provider-neutral scope 错误，让 callback 继续收敛渐进授权状态。
+            raise UserActionRequiredError(
+                error_code="connection_scope_missing",
+                message="Microsoft connection scope requires user action",
+            )
         tenant = _tenant_from_claims(claims)
         normalized_access = _require_microsoft_text(token.access_token, "access_token")
         async with httpx.AsyncClient(timeout=_timeout()) as client:

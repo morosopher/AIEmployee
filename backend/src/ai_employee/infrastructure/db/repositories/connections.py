@@ -53,7 +53,11 @@ def _scope_sort_key(scope: str) -> tuple[int, int, str]:
         "openid": 0,
         "profile": 1,
         "email": 2,
-        "offline_access": 3,
+        # Microsoft Graph `/me` 依赖的 User.Read 仍属于基础身份 scope，不能被
+        # 按未知供应商权限排到 Mail/Calendar 资源之后；这样数据库 JSONB 列与授权 URL
+        # 维持同一确定性身份→离线→资源顺序。
+        "User.Read": 3,
+        "offline_access": 4,
     }
     if scope in identity_order:
         return (0, identity_order[scope], scope)

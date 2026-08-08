@@ -132,6 +132,7 @@ async def test_microsoft_start_and_callback_use_common_endpoint_and_state_once(
         "openid",
         "profile",
         "email",
+        "User.Read",
         "offline_access",
         "Mail.Read",
         "Calendars.Read",
@@ -184,6 +185,7 @@ async def test_microsoft_start_can_request_mail_read_only(
         "openid",
         "profile",
         "email",
+        "User.Read",
         "offline_access",
         "Mail.Read",
     ]
@@ -212,6 +214,7 @@ async def test_microsoft_start_can_request_calendar_read_only_via_query(
         "openid",
         "profile",
         "email",
+        "User.Read",
         "offline_access",
         "Calendars.Read",
     ]
@@ -289,7 +292,7 @@ async def test_microsoft_success_callback_persists_tenant_graph_identity(
                 "access_token": "synthetic-microsoft-access",
                 "refresh_token": "synthetic-microsoft-refresh",
                 "expires_in": 3600,
-                "scope": "openid profile email offline_access Mail.Read Calendars.Read",
+                "scope": "openid profile email User.Read offline_access Mail.Read Calendars.Read",
                 "id_token": id_token,
             },
         )
@@ -316,14 +319,97 @@ async def test_microsoft_success_callback_persists_tenant_graph_identity(
     assert connection.provider_tenant_id == tenant
     assert connection.provider_account_id == f"{tenant}:graph-integration-user"
     assert connection.account_type == "work_school"
-    assert set(connection.scopes) == {
+    assert connection.scopes == [
         "openid",
         "profile",
         "email",
+        "User.Read",
         "offline_access",
         "Mail.Read",
         "Calendars.Read",
-    }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_microsoft_callback_missing_user_read_stops_before_graph_and_persistence(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """实际 token 缺少 User.Read 时返回 scope 冲突，不调用 Graph 或启用能力。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 200
+    query = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    tenant = "tenant-missing-user-read"
+    private_key, jwk = _signing_material()
+    id_token = jwt.encode(
+        {
+            "iss": f"https://login.microsoftonline.com/{tenant}/v2.0",
+            "aud": "synthetic-microsoft-client",
+            "tid": tenant,
+            "nonce": query["nonce"][0],
+            "exp": 1893456000,
+            "iat": 1780000000,
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "integration-runtime-key"},
+    )
+    discovery = json.loads(
+        (
+            Path(__file__).parents[2]
+            / "contract"
+            / "microsoft"
+            / "fixtures"
+            / "openid_configuration.json"
+        ).read_text(encoding="utf-8")
+    )
+    with respx.mock(assert_all_called=False) as mocked:
+        mocked.post(MICROSOFT_TOKEN_URL).respond(
+            200,
+            json={
+                "access_token": "synthetic-missing-user-read-access",
+                "refresh_token": "synthetic-missing-user-read-refresh",
+                "expires_in": 3600,
+                "scope": "openid profile email offline_access Mail.Read Calendars.Read",
+                "id_token": id_token,
+            },
+        )
+        mocked.get(MICROSOFT_DISCOVERY_URL).respond(200, json=discovery)
+        mocked.get(MICROSOFT_JWKS_URL).respond(200, json={"keys": [jwk]})
+        mocked.get(MICROSOFT_GRAPH_ME_URL).respond(
+            200,
+            json={
+                "id": "graph-missing-user-read",
+                "mail": "microsoft-owner@example.test",
+                "userPrincipalName": "microsoft-owner@example.test",
+            },
+        )
+        response = await context.client.get(
+            "/api/v1/connections/microsoft/callback",
+            params={"code": "synthetic-missing-user-read-code", "state": query["state"][0]},
+        )
+        assert not any(call.request.url.path == "/v1.0/me" for call in mocked.calls)
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "connection_scope_missing"
+    async with context.queries() as session:
+        connections = tuple((await session.scalars(select(OAuthConnectionModel))).all())
+    assert connections == ()
+    replay = await context.client.get(
+        "/api/v1/connections/microsoft/callback",
+        params={"code": "synthetic-missing-user-read-code", "state": query["state"][0]},
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error_code"] == "oauth_state_rejected"
 
 
 @pytest.mark.asyncio
@@ -471,7 +557,7 @@ async def test_microsoft_disconnect_does_not_call_broad_revoke_endpoints(
             provider_tenant_id="tenant-synthetic",
             account_type="work_school",
             account_email="microsoft-owner@example.test",
-            scopes=["openid", "profile", "email", "offline_access", "Mail.Read"],
+            scopes=["openid", "profile", "email", "User.Read", "offline_access", "Mail.Read"],
             status="connected",
             last_error_code=None,
         )
