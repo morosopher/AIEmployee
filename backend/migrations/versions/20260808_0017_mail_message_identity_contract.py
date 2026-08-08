@@ -27,6 +27,7 @@ _THREAD_UNIQUE_COLUMNS = ("id", "connection_id", "user_id")
 _THREAD_UNIQUE_TABLE = "email_threads"
 _LEGACY_MESSAGE_UNIQUE = "uq_email_messages_thread_provider_message"
 _NULL_CHECK = "ck_email_messages_connection_id_present"
+_BACKFILL_BATCH_SIZE = 1_000
 
 
 def _column_exists(table_name: str, column_name: str) -> bool:
@@ -186,6 +187,38 @@ def _index_row(index_name: str) -> tuple[object, ...] | None:
 def _quote_identifier(identifier: str) -> str:
     """用当前 PostgreSQL 方言安全引用固定迁移标识符。"""
     return op.get_bind().dialect.identifier_preparer.quote(identifier)
+
+
+def _catch_up_connection_identity() -> None:
+    """有界追赶 0016 部署窗口内旧应用实例留下的 nullable direct identity。
+
+    0016 初始回填完成后仍必须先部署双写应用并排空旧实例，期间旧列集合可以继续插入
+    ``connection_id IS NULL``。这里重复同一可信 thread 投影和固定批次 AUTOCOMMIT 更新，
+    每批释放行锁且可安全重跑；任何无法从 thread 证明归属的行会留给后续 preflight
+    fail closed，绝不猜测或删除业务事实。
+    """
+    with op.get_context().autocommit_block():
+        bind = op.get_bind()
+        while True:
+            result = bind.execute(
+                sa.text(
+                    "WITH batch AS ("
+                    "SELECT message.id, thread.connection_id "
+                    "FROM email_messages AS message "
+                    "JOIN email_threads AS thread ON thread.id = message.thread_id "
+                    "WHERE message.connection_id IS NULL "
+                    "ORDER BY message.id "
+                    "LIMIT :batch_size "
+                    "FOR UPDATE OF message SKIP LOCKED"
+                    ") UPDATE email_messages AS message "
+                    "SET connection_id = batch.connection_id "
+                    "FROM batch WHERE message.id = batch.id "
+                    "RETURNING message.id"
+                ),
+                {"batch_size": _BACKFILL_BATCH_SIZE},
+            )
+            if not result.fetchall():
+                break
 
 
 def _assert_preflight() -> None:
@@ -406,6 +439,7 @@ def upgrade() -> None:
             _MESSAGE_UNIQUE_TABLE,
             sa.Column("provider_updated_at", sa.DateTime(timezone=True), nullable=True),
         )
+    _catch_up_connection_identity()
     _assert_preflight()
     _prepare_unique_indexes()
     _attach_unique_constraints()

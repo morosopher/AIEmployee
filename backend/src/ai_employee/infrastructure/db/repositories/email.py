@@ -4,9 +4,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from uuid import UUID
 
-from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
@@ -41,12 +42,32 @@ class MailConnectionCredentials:
     refresh_token: EncryptedValue | None
 
 
+class _MailMessageConflictTarget(StrEnum):
+    """表示当前事务可安全使用的邮件消息 identity conflict target。"""
+
+    NEW_CONSTRAINT = "new_constraint"
+    NEW_INDEX = "new_index"
+    LEGACY_CONSTRAINT = "legacy_constraint"
+
+
+_NEW_MESSAGE_IDENTITY = "uq_email_messages_connection_provider_message"
+_LEGACY_MESSAGE_IDENTITY = "uq_email_messages_thread_provider_message"
+_MESSAGE_IDENTITY_CATALOG_ERROR = "mail message identity catalog is unsafe"
+
+
 class SqlAlchemyMailSyncRepository:
     """在调用方事务内维护邮件可审计事实；所有方法均不自行提交。"""
 
     def __init__(self, session: AsyncSession) -> None:
-        """绑定由用例拥有的异步会话，禁止仓储跨边界提交。"""
+        """绑定由用例拥有的异步会话，禁止仓储跨边界提交。
+
+        邮件 identity target 只允许在同一个数据库事务内缓存。0016/0017 online 部署期间
+        不同事务可能看到 legacy constraint、已完成但未挂载的新索引或最终新约束；跨事务
+        复用一次探测结果会把迁移窗口重新变成不可用窗口。
+        """
         self._session = session
+        self._message_conflict_transaction: object | None = None
+        self._message_conflict_target: _MailMessageConflictTarget | None = None
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
@@ -258,8 +279,18 @@ class SqlAlchemyMailSyncRepository:
         线程先按 ``connection_id + provider_thread_id`` 写入，消息随后以取得的本地主键按
         ``connection_id + provider_message_id`` 写入。Graph ImmutableId 在 folder move 或
         conversation 投影变化后仍代表同一消息，因此冲突更新必须同步切换 ``thread_id``、
-        scope、规范元数据与新密文，不能制造第二个事实行或保留原始 MIME/附件。
+        scope、规范元数据与新密文，不能制造第二个事实行或保留原始 MIME/附件。online
+        迁移期间 conflict target 由当前事务的真实 PostgreSQL catalog 决定，不能假设 0017
+        已经完成，也不能把供应商网络 I/O 带入这里。
         """
+        conflict_target = await self._message_identity_conflict_target()
+        if conflict_target == _MailMessageConflictTarget.LEGACY_CONSTRAINT:
+            # 0016 尚无连接级唯一索引。锁定同一连接可串行化短暂部署窗口内的 folder
+            # projection 写入，使下面的 legacy move 检查不会与另一个事务同时插入第二行。
+            await self._lock_legacy_identity_connection(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
         participants = self._participants(message)
         thread_statement = insert(EmailThreadModel).values(
             user_id=user_id,
@@ -304,6 +335,16 @@ class SqlAlchemyMailSyncRepository:
         )
         if thread_id is None:
             raise RuntimeError("Mail thread upsert did not return an ID")
+        if conflict_target == _MailMessageConflictTarget.LEGACY_CONSTRAINT:
+            legacy_result = await self._update_existing_legacy_message(
+                user_id=user_id,
+                connection_id=connection_id,
+                thread_id=thread_id,
+                message=message,
+                encrypted_body=encrypted_body,
+            )
+            if legacy_result is not None:
+                return legacy_result
         message_statement = insert(EmailMessageModel).values(
             user_id=user_id,
             connection_id=connection_id,
@@ -331,38 +372,325 @@ class SqlAlchemyMailSyncRepository:
             stored=EmailMessageModel.provider_updated_at,
             incoming=message_statement.excluded.provider_updated_at,
         )
-        applied_id = await self._session.scalar(
-            message_statement.on_conflict_do_update(
-                constraint="uq_email_messages_connection_provider_message",
-                set_={
-                    "thread_id": message_statement.excluded.thread_id,
-                    "received_at": message_statement.excluded.received_at,
-                    "sent_at": message_statement.excluded.sent_at,
-                    "provider_updated_at": message_statement.excluded.provider_updated_at,
-                    "internet_message_id": message_statement.excluded.internet_message_id,
-                    "provider_conversation_id": (
-                        message_statement.excluded.provider_conversation_id
-                    ),
-                    "mailbox_scope_key": message_statement.excluded.mailbox_scope_key,
-                    "sender": message_statement.excluded.sender,
-                    "recipients": message_statement.excluded.recipients,
-                    "subject": message_statement.excluded.subject,
-                    "snippet": message_statement.excluded.snippet,
-                    "body_ciphertext": message_statement.excluded.body_ciphertext,
-                    "body_nonce": message_statement.excluded.body_nonce,
-                    "body_key_version": message_statement.excluded.body_key_version,
-                    "labels": message_statement.excluded.labels,
-                    "headers": message_statement.excluded.headers,
-                    "provider_url": message_statement.excluded.provider_url,
-                },
+        update_values = {
+            # legacy 实例可能在 0016 nullable 窗口留下 NULL；即使本次命中旧 thread 约束，
+            # 冲突更新也必须补写 direct connection，保证双写部署真正追赶旧列集合。
+            "connection_id": message_statement.excluded.connection_id,
+            "thread_id": message_statement.excluded.thread_id,
+            "received_at": message_statement.excluded.received_at,
+            "sent_at": message_statement.excluded.sent_at,
+            "provider_updated_at": message_statement.excluded.provider_updated_at,
+            "internet_message_id": message_statement.excluded.internet_message_id,
+            "provider_conversation_id": message_statement.excluded.provider_conversation_id,
+            "mailbox_scope_key": message_statement.excluded.mailbox_scope_key,
+            "sender": message_statement.excluded.sender,
+            "recipients": message_statement.excluded.recipients,
+            "subject": message_statement.excluded.subject,
+            "snippet": message_statement.excluded.snippet,
+            "body_ciphertext": message_statement.excluded.body_ciphertext,
+            "body_nonce": message_statement.excluded.body_nonce,
+            "body_key_version": message_statement.excluded.body_key_version,
+            "labels": message_statement.excluded.labels,
+            "headers": message_statement.excluded.headers,
+            "provider_url": message_statement.excluded.provider_url,
+        }
+        if conflict_target == _MailMessageConflictTarget.NEW_INDEX:
+            conflict_statement = message_statement.on_conflict_do_update(
+                index_elements=(
+                    EmailMessageModel.connection_id,
+                    EmailMessageModel.provider_message_id,
+                ),
+                set_=update_values,
                 where=message_is_newer,
-            ).returning(EmailMessageModel.id)
+            )
+        else:
+            constraint_name = (
+                _NEW_MESSAGE_IDENTITY
+                if conflict_target == _MailMessageConflictTarget.NEW_CONSTRAINT
+                else _LEGACY_MESSAGE_IDENTITY
+            )
+            conflict_statement = message_statement.on_conflict_do_update(
+                constraint=constraint_name,
+                set_=update_values,
+                where=message_is_newer,
+            )
+        applied_id = await self._session.scalar(
+            conflict_statement.returning(EmailMessageModel.id)
         )
         return (
             MailMessageUpsertResult.APPLIED
             if applied_id is not None
             else MailMessageUpsertResult.STALE_SKIPPED
         )
+
+    async def _message_identity_conflict_target(self) -> _MailMessageConflictTarget:
+        """按当前事务的真实 catalog 选择精确 conflict target。
+
+        Returns:
+            0016 legacy constraint、0017 standalone valid index 或最终新 constraint 对应模式。
+
+        Raises:
+            RuntimeError: 同名对象类型、归属表、唯一性、谓词或有序列不符合固定契约，或
+                新旧 identity target 均不存在。错误文本固定且不包含 catalog 标识以外数据。
+        """
+        transaction = self._session.sync_session.get_transaction()
+        if (
+            transaction is not None
+            and transaction is self._message_conflict_transaction
+            and self._message_conflict_target is not None
+        ):
+            return self._message_conflict_target
+
+        target = await self._resolve_message_identity_conflict_target()
+        # catalog 查询本身会在未显式 begin 的兼容调用方中触发 autobegin；因此查询后再读取
+        # 根事务对象，确保缓存最多存活到这一事务结束，绝不跨 0016/0017 部署阶段复用。
+        self._message_conflict_transaction = self._session.sync_session.get_transaction()
+        self._message_conflict_target = target
+        return target
+
+    async def _resolve_message_identity_conflict_target(self) -> _MailMessageConflictTarget:
+        """验证新 constraint/index 或 legacy constraint 的完整 PostgreSQL 形状。"""
+        new_constraints = await self._constraint_catalog_rows(_NEW_MESSAGE_IDENTITY)
+        if new_constraints:
+            if len(new_constraints) != 1 or not self._is_exact_identity_constraint(
+                new_constraints[0],
+                expected_columns=("connection_id", "provider_message_id"),
+            ):
+                raise RuntimeError(_MESSAGE_IDENTITY_CATALOG_ERROR)
+            return _MailMessageConflictTarget.NEW_CONSTRAINT
+
+        new_index = (
+            await self._session.execute(
+                text(
+                    "SELECT index_class.relkind::text, table_class.relname, "
+                    "index_info.indisvalid, index_info.indisunique, "
+                    "index_info.indpred IS NULL, index_info.indexprs IS NULL, "
+                    "ARRAY(SELECT attribute.attname "
+                    "FROM unnest(index_info.indkey) WITH ORDINALITY "
+                    "AS index_key(attnum, position) "
+                    "JOIN pg_catalog.pg_attribute AS attribute "
+                    "ON attribute.attrelid = index_info.indrelid "
+                    "AND attribute.attnum = index_key.attnum "
+                    "ORDER BY index_key.position) "
+                    "FROM pg_catalog.pg_class AS index_class "
+                    "JOIN pg_catalog.pg_namespace AS namespace "
+                    "ON namespace.oid = index_class.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_index AS index_info "
+                    "ON index_info.indexrelid = index_class.oid "
+                    "LEFT JOIN pg_catalog.pg_class AS table_class "
+                    "ON table_class.oid = index_info.indrelid "
+                    "WHERE namespace.nspname = current_schema() "
+                    "AND index_class.relname = :index_name"
+                ),
+                {"index_name": _NEW_MESSAGE_IDENTITY},
+            )
+        ).one_or_none()
+        if new_index is not None:
+            index_columns = self._catalog_columns(new_index[6])
+            if (
+                new_index[0] != "i"
+                or new_index[1] != "email_messages"
+                or not bool(new_index[2])
+                or not bool(new_index[3])
+                or not bool(new_index[4])
+                or not bool(new_index[5])
+                or index_columns != ("connection_id", "provider_message_id")
+            ):
+                # invalid CONCURRENTLY 索引只能由 0017 在明确迁移窗口内处理；应用继续写入
+                # 会让 catalog 状态和冲突语义更难判定，因此必须立即 fail closed。
+                raise RuntimeError(_MESSAGE_IDENTITY_CATALOG_ERROR)
+            return _MailMessageConflictTarget.NEW_INDEX
+
+        legacy_constraints = await self._constraint_catalog_rows(_LEGACY_MESSAGE_IDENTITY)
+        if len(legacy_constraints) != 1 or not self._is_exact_identity_constraint(
+            legacy_constraints[0],
+            expected_columns=("thread_id", "provider_message_id"),
+        ):
+            raise RuntimeError(_MESSAGE_IDENTITY_CATALOG_ERROR)
+        return _MailMessageConflictTarget.LEGACY_CONSTRAINT
+
+    async def _constraint_catalog_rows(
+        self,
+        constraint_name: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        """读取当前 schema 内同名 constraint 及其 backing index 的精确形状。"""
+        rows = await self._session.execute(
+            text(
+                "SELECT table_class.relname, constraint_info.contype::text, "
+                "ARRAY(SELECT attribute.attname "
+                "FROM unnest(constraint_info.conkey) WITH ORDINALITY "
+                "AS constraint_key(attnum, position) "
+                "JOIN pg_catalog.pg_attribute AS attribute "
+                "ON attribute.attrelid = constraint_info.conrelid "
+                "AND attribute.attnum = constraint_key.attnum "
+                "ORDER BY constraint_key.position), "
+                "index_info.indisvalid, index_info.indisunique, "
+                "index_info.indpred IS NULL, index_info.indexprs IS NULL, "
+                "ARRAY(SELECT attribute.attname "
+                "FROM unnest(index_info.indkey) WITH ORDINALITY "
+                "AS index_key(attnum, position) "
+                "JOIN pg_catalog.pg_attribute AS attribute "
+                "ON attribute.attrelid = index_info.indrelid "
+                "AND attribute.attnum = index_key.attnum "
+                "ORDER BY index_key.position) "
+                "FROM pg_catalog.pg_constraint AS constraint_info "
+                "JOIN pg_catalog.pg_class AS table_class "
+                "ON table_class.oid = constraint_info.conrelid "
+                "JOIN pg_catalog.pg_namespace AS namespace "
+                "ON namespace.oid = table_class.relnamespace "
+                "LEFT JOIN pg_catalog.pg_index AS index_info "
+                "ON index_info.indexrelid = constraint_info.conindid "
+                "WHERE namespace.nspname = current_schema() "
+                "AND constraint_info.conname = :constraint_name"
+            ),
+            {"constraint_name": constraint_name},
+        )
+        return tuple(tuple(row) for row in rows)
+
+    @staticmethod
+    def _is_exact_identity_constraint(
+        row: tuple[object, ...],
+        *,
+        expected_columns: tuple[str, ...],
+    ) -> bool:
+        """确认唯一 constraint 与其有效、无谓词 backing index 均精确匹配。"""
+        if len(row) != 8:
+            return False
+        constraint_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[2])
+        index_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[7])
+        return (
+            row[0] == "email_messages"
+            and row[1] == "u"
+            and constraint_columns == expected_columns
+            and bool(row[3])
+            and bool(row[4])
+            and bool(row[5])
+            and bool(row[6])
+            and index_columns == expected_columns
+        )
+
+    @staticmethod
+    def _catalog_columns(value: object) -> tuple[str, ...] | None:
+        """把 asyncpg 的 PostgreSQL text[] 收窄为纯字符串 tuple，坏类型返回 ``None``。"""
+        if not isinstance(value, (list, tuple)) or not all(
+            isinstance(column, str) for column in value
+        ):
+            return None
+        return tuple(value)
+
+    async def _lock_legacy_identity_connection(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> None:
+        """在 0016 窗口锁定连接，串行化缺少连接级唯一索引的短事务。"""
+        locked_id = await self._session.scalar(
+            select(OAuthConnectionModel.id)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if locked_id is None:
+            raise StateConflictError(
+                error_code="mail_connection_not_syncable",
+                message="Mail connection is no longer available for message persistence",
+            )
+
+    async def _update_existing_legacy_message(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        thread_id: UUID,
+        message: MailMessage,
+        encrypted_body: EncryptedValue,
+    ) -> MailMessageUpsertResult | None:
+        """在 0016 legacy constraint 下原地移动已有 connection-level projection。
+
+        查询通过 thread 的可信 connection 归属而不是 nullable direct 列，因此也能补齐旧
+        实例在 expand 窗口写入的 NULL。连接行已由调用方锁定；若仍看到两行，说明历史数据
+        在双写部署前已经含糊，必须留给迁移 preflight 和人工修复，不能任意选一行。
+        """
+        rows = tuple(
+            (
+                await self._session.scalars(
+                    select(EmailMessageModel)
+                    .join(EmailThreadModel, EmailThreadModel.id == EmailMessageModel.thread_id)
+                    .where(
+                        EmailMessageModel.user_id == user_id,
+                        EmailThreadModel.user_id == user_id,
+                        EmailThreadModel.connection_id == connection_id,
+                        EmailMessageModel.provider_message_id == message.provider_message_id,
+                    )
+                    .order_by(EmailMessageModel.id)
+                    .limit(2)
+                    .with_for_update(of=EmailMessageModel)
+                )
+            ).all()
+        )
+        if len(rows) > 1:
+            raise RuntimeError(
+                "mail message connection-level duplicate requires manual repair"
+            )
+        if not rows:
+            return None
+        stored = rows[0]
+        if not self._incoming_projection_value_is_newer(
+            stored=stored.provider_updated_at,
+            incoming=message.provider_updated_at,
+        ):
+            return MailMessageUpsertResult.STALE_SKIPPED
+        self._apply_message_projection(
+            stored=stored,
+            connection_id=connection_id,
+            thread_id=thread_id,
+            message=message,
+            encrypted_body=encrypted_body,
+        )
+        return MailMessageUpsertResult.APPLIED
+
+    @staticmethod
+    def _apply_message_projection(
+        *,
+        stored: EmailMessageModel,
+        connection_id: UUID,
+        thread_id: UUID,
+        message: MailMessage,
+        encrypted_body: EncryptedValue,
+    ) -> None:
+        """把经过版本判断的规范字段写回同一 ORM 行，并保持正文只存 AEAD 三元组。"""
+        stored.connection_id = connection_id
+        stored.thread_id = thread_id
+        stored.received_at = message.received_at
+        stored.sent_at = message.sent_at
+        stored.provider_updated_at = message.provider_updated_at
+        stored.internet_message_id = message.internet_message_id
+        stored.provider_conversation_id = message.provider_conversation_id
+        stored.mailbox_scope_key = message.mailbox_scope_key
+        stored.sender = dict(message.sender)
+        stored.recipients = [dict(recipient) for recipient in message.recipients]
+        stored.subject = message.subject
+        stored.snippet = ""
+        stored.body_ciphertext = encrypted_body.ciphertext
+        stored.body_nonce = encrypted_body.nonce
+        stored.body_key_version = encrypted_body.key_version
+        stored.labels = list(message.labels)
+        stored.headers = dict(message.normalized_reply_headers)
+        stored.provider_url = message.provider_url
+
+    @staticmethod
+    def _incoming_projection_value_is_newer(
+        *,
+        stored: datetime | None,
+        incoming: datetime | None,
+    ) -> bool:
+        """以 Python 值复刻 SQL 版本顺序，供已锁定的 0016 legacy 行更新。"""
+        if stored is None:
+            return True
+        return incoming is not None and incoming > stored
 
     async def remove_message(
         self,

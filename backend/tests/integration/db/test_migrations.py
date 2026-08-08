@@ -1,18 +1,23 @@
 """验证 Alembic 能从空数据库升级到当前任务持久化 Schema 且无元数据漂移。"""
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ai_employee.agents.runner import postgres_checkpointer
+from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.mail import MailMessage, MailMessageUpsertResult
 from ai_employee.infrastructure.db.alembic import set_alembic_database_url
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 
 
 def _public_table_names(database_url: URL) -> set[str]:
@@ -720,6 +725,100 @@ def _mail_identity_migration_state(database_url: URL) -> tuple[set[str], int, st
     return asyncio.run(read_state())
 
 
+def _upsert_identity_migration_message(
+    database_url: URL,
+    *,
+    provider_message_id: str = "synthetic-message-before-migration",
+    provider_thread_id: str,
+    provider_updated_at: datetime,
+    mailbox_scope_key: str,
+) -> MailMessageUpsertResult:
+    """在目标迁移 Schema 上运行真实 Repository upsert，而非直接拼 SQL。
+
+    同一个 helper 会依次用于 0016、已完成并发索引但尚未 ``USING INDEX`` 的中间态和
+    0017 contract，确保应用代码没有按进程缓存一次性探测结果。消息 ID 固定为迁移前
+    已存在的合成 ImmutableId，从而同时覆盖 legacy 窗口中的跨 thread move 保护。
+    """
+
+    async def upsert() -> MailMessageUpsertResult:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions.begin() as session:
+                repository = SqlAlchemyMailSyncRepository(session)
+                return await repository.upsert_message(
+                    user_id=UUID("00000000-0000-0000-0000-000000000201"),
+                    connection_id=UUID("00000000-0000-0000-0000-000000000202"),
+                    message=MailMessage(
+                        provider_message_id=provider_message_id,
+                        provider_thread_id=provider_thread_id,
+                        provider_conversation_id="synthetic-migration-conversation",
+                        internet_message_id="<synthetic-migration@example.test>",
+                        mailbox_scope_key=mailbox_scope_key,
+                        sender={"name": "Synthetic Sender", "email": "sender@example.test"},
+                        recipients=(
+                            {"name": "Synthetic Recipient", "email": "recipient@example.test"},
+                        ),
+                        subject="Synthetic identity migration projection",
+                        sanitized_body="Synthetic encrypted body",
+                        received_at=datetime(2026, 8, 8, 1, tzinfo=UTC),
+                        sent_at=datetime(2026, 8, 8, 0, 59, tzinfo=UTC),
+                        provider_updated_at=provider_updated_at,
+                        labels=("synthetic",),
+                        normalized_reply_headers={
+                            "message-id": "<synthetic-migration@example.test>"
+                        },
+                        provider_url="https://example.test/message/migration",
+                    ),
+                    encrypted_body=EncryptedValue(
+                        ciphertext=b"synthetic-ciphertext",
+                        nonce=b"0123456789ab",
+                        key_version=1,
+                    ),
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(upsert())
+
+
+def _identity_message_projection_rows(
+    database_url: URL,
+    *,
+    provider_message_id: str = "synthetic-message-before-migration",
+) -> tuple[tuple[str | None, datetime | None, str, str], ...]:
+    """读取一个合成 ImmutableId 的 direct connection、版本、thread 与 folder 投影。"""
+
+    async def read_rows() -> tuple[tuple[str | None, datetime | None, str, str], ...]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                rows = await connection.execute(
+                    text(
+                        "SELECT message.connection_id, message.provider_updated_at, "
+                        "thread.provider_thread_id, message.mailbox_scope_key "
+                        "FROM email_messages AS message "
+                        "JOIN email_threads AS thread ON thread.id = message.thread_id "
+                        "WHERE message.provider_message_id = :provider_message_id "
+                        "ORDER BY message.id"
+                    ),
+                    {"provider_message_id": provider_message_id},
+                )
+                return tuple(
+                    (
+                        str(row[0]) if row[0] is not None else None,
+                        row[1] if isinstance(row[1], datetime) else None,
+                        str(row[2]),
+                        str(row[3]),
+                    )
+                    for row in rows
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_rows())
+
+
 @pytest.mark.filterwarnings("error:Cannot correctly sort tables")
 def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
     empty_migration_database: URL,
@@ -940,6 +1039,189 @@ def test_mail_message_identity_migration_backfills_and_downgrades_without_row_lo
         1,
         None,
         False,
+    )
+
+
+def test_mail_repository_upsert_spans_0016_index_window_and_0017(
+    empty_migration_database: URL,
+) -> None:
+    """同一双写 Repository 必须覆盖 expand、并发索引中间态与 contract。
+
+    0016 只存在 legacy message identity constraint；并发索引完成但尚未通过
+    ``USING INDEX`` 挂载时，新索引已经开始执法；0017 最终只保留连接级约束。三次
+    upsert 均移动同一个 ImmutableId 的 thread/folder 投影，任何错误 conflict target
+    都会在真实 PostgreSQL 上失败或制造第二行。
+    """
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    inserted_updated_at = datetime(2026, 8, 8, 1, 30, tzinfo=UTC)
+    assert _upsert_identity_migration_message(
+        empty_migration_database,
+        provider_message_id="synthetic-0016-dual-write-message",
+        provider_thread_id="synthetic-thread-dual-write-insert",
+        provider_updated_at=inserted_updated_at,
+        mailbox_scope_key="synthetic-folder-dual-write",
+    ) == MailMessageUpsertResult.APPLIED
+    assert _identity_message_projection_rows(
+        empty_migration_database,
+        provider_message_id="synthetic-0016-dual-write-message",
+    ) == (
+        (
+            "00000000-0000-0000-0000-000000000202",
+            inserted_updated_at,
+            "synthetic-thread-dual-write-insert",
+            "synthetic-folder-dual-write",
+        ),
+    )
+
+    legacy_updated_at = datetime(2026, 8, 8, 2, tzinfo=UTC)
+    assert _upsert_identity_migration_message(
+        empty_migration_database,
+        provider_thread_id="synthetic-thread-legacy-upsert",
+        provider_updated_at=legacy_updated_at,
+        mailbox_scope_key="synthetic-folder-legacy",
+    ) == MailMessageUpsertResult.APPLIED
+    assert _identity_message_projection_rows(empty_migration_database) == (
+        (
+            "00000000-0000-0000-0000-000000000202",
+            legacy_updated_at,
+            "synthetic-thread-legacy-upsert",
+            "synthetic-folder-legacy",
+        ),
+    )
+
+    async def create_valid_unattached_index() -> None:
+        """复现 0017 已建新索引、尚未进入 ``USING INDEX`` metadata 事务的窗口。"""
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_email_messages_connection_provider_message "
+                        "ON email_messages (connection_id, provider_message_id)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create_valid_unattached_index())
+    index_updated_at = datetime(2026, 8, 8, 3, tzinfo=UTC)
+    assert _upsert_identity_migration_message(
+        empty_migration_database,
+        provider_thread_id="synthetic-thread-index-upsert",
+        provider_updated_at=index_updated_at,
+        mailbox_scope_key="synthetic-folder-index",
+    ) == MailMessageUpsertResult.APPLIED
+    assert _identity_message_projection_rows(empty_migration_database) == (
+        (
+            "00000000-0000-0000-0000-000000000202",
+            index_updated_at,
+            "synthetic-thread-index-upsert",
+            "synthetic-folder-index",
+        ),
+    )
+
+    command.upgrade(alembic_config, "20260808_0017")
+    contract_updated_at = datetime(2026, 8, 8, 4, tzinfo=UTC)
+    assert _upsert_identity_migration_message(
+        empty_migration_database,
+        provider_thread_id="synthetic-thread-contract-upsert",
+        provider_updated_at=contract_updated_at,
+        mailbox_scope_key="synthetic-folder-contract",
+    ) == MailMessageUpsertResult.APPLIED
+    assert _identity_message_projection_rows(empty_migration_database) == (
+        (
+            "00000000-0000-0000-0000-000000000202",
+            contract_updated_at,
+            "synthetic-thread-contract-upsert",
+            "synthetic-folder-contract",
+        ),
+    )
+
+
+def test_mail_message_identity_contract_catches_up_0016_window_null_rows(
+    empty_migration_database: URL,
+) -> None:
+    """0017 必须追赶 0016 后旧实例写入的 NULL，再执行 NOT NULL contract。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def insert_old_application_row() -> None:
+        """模拟尚未排空的旧实例按 legacy 列集合写入第二条合成消息。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, thread_id, provider_message_id, received_at, "
+                        "mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000225', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000212', "
+                        "'synthetic-0016-window-message', now(), 'synthetic-window-folder', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic window message', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message/window', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(insert_old_application_row())
+    command.upgrade(alembic_config, "20260808_0017")
+
+    async def read_caught_up_connection() -> tuple[str | None, int]:
+        """读取旧式行的回填结果与剩余 NULL 数，证明 contract 前追赶完成。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                value = await connection.scalar(
+                    text(
+                        "SELECT connection_id FROM email_messages "
+                        "WHERE id = '00000000-0000-0000-0000-000000000225'"
+                    )
+                )
+                null_count = int(
+                    await connection.scalar(
+                        text("SELECT count(*) FROM email_messages WHERE connection_id IS NULL")
+                    )
+                    or 0
+                )
+                return (str(value) if value is not None else None, null_count)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_caught_up_connection()) == (
+        "00000000-0000-0000-0000-000000000202",
+        0,
+    )
+    assert _email_identity_column_metadata(empty_migration_database)["connection_id"] == (
+        "uuid",
+        "NO",
     )
 
 
