@@ -370,6 +370,47 @@ async def test_microsoft_admin_consent_callback_never_echoes_raw_description(
 
 
 @pytest.mark.asyncio
+async def test_microsoft_interaction_required_maps_to_reauthorization_and_consumes_state(
+    microsoft_oauth_context: MicrosoftOAuthContext,
+) -> None:
+    """普通交互失败返回 403 reauthorization，不误报 409 管理员同意。"""
+    context = microsoft_oauth_context
+    login = await context.client.post(
+        "/api/v1/auth/login",
+        json={"email": "microsoft-owner@example.test", "password": "synthetic-password"},
+    )
+    assert login.status_code == 200
+    csrf = context.client.cookies.get("ai_employee_csrf")
+    assert csrf is not None
+    started = await context.client.post(
+        "/api/v1/connections/microsoft/start",
+        headers={"X-CSRF-Token": csrf},
+    )
+    state = parse_qs(urlparse(started.json()["authorization_url"]).query)["state"][0]
+    raw_description = "synthetic user sign-in detail"
+    response = await context.client.get(
+        "/api/v1/connections/microsoft/callback",
+        params={
+            "error": "interaction_required",
+            "error_description": raw_description,
+            "state": state,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["error_code"] == "microsoft_reauthorization_required"
+    assert raw_description not in response.text
+    replay = await context.client.get(
+        "/api/v1/connections/microsoft/callback",
+        params={
+            "error": "interaction_required",
+            "state": state,
+        },
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error_code"] == "oauth_state_rejected"
+
+
+@pytest.mark.asyncio
 async def test_microsoft_token_admin_consent_maps_to_conflict_and_consumes_state(
     microsoft_oauth_context: MicrosoftOAuthContext,
 ) -> None:

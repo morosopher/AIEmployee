@@ -463,6 +463,9 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
                 url=MICROSOFT_GRAPH_ME_URL,
                 operation="Graph me",
                 headers={"Authorization": f"Bearer {normalized_access}"},
+                # Graph profile 默认字段可能包含不必要的个人资料；只读取建立连接所需
+                # 的稳定 ID 与邮箱候选字段，遵守最小披露边界。
+                params={"$select": "id,mail,userPrincipalName"},
             )
             payload = _read_json_object(response, "Graph me")
         try:
@@ -787,10 +790,11 @@ def classify_microsoft_callback_error(
     error_description: str | None,
     error_codes: str | None,
 ) -> DomainError | None:
-    """把 Microsoft callback 的管理员同意失败映射为固定错误码。
+    """把 Microsoft callback 的同意/重新授权失败映射为固定错误码。
 
-    只检查稳定的 ``error``/``error_codes`` 和 description 中的 AADSTS 代码；原始描述
-    不进入异常消息、metadata、数据库或日志。未知 callback error 交给上层通用失败处理。
+    只有明确的 ``AADSTS65001``/管理员同意证据才返回 409 对应的错误码；普通
+    ``interaction_required`` 返回 403 对应的重新授权错误。原始描述只用于本地分类，
+    不进入异常消息、metadata、数据库或日志。其他未知 callback error 交给上层通用失败处理。
     """
     normalized_error = error.casefold() if isinstance(error, str) else ""
     normalized_codes = error_codes.casefold() if isinstance(error_codes, str) else ""
@@ -798,8 +802,8 @@ def classify_microsoft_callback_error(
         error_description.casefold() if isinstance(error_description, str) else ""
     )
     # ``interaction_required`` 既可能表示普通登录交互，也可能表示租户管理员同意缺失。
-    # 只有固定代码或明确的 consent/admin-consent 词组才能证明后者，避免把普通重新登录
-    # 错误错误地升级为组织级 409；原始 description 仍只用于本地分类，永不回显。
+    # 只有固定代码或明确的 consent/admin-consent 词组才能证明后者，普通交互则要求用户
+    # 重新授权；两条路径都只返回稳定错误码，原始 description 永不回显。
     explicit_consent_evidence = (
         "65001" in normalized_codes
         or "65001" in normalized_description
@@ -825,5 +829,10 @@ def classify_microsoft_callback_error(
         return UserActionRequiredError(
             error_code="microsoft_admin_consent_required",
             message="Microsoft administrator consent is required",
+        )
+    if normalized_error == "interaction_required":
+        return UserActionRequiredError(
+            error_code="microsoft_reauthorization_required",
+            message="Microsoft authorization requires user action",
         )
     return None

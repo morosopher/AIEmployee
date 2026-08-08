@@ -271,6 +271,11 @@ async def test_microsoft_oidc_signature_nonce_issuer_and_graph_identity_are_veri
             oauth_token,
             expected_nonce_hash=sha256(nonce.encode()).digest(),
         )
+        graph_calls = [call for call in mocked.calls if call.request.url.path == "/v1.0/me"]
+        assert len(graph_calls) == 1
+        assert dict(graph_calls[0].request.url.params) == {
+            "$select": "id,mail,userPrincipalName"
+        }
     assert account.provider_tenant_id == tenant
     assert account.account_type == "work_school"
     assert account.provider_account_id == f"{tenant}:graph-user-123"
@@ -501,16 +506,15 @@ def test_microsoft_admin_consent_error_is_stable_and_content_free() -> None:
     )
 
 
-def test_microsoft_plain_interaction_required_is_not_admin_consent() -> None:
-    """没有明确管理员同意证据的 interaction_required 不得误报组织冲突。"""
-    assert (
-        classify_microsoft_callback_error(
-            error="interaction_required",
-            error_description="The user must sign in again.",
-            error_codes=None,
-        )
-        is None
+def test_microsoft_plain_interaction_required_requires_reauthorization() -> None:
+    """普通 interaction_required 应要求用户重新授权，但不能误报组织冲突。"""
+    classified = classify_microsoft_callback_error(
+        error="interaction_required",
+        error_description="The user must sign in again.",
+        error_codes=None,
     )
+    assert isinstance(classified, UserActionRequiredError)
+    assert classified.error_code == "microsoft_reauthorization_required"
 
 
 def test_microsoft_interaction_required_with_consent_evidence_is_admin_consent() -> None:

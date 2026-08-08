@@ -21,6 +21,14 @@ from ai_employee.domain.errors import (
         (UserActionRequiredError(error_code="reauth_required", message="secret token"), 403, None),
         (
             UserActionRequiredError(
+                error_code="microsoft_reauthorization_required",
+                message="secret provider detail",
+            ),
+            403,
+            None,
+        ),
+        (
+            UserActionRequiredError(
                 error_code="microsoft_admin_consent_required",
                 message="secret administrator detail",
             ),
