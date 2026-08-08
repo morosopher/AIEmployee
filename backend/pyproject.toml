@@ -20,6 +20,10 @@ dependencies = [
   "langgraph-checkpoint-postgres>=2,<4",
   "prometheus-client>=0.22,<1",
   "psycopg[binary]>=3.3,<4",
+  # PyJWT 采用 MIT 许可证且仍有维护；仅用于 Microsoft OIDC ID token 的 discovery/JWKS
+  # 签名验证，所有 claims 必须经过签名、audience、issuer、exp 与 nonce 校验后才能使用。
+  # 禁止把未验证 JWT parser 暴露到 application/domain 层。
+  "pyjwt[crypto]>=2.10,<3",
   "pydantic-settings>=2.10,<3",
   "redis>=6,<7",
   "sse-starlette>=3,<4",

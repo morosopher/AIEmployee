@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "synthetic-microsoft-key",
+      "alg": "RS256",
+      "n": "qFIu4WkRUMcj1xAHXZrQe_DrlL8Wwg-ANYtqMNbghtN_KHBaWugyiUnlQgU9slzDYpMfmcLYtfcKaZzwBJFThqxdaMLOh7H_I9-cZ_H7FBALLst-iU3QLoGzkLmtkp2vME3nxL2B3A0ZDCye54yFlmvs4iYmHi-l_rEFIcpIkbRwHYkHPkHjn2dASPMWTOCnkbwfGtvBavzvWBFbeZT9DTbk2I5Ki2tqefbLk90yqo4cKERF--RwR_yWsT8uk1FtXSOkRZ09nttk8V-noBvSrNWPHWLBF_FBDk98DR_lb2AHZkn1y_C5zp8yNfHlBGYDKfRxr1gxy4KJVB75csrBBw",
+      "e": "AQAB"
+    }
+  ]
+}

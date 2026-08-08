@@ -19,6 +19,8 @@ from ai_employee.application.use_cases.connections import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
+from ai_employee.domain.errors import PermanentProviderError
+from ai_employee.integrations.microsoft.oauth import classify_microsoft_callback_error
 
 
 class ConnectionResponse(BaseModel):
@@ -194,6 +196,78 @@ def build_connections_router() -> APIRouter:
         use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
     ) -> dict[str, str]:
         """消费一次性 state 并完成 callback；state 本身提供 OAuth CSRF 绑定。"""
+        try:
+            connection_id = await use_case.callback(code=code, state=state_value)
+        except OAuthStateRejectedError:
+            raise ApiProblem(
+                400,
+                "oauth_state_rejected",
+                "OAuth state rejected",
+                "The OAuth state is invalid or expired.",
+            ) from None
+        return {"connection_id": str(connection_id)}
+
+    @router.post("/microsoft/start", response_model=StartConnectionResponse)
+    async def start_microsoft_connection(
+        authenticated: CsrfProtectedSession,
+        use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+    ) -> StartConnectionResponse:
+        """发起 Microsoft common v2 首次授权，仅请求两项明确选择的读取能力。"""
+        result = await use_case.start(
+            user_id=authenticated.user.id,
+            provider=OAuthProvider.MICROSOFT,
+            capabilities=frozenset(
+                {
+                    ConnectionCapability.MAIL_READ,
+                    ConnectionCapability.CALENDAR_READ,
+                }
+            ),
+        )
+        return StartConnectionResponse(authorization_url=result.authorization_url)
+
+    @router.get("/microsoft/callback")
+    async def complete_microsoft_connection(
+        state_value: Annotated[str, Query(alias="state", min_length=1, max_length=512)],
+        use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+        code: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
+        error: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        error_description: Annotated[str | None, Query(max_length=4096)] = None,
+        error_codes: Annotated[str | None, Query(max_length=256)] = None,
+    ) -> dict[str, str]:
+        """消费 Microsoft callback state，并将管理员同意错误映射为稳定 Problem。
+
+        ``error_description`` 仅作为分类输入，绝不进入异常消息、审计或响应；未知错误
+        统一收敛为不含供应商正文的永久失败。
+        """
+        if error is not None:
+            classified = classify_microsoft_callback_error(
+                error=error,
+                error_description=error_description,
+                error_codes=error_codes,
+            )
+            try:
+                await use_case.callback_error(
+                    provider=OAuthProvider.MICROSOFT,
+                    state=state_value,
+                )
+            except OAuthStateRejectedError:
+                raise ApiProblem(
+                    400,
+                    "oauth_state_rejected",
+                    "OAuth state rejected",
+                    "The OAuth state is invalid or expired.",
+                ) from None
+            if classified is not None:
+                raise classified
+            raise PermanentProviderError(
+                error_code="microsoft_oauth_rejected",
+                message="Microsoft OAuth request was rejected",
+            )
+        if code is None:
+            raise PermanentProviderError(
+                error_code="microsoft_oauth_invalid_response",
+                message="Microsoft OAuth response is invalid",
+            )
         try:
             connection_id = await use_case.callback(code=code, state=state_value)
         except OAuthStateRejectedError:

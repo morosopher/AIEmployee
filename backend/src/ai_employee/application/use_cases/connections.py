@@ -735,6 +735,29 @@ class ConnectionsUseCase:
             adapter=adapter,
         )
 
+    async def callback_error(self, *, provider: str | OAuthProvider, state: str) -> None:
+        """消费供应商拒绝回调的 state，并收敛目标渐进能力。
+
+        OAuth provider 在用户拒绝或管理员同意缺失时不会返回授权码；若直接把错误映射为
+        Problem 而不消费 state，攻击者或浏览器重试可重复触发同一一次性回调。此方法复用
+        正常 callback 的原子 state 消费与失败收敛边界，调用方随后只抛出脱敏错误。
+
+        Args:
+            provider: 预期供应商，防止一个供应商的 callback 误消费另一供应商 state。
+            state: 浏览器回传的一次性 OAuth state 原文。
+
+        Raises:
+            OAuthStateRejectedError: state 非法、已消费、过期或供应商不匹配。
+        """
+        now = _utc_now(self._clock)
+        state_hash = _oauth_state_hash(state)
+        normalized_provider = OAuthProvider(provider).value
+        async with self._stores() as store:
+            consumed = await store.consume_attempt(state_hash=state_hash, now=now)
+        if consumed is None or consumed.provider != normalized_provider:
+            raise OAuthStateRejectedError
+        await self._converge_failed_progressive_authorization(consumed)
+
     async def _converge_failed_progressive_authorization(
         self,
         consumed: ConsumedOAuthAttempt,

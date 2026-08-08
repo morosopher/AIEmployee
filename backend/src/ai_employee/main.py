@@ -133,8 +133,9 @@ def create_app(
     app.state.auth_token_hasher = hash_token
     app.state.auth_password_verifier = PasswordHasher()
     app.state.connections_store_factory = SqlAlchemyConnectionStoreFactory(session_factory)
-    # 正常运行由 deps 惰性构造固定供应商 mapping；测试可在请求前一次性替换为 fake mapping，
-    # 用例构造后会复制冻结，应用本身不暴露运行时注册或扩展供应商的入口。
+    # 正常运行由 deps 惰性构造固定的 Google/Microsoft provider mapping；测试可在请求前
+    # 一次性替换为 fake mapping。用例构造后会复制冻结，应用本身不暴露运行时注册或扩展
+    # 供应商的入口，避免通过动态注册绕过 M2 scope 与人工审批边界。
     app.state.oauth_adapters = None
     task_store = SqlAlchemyTaskViewStore(session_factory)
     app.state.create_task_use_case = CreateTaskUseCase(

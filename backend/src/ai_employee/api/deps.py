@@ -54,6 +54,7 @@ from ai_employee.integrations.google.oauth import (
     GoogleTokenResponse,
     build_authorization_url,
 )
+from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 
 CSRF_COOKIE_NAME = "ai_employee_csrf"
 _LOGGER = logging.getLogger(__name__)
@@ -401,9 +402,9 @@ def get_connections_use_case(request: Request):
     """在组合边界构造固定 adapter mapping 的供应商中立连接用例。
 
     集成测试可在 ``app.state.oauth_adapters`` 一次性放入 fake mapping；普通运行时装配
-    Task 9 的 ``GoogleOAuthAdapter``，测试模式才使用绝不联网的 M1 兼容 fake。mapping
-    会由用例复制冻结，没有运行时注册或替换入口。真实 client secret 仍只在非测试模式
-    从 Secret 文件读取。
+    Task 9 的 ``GoogleOAuthAdapter`` 与 Task 10 的 ``MicrosoftOAuthAdapter``，测试模式才
+    使用绝不联网的兼容 fake/合成配置。mapping 会由用例复制冻结，没有运行时注册或替换
+    入口。真实 client secret 仍只在非测试模式从 Secret 文件读取。
     """
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.infrastructure.security.encryption import AeadCipher
@@ -415,7 +416,8 @@ def get_connections_use_case(request: Request):
         adapters = cast(Mapping[str, OAuthProviderAdapter], injected)
     else:
         if settings.app_test_mode:
-            # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端，浏览器连接由固定 fake 驱动。
+            # 测试模式绝不读取 OAuth secret 或创建 httpx 客户端；浏览器连接由固定 fake
+            # 驱动。Microsoft adapter 仅保存合成配置，HTTP 调用仍需由测试显式注入 fake。
             from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
 
             oauth: _LegacyGoogleOAuthClient = FakeGoogleOAuthClient()
@@ -424,10 +426,16 @@ def get_connections_use_case(request: Request):
                     oauth,
                     client_id=settings.google_client_id,
                     redirect_uri=settings.google_redirect_uri,
-                )
+                ),
+                OAuthProvider.MICROSOFT.value: MicrosoftOAuthAdapter(
+                    settings.microsoft_client_id or "test-mode-microsoft-client",
+                    "test-mode-microsoft-secret",
+                    settings.microsoft_redirect_uri
+                    or "https://app.example.test/api/v1/connections/microsoft/callback",
+                ),
             }
         else:
-            secret = settings.read_secret_file(
+            google_secret = settings.read_secret_file(
                 settings.google_client_secret_file
             ).get_secret_value()
             # 生产 OAuth 必须经过具备 token-info 与 nonce 校验的真实 adapter；旧客户端仅
@@ -435,10 +443,21 @@ def get_connections_use_case(request: Request):
             adapters = {
                 OAuthProvider.GOOGLE.value: GoogleOAuthAdapter(
                     settings.google_client_id,
-                    secret,
+                    google_secret,
                     settings.google_redirect_uri,
                 )
             }
+            # 兼容现有只配置 Google 的开发/回归环境：只有 Microsoft 客户端配置完整时
+            # 才读取其 Secret。生产部署应始终提供这三项配置，从而固定装配两个 provider。
+            if settings.microsoft_client_id and settings.microsoft_redirect_uri:
+                microsoft_secret = settings.read_secret_file(
+                    settings.microsoft_client_secret_file
+                ).get_secret_value()
+                adapters[OAuthProvider.MICROSOFT.value] = MicrosoftOAuthAdapter(
+                    settings.microsoft_client_id,
+                    microsoft_secret,
+                    settings.microsoft_redirect_uri,
+                )
     return ConnectionsUseCase(
         request.app.state.connections_store_factory,
         cipher,
