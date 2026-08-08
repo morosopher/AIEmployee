@@ -8,6 +8,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -326,6 +327,165 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
             manager.loggerDict.pop(child_name, None)
         else:
             manager.loggerDict[child_name] = child_entry
+
+
+def test_http_client_logging_installation_window_scrubs_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """安装窗口内创建的 HTTP 记录也必须阻断 extra，避免两步替换之间发生泄漏。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获消息和完整记录快照，验证 handler 看不到 race canary。"""
+
+        def __init__(self) -> None:
+            """初始化线程安全事件与快照容器。"""
+            super().__init__()
+            self.emitted = Event()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler 收到的记录并唤醒测试线程。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+            self.emitted.set()
+
+    def baseline_make_record(
+        _logger: logging.Logger,
+        *args: object,
+        **kwargs: object,
+    ) -> logging.LogRecord:
+        """复现未安装 wrapper 的标准 makeRecord，保留 factory 后置 extra 时序。"""
+        extra = kwargs.get("extra")
+        factory_args = args
+        if len(args) >= 9:
+            extra = args[8]
+            factory_args = (*args[:8], *args[9:])
+        elif "extra" in kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key != "extra"}
+        record = logging.getLogRecordFactory()(*factory_args, **kwargs)
+        if extra is not None:
+            extra_values = extra  # type: ignore[assignment]
+            for key in extra_values:  # type: ignore[union-attr]
+                if (key in {"message", "asctime"}) or (key in record.__dict__):
+                    raise KeyError(f"Attempt to overwrite {key!r} in LogRecord")
+                record.__dict__[key] = extra_values[key]  # type: ignore[index]
+        return record
+
+    logger_name = "httpx.installation_window_race"
+    app_name = "ai_employee.installation_window_race_app"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    app_logger = logging.getLogger(app_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    app_state = (
+        app_logger.level,
+        app_logger.propagate,
+        app_logger.disabled,
+        app_logger.handlers[:],
+        app_logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    app_entry = manager.loggerDict.get(app_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    real_set_factory = logging.setLogRecordFactory
+    factory_installed = Event()
+    release_installation = Event()
+    installation_timeout = Event()
+    handler = RecordingHandler()
+    app_handler = RecordingHandler()
+    installer: Thread | None = None
+    emitter: Thread | None = None
+
+    def host_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+        """模拟宿主 factory，确认包装后仍保留应用自定义字段。"""
+        record = logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+        record.host_factory_marker = "synthetic-host-factory-marker"
+        return record
+
+    def gated_set_factory(factory: object) -> None:
+        """在 factory 已替换、makeRecord 尚未替换时暂停安装线程。"""
+        real_set_factory(factory)  # type: ignore[arg-type]
+        factory_installed.set()
+        if not release_installation.wait(timeout=5):
+            installation_timeout.set()
+
+    try:
+        # 先恢复到可控的“未安装 makeRecord wrapper”状态，再只门控 helper 的 setter。
+        real_set_factory(host_factory)
+        type.__setattr__(logging.Logger, "makeRecord", baseline_make_record)
+        monkeypatch.setattr(logging, "setLogRecordFactory", gated_set_factory)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        app_logger.setLevel(logging.INFO)
+        app_logger.propagate = False
+        app_logger.addHandler(app_handler)
+
+        installer = Thread(target=configure_http_client_logging)
+        installer.start()
+        assert factory_installed.wait(timeout=5)
+
+        def emit_during_installation() -> None:
+            """在 setter barrier 内发送携带敏感 extra 的 HTTP 记录。"""
+            logger.warning(
+                "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-race-token",
+                extra={
+                    "authorization": "Bearer synthetic-race-extra-secret",
+                    "opaque": "synthetic-race-extra-token",
+                },
+            )
+
+        emitter = Thread(target=emit_during_installation)
+        emitter.start()
+        assert handler.emitted.wait(timeout=5)
+        emitter.join(timeout=5)
+        release_installation.set()
+        installer.join(timeout=5)
+
+        assert not installation_timeout.is_set()
+        assert handler.messages == ["http_client_event"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-race-token",
+                "synthetic-race-extra-secret",
+                "synthetic-race-extra-token",
+            )
+        )
+        app_logger.info("safe-race-application-event")
+        assert app_handler.messages == ["safe-race-application-event"]
+        assert "synthetic-host-factory-marker" in app_handler.snapshots[0]
+    finally:
+        release_installation.set()
+        if emitter is not None:
+            emitter.join(timeout=5)
+        if installer is not None:
+            installer.join(timeout=5)
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        for target, state in ((logger, logger_state), (app_logger, app_state)):
+            for existing_handler in tuple(target.handlers):
+                target.removeHandler(existing_handler)
+            for existing_handler in state[3]:
+                target.addHandler(existing_handler)
+            target.setLevel(state[0])
+            target.propagate = state[1]
+            target.disabled = state[2]
+            target.filters[:] = state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+        if app_entry is None:
+            manager.loggerDict.pop(app_name, None)
+        else:
+            manager.loggerDict[app_name] = app_entry
 
 
 def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> None:

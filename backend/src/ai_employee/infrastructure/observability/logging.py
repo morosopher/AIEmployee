@@ -134,13 +134,11 @@ def configure_http_client_logging() -> None:
     ``extra`` 的时序；因此宿主可以自由重配第三方 logger，而每条新记录仍会在所有 sink 之
     前被固定为安全事件。应用自己的 ``ai_employee.*`` logger 完全沿用原行为。
     """
-    # 全局 factory 是进程级共享状态；锁只保护本 helper 的 get/set，避免并发初始化把多个
-    # wrapper 叠加。记录创建本身无需持有该锁，减少 OAuth 并发请求的额外争用。
+    # 两个全局入口必须在同一把锁下按 makeRecord → factory 顺序安装：makeRecord wrapper
+    # 先覆盖 factory 之后的 extra 注入步骤，避免另一线程恰好在 factory 已替换、旧
+    # makeRecord 仍生效的窗口里把 Authorization/token 写回记录。记录创建本身无需持有该锁，
+    # 减少 OAuth 并发请求的额外争用。
     with _HTTP_CLIENT_LOGGING_LOCK:
-        current_factory = logging.getLogRecordFactory()
-        if not isinstance(current_factory, _HttpClientLogRecordFactory):
-            logging.setLogRecordFactory(_HttpClientLogRecordFactory(current_factory))
-
         current_make_record = logging.Logger.makeRecord
         if (
             getattr(current_make_record, _HTTP_CLIENT_MAKE_RECORD_MARKER_ATTR, None)
@@ -153,6 +151,12 @@ def configure_http_client_logging() -> None:
                 "makeRecord",
                 _wrap_http_client_make_record(current_make_record),
             )
+
+        # makeRecord 边界已经覆盖后，再安装 factory 以处理直接调用 factory 的路径；这样
+        # 无论初始化线程在两步之间被调度到哪里，HTTP 记录都至少经过一个完整的 scrubber。
+        current_factory = logging.getLogRecordFactory()
+        if not isinstance(current_factory, _HttpClientLogRecordFactory):
+            logging.setLogRecordFactory(_HttpClientLogRecordFactory(current_factory))
 
 
 def diagnostic_user_digest(user_id: str) -> str:
