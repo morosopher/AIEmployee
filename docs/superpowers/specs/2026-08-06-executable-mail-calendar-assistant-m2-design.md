@@ -696,9 +696,18 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 
 ### 12.3 数据模型对齐
 
-现有 `EmailThread`、`EmailMessage` 和 `CalendarEvent` 继续以
-`connection_id + provider_object_id` 唯一。所有硬编码 `provider == "google"` 的共享查询必须
-改为通过连接类型和供应商适配器选择，不能复制第二套 Microsoft 领域模型。
+`EmailThread` 继续以 `(connection_id, provider_thread_id)` 唯一，`EmailMessage` 继续以
+`(connection_id, provider_message_id)` 唯一。`CalendarEvent` 不得复用邮件对象的连接级二元
+身份：Google 与 Microsoft 的事件 ID 都只能在单个日历内作为稳定供应商身份，Google Calendar
+尤其明确自定义 event ID 只要求在目标 calendar 内唯一。因此事件唯一键固定为
+`(connection_id, calendar_id, provider_event_id)`，同一连接下两个日历允许出现相同 event ID，
+但同一三元组仍必须拒绝重复。
+
+所有 `CalendarEvent` upsert、精确事件读取、单事件 tombstone、ETag/版本匹配和恢复准备查询都
+必须显式携带 `user_id + connection_id + calendar_id + provider_event_id`；禁止只凭连接与事件 ID
+跨日历覆盖或读取。目录 tombstone 或完整快照缺席按 `calendar_id` 清理整个来源缓存仍是合法的
+日历级操作。所有硬编码 `provider == "google"` 的共享查询必须改为通过连接类型和供应商适配器
+选择，不能复制第二套 Microsoft 领域模型。
 
 邮件消息额外保存 nullable `provider_updated_at`；历史 Google 行允许为 `NULL`。消息与线程的
 描述字段更新必须遵守供应商版本排序，`latest_message_at` 只能单调增加。消息身份和线程归属
@@ -786,6 +795,10 @@ action + task_id + approval_id + approval_version + operation_id
 或 folder key，日历使用 provider calendar ID。迁移期间现有 Google 游标回填到明确的 primary
 calendar scope，不能丢失原同步位置。
 
+CalendarEvent 的供应商身份从旧 `(connection_id, provider_event_id)` 放宽为
+`(connection_id, calendar_id, provider_event_id)`。迁移不得删除、合并或重写任何事件业务行；
+必须先建立并验证新的三元唯一索引，再把它挂载为稳定命名约束，最后才移除旧二元约束。
+
 ### 14.2 扩展实体
 
 `ApprovalRequest` 增加：
@@ -839,9 +852,20 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    0016 相同的有界 autocommit 批处理追赶旧实例在部署窗口留下的 `connection_id IS NULL` 行，
    然后才能执行 preflight、并发索引和 contract，并在最后移除旧 unique。供应商网络 I/O 在
    整个部署窗口内仍位于数据库事务之外。
-2. 只增加新表、新列、新索引和新状态值；不删除业务行，不依赖破坏性 downgrade。
-3. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
-4. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式
+2. CalendarEvent 身份迁移使用一个受控 contract revision：先在旧二元约束仍存在时以
+   `CREATE UNIQUE INDEX CONCURRENTLY` 建立并验证
+   `(connection_id, calendar_id, provider_event_id)` 索引；只允许清理本迁移固定名称、且经 catalog
+   证明形状完全一致的 invalid 索引，同名错误对象必须 fail closed。随后在短 metadata 事务中
+   `UNIQUE USING INDEX` 挂载新约束并移除旧二元约束，全程保留业务行。旧代码和新代码都通过命名
+   约束执行 `ON CONFLICT`，因此该切换不支持旧新 Calendar 写入实例无缝混跑。上线顺序固定为：
+   先关闭 Calendar 周期调度，排空并停止全部可能执行 `sync_calendar` 的旧 Worker；确认无旧事件
+   upsert 事务后应用迁移；再部署引用新三元约束的 API/Worker/Scheduler，最后恢复 Worker 与调度。
+   迁移后禁止旧 Worker 回流。若 downgrade 前已产生跨日历同 ID，旧二元约束无法无损恢复，必须
+   fail closed 并先由人工制定数据保留方案，迁移不得删除任一事件来强行回退。
+3. 除本节明确批准且已先建立替代事实的约束 contract 外，迁移只增加新表、新列、新索引和新状态
+   值；任何迁移都不得删除业务行，也不得依赖破坏性 downgrade。
+4. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
+5. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式
    供应商参数。
 
 ## 15. API 与 SSE

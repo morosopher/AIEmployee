@@ -1573,10 +1573,16 @@ git commit -m "feat: sync Microsoft mail delta"
 - Modify: `backend/src/ai_employee/application/ports/calendar.py`
 - Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py`
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/calendar.py`
+- Modify: `backend/src/ai_employee/infrastructure/db/models/sources.py`
 - Modify: `backend/src/ai_employee/workers/sync_calendar.py`
+- Modify: `backend/src/ai_employee/integrations/google/fake.py`
+- Create: `backend/migrations/versions/20260809_0018_calendar_event_calendar_identity.py`
 - Create: `backend/tests/contract/fixtures/google_calendar_list.json`
 - Modify: `backend/tests/contract/test_calendar_adapter.py`
 - Modify: `backend/tests/integration/google/test_calendar_sync.py`
+- Modify: `backend/tests/integration/google/test_test_mode_adapters.py`
+- Modify: `backend/tests/integration/db/test_migrations.py`
+- Modify: `backend/tests/integration/m2/test_connection_source_schema.py`
 
 - [ ] **Step 1: Write failing directory and per-calendar tests**
 
@@ -1654,6 +1660,140 @@ Expected: PASS with events from all visible calendars available to the brief sou
 ~~~bash
 git add backend/src/ai_employee/integrations/google/calendar.py backend/src/ai_employee/application/ports/calendar.py backend/src/ai_employee/application/use_cases/sync_calendar.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/workers/sync_calendar.py backend/tests/contract/fixtures/google_calendar_list.json backend/tests/contract/test_calendar_adapter.py backend/tests/integration/google/test_calendar_sync.py
 git commit -m "feat: sync Google calendar directory"
+~~~
+
+- [ ] **Step 7: Write failing per-calendar event identity, migration, and Fake tests**
+
+Add a PostgreSQL sync regression where `primary` and `readonly@example.test` both return
+`provider_event_id="shared-event-id"`. After directory synchronization, assert that two rows exist
+under the same user and connection, each retaining its own `calendar_id`, title, ETag, and provider URL.
+Run a second synchronization that changes only the primary event and assert the readonly row is byte-for-byte
+unchanged in all projected non-sensitive fields.
+
+Add a migration test that upgrades an isolated database to `20260808_0017`, seeds a historical calendar event,
+then upgrades to `20260809_0018`. Assert the historical row remains, the only CalendarEvent identity constraint is
+`(connection_id, calendar_id, provider_event_id)`, two calendars may insert the same provider event ID, and a
+duplicate of the same three-part identity raises `IntegrityError`.
+
+Add a Fake regression proving the shared calendar fixture belongs only to `primary`:
+
+~~~python
+@pytest.mark.asyncio
+async def test_fake_calendar_fixture_is_not_cloned_across_directory_calendars() -> None:
+    reader = FakeCalendarReader(calendar_fixture, directory_fixture=directory_fixture)
+
+    primary = [
+        event async for page in reader.initial_pages("primary") for event in page.events
+    ]
+    secondary = [
+        event
+        async for page in reader.initial_pages("readonly@example.test")
+        for event in page.events
+    ]
+
+    assert primary
+    assert secondary == []
+    assert await reader.get_current_event("readonly@example.test", primary[0].event_id) is None
+~~~
+
+- [ ] **Step 8: Run the new tests and observe the expected failures**
+
+Run from the repository root:
+
+~~~bash
+TEST_DATABASE_URL="${TEST_DATABASE_URL:?set an isolated PostgreSQL *_test URL}" \
+uv run --project backend pytest \
+  backend/tests/integration/google/test_calendar_sync.py::test_same_provider_event_id_is_scoped_per_calendar \
+  backend/tests/integration/db/test_migrations.py::test_calendar_event_identity_migration_scopes_ids_per_calendar \
+  backend/tests/integration/google/test_test_mode_adapters.py::test_fake_calendar_fixture_is_not_cloned_across_directory_calendars \
+  -q
+~~~
+
+Expected: FAIL for three independent reasons: the old repository/constraint leaves one overwritten event row, the
+`20260809_0018` revision and three-column constraint do not exist, and `FakeCalendarReader` currently rewrites the
+same fixture event into the secondary calendar.
+
+- [ ] **Step 9: Add the forward-only CalendarEvent identity migration**
+
+Create `20260809_0018_calendar_event_calendar_identity.py` with direct predecessor
+`20260808_0017`. The upgrade must:
+
+1. Verify any existing legacy/new constraint or same-name index against exact catalog shape.
+2. While the legacy binary constraint remains, create
+   `uq_calendar_events_connection_calendar_provider_event` with
+   `CREATE UNIQUE INDEX CONCURRENTLY` over
+   `(connection_id, calendar_id, provider_event_id)`.
+3. If an interrupted build left an invalid index, drop it concurrently only after proving the table, uniqueness,
+   non-partial/non-expression shape, key count, and exact ordered columns; wrong-shape objects fail closed.
+4. Attach the valid index using `UNIQUE USING INDEX`, then remove
+   `uq_calendar_events_connection_provider_event` in the short contract transaction.
+5. Never delete or merge CalendarEvent rows. Downgrade may recreate the legacy identity only after proving no
+   cross-calendar duplicate provider IDs exist; otherwise raise a stable error and preserve all rows.
+
+Deployment is not rolling-write compatible because old and new repositories reference different named constraints.
+Disable Calendar scheduling, drain and stop every old `sync_calendar` Worker, apply `20260809_0018`, deploy the new
+API/Worker/Scheduler release, then restore workers and scheduling. No old Calendar writer may run after migration.
+
+- [ ] **Step 10: Change ORM, Repository identity, and exact event predicates**
+
+In `CalendarEventModel`, replace the old unique constraint with:
+
+~~~python
+UniqueConstraint(
+    "connection_id",
+    "calendar_id",
+    "provider_event_id",
+    name="uq_calendar_events_connection_calendar_provider_event",
+)
+~~~
+
+Change Calendar event upsert to target that constraint and remove `calendar_id` from the conflict update set because
+it is now immutable identity. Audit every exact event read, update, version comparison, and single-event tombstone
+predicate: each must include `user_id`, `connection_id`, `calendar_id`, and `provider_event_id`. Keep whole-calendar
+cache removal predicates keyed by `calendar_id`; those are directory-level operations rather than exact identity.
+
+- [ ] **Step 11: Stop FakeCalendarReader from cloning provider events**
+
+`calendar_initial.json` represents the primary Calendar event collection. `initial_pages(non_primary)` and
+`sync_pages(non_primary, ...)` must return empty pages with a stable synthetic cursor, while primary keeps the existing
+fixture projection. `get_current_event()` must return `None` for non-primary calendars before inspecting the fixture.
+Do not create a general fixture routing framework or copy the same event with a rewritten `calendar_id`.
+
+- [ ] **Step 12: Run GREEN verification and commit the identity correction**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL="${TEST_DATABASE_URL:?set an isolated PostgreSQL *_test URL}" \
+uv run --project backend pytest \
+  backend/tests/integration/google/test_calendar_sync.py \
+  backend/tests/integration/google/test_test_mode_adapters.py \
+  backend/tests/integration/db/test_migrations.py \
+  backend/tests/integration/m2/test_connection_source_schema.py \
+  backend/tests/integration/briefs/test_daily_brief_graph.py \
+  backend/tests/integration/briefs/test_generate_brief_task.py \
+  backend/tests/integration/workers/test_google_sync_schedule.py \
+  backend/tests/unit/application/test_provider_neutral_sync.py \
+  -q
+uv run --project backend pytest backend/tests/contract/test_calendar_adapter.py -q
+uv run --project backend ruff check backend/src backend/tests
+uv run --project backend ruff format --check backend/src backend/tests
+uv run --project backend mypy backend/src
+git diff --check
+~~~
+
+Expected: PASS. Then inspect the migration deployment order, `git diff`, and staged file boundary before committing:
+
+~~~bash
+git add backend/migrations/versions/20260809_0018_calendar_event_calendar_identity.py \
+  backend/src/ai_employee/infrastructure/db/models/sources.py \
+  backend/src/ai_employee/infrastructure/db/repositories/calendar.py \
+  backend/src/ai_employee/integrations/google/fake.py \
+  backend/tests/integration/db/test_migrations.py \
+  backend/tests/integration/m2/test_connection_source_schema.py \
+  backend/tests/integration/google/test_calendar_sync.py \
+  backend/tests/integration/google/test_test_mode_adapters.py
+git commit -m "fix: scope calendar event identities per calendar"
 ~~~
 
 ### Task 13: Add Microsoft calendar directory and CalendarView Delta synchronization
