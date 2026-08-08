@@ -18,6 +18,8 @@ _HTTP_CLIENT_EVENT: Final[str] = "http_client_event"
 _HTTP_CLIENT_LOGGING_LOCK = RLock()
 _HTTP_CLIENT_MAKE_RECORD_MARKER: Final[object] = object()
 _HTTP_CLIENT_MAKE_RECORD_MARKER_ATTR: Final[str] = "_ai_employee_http_client_make_record_marker"
+_HTTP_CLIENT_HANDLE_MARKER: Final[object] = object()
+_HTTP_CLIENT_HANDLE_MARKER_ATTR: Final[str] = "_ai_employee_http_client_handle_marker"
 _HTTP_CLIENT_SAFE_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
     {
         # logging.LogRecord 的标准字段保留文件位置、级别和线程维度，但不保留第三方
@@ -93,9 +95,9 @@ class _HttpClientLogRecordFactory:
     """在保留宿主记录工厂的前提下，固定第三方 HTTP 记录的可观测内容。
 
     ``logging`` 在创建 ``LogRecord`` 时调用全局 factory；``Logger.makeRecord`` 随后才注入
-    ``extra``。factory 与 makeRecord 两个边界都完成收窄后，同一记录经过父/子 logger、重
-    配置后的 handler 以及 ``lastResort`` 时都共享安全字段。委托原 factory 可保留宿主已经
-    安装的记录类型，不改变应用 ``ai_employee`` 日志的既有行为。
+    ``extra``。handle、makeRecord 与 factory 三个边界都完成收窄后，同一记录经过父/子
+    logger、重配置后的 handler 以及 ``lastResort`` 时都共享安全字段。委托原 factory 可
+    保留宿主已经安装的记录类型，不改变应用 ``ai_employee`` 日志的既有行为。
     """
 
     def __init__(self, delegate: Callable[..., logging.LogRecord]) -> None:
@@ -106,6 +108,23 @@ class _HttpClientLogRecordFactory:
         """创建记录并在 extra 注入前清除 HTTP 客户端原文和异常上下文。"""
         record = self._delegate(*args, **kwargs)
         return _scrub_http_client_record(record)
+
+
+def _wrap_http_client_handle(delegate: Callable[..., None]) -> Callable[..., None]:
+    """包装宿主 ``Logger.handle``，覆盖已在旧 makeRecord 中途的记录。"""
+
+    def wrapped(
+        logger: logging.Logger,
+        record: logging.LogRecord,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        """在 logger filter/handler 链之前执行最终记录清理，再委托宿主实现。"""
+        scrubbed_record = _scrub_http_client_record(record)
+        delegate(logger, scrubbed_record, *args, **kwargs)
+
+    setattr(wrapped, _HTTP_CLIENT_HANDLE_MARKER_ATTR, _HTTP_CLIENT_HANDLE_MARKER)
+    return wrapped
 
 
 def _wrap_http_client_make_record(
@@ -129,23 +148,36 @@ def _wrap_http_client_make_record(
 def configure_http_client_logging() -> None:
     """安装 HTTPX/HTTPCore 记录级脱敏边界，且重复调用保持幂等。
 
-    该 helper 只包装当前 ``LogRecordFactory`` 与 ``Logger.makeRecord``，不删除宿主 handler、
-    不修改 logger level 或 ``propagate``。后一个边界用于覆盖标准库在 factory 返回后注入
-    ``extra`` 的时序；因此宿主可以自由重配第三方 logger，而每条新记录仍会在所有 sink 之
-    前被固定为安全事件。应用自己的 ``ai_employee.*`` logger 完全沿用原行为。
+    该 helper 只包装当前 ``Logger.handle``、``Logger.makeRecord`` 与 ``LogRecordFactory``，
+    不删除宿主 handler、不修改 logger level 或 ``propagate``。handle 是最终记录边界，用于
+    覆盖已在旧 makeRecord 调用栈中的记录；makeRecord 覆盖标准库在 factory 返回后注入
+    ``extra`` 的时序；factory 则保护直接创建记录的路径。应用自己的 ``ai_employee.*``
+    logger 完全沿用原行为。
     """
-    # 两个全局入口必须在同一把锁下按 makeRecord → factory 顺序安装：makeRecord wrapper
-    # 先覆盖 factory 之后的 extra 注入步骤，避免另一线程恰好在 factory 已替换、旧
-    # makeRecord 仍生效的窗口里把 Authorization/token 写回记录。记录创建本身无需持有该锁，
-    # 减少 OAuth 并发请求的额外争用。
+    # 三个全局入口必须在同一把锁下按 handle → makeRecord → factory 顺序安装：handle 先
+    # 覆盖已经进入旧 makeRecord 的 in-flight 调用，makeRecord 再覆盖 factory 之后的 extra
+    # 注入步骤，最后由 factory 保护直接创建记录的路径。记录创建本身无需持有该锁，减少
+    # OAuth 并发请求的额外争用。
     with _HTTP_CLIENT_LOGGING_LOCK:
+        current_handle = logging.Logger.handle
+        if (
+            getattr(current_handle, _HTTP_CLIENT_HANDLE_MARKER_ATTR, None)
+            is not _HTTP_CLIENT_HANDLE_MARKER
+        ):
+            # 通过类属性替换保留 Python descriptor 绑定语义；wrapper 不遍历 loggerDict，
+            # 因而未来新建子 logger、dictConfig、lastResort 与 in-flight 记录共享边界。
+            type.__setattr__(
+                logging.Logger,
+                "handle",
+                _wrap_http_client_handle(current_handle),
+            )
+
         current_make_record = logging.Logger.makeRecord
         if (
             getattr(current_make_record, _HTTP_CLIENT_MAKE_RECORD_MARKER_ATTR, None)
             is not _HTTP_CLIENT_MAKE_RECORD_MARKER
         ):
-            # 通过类属性替换保留 Python descriptor 绑定语义；wrapper 本身不遍历 loggerDict，
-            # 因而未来新建子 logger、dictConfig 和并发 getLogger 都共享同一安全边界。
+            # 通过类属性替换保留 Python descriptor 绑定语义；wrapper 本身不遍历 loggerDict。
             type.__setattr__(
                 logging.Logger,
                 "makeRecord",

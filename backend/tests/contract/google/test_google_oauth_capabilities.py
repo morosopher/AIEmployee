@@ -299,6 +299,7 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
     }
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
     parent_sink = RecordingHandler()
     child_sink = RecordingHandler()
     parent_logger.addHandler(parent_sink)
@@ -313,7 +314,8 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
         assert child_sink.messages == ["http_client_event"]
     finally:
         logging.setLogRecordFactory(original_factory)
-        logging.Logger.makeRecord = original_make_record
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
         for logger, state in logger_states.items():
             for handler in tuple(logger.handlers):
                 logger.removeHandler(handler)
@@ -395,6 +397,7 @@ def test_http_client_logging_installation_window_scrubs_extra(
     app_entry = manager.loggerDict.get(app_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
     real_set_factory = logging.setLogRecordFactory
     factory_installed = Event()
     release_installation = Event()
@@ -411,7 +414,7 @@ def test_http_client_logging_installation_window_scrubs_extra(
         return record
 
     def gated_set_factory(factory: object) -> None:
-        """在 factory 已替换、makeRecord 尚未替换时暂停安装线程。"""
+        """在 makeRecord 已替换、factory setter 尚未返回时暂停安装线程。"""
         real_set_factory(factory)  # type: ignore[arg-type]
         factory_installed.set()
         if not release_installation.wait(timeout=5):
@@ -471,6 +474,7 @@ def test_http_client_logging_installation_window_scrubs_extra(
             installer.join(timeout=5)
         logging.setLogRecordFactory(original_factory)
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
         for target, state in ((logger, logger_state), (app_logger, app_state)):
             for existing_handler in tuple(target.handlers):
                 target.removeHandler(existing_handler)
@@ -488,6 +492,141 @@ def test_http_client_logging_installation_window_scrubs_extra(
             manager.loggerDict.pop(app_name, None)
         else:
             manager.loggerDict[app_name] = app_entry
+
+
+def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
+    """旧 makeRecord 已在途时，恢复后注入的 extra 也必须在 handle 边界被清理。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获最终 handler 快照，验证 in-flight canary 不会落入 sink。"""
+
+        def __init__(self) -> None:
+            """初始化事件和记录容器。"""
+            super().__init__()
+            self.emitted = Event()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler 收到的最终记录。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+            self.emitted.set()
+
+    make_record_entered = Event()
+    release_make_record = Event()
+    make_record_timeout = Event()
+
+    def baseline_make_record(
+        _logger: logging.Logger,
+        *args: object,
+        **kwargs: object,
+    ) -> logging.LogRecord:
+        """暂停旧 makeRecord 的 factory 前阶段，模拟已在途的调用栈。"""
+        make_record_entered.set()
+        if not release_make_record.wait(timeout=5):
+            make_record_timeout.set()
+        extra = kwargs.get("extra")
+        factory_args = args
+        if len(args) >= 9:
+            extra = args[8]
+            factory_args = (*args[:8], *args[9:])
+        elif "extra" in kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key != "extra"}
+        record = logging.getLogRecordFactory()(*factory_args, **kwargs)
+        if extra is not None:
+            extra_values = extra  # type: ignore[assignment]
+            for key in extra_values:  # type: ignore[union-attr]
+                if (key in {"message", "asctime"}) or (key in record.__dict__):
+                    raise KeyError(f"Attempt to overwrite {key!r} in LogRecord")
+                record.__dict__[key] = extra_values[key]  # type: ignore[index]
+        return record
+
+    def baseline_handle(logger: logging.Logger, record: logging.LogRecord) -> None:
+        """复现未安装最终 handle scrubber 的标准 Logger.handle 行为。"""
+        if logger.disabled:
+            return
+        maybe_record = logger.filter(record)
+        if not maybe_record:
+            return
+        if isinstance(maybe_record, logging.LogRecord):
+            record = maybe_record
+        logger.callHandlers(record)
+
+    logger_name = "httpx.in_flight_make_record_race"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    handler = RecordingHandler()
+    emitter: Thread | None = None
+
+    try:
+        # 先把 class method 恢复为未包装版本，确保线程 A 的调用栈不会预先经过新边界。
+        logging.setLogRecordFactory(logging.LogRecord)
+        type.__setattr__(logging.Logger, "makeRecord", baseline_make_record)
+        type.__setattr__(logging.Logger, "handle", baseline_handle)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+
+        def emit_in_flight() -> None:
+            """在线程 A 中进入旧 makeRecord 并携带敏感 extra。"""
+            logger.warning(
+                "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-in-flight-token",
+                extra={
+                    "authorization": "Bearer synthetic-in-flight-extra-secret",
+                    "opaque": "synthetic-in-flight-extra-token",
+                },
+            )
+
+        emitter = Thread(target=emit_in_flight)
+        emitter.start()
+        assert make_record_entered.wait(timeout=5)
+
+        # 线程 A 暂停在旧 makeRecord 内；线程 B 完成新的三层安装后再放行线程 A。
+        configure_http_client_logging()
+        release_make_record.set()
+        assert handler.emitted.wait(timeout=5)
+        emitter.join(timeout=5)
+
+        assert not make_record_timeout.is_set()
+        assert handler.messages == ["http_client_event"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-in-flight-extra-secret",
+                "synthetic-in-flight-extra-token",
+            )
+        )
+    finally:
+        release_make_record.set()
+        if emitter is not None:
+            emitter.join(timeout=5)
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
 
 
 def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> (
@@ -515,6 +654,7 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
     manager = logging.Logger.manager
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
     original_entries = {
         name: entry
         for name, entry in tuple(manager.loggerDict.items())
@@ -626,7 +766,8 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
         assert any("synthetic-app-extra" in snapshot for snapshot in app_sink.snapshots)
     finally:
         logging.setLogRecordFactory(original_factory)
-        logging.Logger.makeRecord = original_make_record
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
         for logger in (app_logger,):
             for handler in tuple(logger.handlers):
                 logger.removeHandler(handler)
