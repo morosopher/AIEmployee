@@ -689,7 +689,12 @@ class MicrosoftOAuthAdapter(OAuthProviderAdapter):
             )
         keys: list[Mapping[str, object]] = []
         for raw in raw_keys:
-            if isinstance(raw, Mapping) and raw.get("kty") == "RSA" and raw.get("alg") == "RS256":
+            if isinstance(raw, Mapping) and raw.get("kty") == "RSA":
+                # Microsoft common JWKS 的 RSA 条目可能省略可选 ``alg``；真正的签名算法
+                # 仍在下方由 JWT header 与 ``jwt.decode(algorithms=["RS256"])`` 双重固定。
+                # 显式声明其他算法的 key 不得进入信任集合，避免把 metadata 当作放宽依据。
+                if "alg" in raw and raw.get("alg") != "RS256":
+                    continue
                 normalized_key = cast(Mapping[str, object], raw)
                 try:
                     public_key = cast(

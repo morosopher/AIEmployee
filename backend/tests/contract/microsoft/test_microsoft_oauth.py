@@ -67,7 +67,6 @@ def _jwk_and_private_key() -> tuple[dict[str, str], rsa.RSAPrivateKey]:
             "kty": "RSA",
             "use": "sig",
             "kid": "synthetic-runtime-key",
-            "alg": "RS256",
             "n": encode(public_numbers.n),
             "e": encode(public_numbers.e),
         },
@@ -374,6 +373,35 @@ async def test_microsoft_malformed_jwks_is_stable_and_redacted() -> None:
             )
     assert raised.value.error_code == "microsoft_oidc_invalid_response"
     assert "not-a-base64url-rsa-modulus" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_microsoft_non_rs256_jwks_is_rejected_stably() -> None:
+    """显式声明非 RS256 的 RSA key 不能进入验签信任集合。"""
+    non_rs256_jwk, private_key = _jwk_and_private_key()
+    tenant = "tenant-non-rs256-jwks"
+    nonce = "non-rs256-jwks-nonce"
+    id_token = _id_token(private_key, tenant=tenant, nonce=nonce)
+    from ai_employee.application.ports.oauth import OAuthTokenSet
+
+    token = OAuthTokenSet(
+        access_token="synthetic-non-rs256-jwks-access",
+        refresh_token=None,
+        expires_in=3600,
+        granted_scopes=frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read"}),
+        id_token=id_token,
+    )
+    non_rs256_jwk["alg"] = "PS256"
+    with respx.mock(assert_all_called=True) as mocked:
+        mocked.get(MICROSOFT_DISCOVERY_URL).respond(200, json=_openid_configuration())
+        mocked.get(MICROSOFT_JWKS_URL).respond(200, json={"keys": [non_rs256_jwk]})
+        with pytest.raises(PermanentProviderError) as raised:
+            await _adapter().fetch_account(
+                token,
+                expected_nonce_hash=sha256(nonce.encode()).digest(),
+            )
+    assert raised.value.error_code == "microsoft_oidc_invalid_response"
+    assert "PS256" not in str(raised.value)
 
 
 @pytest.mark.asyncio
