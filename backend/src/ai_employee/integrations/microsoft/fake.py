@@ -1,8 +1,8 @@
-"""提供 Microsoft 测试模式的离线 OAuth 适配器。
+"""提供 Microsoft 测试模式的离线 OAuth 与邮件读取适配器。
 
-该模块只返回合成 token、账户和授权 URL，不导入或创建 HTTP 客户端。真实的
-``MicrosoftOAuthAdapter`` 仅由关闭 ``APP_TEST_MODE`` 的组合根装配或显式注入；测试模式
-组合根无条件覆盖两个供应商为内置 fake，避免外部 mapping 因误配访问 Google/Microsoft。
+该模块只返回合成 token、账户、授权 URL、folder 与 Delta cursor，不导入或创建 HTTP
+客户端。真实 Microsoft adapter 仅由关闭 ``APP_TEST_MODE`` 的组合根装配或显式注入；
+测试模式组合根无条件覆盖两个供应商为内置 fake，避免误配访问 Google/Microsoft。
 """
 
 from __future__ import annotations
@@ -10,9 +10,12 @@ from __future__ import annotations
 import base64
 import hashlib
 from collections import OrderedDict
+from collections.abc import AsyncIterator
+from datetime import datetime
 from threading import Lock
 from typing import ClassVar
 
+from ai_employee.application.ports.mail import MailReader, MailScope, MailSyncPage
 from ai_employee.application.ports.oauth import (
     OAuthAccount,
     OAuthAuthorizationRequest,
@@ -28,6 +31,51 @@ from ai_employee.integrations.microsoft.oauth import (
     MICROSOFT_CAPABILITY_SCOPES,
     build_authorization_url,
 )
+
+
+class FakeMicrosoftMailReader(MailReader):
+    """返回固定空邮件页和独立 cursor 的测试模式离线读取器。
+
+    测试模式只需证明目录发现、逐 scope cursor 与 Durable Worker 编排；不复制真实 Graph
+    JSON，也不构造 HTTP 客户端。空消息页避免把伪造正文混入简报或草稿流程，同时仍通过
+    一个稳定合成 folder 验证 Microsoft 首次 discovery 路径。
+    """
+
+    provider = "microsoft"
+    _SCOPE_KEY = "fake-microsoft-mailbox"
+    _CURSOR = "fake-microsoft-mail-delta-v1"
+
+    async def list_sync_scopes(self) -> tuple[MailScope, ...]:
+        """返回一个固定、非 Drafts/Junk/Deleted 的合成收件 scope。"""
+        return (MailScope(self._SCOPE_KEY, "Synthetic Microsoft Inbox", "inbox"),)
+
+    def initial_pages(
+        self,
+        scope_key: str,
+        *,
+        since: datetime,
+    ) -> AsyncIterator[MailSyncPage]:
+        """为固定 scope 返回带最终 cursor 的空初始页。"""
+        del since
+        self._require_scope(scope_key)
+        return self._pages()
+
+    def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
+        """只接受该 fake 自己生成的 cursor，并返回幂等空增量页。"""
+        self._require_scope(scope_key)
+        if cursor != self._CURSOR:
+            raise ValueError("Fake Microsoft mail cursor is invalid")
+        return self._pages()
+
+    async def _pages(self) -> AsyncIterator[MailSyncPage]:
+        """输出单个空页面，使应用层仍能原子创建或推进真实 cursor 行。"""
+        yield MailSyncPage((), None, self._CURSOR)
+
+    @classmethod
+    def _require_scope(cls, scope_key: str) -> None:
+        """拒绝测试调用方把任意 provider scope 送入固定 fake。"""
+        if scope_key != cls._SCOPE_KEY:
+            raise ValueError("Fake Microsoft mail scope is invalid")
 
 
 class FakeMicrosoftOAuthAdapter(OAuthProviderAdapter):
@@ -173,3 +221,6 @@ def _refresh_token_for_scopes(scopes: frozenset[str]) -> str:
         return "fake-microsoft-refresh"
     digest = hashlib.sha256("\x00".join(sorted(scopes)).encode("utf-8")).hexdigest()[:16]
     return f"fake-microsoft-refresh-{digest}"
+
+
+__all__ = ["FakeMicrosoftMailReader", "FakeMicrosoftOAuthAdapter"]

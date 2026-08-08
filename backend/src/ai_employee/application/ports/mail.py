@@ -201,6 +201,7 @@ class MailSyncPage:
     messages: tuple[MailMessage, ...]
     next_page_token: str | None
     next_cursor: str | None
+    removals: tuple["MailRemoval", ...]
 
     def __init__(
         self,
@@ -209,6 +210,7 @@ class MailSyncPage:
         next_cursor: str | None = None,
         *,
         latest_history_id: str | None = None,
+        removals: Sequence["MailRemoval"] = (),
     ) -> None:
         """冻结页面并兼容 M1 ``latest_history_id`` 关键字。
 
@@ -228,6 +230,7 @@ class MailSyncPage:
             "next_cursor",
             next_cursor if next_cursor is not None else latest_history_id,
         )
+        object.__setattr__(self, "removals", tuple(removals))
 
     @property
     def latest_history_id(self) -> str:
@@ -242,6 +245,27 @@ class MailConnectionState:
     cursor: str | None
     provider: str = "google"
     scope_key: str = "mailbox"
+
+
+@dataclass(frozen=True, slots=True)
+class MailRemoval:
+    """表示一个 Graph ``@removed`` 墓碑，而不伪造不存在的邮件字段。
+
+    删除响应通常只携带 provider message ID 和可选 ``reason``，没有 thread、接收时间或
+    正文。独立值对象让 integrations 在边界完成字段校验，application/repository 只能按
+    精确连接与 folder scope 删除，避免把缺失字段填成看似真实的邮件。
+    """
+
+    provider_message_id: str
+    mailbox_scope_key: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        """拒绝空 ID/scope，防止墓碑删除扩大到连接或用户范围。"""
+        if self.provider_message_id == "":
+            raise ValueError("provider_message_id must not be empty")
+        if self.mailbox_scope_key == "":
+            raise ValueError("mailbox_scope_key must not be empty")
 
 
 class MailCursorExpiredError(PermanentProviderError):
@@ -279,6 +303,7 @@ __all__ = [
     "MailCursorExpiredError",
     "MailMessage",
     "MailReader",
+    "MailRemoval",
     "MailScope",
     "MailSyncPage",
     "TransientProviderError",

@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_employee.application.ports.mail import MailConnectionState, MailMessage
+from ai_employee.application.ports.mail import MailConnectionState, MailMessage, MailRemoval
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -253,6 +253,32 @@ class SqlAlchemyMailSyncRepository:
             )
         )
 
+    async def remove_message(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        removal: MailRemoval,
+    ) -> None:
+        """按用户、连接、folder scope 和不可变消息 ID安全删除一个墓碑对象。
+
+        ``email_messages`` 通过线程间接持有 ``connection_id``，因此删除谓词同时约束消息
+        自身的 ``user_id``、所属线程的连接/用户以及精确 ``mailbox_scope_key``。即使供应商
+        重复投递同一 tombstone 或另一个用户拥有相同 provider ID，也不会越过连接边界。
+        空线程暂时保留其无敏感正文的索引元数据，避免删除墓碑与分析/审计外键形成级联副作用。
+        """
+        thread_ids = select(EmailThreadModel.id).where(
+            EmailThreadModel.connection_id == connection_id,
+            EmailThreadModel.user_id == user_id,
+        )
+        statement = delete(EmailMessageModel).where(
+            EmailMessageModel.user_id == user_id,
+            EmailMessageModel.provider_message_id == removal.provider_message_id,
+            EmailMessageModel.mailbox_scope_key == removal.mailbox_scope_key,
+            EmailMessageModel.thread_id.in_(thread_ids),
+        )
+        await self._session.execute(statement)
+
     async def finish_sync(
         self,
         *,
@@ -265,6 +291,7 @@ class SqlAlchemyMailSyncRepository:
         message_count: int,
         used_full_resync: bool,
         completed_at: datetime,
+        removed_count: int = 0,
     ) -> None:
         """在同一事务中 CAS 推进精确 scope 游标并追加不含正文/游标的审计事实。
 
@@ -331,6 +358,7 @@ class SqlAlchemyMailSyncRepository:
                 event_metadata={
                     "threads_upserted": thread_count,
                     "messages_upserted": message_count,
+                    "messages_removed": removed_count,
                     "scope_key": scope_key,
                     "used_full_resync": used_full_resync,
                 },
@@ -379,6 +407,39 @@ class SqlAlchemyMailSyncRepository:
         if connection is not None:
             connection.status = "degraded"
             connection.last_error_code = "oauth_revoked"
+
+    async def mark_mail_capability_action_required(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        error_code: str = "microsoft_mail_permission_required",
+    ) -> None:
+        """持久化邮件读取权限撤销，只降级 ``mail.read`` 能力而不误断开连接。
+
+        Graph 403 只证明当前 delegated mail scope 不可用，不能推断 OIDC 连接身份或日历
+        scope 已失效。锁定同用户/连接的 capability 行并写入稳定错误码，Scheduler 会因
+        ``status != enabled`` 停止该 folder 的新任务；原有 folder cursor 保留供重新授权后
+        继续使用。
+        """
+        capability = await self._session.scalar(
+            select(ConnectionCapabilityModel)
+            .join(
+                OAuthConnectionModel,
+                (OAuthConnectionModel.id == ConnectionCapabilityModel.connection_id)
+                & (OAuthConnectionModel.user_id == ConnectionCapabilityModel.user_id),
+            )
+            .where(
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.connection_id == connection_id,
+                ConnectionCapabilityModel.capability == "mail.read",
+                OAuthConnectionModel.status == "connected",
+            )
+            .with_for_update()
+        )
+        if capability is not None:
+            capability.status = "action_required"
+            capability.last_error_code = error_code
 
     async def _upsert_credential(
         self,

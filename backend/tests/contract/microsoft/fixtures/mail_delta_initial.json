@@ -1,0 +1,45 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('synthetic-user')/mailFolders('synthetic-folder-inbox')/messages",
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/synthetic-folder-inbox/messages/delta?$skiptoken=synthetic-next-1",
+  "value": [
+    {
+      "id": "synthetic-message-1",
+      "conversationId": "synthetic-conversation-1",
+      "internetMessageId": "<synthetic-message-1@example.test>",
+      "from": {
+        "emailAddress": {
+          "name": "Synthetic Sender",
+          "address": "sender@example.test"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "Synthetic Recipient",
+            "address": "recipient@example.test"
+          }
+        }
+      ],
+      "ccRecipients": [
+        {
+          "emailAddress": {
+            "name": "Synthetic Cc",
+            "address": "cc@example.test"
+          }
+        }
+      ],
+      "bccRecipients": [],
+      "subject": "Synthetic initial status",
+      "body": {
+        "contentType": "text",
+        "content": "Synthetic initial body\n\n--\nSynthetic signature"
+      },
+      "receivedDateTime": "2030-01-08T09:30:00Z",
+      "sentDateTime": "2030-01-08T09:29:00Z",
+      "categories": [
+        "Synthetic Category"
+      ],
+      "webLink": "https://outlook.office.example.test/mail/synthetic-message-1"
+    }
+  ]
+}

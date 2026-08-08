@@ -1,0 +1,35 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('synthetic-user')/mailFolders(id,displayName,wellKnownName)",
+  "value": [
+    {
+      "id": "synthetic-folder-inbox",
+      "displayName": "Synthetic Inbox",
+      "wellKnownName": "inbox"
+    },
+    {
+      "id": "synthetic-folder-sent",
+      "displayName": "Synthetic Sent Items",
+      "wellKnownName": "sentitems"
+    },
+    {
+      "id": "synthetic-folder-archive",
+      "displayName": "Synthetic Archive",
+      "wellKnownName": "archive"
+    },
+    {
+      "id": "synthetic-folder-drafts",
+      "displayName": "Synthetic Drafts",
+      "wellKnownName": "drafts"
+    },
+    {
+      "id": "synthetic-folder-deleted",
+      "displayName": "Synthetic Deleted Items",
+      "wellKnownName": "deleteditems"
+    },
+    {
+      "id": "synthetic-folder-junk",
+      "displayName": "Synthetic Junk Email",
+      "wellKnownName": "junkemail"
+    }
+  ]
+}

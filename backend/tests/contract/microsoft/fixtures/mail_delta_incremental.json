@@ -1,0 +1,49 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('synthetic-user')/mailFolders('synthetic-folder-inbox')/messages",
+  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/synthetic-folder-inbox/messages/delta?$deltatoken=synthetic-delta-2",
+  "value": [
+    {
+      "id": "synthetic-message-2",
+      "conversationId": "synthetic-conversation-1",
+      "internetMessageId": "<synthetic-message-2@example.test>",
+      "from": {
+        "emailAddress": {
+          "name": "Synthetic Sender",
+          "address": "sender@example.test"
+        }
+      },
+      "toRecipients": [
+        {
+          "emailAddress": {
+            "name": "Synthetic Recipient",
+            "address": "recipient@example.test"
+          }
+        }
+      ],
+      "ccRecipients": [],
+      "bccRecipients": [
+        {
+          "emailAddress": {
+            "name": "Synthetic Bcc",
+            "address": "bcc@example.test"
+          }
+        }
+      ],
+      "subject": "Synthetic incremental status",
+      "body": {
+        "contentType": "html",
+        "content": "<p>Synthetic incremental body</p><blockquote>Synthetic quoted history</blockquote>"
+      },
+      "receivedDateTime": "2030-01-08T10:30:00+00:00",
+      "sentDateTime": "2030-01-08T10:29:00+00:00",
+      "categories": [],
+      "webLink": "https://outlook.office.example.test/mail/synthetic-message-2"
+    },
+    {
+      "id": "synthetic-message-removed",
+      "@removed": {
+        "reason": "deleted"
+      }
+    }
+  ]
+}

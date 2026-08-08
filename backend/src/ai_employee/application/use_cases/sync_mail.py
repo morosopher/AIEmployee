@@ -13,6 +13,7 @@ from ai_employee.application.ports.mail import (
     MailCursorExpiredError,
     MailMessage,
     MailReader,
+    MailRemoval,
     MailSyncPage,
 )
 from ai_employee.domain.errors import InternalInvariantError
@@ -43,6 +44,14 @@ class MailSyncStore(Protocol):
         encrypted_body: EncryptedValue,
     ) -> None: ...
 
+    async def remove_message(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        removal: MailRemoval,
+    ) -> None: ...
+
     async def finish_sync(
         self,
         *,
@@ -53,6 +62,7 @@ class MailSyncStore(Protocol):
         next_cursor: str,
         thread_count: int,
         message_count: int,
+        removed_count: int,
         used_full_resync: bool,
         completed_at: datetime,
     ) -> None: ...
@@ -84,6 +94,7 @@ class MailSyncResult:
     messages_upserted: int
     next_cursor: str
     used_full_resync: bool
+    messages_removed: int = 0
 
     @property
     def cursor(self) -> str:
@@ -172,6 +183,7 @@ class SyncMailUseCase:
         next_cursor = self._last_cursor(pages, state.cursor)
         thread_ids: set[str] = set()
         message_count = 0
+        removed_count = 0
         async with self._stores() as store:
             for page in pages:
                 for message in page.messages:
@@ -189,6 +201,18 @@ class SyncMailUseCase:
                     )
                     thread_ids.add(message.provider_thread_id)
                     message_count += 1
+                for removal in page.removals:
+                    if removal.mailbox_scope_key != scope_key:
+                        raise InternalInvariantError(
+                            error_code="mail_removal_scope_mismatch",
+                            message="Mail removal scope does not match sync scope",
+                        )
+                    await store.remove_message(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        removal=removal,
+                    )
+                    removed_count += 1
             await store.finish_sync(
                 user_id=user_id,
                 connection_id=connection_id,
@@ -197,6 +221,7 @@ class SyncMailUseCase:
                 next_cursor=next_cursor,
                 thread_count=len(thread_ids),
                 message_count=message_count,
+                removed_count=removed_count,
                 used_full_resync=used_full_resync,
                 completed_at=now,
             )
@@ -205,6 +230,7 @@ class SyncMailUseCase:
             messages_upserted=message_count,
             next_cursor=next_cursor,
             used_full_resync=used_full_resync,
+            messages_removed=removed_count,
         )
 
     @staticmethod
