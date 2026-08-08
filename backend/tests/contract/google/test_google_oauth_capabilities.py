@@ -301,6 +301,7 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     parent_sink = RecordingHandler()
     child_sink = RecordingHandler()
     parent_logger.addHandler(parent_sink)
@@ -318,6 +319,7 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for logger, state in logger_states.items():
             for handler in tuple(logger.handlers):
                 logger.removeHandler(handler)
@@ -401,6 +403,7 @@ def test_http_client_logging_installation_window_scrubs_extra(
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     real_set_factory = logging.setLogRecordFactory
     factory_installed = Event()
     release_installation = Event()
@@ -479,6 +482,7 @@ def test_http_client_logging_installation_window_scrubs_extra(
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for target, state in ((logger, logger_state), (app_logger, app_state)):
             for existing_handler in tuple(target.handlers):
                 target.removeHandler(existing_handler)
@@ -572,6 +576,7 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
     emitter: Thread | None = None
 
@@ -621,6 +626,7 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -667,6 +673,7 @@ def test_http_client_logging_scrubs_filter_mutation_before_dispatch() -> None:
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
 
     def mutate_record(record: logging.LogRecord) -> bool:
@@ -700,6 +707,7 @@ def test_http_client_logging_scrubs_filter_mutation_before_dispatch() -> None:
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -748,6 +756,7 @@ def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> No
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
 
     def mutate_record(record: logging.LogRecord) -> bool:
@@ -771,7 +780,7 @@ def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> No
         logger.warning("safe-before-name-mutation", extra={"opaque": "synthetic-original"})
 
         assert handler.messages == ["http_client_event"]
-        assert handler.names == ["ai_employee.filter_name_mutation_alias"]
+        assert handler.names == ["httpx"]
         assert all(
             secret not in handler.snapshots[0]
             for secret in (
@@ -786,6 +795,7 @@ def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> No
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -835,6 +845,7 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
 
     def replace_record(_record: logging.LogRecord) -> logging.LogRecord:
@@ -863,7 +874,7 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
         logger.warning("safe-before-replacement")
 
         assert handler.messages == ["http_client_event"]
-        assert handler.names == [replacement_name]
+        assert handler.names == ["httpx"]
         assert all(
             secret not in handler.snapshots[0]
             for secret in (
@@ -877,6 +888,7 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -923,12 +935,20 @@ def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
 
     try:
         logger.setLevel(logging.INFO)
         logger.propagate = False
         logger.addHandler(handler)
+
+        def preserve_application_record(record: logging.LogRecord) -> bool:
+            """模拟应用 handler filter，确认伪造 HTTP name 不会触发全局清洗。"""
+            record.application_filter_marker = "synthetic-application-filter-marker"
+            return True
+
+        handler.addFilter(preserve_application_record)
         configure_http_client_logging()
         foreign_record = logging.LogRecord(
             "httpx.synthetic_serialized",
@@ -950,6 +970,7 @@ def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -999,6 +1020,7 @@ def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     handler = RecordingHandler()
 
     try:
@@ -1023,7 +1045,7 @@ def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
         logger.handle(foreign_record)
 
         assert handler.messages == ["http_client_event"]
-        assert handler.names == [record_name]
+        assert handler.names == ["httpx"]
         assert all(
             secret not in handler.snapshots[0]
             for secret in (
@@ -1037,6 +1059,198 @@ def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_scrubs_handler_filter_mutation_before_emit() -> None:
+    """handler filter 改写 msg、args、extra 和 name 后，emit 仍只能看到安全事件。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获 filter 之后的记录，验证 emit 前存在最终清洗边界。"""
+
+        def __init__(self) -> None:
+            """初始化消息、名称和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.names: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler emit 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.names.append(record.name)
+            self.snapshots.append(repr(record.__dict__))
+
+        def handle(self, record: logging.LogRecord) -> object:
+            """模拟遵循标准约定、仍委托基类 filter/lock/emit 的自定义 handle。"""
+            return super().handle(record)
+
+    logger_name = "httpx.handler_filter_mutation_race"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
+    handler = RecordingHandler()
+
+    def mutate_record(record: logging.LogRecord) -> bool:
+        """模拟 handler filter 在 callHandlers scrub 后重新写入敏感字段。"""
+        record.name = "ai_employee.handler-filter-name-synthetic-secret"
+        record.msg = (
+            "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
+            "access_token=synthetic-handler-filter-token"
+        )
+        record.args = ()
+        record.authorization = "Bearer synthetic-handler-filter-extra-secret"
+        record.opaque = "synthetic-handler-filter-extra-token"
+        return True
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        handler.addFilter(mutate_record)
+        configure_http_client_logging()
+        logger.warning("safe-before-handler-filter", extra={"opaque": "synthetic-original"})
+
+        assert handler.messages == ["http_client_event"]
+        assert handler.names == ["httpx"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-handler-filter-token",
+                "synthetic-handler-filter-extra-secret",
+                "synthetic-handler-filter-extra-token",
+                "synthetic-original",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_scrubs_handler_filter_replacement_before_emit() -> None:
+    """handler filter 返回 replacement 后，emit 仍应使用其身份但只携带安全字段。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获 replacement 记录，验证 3.12 filter 返回语义。"""
+
+        def __init__(self) -> None:
+            """初始化消息、名称和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.names: list[str] = []
+            self.records: list[logging.LogRecord] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler emit 实际接收的 replacement。"""
+            self.messages.append(record.getMessage())
+            self.names.append(record.name)
+            self.records.append(record)
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "httpx.handler_filter_replacement_race"
+    replacement_name = "ai_employee.handler-filter-replacement-synthetic-name-secret"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
+    handler = RecordingHandler()
+    replacement_records: list[logging.LogRecord] = []
+
+    def replace_record(_record: logging.LogRecord) -> logging.LogRecord:
+        """模拟 handler filter 返回带有敏感消息和扩展字段的新记录。"""
+        replacement = logging.LogRecord(
+            replacement_name,
+            logging.WARNING,
+            __file__,
+            1,
+            "HTTP Request: GET %s Authorization: %s",
+            (
+                "https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-handler-replacement-token",
+                "Bearer synthetic-handler-replacement-secret",
+            ),
+            None,
+        )
+        replacement.opaque = "synthetic-handler-replacement-extra-token"
+        replacement_records.append(replacement)
+        return replacement
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        handler.addFilter(replace_record)
+        configure_http_client_logging()
+        logger.warning("safe-before-handler-replacement")
+
+        assert handler.messages == ["http_client_event"]
+        assert handler.names == ["httpx"]
+        assert handler.records == replacement_records
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-handler-replacement-token",
+                "synthetic-handler-replacement-secret",
+                "synthetic-handler-replacement-extra-token",
+                "synthetic-handler-filter-replacement-synthetic-name-secret",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -1130,6 +1344,7 @@ def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> No
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     recording_handler = RecordingHandler()
     emitter: Thread | None = None
 
@@ -1179,6 +1394,7 @@ def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> No
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for existing_handler in tuple(logger.handlers):
             logger.removeHandler(existing_handler)
         for existing_handler in logger_state[3]:
@@ -1220,6 +1436,7 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
     original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
     original_entries = {
         name: entry
         for name, entry in tuple(manager.loggerDict.items())
@@ -1334,6 +1551,7 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)
         type.__setattr__(logging.Logger, "handle", original_handle)
         type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
         for logger in (app_logger,):
             for handler in tuple(logger.handlers):
                 logger.removeHandler(handler)

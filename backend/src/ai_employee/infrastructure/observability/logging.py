@@ -7,6 +7,7 @@ import traceback
 from collections.abc import Callable
 from threading import RLock
 from typing import Final
+from weakref import WeakKeyDictionary
 
 from ai_employee.infrastructure.observability.redaction import redact_value
 
@@ -16,12 +17,19 @@ from ai_employee.infrastructure.observability.redaction import redact_value
 _HTTP_CLIENT_LOGGER_NAMES: Final[tuple[str, ...]] = ("httpx", "httpcore")
 _HTTP_CLIENT_EVENT: Final[str] = "http_client_event"
 _HTTP_CLIENT_LOGGING_LOCK = RLock()
+_HTTP_CLIENT_RECORD_SOURCES_LOCK = RLock()
 _HTTP_CLIENT_MAKE_RECORD_MARKER: Final[object] = object()
 _HTTP_CLIENT_MAKE_RECORD_MARKER_ATTR: Final[str] = "_ai_employee_http_client_make_record_marker"
 _HTTP_CLIENT_HANDLE_MARKER: Final[object] = object()
 _HTTP_CLIENT_HANDLE_MARKER_ATTR: Final[str] = "_ai_employee_http_client_handle_marker"
 _HTTP_CLIENT_CALL_HANDLERS_MARKER: Final[object] = object()
 _HTTP_CLIENT_CALL_HANDLERS_MARKER_ATTR: Final[str] = "_ai_employee_http_client_call_handlers_marker"
+_HTTP_CLIENT_HANDLER_FILTER_MARKER: Final[object] = object()
+_HTTP_CLIENT_HANDLER_FILTER_MARKER_ATTR: Final[str] = (
+    "_ai_employee_http_client_handler_filter_marker"
+)
+_HTTP_CLIENT_RECORD_SOURCE_FALLBACK_ATTR: Final[str] = "_ai_employee_http_client_record_source"
+_HTTP_CLIENT_RECORD_SOURCES: WeakKeyDictionary[logging.LogRecord, str] = WeakKeyDictionary()
 _HTTP_CLIENT_SAFE_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
     {
         # logging.LogRecord 的标准字段保留文件位置、级别和线程维度，但不保留第三方
@@ -62,6 +70,39 @@ def _is_http_client_logger(name: str) -> bool:
     )
 
 
+def _canonical_http_client_name(source_name: str) -> str:
+    """把可信 HTTP logger 名称收窄到不含动态子段的稳定命名空间。"""
+    for namespace in _HTTP_CLIENT_LOGGER_NAMES:
+        if source_name == namespace or source_name.startswith(f"{namespace}."):
+            return namespace
+    return _HTTP_CLIENT_EVENT
+
+
+def _remember_http_client_source(record: logging.LogRecord, source_name: str) -> None:
+    """在弱引用表中记录 HTTP 来源，避免把可变 ``record.name`` 当作信任根。"""
+    canonical_name = _canonical_http_client_name(source_name)
+    with _HTTP_CLIENT_RECORD_SOURCES_LOCK:
+        try:
+            _HTTP_CLIENT_RECORD_SOURCES[record] = canonical_name
+        except TypeError:
+            # 宿主自定义 LogRecord 可能实现 __eq__ 而失去 hash；仅在此边界使用固定供应商
+            # 名称作为兼容回退，绝不把原始 URL、Header 或正文写入 marker。
+            setattr(record, _HTTP_CLIENT_RECORD_SOURCE_FALLBACK_ATTR, canonical_name)
+
+
+def _http_client_source_for_record(record: logging.LogRecord) -> str | None:
+    """读取记录的 HTTP 来源；记录回收后弱引用表自动清理，不保留业务副本。"""
+    with _HTTP_CLIENT_RECORD_SOURCES_LOCK:
+        try:
+            source_name = _HTTP_CLIENT_RECORD_SOURCES.get(record)
+        except TypeError:
+            source_name = None
+        if source_name is not None:
+            return source_name
+        fallback = getattr(record, _HTTP_CLIENT_RECORD_SOURCE_FALLBACK_ATTR, None)
+        return fallback if isinstance(fallback, str) else None
+
+
 def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
     """在记录进入任意 handler 前固定 HTTP 客户端字段并清空未知扩展值。
 
@@ -76,11 +117,20 @@ def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
     if not _is_http_client_logger(record.name):
         return record
 
-    return _scrub_http_client_record_fields(record)
+    return _scrub_http_client_record_fields(record, source_name=record.name)
 
 
-def _scrub_http_client_record_fields(record: logging.LogRecord) -> logging.LogRecord:
+def _scrub_http_client_record_fields(
+    record: logging.LogRecord,
+    *,
+    source_name: str | None = None,
+) -> logging.LogRecord:
     """执行已确认属于 HTTP 客户端记录的字段收窄，不再次读取可变来源字段。"""
+
+    if source_name is not None:
+        # filter 可以把 name 改成包含 token 的任意字符串；只写入受控的供应商命名空间，
+        # 既保留来源维度，又保证 formatter/序列化器不会看到可变敏感名称。
+        record.name = _canonical_http_client_name(source_name)
 
     # 只保留稳定事件名；args、异常和 stack_info 可能分别携带 URL、Header、Cookie 或
     # 供应商响应，必须在记录进入任何 logger/handler 前一起清空。
@@ -114,17 +164,19 @@ def _scrub_http_client_record_from_logger(
     """
     if not _is_http_client_logger(logger.name):
         return record
-    return _scrub_http_client_record_fields(record)
+    scrubbed_record = _scrub_http_client_record_fields(record, source_name=logger.name)
+    _remember_http_client_source(scrubbed_record, logger.name)
+    return scrubbed_record
 
 
 class _HttpClientLogRecordFactory:
     """在保留宿主记录工厂的前提下，固定第三方 HTTP 记录的可观测内容。
 
     ``logging`` 在创建 ``LogRecord`` 时调用全局 factory；``Logger.makeRecord`` 随后才注入
-    ``extra``。callHandlers、handle、makeRecord 与 factory 四个边界都完成收窄后，同一
-    HTTP 来源记录经过父/子 logger、重配置后的 handler 以及 ``lastResort`` 时都共享安全
-    字段。委托原 factory 可保留宿主已经安装的记录类型，不改变应用 ``ai_employee`` 日志
-    的既有行为。
+    ``extra``。Handler.filter、callHandlers、handle、makeRecord 与 factory 五个边界都完成
+    收窄后，同一 HTTP 来源记录经过父/子 logger、重配置后的 handler 以及 ``lastResort`` 时
+    都共享安全字段。委托原 factory 可保留宿主已经安装的记录类型，不改变应用
+    ``ai_employee`` 日志的既有行为。
     """
 
     def __init__(self, delegate: Callable[..., logging.LogRecord]) -> None:
@@ -175,6 +227,42 @@ def _wrap_http_client_call_handlers(delegate: Callable[..., None]) -> Callable[.
     return wrapped
 
 
+def _wrap_http_client_handler_filter(
+    delegate: Callable[..., object],
+) -> Callable[..., object]:
+    """包装标准 ``Handler.filter``，在全部 handler filter 后、emit 前收窄记录。"""
+
+    def wrapped(
+        handler: logging.Handler,
+        record: logging.LogRecord,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """保留 filter 返回值与后续 lock/emit 流程，同时清理原地或 replacement 记录。"""
+        source_name = _http_client_source_for_record(record)
+        result = delegate(handler, record, *args, **kwargs)
+        if source_name is None and isinstance(result, logging.LogRecord):
+            source_name = _http_client_source_for_record(result)
+
+        # 即使宿主 Python 版本尚未把 replacement 传给 emit，也先清理原记录；支持 3.12
+        # 的 replacement 语义时，再对 replacement 独立清理并原样返回其对象身份。
+        if source_name is None:
+            return result
+        _scrub_http_client_record_fields(record, source_name=source_name)
+        if isinstance(result, logging.LogRecord):
+            _remember_http_client_source(result, source_name)
+            _scrub_http_client_record_fields(result, source_name=source_name)
+        _remember_http_client_source(record, source_name)
+        return result
+
+    setattr(
+        wrapped,
+        _HTTP_CLIENT_HANDLER_FILTER_MARKER_ATTR,
+        _HTTP_CLIENT_HANDLER_FILTER_MARKER,
+    )
+    return wrapped
+
+
 def _wrap_http_client_make_record(
     delegate: Callable[..., logging.LogRecord],
 ) -> Callable[..., logging.LogRecord]:
@@ -196,19 +284,36 @@ def _wrap_http_client_make_record(
 def configure_http_client_logging() -> None:
     """安装 HTTPX/HTTPCore 记录级脱敏边界，且重复调用保持幂等。
 
-    该 helper 只包装当前 ``Logger.callHandlers``、``Logger.handle``、``Logger.makeRecord``
-    与 ``LogRecordFactory``，不删除宿主 handler、不修改 logger level 或 ``propagate``。
-    callHandlers 是进入任意 handler 前的最终记录边界，用于覆盖 logger filter 重新写入的
-    字段以及已在旧 handle 调用栈中的记录；handle 覆盖已在旧 makeRecord 调用栈中的记录；
-    makeRecord 覆盖标准库在 factory 返回后注入 ``extra`` 的时序；factory 则保护直接创建
-    记录的路径。应用自己的 ``ai_employee.*`` logger 完全沿用原行为。
+    该 helper 只包装当前 ``Handler.filter``、``Logger.callHandlers``、``Logger.handle``、
+    ``Logger.makeRecord`` 与 ``LogRecordFactory``，不删除宿主 handler、不修改 logger level
+    或 ``propagate``。Handler.filter 是标准 ``Handler.handle`` 在 emit 前的最后可控边界，
+    callHandlers 覆盖 logger filter 重新写入的字段以及已在旧 handle 调用栈中的记录；handle
+    覆盖已在旧 makeRecord 调用栈中的记录；makeRecord 覆盖标准库在 factory 返回后注入
+    ``extra`` 的时序；factory 则保护直接创建记录的路径。应用自己的 ``ai_employee.*``
+    logger 完全沿用原行为。
     """
-    # 四个全局入口必须在同一把锁下按 callHandlers → handle → makeRecord → factory 顺序
-    # 安装：callHandlers 在最终 dispatch 前再次清理 logger filter 的突变，并覆盖已经进入
-    # 旧 handle 的 in-flight 调用；handle 再覆盖已经进入旧 makeRecord 的调用；makeRecord
-    # 覆盖 factory 之后的 extra 注入步骤；最后由 factory 保护直接创建记录的路径。记录
-    # 创建本身无需持有该锁，减少 OAuth 并发请求的额外争用。
+    # 五个全局入口必须在同一把锁下按 Handler.filter → callHandlers → handle → makeRecord →
+    # factory 顺序安装：Handler.filter 在全部 handler filter 后、emit 前清理原地突变或
+    # replacement；callHandlers 在最终 dispatch 前再次清理 logger filter 的突变，并覆盖
+    # 已进入旧 handle 的 in-flight 调用；handle 再覆盖已进入旧 makeRecord 的调用；makeRecord
+    # 覆盖 factory 之后的 extra 注入步骤；最后由 factory 保护直接创建记录的路径。记录创建
+    # 本身无需持有该锁，减少 OAuth 并发请求的额外争用。
     with _HTTP_CLIENT_LOGGING_LOCK:
+        current_handler_filter = logging.Handler.filter
+        if (
+            getattr(current_handler_filter, _HTTP_CLIENT_HANDLER_FILTER_MARKER_ATTR, None)
+            is not _HTTP_CLIENT_HANDLER_FILTER_MARKER
+        ):
+            # 通过类属性替换保留 descriptor 绑定语义；标准 Handler.handle 与遵循约定调用
+            # self.filter 的自定义 handle 都会进入该边界。自定义 filter 若完全覆盖基类而不
+            # 调用 super().filter，或 handle 直接绕过 filter/emit，logging API 无法插入通用
+            # 钩子；该宿主自定义 I/O 不在本边界保证内，调用方需自行保证不直接输出原记录。
+            type.__setattr__(
+                logging.Handler,
+                "filter",
+                _wrap_http_client_handler_filter(current_handler_filter),
+            )
+
         current_call_handlers = logging.Logger.callHandlers
         if (
             getattr(current_call_handlers, _HTTP_CLIENT_CALL_HANDLERS_MARKER_ATTR, None)
