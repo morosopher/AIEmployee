@@ -1,12 +1,24 @@
-# M1 运行手册
+# AI Employee 运行手册
 
-本手册只覆盖可信任务中心与每日办公简报的 M1 部署。生产环境不连接测试账号，不使用真实写工具，也不以 Redis 作为业务事实来源。
+本手册覆盖可信任务中心与每日办公简报的 M1 基线，以及当前已落地的 M2 邮件与日历助手发布边界。生产环境不连接测试账号，不以 Redis 作为业务事实来源；M2 真实写入仍必须遵守三层开关、连接能力和精确人工审批。
 
 ## 发布与回滚
 
 发布前为 `APP_IMAGE_TAG` 指定不可变镜像标签或摘要，严禁使用 `latest`。先执行一次独立、向前兼容的 `migration` 服务；它完成 Alembic upgrade 后会重新运行数据库角色授权，使新增表获得最小权限。确认 API、Worker、Scheduler、PostgreSQL、Redis 均为 healthy 后，才切换 Caddy 流量。
 
 应用镜像可回滚到上一个不可变标签，但绝不对生产数据库执行破坏性 migration downgrade。迁移采用 expand/migrate/switch/contract：旧应用必须能读取扩展后的 schema，删除旧列或表只能在所有旧应用退出后的后续发布完成。
+
+### M2 CalendarEvent 0018 发布
+
+`20260809_0018` 将 CalendarEvent 供应商身份从连接级二元组切换为 `connection_id + calendar_id + provider_event_id` 三元组。该 contract revision 不支持旧、新 Calendar writer 混跑，发布必须严格按以下顺序执行：
+
+1. 关闭 Calendar 周期调度。
+2. 排空并停止全部可能执行 `sync_calendar` 的旧 Worker，确认没有旧事件 upsert 事务仍在运行。
+3. 应用 Alembic revision `20260809_0018`。
+4. 部署引用三元约束的新 API、Worker 和 Scheduler，禁止旧 Worker 回流。
+5. 恢复 Worker，再恢复 Calendar 调度。
+
+生产环境不得对该迁移执行破坏性 downgrade。若迁移后已经存在跨日历相同 provider event ID，旧二元约束无法无损恢复，downgrade 必须 fail closed；不得删除、合并或改写事件行来强行回退，应停止发布并制定人工数据保留方案。
 
 ## 备份与恢复演练
 
