@@ -30,7 +30,11 @@ from ai_employee.application.use_cases.sync_mail import (
 )
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
-from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
+from ai_employee.domain.errors import (
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
@@ -176,6 +180,36 @@ class _SinglePageMailReader:
         assert scope_key == "synthetic-folder-inbox"
         assert cursor == self.expected_cursor
         yield self.page
+
+
+@dataclass(slots=True)
+class _BudgetFailingMailReader:
+    """先产生一页消息再以固定预算错误终止，验证收集与事务边界。"""
+
+    first_page: MailSyncPage
+    expected_cursor: str
+
+    async def list_sync_scopes(self) -> tuple[object, ...]:
+        """该场景已有 folder cursor，不重复读取目录。"""
+        return ()
+
+    async def initial_pages(
+        self, scope_key: str, *, since: datetime
+    ) -> AsyncIterator[MailSyncPage]:
+        """测试只走已有 cursor 的增量路径。"""
+        del scope_key, since
+        if False:
+            yield self.first_page
+
+    async def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
+        """暴露第一页后模拟后续响应超过链预算。"""
+        assert scope_key == "synthetic-folder-inbox"
+        assert cursor == self.expected_cursor
+        yield self.first_page
+        raise PermanentProviderError(
+            error_code="microsoft_mail_sync_budget_exceeded",
+            message="Microsoft mail sync budget was exceeded",
+        )
 
 
 @dataclass(slots=True)
@@ -756,6 +790,72 @@ async def test_stale_projection_skip_still_advances_confirmed_folder_cursor(
         assert stored is not None and stored.subject == "Synthetic current projection"
         assert stored.mailbox_scope_key == "synthetic-folder-archive"
         assert cursor is not None and cursor.cursor == next_cursor
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_budget_failure_after_first_page_does_not_persist_or_advance_cursor(
+    database_url: str,
+) -> None:
+    """后续页预算失败时，预先产生的消息与 folder cursor 都不得形成持久事实。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"b" * 32)
+    current_cursor = "synthetic-budget-current-cursor"
+    sensitive_body = "Synthetic budget body that must not persist"
+    reader = _BudgetFailingMailReader(
+        first_page=MailSyncPage(
+            (
+                _message(
+                    "synthetic-budget-message",
+                    scope_key="synthetic-folder-inbox",
+                    body=sensitive_body,
+                    provider_updated_at=datetime(2030, 1, 8, 12, 5, tzinfo=UTC),
+                ),
+            ),
+            "synthetic-budget-next-page",
+            None,
+        ),
+        expected_cursor=current_cursor,
+    )
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={"synthetic-folder-inbox": current_cursor},
+        )
+        use_case = SyncMailUseCase(
+            lambda: _repository_factory(sessions),
+            ProviderAdapterRegistry(microsoft_mail=reader),
+            cipher,
+            clock=_FixedClock(datetime(2030, 1, 8, 13, tzinfo=UTC)),
+        )
+
+        with pytest.raises(PermanentProviderError) as raised:
+            await use_case.execute(
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                scope_key="synthetic-folder-inbox",
+            )
+
+        async with sessions() as session:
+            message_count = await session.scalar(
+                select(func.count()).select_from(EmailMessageModel)
+            )
+            thread_count = await session.scalar(select(func.count()).select_from(EmailThreadModel))
+            cursor = await session.scalar(
+                select(SyncCursorModel).where(
+                    SyncCursorModel.connection_id == CONNECTION_ONE,
+                    SyncCursorModel.scope_key == "synthetic-folder-inbox",
+                )
+            )
+        assert raised.value.error_code == "microsoft_mail_sync_budget_exceeded"
+        assert sensitive_body not in str(raised.value)
+        assert message_count == 0
+        assert thread_count == 0
+        assert cursor is not None and cursor.cursor == current_cursor
     finally:
         await sessions.dispose()
 

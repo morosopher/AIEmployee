@@ -381,15 +381,25 @@ class MicrosoftMailAdapter(MailReader):
 
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
-                        response_size = len(body) + len(chunk)
-                        if response_size > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
+                        decoded_size = len(body) + len(chunk)
+                        if decoded_size > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
                             raise self._response_too_large()
+                        # ``aiter_bytes`` 返回经过 content-encoding 解码的内容；HTTPX 独立
+                        # 暴露的下载累计值才是传输链 wire 事实，不能用 decoded 长度代替。
                         if (
-                            self._chain_wire_bytes + response_size
+                            self._chain_wire_bytes + response.num_bytes_downloaded
                             > MICROSOFT_MAIL_MAX_CHAIN_BYTES
                         ):
                             raise self._sync_budget_exceeded()
                         body.extend(chunk)
+                    # decoder 可能在某些 raw chunk 上暂不产出 decoded chunk；迭代结束后再
+                    # 检查一次，确保任何已下载 wire 都在 JSON 解析前进入链预算。
+                    response_wire_bytes = response.num_bytes_downloaded
+                    if (
+                        self._chain_wire_bytes + response_wire_bytes
+                        > MICROSOFT_MAIL_MAX_CHAIN_BYTES
+                    ):
+                        raise self._sync_budget_exceeded()
             except httpx.TimeoutException:
                 raise TransientProviderError(
                     error_code="microsoft_mail_timeout",
@@ -419,7 +429,7 @@ class MicrosoftMailAdapter(MailReader):
                 > MICROSOFT_MAIL_MAX_NORMALIZED_BYTES
             ):
                 raise self._sync_budget_exceeded()
-            self._chain_wire_bytes += len(body)
+            self._chain_wire_bytes += response_wire_bytes
             self._chain_normalized_bytes += normalized_size
             return payload
         raise AssertionError("Microsoft mail request retry loop exhausted")

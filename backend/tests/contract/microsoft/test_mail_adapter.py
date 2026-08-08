@@ -287,8 +287,15 @@ class _ChunkedResponse:
     status_code = 200
     headers: ClassVar[dict[str, str]] = {"Content-Type": "application/json"}
 
-    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+    def __init__(
+        self,
+        chunks: tuple[bytes, ...],
+        *,
+        raw_download_totals: tuple[int, ...] | None = None,
+    ) -> None:
         self._chunks = chunks
+        self._raw_download_totals = raw_download_totals
+        self._num_bytes_downloaded = 0
         self.closed = False
 
     @property
@@ -297,9 +304,18 @@ class _ChunkedResponse:
         raise AssertionError("streaming response must not access content")
 
     async def aiter_bytes(self):
-        """按多个 chunk 返回合成 wire body。"""
-        for chunk in self._chunks:
+        """返回 decoded chunk，并同步暴露 HTTPX raw 下载累计事实。"""
+        for index, chunk in enumerate(self._chunks):
+            if self._raw_download_totals is None:
+                self._num_bytes_downloaded += len(chunk)
+            else:
+                self._num_bytes_downloaded = self._raw_download_totals[index]
             yield chunk
+
+    @property
+    def num_bytes_downloaded(self) -> int:
+        """模拟 HTTPX 在内容解码前累计的实际下载字节数。"""
+        return self._num_bytes_downloaded
 
     async def aclose(self) -> None:
         """记录 adapter 是否在超限时关闭响应。"""
@@ -355,6 +371,41 @@ async def test_streaming_response_aborts_and_closes_after_byte_limit(monkeypatch
         await module.MicrosoftMailAdapter(access_token="synthetic-token").list_sync_scopes()  # type: ignore[attr-defined]
 
     assert raised.value.error_code == "microsoft_mail_response_too_large"
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_chain_budget_uses_raw_downloaded_bytes(monkeypatch) -> None:
+    """decoded JSON 很小时，raw 下载超过链预算仍须立即关闭并安全失败。"""
+    module = _mail_module()
+    decoded = b'{"value":[]}'
+    response = _ChunkedResponse(
+        (decoded,),
+        raw_download_totals=(module.MICROSOFT_MAIL_MAX_CHAIN_BYTES + 1,),  # type: ignore[attr-defined]
+    )
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **_kwargs: _StreamingClient(response))
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await module.MicrosoftMailAdapter(access_token="synthetic-token").list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_sync_budget_exceeded"
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_normalized_budget_is_independent_from_wire_budget(monkeypatch) -> None:
+    """只缩小规范化预算时也必须使用固定链容量错误并关闭响应。"""
+    module = _mail_module()
+    decoded = b'{"value":[]}'
+    monkeypatch.setattr(module, "MICROSOFT_MAIL_MAX_NORMALIZED_BYTES", len(decoded) - 1)
+    monkeypatch.setattr(module, "MICROSOFT_MAIL_MAX_CHAIN_BYTES", len(decoded) * 10)
+    response = _ChunkedResponse((decoded,))
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **_kwargs: _StreamingClient(response))
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await module.MicrosoftMailAdapter(access_token="synthetic-token").list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_sync_budget_exceeded"
     assert response.closed is True
 
 
