@@ -586,6 +586,38 @@ class SqlAlchemyCalendarSyncRepository:
             )
         )
 
+    async def mark_calendar_capability_action_required(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        error_code: str = "microsoft_calendar_permission_required",
+    ) -> None:
+        """仅降级 calendar.read 能力，保留连接与其它邮件能力。
+
+        Graph 403 只证明当前 delegated 日历 scope 不可用；不能把身份连接误记为 revoked，
+        也不能清除其它日历或邮件的恢复位置。通过同用户/连接组合条件加锁，避免跨用户
+        capability 被错误修改。
+        """
+        capability = await self._session.scalar(
+            select(ConnectionCapabilityModel)
+            .join(
+                OAuthConnectionModel,
+                (OAuthConnectionModel.id == ConnectionCapabilityModel.connection_id)
+                & (OAuthConnectionModel.user_id == ConnectionCapabilityModel.user_id),
+            )
+            .where(
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.connection_id == connection_id,
+                ConnectionCapabilityModel.capability == "calendar.read",
+                OAuthConnectionModel.status == "connected",
+            )
+            .with_for_update()
+        )
+        if capability is not None:
+            capability.status = "action_required"
+            capability.last_error_code = error_code
+
 
 class SqlAlchemyCalendarSyncRepositoryFactory:
     """为每次日历同步提供自动提交/回滚的真实事务。"""

@@ -254,6 +254,7 @@ class GoogleCalendarAdapter:
         status = self._optional_string(payload.get("status")) or "confirmed"
         recurring_event_id = self._recurring_event_id(payload, event_id)
         etag = self._optional_string(payload.get("etag"))
+        change_key = self._optional_string(payload.get("changeKey"))
         provider_url = self._optional_string(payload.get("htmlLink")) or ""
         updated_at = self._provider_updated_at(payload.get("updated"))
         start_value = payload.get("start")
@@ -281,6 +282,7 @@ class GoogleCalendarAdapter:
                 self._normalize_attendees(payload.get("attendees")),
                 self._optional_string(payload.get("accessRole")),
                 False,
+                change_key,
             )
         start, end = self._record(start_value), self._record(end_value)
         timezone = (
@@ -311,6 +313,7 @@ class GoogleCalendarAdapter:
             self._normalize_attendees(payload.get("attendees")),
             self._optional_string(payload.get("accessRole")),
             self._event_can_edit(payload, status),
+            change_key,
         )
 
     @staticmethod

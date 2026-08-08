@@ -29,6 +29,16 @@ class ProviderCalendar:
     can_write: bool
     provider_url: str | None = None
     is_deleted: bool = False
+    # Microsoft 目录的共享能力、颜色与 owner 是展示/权限事实；旧 Google 行为空时保持
+    # 默认值，避免为了供应商字段新增第二套模型或迁移。
+    can_share: bool = False
+    hex_color: str | None = None
+    owner: Mapping[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        """冻结 owner 映射，防止供应商边界事实被调用方在事务间篡改。"""
+        if self.owner is not None:
+            object.__setattr__(self, "owner", MappingProxyType(dict(self.owner)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,11 +77,21 @@ class CalendarEvent:
     attendees: tuple[Mapping[str, str], ...] = ()
     access_role: str | None = None
     can_edit: bool = False
+    # Microsoft changeKey 是与 ETag 并列的版本事实；作为 provider-neutral 可选字段扩展，
+    # 旧 Google/Fake 事件保持 None，当前数据库版本不把它扩散为供应商专属表。
+    change_key: str | None = None
+    recurrence_metadata: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         """冻结组织者和参会人嵌套结构，保持跨事务同步事实不可变。"""
         if self.organizer is not None:
             object.__setattr__(self, "organizer", MappingProxyType(dict(self.organizer)))
+        if self.recurrence_metadata is not None:
+            object.__setattr__(
+                self,
+                "recurrence_metadata",
+                MappingProxyType(dict(self.recurrence_metadata)),
+            )
         object.__setattr__(
             self,
             "attendees",

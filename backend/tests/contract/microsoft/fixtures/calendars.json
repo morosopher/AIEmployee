@@ -1,0 +1,38 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('synthetic')/calendars",
+  "value": [
+    {
+      "id": "calendar-primary",
+      "name": "Synthetic Primary",
+      "isDefaultCalendar": true,
+      "canEdit": true,
+      "canShare": true,
+      "owner": {
+        "emailAddress": {
+          "name": "Synthetic Owner",
+          "address": "owner@example.test"
+        }
+      },
+      "hexColor": "#123456",
+      "webUrl": "https://outlook.example.test/calendar-primary",
+      "timeZone": "China Standard Time"
+    },
+    {
+      "id": "calendar-readonly",
+      "name": "Synthetic Read Only",
+      "isDefaultCalendar": false,
+      "canEdit": false,
+      "canShare": false,
+      "owner": {
+        "emailAddress": {
+          "name": "Other Owner",
+          "address": "other-owner@example.test"
+        }
+      },
+      "hexColor": "#abcdef",
+      "webUrl": "https://outlook.example.test/calendar-readonly",
+      "timeZone": "Pacific Standard Time"
+    }
+  ],
+  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendars?$deltatoken=synthetic-directory-final"
+}

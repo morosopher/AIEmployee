@@ -1,4 +1,4 @@
-"""把 Google 同步结果收敛为不含个人数据的 Prometheus 指标。"""
+"""把供应商同步结果收敛为不含个人数据的 Prometheus 指标。"""
 
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -35,14 +35,39 @@ async def observe_google_sync[ResultT](
     成功路径只将新鲜度重置为零。此处不能附带用户、连接、任务载荷或供应商响应，避免把
     个人数据引入 Prometheus 标签。新鲜度在下一次成功同步前由该 Gauge 的最后样本表示。
     """
+    return await observe_provider_sync(
+        provider="google",
+        metrics=metrics,
+        resource=resource,
+        operation=operation,
+    )
+
+
+async def observe_provider_sync[ResultT](
+    *,
+    provider: str,
+    metrics: Metrics | None,
+    resource: str,
+    operation: Callable[[], Awaitable[ResultT]],
+) -> ResultT:
+    """执行任一已支持供应商同步并以真实 provider 标签记录指标。
+
+    Args:
+        provider: 固定的 google 或 microsoft provider 键；禁止使用用户输入。
+        metrics: 当前 Worker 的进程级指标；禁用指标时为 None。
+        resource: 受控的 mail 或 calendar 资源名称。
+        operation: 不接收观测参数的实际同步协程。
+    """
+    if provider not in {"google", "microsoft"}:
+        raise ValueError("provider is unsupported")
     try:
         result = await operation()
     except (TransientProviderError, UserActionRequiredError) as error:
         if metrics is not None:
-            metrics.record_provider_error(provider="google", error_code=error.error_code)
+            metrics.record_provider_error(provider=provider, error_code=error.error_code)
         raise
     if metrics is not None:
-        metrics.record_sync_success(provider="google", resource=resource)
+        metrics.record_sync_success(provider=provider, resource=resource)
     return result
 
 
@@ -60,7 +85,10 @@ async def refresh_sync_age_metrics(
             rows = (
                 await session.execute(
                     select(SyncCursorModel.resource_kind, func.min(SyncCursorModel.last_success_at))
-                    .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
+                    .join(
+                        OAuthConnectionModel,
+                        OAuthConnectionModel.id == SyncCursorModel.connection_id,
+                    )
                     .where(
                         OAuthConnectionModel.provider == "google",
                         OAuthConnectionModel.status == "connected",

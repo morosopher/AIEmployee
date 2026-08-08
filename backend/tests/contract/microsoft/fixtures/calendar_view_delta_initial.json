@@ -1,0 +1,27 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(event)",
+  "value": [
+    {
+      "id": "event-1",
+      "subject": "Synthetic Microsoft event",
+      "body": {"contentType": "text", "content": "Synthetic description"},
+      "location": {"displayName": "Synthetic room"},
+      "start": {"dateTime": "2030-01-02T09:00:00.0000000", "timeZone": "China Standard Time"},
+      "end": {"dateTime": "2030-01-02T10:00:00.0000000", "timeZone": "China Standard Time"},
+      "isAllDay": false,
+      "isCancelled": false,
+      "showAs": "busy",
+      "@odata.etag": "W/\"synthetic-etag\"",
+      "changeKey": "synthetic-change-key-1",
+      "lastModifiedDateTime": "2030-01-01T01:02:03Z",
+      "webLink": "https://outlook.example.test/event-1",
+      "organizer": {"emailAddress": {"name": "Synthetic Organizer", "address": "organizer@example.test"}},
+      "attendees": [
+        {"type": "required", "status": {"response": "accepted"}, "emailAddress": {"name": "Synthetic Attendee", "address": "attendee@example.test"}}
+      ],
+      "seriesMasterId": "series-1",
+      "recurrence": {"pattern": {"type": "weekly", "interval": 1}, "range": {"type": "endDate", "startDate": "2030-01-02", "endDate": "2030-02-01"}}
+    }
+  ],
+  "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/calendars/calendar-primary/calendarView/delta?$skiptoken=synthetic-next-1"
+}
