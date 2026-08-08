@@ -329,7 +329,9 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
             manager.loggerDict[child_name] = child_entry
 
 
-def test_http_client_logging_installation_window_scrubs_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_http_client_logging_installation_window_scrubs_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """安装窗口内创建的 HTTP 记录也必须阻断 extra，避免两步替换之间发生泄漏。"""
 
     class RecordingHandler(logging.Handler):
@@ -488,7 +490,9 @@ def test_http_client_logging_installation_window_scrubs_extra(monkeypatch: pytes
             manager.loggerDict[app_name] = app_entry
 
 
-def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> None:
+def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> (
+    None
+):
     """记录级边界覆盖新子 logger、extra、异常和并发重复初始化。"""
 
     class RecordingHandler(logging.Handler):
@@ -594,14 +598,12 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
         with ThreadPoolExecutor(max_workers=4) as executor:
             list(executor.map(configure_repeatedly, range(4)))
 
-        all_http_messages = (
-            parent_sink.messages
-            + child_sink.messages
-            + reattached_sink.messages
-        )
+        all_http_messages = parent_sink.messages + child_sink.messages + reattached_sink.messages
         assert all_http_messages
         assert set(all_http_messages) == {"http_client_event"}
-        all_http_snapshots = parent_sink.snapshots + child_sink.snapshots + reattached_sink.snapshots
+        all_http_snapshots = (
+            parent_sink.snapshots + child_sink.snapshots + reattached_sink.snapshots
+        )
         assert all(
             secret not in snapshot
             for snapshot in all_http_snapshots
