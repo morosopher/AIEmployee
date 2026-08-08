@@ -15,7 +15,11 @@ from ai_employee.domain.errors import (
 
 @dataclass(frozen=True, slots=True)
 class ProviderCalendar:
-    """表示供应商日历目录中的一个 opaque 日历及只读权限投影。"""
+    """表示供应商日历目录中的一个 opaque 日历及只读权限投影。
+
+    ``is_deleted`` 只承载目录增量明确返回的删除事实。删除项至少保留供应商日历 ID，
+    其他展示和权限字段不得由应用层猜测；仓储据此撤销当前目录投影与来源缓存。
+    """
 
     calendar_id: str
     display_name: str
@@ -24,6 +28,7 @@ class ProviderCalendar:
     access_role: str
     can_write: bool
     provider_url: str | None = None
+    is_deleted: bool = False
 
 
 @dataclass(frozen=True, slots=True)

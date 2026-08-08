@@ -17,10 +17,11 @@ from ai_employee.application.ports.calendar import (
     ProviderCalendar,
 )
 from ai_employee.application.use_cases.sync_calendar import (
+    CalendarConnectionNotFoundError,
     CalendarSyncStoreFactory,
     SyncCalendarUseCase,
 )
-from ai_employee.domain.errors import TransientProviderError
+from ai_employee.domain.errors import InternalInvariantError, TransientProviderError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
@@ -33,6 +34,7 @@ from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepository,
     SqlAlchemyEnabledSyncScopeReader,
 )
+from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStore
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
@@ -63,6 +65,8 @@ class DirectoryCalendarReader:
     expire_directory_once: bool = False
     expire_event_once: str | None = None
     fail_event: str | None = None
+    emit_events: bool = True
+    directory_pages_override: tuple[CalendarDirectoryPage, ...] | None = None
     directory_calls: list[str | None] = field(default_factory=list)
     initial_calls: list[str] = field(default_factory=list)
     sync_calls: list[tuple[str, str]] = field(default_factory=list)
@@ -77,6 +81,10 @@ class DirectoryCalendarReader:
         if cursor is not None and self.expire_directory_once and not self._directory_expired:
             self._directory_expired = True
             raise CalendarCursorExpiredError("google", "directory")
+        if self.directory_pages_override is not None:
+            for page in self.directory_pages_override:
+                yield page
+            return
         token_index = min(len(self.directory_calls) - 1, len(self.directory_tokens) - 1)
         yield CalendarDirectoryPage(
             self.calendars,
@@ -88,7 +96,7 @@ class DirectoryCalendarReader:
         """返回一个含敏感字段、权限投影和参与者事实的合成完整页。"""
         self.initial_calls.append(calendar_id)
         yield CalendarSyncPage(
-            (self._event(calendar_id),),
+            (self._event(calendar_id),) if self.emit_events else (),
             None,
             f"{calendar_id}-token-{self.event_generation}",
         )
@@ -105,7 +113,7 @@ class DirectoryCalendarReader:
             self._event_expired = True
             raise CalendarCursorExpiredError("google", calendar_id)
         yield CalendarSyncPage(
-            (self._event(calendar_id),),
+            (self._event(calendar_id),) if self.emit_events else (),
             None,
             f"{calendar_id}-token-{self.event_generation}",
         )
@@ -174,6 +182,20 @@ def _directory_calendars() -> tuple[ProviderCalendar, ...]:
             can_write=False,
             provider_url="https://calendar.example.test/readonly",
         ),
+    )
+
+
+def _deleted_calendar(calendar_id: str) -> ProviderCalendar:
+    """创建只保留 opaque ID 的供应商中立目录删除事实。"""
+    return ProviderCalendar(
+        calendar_id=calendar_id,
+        display_name=calendar_id,
+        timezone="UTC",
+        is_primary=False,
+        access_role="unknown",
+        can_write=False,
+        provider_url=None,
+        is_deleted=True,
     )
 
 
@@ -303,6 +325,17 @@ async def test_calendar_sync_encrypts_upserts_tombstone_and_advances_cursor(
                     scope_key="primary",
                     cursor=None,
                 ),
+                ProviderCalendarModel(
+                    user_id=user.id,
+                    connection_id=connection.id,
+                    provider_calendar_id="primary",
+                    name="Primary",
+                    timezone="UTC",
+                    is_primary=True,
+                    access_role="owner",
+                    can_write=True,
+                    provider_url="https://calendar.example.test/primary",
+                ),
             ]
         )
         user_id, connection_id = user.id, connection.id
@@ -423,6 +456,28 @@ async def test_calendar_cursor_updates_are_isolated_by_calendar_scope(database_u
                     resource_kind="calendar",
                     scope_key="calendar-b",
                     cursor="cursor-b-1",
+                ),
+                ProviderCalendarModel(
+                    user_id=user.id,
+                    connection_id=connection.id,
+                    provider_calendar_id="calendar-a",
+                    name="Calendar A",
+                    timezone="UTC",
+                    is_primary=True,
+                    access_role="owner",
+                    can_write=True,
+                    provider_url="https://calendar.example.test/calendar-a",
+                ),
+                ProviderCalendarModel(
+                    user_id=user.id,
+                    connection_id=connection.id,
+                    provider_calendar_id="calendar-b",
+                    name="Calendar B",
+                    timezone="UTC",
+                    is_primary=False,
+                    access_role="reader",
+                    can_write=False,
+                    provider_url="https://calendar.example.test/calendar-b",
                 ),
             ]
         )
@@ -594,6 +649,330 @@ async def test_directory_sync_persists_roles_events_and_is_idempotent_on_replay(
         ("readonly@example.test", "reader", False),
     ]
     assert all(b"private description" not in row.description_ciphertext for row in event_rows)
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_directory_tombstone_removes_projection_events_and_future_scope_sync(
+    database_url: str,
+) -> None:
+    """目录删除事实必须撤销 selector 投影、来源缓存，并停止访问已移除 scope。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    reader = DirectoryCalendarReader(
+        (_deleted_calendar("readonly@example.test"),),
+        directory_tokens=("directory-token-2",),
+        event_generation=2,
+    )
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        snapshot = await SqlAlchemyConnectionStore(session).get_capability_snapshot(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        cached_calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel.calendar_id)
+                    .where(CalendarEventModel.connection_id == connection_id)
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+        brief_sources = await GenerateBriefTaskStep(sessions)._events_for_local_day(
+            session,
+            user_id,
+            date(2030, 1, 2),
+            "UTC",
+            connection_id,
+        )
+
+    assert snapshot is not None
+    assert [calendar.id for calendar in snapshot.provider_calendars] == ["primary"]
+    assert cached_calendar_ids == ("primary",)
+    assert {item["provider_url"] for item in brief_sources} == {
+        "https://calendar.example.test/events/primary"
+    }
+    assert reader.sync_calls == [("primary", "primary-token-1")]
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_directory_acl_downgrade_tightens_cached_events_without_event_delta(
+    database_url: str,
+) -> None:
+    """目录 owner→reader 即使事件增量为空，也必须立即收紧历史事件修改权限。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    downgraded = ProviderCalendar(
+        calendar_id="primary",
+        display_name="Primary",
+        timezone="UTC",
+        is_primary=True,
+        access_role="reader",
+        can_write=False,
+        provider_url="https://calendar.example.test/primary",
+    )
+
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(
+            google_calendar=DirectoryCalendarReader(
+                (downgraded,),
+                directory_tokens=("directory-token-2",),
+                event_generation=2,
+                emit_events=False,
+            )
+        ),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        event = await session.scalar(
+            select(CalendarEventModel).where(
+                CalendarEventModel.connection_id == connection_id,
+                CalendarEventModel.calendar_id == "primary",
+            )
+        )
+
+    assert event is not None
+    assert event.access_role == "reader"
+    assert event.can_edit is False
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_directory_acl_upgrade_does_not_blindly_relax_cached_event(
+    database_url: str,
+) -> None:
+    """目录 reader→owner 只更新角色；缺少新事件 locked 事实时不得把 can_edit 提升为 true。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    upgraded = ProviderCalendar(
+        calendar_id="readonly@example.test",
+        display_name="Readonly upgraded",
+        timezone="UTC",
+        is_primary=False,
+        access_role="owner",
+        can_write=True,
+        provider_url="https://calendar.example.test/readonly",
+    )
+
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(
+            google_calendar=DirectoryCalendarReader(
+                (upgraded,),
+                directory_tokens=("directory-token-2",),
+                event_generation=2,
+                emit_events=False,
+            )
+        ),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        event = await session.scalar(
+            select(CalendarEventModel).where(
+                CalendarEventModel.connection_id == connection_id,
+                CalendarEventModel.calendar_id == "readonly@example.test",
+            )
+        )
+
+    assert event is not None
+    assert event.access_role == "owner"
+    assert event.can_edit is False
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_calendar_scope_is_rejected_without_cursor_provider_call_or_event(
+    database_url: str,
+) -> None:
+    """未被目录证明的显式维修 scope 必须在仓储边界 fail closed。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    reader = DirectoryCalendarReader(_directory_calendars())
+
+    with pytest.raises(CalendarConnectionNotFoundError):
+        await SyncCalendarUseCase(
+            _calendar_stores(sessions),
+            ProviderAdapterRegistry(google_calendar=reader),
+            cipher,
+        ).execute(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key="unlisted@example.test",
+        )
+
+    async with sessions() as session:
+        unknown_cursor_count = await session.scalar(
+            select(func.count())
+            .select_from(SyncCursorModel)
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "unlisted@example.test",
+            )
+        )
+        unknown_event_count = await session.scalar(
+            select(func.count())
+            .select_from(CalendarEventModel)
+            .where(
+                CalendarEventModel.connection_id == connection_id,
+                CalendarEventModel.calendar_id == "unlisted@example.test",
+            )
+        )
+
+    assert reader.initial_calls == []
+    assert reader.sync_calls == []
+    assert unknown_cursor_count == 0
+    assert unknown_event_count == 0
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_discovered_calendar_scope_can_be_synced_explicitly(database_url: str) -> None:
+    """已发现的 provider calendar ID 仍可由显式维修任务推进自己的 cursor。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    reader = DirectoryCalendarReader(
+        _directory_calendars(),
+        event_generation=2,
+    )
+
+    result = await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="primary")
+
+    assert reader.sync_calls == [("primary", "primary-token-1")]
+    assert result.next_cursor == "primary-token-2"
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_initial_directory_requires_sync_token_on_final_page(database_url: str) -> None:
+    """初始目录不得接受前页 token；最终页缺 token 时不能写目录或启动事件读取。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    reader = DirectoryCalendarReader(
+        _directory_calendars(),
+        directory_pages_override=(
+            CalendarDirectoryPage(
+                _directory_calendars(),
+                "directory-page-2",
+                "token-illegally-on-first-page",
+            ),
+            CalendarDirectoryPage((), None, None),
+        ),
+    )
+
+    with pytest.raises(InternalInvariantError) as raised:
+        await SyncCalendarUseCase(
+            _calendar_stores(sessions),
+            ProviderAdapterRegistry(google_calendar=reader),
+            cipher,
+        ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        directory_cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        calendar_count = await session.scalar(
+            select(func.count())
+            .select_from(ProviderCalendarModel)
+            .where(ProviderCalendarModel.connection_id == connection_id)
+        )
+
+    assert raised.value.error_code == "calendar_directory_final_cursor_missing"
+    assert directory_cursor is not None
+    assert directory_cursor.cursor is None
+    assert directory_cursor.last_success_at is None
+    assert calendar_count == 0
+    assert reader.initial_calls == []
+    assert reader.sync_calls == []
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_directory_missing_final_token_preserves_old_success(
+    database_url: str,
+) -> None:
+    """增量最终页缺 token 时不得复用旧 cursor、推进成功时间或读取事件。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    async with sessions() as session:
+        before = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert before is not None
+        previous_success_at = before.last_success_at
+
+    reader = DirectoryCalendarReader(
+        _directory_calendars(),
+        directory_pages_override=(CalendarDirectoryPage((), None, None),),
+    )
+    with pytest.raises(InternalInvariantError) as raised:
+        await SyncCalendarUseCase(
+            stores,
+            ProviderAdapterRegistry(google_calendar=reader),
+            cipher,
+        ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        after = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+
+    assert raised.value.error_code == "calendar_directory_final_cursor_missing"
+    assert after is not None
+    assert after.cursor == "directory-token-1"
+    assert after.last_success_at == previous_success_at
+    assert reader.initial_calls == []
+    assert reader.sync_calls == []
     await sessions.dispose()
 
 

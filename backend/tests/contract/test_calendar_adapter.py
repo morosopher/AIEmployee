@@ -48,6 +48,31 @@ async def test_google_calendar_directory_normalizes_each_calendar_and_write_role
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_google_calendar_directory_preserves_deleted_tombstone() -> None:
+    """CalendarList 删除项必须保留 opaque ID，并明确投影为不可写 tombstone。"""
+    respx.get(GOOGLE_CALENDAR_LIST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [{"id": "removed@example.test", "deleted": True}],
+                "nextSyncToken": "directory-after-removal",
+            },
+        )
+    )
+    adapter = GoogleCalendarAdapter(access_token="synthetic", user_timezone="UTC")
+
+    pages = [page async for page in adapter.directory_pages("directory-before-removal")]
+
+    assert len(pages[0].calendars) == 1
+    removed = pages[0].calendars[0]
+    assert removed.calendar_id == "removed@example.test"
+    assert removed.is_deleted is True
+    assert removed.access_role == "unknown"
+    assert removed.can_write is False
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_google_calendar_directory_paginates_and_preserves_sync_token() -> None:
     """目录分页必须携带 pageToken，只有最终页承载目录 nextSyncToken。"""
     route = respx.get(GOOGLE_CALENDAR_LIST_URL).mock(
@@ -125,6 +150,65 @@ async def test_google_calendar_event_normalizes_attendees_organizer_and_current_
     assert event.etag == "etag-current"
     assert event.can_edit is False
     assert "singleEvents" not in route.calls[0].request.url.params
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_calendar_recurring_master_is_marked_in_list_and_current_get() -> None:
+    """重复 master 与 instance 都必须投影非空 recurring_event_id，供写提案稳定拒绝。"""
+    master = {
+        "id": "recurring-master",
+        "summary": "Synthetic recurring master",
+        "start": {"dateTime": "2030-01-02T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2030-01-02T10:00:00Z", "timeZone": "UTC"},
+        "recurrence": ["RRULE:FREQ=WEEKLY"],
+    }
+    instance = {
+        "id": "recurring-instance",
+        "summary": "Synthetic recurring instance",
+        "start": {"dateTime": "2030-01-09T09:00:00Z", "timeZone": "UTC"},
+        "end": {"dateTime": "2030-01-09T10:00:00Z", "timeZone": "UTC"},
+        "recurringEventId": "recurring-master",
+    }
+    respx.get("https://www.googleapis.com/calendar/v3/calendars/primary/events").mock(
+        return_value=httpx.Response(
+            200,
+            json={"items": [master, instance], "nextSyncToken": "event-token"},
+        )
+    )
+    respx.get(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events/recurring-master"
+    ).mock(return_value=httpx.Response(200, json=master))
+    adapter = GoogleCalendarAdapter(access_token="synthetic", user_timezone="UTC")
+
+    pages = [page async for page in adapter.initial_pages("primary")]
+    current = await adapter.get_current_event("primary", "recurring-master")
+
+    assert pages[0].events[0].recurring_event_id == "recurring-master"
+    assert pages[0].events[1].recurring_event_id == "recurring-master"
+    assert current is not None
+    assert current.recurring_event_id == "recurring-master"
+
+
+@pytest.mark.parametrize(
+    "recurrence",
+    ([], [""], [123], "RRULE:FREQ=WEEKLY", {"rule": "RRULE:FREQ=WEEKLY"}),
+)
+def test_google_calendar_does_not_guess_malformed_recurring_master(recurrence: object) -> None:
+    """空或畸形 recurrence 不是可靠重复事实，必须保持非重复投影。"""
+    event = GoogleCalendarAdapter(
+        access_token="synthetic",
+        user_timezone="UTC",
+    )._normalize(
+        {
+            "id": "malformed-recurrence",
+            "start": {"dateTime": "2030-01-02T09:00:00Z", "timeZone": "UTC"},
+            "end": {"dateTime": "2030-01-02T10:00:00Z", "timeZone": "UTC"},
+            "recurrence": recurrence,
+        }
+    )
+
+    assert event.recurring_event_id is None
 
 
 def test_google_calendar_naive_datetime_uses_explicit_event_timezone_and_returns_utc() -> None:

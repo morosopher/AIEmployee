@@ -204,7 +204,7 @@ class SyncCalendarUseCase:
                 cursor=None,
             )
 
-        next_cursor = self._last_cursor(pages, state.cursor)
+        next_cursor = self._last_cursor(pages)
         calendars = self._validated_directory_calendars(pages)
         completed_at = datetime.now(UTC)
         async with self._stores() as store:
@@ -322,6 +322,26 @@ class SyncCalendarUseCase:
         count = 0
         completed_at = datetime.now(UTC)
         async with self._stores() as store:
+            # 供应商 I/O 期间目录 ACL 可能被另一任务撤销。提交前重新锁定目录证明，
+            # 确保 tombstone 与事件写入按同一 ProviderCalendar 行串行，未知 scope 不落库。
+            current_state = await store.get_state(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key=scope_key,
+            )
+            if current_state is None:
+                raise CalendarConnectionNotFoundError
+            if current_state.provider != state.provider or current_state.scope_key != scope_key:
+                raise InternalInvariantError(
+                    error_code="calendar_cursor_scope_mismatch",
+                    message="Calendar cursor scope changed during provider read",
+                )
+            if current_state.cursor != state.cursor:
+                raise TransientProviderError(
+                    error_code="calendar_sync_cursor_conflict",
+                    message="Calendar sync cursor changed during provider read",
+                    retry_after=1,
+                )
             for page in pages:
                 for event in page.events:
                     if event.calendar_id != scope_key:
@@ -367,13 +387,14 @@ class SyncCalendarUseCase:
         return tuple([page async for page in pages])
 
     @staticmethod
-    def _last_cursor(pages: tuple[CalendarDirectoryPage, ...], fallback: str | None) -> str:
-        """取得目录最终 cursor；增量空页保留既有 opaque cursor。"""
-        for page in reversed(pages):
-            if page.next_cursor:
-                return page.next_cursor
-        if fallback:
-            return fallback
+    def _last_cursor(pages: tuple[CalendarDirectoryPage, ...]) -> str:
+        """只接受目录最终页明确返回的非空 opaque cursor。
+
+        Google CalendarList 仅保证最终页的 ``nextSyncToken`` 有效；扫描前页或复用旧 token
+        会把不完整分页错误记录为成功，并跳过后续目录变化，因此两种情况都必须 fail closed。
+        """
+        if pages and pages[-1].next_cursor:
+            return pages[-1].next_cursor
         raise InternalInvariantError(
             error_code="calendar_directory_final_cursor_missing",
             message="Calendar directory pages are missing a final cursor",

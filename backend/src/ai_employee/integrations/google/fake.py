@@ -101,7 +101,7 @@ class FakeCalendarReader:
             tuple(
                 adapter._normalize_calendar(item)
                 for item in payload.get("items", [])
-                if isinstance(item, dict) and item.get("deleted") is not True
+                if isinstance(item, dict)
             ),
             None,
             payload.get("nextSyncToken"),

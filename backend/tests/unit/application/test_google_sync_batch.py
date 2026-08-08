@@ -195,9 +195,9 @@ async def test_manual_sync_creates_canonical_tasks_with_explicit_owner_scopes() 
     )
 
 
-def test_calendar_worker_reserves_primary_fallback_for_legacy_missing_scope() -> None:
-    """显式新 owner 保持 directory；只有持久旧任务缺字段时才回退 primary。"""
+def test_calendar_worker_routes_legacy_missing_scope_through_directory() -> None:
+    """缺少 scope 的持久旧任务也必须先经过目录发现，不能绕过目录证明 primary。"""
     assert CalendarSyncTaskStep._resolve_scope_key("directory") == "directory"
-    assert CalendarSyncTaskStep._resolve_scope_key(None) == "primary"
+    assert CalendarSyncTaskStep._resolve_scope_key(None) == "directory"
     with pytest.raises(ValueError, match="requires scope_key"):
         CalendarSyncTaskStep._resolve_scope_key("")

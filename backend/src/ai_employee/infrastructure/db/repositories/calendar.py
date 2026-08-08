@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +57,20 @@ class SqlAlchemyCalendarSyncRepository:
         )
         if connection is None:
             return None
+        if scope_key != "directory":
+            # 事件 scope 只能来自当前连接的可见目录。锁住目录行直到调用方短事务结束，
+            # 使并发 tombstone 必须等事件提交完成，或先删除后令本次同步 fail closed。
+            calendar_id = await self._session.scalar(
+                select(ProviderCalendarModel.id)
+                .where(
+                    ProviderCalendarModel.user_id == user_id,
+                    ProviderCalendarModel.connection_id == connection_id,
+                    ProviderCalendarModel.provider_calendar_id == scope_key,
+                )
+                .with_for_update()
+            )
+            if calendar_id is None:
+                return None
         cursor = await self._session.scalar(
             select(SyncCursorModel)
             .where(
@@ -212,20 +226,20 @@ class SqlAlchemyCalendarSyncRepository:
         """原子保存目录事实、建立日历 placeholder 并推进独立目录游标。
 
         目录页已在供应商 I/O 边界完成分页、字段校验和稳定排序；此方法只在一个短事务内
-        做用户/连接能力复核、目录 upsert、日历 cursor placeholder 与 directory CAS。已有
-        日历 cursor 和最后成功时间绝不被目录重放清除，因而 CalendarList 410 回退不会影响
-        任一事件增量恢复位置。
+        做用户/连接能力复核、可见目录 upsert、删除 tombstone 应用、事件 ACL 收紧、日历
+        cursor placeholder 与 directory CAS。已有日历 cursor 和最后成功时间绝不被目录重放
+        清除，因而 CalendarList 410 回退不会影响任一事件增量恢复位置。
 
         Args:
             user_id: 当前管理员用户。
             connection_id: 已连接的 Google/Microsoft 连接主键。
-            calendars: 已规范化且按 provider calendar ID 稳定排序的目录页聚合。
+            calendars: 已规范化且按 provider calendar ID 稳定排序的可见项与删除项聚合。
             expected_cursor: 读取目录前观察到的 directory cursor。
             next_cursor: 供应商最终确认的 directory cursor。
             completed_at: 注入的 UTC 完成时间。
 
         Returns:
-            该连接当前已发现的全部日历 ID，供后续逐日历同步使用。
+            该连接当前仍可见的全部日历 ID，供后续逐日历同步使用。
 
         Raises:
             StateConflictError: 连接能力撤销、目录对象不安全或 CAS 竞争。
@@ -292,7 +306,29 @@ class SqlAlchemyCalendarSyncRepository:
                 retry_after=1,
             )
 
-        for calendar in calendars:
+        visible_calendars = tuple(calendar for calendar in calendars if not calendar.is_deleted)
+        deleted_calendar_ids = tuple(
+            calendar.calendar_id for calendar in calendars if calendar.is_deleted
+        )
+        for calendar_id in deleted_calendar_ids:
+            # CalendarList tombstone 撤销的是当前目录与来源缓存事实；独立 cursor 和历史
+            # 审计仍保留，以便重获访问权后由受限增量/410 回退安全恢复。
+            await self._session.execute(
+                delete(CalendarEventModel).where(
+                    CalendarEventModel.user_id == user_id,
+                    CalendarEventModel.connection_id == connection_id,
+                    CalendarEventModel.calendar_id == calendar_id,
+                )
+            )
+            await self._session.execute(
+                delete(ProviderCalendarModel).where(
+                    ProviderCalendarModel.user_id == user_id,
+                    ProviderCalendarModel.connection_id == connection_id,
+                    ProviderCalendarModel.provider_calendar_id == calendar_id,
+                )
+            )
+
+        for calendar in visible_calendars:
             statement = insert(ProviderCalendarModel).values(
                 user_id=user_id,
                 connection_id=connection_id,
@@ -318,7 +354,23 @@ class SqlAlchemyCalendarSyncRepository:
                 )
             )
 
-        if calendar_ids:
+            permission_values: dict[str, object] = {"access_role": calendar.access_role}
+            if not calendar.can_write:
+                # ACL 降级必须立即收紧历史事件；升级时保留既有 can_edit=false，等待
+                # 后续事件列表或精确 GET 再结合 locked 等事件事实确认，禁止盲目放宽。
+                permission_values["can_edit"] = False
+            await self._session.execute(
+                update(CalendarEventModel)
+                .where(
+                    CalendarEventModel.user_id == user_id,
+                    CalendarEventModel.connection_id == connection_id,
+                    CalendarEventModel.calendar_id == calendar.calendar_id,
+                )
+                .values(**permission_values)
+            )
+
+        visible_calendar_ids = tuple(calendar.calendar_id for calendar in visible_calendars)
+        if visible_calendar_ids:
             existing_cursor_ids = set(
                 (
                     await self._session.scalars(
@@ -326,13 +378,13 @@ class SqlAlchemyCalendarSyncRepository:
                         .where(
                             SyncCursorModel.connection_id == connection_id,
                             SyncCursorModel.resource_kind == "calendar",
-                            SyncCursorModel.scope_key.in_(calendar_ids),
+                            SyncCursorModel.scope_key.in_(visible_calendar_ids),
                         )
                         .with_for_update()
                     )
                 ).all()
             )
-            for calendar_id in calendar_ids:
+            for calendar_id in visible_calendar_ids:
                 if calendar_id not in existing_cursor_ids:
                     # placeholder 只证明目录已发现该 calendar；事件同步的尝试/成功时间和
                     # opaque token 必须由该日历独立的 finish_sync 事务写入。
@@ -369,7 +421,8 @@ class SqlAlchemyCalendarSyncRepository:
                 actor_type="system",
                 actor_id=str(connection_id),
                 event_metadata={
-                    "calendar_count": len(calendar_ids),
+                    "calendar_count": len(visible_calendar_ids),
+                    "removed_calendar_count": len(deleted_calendar_ids),
                     "scope_key": "directory",
                     "cutoff": completed_at.isoformat(),
                 },

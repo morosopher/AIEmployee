@@ -166,14 +166,15 @@ class CalendarSyncTaskStep:
 
     @staticmethod
     def _resolve_scope_key(raw_scope_key: object) -> str:
-        """解析任务 scope，并把 ``primary`` 回退严格限制在历史缺字段任务。
+        """解析任务 scope，并让历史缺字段任务安全经过 ``directory`` owner。
 
         Task 12 之后所有新建手动/周期任务都必须显式携带 ``directory``；但数据库中可能仍有
         Task 7 前固定 primary 架构创建的 ``sync_calendar`` 任务。同一 kind 无法区分版本，
-        因此仅当字段完全缺失时采用可证明的 primary 兼容值，显式空串或非字符串继续拒绝。
+        因此字段完全缺失时也先同步目录，由当前 ProviderCalendar 事实证明后再访问 primary；
+        显式空串或非字符串继续拒绝。
         """
         if raw_scope_key is None:
-            return "primary"
+            return "directory"
         if isinstance(raw_scope_key, str) and raw_scope_key != "":
             return raw_scope_key
         raise ValueError("sync_calendar requires scope_key")

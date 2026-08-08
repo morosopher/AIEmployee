@@ -75,11 +75,7 @@ class GoogleCalendarAdapter:
             page_token = self._optional_string(payload.get("nextPageToken"))
             items = payload.get("items")
             calendars = (
-                tuple(
-                    self._normalize_calendar(item)
-                    for item in items
-                    if isinstance(item, dict) and item.get("deleted") is not True
-                )
+                tuple(self._normalize_calendar(item) for item in items if isinstance(item, dict))
                 if isinstance(items, list)
                 else ()
             )
@@ -229,8 +225,9 @@ class GoogleCalendarAdapter:
         raise AssertionError("Calendar request retry loop exhausted")
 
     def _normalize_calendar(self, payload: dict[str, object]) -> ProviderCalendar:
-        """把 CalendarList 项收窄为目录领域模型，并对未知权限 fail closed。"""
+        """把 CalendarList 项收窄为目录领域模型，并对删除或未知权限 fail closed。"""
         calendar_id = self._required(payload, "id")
+        is_deleted = payload.get("deleted") is True
         role = self._optional_string(payload.get("accessRole")) or "unknown"
         timezone = self._optional_string(payload.get("timeZone")) or str(self._timezone)
         display_name = (
@@ -242,10 +239,11 @@ class GoogleCalendarAdapter:
             calendar_id=calendar_id,
             display_name=display_name,
             timezone=timezone,
-            is_primary=payload.get("primary") is True,
-            access_role=role,
-            can_write=role in {"owner", "writer"},
-            provider_url=self._optional_string(payload.get("htmlLink")),
+            is_primary=not is_deleted and payload.get("primary") is True,
+            access_role="unknown" if is_deleted else role,
+            can_write=not is_deleted and role in {"owner", "writer"},
+            provider_url=None if is_deleted else self._optional_string(payload.get("htmlLink")),
+            is_deleted=is_deleted,
         )
 
     def _normalize(
@@ -254,7 +252,7 @@ class GoogleCalendarAdapter:
         """收窄供应商字段，日期事件按源时区当地午夜转为 UTC。"""
         event_id = self._required(payload, "id")
         status = self._optional_string(payload.get("status")) or "confirmed"
-        recurring_event_id = self._optional_string(payload.get("recurringEventId"))
+        recurring_event_id = self._recurring_event_id(payload, event_id)
         etag = self._optional_string(payload.get("etag"))
         provider_url = self._optional_string(payload.get("htmlLink")) or ""
         updated_at = self._provider_updated_at(payload.get("updated"))
@@ -359,6 +357,26 @@ class GoogleCalendarAdapter:
         仓储仍会 fail closed 为不可编辑。
         """
         return status != "cancelled" and payload.get("locked") is not True
+
+    @classmethod
+    def _recurring_event_id(cls, payload: dict[str, object], event_id: str) -> str | None:
+        """统一标记 Google 重复 instance 与 master，拒绝畸形 recurrence 猜测。
+
+        instance 使用供应商明确给出的 ``recurringEventId``；master 没有该字段，但会带
+        非空字符串 ``recurrence`` 规则集合，因此用自身 event ID 作为稳定 sentinel。
+        后续领域逻辑只需判断该字段非空即可同时拒绝两类 M2 不支持的重复写入。
+        """
+        parent_id = cls._optional_string(payload.get("recurringEventId"))
+        if parent_id:
+            return parent_id
+        recurrence = payload.get("recurrence")
+        if (
+            isinstance(recurrence, list)
+            and recurrence
+            and all(isinstance(rule, str) and rule.strip() != "" for rule in recurrence)
+        ):
+            return event_id
+        return None
 
     @staticmethod
     def _provider_updated_at(value: object) -> datetime | None:
