@@ -153,17 +153,26 @@ def _check_expression(table_name: str, constraint_name: str) -> str | None:
 
 
 def _index_row(index_name: str) -> tuple[object, ...] | None:
-    """读取指定索引的有效性、唯一性、谓词和列顺序。"""
+    """读取指定索引的完整键形状，保留表达式与 INCLUDE 项的 catalog 事实。
+
+    PostgreSQL 用 ``indkey`` 中的 ``attnum=0`` 表示表达式键；因此这里必须使用
+    ``LEFT JOIN`` 并保留 ``NULL`` 位置，同时读取 ``indexprs``、``indnkeyatts`` 与
+    ``indnatts``。否则额外表达式会被 INNER JOIN 静默吞掉，错误的 invalid 同名索引
+    可能被误判成迁移目标并遭到删除。
+    """
     row = (
         op.get_bind()
         .execute(
             sa.text(
                 "SELECT table_class.relname, index_info.indisvalid, "
                 "index_info.indisunique, index_info.indpred IS NULL, "
-                "ARRAY(SELECT attribute.attname "
+                "index_info.indexprs IS NULL, index_info.indnkeyatts, "
+                "index_info.indnatts, ARRAY("
+                "SELECT CASE WHEN index_key.attnum = 0 THEN NULL "
+                "ELSE attribute.attname::text END "
                 "FROM unnest(index_info.indkey) WITH ORDINALITY "
                 "AS index_key(attnum, position) "
-                "JOIN pg_catalog.pg_attribute AS attribute "
+                "LEFT JOIN pg_catalog.pg_attribute AS attribute "
                 "ON attribute.attrelid = index_info.indrelid "
                 "AND attribute.attnum = index_key.attnum "
                 "ORDER BY index_key.position) "
@@ -273,12 +282,29 @@ def _prepare_unique_indexes() -> None:
 
         index = _index_row(constraint_name)
         if index is not None:
-            index_table, is_valid, is_unique, is_unpartial, index_columns = index
+            (
+                index_table,
+                is_valid,
+                is_unique,
+                is_unpartial,
+                has_no_expressions,
+                key_attribute_count,
+                attribute_count,
+                index_columns,
+            ) = index
             if index_table != table_name:
                 raise RuntimeError(f"{constraint_name} belongs to an unexpected table")
-            if not bool(is_unique) or not bool(is_unpartial) or tuple(index_columns) != columns:
+            if (
+                not bool(is_unique)
+                or not bool(is_unpartial)
+                or not bool(has_no_expressions)
+                or key_attribute_count != len(columns)
+                or attribute_count != len(columns)
+                or tuple(index_columns) != columns
+            ):
                 # 同名对象即使 invalid 也可能由其他部署或人工 DDL 创建。必须先证明它正是
-                # 本迁移声明的目标形状，才能把 DROP CONCURRENTLY 视为安全、精确的恢复动作。
+                # 本迁移声明的普通列、无 INCLUDE 精确目标，才能把 DROP CONCURRENTLY
+                # 视为安全、精确的恢复动作；表达式位置绝不能靠 JOIN 丢弃后当作缺席。
                 raise RuntimeError(f"{constraint_name} has an unexpected index definition")
             if not bool(is_valid):
                 # failed CONCURRENTLY build leaves an invalid catalog row. Preserve the declared

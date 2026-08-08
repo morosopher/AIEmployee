@@ -345,21 +345,36 @@ def _email_identity_foreign_key_metadata(
 
 def _email_identity_index_metadata(
     database_url: URL,
-) -> dict[str, tuple[bool, bool, tuple[str, ...]]]:
-    """读取 0017 两个固定并发索引的有效性、唯一性和列顺序。"""
+) -> dict[
+    str,
+    tuple[bool, bool, bool, bool, int, int, tuple[str | None, ...]],
+]:
+    """读取 0017 固定索引的完整键形状，不能静默丢弃表达式或 INCLUDE 项。
 
-    async def read_metadata() -> dict[str, tuple[bool, bool, tuple[str, ...]]]:
+    返回值依次包含 valid、unique、无 predicate、无 expression、key attribute 数、
+    总 attribute 数和完整 ``indkey`` 位置。表达式在 ``indkey`` 中以 ``attnum=0``
+    表示，因此用 ``None`` 保留其原始位置；若改用 INNER JOIN，测试 helper 本身会复现
+    生产迁移的盲区，无法证明 wrong-shape 对象确实未被替换。
+    """
+
+    async def read_metadata() -> dict[
+        str,
+        tuple[bool, bool, bool, bool, int, int, tuple[str | None, ...]],
+    ]:
         engine = create_async_engine(database_url, poolclass=NullPool)
         try:
             async with engine.connect() as connection:
                 result = await connection.execute(
                     text(
                         "SELECT index_class.relname, index_info.indisvalid, "
-                        "index_info.indisunique, ARRAY("
-                        "SELECT attribute.attname "
+                        "index_info.indisunique, index_info.indpred IS NULL, "
+                        "index_info.indexprs IS NULL, index_info.indnkeyatts, "
+                        "index_info.indnatts, ARRAY("
+                        "SELECT CASE WHEN index_key.attnum = 0 THEN NULL "
+                        "ELSE attribute.attname::text END "
                         "FROM unnest(index_info.indkey) WITH ORDINALITY "
                         "AS index_key(attnum, position) "
-                        "JOIN pg_catalog.pg_attribute AS attribute "
+                        "LEFT JOIN pg_catalog.pg_attribute AS attribute "
                         "ON attribute.attrelid = index_info.indrelid "
                         "AND attribute.attnum = index_key.attnum "
                         "ORDER BY index_key.position"
@@ -380,7 +395,11 @@ def _email_identity_index_metadata(
                     str(row[0]): (
                         bool(row[1]),
                         bool(row[2]),
-                        tuple(str(value) for value in row[3]),
+                        bool(row[3]),
+                        bool(row[4]),
+                        int(row[5]),
+                        int(row[6]),
+                        tuple(str(value) if value is not None else None for value in row[7]),
                     )
                     for row in result
                 }
@@ -1663,7 +1682,122 @@ def test_mail_message_identity_contract_preserves_wrong_shape_invalid_index(
         "uq_email_messages_connection_provider_message": (
             False,
             True,
+            True,
+            True,
+            2,
+            2,
             ("connection_id", "mailbox_scope_key"),
+        )
+    }
+    assert _email_identity_index_metadata(empty_migration_database) == expected_index
+
+    error_message: str | None = None
+    try:
+        command.upgrade(alembic_config, "20260808_0017")
+    except RuntimeError as error:
+        error_message = str(error)
+
+    assert (
+        error_message,
+        _alembic_revisions(empty_migration_database),
+        _email_identity_index_metadata(empty_migration_database),
+    ) == (
+        "uq_email_messages_connection_provider_message has an unexpected index definition",
+        {"20260808_0016"},
+        expected_index,
+    )
+
+
+def test_mail_message_identity_contract_preserves_invalid_expression_index(
+    empty_migration_database: URL,
+) -> None:
+    """额外表达式键即使 invalid 也不是迁移目标，0017 必须保留并 fail closed。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def seed_duplicate_projection() -> None:
+        """先制造连接级 ImmutableId 重复，让三键表达式索引稳定留下 invalid catalog。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, connection_id, thread_id, provider_message_id, "
+                        "received_at, mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000227', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'00000000-0000-0000-0000-000000000212', "
+                        "'synthetic-message-before-migration', now(), 'expression-index', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic expression duplicate', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message/expression-duplicate', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    async def create_invalid_expression_index() -> None:
+        """并发构建带额外 ``lower`` 键的索引，并因前两键重复留下 invalid 对象。"""
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_email_messages_connection_provider_message "
+                        "ON email_messages ("
+                        "connection_id, provider_message_id, lower(provider_message_id)"
+                        ")"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    async def repair_duplicate_projection() -> None:
+        """修复测试数据重复，使 0017 能进入索引形状检查而非被 preflight 提前拒绝。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE email_messages "
+                        "SET provider_message_id = 'synthetic-expression-index-repaired' "
+                        "WHERE id = '00000000-0000-0000-0000-000000000227'"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_duplicate_projection())
+    with pytest.raises(IntegrityError):
+        asyncio.run(create_invalid_expression_index())
+    asyncio.run(repair_duplicate_projection())
+
+    expected_index = {
+        "uq_email_messages_connection_provider_message": (
+            False,
+            True,
+            True,
+            False,
+            3,
+            3,
+            ("connection_id", "provider_message_id", None),
         )
     }
     assert _email_identity_index_metadata(empty_migration_database) == expected_index
@@ -1750,6 +1884,10 @@ def test_mail_message_identity_contract_rebuilds_only_named_invalid_index(
         "uq_email_messages_connection_provider_message": (
             False,
             True,
+            True,
+            True,
+            2,
+            2,
             ("connection_id", "provider_message_id"),
         )
     }
@@ -1775,11 +1913,19 @@ def test_mail_message_identity_contract_rebuilds_only_named_invalid_index(
         "uq_email_messages_connection_provider_message": (
             True,
             True,
+            True,
+            True,
+            2,
+            2,
             ("connection_id", "provider_message_id"),
         ),
         "uq_email_threads_id_connection_user": (
             True,
             True,
+            True,
+            True,
+            3,
+            3,
             ("id", "connection_id", "user_id"),
         ),
     }
