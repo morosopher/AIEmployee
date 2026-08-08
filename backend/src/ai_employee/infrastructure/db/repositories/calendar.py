@@ -226,9 +226,9 @@ class SqlAlchemyCalendarSyncRepository:
         """原子保存目录事实、建立日历 placeholder 并推进独立目录游标。
 
         目录页已在供应商 I/O 边界完成分页、字段校验和稳定排序；此方法只在一个短事务内
-        做用户/连接能力复核、可见目录 upsert、删除 tombstone 应用、事件 ACL 收紧、日历
-        cursor placeholder 与 directory CAS。已有日历 cursor 和最后成功时间绝不被目录重放
-        清除，因而 CalendarList 410 回退不会影响任一事件增量恢复位置。
+        做用户/连接能力复核、可见目录 upsert、增量 tombstone 或全量快照差集清理、事件 ACL
+        收紧、日历 cursor placeholder 与 directory CAS。已有日历 cursor 和最后成功时间绝不
+        被目录重放清除，因而 CalendarList 410 回退不会影响任一事件增量恢复位置。
 
         Args:
             user_id: 当前管理员用户。
@@ -307,10 +307,29 @@ class SqlAlchemyCalendarSyncRepository:
             )
 
         visible_calendars = tuple(calendar for calendar in calendars if not calendar.is_deleted)
-        deleted_calendar_ids = tuple(
+        visible_calendar_ids = tuple(calendar.calendar_id for calendar in visible_calendars)
+        explicit_deleted_calendar_ids = tuple(
             calendar.calendar_id for calendar in calendars if calendar.is_deleted
         )
-        for calendar_id in deleted_calendar_ids:
+        removed_calendar_ids = set(explicit_deleted_calendar_ids)
+        if expected_cursor is None:
+            # 初始同步与 410 回退返回完整目录快照；未再次出现的历史行已经不再可见，
+            # 必须与显式 tombstone 合并清理。增量 delta 不具备该完备性，绝不能做差集。
+            existing_calendar_ids = set(
+                (
+                    await self._session.scalars(
+                        select(ProviderCalendarModel.provider_calendar_id)
+                        .where(
+                            ProviderCalendarModel.user_id == user_id,
+                            ProviderCalendarModel.connection_id == connection_id,
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            removed_calendar_ids.update(existing_calendar_ids.difference(visible_calendar_ids))
+        ordered_removed_calendar_ids = tuple(sorted(removed_calendar_ids))
+        for calendar_id in ordered_removed_calendar_ids:
             # CalendarList tombstone 撤销的是当前目录与来源缓存事实；独立 cursor 和历史
             # 审计仍保留，以便重获访问权后由受限增量/410 回退安全恢复。
             await self._session.execute(
@@ -369,7 +388,6 @@ class SqlAlchemyCalendarSyncRepository:
                 .values(**permission_values)
             )
 
-        visible_calendar_ids = tuple(calendar.calendar_id for calendar in visible_calendars)
         if visible_calendar_ids:
             existing_cursor_ids = set(
                 (
@@ -422,7 +440,7 @@ class SqlAlchemyCalendarSyncRepository:
                 actor_id=str(connection_id),
                 event_metadata={
                     "calendar_count": len(visible_calendar_ids),
-                    "removed_calendar_count": len(deleted_calendar_ids),
+                    "removed_calendar_count": len(ordered_removed_calendar_ids),
                     "scope_key": "directory",
                     "cutoff": completed_at.isoformat(),
                 },

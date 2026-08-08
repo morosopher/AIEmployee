@@ -30,6 +30,7 @@ from ai_employee.infrastructure.db.models.sources import (
     ProviderCalendarModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepository,
     SqlAlchemyEnabledSyncScopeReader,
@@ -196,6 +197,108 @@ def _deleted_calendar(calendar_id: str) -> ProviderCalendar:
         can_write=False,
         provider_url=None,
         is_deleted=True,
+    )
+
+
+def _isolation_calendar_event(
+    *, user_id: UUID, connection_id: UUID, suffix: str
+) -> CalendarEventModel:
+    """创建同 calendar ID 的合成缓存事件，用于证明全量清理不会越过所有权边界。"""
+    return CalendarEventModel(
+        user_id=user_id,
+        connection_id=connection_id,
+        provider_event_id=f"isolation-event-{suffix}",
+        calendar_id="readonly@example.test",
+        title=f"Isolation {suffix}",
+        description_ciphertext=None,
+        description_nonce=None,
+        description_key_version=None,
+        location_ciphertext=None,
+        location_nonce=None,
+        location_key_version=None,
+        starts_at=datetime(2030, 1, 2, 3, tzinfo=UTC),
+        ends_at=datetime(2030, 1, 2, 4, tzinfo=UTC),
+        all_day=False,
+        transparency="opaque",
+        status="confirmed",
+        timezone="UTC",
+        recurring_event_id=None,
+        etag=f"isolation-etag-{suffix}",
+        organizer=None,
+        attendees=[],
+        access_role="owner",
+        can_edit=True,
+        provider_url=f"https://calendar.example.test/isolation/{suffix}",
+        provider_updated_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+
+async def _seed_calendar_isolation_controls(
+    sessions: ManagedAsyncSessionMaker,
+    *,
+    owner_user_id: UUID,
+) -> tuple[tuple[UUID, UUID], tuple[UUID, UUID]]:
+    """种入同用户其他连接与其他用户连接的同名日历/事件控制组。"""
+    async with sessions.begin() as session:
+        sibling_connection = OAuthConnectionModel(
+            user_id=owner_user_id,
+            provider="google",
+            provider_account_id="calendar-sibling-subject",
+            account_email="calendar-sibling@example.test",
+            scopes=["https://www.googleapis.com/auth/calendar.readonly"],
+            status="connected",
+            last_error_code=None,
+        )
+        foreign_user = UserModel(
+            email="calendar-foreign@example.test",
+            display_name="Foreign Calendar Owner",
+            password_hash=None,
+            timezone="UTC",
+            locale="zh-CN",
+            brief_time=time(8),
+            is_active=True,
+        )
+        session.add_all((sibling_connection, foreign_user))
+        await session.flush()
+        foreign_connection = OAuthConnectionModel(
+            user_id=foreign_user.id,
+            provider="google",
+            provider_account_id="calendar-foreign-subject",
+            account_email="calendar-foreign@example.test",
+            scopes=["https://www.googleapis.com/auth/calendar.readonly"],
+            status="connected",
+            last_error_code=None,
+        )
+        session.add(foreign_connection)
+        await session.flush()
+        controls = (
+            (owner_user_id, sibling_connection.id, "sibling"),
+            (foreign_user.id, foreign_connection.id, "foreign"),
+        )
+        for control_user_id, control_connection_id, suffix in controls:
+            session.add_all(
+                (
+                    ProviderCalendarModel(
+                        user_id=control_user_id,
+                        connection_id=control_connection_id,
+                        provider_calendar_id="readonly@example.test",
+                        name=f"Isolation {suffix}",
+                        timezone="UTC",
+                        is_primary=False,
+                        access_role="owner",
+                        can_write=True,
+                        provider_url=f"https://calendar.example.test/isolation/{suffix}",
+                    ),
+                    _isolation_calendar_event(
+                        user_id=control_user_id,
+                        connection_id=control_connection_id,
+                        suffix=suffix,
+                    ),
+                )
+            )
+    return (
+        (owner_user_id, sibling_connection.id),
+        (foreign_user.id, foreign_connection.id),
     )
 
 
@@ -705,6 +808,231 @@ async def test_directory_tombstone_removes_projection_events_and_future_scope_sy
         "https://calendar.example.test/events/primary"
     }
     assert reader.sync_calls == [("primary", "primary-token-1")]
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_directory_410_full_snapshot_removes_absent_calendar_with_owner_isolation(
+    database_url: str,
+) -> None:
+    """410 后完整目录只保留本次可见项，并精确隔离同名的其他用户/连接数据。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    control_owners = set(await _seed_calendar_isolation_controls(sessions, owner_user_id=user_id))
+    reader = DirectoryCalendarReader(
+        (_directory_calendars()[0],),
+        directory_tokens=("ignored-after-410", "directory-token-reset"),
+        event_generation=2,
+        expire_directory_once=True,
+    )
+
+    result = await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        snapshot = await SqlAlchemyConnectionStore(session).get_capability_snapshot(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        target_event_calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel.calendar_id)
+                    .where(CalendarEventModel.connection_id == connection_id)
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+        cursor_rows = dict(
+            (
+                await session.execute(
+                    select(SyncCursorModel.scope_key, SyncCursorModel.cursor).where(
+                        SyncCursorModel.connection_id == connection_id,
+                        SyncCursorModel.resource_kind == "calendar",
+                    )
+                )
+            ).all()
+        )
+        brief_sources = await GenerateBriefTaskStep(sessions)._events_for_local_day(
+            session,
+            user_id,
+            date(2030, 1, 2),
+            "UTC",
+            connection_id,
+        )
+        remaining_calendar_owners = set(
+            (
+                await session.execute(
+                    select(
+                        ProviderCalendarModel.user_id,
+                        ProviderCalendarModel.connection_id,
+                    ).where(ProviderCalendarModel.provider_calendar_id == "readonly@example.test")
+                )
+            ).all()
+        )
+        remaining_event_owners = set(
+            (
+                await session.execute(
+                    select(
+                        CalendarEventModel.user_id,
+                        CalendarEventModel.connection_id,
+                    ).where(CalendarEventModel.calendar_id == "readonly@example.test")
+                )
+            ).all()
+        )
+
+    assert snapshot is not None
+    assert [calendar.id for calendar in snapshot.provider_calendars] == ["primary"]
+    assert target_event_calendar_ids == ("primary",)
+    assert {item["provider_url"] for item in brief_sources} == {
+        "https://calendar.example.test/events/primary"
+    }
+    assert reader.directory_calls == ["directory-token-1", None]
+    assert reader.sync_calls == [("primary", "primary-token-1")]
+    assert cursor_rows == {
+        "directory": "directory-token-reset",
+        "primary": "primary-token-2",
+        "readonly@example.test": "readonly@example.test-token-1",
+    }
+    assert result.events_upserted == 1
+    assert remaining_calendar_owners == control_owners
+    assert remaining_event_owners == control_owners
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_full_empty_directory_snapshot_removes_only_current_cache_and_keeps_cursors_audit(
+    database_url: str,
+) -> None:
+    """全量空快照撤销当前目录/缓存，但保留所有事件 cursor 与追加审计。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    reader = DirectoryCalendarReader(
+        (),
+        directory_tokens=("ignored-after-410", "directory-empty-reset"),
+        event_generation=2,
+        expire_directory_once=True,
+    )
+
+    result = await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        calendar_count = await session.scalar(
+            select(func.count())
+            .select_from(ProviderCalendarModel)
+            .where(
+                ProviderCalendarModel.user_id == user_id,
+                ProviderCalendarModel.connection_id == connection_id,
+            )
+        )
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(CalendarEventModel)
+            .where(
+                CalendarEventModel.user_id == user_id,
+                CalendarEventModel.connection_id == connection_id,
+            )
+        )
+        cursor_rows = dict(
+            (
+                await session.execute(
+                    select(SyncCursorModel.scope_key, SyncCursorModel.cursor).where(
+                        SyncCursorModel.connection_id == connection_id,
+                        SyncCursorModel.resource_kind == "calendar",
+                    )
+                )
+            ).all()
+        )
+        directory_audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEventModel)
+            .where(
+                AuditEventModel.user_id == user_id,
+                AuditEventModel.event_type == "source.calendar.directory_discovered",
+            )
+        )
+
+    assert calendar_count == 0
+    assert event_count == 0
+    assert reader.sync_calls == []
+    assert cursor_rows == {
+        "directory": "directory-empty-reset",
+        "primary": "primary-token-1",
+        "readonly@example.test": "readonly@example.test-token-1",
+    }
+    assert directory_audit_count == 2
+    assert result.events_upserted == 0
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_incremental_empty_directory_delta_preserves_every_visible_calendar(
+    database_url: str,
+) -> None:
+    """增量空变更只推进目录 token，未返回的既有日历仍须保留并继续同步。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    reader = DirectoryCalendarReader(
+        (),
+        directory_tokens=("directory-token-2",),
+        event_generation=2,
+    )
+
+    result = await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id)
+                    .where(ProviderCalendarModel.connection_id == connection_id)
+                    .order_by(ProviderCalendarModel.provider_calendar_id)
+                )
+            ).all()
+        )
+        event_calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel.calendar_id)
+                    .where(CalendarEventModel.connection_id == connection_id)
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+
+    assert calendar_ids == ("primary", "readonly@example.test")
+    assert event_calendar_ids == ("primary", "readonly@example.test")
+    assert reader.sync_calls == [
+        ("primary", "primary-token-1"),
+        ("readonly@example.test", "readonly@example.test-token-1"),
+    ]
+    assert result.events_upserted == 2
     await sessions.dispose()
 
 
