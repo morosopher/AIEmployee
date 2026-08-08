@@ -283,10 +283,11 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
             """保存格式化前消息，避免测试依赖 stdout/stderr。"""
             self.messages.append(record.getMessage())
 
-    parent_logger = logging.getLogger(namespace)
     child_name = f"{namespace}.{child_suffix}"
     manager = logging.Logger.manager
+    parent_entry = manager.loggerDict.get(namespace)
     child_entry = manager.loggerDict.get(child_name)
+    parent_logger = logging.getLogger(namespace)
     child_logger = logging.getLogger(child_name)
     logger_states = {
         logger: (
@@ -334,6 +335,10 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
             manager.loggerDict.pop(child_name, None)
         else:
             manager.loggerDict[child_name] = child_entry
+        if parent_entry is None:
+            manager.loggerDict.pop(namespace, None)
+        else:
+            manager.loggerDict[namespace] = parent_entry
 
 
 @pytest.mark.parametrize(
@@ -409,6 +414,8 @@ def test_http_client_logging_installation_window_scrubs_extra(
     logger_name = "httpx.installation_window_race"
     app_name = "ai_employee.installation_window_race_app"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
+    app_entry = manager.loggerDict.get(app_name)
     logger = logging.getLogger(logger_name)
     app_logger = logging.getLogger(app_name)
     logger_state = (
@@ -425,8 +432,6 @@ def test_http_client_logging_installation_window_scrubs_extra(
         app_logger.handlers[:],
         app_logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
-    app_entry = manager.loggerDict.get(app_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -592,6 +597,7 @@ def test_http_client_logging_first_layer_closes_partial_installation_window(
 
     logger_name = "httpx.partial_installation_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -600,7 +606,6 @@ def test_http_client_logging_first_layer_closes_partial_installation_window(
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -756,6 +761,7 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
 
     logger_name = "httpx.in_flight_make_record_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -764,7 +770,6 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -853,6 +858,7 @@ def test_http_client_logging_scrubs_filter_mutation_before_dispatch() -> None:
 
     logger_name = "httpx.filter_mutation_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -861,7 +867,6 @@ def test_http_client_logging_scrubs_filter_mutation_before_dispatch() -> None:
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -936,6 +941,7 @@ def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> No
 
     logger_name = "httpx.filter_name_mutation_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -944,7 +950,6 @@ def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> No
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1025,6 +1030,7 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
     logger_name = "httpx.filter_replacement_race"
     replacement_name = "ai_employee.filter_replacement_alias"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1033,7 +1039,6 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1115,6 +1120,7 @@ def test_http_client_logging_scrubs_unproven_http_named_app_direct_handle_record
 
     logger_name = "ai_employee.direct_handle_source"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1123,7 +1129,6 @@ def test_http_client_logging_scrubs_unproven_http_named_app_direct_handle_record
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1204,6 +1209,7 @@ def test_http_client_logging_preserves_standard_app_logger_message_and_extra() -
 
     logger_name = "ai_employee.standard_application_logging"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1212,7 +1218,6 @@ def test_http_client_logging_preserves_standard_app_logger_message_and_extra() -
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1274,6 +1279,7 @@ def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
     logger_name = "httpx.direct_handle_source"
     record_name = "ai_employee.direct_handle_alias"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1282,7 +1288,6 @@ def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1366,6 +1371,7 @@ def test_http_client_logging_scrubs_handler_filter_mutation_before_emit() -> Non
 
     logger_name = "httpx.handler_filter_mutation_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1374,7 +1380,6 @@ def test_http_client_logging_scrubs_handler_filter_mutation_before_emit() -> Non
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1457,6 +1462,7 @@ def test_http_client_logging_scrubs_handler_filter_replacement_before_emit() -> 
     logger_name = "httpx.handler_filter_replacement_race"
     replacement_name = "ai_employee.handler-filter-replacement-synthetic-name-secret"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1465,7 +1471,6 @@ def test_http_client_logging_scrubs_handler_filter_replacement_before_emit() -> 
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1598,6 +1603,7 @@ def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> No
 
     logger_name = "httpx.in_flight_handle_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1606,7 +1612,6 @@ def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> No
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1720,6 +1725,7 @@ def test_http_client_logging_preserves_provenance_for_in_flight_old_call_handler
 
     logger_name = "httpx.in_flight_call_handlers_race"
     manager = logging.Logger.manager
+    logger_entry = manager.loggerDict.get(logger_name)
     logger = logging.getLogger(logger_name)
     logger_state = (
         logger.level,
@@ -1728,7 +1734,6 @@ def test_http_client_logging_preserves_provenance_for_in_flight_old_call_handler
         logger.handlers[:],
         logger.filters[:],
     )
-    logger_entry = manager.loggerDict.get(logger_name)
     original_factory = logging.getLogRecordFactory()
     original_make_record = logging.Logger.makeRecord
     original_handle = logging.Logger.handle
@@ -1859,8 +1864,8 @@ def test_http_client_log_record_scrub_survives_future_children_and_concurrent_in
                 entry.handlers[:],
                 entry.filters[:],
             )
-    parent_logger = logging.getLogger(namespace)
     app_entry = manager.loggerDict.get(app_name)
+    parent_logger = logging.getLogger(namespace)
     app_logger = logging.getLogger(app_name)
     app_state = (
         app_logger.level,
