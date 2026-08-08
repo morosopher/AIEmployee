@@ -336,6 +336,33 @@ def test_http_client_logging_scrubs_records_for_preexisting_parent_and_child_han
             manager.loggerDict[child_name] = child_entry
 
 
+@pytest.mark.parametrize(
+    ("payload_name", "expected_name"),
+    (("missing", None), ("none", None), ("non_string", 42)),
+)
+def test_http_client_logging_make_log_record_tolerates_non_string_name(
+    payload_name: str,
+    expected_name: object,
+) -> None:
+    """``logging.makeLogRecord`` 的占位 name 不应让 factory 崩溃或误清洗记录。"""
+    configure_http_client_logging()
+    raw_message = f"synthetic-make-log-record-{payload_name}"
+    payload: dict[str, object] = {
+        "msg": raw_message,
+        "args": (),
+        "make_log_record_marker": "synthetic-safe-make-log-record-extra",
+    }
+    if payload_name != "missing":
+        payload["name"] = expected_name
+
+    record = logging.makeLogRecord(payload)
+
+    assert record.name == expected_name
+    assert record.msg == raw_message
+    assert record.getMessage() == raw_message
+    assert record.__dict__["make_log_record_marker"] == "synthetic-safe-make-log-record-extra"
+
+
 def test_http_client_logging_installation_window_scrubs_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

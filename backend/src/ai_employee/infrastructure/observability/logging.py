@@ -62,8 +62,15 @@ _HTTP_CLIENT_SAFE_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
-def _is_http_client_logger(name: str) -> bool:
-    """判断记录是否来自 HTTPX 或 HTTPCore 命名空间。"""
+def _is_http_client_logger(name: object) -> bool:
+    """判断记录是否来自 HTTPX 或 HTTPCore 命名空间。
+
+    ``logging.makeLogRecord`` 会先用 ``name=None`` 创建占位记录，再把调用方字典更新
+    到记录上；反序列化输入也可能提供其他非字符串值。此处先收窄类型，避免日志安全
+    入口因元数据异常抛错，同时让未知来源继续沿用应用日志行为。
+    """
+    if not isinstance(name, str):
+        return False
     return any(
         name == namespace or name.startswith(f"{namespace}.")
         for namespace in _HTTP_CLIENT_LOGGER_NAMES
