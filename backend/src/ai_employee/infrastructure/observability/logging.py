@@ -20,6 +20,8 @@ _HTTP_CLIENT_MAKE_RECORD_MARKER: Final[object] = object()
 _HTTP_CLIENT_MAKE_RECORD_MARKER_ATTR: Final[str] = "_ai_employee_http_client_make_record_marker"
 _HTTP_CLIENT_HANDLE_MARKER: Final[object] = object()
 _HTTP_CLIENT_HANDLE_MARKER_ATTR: Final[str] = "_ai_employee_http_client_handle_marker"
+_HTTP_CLIENT_CALL_HANDLERS_MARKER: Final[object] = object()
+_HTTP_CLIENT_CALL_HANDLERS_MARKER_ATTR: Final[str] = "_ai_employee_http_client_call_handlers_marker"
 _HTTP_CLIENT_SAFE_RECORD_FIELDS: Final[frozenset[str]] = frozenset(
     {
         # logging.LogRecord 的标准字段保留文件位置、级别和线程维度，但不保留第三方
@@ -127,6 +129,27 @@ def _wrap_http_client_handle(delegate: Callable[..., None]) -> Callable[..., Non
     return wrapped
 
 
+def _wrap_http_client_call_handlers(delegate: Callable[..., None]) -> Callable[..., None]:
+    """包装宿主 ``Logger.callHandlers``，在 filter 后再次固定记录内容。"""
+
+    def wrapped(
+        logger: logging.Logger,
+        record: logging.LogRecord,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        """在 handler dispatch 前清理 logger filter 可能重新写入的字段。"""
+        scrubbed_record = _scrub_http_client_record(record)
+        delegate(logger, scrubbed_record, *args, **kwargs)
+
+    setattr(
+        wrapped,
+        _HTTP_CLIENT_CALL_HANDLERS_MARKER_ATTR,
+        _HTTP_CLIENT_CALL_HANDLERS_MARKER,
+    )
+    return wrapped
+
+
 def _wrap_http_client_make_record(
     delegate: Callable[..., logging.LogRecord],
 ) -> Callable[..., logging.LogRecord]:
@@ -148,17 +171,32 @@ def _wrap_http_client_make_record(
 def configure_http_client_logging() -> None:
     """安装 HTTPX/HTTPCore 记录级脱敏边界，且重复调用保持幂等。
 
-    该 helper 只包装当前 ``Logger.handle``、``Logger.makeRecord`` 与 ``LogRecordFactory``，
-    不删除宿主 handler、不修改 logger level 或 ``propagate``。handle 是最终记录边界，用于
-    覆盖已在旧 makeRecord 调用栈中的记录；makeRecord 覆盖标准库在 factory 返回后注入
-    ``extra`` 的时序；factory 则保护直接创建记录的路径。应用自己的 ``ai_employee.*``
-    logger 完全沿用原行为。
+    该 helper 只包装当前 ``Logger.callHandlers``、``Logger.handle``、``Logger.makeRecord``
+    与 ``LogRecordFactory``，不删除宿主 handler、不修改 logger level 或 ``propagate``。
+    callHandlers 是进入任意 handler 前的最终记录边界，用于覆盖 logger filter 重新写入的
+    字段以及已在旧 handle 调用栈中的记录；handle 覆盖已在旧 makeRecord 调用栈中的记录；
+    makeRecord 覆盖标准库在 factory 返回后注入 ``extra`` 的时序；factory 则保护直接创建
+    记录的路径。应用自己的 ``ai_employee.*`` logger 完全沿用原行为。
     """
-    # 三个全局入口必须在同一把锁下按 handle → makeRecord → factory 顺序安装：handle 先
-    # 覆盖已经进入旧 makeRecord 的 in-flight 调用，makeRecord 再覆盖 factory 之后的 extra
-    # 注入步骤，最后由 factory 保护直接创建记录的路径。记录创建本身无需持有该锁，减少
-    # OAuth 并发请求的额外争用。
+    # 四个全局入口必须在同一把锁下按 callHandlers → handle → makeRecord → factory 顺序
+    # 安装：callHandlers 在最终 dispatch 前再次清理 logger filter 的突变，并覆盖已经进入
+    # 旧 handle 的 in-flight 调用；handle 再覆盖已经进入旧 makeRecord 的调用；makeRecord
+    # 覆盖 factory 之后的 extra 注入步骤；最后由 factory 保护直接创建记录的路径。记录
+    # 创建本身无需持有该锁，减少 OAuth 并发请求的额外争用。
     with _HTTP_CLIENT_LOGGING_LOCK:
+        current_call_handlers = logging.Logger.callHandlers
+        if (
+            getattr(current_call_handlers, _HTTP_CLIENT_CALL_HANDLERS_MARKER_ATTR, None)
+            is not _HTTP_CLIENT_CALL_HANDLERS_MARKER
+        ):
+            # 通过类属性替换保留 Python descriptor 绑定语义；wrapper 不遍历 loggerDict，
+            # 因而未来新建子 logger、dictConfig、lastResort 与 in-flight 记录共享边界。
+            type.__setattr__(
+                logging.Logger,
+                "callHandlers",
+                _wrap_http_client_call_handlers(current_call_handlers),
+            )
+
         current_handle = logging.Logger.handle
         if (
             getattr(current_handle, _HTTP_CLIENT_HANDLE_MARKER_ATTR, None)
