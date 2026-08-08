@@ -276,12 +276,14 @@ def _prepare_unique_indexes() -> None:
             index_table, is_valid, is_unique, is_unpartial, index_columns = index
             if index_table != table_name:
                 raise RuntimeError(f"{constraint_name} belongs to an unexpected table")
+            if not bool(is_unique) or not bool(is_unpartial) or tuple(index_columns) != columns:
+                # 同名对象即使 invalid 也可能由其他部署或人工 DDL 创建。必须先证明它正是
+                # 本迁移声明的目标形状，才能把 DROP CONCURRENTLY 视为安全、精确的恢复动作。
+                raise RuntimeError(f"{constraint_name} has an unexpected index definition")
             if not bool(is_valid):
                 # failed CONCURRENTLY build leaves an invalid catalog row. Preserve the declared
                 # target columns so the same pass can rebuild the exact two/three-column index.
                 operations.append(("drop", constraint_name, columns))
-            elif not bool(is_unique) or not bool(is_unpartial) or tuple(index_columns) != columns:
-                raise RuntimeError(f"{constraint_name} has an unexpected index definition")
             else:
                 operations.append(("attach", constraint_name, columns))
         else:

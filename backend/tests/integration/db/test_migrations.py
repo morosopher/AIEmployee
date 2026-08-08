@@ -1597,6 +1597,94 @@ def test_mail_message_identity_contract_downgrades_without_row_loss(
     assert _email_identity_column_metadata(empty_migration_database) == {}
 
 
+def test_mail_message_identity_contract_preserves_wrong_shape_invalid_index(
+    empty_migration_database: URL,
+) -> None:
+    """同名 invalid 索引若不是精确目标形状，0017 必须保留对象并 fail closed。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def seed_wrong_shape_duplicate() -> None:
+        """制造相同 connection/folder、不同 provider ID，保持目标 identity 本身合法。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, connection_id, thread_id, provider_message_id, "
+                        "received_at, mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000226', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'00000000-0000-0000-0000-000000000212', "
+                        "'synthetic-wrong-shape-index-message', now(), 'mailbox', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic wrong shape row', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message/wrong-shape', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    async def create_wrong_shape_invalid_index() -> None:
+        """让错误列集合的并发唯一索引失败并留下 ``indisvalid=false`` catalog 行。"""
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_email_messages_connection_provider_message "
+                        "ON email_messages (connection_id, mailbox_scope_key)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_wrong_shape_duplicate())
+    with pytest.raises(IntegrityError):
+        asyncio.run(create_wrong_shape_invalid_index())
+    expected_index = {
+        "uq_email_messages_connection_provider_message": (
+            False,
+            True,
+            ("connection_id", "mailbox_scope_key"),
+        )
+    }
+    assert _email_identity_index_metadata(empty_migration_database) == expected_index
+
+    error_message: str | None = None
+    try:
+        command.upgrade(alembic_config, "20260808_0017")
+    except RuntimeError as error:
+        error_message = str(error)
+
+    assert (
+        error_message,
+        _alembic_revisions(empty_migration_database),
+        _email_identity_index_metadata(empty_migration_database),
+    ) == (
+        "uq_email_messages_connection_provider_message has an unexpected index definition",
+        {"20260808_0016"},
+        expected_index,
+    )
+
+
 def test_mail_message_identity_contract_rebuilds_only_named_invalid_index(
     empty_migration_database: URL,
 ) -> None:
