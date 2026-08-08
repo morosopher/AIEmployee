@@ -833,7 +833,12 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    unique/约束；0017 在短 metadata 事务外使用 `CREATE UNIQUE INDEX CONCURRENTLY`，再通过
    `USING INDEX`、`NOT VALID`/`VALIDATE` 复合 ownership FK 和 validated `NOT NULL` check 完成
    contract，最后才移除旧 unique。CONCURRENTLY 失败留下的 valid/invalid index 必须可安全探测、
-   清理和重跑，不得假设 Alembic 单事务包住该操作。
+   清理和重跑，不得假设 Alembic 单事务包住该操作。上线顺序固定为：先应用仍兼容旧应用实例的
+   0016 nullable expand；再部署同时兼容 0016 与 0017、始终双写 `connection_id` 和
+   `provider_updated_at` 的 Repository；排空全部旧应用实例后才应用 0017。0017 必须先以与
+   0016 相同的有界 autocommit 批处理追赶旧实例在部署窗口留下的 `connection_id IS NULL` 行，
+   然后才能执行 preflight、并发索引和 contract，并在最后移除旧 unique。供应商网络 I/O 在
+   整个部署窗口内仍位于数据库事务之外。
 2. 只增加新表、新列、新索引和新状态值；不删除业务行，不依赖破坏性 downgrade。
 3. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
 4. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式

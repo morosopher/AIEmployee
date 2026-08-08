@@ -1544,7 +1544,14 @@ The mail identity migration is deliberately split into an online expand/contract
 columns and fail-closed backfill while retaining legacy constraints; 0017 creates concurrent unique indexes,
 composite ownership foreign keys, validated checks/NOT NULL, and only then removes legacy uniqueness. Test
 fresh 0015-to-head and already-applied 0016 databases, downgrade row preservation, and rerunnable
-valid/invalid concurrent-index paths.
+valid/invalid concurrent-index paths. Deploy this pair in a fixed order: apply 0016 first because its nullable
+expand remains compatible with old application instances; deploy a dual-write repository that runs on both
+0016 and 0017; drain every old instance; then apply 0017. Before preflight or concurrent-index work, 0017 must
+rerun the bounded autocommit catch-up so rows written with `connection_id IS NULL` by old instances during the
+0016 window are filled before contract. The repository must also tolerate the valid intermediate state where
+the new concurrent index exists but has not yet been attached with `USING INDEX`, while invalid or wrong-shape
+catalog objects remain fail-closed. Provider network I/O stays outside database transactions throughout this
+deployment sequence.
 
 - [ ] **Step 5: Run Microsoft mail and provider-neutral regressions**
 
