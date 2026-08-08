@@ -603,7 +603,7 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
         emitter.start()
         assert make_record_entered.wait(timeout=5)
 
-        # 线程 A 暂停在旧 makeRecord 内；线程 B 完成新的四层安装后再放行线程 A。
+        # 线程 A 暂停在旧 makeRecord 内；线程 B 完成新的五层安装后再放行线程 A。
         configure_http_client_logging()
         release_make_record.set()
         assert handler.emitted.wait(timeout=5)
@@ -1492,7 +1492,7 @@ def test_http_client_logging_preserves_provenance_for_in_flight_old_call_handler
         recording_handler.addFilter(mutate_handler_record)
 
         def emit_in_flight() -> None:
-            """在线程 A 中创建已由 factory/makeRecord 清理、但尚未登记 provenance 的记录。"""
+            """在线程 A 中创建由 factory/makeRecord 清理并登记 provenance 的在途记录。"""
             logger.warning(
                 "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
                 "access_token=synthetic-in-flight-call-handlers-token",
