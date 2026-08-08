@@ -1,8 +1,8 @@
 """提供 Microsoft 测试模式的离线 OAuth 适配器。
 
 该模块只返回合成 token、账户和授权 URL，不导入或创建 HTTP 客户端。真实的
-``MicrosoftOAuthAdapter`` 仅由非测试组合根或显式 ``app.state.oauth_adapters`` 注入，
-避免 ``APP_TEST_MODE`` 因配置缺失而意外访问 Microsoft。
+``MicrosoftOAuthAdapter`` 仅由关闭 ``APP_TEST_MODE`` 的组合根装配或显式注入；测试模式
+组合根无条件覆盖两个供应商为内置 fake，避免外部 mapping 因误配访问 Google/Microsoft。
 """
 
 from __future__ import annotations

@@ -410,11 +410,11 @@ def get_create_task_use_case(request: Request):
 def get_connections_use_case(request: Request):
     """在组合边界构造固定 adapter mapping 的供应商中立连接用例。
 
-    集成测试可在 ``app.state.oauth_adapters`` 一次性放入 fake mapping；普通运行时装配
-    Task 9 的 ``GoogleOAuthAdapter`` 与 Task 10 的 ``MicrosoftOAuthAdapter``，而
-    ``APP_TEST_MODE`` 始终覆盖 Microsoft 条目为绝不联网的合成 fake。mapping 会由用例
-    复制冻结，没有运行时注册或替换入口。真实 client secret 仍只在非测试模式从 Secret
-    文件读取。
+    非 ``APP_TEST_MODE`` 的契约/集成测试可在 ``app.state.oauth_adapters`` 一次性放入
+    受 HTTP mock 保护的 mapping；普通运行时装配 Task 9 的 ``GoogleOAuthAdapter`` 与
+    Task 10 的 ``MicrosoftOAuthAdapter``。``APP_TEST_MODE`` 的优先级最高，会完全忽略
+    外部 mapping，并为两个供应商固定装配绝不联网的合成 fake。mapping 会由用例复制冻结，
+    没有运行时注册或替换入口。真实 client secret 仍只在非测试模式从 Secret 文件读取。
     """
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.infrastructure.security.encryption import AeadCipher
@@ -423,33 +423,27 @@ def get_connections_use_case(request: Request):
     cipher = AeadCipher.from_file(settings.app_master_key_file)
     injected = getattr(request.app.state, "oauth_adapters", None)
     if settings.app_test_mode:
-        # APP_TEST_MODE 是不可绕过的供应商隔离边界：即使组合根显式注入 mapping，也
-        # 不能让其中的真实 Microsoft adapter 进入 callback/refresh。保留注入的其他
-        # fake 便于测试替换 Google；Microsoft 始终由本分支覆盖为内置离线 fake。
+        # APP_TEST_MODE 是优先于 app.state 注入的不可绕过隔离边界。这里不尝试通过
+        # 鸭子类型或调用方声明判断 adapter 是否安全，而是完全丢弃外部 mapping，避免
+        # 真实 Google/Microsoft adapter 经 exchange、callback、refresh 接触网络。
         from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
         from ai_employee.integrations.microsoft.fake import FakeMicrosoftOAuthAdapter
 
-        adapters = (
-            dict(cast(Mapping[str, OAuthProviderAdapter], injected))
-            if injected is not None
-            else {}
-        )
         oauth: _LegacyGoogleOAuthClient = FakeGoogleOAuthClient()
-        adapters.setdefault(
-            OAuthProvider.GOOGLE.value,
-            _GoogleOAuthAdapterCompat(
+        adapters: dict[str, OAuthProviderAdapter] = {
+            OAuthProvider.GOOGLE.value: _GoogleOAuthAdapterCompat(
                 oauth,
                 client_id=settings.google_client_id,
                 redirect_uri=settings.google_redirect_uri,
             ),
-        )
-        adapters[OAuthProvider.MICROSOFT.value] = FakeMicrosoftOAuthAdapter(
-            client_id=settings.microsoft_client_id or "test-mode-microsoft-client",
-            redirect_uri=(
-                settings.microsoft_redirect_uri
-                or "https://app.example.test/api/v1/connections/microsoft/callback"
+            OAuthProvider.MICROSOFT.value: FakeMicrosoftOAuthAdapter(
+                client_id=settings.microsoft_client_id or "test-mode-microsoft-client",
+                redirect_uri=(
+                    settings.microsoft_redirect_uri
+                    or "https://app.example.test/api/v1/connections/microsoft/callback"
+                ),
             ),
-        )
+        }
     elif injected is not None:
         adapters = dict(cast(Mapping[str, OAuthProviderAdapter], injected))
     else:

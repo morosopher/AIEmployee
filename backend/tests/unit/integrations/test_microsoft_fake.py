@@ -13,11 +13,13 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
-from ai_employee.api.deps import get_connections_use_case
+from ai_employee.api.deps import _GoogleOAuthAdapterCompat, get_connections_use_case
 from ai_employee.application.ports.oauth import OAuthAuthorizationRequest
 from ai_employee.application.use_cases.connections import ConsumedOAuthAttempt
 from ai_employee.config import get_settings
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
+from ai_employee.integrations.google.oauth import GoogleOAuthAdapter
 from ai_employee.integrations.microsoft.fake import FakeMicrosoftOAuthAdapter
 from ai_employee.integrations.microsoft.oauth import (
     MICROSOFT_BASE_SCOPES,
@@ -127,11 +129,11 @@ async def test_fake_microsoft_oauth_exchange_refresh_and_account_are_offline() -
 
 
 @pytest.mark.asyncio
-async def test_app_test_mode_composes_fake_microsoft_adapter_without_http(
+async def test_app_test_mode_composes_fake_oauth_adapters_without_http(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """APP_TEST_MODE 组合根必须装配 fake，callback/refresh 不得创建真实 HTTP。"""
+    """APP_TEST_MODE 默认组合根必须为两个供应商固定装配离线 fake。"""
     master_key = tmp_path / "master-key"
     master_key.write_text(
         "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
@@ -153,23 +155,78 @@ async def test_app_test_mode_composes_fake_microsoft_adapter_without_http(
     monkeypatch.setattr(httpx, "AsyncClient", NoHttpClient)
     try:
         use_case = get_connections_use_case(SimpleNamespace(app=app))
-        adapter = use_case._adapters["microsoft"]
-        assert isinstance(adapter, FakeMicrosoftOAuthAdapter)
-        exchanged = await adapter.exchange_code(code="ignored", verifier="ignored")
-        refreshed = await adapter.refresh("ignored-refresh")
-        assert exchanged.access_token == "fake-microsoft-access"
-        assert refreshed.access_token == "fake-microsoft-refreshed-access"
+        google_adapter = use_case._adapters["google"]
+        microsoft_adapter = use_case._adapters["microsoft"]
+        assert isinstance(google_adapter, _GoogleOAuthAdapterCompat)
+        assert isinstance(google_adapter._client, FakeGoogleOAuthClient)
+        assert isinstance(microsoft_adapter, FakeMicrosoftOAuthAdapter)
+
+        google_exchanged = await google_adapter.exchange_code(
+            code="ignored-google",
+            verifier="ignored-google",
+        )
+        google_refreshed = await google_adapter.refresh("ignored-google-refresh")
+        microsoft_exchanged = await microsoft_adapter.exchange_code(
+            code="ignored-microsoft",
+            verifier="ignored-microsoft",
+        )
+        microsoft_refreshed = await microsoft_adapter.refresh(
+            "ignored-microsoft-refresh"
+        )
+        assert google_exchanged.access_token == "fake-access"
+        assert google_refreshed.access_token == "fake-reconnected-access"
+        assert microsoft_exchanged.access_token == "fake-microsoft-access"
+        assert microsoft_refreshed.access_token == "fake-microsoft-refreshed-access"
     finally:
         await app.state.auth_session_factory.dispose()
         get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
-async def test_app_test_mode_replaces_injected_real_microsoft_adapter(
+async def test_non_test_mode_preserves_explicit_oauth_adapter_injection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """测试模式即使显式注入真实 adapter，也必须替换为 fake 后再执行 callback/refresh。"""
+    """关闭 APP_TEST_MODE 后仍允许契约测试注入受 HTTP mock 保护的真实 adapter。"""
+    master_key = tmp_path / "master-key"
+    master_key.write_text(
+        "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("APP_TEST_MODE", "false")
+    monkeypatch.setenv("APP_MASTER_KEY_FILE", str(master_key))
+    get_settings.cache_clear()
+    app = create_app()
+    google_adapter = GoogleOAuthAdapter(
+        "synthetic-real-google-client",
+        "synthetic-real-google-secret",
+        "https://app.example.test/google/callback",
+    )
+    microsoft_adapter = MicrosoftOAuthAdapter(
+        "synthetic-real-microsoft-client",
+        "synthetic-real-microsoft-secret",
+        "https://app.example.test/microsoft/callback",
+    )
+    app.state.oauth_adapters = {
+        "google": google_adapter,
+        "microsoft": microsoft_adapter,
+    }
+    try:
+        use_case = get_connections_use_case(SimpleNamespace(app=app))
+        assert use_case._adapters["google"] is google_adapter
+        assert use_case._adapters["microsoft"] is microsoft_adapter
+    finally:
+        await app.state.auth_session_factory.dispose()
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_app_test_mode_replaces_injected_real_oauth_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """测试模式必须同时替换注入的真实 Google/Microsoft adapter。"""
     master_key = tmp_path / "master-key"
     master_key.write_text(
         "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
@@ -181,6 +238,11 @@ async def test_app_test_mode_replaces_injected_real_microsoft_adapter(
     get_settings.cache_clear()
     app = create_app()
     app.state.oauth_adapters = {
+        "google": GoogleOAuthAdapter(
+            "synthetic-real-google-client",
+            "synthetic-real-google-secret",
+            "https://app.example.test/google/callback",
+        ),
         "microsoft": MicrosoftOAuthAdapter(
             "synthetic-real-client",
             "synthetic-real-secret",
@@ -198,23 +260,41 @@ async def test_app_test_mode_replaces_injected_real_microsoft_adapter(
     monkeypatch.setattr(httpx, "AsyncClient", NoHttpClient)
     try:
         use_case = get_connections_use_case(SimpleNamespace(app=app))
-        adapter = use_case._adapters["microsoft"]
-        assert isinstance(adapter, FakeMicrosoftOAuthAdapter)
-        exchanged = await adapter.exchange_code(code="ignored", verifier="ignored")
-        refreshed = await adapter.refresh("ignored-refresh")
-        assert exchanged.access_token == "fake-microsoft-access"
-        assert refreshed.access_token == "fake-microsoft-refreshed-access"
+        google_adapter = use_case._adapters["google"]
+        microsoft_adapter = use_case._adapters["microsoft"]
+        assert isinstance(google_adapter, _GoogleOAuthAdapterCompat)
+        assert isinstance(google_adapter._client, FakeGoogleOAuthClient)
+        assert isinstance(microsoft_adapter, FakeMicrosoftOAuthAdapter)
+
+        google_exchanged = await google_adapter.exchange_code(
+            code="ignored-google",
+            verifier="ignored-google",
+        )
+        google_refreshed = await google_adapter.refresh("ignored-google-refresh")
+        microsoft_exchanged = await microsoft_adapter.exchange_code(
+            code="ignored-microsoft",
+            verifier="ignored-microsoft",
+        )
+        microsoft_refreshed = await microsoft_adapter.refresh(
+            "ignored-microsoft-refresh"
+        )
+        assert google_exchanged.access_token == "fake-access"
+        assert google_refreshed.access_token == "fake-reconnected-access"
+        assert microsoft_exchanged.access_token == "fake-microsoft-access"
+        assert microsoft_refreshed.access_token == "fake-microsoft-refreshed-access"
     finally:
         await app.state.auth_session_factory.dispose()
         get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
-async def test_test_mode_callback_with_injected_real_adapter_stays_offline(
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+async def test_test_mode_callback_with_injected_real_adapters_stays_offline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    provider: str,
 ) -> None:
-    """完整 ConnectionsUseCase callback 在 test mode 下也不能触发真实 Microsoft HTTP。"""
+    """完整 callback 对两个供应商都必须越过注入值并保持离线。"""
     master_key = tmp_path / "master-key"
     master_key.write_text(
         "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",
@@ -226,6 +306,11 @@ async def test_test_mode_callback_with_injected_real_adapter_stays_offline(
     get_settings.cache_clear()
     app = create_app()
     app.state.oauth_adapters = {
+        "google": GoogleOAuthAdapter(
+            "synthetic-real-google-client",
+            "synthetic-real-google-secret",
+            "https://app.example.test/google/callback",
+        ),
         "microsoft": MicrosoftOAuthAdapter(
             "synthetic-real-client",
             "synthetic-real-secret",
@@ -253,7 +338,7 @@ async def test_test_mode_callback_with_injected_real_adapter_stays_offline(
             attempt=ConsumedOAuthAttempt(
                 id=attempt_id,
                 user_id=user_id,
-                provider="microsoft",
+                provider=provider,
                 requested_capabilities=frozenset({ConnectionCapability.MAIL_READ}),
                 verifier=encrypted_verifier,
                 oidc_nonce_hash=None,
