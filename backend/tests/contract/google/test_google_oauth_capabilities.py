@@ -714,6 +714,183 @@ def test_http_client_logging_scrubs_filter_mutation_before_dispatch() -> None:
             manager.loggerDict[logger_name] = logger_entry
 
 
+def test_http_client_logging_scrubs_filter_name_mutation_before_dispatch() -> None:
+    """HTTP logger filter 改写记录 name 后，最终 dispatch 仍必须固定安全事件。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获最终记录，验证改名不会绕过安全边界。"""
+
+        def __init__(self) -> None:
+            """初始化消息、名称和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.names: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.names.append(record.name)
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "httpx.filter_name_mutation_race"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    handler = RecordingHandler()
+
+    def mutate_record(record: logging.LogRecord) -> bool:
+        """模拟 filter 同时改名并重新写入供应商原文。"""
+        record.name = "ai_employee.filter_name_mutation_alias"
+        record.msg = (
+            "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
+            "access_token=synthetic-name-mutation-token"
+        )
+        record.args = ()
+        record.authorization = "Bearer synthetic-name-mutation-extra-secret"
+        record.opaque = "synthetic-name-mutation-extra-token"
+        return True
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        logger.addFilter(mutate_record)
+        configure_http_client_logging()
+        logger.warning("safe-before-name-mutation", extra={"opaque": "synthetic-original"})
+
+        assert handler.messages == ["http_client_event"]
+        assert handler.names == ["ai_employee.filter_name_mutation_alias"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-name-mutation-token",
+                "synthetic-name-mutation-extra-secret",
+                "synthetic-name-mutation-extra-token",
+                "synthetic-original",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() -> None:
+    """HTTP logger filter 返回 replacement 记录后，最终 dispatch 仍必须清理敏感字段。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获 replacement 记录，验证标准 filter 返回语义仍被保留。"""
+
+        def __init__(self) -> None:
+            """初始化消息、名称和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.names: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler 实际接收的 replacement 记录。"""
+            self.messages.append(record.getMessage())
+            self.names.append(record.name)
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "httpx.filter_replacement_race"
+    replacement_name = "ai_employee.filter_replacement_alias"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    handler = RecordingHandler()
+
+    def replace_record(_record: logging.LogRecord) -> logging.LogRecord:
+        """模拟 logger filter 返回带有敏感内容的全新记录。"""
+        replacement = logging.LogRecord(
+            replacement_name,
+            logging.WARNING,
+            __file__,
+            1,
+            "HTTP Request: GET %s Authorization: %s",
+            (
+                "https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-replacement-token",
+                "Bearer synthetic-replacement-secret",
+            ),
+            None,
+        )
+        replacement.opaque = "synthetic-replacement-extra-token"
+        return replacement
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        logger.addFilter(replace_record)
+        configure_http_client_logging()
+        logger.warning("safe-before-replacement")
+
+        assert handler.messages == ["http_client_event"]
+        assert handler.names == [replacement_name]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-replacement-token",
+                "synthetic-replacement-secret",
+                "synthetic-replacement-extra-token",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
 def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> None:
     """旧 handle 已在途时，恢复后直接 callHandlers 的记录也必须被清理。"""
 

@@ -68,11 +68,19 @@ def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
     ``Logger.makeRecord`` 会在全局 ``LogRecordFactory`` 返回后再把 ``extra`` 写入
     ``record.__dict__``。因此仅包装 factory 不能覆盖 ``extra`` 中的 Authorization、URL
     或 token；配置 helper 还会包装 ``Logger.makeRecord``，在该注入步骤完成后再次调用本
-    函数。未知字段会被删除；需要固定占位符的宿主 formatter 可通过
-    ``logging.Formatter.defaults`` 提供安全默认值。
+    函数。该入口根据记录创建时的 ``record.name`` 判断来源；经过 logger filter 后若记录
+    被改名，应改用 ``_scrub_http_client_record_from_logger``，以免把可变字段当作可信来源。
+    未知字段会被删除；需要固定占位符的宿主 formatter 可通过 ``logging.Formatter.defaults``
+    提供安全默认值。
     """
     if not _is_http_client_logger(record.name):
         return record
+
+    return _scrub_http_client_record_fields(record)
+
+
+def _scrub_http_client_record_fields(record: logging.LogRecord) -> logging.LogRecord:
+    """执行已确认属于 HTTP 客户端记录的字段收窄，不再次读取可变来源字段。"""
 
     # 只保留稳定事件名；args、异常和 stack_info 可能分别携带 URL、Header、Cookie 或
     # 供应商响应，必须在记录进入任何 logger/handler 前一起清空。
@@ -91,6 +99,22 @@ def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
         if key not in _HTTP_CLIENT_SAFE_RECORD_FIELDS:
             del attributes[key]
     return record
+
+
+def _scrub_http_client_record_from_logger(
+    logger: logging.Logger,
+    record: logging.LogRecord,
+) -> logging.LogRecord:
+    """以调用方 logger.name 作为可信来源，清理 filter 返回或改名后的记录。
+
+    ``Logger.filter`` 可以原地改写 ``LogRecord.name``，也可以返回全新的记录；这两个字段
+    都不再代表最初的 HTTPX/HTTPCore 调用方。``Logger.callHandlers`` 收到的 ``logger``
+    是真实调用方对象，因此只在其名称属于 HTTP 客户端命名空间时强制执行字段收窄；应用
+    logger 即使处理一个名称看似 ``httpx`` 的自定义记录，也保持原有行为。
+    """
+    if not _is_http_client_logger(logger.name):
+        return record
+    return _scrub_http_client_record_fields(record)
 
 
 class _HttpClientLogRecordFactory:
@@ -139,7 +163,7 @@ def _wrap_http_client_call_handlers(delegate: Callable[..., None]) -> Callable[.
         **kwargs: object,
     ) -> None:
         """在 handler dispatch 前清理 logger filter 可能重新写入的字段。"""
-        scrubbed_record = _scrub_http_client_record(record)
+        scrubbed_record = _scrub_http_client_record_from_logger(logger, record)
         delegate(logger, scrubbed_record, *args, **kwargs)
 
     setattr(
