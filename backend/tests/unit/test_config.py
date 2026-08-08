@@ -117,6 +117,53 @@ def test_write_allowlist_matches_only_the_exact_provider_identity_key() -> None:
     assert settings.write_account_allowed("synthetic-account@example.test") is False
 
 
+def test_write_allowlist_accepts_canonical_microsoft_identity_and_rejects_four_segments() -> None:
+    """Microsoft 白名单只接受去重 tenant 后的三段键，并继续执行精确匹配。"""
+    identity_key = "microsoft:synthetic-tenant:synthetic-graph-account"
+    settings = Settings(
+        _env_file=None,
+        app_env="staging",
+        external_writes_enabled=True,
+        microsoft_writes_enabled=True,
+        write_test_account_allowlist=[identity_key],
+    )
+
+    assert settings.write_account_allowed(identity_key) is True
+    other_identity_key = "microsoft:synthetic-tenant:another-synthetic-graph-account"
+    assert settings.write_account_allowed(other_identity_key) is False
+    with pytest.raises(ValueError, match="WRITE_TEST_ACCOUNT_ALLOWLIST"):
+        Settings(
+            _env_file=None,
+            app_env="staging",
+            external_writes_enabled=True,
+            microsoft_writes_enabled=True,
+            write_test_account_allowlist=[
+                "microsoft:synthetic-tenant:synthetic-tenant:synthetic-graph-account"
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "identity_key",
+    (
+        "microsoft:synthetic-tenant:synthetic graph account",
+        "google::synthetic\taccount",
+        "google::synthetic\x00account",
+    ),
+)
+def test_write_allowlist_rejects_identity_whitespace_and_controls_without_echoing(
+    identity_key: str,
+) -> None:
+    """配置复用领域 parser，拒绝旧宽松校验会接受的内部空白和控制字符。"""
+    with pytest.raises(ValueError, match="WRITE_TEST_ACCOUNT_ALLOWLIST") as exc_info:
+        Settings(
+            _env_file=None,
+            write_test_account_allowlist=[identity_key],
+        )
+
+    assert identity_key not in str(exc_info.value)
+
+
 def test_write_allowlist_rejects_account_email_entries() -> None:
     """配置拒绝邮箱条目且不回显身份，避免可变地址或连接标识进入异常输出。"""
     rejected_identity = "synthetic-account@example.test"
@@ -200,3 +247,21 @@ def test_production_empty_allowlist_allows_accounts_but_non_empty_list_still_res
     assert unrestricted.write_account_allowed("google::synthetic-account") is True
     assert restricted.write_account_allowed("google::synthetic-account") is True
     assert restricted.write_account_allowed("google::another-account") is False
+
+
+@pytest.mark.parametrize(
+    "identity_key",
+    (
+        "unknown::synthetic-account",
+        "google::synthetic-account@example.test",
+        "microsoft:tenant:tenant:graph-account",
+        "microsoft:tenant:graph account",
+    ),
+)
+def test_production_empty_allowlist_rejects_noncanonical_identity_candidates(
+    identity_key: str,
+) -> None:
+    """生产空白名单也只放行可由同一 parser 验证的规范身份候选。"""
+    settings = Settings(_env_file=None, app_env="production")
+
+    assert settings.write_account_allowed(identity_key) is False

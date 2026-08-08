@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ai_employee.domain.connections import parse_provider_identity_key
 from ai_employee.domain.identity import MAX_SESSION_TTL_SECONDS, MIN_SESSION_TTL_SECONDS
 
 
@@ -137,18 +138,12 @@ class Settings(BaseSettings):
             ValueError: 任一条目不是支持供应商的规范化稳定身份键时抛出。
         """
         for provider_identity_key in value:
-            parts = provider_identity_key.split(":")
-            if (
-                len(parts) != 3
-                or parts[0] not in {"google", "microsoft"}
-                or not parts[2]
-                or any(part != part.strip() for part in parts)
-                or (parts[0] == "microsoft" and not parts[1])
-                or "@" in provider_identity_key
-            ):
+            try:
+                parse_provider_identity_key(provider_identity_key)
+            except (TypeError, ValueError):
                 raise ValueError(
                     "WRITE_TEST_ACCOUNT_ALLOWLIST entries must use normalized provider identity keys"
-                )
+                ) from None
         return value
 
     @model_validator(mode="after")
@@ -211,9 +206,16 @@ class Settings(BaseSettings):
                 ``provider:provider_tenant_id:provider_account_id``。
 
         Returns:
-            白名单非空时仅返回精确成员匹配结果；白名单为空时仅生产环境返回
-            ``True``。调用方仍须独立验证全局、供应商、连接能力与精确人工审批。
+            输入不是规范化身份键时始终返回 ``False``；身份键通过 parser 后，白名单非空
+            时仅返回精确成员匹配结果，白名单为空时仅生产环境返回 ``True``。调用方仍须
+            独立验证全局、供应商、连接能力与精确人工审批。
         """
+        # 即使生产环境省略额外 allowlist，也不能让格式异常的候选绕过身份边界；复用同一
+        # parser 可保证候选与配置条目拥有完全相同的 provider/tenant/account 约束。
+        try:
+            parse_provider_identity_key(provider_identity_key)
+        except (TypeError, ValueError):
+            return False
         if self.write_test_account_allowlist:
             return provider_identity_key in self.write_test_account_allowlist
         return self.app_env == "production"

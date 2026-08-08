@@ -5,6 +5,7 @@ from collections.abc import Set as AbstractSet
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
+from unicodedata import category
 
 from ai_employee.domain.errors import StateConflictError
 
@@ -30,6 +31,110 @@ class ConnectionCapability(StrEnum):
     MAIL_SEND = "mail.send"
     CALENDAR_READ = "calendar.read"
     CALENDAR_WRITE = "calendar.write"
+
+
+_SUPPORTED_PROVIDER_IDENTITY_PROVIDERS: Final[frozenset[str]] = frozenset({"google", "microsoft"})
+_PROVIDER_IDENTITY_ERROR: Final[str] = "provider identity key is invalid"
+
+
+def _is_safe_provider_identity_part(value: object, *, allow_empty: bool = False) -> bool:
+    """验证身份键单段文本，不对不可信供应商值执行静默清理。"""
+    if type(value) is not str:
+        return False
+    if value == "":
+        return allow_empty
+    if value != value.strip():
+        return False
+    if any(char.isspace() or category(char).startswith("C") for char in value):
+        return False
+    # ``:`` 是三段键的结构分隔符，``@`` 保留为邮箱拒绝边界；二者都不能由
+    # 供应商身份字段携带，否则 allowlist 可能把可变显示标识或歧义键当成稳定身份。
+    return ":" not in value and "@" not in value
+
+
+def canonical_provider_identity_key(
+    provider: str,
+    provider_tenant_id: str,
+    provider_account_id: str,
+) -> str:
+    """生成严格三段的供应商连接身份键，并核对 Microsoft tenant 绑定。
+
+    Args:
+        provider: 小写的固定供应商名称，当前仅支持 ``google`` 与 ``microsoft``。
+        provider_tenant_id: 连接记录中的供应商租户标识；Google 必须是精确空串。
+        provider_account_id: 连接记录中的稳定账户 ID。Microsoft 现有持久化格式为
+            ``<tenant>:<graph_user_id>``，Google 则是单段 subject。
+
+    Returns:
+        供 Trusted Action 账户 allowlist 与 claim 共同使用的
+        ``provider:provider_tenant_id:provider_account_id`` 键。Microsoft 输出只把
+        tenant 放在外层一次，即 ``microsoft:<tenant>:<graph_user_id>``。
+
+    Raises:
+        ValueError: 输入类型、供应商、空 tenant、分隔符或 Microsoft 内嵌 tenant
+            绑定任一不满足严格边界时抛出固定错误，不回显原始身份值。
+    """
+    if (
+        type(provider) is not str
+        or provider not in _SUPPORTED_PROVIDER_IDENTITY_PROVIDERS
+        or not _is_safe_provider_identity_part(provider)
+    ):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+
+    if provider == "google":
+        if (
+            type(provider_tenant_id) is not str
+            or provider_tenant_id != ""
+            or not _is_safe_provider_identity_part(provider_account_id)
+        ):
+            raise ValueError(_PROVIDER_IDENTITY_ERROR)
+        return f"google::{provider_account_id}"
+
+    if not _is_safe_provider_identity_part(provider_tenant_id):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    if type(provider_account_id) is not str or provider_account_id.count(":") != 1:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    embedded_tenant, graph_user_id = provider_account_id.split(":", 1)
+    if (
+        embedded_tenant != provider_tenant_id
+        or not _is_safe_provider_identity_part(embedded_tenant)
+        or not _is_safe_provider_identity_part(graph_user_id)
+    ):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    return f"microsoft:{provider_tenant_id}:{graph_user_id}"
+
+
+def parse_provider_identity_key(value: str) -> tuple[str, str, str]:
+    """验证 allowlist 中的三段键，并还原连接字段的既有持久化表示。
+
+    Args:
+        value: 预期为 ``provider:tenant:account`` 的完整键；该值不会被 trim 或
+            以宽松 split 规则静默修复。
+
+    Returns:
+        ``(provider, provider_tenant_id, provider_account_id)``，其中 Microsoft 的
+        第三项恢复为现有 ``tenant:graph_user_id`` 数据库字段，Google 保持 subject。
+
+    Raises:
+        ValueError: 键不是精确三段格式，或无法通过
+            :func:`canonical_provider_identity_key` 的供应商绑定校验。
+    """
+    if type(value) is not str:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    provider, tenant, account_segment = parts
+    stored_account_id = (
+        f"{tenant}:{account_segment}" if provider == "microsoft" else account_segment
+    )
+    try:
+        canonical = canonical_provider_identity_key(provider, tenant, stored_account_id)
+    except (TypeError, ValueError):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR) from None
+    if canonical != value:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    return provider, tenant, stored_account_id
 
 
 class CapabilityStatus(StrEnum):
