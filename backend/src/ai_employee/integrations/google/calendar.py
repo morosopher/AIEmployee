@@ -1,6 +1,7 @@
 """实现 Google Calendar 目录、分日历事件读取与严格错误分类。"""
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from urllib.parse import quote
@@ -15,7 +16,11 @@ from ai_employee.application.ports.calendar import (
     CalendarSyncPage,
     ProviderCalendar,
 )
-from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
+from ai_employee.domain.errors import (
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 
 GOOGLE_CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 GOOGLE_CALENDAR_EVENTS_BASE_URL = "https://www.googleapis.com/calendar/v3/calendars"
@@ -24,6 +29,15 @@ CALENDAR_EVENTS_URL = f"{GOOGLE_CALENDAR_EVENTS_BASE_URL}/primary/events"
 
 _RefreshAccessToken = Callable[[], Awaitable[str]]
 _MarkExpired = Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedCalendarPage:
+    """保存已验证的 Google Calendar 分页结构，避免原始 JSON 渗透到规范化流程。"""
+
+    items: tuple[dict[str, object], ...]
+    next_page_token: str | None
+    next_cursor: str | None
 
 
 class GoogleCalendarAdapter:
@@ -64,7 +78,7 @@ class GoogleCalendarAdapter:
             if page_token is not None:
                 values["pageToken"] = page_token
             try:
-                payload = self._record(
+                page = self._parse_page(
                     await self.execute_request(values, url=GOOGLE_CALENDAR_LIST_URL)
                 )
             except httpx.HTTPStatusError as error:
@@ -72,17 +86,12 @@ class GoogleCalendarAdapter:
                     # 目录游标失效只影响目录发现；事件游标由应用层按 calendar ID 独立保留。
                     raise CalendarCursorExpiredError("google", "directory") from error
                 raise
-            page_token = self._optional_string(payload.get("nextPageToken"))
-            items = payload.get("items")
-            calendars = (
-                tuple(self._normalize_calendar(item) for item in items if isinstance(item, dict))
-                if isinstance(items, list)
-                else ()
-            )
+            page_token = page.next_page_token
+            calendars = tuple(self._normalize_calendar(item) for item in page.items)
             yield CalendarDirectoryPage(
                 calendars=calendars,
                 next_page_token=page_token,
-                next_cursor=self._optional_string(payload.get("nextSyncToken")),
+                next_cursor=page.next_cursor,
             )
             if page_token is None:
                 return
@@ -155,26 +164,17 @@ class GoogleCalendarAdapter:
             if page_token is not None:
                 values["pageToken"] = page_token
             try:
-                payload = self._record(await self.execute_request(values, url=url))
+                page = self._parse_page(await self.execute_request(values, url=url))
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 410 and expired_scope is not None:
                     raise CalendarCursorExpiredError("google", expired_scope) from error
                 raise
-            page_token = self._optional_string(payload.get("nextPageToken"))
-            items = payload.get("items")
-            events = (
-                tuple(
-                    self._normalize(item, calendar_id=calendar_id)
-                    for item in items
-                    if isinstance(item, dict)
-                )
-                if isinstance(items, list)
-                else ()
-            )
+            page_token = page.next_page_token
+            events = tuple(self._normalize(item, calendar_id=calendar_id) for item in page.items)
             yield CalendarSyncPage(
                 events,
                 page_token,
-                self._optional_string(payload.get("nextSyncToken")),
+                page.next_cursor,
             )
             if page_token is None:
                 return
@@ -420,6 +420,53 @@ class GoogleCalendarAdapter:
     def _optional_string(value: object) -> str | None:
         """将第三方任意值收窄为可选字符串。"""
         return value if isinstance(value, str) else None
+
+    @classmethod
+    def _parse_page(cls, value: object) -> _ParsedCalendarPage:
+        """严格验证集合页的 items 与两个 opaque 游标字段。
+
+        字段缺失符合 Google 最终页或空页协议；字段一旦存在，就必须保持供应商文档定义的
+        非空字符串或对象数组类型。静默丢弃畸形项会把供应商响应错误伪装成删除或同步完成，
+        因此统一抛出不可自动重试且不携带原始响应的稳定错误。
+
+        Args:
+            value: ``response.json()`` 返回的未受信任对象。
+
+        Returns:
+            已复制为不可变容器的分页结构。
+
+        Raises:
+            PermanentProviderError: 根对象、items 或游标字段不符合协议。
+        """
+        if not isinstance(value, dict):
+            raise cls._invalid_response()
+
+        raw_items = value.get("items", [])
+        if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+            raise cls._invalid_response()
+        return _ParsedCalendarPage(
+            items=tuple(raw_items),
+            next_page_token=cls._page_string(value, "nextPageToken"),
+            next_cursor=cls._page_string(value, "nextSyncToken"),
+        )
+
+    @classmethod
+    def _page_string(cls, payload: dict[str, object], key: str) -> str | None:
+        """读取可缺失但一旦存在就必须为非空字符串的分页字段。"""
+        if key not in payload:
+            return None
+        value = payload[key]
+        if not isinstance(value, str) or value == "":
+            raise cls._invalid_response()
+        return value
+
+    @staticmethod
+    def _invalid_response() -> PermanentProviderError:
+        """创建不含字段值、Token 或正文的 Google Calendar 永久解析错误。"""
+        return PermanentProviderError(
+            error_code="google_calendar_response_invalid",
+            message="Google Calendar response is invalid",
+        )
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> int | None:

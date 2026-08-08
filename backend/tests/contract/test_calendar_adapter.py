@@ -13,6 +13,7 @@ from ai_employee.application.ports.calendar import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.domain.errors import PermanentProviderError
 from ai_employee.integrations.google.calendar import (
     GOOGLE_CALENDAR_LIST_URL,
     CalendarAdapter,
@@ -91,6 +92,46 @@ async def test_google_calendar_directory_paginates_and_preserves_sync_token() ->
     assert route.calls[1].request.url.params["pageToken"] == "directory-page-2"
 
 
+@pytest.mark.parametrize(
+    "malformed_payload",
+    (
+        {"items": {}},
+        {"items": [{"id": "primary"}, "not-an-object"]},
+        {"items": [], "nextPageToken": 123},
+        {"items": [], "nextPageToken": ""},
+        {"items": [], "nextSyncToken": 123},
+        {"items": [], "nextSyncToken": ""},
+    ),
+    ids=(
+        "items-not-list",
+        "item-not-object",
+        "page-token-not-string",
+        "page-token-empty",
+        "sync-token-not-string",
+        "sync-token-empty",
+    ),
+)
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_calendar_directory_rejects_malformed_page_fields(
+    malformed_payload: dict[str, object],
+) -> None:
+    """目录分页结构畸形时必须永久失败，不能把缺失事实伪装为空目录或终页。"""
+    # 空 page token 在旧实现中会继续请求；第二个响应让 RED 稳定终止而不是形成无限循环。
+    respx.get(GOOGLE_CALENDAR_LIST_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=malformed_payload),
+            httpx.Response(200, json={"items": [], "nextSyncToken": "directory-final"}),
+        ]
+    )
+    adapter = GoogleCalendarAdapter(access_token="synthetic", user_timezone="UTC")
+
+    with pytest.raises(PermanentProviderError) as raised:
+        [page async for page in adapter.directory_pages()]
+
+    assert raised.value.error_code == "google_calendar_response_invalid"
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_google_calendar_events_use_quoted_calendar_id_and_bounded_local_window() -> None:
@@ -113,6 +154,56 @@ async def test_google_calendar_events_use_quoted_calendar_id_and_bounded_local_w
     assert params["showDeleted"] == "true"
     assert params["timeMin"].startswith("2030-01-09T00:00:00+08:00")
     assert params["timeMax"].startswith("2030-02-09T00:00:00+08:00")
+
+
+@pytest.mark.parametrize(
+    "malformed_payload",
+    (
+        {"items": {}},
+        {
+            "items": [
+                {
+                    "id": "synthetic-event",
+                    "start": {"dateTime": "2030-01-02T09:00:00Z"},
+                    "end": {"dateTime": "2030-01-02T10:00:00Z"},
+                },
+                "not-an-object",
+            ]
+        },
+        {"items": [], "nextPageToken": 123},
+        {"items": [], "nextPageToken": ""},
+        {"items": [], "nextSyncToken": 123},
+        {"items": [], "nextSyncToken": ""},
+    ),
+    ids=(
+        "items-not-list",
+        "item-not-object",
+        "page-token-not-string",
+        "page-token-empty",
+        "sync-token-not-string",
+        "sync-token-empty",
+    ),
+)
+@pytest.mark.asyncio
+@respx.mock
+async def test_google_calendar_events_reject_malformed_page_fields(
+    malformed_payload: dict[str, object],
+) -> None:
+    """事件分页结构畸形时必须永久失败，不能推进或丢弃日历事件同步事实。"""
+    url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    # 与目录契约相同，第二个合法响应只用于约束旧实现对空 page token 的额外请求。
+    respx.get(url).mock(
+        side_effect=[
+            httpx.Response(200, json=malformed_payload),
+            httpx.Response(200, json={"items": [], "nextSyncToken": "event-final"}),
+        ]
+    )
+    adapter = GoogleCalendarAdapter(access_token="synthetic", user_timezone="UTC")
+
+    with pytest.raises(PermanentProviderError) as raised:
+        [page async for page in adapter.initial_pages("primary")]
+
+    assert raised.value.error_code == "google_calendar_response_invalid"
 
 
 @pytest.mark.asyncio

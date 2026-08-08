@@ -1,13 +1,17 @@
 """在 PostgreSQL 上验证 Calendar 加密、tombstone、游标与用户隔离。"""
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
 from uuid import UUID
 
+import httpx
 import pytest
-from sqlalchemy import func, select
+import respx
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.calendar import (
     CalendarCursorExpiredError,
@@ -21,7 +25,11 @@ from ai_employee.application.use_cases.sync_calendar import (
     CalendarSyncStoreFactory,
     SyncCalendarUseCase,
 )
-from ai_employee.domain.errors import InternalInvariantError, TransientProviderError
+from ai_employee.domain.errors import (
+    InternalInvariantError,
+    PermanentProviderError,
+    TransientProviderError,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
@@ -38,6 +46,10 @@ from ai_employee.infrastructure.db.repositories.calendar import (
 from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStore
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.integrations.google.calendar import (
+    GOOGLE_CALENDAR_LIST_URL,
+    GoogleCalendarAdapter,
+)
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.generate_brief import GenerateBriefTaskStep
 
@@ -67,6 +79,7 @@ class DirectoryCalendarReader:
     expire_event_once: str | None = None
     fail_event: str | None = None
     emit_events: bool = True
+    empty_delta_scopes: frozenset[str] = frozenset()
     directory_pages_override: tuple[CalendarDirectoryPage, ...] | None = None
     directory_calls: list[str | None] = field(default_factory=list)
     initial_calls: list[str] = field(default_factory=list)
@@ -114,7 +127,11 @@ class DirectoryCalendarReader:
             self._event_expired = True
             raise CalendarCursorExpiredError("google", calendar_id)
         yield CalendarSyncPage(
-            (self._event(calendar_id),) if self.emit_events else (),
+            (
+                (self._event(calendar_id),)
+                if self.emit_events and calendar_id not in self.empty_delta_scopes
+                else ()
+            ),
             None,
             f"{calendar_id}-token-{self.event_generation}",
         )
@@ -361,6 +378,132 @@ def _calendar_stores(sessions: ManagedAsyncSessionMaker) -> CalendarSyncStoreFac
             yield SqlAlchemyCalendarSyncRepository(session)
 
     return stores
+
+
+@dataclass(frozen=True, slots=True)
+class _CalendarPersistenceSnapshot:
+    """保存一次同步前后的非敏感数据库事实，用于断言永久解析错误完全不落库。"""
+
+    calendars: tuple[tuple[str, str, str, bool], ...]
+    events: tuple[tuple[str, str, str, str | None, datetime | None], ...]
+    cursors: tuple[tuple[str, str | None, datetime | None, datetime | None, str | None], ...]
+    audit_count: int
+
+
+async def _calendar_persistence_snapshot(
+    sessions: ManagedAsyncSessionMaker,
+    *,
+    user_id: UUID,
+    connection_id: UUID,
+) -> _CalendarPersistenceSnapshot:
+    """读取目录、事件、全部日历游标成功时间与审计数量的稳定快照。"""
+    async with sessions() as session:
+        calendar_rows = (
+            await session.execute(
+                select(
+                    ProviderCalendarModel.provider_calendar_id,
+                    ProviderCalendarModel.name,
+                    ProviderCalendarModel.access_role,
+                    ProviderCalendarModel.can_write,
+                )
+                .where(
+                    ProviderCalendarModel.user_id == user_id,
+                    ProviderCalendarModel.connection_id == connection_id,
+                )
+                .order_by(ProviderCalendarModel.provider_calendar_id)
+            )
+        ).all()
+        event_rows = (
+            await session.execute(
+                select(
+                    CalendarEventModel.provider_event_id,
+                    CalendarEventModel.calendar_id,
+                    CalendarEventModel.status,
+                    CalendarEventModel.etag,
+                    CalendarEventModel.provider_updated_at,
+                )
+                .where(
+                    CalendarEventModel.user_id == user_id,
+                    CalendarEventModel.connection_id == connection_id,
+                )
+                .order_by(CalendarEventModel.calendar_id, CalendarEventModel.provider_event_id)
+            )
+        ).all()
+        cursor_rows = (
+            await session.execute(
+                select(
+                    SyncCursorModel.scope_key,
+                    SyncCursorModel.cursor,
+                    SyncCursorModel.last_success_at,
+                    SyncCursorModel.last_attempt_at,
+                    SyncCursorModel.last_error_code,
+                )
+                .where(
+                    SyncCursorModel.connection_id == connection_id,
+                    SyncCursorModel.resource_kind == "calendar",
+                )
+                .order_by(SyncCursorModel.scope_key)
+            )
+        ).all()
+        audit_count = await session.scalar(
+            select(func.count())
+            .select_from(AuditEventModel)
+            .where(AuditEventModel.user_id == user_id)
+        )
+    return _CalendarPersistenceSnapshot(
+        calendars=tuple(
+            (row.provider_calendar_id, row.name, row.access_role, row.can_write)
+            for row in calendar_rows
+        ),
+        events=tuple(
+            (
+                row.provider_event_id,
+                row.calendar_id,
+                row.status,
+                row.etag,
+                row.provider_updated_at,
+            )
+            for row in event_rows
+        ),
+        cursors=tuple(
+            (
+                row.scope_key,
+                row.cursor,
+                row.last_success_at,
+                row.last_attempt_at,
+                row.last_error_code,
+            )
+            for row in cursor_rows
+        ),
+        audit_count=int(audit_count or 0),
+    )
+
+
+async def _postgres_backend_pid(session: AsyncSession) -> int:
+    """返回当前测试会话的 PostgreSQL backend PID，供锁等待关系做确定性断言。"""
+    value = await session.scalar(text("SELECT pg_backend_pid()"))
+    assert isinstance(value, int), "PostgreSQL backend PID is unavailable"
+    return value
+
+
+async def _wait_for_postgres_blockers(
+    sessions: ManagedAsyncSessionMaker,
+    *,
+    waiting_pid: int,
+) -> tuple[int, ...]:
+    """轮询 ``pg_blocking_pids`` 直到目标事务真实进入锁等待，禁止依赖固定 sleep。"""
+    async with asyncio.timeout(5):
+        async with sessions() as observer:
+            while True:
+                blockers = await observer.scalar(
+                    text("SELECT pg_blocking_pids(:waiting_pid)"),
+                    {"waiting_pid": waiting_pid},
+                )
+                normalized = tuple(int(pid) for pid in blockers or ())
+                if normalized:
+                    return normalized
+                # 这里只让出事件循环；继续条件轮询数据库真实锁状态，不把墙钟延时当屏障。
+                await asyncio.sleep(0)
 
 
 def _event(status: str = "confirmed") -> CalendarEvent:
@@ -657,6 +800,171 @@ async def test_calendar_cursor_updates_are_isolated_by_calendar_scope(database_u
 
 
 @pytest.mark.asyncio
+async def test_clear_cursor_and_finish_sync_share_connection_then_cursor_lock_order(
+    database_url: str,
+) -> None:
+    """clear 与 finish 必须先锁 connection 再锁 cursor，避免反向等待形成数据库死锁。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    await SyncCalendarUseCase(
+        _calendar_stores(sessions),
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    blocker_session = sessions()
+    await blocker_session.begin()
+    blocker_pid = await _postgres_backend_pid(blocker_session)
+    locked_cursor = await blocker_session.scalar(
+        select(SyncCursorModel)
+        .where(
+            SyncCursorModel.connection_id == connection_id,
+            SyncCursorModel.resource_kind == "calendar",
+            SyncCursorModel.scope_key == "primary",
+        )
+        .with_for_update()
+    )
+    assert locked_cursor is not None
+    assert locked_cursor.cursor == "primary-token-1"
+
+    loop = asyncio.get_running_loop()
+    clear_pid_ready: asyncio.Future[int] = loop.create_future()
+    finish_pid_ready: asyncio.Future[int] = loop.create_future()
+
+    async def clear_cursor() -> None:
+        """在独立事务中执行失效 CAS，并把 backend PID 暴露给锁图断言。"""
+        async with sessions.begin() as session:
+            await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            clear_pid_ready.set_result(await _postgres_backend_pid(session))
+            await SqlAlchemyCalendarSyncRepository(session).clear_cursor(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="primary",
+                expected_cursor="primary-token-1",
+            )
+
+    async def finish_sync() -> None:
+        """并发执行正常完成 CAS；统一锁序下它应先等待 clear 持有的 connection。"""
+        async with sessions.begin() as session:
+            await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+            finish_pid_ready.set_result(await _postgres_backend_pid(session))
+            await SqlAlchemyCalendarSyncRepository(session).finish_sync(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key="primary",
+                expected_cursor="primary-token-1",
+                next_cursor="primary-token-finished",
+                event_count=0,
+                used_full_resync=False,
+                completed_at=datetime(2030, 1, 2, tzinfo=UTC),
+            )
+
+    clear_task = asyncio.create_task(clear_cursor())
+    finish_task: asyncio.Task[None] | None = None
+    results: tuple[object, ...] = ()
+    try:
+        clear_pid = await asyncio.wait_for(clear_pid_ready, timeout=2)
+        clear_blockers = await _wait_for_postgres_blockers(
+            sessions,
+            waiting_pid=clear_pid,
+        )
+        assert blocker_pid in clear_blockers
+
+        finish_task = asyncio.create_task(finish_sync())
+        finish_pid = await asyncio.wait_for(finish_pid_ready, timeout=2)
+        finish_blockers = await _wait_for_postgres_blockers(
+            sessions,
+            waiting_pid=finish_pid,
+        )
+    finally:
+        # 无论锁序断言是否成立，都先释放第三会话并回收两个任务，避免失败测试污染连接池。
+        await blocker_session.rollback()
+        await blocker_session.close()
+        tasks = (clear_task,) if finish_task is None else (clear_task, finish_task)
+        results = tuple(
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=7,
+            )
+        )
+
+    assert finish_blockers == (clear_pid,)
+    assert results[0] is None
+    assert isinstance(results[1], TransientProviderError)
+    assert results[1].error_code == "calendar_sync_cursor_conflict"
+    async with sessions() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel.cursor).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "primary",
+            )
+        )
+    assert cursor is None
+    await sessions.dispose()
+
+
+@pytest.mark.parametrize("boundary", ("foreign-user", "disabled-capability"))
+@pytest.mark.asyncio
+async def test_clear_cursor_preserves_ownership_capability_and_error_contract(
+    database_url: str,
+    boundary: str,
+) -> None:
+    """拆分锁查询后仍须隐藏跨用户连接，并在能力撤销时保持原稳定冲突错误。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    await SyncCalendarUseCase(
+        _calendar_stores(sessions),
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    actor_user_id = user_id
+    async with sessions.begin() as session:
+        if boundary == "foreign-user":
+            foreign = UserModel(
+                email="calendar-clear-foreign@example.test",
+                display_name="Foreign Clear Actor",
+                password_hash=None,
+                timezone="UTC",
+                locale="zh-CN",
+                brief_time=time(8),
+                is_active=True,
+            )
+            session.add(foreign)
+            await session.flush()
+            actor_user_id = foreign.id
+        else:
+            capability = await session.scalar(
+                select(ConnectionCapabilityModel).where(
+                    ConnectionCapabilityModel.user_id == user_id,
+                    ConnectionCapabilityModel.connection_id == connection_id,
+                    ConnectionCapabilityModel.capability == "calendar.read",
+                )
+            )
+            assert capability is not None
+            capability.status = "disabled"
+
+    with pytest.raises(TransientProviderError) as raised:
+        async with sessions.begin() as session:
+            await SqlAlchemyCalendarSyncRepository(session).clear_cursor(
+                user_id=actor_user_id,
+                connection_id=connection_id,
+                scope_key="primary",
+                expected_cursor="primary-token-1",
+            )
+
+    async with sessions() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel.cursor).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "primary",
+            )
+        )
+    assert raised.value.error_code == "calendar_sync_cursor_conflict"
+    assert cursor == "primary-token-1"
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
 async def test_directory_sync_persists_roles_events_and_is_idempotent_on_replay(
     database_url: str,
 ) -> None:
@@ -808,6 +1116,125 @@ async def test_directory_tombstone_removes_projection_events_and_future_scope_sy
         "https://calendar.example.test/events/primary"
     }
     assert reader.sync_calls == [("primary", "primary-token-1")]
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reappearing_calendar_discards_retained_cursor_and_rebuilds_event_cache(
+    database_url: str,
+) -> None:
+    """目录删除后重新出现的日历必须走完整窗口，不能用保留 cursor 的空 delta 恢复缓存。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(
+            google_calendar=DirectoryCalendarReader(
+                (_deleted_calendar("readonly@example.test"),),
+                directory_tokens=("directory-token-2",),
+                event_generation=2,
+            )
+        ),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    reappearing = DirectoryCalendarReader(
+        (_directory_calendars()[1],),
+        directory_tokens=("directory-token-3",),
+        event_generation=3,
+        empty_delta_scopes=frozenset({"readonly@example.test"}),
+    )
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=reappearing),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        event_calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel.calendar_id)
+                    .where(CalendarEventModel.connection_id == connection_id)
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+        cursor_rows = dict(
+            (
+                await session.execute(
+                    select(SyncCursorModel.scope_key, SyncCursorModel.cursor).where(
+                        SyncCursorModel.connection_id == connection_id,
+                        SyncCursorModel.resource_kind == "calendar",
+                    )
+                )
+            ).all()
+        )
+
+    assert reappearing.initial_calls == ["readonly@example.test"]
+    assert reappearing.sync_calls == [("primary", "primary-token-2")]
+    assert event_calendar_ids == ("primary", "readonly@example.test")
+    assert cursor_rows == {
+        "directory": "directory-token-3",
+        "primary": "primary-token-3",
+        "readonly@example.test": "readonly@example.test-token-3",
+    }
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_first_directory_discovery_resets_legacy_primary_cursor_without_projection(
+    database_url: str,
+) -> None:
+    """历史 primary cursor 没有目录证明时必须视为首次发现并通过完整窗口重建。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    async with sessions.begin() as session:
+        session.add(
+            SyncCursorModel(
+                connection_id=connection_id,
+                resource_kind="calendar",
+                scope_key="primary",
+                cursor="legacy-primary-token",
+                last_success_at=datetime(2029, 12, 31, tzinfo=UTC),
+            )
+        )
+    reader = DirectoryCalendarReader(
+        (_directory_calendars()[0],),
+        empty_delta_scopes=frozenset({"primary"}),
+    )
+
+    await SyncCalendarUseCase(
+        _calendar_stores(sessions),
+        ProviderAdapterRegistry(google_calendar=reader),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        event_count = await session.scalar(
+            select(func.count())
+            .select_from(CalendarEventModel)
+            .where(
+                CalendarEventModel.connection_id == connection_id,
+                CalendarEventModel.calendar_id == "primary",
+            )
+        )
+        cursor = await session.scalar(
+            select(SyncCursorModel.cursor).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "primary",
+            )
+        )
+
+    assert reader.initial_calls == ["primary"]
+    assert reader.sync_calls == []
+    assert event_count == 1
+    assert cursor == "primary-token-1"
     await sessions.dispose()
 
 
@@ -1301,6 +1728,63 @@ async def test_incremental_directory_missing_final_token_preserves_old_success(
     assert after.last_success_at == previous_success_at
     assert reader.initial_calls == []
     assert reader.sync_calls == []
+    await sessions.dispose()
+
+
+@pytest.mark.parametrize(
+    ("scope_key", "url", "malformed_payload"),
+    (
+        ("directory", GOOGLE_CALENDAR_LIST_URL, {"items": {}}),
+        (
+            "primary",
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            {"items": [], "nextSyncToken": ""},
+        ),
+    ),
+    ids=("directory-page", "event-page"),
+)
+@pytest.mark.asyncio
+@respx.mock
+async def test_malformed_google_calendar_page_preserves_all_persisted_sync_facts(
+    database_url: str,
+    scope_key: str,
+    url: str,
+    malformed_payload: dict[str, object],
+) -> None:
+    """畸形目录页或事件页必须在供应商 I/O 边界失败，不得触碰任何数据库事实。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=DirectoryCalendarReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    before = await _calendar_persistence_snapshot(
+        sessions,
+        user_id=user_id,
+        connection_id=connection_id,
+    )
+    respx.get(url).mock(return_value=httpx.Response(200, json=malformed_payload))
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await SyncCalendarUseCase(
+            stores,
+            ProviderAdapterRegistry(
+                google_calendar=GoogleCalendarAdapter(
+                    access_token="synthetic",
+                    user_timezone="UTC",
+                )
+            ),
+            cipher,
+        ).execute(user_id=user_id, connection_id=connection_id, scope_key=scope_key)
+
+    after = await _calendar_persistence_snapshot(
+        sessions,
+        user_id=user_id,
+        connection_id=connection_id,
+    )
+    assert raised.value.error_code == "google_calendar_response_invalid"
+    assert after == before
     await sessions.dispose()
 
 

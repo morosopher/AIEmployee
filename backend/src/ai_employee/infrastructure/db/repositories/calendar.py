@@ -35,6 +35,49 @@ class SqlAlchemyCalendarSyncRepository:
         self._session = session
         self._calendar_permissions: dict[tuple[UUID, UUID, str], tuple[str, bool] | None] = {}
 
+    async def _lock_syncable_connection(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> bool:
+        """按固定 connection→capability 顺序锁定并验证日历读取前提。
+
+        ``clear_cursor`` 不能用从 cursor 出发的多表 ``JOIN ... FOR UPDATE``：PostgreSQL
+        可按执行计划交错锁定 cursor、connection 与 capability，和正常完成路径形成反向等待。
+        这里先用所有权、connected 状态锁住唯一 connection，再锁定同用户的 enabled
+        ``calendar.read`` 行；后续调用方才允许获取精确 cursor 锁。
+
+        Args:
+            user_id: 当前管理员用户。
+            connection_id: 待验证的 OAuth 连接。
+
+        Returns:
+            连接与读取能力均存在且已按固定顺序锁定时返回 ``True``，否则返回 ``False``。
+        """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel.id)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            return False
+        capability = await self._session.scalar(
+            select(ConnectionCapabilityModel.id)
+            .where(
+                ConnectionCapabilityModel.connection_id == connection_id,
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.capability == "calendar.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .with_for_update()
+        )
+        return capability is not None
+
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
     ) -> CalendarConnectionState | None:
@@ -227,8 +270,9 @@ class SqlAlchemyCalendarSyncRepository:
 
         目录页已在供应商 I/O 边界完成分页、字段校验和稳定排序；此方法只在一个短事务内
         做用户/连接能力复核、可见目录 upsert、增量 tombstone 或全量快照差集清理、事件 ACL
-        收紧、日历 cursor placeholder 与 directory CAS。已有日历 cursor 和最后成功时间绝不
-        被目录重放清除，因而 CalendarList 410 回退不会影响任一事件增量恢复位置。
+        收紧、日历 cursor placeholder 与 directory CAS。持续可见日历保留 cursor；本次事务前
+        没有目录投影的首次发现或重新出现日历必须清空保留 cursor 与成功时间，强制用受限完整
+        窗口重建已经撤销的缓存。CalendarList 410 回退仍不会影响持续可见日历的恢复位置。
 
         Args:
             user_id: 当前管理员用户。
@@ -306,6 +350,22 @@ class SqlAlchemyCalendarSyncRepository:
                 retry_after=1,
             )
 
+        # 必须在删除 tombstone 与 upsert 新目录行之前记录当前可见集合。cursor 行会跨目录
+        # 删除保留，仅凭 cursor 是否存在无法区分持续可见与重新出现，正是空 delta 无法恢复
+        # 缓存的根因。锁定这些行也让同一连接的目录变更在本事务内保持稳定。
+        existing_visible_calendar_ids = set(
+            (
+                await self._session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id)
+                    .where(
+                        ProviderCalendarModel.user_id == user_id,
+                        ProviderCalendarModel.connection_id == connection_id,
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+
         visible_calendars = tuple(calendar for calendar in calendars if not calendar.is_deleted)
         visible_calendar_ids = tuple(calendar.calendar_id for calendar in visible_calendars)
         explicit_deleted_calendar_ids = tuple(
@@ -315,19 +375,9 @@ class SqlAlchemyCalendarSyncRepository:
         if expected_cursor is None:
             # 初始同步与 410 回退返回完整目录快照；未再次出现的历史行已经不再可见，
             # 必须与显式 tombstone 合并清理。增量 delta 不具备该完备性，绝不能做差集。
-            existing_calendar_ids = set(
-                (
-                    await self._session.scalars(
-                        select(ProviderCalendarModel.provider_calendar_id)
-                        .where(
-                            ProviderCalendarModel.user_id == user_id,
-                            ProviderCalendarModel.connection_id == connection_id,
-                        )
-                        .with_for_update()
-                    )
-                ).all()
+            removed_calendar_ids.update(
+                existing_visible_calendar_ids.difference(visible_calendar_ids)
             )
-            removed_calendar_ids.update(existing_calendar_ids.difference(visible_calendar_ids))
         ordered_removed_calendar_ids = tuple(sorted(removed_calendar_ids))
         for calendar_id in ordered_removed_calendar_ids:
             # CalendarList tombstone 撤销的是当前目录与来源缓存事实；独立 cursor 和历史
@@ -389,10 +439,10 @@ class SqlAlchemyCalendarSyncRepository:
             )
 
         if visible_calendar_ids:
-            existing_cursor_ids = set(
+            cursor_rows = tuple(
                 (
                     await self._session.scalars(
-                        select(SyncCursorModel.scope_key)
+                        select(SyncCursorModel)
                         .where(
                             SyncCursorModel.connection_id == connection_id,
                             SyncCursorModel.resource_kind == "calendar",
@@ -402,8 +452,10 @@ class SqlAlchemyCalendarSyncRepository:
                     )
                 ).all()
             )
+            cursors_by_scope = {cursor.scope_key: cursor for cursor in cursor_rows}
             for calendar_id in visible_calendar_ids:
-                if calendar_id not in existing_cursor_ids:
+                cursor = cursors_by_scope.get(calendar_id)
+                if cursor is None:
                     # placeholder 只证明目录已发现该 calendar；事件同步的尝试/成功时间和
                     # opaque token 必须由该日历独立的 finish_sync 事务写入。
                     self._session.add(
@@ -414,6 +466,12 @@ class SqlAlchemyCalendarSyncRepository:
                             cursor=None,
                         )
                     )
+                elif calendar_id not in existing_visible_calendar_ids:
+                    # tombstone/full-snapshot 缺席会删除目录与事件缓存但保留 cursor。重新
+                    # 获得访问权后旧 delta 可能合法返回空页，必须先失效旧恢复位置与 freshness，
+                    # 让紧随目录同步的事件路径确定性调用 initial_pages() 重建缓存。
+                    cursor.cursor = None
+                    cursor.last_success_at = None
 
         directory_cursor.cursor = next_cursor
         directory_cursor.last_success_at = completed_at
@@ -456,23 +514,23 @@ class SqlAlchemyCalendarSyncRepository:
         scope_key: str,
         expected_cursor: str,
     ) -> None:
-        """在游标失效后以 CAS 只清除同一日历 scope，避免影响其他日历。"""
+        """按 connection→capability→cursor 固定锁序执行单 scope 失效 CAS。"""
+        syncable = await self._lock_syncable_connection(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        if not syncable:
+            raise TransientProviderError(
+                error_code="calendar_sync_cursor_conflict",
+                message="Calendar sync cursor changed during provider read",
+                retry_after=1,
+            )
         cursor = await self._session.scalar(
             select(SyncCursorModel)
-            .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
-            .join(
-                ConnectionCapabilityModel,
-                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
-                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
-            )
             .where(
                 SyncCursorModel.connection_id == connection_id,
                 SyncCursorModel.resource_kind == "calendar",
                 SyncCursorModel.scope_key == scope_key,
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.status == "connected",
-                ConnectionCapabilityModel.capability == "calendar.read",
-                ConnectionCapabilityModel.status == "enabled",
             )
             .with_for_update()
         )
