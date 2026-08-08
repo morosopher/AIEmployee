@@ -6,6 +6,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
 from unicodedata import category
+from urllib.parse import quote, unquote
 
 from ai_employee.domain.errors import StateConflictError
 
@@ -35,21 +36,75 @@ class ConnectionCapability(StrEnum):
 
 _SUPPORTED_PROVIDER_IDENTITY_PROVIDERS: Final[frozenset[str]] = frozenset({"google", "microsoft"})
 _PROVIDER_IDENTITY_ERROR: Final[str] = "provider identity key is invalid"
+MAX_PROVIDER_IDENTITY_PART_LENGTH: Final[int] = 255
+"""OAuth 与连接存储共同使用的原始 tenant/account 字符上限。"""
+MAX_PROVIDER_IDENTITY_ENCODED_PART_LENGTH: Final[int] = 12 * MAX_PROVIDER_IDENTITY_PART_LENGTH
+"""percent-encoding 最坏每个四字节 UTF-8 字符占三字符时的 encoded segment 上限。"""
+_PROVIDER_IDENTITY_QUOTE_SAFE: Final[str] = "-._~"
 
 
 def _is_safe_provider_identity_part(value: object, *, allow_empty: bool = False) -> bool:
-    """验证身份键单段文本，不对不可信供应商值执行静默清理。"""
+    """验证身份键单段 opaque 文本，不对不可信供应商值执行静默清理。
+
+    ``@``、``:`` 与 ``%`` 都属于可逆 opaque 内容；它们是否能出现在持久化复合账户中
+    由调用方的结构校验决定，canonical key 中则统一交给 percent-encoding 处理。
+    """
     if type(value) is not str:
         return False
     if value == "":
         return allow_empty
     if value != value.strip():
         return False
-    if any(char.isspace() or category(char).startswith("C") for char in value):
-        return False
-    # ``:`` 是三段键的结构分隔符，``@`` 保留为邮箱拒绝边界；二者都不能由
-    # 供应商身份字段携带，否则 allowlist 可能把可变显示标识或歧义键当成稳定身份。
-    return ":" not in value and "@" not in value
+    return not any(char.isspace() or category(char).startswith("C") for char in value)
+
+
+def _encode_provider_identity_part(value: object, *, allow_empty: bool = False) -> str:
+    """把一个合法 opaque 身份段编码为 canonical allowlist segment。
+
+    Args:
+        value: 供应商返回或连接记录中的单段身份文本。
+        allow_empty: 是否允许精确空串；仅 Google tenant 使用。
+
+    Returns:
+        只含 unreserved 字符及大写 ``%HH`` 转义的 canonical segment。
+
+    Raises:
+        ValueError: 类型、空值、空白/控制字符、原始长度或编码后长度越界。
+    """
+    if not _is_safe_provider_identity_part(value, allow_empty=allow_empty):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    if type(value) is not str:
+        # 上面的精确类型检查已 fail closed；此分支仅帮助静态类型收窄，避免把
+        # 不受控对象交给 urllib 的错误消息边界。
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    if len(value) > MAX_PROVIDER_IDENTITY_PART_LENGTH:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    try:
+        encoded = quote(value, safe=_PROVIDER_IDENTITY_QUOTE_SAFE)
+    except (UnicodeError, ValueError):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR) from None
+    if len(encoded) > MAX_PROVIDER_IDENTITY_ENCODED_PART_LENGTH:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    return encoded
+
+
+def _decode_provider_identity_part(value: object, *, allow_empty: bool = False) -> str:
+    """严格解码一个 canonical segment，并拒绝任何非规范 percent 表示。
+
+    ``urllib.parse.unquote`` 对 malformed ``%`` 默认采取宽松策略，因此解码后必须重新
+    canonicalize 并做字面量相等比较；这同时拒绝小写 hex、对安全字符的过度编码和未编码
+    的 ``@``/``:`` 等保留字符。
+    """
+    if type(value) is not str or len(value) > MAX_PROVIDER_IDENTITY_ENCODED_PART_LENGTH:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    try:
+        decoded = unquote(value, encoding="utf-8", errors="strict")
+        canonical = _encode_provider_identity_part(decoded, allow_empty=allow_empty)
+    except (UnicodeError, TypeError, ValueError):
+        raise ValueError(_PROVIDER_IDENTITY_ERROR) from None
+    if canonical != value:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    return decoded
 
 
 def canonical_provider_identity_key(
@@ -67,12 +122,13 @@ def canonical_provider_identity_key(
 
     Returns:
         供 Trusted Action 账户 allowlist 与 claim 共同使用的
-        ``provider:provider_tenant_id:provider_account_id`` 键。Microsoft 输出只把
-        tenant 放在外层一次，即 ``microsoft:<tenant>:<graph_user_id>``。
+        ``provider:encoded_tenant:encoded_account`` 键。普通 unreserved ID 保持原样；
+        opaque 保留字符使用 canonical percent-encoding。Microsoft 输出只把 tenant
+        放在外层一次，即 ``microsoft:<encoded_tenant>:<encoded_graph_user_id>``。
 
     Raises:
-        ValueError: 输入类型、供应商、空 tenant、分隔符或 Microsoft 内嵌 tenant
-            绑定任一不满足严格边界时抛出固定错误，不回显原始身份值。
+        ValueError: 输入类型、供应商、长度、结构性冒号或 Microsoft 内嵌 tenant 绑定
+            任一不满足严格边界时抛出固定错误，不回显原始身份值。
     """
     if (
         type(provider) is not str
@@ -82,26 +138,25 @@ def canonical_provider_identity_key(
         raise ValueError(_PROVIDER_IDENTITY_ERROR)
 
     if provider == "google":
-        if (
-            type(provider_tenant_id) is not str
-            or provider_tenant_id != ""
-            or not _is_safe_provider_identity_part(provider_account_id)
-        ):
+        if type(provider_tenant_id) is not str or provider_tenant_id != "":
             raise ValueError(_PROVIDER_IDENTITY_ERROR)
-        return f"google::{provider_account_id}"
+        account_segment = _encode_provider_identity_part(provider_account_id)
+        return f"google::{account_segment}"
 
     if not _is_safe_provider_identity_part(provider_tenant_id):
         raise ValueError(_PROVIDER_IDENTITY_ERROR)
-    if type(provider_account_id) is not str or provider_account_id.count(":") != 1:
-        raise ValueError(_PROVIDER_IDENTITY_ERROR)
-    embedded_tenant, graph_user_id = provider_account_id.split(":", 1)
     if (
-        embedded_tenant != provider_tenant_id
-        or not _is_safe_provider_identity_part(embedded_tenant)
-        or not _is_safe_provider_identity_part(graph_user_id)
+        type(provider_account_id) is not str
+        or len(provider_account_id) > MAX_PROVIDER_IDENTITY_PART_LENGTH
+        or provider_account_id.count(":") != 1
     ):
         raise ValueError(_PROVIDER_IDENTITY_ERROR)
-    return f"microsoft:{provider_tenant_id}:{graph_user_id}"
+    embedded_tenant, graph_user_id = provider_account_id.split(":", 1)
+    if embedded_tenant != provider_tenant_id:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
+    tenant_segment = _encode_provider_identity_part(provider_tenant_id)
+    graph_segment = _encode_provider_identity_part(graph_user_id)
+    return f"microsoft:{tenant_segment}:{graph_segment}"
 
 
 def parse_provider_identity_key(value: str) -> tuple[str, str, str]:
@@ -124,13 +179,22 @@ def parse_provider_identity_key(value: str) -> tuple[str, str, str]:
     parts = value.split(":")
     if len(parts) != 3:
         raise ValueError(_PROVIDER_IDENTITY_ERROR)
-    provider, tenant, account_segment = parts
-    stored_account_id = (
-        f"{tenant}:{account_segment}" if provider == "microsoft" else account_segment
-    )
+    provider, encoded_tenant, encoded_account = parts
+    if type(provider) is not str or provider not in _SUPPORTED_PROVIDER_IDENTITY_PROVIDERS:
+        raise ValueError(_PROVIDER_IDENTITY_ERROR)
     try:
+        if provider == "google":
+            if encoded_tenant != "":
+                raise ValueError(_PROVIDER_IDENTITY_ERROR)
+            tenant = ""
+            account = _decode_provider_identity_part(encoded_account)
+            stored_account_id = account
+        else:
+            tenant = _decode_provider_identity_part(encoded_tenant)
+            graph_user_id = _decode_provider_identity_part(encoded_account)
+            stored_account_id = f"{tenant}:{graph_user_id}"
         canonical = canonical_provider_identity_key(provider, tenant, stored_account_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeError):
         raise ValueError(_PROVIDER_IDENTITY_ERROR) from None
     if canonical != value:
         raise ValueError(_PROVIDER_IDENTITY_ERROR)

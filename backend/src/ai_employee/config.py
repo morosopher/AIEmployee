@@ -124,9 +124,10 @@ class Settings(BaseSettings):
     def validate_write_test_account_allowlist(cls, value: list[str]) -> list[str]:
         """验证专用测试账户使用稳定且规范化的供应商连接身份键。
 
-        身份键固定为 ``provider:provider_tenant_id:provider_account_id``。Google
-        可使用空 tenant，形成 ``google::account``；邮箱等可变显示标识不得进入
-        白名单。错误信息只指出配置项，不回显具体身份，避免敏感连接标识进入日志。
+        身份键固定为 ``provider:encoded_tenant:encoded_account``。Google 使用空 tenant，
+        形成 ``google::encoded_account``；opaque 保留字符采用 canonical percent-encoding。
+        白名单来源必须是稳定 provider account ID 而非 ``account_email`` 字段，但不会把
+        opaque ID 中的 ``@`` 自行解释成邮箱。错误信息不回显具体身份。
 
         Args:
             value: 从环境变量解析出的供应商连接身份键列表。
@@ -203,7 +204,7 @@ class Settings(BaseSettings):
 
         Args:
             provider_identity_key: 待核对的稳定连接身份键，格式由连接层规范化为
-                ``provider:provider_tenant_id:provider_account_id``。
+                ``provider:encoded_tenant:encoded_account``。
 
         Returns:
             输入不是规范化身份键时始终返回 ``False``；身份键通过 parser 后，白名单非空

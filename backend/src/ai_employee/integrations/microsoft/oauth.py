@@ -41,7 +41,10 @@ from ai_employee.application.ports.oauth import (
     OAuthRevocationStatus,
     OAuthTokenSet,
 )
-from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.connections import (
+    MAX_PROVIDER_IDENTITY_PART_LENGTH,
+    ConnectionCapability,
+)
 from ai_employee.domain.errors import (
     DomainError,
     PermanentProviderError,
@@ -96,7 +99,9 @@ MICROSOFT_MAX_JWKS_KEYS: Final[int] = 32
 MICROSOFT_TIMEOUT_SECONDS: Final[float] = 10.0
 MICROSOFT_CONNECT_TIMEOUT_SECONDS: Final[float] = 3.0
 
-_TENANT_TEXT_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+_TENANT_TEXT_RE = re.compile(
+    rf"^[A-Za-z0-9._-]{{1,{MAX_PROVIDER_IDENTITY_PART_LENGTH}}}$"
+)
 _ISSUER_TEMPLATE_RE = re.compile(
     r"^https://(?P<host>login\.microsoftonline\.com|login\.live\.com)/(?P<tenant>[^/]+)/v2\.0/?$"
 )

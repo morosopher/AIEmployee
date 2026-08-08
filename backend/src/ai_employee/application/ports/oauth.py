@@ -2,10 +2,13 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Final, Protocol
 from unicodedata import category
 
-from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.connections import (
+    MAX_PROVIDER_IDENTITY_PART_LENGTH,
+    ConnectionCapability,
+)
 
 MAX_OAUTH_TOKEN_LENGTH = 8192
 """单个 OAuth opaque token 的最大字符数，避免 malformed 响应放大内存/密文。"""
@@ -16,8 +19,9 @@ MAX_OAUTH_SCOPE_LENGTH = 512
 MAX_OAUTH_EXPIRES_IN = 10 * 365 * 24 * 60 * 60
 """接受的最大 token 有效期（十年），确保后续 ``timedelta`` 不会溢出。"""
 
-MAX_PROVIDER_ACCOUNT_ID_LENGTH = 255
-MAX_PROVIDER_TENANT_ID_LENGTH = 255
+MAX_PROVIDER_ACCOUNT_ID_LENGTH: Final[int] = MAX_PROVIDER_IDENTITY_PART_LENGTH
+MAX_PROVIDER_TENANT_ID_LENGTH: Final[int] = MAX_PROVIDER_IDENTITY_PART_LENGTH
+"""连接身份上限复用 domain 常量，避免 OAuth 与 Trusted Action 边界漂移。"""
 MAX_ACCOUNT_EMAIL_LENGTH = 320
 MAX_ACCOUNT_TYPE_LENGTH = 32
 

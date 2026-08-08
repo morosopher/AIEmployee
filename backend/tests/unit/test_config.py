@@ -101,7 +101,7 @@ def test_non_production_writes_require_a_test_account_allowlist(
 
 
 def test_write_allowlist_matches_only_the_exact_provider_identity_key() -> None:
-    """白名单按规范化连接身份精确匹配，不接受邮箱或同供应商的其他账户。"""
+    """白名单按规范化连接身份精确匹配，不接受裸邮箱或同供应商的其他账户。"""
     settings = Settings(
         _env_file=None,
         app_env="staging",
@@ -164,8 +164,8 @@ def test_write_allowlist_rejects_identity_whitespace_and_controls_without_echoin
     assert identity_key not in str(exc_info.value)
 
 
-def test_write_allowlist_rejects_account_email_entries() -> None:
-    """配置拒绝邮箱条目且不回显身份，避免可变地址或连接标识进入异常输出。"""
+def test_write_allowlist_rejects_bare_account_email_entries() -> None:
+    """裸邮箱不是 canonical provider key，配置拒绝且不回显原始身份。"""
     rejected_identity = "synthetic-account@example.test"
 
     with pytest.raises(ValueError, match="WRITE_TEST_ACCOUNT_ALLOWLIST") as exc_info:
@@ -175,6 +175,21 @@ def test_write_allowlist_rejects_account_email_entries() -> None:
         )
 
     assert rejected_identity not in str(exc_info.value)
+
+
+def test_write_allowlist_accepts_canonical_encoded_opaque_identity() -> None:
+    """opaque ``@``、``:``、``%`` 经 canonical 编码后可配置，原始非规范形式仍拒绝。"""
+    identity_key = "google::synthetic%40opaque%3Asubject%251"
+    settings = Settings(
+        _env_file=None,
+        app_env="staging",
+        external_writes_enabled=True,
+        google_writes_enabled=True,
+        write_test_account_allowlist=[identity_key],
+    )
+
+    assert settings.write_account_allowed(identity_key) is True
+    assert settings.write_account_allowed("google::synthetic@opaque%3Asubject%251") is False
 
 
 def test_write_allowlist_parses_normalized_identities_from_environment(
