@@ -117,7 +117,12 @@ def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
     if not _is_http_client_logger(record.name):
         return record
 
-    return _scrub_http_client_record_fields(record, source_name=record.name)
+    source_name = record.name
+    scrubbed_record = _scrub_http_client_record_fields(record, source_name=source_name)
+    # factory/makeRecord 可能先于新 handle/callHandlers wrapper 返回记录；提前登记来源，
+    # 让已经进入旧 dispatch 调用栈的记录仍能在 patched Handler.filter 边界被最终清理。
+    _remember_http_client_source(scrubbed_record, source_name)
+    return scrubbed_record
 
 
 def _scrub_http_client_record_fields(

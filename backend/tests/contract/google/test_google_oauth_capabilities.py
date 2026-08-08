@@ -1409,6 +1409,143 @@ def test_http_client_logging_scrubs_in_flight_old_handle_before_dispatch() -> No
             manager.loggerDict[logger_name] = logger_entry
 
 
+def test_http_client_logging_preserves_provenance_for_in_flight_old_call_handlers() -> None:
+    """旧 callHandlers 在途恢复后，factory/makeRecord 记录仍必须覆盖 handler filter 突变。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获旧 callHandlers 直接 dispatch 的最终记录。"""
+
+        def __init__(self) -> None:
+            """初始化 barrier、事件、消息和完整记录快照。"""
+            super().__init__()
+            self.call_handlers_entered = Event()
+            self.release_call_handlers = Event()
+            self.call_handlers_timeout = Event()
+            self.emitted = Event()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 handler emit 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+            self.emitted.set()
+
+    def baseline_call_handlers(logger: logging.Logger, record: logging.LogRecord) -> None:
+        """暂停旧 dispatch，模拟安装 wrapper 前已进入的 Logger.callHandlers。"""
+        recording_handler.call_handlers_entered.set()
+        if not recording_handler.release_call_handlers.wait(timeout=5):
+            recording_handler.call_handlers_timeout.set()
+        for handler in logger.handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+
+    def baseline_handle(logger: logging.Logger, record: logging.LogRecord) -> None:
+        """复现未安装 source-bound handle 的标准 Logger.handle 行为。"""
+        if logger.disabled:
+            return
+        maybe_record = logger.filter(record)
+        if not maybe_record:
+            return
+        if isinstance(maybe_record, logging.LogRecord):
+            record = maybe_record
+        logger.callHandlers(record)
+
+    logger_name = "httpx.in_flight_call_handlers_race"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
+    recording_handler = RecordingHandler()
+    emitter: Thread | None = None
+
+    def mutate_handler_record(record: logging.LogRecord) -> bool:
+        """模拟 handler filter 在旧 callHandlers 恢复后重新写入敏感字段。"""
+        record.name = "ai_employee.in_flight-handler-name-synthetic-secret"
+        record.msg = (
+            "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
+            "access_token=synthetic-in-flight-handler-token"
+        )
+        record.args = ()
+        record.authorization = "Bearer synthetic-in-flight-handler-extra-secret"
+        record.opaque = "synthetic-in-flight-handler-extra-token"
+        return True
+
+    try:
+        # 保留已安装的 factory/makeRecord wrapper，只撤回 handle/callHandlers，精准复现该窗口。
+        type.__setattr__(logging.Logger, "handle", baseline_handle)
+        type.__setattr__(logging.Logger, "callHandlers", baseline_call_handlers)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(recording_handler)
+        recording_handler.addFilter(mutate_handler_record)
+
+        def emit_in_flight() -> None:
+            """在线程 A 中创建已由 factory/makeRecord 清理、但尚未登记 provenance 的记录。"""
+            logger.warning(
+                "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
+                "access_token=synthetic-in-flight-call-handlers-token",
+                extra={
+                    "authorization": "Bearer synthetic-in-flight-call-handlers-extra-secret",
+                    "opaque": "synthetic-in-flight-call-handlers-extra-token",
+                },
+            )
+
+        emitter = Thread(target=emit_in_flight)
+        emitter.start()
+        assert recording_handler.call_handlers_entered.wait(timeout=5)
+
+        # 线程 A 已进入旧 callHandlers；线程 B 安装新边界后再放行 A，触发旧函数直接调用
+        # patched Handler.filter 的路径。
+        configure_http_client_logging()
+        recording_handler.release_call_handlers.set()
+        assert recording_handler.emitted.wait(timeout=5)
+        emitter.join(timeout=5)
+
+        assert not recording_handler.call_handlers_timeout.is_set()
+        assert recording_handler.messages == ["http_client_event"]
+        assert all(
+            secret not in recording_handler.snapshots[0]
+            for secret in (
+                "synthetic-in-flight-handler-token",
+                "synthetic-in-flight-handler-extra-secret",
+                "synthetic-in-flight-handler-extra-token",
+            )
+        )
+    finally:
+        recording_handler.release_call_handlers.set()
+        if emitter is not None:
+            emitter.join(timeout=5)
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
 def test_http_client_log_record_scrub_survives_future_children_and_concurrent_initialization() -> (
     None
 ):
