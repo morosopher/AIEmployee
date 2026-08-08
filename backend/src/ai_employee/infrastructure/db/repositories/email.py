@@ -6,11 +6,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
-from ai_employee.application.ports.mail import MailConnectionState, MailMessage, MailRemoval
+from ai_employee.application.ports.mail import (
+    MailConnectionState,
+    MailMessage,
+    MailMessageUpsertResult,
+    MailRemoval,
+)
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -246,7 +252,7 @@ class SqlAlchemyMailSyncRepository:
         connection_id: UUID,
         message: MailMessage,
         encrypted_body: EncryptedValue,
-    ) -> None:
+    ) -> MailMessageUpsertResult:
         """原子 upsert 一个规范化线程及其消息，保持幂等键和用户归属不变量。
 
         线程先按 ``connection_id + provider_thread_id`` 写入，消息随后以取得的本地主键按
@@ -263,18 +269,36 @@ class SqlAlchemyMailSyncRepository:
             participants=participants,
             latest_message_at=message.received_at,
             provider_url=message.provider_url,
+            provider_updated_at=message.provider_updated_at,
+        )
+        thread_is_newer = self._incoming_projection_is_newer(
+            stored=EmailThreadModel.provider_updated_at,
+            incoming=thread_statement.excluded.provider_updated_at,
         )
         thread_id = await self._session.scalar(
             thread_statement.on_conflict_do_update(
                 constraint="uq_email_threads_connection_provider_thread",
                 set_={
-                    "subject": thread_statement.excluded.subject,
-                    "participants": thread_statement.excluded.participants,
+                    "subject": case(
+                        (thread_is_newer, thread_statement.excluded.subject),
+                        else_=EmailThreadModel.subject,
+                    ),
+                    "participants": case(
+                        (thread_is_newer, thread_statement.excluded.participants),
+                        else_=EmailThreadModel.participants,
+                    ),
                     "latest_message_at": func.greatest(
                         EmailThreadModel.latest_message_at,
                         thread_statement.excluded.latest_message_at,
                     ),
-                    "provider_url": thread_statement.excluded.provider_url,
+                    "provider_url": case(
+                        (thread_is_newer, thread_statement.excluded.provider_url),
+                        else_=EmailThreadModel.provider_url,
+                    ),
+                    "provider_updated_at": case(
+                        (thread_is_newer, thread_statement.excluded.provider_updated_at),
+                        else_=EmailThreadModel.provider_updated_at,
+                    ),
                 },
             ).returning(EmailThreadModel.id)
         )
@@ -289,6 +313,7 @@ class SqlAlchemyMailSyncRepository:
             provider_conversation_id=message.provider_conversation_id,
             received_at=message.received_at,
             sent_at=message.sent_at,
+            provider_updated_at=message.provider_updated_at,
             mailbox_scope_key=message.mailbox_scope_key,
             sender=dict(message.sender),
             recipients=[dict(recipient) for recipient in message.recipients],
@@ -302,13 +327,18 @@ class SqlAlchemyMailSyncRepository:
             headers=dict(message.normalized_reply_headers),
             provider_url=message.provider_url,
         )
-        await self._session.execute(
+        message_is_newer = self._incoming_projection_is_newer(
+            stored=EmailMessageModel.provider_updated_at,
+            incoming=message_statement.excluded.provider_updated_at,
+        )
+        applied_id = await self._session.scalar(
             message_statement.on_conflict_do_update(
                 constraint="uq_email_messages_connection_provider_message",
                 set_={
                     "thread_id": message_statement.excluded.thread_id,
                     "received_at": message_statement.excluded.received_at,
                     "sent_at": message_statement.excluded.sent_at,
+                    "provider_updated_at": message_statement.excluded.provider_updated_at,
                     "internet_message_id": message_statement.excluded.internet_message_id,
                     "provider_conversation_id": (
                         message_statement.excluded.provider_conversation_id
@@ -325,7 +355,13 @@ class SqlAlchemyMailSyncRepository:
                     "headers": message_statement.excluded.headers,
                     "provider_url": message_statement.excluded.provider_url,
                 },
-            )
+                where=message_is_newer,
+            ).returning(EmailMessageModel.id)
+        )
+        return (
+            MailMessageUpsertResult.APPLIED
+            if applied_id is not None
+            else MailMessageUpsertResult.STALE_SKIPPED
         )
 
     async def remove_message(
@@ -551,6 +587,27 @@ class SqlAlchemyMailSyncRepository:
             if email:
                 participants[email.lower()] = {"name": address.get("name", ""), "email": email}
         return list(participants.values())
+
+    @staticmethod
+    def _incoming_projection_is_newer(
+        *,
+        stored: SQLColumnExpression[datetime | None],
+        incoming: SQLColumnExpression[datetime | None],
+    ) -> ColumnElement[bool]:
+        """构造 provider 版本比较：Google 双 NULL 兼容，equal/旧值一律不覆盖。
+
+        ``stored`` 与 ``incoming`` 是 SQLAlchemy 列表达式。返回表达式只用于数据库
+        ``CASE``/``ON CONFLICT WHERE``，避免先读后写造成迟到页面竞态。
+        """
+        return or_(
+            and_(stored.is_(None), incoming.is_(None)),
+            and_(stored.is_(None), incoming.is_not(None)),
+            and_(
+                stored.is_not(None),
+                incoming.is_not(None),
+                incoming > stored,
+            ),
+        )
 
 
 class SqlAlchemyMailSyncRepositoryFactory:

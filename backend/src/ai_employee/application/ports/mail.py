@@ -2,7 +2,8 @@
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
 
@@ -26,6 +27,13 @@ class MailScope:
     well_known_name: str | None = None
 
 
+class MailMessageUpsertResult(StrEnum):
+    """表示规范消息是否成为当前连接内最新的持久 projection。"""
+
+    APPLIED = "applied"
+    STALE_SKIPPED = "stale_skipped"
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class MailMessage:
     """表示已去除供应商 JSON、原始 MIME 与危险正文的一封规范化邮件。
@@ -46,6 +54,7 @@ class MailMessage:
     sanitized_body: str
     received_at: datetime
     sent_at: datetime | None
+    provider_updated_at: datetime | None
     labels: tuple[str, ...]
     normalized_reply_headers: Mapping[str, str]
     provider_url: str
@@ -66,6 +75,7 @@ class MailMessage:
         sanitized_body: str | None = None,
         received_at: datetime | None = None,
         sent_at: datetime | None = None,
+        provider_updated_at: datetime | None = None,
         labels: Sequence[str] = (),
         normalized_reply_headers: Mapping[str, str] | None = None,
         provider_url: str = "",
@@ -90,6 +100,7 @@ class MailMessage:
             sanitized_body: 已在适配器边界清洗的正文。
             received_at: 带时区的接收时间。
             sent_at: 可选带时区发送时间。
+            provider_updated_at: 可选供应商版本时间；Microsoft 必须提供，Google 可为空。
             labels: 供应商标签或类别的规范字符串。
             normalized_reply_headers: 回复所需的规范化 Header 映射。
             provider_url: 供应商界面的只读链接。
@@ -132,6 +143,10 @@ class MailMessage:
             raise ValueError("normalized_reply_headers conflicts with headers")
         resolved_headers = normalized_reply_headers or headers or {}
         resolved_internet_id = internet_message_id or resolved_headers.get("message-id")
+        if provider_updated_at is not None:
+            if provider_updated_at.tzinfo is None or provider_updated_at.utcoffset() is None:
+                raise ValueError("provider_updated_at must be timezone-aware")
+            provider_updated_at = provider_updated_at.astimezone(UTC)
 
         object.__setattr__(self, "provider_message_id", resolved_message_id)
         object.__setattr__(self, "provider_thread_id", resolved_thread_id)
@@ -148,6 +163,7 @@ class MailMessage:
         object.__setattr__(self, "sanitized_body", resolved_body)
         object.__setattr__(self, "received_at", received_at)
         object.__setattr__(self, "sent_at", sent_at)
+        object.__setattr__(self, "provider_updated_at", provider_updated_at)
         object.__setattr__(self, "labels", tuple(labels))
         object.__setattr__(
             self,
@@ -302,6 +318,7 @@ __all__ = [
     "MailConnectionState",
     "MailCursorExpiredError",
     "MailMessage",
+    "MailMessageUpsertResult",
     "MailReader",
     "MailRemoval",
     "MailScope",

@@ -19,6 +19,7 @@ from ai_employee.application.ports.gmail import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.application.ports.mail import MailMessageUpsertResult
 from ai_employee.application.use_cases.sync_gmail import SyncGmailUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.domain.errors import InternalInvariantError, StateConflictError
@@ -88,12 +89,12 @@ class FailingSecondMessageRepository(SqlAlchemyGmailSyncRepository):
         super().__init__(session)
         self._message_writes = 0
 
-    async def upsert_message(self, **kwargs: object) -> None:
+    async def upsert_message(self, **kwargs: object) -> MailMessageUpsertResult:
         """第一条先走真实写入，第二条前抛错使外围事务完整回滚。"""
         self._message_writes += 1
         if self._message_writes == 2:
             raise RuntimeError("synthetic second message persistence failure")
-        await super().upsert_message(**kwargs)
+        return await super().upsert_message(**kwargs)
 
 
 class DisconnectBeforeFinishRepository(SqlAlchemyGmailSyncRepository):

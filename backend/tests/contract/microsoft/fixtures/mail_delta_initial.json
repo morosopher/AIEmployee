@@ -36,6 +36,7 @@
       },
       "receivedDateTime": "2030-01-08T09:30:00Z",
       "sentDateTime": "2030-01-08T09:29:00Z",
+      "lastModifiedDateTime": "2030-01-08T09:31:00Z",
       "categories": [
         "Synthetic Category"
       ],

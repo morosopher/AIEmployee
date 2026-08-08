@@ -7,6 +7,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -193,8 +194,11 @@ def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
                         "AND attribute.attnum = key_info.attnum "
                         "WHERE constraint_info.conname IN ("
                         "'fk_oauth_attempts_target_connection_user', "
+                        "'fk_email_threads_connection_user', "
                         "'fk_email_messages_connection_user', "
+                        "'fk_email_messages_thread_connection_user', "
                         "'uq_oauth_connections_id_user_id', "
+                        "'uq_email_threads_id_connection_user', "
                         "'uq_email_messages_connection_provider_message', "
                         "'uq_sync_cursors_connection_resource', "
                         "'uq_sync_cursors_connection_resource_scope', "
@@ -225,8 +229,10 @@ def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]
                         "FROM pg_catalog.pg_constraint "
                         "WHERE conname IN ("
                         "'fk_oauth_attempts_target_connection_user', "
+                        "'fk_email_threads_connection_user', "
                         "'fk_connection_capabilities_connection_user', "
                         "'fk_email_messages_connection_user', "
+                        "'fk_email_messages_thread_connection_user', "
                         "'fk_provider_calendars_connection_user', "
                         "'fk_users_default_mail_connection_id_user_id', "
                         "'fk_users_default_calendar_connection_id_user_id'"
@@ -272,6 +278,127 @@ def _email_message_identity_metadata(
             await engine.dispose()
 
     return asyncio.run(read_metadata())
+
+
+def _email_identity_column_metadata(
+    database_url: URL,
+) -> dict[str, tuple[str, str]]:
+    """读取邮件连接身份扩展列的数据类型与可空性。"""
+
+    async def read_metadata() -> dict[str, tuple[str, str]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT column_name, data_type, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = 'public' AND table_name = 'email_messages' "
+                        "AND column_name IN ('connection_id', 'provider_updated_at') "
+                        "ORDER BY column_name"
+                    )
+                )
+                return {
+                    str(row[0]): (str(row[1]), str(row[2]))
+                    for row in result
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_metadata())
+
+
+def _email_identity_foreign_key_metadata(
+    database_url: URL,
+) -> dict[str, tuple[bool, bool, bool]]:
+    """读取邮件身份组合外键的验证、可延迟与默认延迟状态。"""
+
+    async def read_metadata() -> dict[str, tuple[bool, bool, bool]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT conname, convalidated, condeferrable, condeferred "
+                        "FROM pg_catalog.pg_constraint "
+                        "WHERE conname IN ("
+                        "'fk_email_threads_connection_user', "
+                        "'fk_email_messages_connection_user', "
+                        "'fk_email_messages_thread_connection_user'"
+                        ")"
+                    )
+                )
+                return {
+                    str(row[0]): (bool(row[1]), bool(row[2]), bool(row[3]))
+                    for row in result
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_metadata())
+
+
+def _email_identity_index_metadata(
+    database_url: URL,
+) -> dict[str, tuple[bool, bool, tuple[str, ...]]]:
+    """读取 0017 两个固定并发索引的有效性、唯一性和列顺序。"""
+
+    async def read_metadata() -> dict[str, tuple[bool, bool, tuple[str, ...]]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT index_class.relname, index_info.indisvalid, "
+                        "index_info.indisunique, ARRAY("
+                        "SELECT attribute.attname "
+                        "FROM unnest(index_info.indkey) WITH ORDINALITY "
+                        "AS index_key(attnum, position) "
+                        "JOIN pg_catalog.pg_attribute AS attribute "
+                        "ON attribute.attrelid = index_info.indrelid "
+                        "AND attribute.attnum = index_key.attnum "
+                        "ORDER BY index_key.position"
+                        ") FROM pg_catalog.pg_index AS index_info "
+                        "JOIN pg_catalog.pg_class AS index_class "
+                        "ON index_class.oid = index_info.indexrelid "
+                        "JOIN pg_catalog.pg_class AS table_class "
+                        "ON table_class.oid = index_info.indrelid "
+                        "JOIN pg_catalog.pg_namespace AS namespace "
+                        "ON namespace.oid = table_class.relnamespace "
+                        "WHERE namespace.nspname = 'public' AND index_class.relname IN ("
+                        "'uq_email_messages_connection_provider_message', "
+                        "'uq_email_threads_id_connection_user'"
+                        ")"
+                    )
+                )
+                return {
+                    str(row[0]): (
+                        bool(row[1]),
+                        bool(row[2]),
+                        tuple(str(value) for value in row[3]),
+                    )
+                    for row in result
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_metadata())
+
+
+def _email_message_count(database_url: URL) -> int:
+    """读取邮件迁移前后业务行数量，降级不得通过删行恢复约束。"""
+
+    async def read_count() -> int:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                return int(
+                    await connection.scalar(text("SELECT count(*) FROM email_messages")) or 0
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_count())
 
 
 def _oauth_attempt_binding_columns(
@@ -642,7 +769,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260808_0016"}
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -668,7 +795,16 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "fk_tool_executions_step_id_task_id": (True, True),
     }
     assert _m2_constraint_columns(empty_migration_database) == {
+        "fk_email_threads_connection_user": (
+            "connection_id",
+            "user_id",
+        ),
         "fk_email_messages_connection_user": (
+            "connection_id",
+            "user_id",
+        ),
+        "fk_email_messages_thread_connection_user": (
+            "thread_id",
             "connection_id",
             "user_id",
         ),
@@ -693,6 +829,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
             "connection_id",
             "provider_message_id",
         ),
+        "uq_email_threads_id_connection_user": ("id", "connection_id", "user_id"),
         "uq_oauth_connections_id_user_id": ("id", "user_id"),
         "uq_provider_calendars_connection_provider_calendar": (
             "connection_id",
@@ -712,7 +849,9 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         ),
     }
     assert _m2_ownership_guard_modes(empty_migration_database) == {
+        "fk_email_threads_connection_user": (True, True),
         "fk_email_messages_connection_user": (True, True),
+        "fk_email_messages_thread_connection_user": (True, True),
         "fk_oauth_attempts_target_connection_user": (True, True),
         "fk_connection_capabilities_connection_user": (True, True),
         "fk_provider_calendars_connection_user": (True, True),
@@ -723,6 +862,15 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         ("uuid", "NO"),
         {"uq_email_messages_connection_provider_message"},
     )
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "NO"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+    assert _email_identity_foreign_key_metadata(empty_migration_database) == {
+        "fk_email_threads_connection_user": (True, True, True),
+        "fk_email_messages_connection_user": (True, True, True),
+        "fk_email_messages_thread_connection_user": (True, True, True),
+    }
     binding_columns = _oauth_attempt_binding_columns(empty_migration_database)
     assert binding_columns[("oauth_attempts", "target_connection_id")] == ("uuid", "YES", None)
     assert binding_columns[("oauth_attempts", "target_authorization_generation")] == (
@@ -773,6 +921,17 @@ def test_mail_message_identity_migration_backfills_and_downgrades_without_row_lo
         "00000000-0000-0000-0000-000000000202",
         True,
     )
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "YES"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+    assert _email_message_identity_metadata(empty_migration_database)[1] == {
+        "uq_email_messages_thread_provider_message"
+    }
+    assert _m2_constraint_columns(empty_migration_database).get(
+        "uq_email_messages_connection_provider_message"
+    ) is None
+    assert _email_identity_foreign_key_metadata(empty_migration_database) == {}
 
     command.downgrade(alembic_config, "20260808_0015")
 
@@ -804,8 +963,506 @@ def test_mail_message_identity_migration_fails_closed_on_historical_duplicates(
         {"20260808_0015"},
         2,
         None,
-        False,
+        True,
     )
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "YES"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+
+    async def repair_duplicate() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE email_messages "
+                        "SET provider_message_id = 'synthetic-message-after-manual-repair' "
+                        "WHERE id = '00000000-0000-0000-0000-000000000222'"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(repair_duplicate())
+    command.upgrade(alembic_config, "20260808_0016")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0016"}
+    assert _email_message_count(empty_migration_database) == 2
+
+
+def _seed_second_mail_identity_connection(database_url: URL) -> None:
+    """为连接级身份测试追加第二个用户/连接及相同供应商消息 ID。"""
+
+    async def seed_rows() -> None:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO users ("
+                        "id, email, display_name, password_hash, timezone, locale, "
+                        "brief_time, is_active, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000203', "
+                        "'mail-identity-owner-two@example.test', 'Mail Identity Owner Two', NULL, "
+                        "'UTC', 'zh-CN', '08:00:00', true, now(), now())"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO oauth_connections ("
+                        "id, user_id, provider, provider_account_id, account_email, scopes, "
+                        "status, last_error_code, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000204', "
+                        "'00000000-0000-0000-0000-000000000203', 'google', "
+                        "'synthetic-mail-identity-account-two', "
+                        "'mail-identity-owner-two@example.test', '[]'::jsonb, "
+                        "'connected', NULL, now(), now())"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_threads ("
+                        "id, user_id, connection_id, provider_thread_id, subject, "
+                        "participants, latest_message_at, provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000213', "
+                        "'00000000-0000-0000-0000-000000000203', "
+                        "'00000000-0000-0000-0000-000000000204', "
+                        "'synthetic-thread-before-migration-two', 'Synthetic thread two', "
+                        "'[]'::jsonb, now(), 'https://example.test/thread-two', now(), now())"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, thread_id, provider_message_id, received_at, "
+                        "mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000223', "
+                        "'00000000-0000-0000-0000-000000000203', "
+                        "'00000000-0000-0000-0000-000000000213', "
+                        "'synthetic-message-before-migration', now(), 'archive', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic message two', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message-two', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_rows())
+
+
+def test_mail_message_identity_migration_fails_closed_on_ownership_mismatch(
+    empty_migration_database: URL,
+) -> None:
+    """0016 不得把跨用户 message/thread 错配固化为 direct connection 事实。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    _seed_second_mail_identity_connection(empty_migration_database)
+
+    async def corrupt_message_owner() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE email_messages "
+                        "SET user_id = '00000000-0000-0000-0000-000000000203' "
+                        "WHERE id = '00000000-0000-0000-0000-000000000221'"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(corrupt_message_owner())
+    with pytest.raises(RuntimeError, match="ownership mismatch"):
+        command.upgrade(alembic_config, "20260808_0016")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0015"}
+    assert _email_message_count(empty_migration_database) == 2
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "YES"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+
+
+def test_mail_message_identity_contract_is_connection_scoped_and_ownership_safe(
+    empty_migration_database: URL,
+) -> None:
+    """0017 切换连接级 ImmutableId，并以组合外键拒绝跨 thread/connection 伪造。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    _seed_second_mail_identity_connection(empty_migration_database)
+
+    command.upgrade(alembic_config, "20260808_0016")
+    command.upgrade(alembic_config, "20260808_0017")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _email_message_identity_metadata(empty_migration_database)[1] == {
+        "uq_email_messages_connection_provider_message"
+    }
+    assert _email_identity_column_metadata(empty_migration_database)["connection_id"] == (
+        "uuid",
+        "NO",
+    )
+    assert _email_identity_foreign_key_metadata(empty_migration_database) == {
+        "fk_email_threads_connection_user": (True, True, True),
+        "fk_email_messages_connection_user": (True, True, True),
+        "fk_email_messages_thread_connection_user": (True, True, True),
+    }
+
+    async def read_count() -> int:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                return int(
+                    await connection.scalar(
+                        text(
+                            "SELECT count(*) FROM email_messages "
+                            "WHERE provider_message_id = 'synthetic-message-before-migration'"
+                        )
+                    )
+                    or 0
+                )
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_count()) == 2
+
+    async def insert_cross_connection_thread() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                # direct connection/user 与 thread ID 分别有效，只有三列组合 FK 能拒绝该错配。
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, connection_id, thread_id, provider_message_id, "
+                        "received_at, mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000224', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'00000000-0000-0000-0000-000000000213', "
+                        "'synthetic-cross-connection-message', now(), 'mailbox', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic mismatch', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message-mismatch', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    with pytest.raises(IntegrityError):
+        asyncio.run(insert_cross_connection_thread())
+
+
+def test_mail_message_identity_contract_upgrades_legacy_0016_shape(
+    empty_migration_database: URL,
+) -> None:
+    """已应用旧版 0016 contract 时，0017 只补缺失对象并保持业务行。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def emulate_legacy_contract() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE email_messages ALTER COLUMN connection_id SET NOT NULL"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE email_messages ADD CONSTRAINT "
+                        "fk_email_messages_connection_user FOREIGN KEY (connection_id, user_id) "
+                        "REFERENCES oauth_connections (id, user_id) ON DELETE CASCADE "
+                        "DEFERRABLE INITIALLY DEFERRED"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE email_messages ADD CONSTRAINT "
+                        "uq_email_messages_connection_provider_message "
+                        "UNIQUE (connection_id, provider_message_id)"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE email_messages DROP CONSTRAINT "
+                        "uq_email_messages_thread_provider_message"
+                    )
+                )
+                await connection.execute(
+                    text("ALTER TABLE email_messages DROP COLUMN provider_updated_at")
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(emulate_legacy_contract())
+    command.upgrade(alembic_config, "20260808_0017")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _email_message_count(empty_migration_database) == 1
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "NO"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+    assert _email_identity_foreign_key_metadata(empty_migration_database) == {
+        "fk_email_threads_connection_user": (True, True, True),
+        "fk_email_messages_connection_user": (True, True, True),
+        "fk_email_messages_thread_connection_user": (True, True, True),
+    }
+
+
+def test_mail_message_identity_contract_rejects_wrong_legacy_foreign_key(
+    empty_migration_database: URL,
+) -> None:
+    """同名但列、目标、级联或延迟语义错误的旧约束必须 fail closed。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def add_wrong_foreign_key() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE email_messages ADD CONSTRAINT "
+                        "fk_email_messages_connection_user FOREIGN KEY (user_id) "
+                        "REFERENCES users (id) ON DELETE RESTRICT"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(add_wrong_foreign_key())
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        command.upgrade(alembic_config, "20260808_0017")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0016"}
+    assert _email_message_count(empty_migration_database) == 1
+
+
+def test_mail_message_identity_contract_downgrades_without_row_loss(
+    empty_migration_database: URL,
+) -> None:
+    """0017→0016→0015 只撤销对应 Schema，不删除连接级邮件事实。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    _seed_second_mail_identity_connection(empty_migration_database)
+    command.upgrade(alembic_config, "20260808_0017")
+
+    assert _email_message_count(empty_migration_database) == 2
+    command.downgrade(alembic_config, "20260808_0016")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0016"}
+    assert _email_message_count(empty_migration_database) == 2
+    assert _email_identity_column_metadata(empty_migration_database) == {
+        "connection_id": ("uuid", "YES"),
+        "provider_updated_at": ("timestamp with time zone", "YES"),
+    }
+    assert _email_message_identity_metadata(empty_migration_database)[1] == {
+        "uq_email_messages_thread_provider_message"
+    }
+    assert _email_identity_foreign_key_metadata(empty_migration_database) == {}
+
+    command.downgrade(alembic_config, "20260808_0015")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0015"}
+    assert _email_message_count(empty_migration_database) == 2
+    assert _email_identity_column_metadata(empty_migration_database) == {}
+
+
+def test_mail_message_identity_contract_rebuilds_only_named_invalid_index(
+    empty_migration_database: URL,
+) -> None:
+    """失败的并发唯一索引可在修复数据后按固定名称安全重建。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def seed_duplicate_projection() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_messages ("
+                        "id, user_id, connection_id, thread_id, provider_message_id, "
+                        "received_at, mailbox_scope_key, sender, recipients, subject, snippet, "
+                        "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                        "provider_url, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000222', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'00000000-0000-0000-0000-000000000212', "
+                        "'synthetic-message-before-migration', now(), 'archive', "
+                        "'{}'::jsonb, '[]'::jsonb, 'Synthetic duplicate projection', '', "
+                        "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                        "'https://example.test/message-duplicate', now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    async def create_invalid_index() -> None:
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_email_messages_connection_provider_message "
+                        "ON email_messages (connection_id, provider_message_id)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_duplicate_projection())
+    with pytest.raises(IntegrityError):
+        asyncio.run(create_invalid_index())
+
+    assert _email_identity_index_metadata(empty_migration_database) == {
+        "uq_email_messages_connection_provider_message": (
+            False,
+            True,
+            ("connection_id", "provider_message_id"),
+        )
+    }
+
+    async def repair_duplicate_projection() -> None:
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE email_messages "
+                        "SET provider_message_id = 'synthetic-message-after-index-repair' "
+                        "WHERE id = '00000000-0000-0000-0000-000000000222'"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(repair_duplicate_projection())
+    command.upgrade(alembic_config, "20260808_0017")
+
+    assert _email_identity_index_metadata(empty_migration_database) == {
+        "uq_email_messages_connection_provider_message": (
+            True,
+            True,
+            ("connection_id", "provider_message_id"),
+        ),
+        "uq_email_threads_id_connection_user": (
+            True,
+            True,
+            ("id", "connection_id", "user_id"),
+        ),
+    }
+
+
+def test_mail_message_identity_contract_attaches_existing_valid_indexes(
+    empty_migration_database: URL,
+) -> None:
+    """0017 重跑应复用已完成但尚未挂载的两个有效并发索引。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def create_valid_indexes() -> None:
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_email_messages_connection_provider_message "
+                        "ON email_messages (connection_id, provider_message_id)"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY uq_email_threads_id_connection_user "
+                        "ON email_threads (id, connection_id, user_id)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create_valid_indexes())
+    command.upgrade(alembic_config, "20260808_0017")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _email_message_identity_metadata(empty_migration_database)[1] == {
+        "uq_email_messages_connection_provider_message"
+    }
+    assert _m2_constraint_columns(empty_migration_database)[
+        "uq_email_threads_id_connection_user"
+    ] == ("id", "connection_id", "user_id")
 
 
 def test_provider_neutral_cursor_migration_renames_only_gmail_resource_kind(

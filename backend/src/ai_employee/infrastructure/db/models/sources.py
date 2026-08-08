@@ -306,14 +306,30 @@ class SyncCursorModel(UUIDPrimaryKeyMixin, Base):
 
 
 class EmailThreadModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """保存 Gmail 线程的最小展示元数据，不保存原始 MIME。"""
+    """保存供应商中立线程元数据，并把线程连接与用户归属绑定到同一事实。"""
 
     __tablename__ = "email_threads"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["connection_id", "user_id"],
+            ["oauth_connections.id", "oauth_connections.user_id"],
+            name="fk_email_threads_connection_user",
+            ondelete="CASCADE",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         UniqueConstraint(
             "connection_id",
             "provider_thread_id",
             name="uq_email_threads_connection_provider_thread",
+        ),
+        # 消息的三列组合外键需要一个与 thread 主键绑定的唯一目标，防止 direct connection
+        # 与所属 thread 在数据库层出现跨连接/跨用户错配。
+        UniqueConstraint(
+            "id",
+            "connection_id",
+            "user_id",
+            name="uq_email_threads_id_connection_user",
         ),
     )
     user_id: Mapped[UUID] = mapped_column(
@@ -351,6 +367,14 @@ class EmailMessageModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             deferrable=True,
             initially="DEFERRED",
         ),
+        ForeignKeyConstraint(
+            ["thread_id", "connection_id", "user_id"],
+            ["email_threads.id", "email_threads.connection_id", "email_threads.user_id"],
+            name="fk_email_messages_thread_connection_user",
+            ondelete="CASCADE",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         UniqueConstraint(
             "connection_id",
             "provider_message_id",
@@ -369,6 +393,10 @@ class EmailMessageModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     provider_conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Microsoft Graph 的 lastModifiedDateTime 用于拒绝迟到 projection；历史 Google 行为空。
+    provider_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     mailbox_scope_key: Mapped[str] = mapped_column(
         String(512),
         nullable=False,

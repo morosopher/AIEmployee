@@ -13,7 +13,11 @@ from ai_employee.application.ports.calendar import (
     CalendarEvent,
     CalendarSyncPage,
 )
-from ai_employee.application.ports.mail import MailConnectionState, MailSyncPage
+from ai_employee.application.ports.mail import (
+    MailConnectionState,
+    MailMessageUpsertResult,
+    MailSyncPage,
+)
 from ai_employee.application.use_cases.sync_calendar import SyncCalendarUseCase
 from ai_employee.application.use_cases.sync_mail import SyncMailUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
@@ -125,7 +129,7 @@ class FakeMailStore:
         """初始同步不应清除游标。"""
         raise AssertionError(f"unexpected cursor clear: {kwargs!r}")
 
-    async def upsert_message(self, **kwargs: object) -> None:
+    async def upsert_message(self, **kwargs: object) -> MailMessageUpsertResult:
         """空页面不应产生消息写入。"""
         self.message_write_count += 1
         raise AssertionError(f"unexpected message write: {kwargs!r}")

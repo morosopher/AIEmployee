@@ -36,6 +36,7 @@
       },
       "receivedDateTime": "2030-01-08T10:30:00+00:00",
       "sentDateTime": "2030-01-08T10:29:00+00:00",
+      "lastModifiedDateTime": "2030-01-08T10:31:00+00:00",
       "categories": [],
       "webLink": "https://outlook.office.example.test/mail/synthetic-message-2"
     },

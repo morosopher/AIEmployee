@@ -12,6 +12,7 @@ from ai_employee.application.ports.mail import (
     MailConnectionState,
     MailCursorExpiredError,
     MailMessage,
+    MailMessageUpsertResult,
     MailReader,
     MailRemoval,
     MailSyncPage,
@@ -51,7 +52,7 @@ class MailSyncStore(Protocol):
         connection_id: UUID,
         message: MailMessage,
         encrypted_body: EncryptedValue,
-    ) -> None: ...
+    ) -> MailMessageUpsertResult: ...
 
     async def remove_message(
         self,
@@ -202,14 +203,15 @@ class SyncMailUseCase:
                             message="Mail message scope does not match sync scope",
                         )
                     encrypted = self._encrypt_body(user_id, connection_id, message)
-                    await store.upsert_message(
+                    upsert_result = await store.upsert_message(
                         user_id=user_id,
                         connection_id=connection_id,
                         message=message,
                         encrypted_body=encrypted,
                     )
-                    thread_ids.add(message.provider_thread_id)
-                    message_count += 1
+                    if upsert_result == MailMessageUpsertResult.APPLIED:
+                        thread_ids.add(message.provider_thread_id)
+                        message_count += 1
                 for removal in page.removals:
                     if removal.mailbox_scope_key != scope_key:
                         raise InternalInvariantError(

@@ -9,6 +9,7 @@ token 和 opaque URL 不会进入日志、异常或持久化层。适配器只�
 from __future__ import annotations
 
 import html
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
@@ -37,6 +38,8 @@ MICROSOFT_GRAPH_HOST = "graph.microsoft.com"
 MICROSOFT_MAIL_TIMEOUT_SECONDS = 15.0
 MICROSOFT_MAIL_CONNECT_TIMEOUT_SECONDS = 3.0
 MICROSOFT_MAIL_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MICROSOFT_MAIL_MAX_CHAIN_BYTES = 32 * 1024 * 1024
+MICROSOFT_MAIL_MAX_NORMALIZED_BYTES = 32 * 1024 * 1024
 MICROSOFT_MAIL_MAX_PAGES = 100
 MICROSOFT_MAIL_MAX_ITEMS = 10_000
 MICROSOFT_MAIL_MAX_STRING_LENGTH = 16_384
@@ -45,7 +48,7 @@ MICROSOFT_MAIL_MAX_PERSISTED_ID_LENGTH = 255
 
 _MAIL_SELECT = (
     "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,"
-    "subject,body,receivedDateTime,sentDateTime,categories,webLink"
+    "subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink"
 )
 _MESSAGE_SELECT = _MAIL_SELECT
 _PREFER_HEADER = 'IdType="ImmutableId"'
@@ -80,6 +83,8 @@ class MicrosoftMailAdapter(MailReader):
         self._access_token = access_token
         self._refresh_access_token = refresh_access_token
         self._refresh_attempted = False
+        self._chain_wire_bytes = 0
+        self._chain_normalized_bytes = 0
 
     async def list_sync_scopes(self) -> tuple[MailScope, ...]:
         """发现可访问 mailFolders，保留 Sent 并排除 Deleted/Junk。
@@ -95,6 +100,7 @@ class MicrosoftMailAdapter(MailReader):
                 "includeHiddenFolders": "false",
                 "$select": "id,displayName,wellKnownName",
             },
+            expected_path="/v1.0/me/mailFolders",
         )
         try:
             scopes = tuple(self._normalize_scope(item) for item in values)
@@ -168,6 +174,7 @@ class MicrosoftMailAdapter(MailReader):
         values = await self._list_collection(
             f"{MICROSOFT_GRAPH_BASE_URL}/me/mailFolders/sentitems/messages",
             params={"$filter": " and ".join(filters), "$select": _MESSAGE_SELECT},
+            expected_path="/v1.0/me/mailFolders/sentitems/messages",
         )
         normalized: list[MailMessage] = []
         for item in values:
@@ -185,8 +192,9 @@ class MicrosoftMailAdapter(MailReader):
         url: str,
         *,
         params: Mapping[str, str],
+        expected_path: str,
     ) -> tuple[Mapping[str, object], ...]:
-        """读取普通 Graph collection，跟随安全 nextLink 但不伪造 delta 游标。"""
+        """读取固定 Graph collection，nextLink 只能保留同一精确 path。"""
         current_url = url
         current_params: Mapping[str, str] | None = params
         seen: set[str] = set()
@@ -210,7 +218,10 @@ class MicrosoftMailAdapter(MailReader):
             next_link = self._optional_string(payload, "@odata.nextLink")
             if next_link is None:
                 return tuple(values)
-            current_url = self._validate_absolute_graph_url(next_link)
+            current_url = self._validate_collection_url(
+                next_link,
+                expected_path=expected_path,
+            )
         raise PermanentProviderError(
             error_code="microsoft_mail_pagination_invalid",
             message="Microsoft mail pagination is invalid",
@@ -300,7 +311,7 @@ class MicrosoftMailAdapter(MailReader):
         params: Mapping[str, str] | None,
         cursor_scope: str | None = None,
     ) -> Mapping[str, object]:
-        """执行一次只读 GET，统一处理超时、401/403/429/5xx 和 JSON 大小边界。"""
+        """流式执行只读 GET，并在解析前实施单响应及整链双重预算。"""
         for attempt in range(2):
             timeout = httpx.Timeout(
                 MICROSOFT_MAIL_TIMEOUT_SECONDS,
@@ -310,16 +321,75 @@ class MicrosoftMailAdapter(MailReader):
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     follow_redirects=False,
-                ) as client:
-                    response = await client.get(
-                        url,
-                        params=params,
-                        headers={
-                            "Authorization": f"Bearer {self._access_token}",
-                            "Accept": "application/json",
-                            "Prefer": _PREFER_HEADER,
-                        },
-                    )
+                ) as client, client.stream(
+                    "GET",
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {self._access_token}",
+                        "Accept": "application/json",
+                        "Prefer": _PREFER_HEADER,
+                    },
+                ) as response:
+                    if response.status_code == 401:
+                        if (
+                            attempt == 0
+                            and not self._refresh_attempted
+                            and self._refresh_access_token is not None
+                        ):
+                            self._refresh_attempted = True
+                            self._access_token = await self._refresh_access_token()
+                            continue
+                        raise UserActionRequiredError(
+                            error_code="microsoft_reauthorization_required",
+                            message="Microsoft authorization requires user action",
+                        )
+                    if response.status_code == 403:
+                        raise UserActionRequiredError(
+                            error_code="microsoft_mail_permission_required",
+                            message="Microsoft mail read permission requires user action",
+                        )
+                    if response.status_code in {404, 410} and cursor_scope is not None:
+                        raise MailCursorExpiredError("microsoft", cursor_scope)
+                    if response.status_code == 429:
+                        raise TransientProviderError(
+                            error_code="microsoft_mail_rate_limited",
+                            message="Microsoft mail is temporarily rate limited",
+                            retry_after=self._retry_after(response),
+                        )
+                    if response.status_code >= 500:
+                        raise TransientProviderError(
+                            error_code="microsoft_mail_service_unavailable",
+                            message="Microsoft mail is temporarily unavailable",
+                            retry_after=self._retry_after(response),
+                        )
+                    if not 200 <= response.status_code < 300:
+                        raise PermanentProviderError(
+                            error_code="microsoft_mail_request_rejected",
+                            message="Microsoft mail request was rejected",
+                        )
+
+                    content_length = self._trusted_content_length(response)
+                    if content_length is not None:
+                        if content_length > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
+                            raise self._response_too_large()
+                        if (
+                            self._chain_wire_bytes + content_length
+                            > MICROSOFT_MAIL_MAX_CHAIN_BYTES
+                        ):
+                            raise self._sync_budget_exceeded()
+
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        response_size = len(body) + len(chunk)
+                        if response_size > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
+                            raise self._response_too_large()
+                        if (
+                            self._chain_wire_bytes + response_size
+                            > MICROSOFT_MAIL_MAX_CHAIN_BYTES
+                        ):
+                            raise self._sync_budget_exceeded()
+                        body.extend(chunk)
             except httpx.TimeoutException:
                 raise TransientProviderError(
                     error_code="microsoft_mail_timeout",
@@ -330,60 +400,27 @@ class MicrosoftMailAdapter(MailReader):
                     error_code="microsoft_mail_request_failed",
                     message="Microsoft mail request failed",
                 ) from None
-
-            if response.status_code == 401:
-                if (
-                    attempt == 0
-                    and not self._refresh_attempted
-                    and self._refresh_access_token is not None
-                ):
-                    self._refresh_attempted = True
-                    self._access_token = await self._refresh_access_token()
-                    continue
-                raise UserActionRequiredError(
-                    error_code="microsoft_reauthorization_required",
-                    message="Microsoft authorization requires user action",
-                )
-            if response.status_code == 403:
-                raise UserActionRequiredError(
-                    error_code="microsoft_mail_permission_required",
-                    message="Microsoft mail read permission requires user action",
-                )
-            if response.status_code in {404, 410} and cursor_scope is not None:
-                raise MailCursorExpiredError("microsoft", cursor_scope)
-            if response.status_code == 429:
-                raise TransientProviderError(
-                    error_code="microsoft_mail_rate_limited",
-                    message="Microsoft mail is temporarily rate limited",
-                    retry_after=self._retry_after(response),
-                )
-            if response.status_code >= 500:
-                raise TransientProviderError(
-                    error_code="microsoft_mail_service_unavailable",
-                    message="Microsoft mail is temporarily unavailable",
-                    retry_after=self._retry_after(response),
-                )
-            if not 200 <= response.status_code < 300:
-                raise PermanentProviderError(
-                    error_code="microsoft_mail_request_rejected",
-                    message="Microsoft mail request was rejected",
-                )
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                try:
-                    if int(content_length) > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
-                        raise self._response_too_large()
-                except ValueError:
-                    # 畸形长度头不被当作可信大小；实际 body 长度仍会经过下方上限。
-                    pass
-            if len(response.content) > MICROSOFT_MAIL_MAX_RESPONSE_BYTES:
-                raise self._response_too_large()
             try:
-                payload = response.json()
+                payload = json.loads(body)
             except (TypeError, ValueError):
                 raise self._invalid_response() from None
             if not isinstance(payload, Mapping):
                 raise self._invalid_response()
+            normalized_size = len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            if (
+                self._chain_normalized_bytes + normalized_size
+                > MICROSOFT_MAIL_MAX_NORMALIZED_BYTES
+            ):
+                raise self._sync_budget_exceeded()
+            self._chain_wire_bytes += len(body)
+            self._chain_normalized_bytes += normalized_size
             return payload
         raise AssertionError("Microsoft mail request retry loop exhausted")
 
@@ -460,6 +497,7 @@ class MicrosoftMailAdapter(MailReader):
             else cls._clean_plain(content)
         )
         received_at = cls._datetime(item, "receivedDateTime")
+        provider_updated_at = cls._datetime(item, "lastModifiedDateTime")
         sent_value = item.get("sentDateTime")
         sent_at = (
             cls._datetime_value(sent_value, "sentDateTime") if sent_value is not None else None
@@ -490,6 +528,7 @@ class MicrosoftMailAdapter(MailReader):
             sanitized_body=body,
             received_at=received_at,
             sent_at=sent_at,
+            provider_updated_at=provider_updated_at,
             labels=categories,
             normalized_reply_headers=headers,
             provider_url=provider_url,
@@ -673,7 +712,11 @@ class MicrosoftMailAdapter(MailReader):
     @classmethod
     def _validate_delta_url(cls, value: str, *, scope_key: str) -> str:
         """验证 cursor 是当前 folder 的精确 Graph absolute URL。"""
-        url = cls._validate_absolute_graph_url(value)
+        url = cls._validate_absolute_graph_url(
+            value,
+            error_code="microsoft_mail_invalid_delta_url",
+            message="Microsoft mail delta URL is invalid",
+        )
         expected_path = f"/v1.0/me/mailFolders/{quote(scope_key, safe='')}/messages/delta"
         if urlsplit(url).path != expected_path:
             raise PermanentProviderError(
@@ -682,13 +725,28 @@ class MicrosoftMailAdapter(MailReader):
             )
         return url
 
+    @classmethod
+    def _validate_collection_url(cls, value: str, *, expected_path: str) -> str:
+        """验证普通 collection nextLink 仍绑定调用方声明的精确 Graph path。"""
+        url = cls._validate_absolute_graph_url(
+            value,
+            error_code="microsoft_mail_invalid_collection_url",
+            message="Microsoft mail collection URL is invalid",
+        )
+        if urlsplit(url).path != expected_path:
+            raise PermanentProviderError(
+                error_code="microsoft_mail_invalid_collection_url",
+                message="Microsoft mail collection URL is invalid",
+            )
+        return url
+
     @staticmethod
-    def _validate_absolute_graph_url(value: str) -> str:
+    def _validate_absolute_graph_url(value: str, *, error_code: str, message: str) -> str:
         """只接受精确 HTTPS Graph 主机，禁止重定向、userinfo、port 与 fragment。"""
         if not isinstance(value, str):
             raise PermanentProviderError(
-                error_code="microsoft_mail_invalid_delta_url",
-                message="Microsoft mail delta URL is invalid",
+                error_code=error_code,
+                message=message,
             )
         try:
             parsed = urlsplit(value)
@@ -696,8 +754,8 @@ class MicrosoftMailAdapter(MailReader):
         except ValueError:
             # 畸形 IPv6/port 解析错误可能包含 opaque URL；切断异常链并仅暴露固定错误。
             raise PermanentProviderError(
-                error_code="microsoft_mail_invalid_delta_url",
-                message="Microsoft mail delta URL is invalid",
+                error_code=error_code,
+                message=message,
             ) from None
         if (
             parsed.scheme != "https"
@@ -709,10 +767,22 @@ class MicrosoftMailAdapter(MailReader):
             or parsed.path == ""
         ):
             raise PermanentProviderError(
-                error_code="microsoft_mail_invalid_delta_url",
-                message="Microsoft mail delta URL is invalid",
+                error_code=error_code,
+                message=message,
             )
         return value
+
+    @staticmethod
+    def _trusted_content_length(response: httpx.Response) -> int | None:
+        """只信任非负十进制 Content-Length；畸形头交由实际流式计数收窄。"""
+        raw = response.headers.get("Content-Length")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
 
     @staticmethod
     def _odata_literal(value: str) -> str:
@@ -747,13 +817,25 @@ class MicrosoftMailAdapter(MailReader):
             message="Microsoft mail response is too large",
         )
 
+    @staticmethod
+    def _sync_budget_exceeded() -> PermanentProviderError:
+        """创建不含 URL、长度或正文的整链容量错误。"""
+        return PermanentProviderError(
+            error_code="microsoft_mail_sync_budget_exceeded",
+            message="Microsoft mail sync budget was exceeded",
+        )
+
     def _reset_refresh_budget(self) -> None:
-        """每个独立只读操作拥有一次 refresh 预算，避免分页循环无限刷新。"""
+        """重置单次只读链的刷新、wire 与规范化容量预算。"""
         self._refresh_attempted = False
+        self._chain_wire_bytes = 0
+        self._chain_normalized_bytes = 0
 
 
 __all__ = [
     "MICROSOFT_GRAPH_BASE_URL",
+    "MICROSOFT_MAIL_MAX_CHAIN_BYTES",
+    "MICROSOFT_MAIL_MAX_NORMALIZED_BYTES",
     "MICROSOFT_MAIL_MAX_RESPONSE_BYTES",
     "MicrosoftMailAdapter",
 ]

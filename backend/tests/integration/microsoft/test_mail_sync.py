@@ -56,7 +56,7 @@ INBOX_NEXT_URL = f"{INBOX_DELTA_URL}?$skiptoken=synthetic-next-1"
 INBOX_DELTA_LINK = f"{INBOX_DELTA_URL}?$deltatoken=synthetic-delta-2"
 MAIL_SELECT = (
     "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,"
-    "subject,body,receivedDateTime,sentDateTime,categories,webLink"
+    "subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink"
 )
 INITIAL_PARAMS = {
     "$filter": "receivedDateTime ge 2030-01-01T12:00:00Z",
@@ -89,6 +89,7 @@ def _message(
     subject: str = "Synthetic subject",
     body: str = "Synthetic body",
     received_at: datetime | None = None,
+    provider_updated_at: datetime | None = None,
 ) -> MailMessage:
     """构造可改变 thread/scope/metadata 的合成规范消息。"""
     resolved_thread_id = thread_id or f"synthetic-thread-{message_id}"
@@ -104,6 +105,7 @@ def _message(
         sanitized_body=body,
         received_at=received_at or datetime(2030, 1, 8, tzinfo=UTC),
         sent_at=datetime(2030, 1, 8, tzinfo=UTC),
+        provider_updated_at=provider_updated_at,
         labels=("Synthetic",),
         normalized_reply_headers={"from": "sender@example.test"},
         provider_url=f"https://outlook.office.example.test/mail/{resolved_thread_id}",
@@ -147,6 +149,32 @@ class _BlockingMailReader:
         assert cursor == "synthetic-delta-old"
         self.loaded.set()
         await self.release.wait()
+        yield self.page
+
+
+@dataclass(slots=True)
+class _SinglePageMailReader:
+    """返回一页固定增量，用于验证 stale skip 与 cursor CAS 相互独立。"""
+
+    page: MailSyncPage
+    expected_cursor: str
+
+    async def list_sync_scopes(self) -> tuple[object, ...]:
+        """该场景已有精确 folder scope，不重复发现目录。"""
+        return ()
+
+    async def initial_pages(
+        self, scope_key: str, *, since: datetime
+    ) -> AsyncIterator[MailSyncPage]:
+        """测试只走已有 cursor 的增量分支。"""
+        del scope_key, since
+        if False:
+            yield self.page
+
+    async def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
+        """返回供应商已确认消费的一页迟到 projection。"""
+        assert scope_key == "synthetic-folder-inbox"
+        assert cursor == self.expected_cursor
         yield self.page
 
 
@@ -504,6 +532,230 @@ async def test_same_connection_message_replay_moves_one_fact_to_latest_thread_an
             )
             == b"Synthetic body after move"
         )
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newer_first", (False, True))
+async def test_provider_version_keeps_newest_message_projection_for_both_commit_orders(
+    database_url: str,
+    newer_first: bool,
+) -> None:
+    """较旧 Graph projection 即使后提交，也不得覆盖较新 thread/scope/body。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"v" * 32)
+    message_id = "synthetic-versioned-message"
+    older = _message(
+        message_id,
+        thread_id="synthetic-versioned-thread",
+        scope_key="synthetic-folder-inbox",
+        subject="Synthetic older subject",
+        body="Synthetic older body",
+        received_at=datetime(2030, 1, 8, 9, tzinfo=UTC),
+        provider_updated_at=datetime(2030, 1, 8, 9, 5, tzinfo=UTC),
+    )
+    newer = _message(
+        message_id,
+        thread_id="synthetic-versioned-thread",
+        scope_key="synthetic-folder-archive",
+        subject="Synthetic newer subject",
+        body="Synthetic newer body",
+        received_at=datetime(2030, 1, 8, 10, tzinfo=UTC),
+        provider_updated_at=datetime(2030, 1, 8, 10, 5, tzinfo=UTC),
+    )
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+        for message in ((newer, older) if newer_first else (older, newer)):
+            await _upsert_repository_message(
+                sessions,
+                cipher,
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                message=message,
+            )
+
+        async with sessions() as session:
+            stored = await session.scalar(
+                select(EmailMessageModel).where(
+                    EmailMessageModel.connection_id == CONNECTION_ONE,
+                    EmailMessageModel.provider_message_id == message_id,
+                )
+            )
+            thread = await session.scalar(
+                select(EmailThreadModel).where(
+                    EmailThreadModel.connection_id == CONNECTION_ONE,
+                    EmailThreadModel.provider_thread_id == "synthetic-versioned-thread",
+                )
+            )
+
+        assert stored is not None and thread is not None
+        assert stored.provider_updated_at == datetime(2030, 1, 8, 10, 5, tzinfo=UTC)
+        assert stored.mailbox_scope_key == "synthetic-folder-archive"
+        assert stored.subject == "Synthetic newer subject"
+        assert thread.subject == "Synthetic newer subject"
+        assert thread.latest_message_at == datetime(2030, 1, 8, 10, tzinfo=UTC)
+        assert stored.body_ciphertext is not None
+        assert (
+            cipher.decrypt(
+                EncryptedValue(
+                    stored.body_ciphertext,
+                    stored.body_nonce,
+                    stored.body_key_version,
+                ),
+                f"{USER_ONE}:{CONNECTION_ONE}:{message_id}:body".encode("ascii"),
+            )
+            == b"Synthetic newer body"
+        )
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_equal_provider_version_does_not_replace_existing_projection(
+    database_url: str,
+) -> None:
+    """相同 Graph 版本视为幂等重放，冲突 projection 保留先前已提交事实。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"e" * 32)
+    message_id = "synthetic-equal-version-message"
+    version = datetime(2030, 1, 8, 11, 5, tzinfo=UTC)
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+        first = _message(
+            message_id,
+            thread_id="synthetic-equal-thread",
+            scope_key="synthetic-folder-inbox",
+            subject="Synthetic first equal subject",
+            body="Synthetic first equal body",
+            provider_updated_at=version,
+        )
+        conflicting = _message(
+            message_id,
+            thread_id="synthetic-equal-thread",
+            scope_key="synthetic-folder-archive",
+            subject="Synthetic conflicting equal subject",
+            body="Synthetic conflicting equal body",
+            provider_updated_at=version,
+        )
+        for message in (first, conflicting):
+            await _upsert_repository_message(
+                sessions,
+                cipher,
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                message=message,
+            )
+
+        async with sessions() as session:
+            stored = await session.scalar(
+                select(EmailMessageModel).where(
+                    EmailMessageModel.connection_id == CONNECTION_ONE,
+                    EmailMessageModel.provider_message_id == message_id,
+                )
+            )
+        assert stored is not None
+        assert stored.mailbox_scope_key == "synthetic-folder-inbox"
+        assert stored.subject == "Synthetic first equal subject"
+        assert stored.body_ciphertext is not None
+        assert (
+            cipher.decrypt(
+                EncryptedValue(
+                    stored.body_ciphertext,
+                    stored.body_nonce,
+                    stored.body_key_version,
+                ),
+                f"{USER_ONE}:{CONNECTION_ONE}:{message_id}:body".encode("ascii"),
+            )
+            == b"Synthetic first equal body"
+        )
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_projection_skip_still_advances_confirmed_folder_cursor(
+    database_url: str,
+) -> None:
+    """迟到消息被跳过时仍推进供应商确认的 Delta cursor，避免永久重放同一页。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"k" * 32)
+    message_id = "synthetic-stale-cursor-message"
+    current_cursor = "synthetic-current-cursor"
+    next_cursor = "synthetic-next-cursor"
+    newer = _message(
+        message_id,
+        scope_key="synthetic-folder-archive",
+        subject="Synthetic current projection",
+        body="Synthetic current body",
+        provider_updated_at=datetime(2030, 1, 8, 12, 5, tzinfo=UTC),
+    )
+    stale = _message(
+        message_id,
+        scope_key="synthetic-folder-inbox",
+        subject="Synthetic stale projection",
+        body="Synthetic stale body",
+        provider_updated_at=datetime(2030, 1, 8, 11, 5, tzinfo=UTC),
+    )
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={"synthetic-folder-inbox": current_cursor},
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            message=newer,
+        )
+        reader = _SinglePageMailReader(
+            MailSyncPage((stale,), None, next_cursor),
+            current_cursor,
+        )
+        result = await SyncMailUseCase(
+            lambda: _repository_factory(sessions),
+            ProviderAdapterRegistry(microsoft_mail=reader),
+            cipher,
+            clock=_FixedClock(datetime(2030, 1, 8, 13, tzinfo=UTC)),
+        ).execute(
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_key="synthetic-folder-inbox",
+        )
+
+        async with sessions() as session:
+            stored = await session.scalar(
+                select(EmailMessageModel).where(
+                    EmailMessageModel.connection_id == CONNECTION_ONE,
+                    EmailMessageModel.provider_message_id == message_id,
+                )
+            )
+            cursor = await session.scalar(
+                select(SyncCursorModel).where(
+                    SyncCursorModel.connection_id == CONNECTION_ONE,
+                    SyncCursorModel.scope_key == "synthetic-folder-inbox",
+                )
+            )
+        assert result.messages_upserted == 0
+        assert stored is not None and stored.subject == "Synthetic current projection"
+        assert stored.mailbox_scope_key == "synthetic-folder-archive"
+        assert cursor is not None and cursor.cursor == next_cursor
     finally:
         await sessions.dispose()
 

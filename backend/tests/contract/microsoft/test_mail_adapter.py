@@ -15,6 +15,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
+from typing import ClassVar, Self
 from urllib.parse import parse_qs
 
 import httpx
@@ -101,7 +102,7 @@ async def test_initial_delta_uses_explicit_utc_lower_bound_and_final_delta_link(
         INBOX_DELTA_URL,
         params={
             "$filter": "receivedDateTime ge 2030-01-01T08:15:00Z",
-            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,categories,webLink",
+            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
         },
     ).respond(200, json=_fixture("mail_delta_initial.json"))
     second = respx.get(NEXT_URL).respond(200, json=_fixture("mail_delta_incremental.json"))
@@ -134,6 +135,7 @@ async def test_initial_delta_uses_explicit_utc_lower_bound_and_final_delta_link(
     )
     assert normalized.sanitized_body == "Synthetic incremental body"
     assert normalized.received_at == datetime(2030, 1, 8, 10, 30, tzinfo=UTC)
+    assert normalized.provider_updated_at == datetime(2030, 1, 8, 10, 31, tzinfo=UTC)
     assert normalized.mailbox_scope_key == "synthetic-folder-inbox"
     assert [removal.provider_message_id for removal in final_page.removals] == [  # type: ignore[attr-defined]
         "synthetic-message-removed"
@@ -238,6 +240,158 @@ async def test_delta_rejects_same_host_next_link_for_another_folder() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_collection_rejects_same_host_next_link_with_wrong_collection_path() -> None:
+    """普通 collection 的同主机 nextLink 也必须绑定预期 path，不能只校验 host。"""
+    payload = _fixture("mail_folders.json")
+    wrong_path = f"{GRAPH_BASE_URL}/me/messages?$skiptoken=synthetic-wrong-path"
+    payload["@odata.nextLink"] = wrong_path
+    respx.get(MAIL_FOLDERS_URL).respond(200, json=payload)
+    wrong_route = respx.get(wrong_path).respond(200, json={"value": []})
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_invalid_collection_url"
+    assert not wrong_route.called
+    assert "synthetic-wrong-path" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_collection_next_link_preserves_opaque_query() -> None:
+    """合法 collection nextLink 的 query 必须原样转发，不能重建或丢失 opaque 参数。"""
+    payload = _fixture("mail_folders.json")
+    opaque_next = (
+        f"{MAIL_FOLDERS_URL}?$skiptoken=synthetic%2Bopaque%3Dvalue&opaque=keep%2Fexact"
+    )
+    payload["@odata.nextLink"] = opaque_next
+    first = respx.get(
+        MAIL_FOLDERS_URL,
+        params={
+            "includeHiddenFolders": "false",
+            "$select": "id,displayName,wellKnownName",
+        },
+    ).respond(200, json=payload)
+    second = respx.get(opaque_next).respond(200, json={"value": []})
+
+    scopes = await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert scopes
+    assert first.called and second.called
+    assert str(second.calls[0].request.url) == opaque_next
+
+
+class _ChunkedResponse:
+    """只提供流式读取接口的合成响应，禁止实现退回完整 content 缓冲。"""
+
+    status_code = 200
+    headers: ClassVar[dict[str, str]] = {"Content-Type": "application/json"}
+
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    @property
+    def content(self) -> bytes:
+        """若生产代码读取完整 body，测试应立即失败。"""
+        raise AssertionError("streaming response must not access content")
+
+    async def aiter_bytes(self):
+        """按多个 chunk 返回合成 wire body。"""
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        """记录 adapter 是否在超限时关闭响应。"""
+        self.closed = True
+
+
+class _StreamContext:
+    """实现 AsyncClient.stream 所需的最小异步上下文。"""
+
+    def __init__(self, response: _ChunkedResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _ChunkedResponse:
+        return self.response
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+        await self.response.aclose()
+
+
+class _StreamingClient:
+    """替代 HTTPX client，确保 adapter 使用 stream 而非完整缓冲 get。"""
+
+    response: _ChunkedResponse
+
+    def __init__(self, response: _ChunkedResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+    def stream(self, *args: object, **kwargs: object) -> _StreamContext:
+        del args, kwargs
+        return _StreamContext(self.response)
+
+    async def get(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("Microsoft mail reads must use AsyncClient.stream")
+
+
+@pytest.mark.asyncio
+async def test_streaming_response_aborts_and_closes_after_byte_limit(monkeypatch) -> None:
+    """chunked body 超过单响应预算时应立即中止并关闭，而不是缓冲完整正文。"""
+    module = _mail_module()
+    monkeypatch.setattr(module, "MICROSOFT_MAIL_MAX_RESPONSE_BYTES", 8)
+    response = _ChunkedResponse((b'{"value":', b"123456789", b"}"))
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **_kwargs: _StreamingClient(response))
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await module.MicrosoftMailAdapter(access_token="synthetic-token").list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_response_too_large"
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delta_chain_budget_fails_before_cursor_pages_are_returned(monkeypatch) -> None:
+    """多页 wire 总量超过链预算时必须 fail closed，不能返回可推进的 cursor。"""
+    module = _mail_module()
+    monkeypatch.setattr(module, "MICROSOFT_MAIL_MAX_CHAIN_BYTES", 2_000, raising=False)
+    first_payload = _fixture("mail_delta_initial.json")
+    second_payload = _fixture("mail_delta_incremental.json")
+    respx.get(
+        INBOX_DELTA_URL,
+        params={
+            "$filter": "receivedDateTime ge 2030-01-01T00:00:00Z",
+            "$select": (
+                "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,"
+                "bccRecipients,subject,body,receivedDateTime,sentDateTime,"
+                "lastModifiedDateTime,categories,webLink"
+            ),
+        },
+    ).respond(200, json=first_payload)
+    respx.get(NEXT_URL).respond(200, json=second_payload)
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _collect(
+            module.MicrosoftMailAdapter(access_token="synthetic-token").initial_pages(  # type: ignore[attr-defined]
+                "synthetic-folder-inbox",
+                since=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    assert raised.value.error_code == "microsoft_mail_sync_budget_exceeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_delta_pagination_cycle_is_rejected_without_logging_opaque_url(caplog) -> None:
     """重复 nextLink 必须在有限页内失败，异常与日志都不得包含 opaque URL。"""
     first_payload = _fixture("mail_delta_initial.json")
@@ -248,7 +402,7 @@ async def test_delta_pagination_cycle_is_rejected_without_logging_opaque_url(cap
         INBOX_DELTA_URL,
         params={
             "$filter": "receivedDateTime ge 2030-01-01T00:00:00Z",
-            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,categories,webLink",
+            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
         },
     ).respond(200, json=first_payload)
     cyclic = respx.get(NEXT_URL).respond(200, json=cyclic_payload)
@@ -450,6 +604,49 @@ async def test_malformed_message_field_is_permanent_safe_error() -> None:
         )
     assert raised.value.error_code == "microsoft_mail_invalid_response"
     assert "synthetic-sensitive-malformed-value" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_message_missing_last_modified_datetime_fails_closed() -> None:
+    """Microsoft message 缺少供应商版本时不得创建不可排序的本地 projection。"""
+    payload = _fixture("mail_delta_incremental.json")
+    messages = payload["value"]
+    assert isinstance(messages, list) and isinstance(messages[0], dict)
+    messages[0].pop("lastModifiedDateTime", None)
+    respx.get(INBOX_DELTA_URL).respond(200, json=payload)
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _collect(
+            _adapter().initial_pages(  # type: ignore[attr-defined]
+                "synthetic-folder-inbox",
+                since=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    assert raised.value.error_code == "microsoft_mail_invalid_response"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_message_malformed_last_modified_datetime_fails_closed() -> None:
+    """畸形供应商版本必须永久失败，且错误不回显第三方字段内容。"""
+    payload = _fixture("mail_delta_incremental.json")
+    messages = payload["value"]
+    assert isinstance(messages, list) and isinstance(messages[0], dict)
+    messages[0]["lastModifiedDateTime"] = "synthetic-sensitive-invalid-version"
+    respx.get(INBOX_DELTA_URL).respond(200, json=payload)
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _collect(
+            _adapter().initial_pages(  # type: ignore[attr-defined]
+                "synthetic-folder-inbox",
+                since=datetime(2030, 1, 1, tzinfo=UTC),
+            )
+        )
+
+    assert raised.value.error_code == "microsoft_mail_invalid_response"
+    assert "synthetic-sensitive-invalid-version" not in str(raised.value)
 
 
 @pytest.mark.asyncio
