@@ -279,17 +279,41 @@ class MailSyncTaskStep:
                     seen_scope_keys: set[str] = set()
                     for discovered in discovered_scopes:
                         discovered_key = discovered.scope_key
-                        if discovered_key == "" or discovered_key in seen_scope_keys:
+                        if (
+                            discovered_key == ""
+                            or discovered_key == "mailbox"
+                            or discovered_key in seen_scope_keys
+                        ):
                             raise PermanentProviderError(
                                 error_code="microsoft_mail_scope_invalid",
                                 message="Microsoft mail folder discovery is invalid",
                             )
                         seen_scope_keys.add(discovered_key)
-                        await sync_case.execute(
+                    discovered_scopes = tuple(
+                        sorted(discovered_scopes, key=lambda scope: scope.scope_key)
+                    )
+                    async with self._stores() as store:
+                        await store.mark_directory_success(
                             user_id=user_id,
                             connection_id=connection_id,
-                            scope_key=discovered_key,
+                            completed_at=datetime.now(UTC),
+                            folder_count=len(discovered_scopes),
                         )
+                    first_folder_error: Exception | None = None
+                    for discovered in discovered_scopes:
+                        try:
+                            await sync_case.execute(
+                                user_id=user_id,
+                                connection_id=connection_id,
+                                scope_key=discovered.scope_key,
+                            )
+                        except (TransientProviderError, PermanentProviderError) as error:
+                            # 已成功 folder 的事务不能回滚；继续尝试其余 folder，最后抛出
+                            # 第一个固定错误，让 Durable Worker 重试失败 scope。
+                            if first_folder_error is None:
+                                first_folder_error = error
+                    if first_folder_error is not None:
+                        raise first_folder_error
                 else:
                     await sync_case.execute(
                         user_id=user_id,

@@ -160,8 +160,8 @@ class _DiscoveringMailReader:
         """返回两个可独立恢复的合成 folder，并记录目录调用。"""
         self.calls.append(("discover", ""))
         return (
-            MailScope("synthetic-folder-inbox", "Synthetic Inbox", "inbox"),
             MailScope("synthetic-folder-sent", "Synthetic Sent", "sentitems"),
+            MailScope("synthetic-folder-inbox", "Synthetic Inbox", "inbox"),
         )
 
     async def initial_pages(
@@ -182,6 +182,44 @@ class _DiscoveringMailReader:
         """重复投递使用各自 cursor，保持同一 folder 的幂等事实。"""
         self.calls.append(("sync", f"{scope_key}:{cursor}"))
         yield MailSyncPage((), None, cursor)
+
+
+@dataclass(slots=True)
+class _PartiallyFailingMailReader:
+    """让一个 folder 暂态失败、另一个 folder 成功，验证 owner 的部分提交语义。"""
+
+    calls: list[tuple[str, str]]
+
+    async def list_sync_scopes(self) -> tuple[MailScope, ...]:
+        """返回两个真实 folder；owner 应按稳定 key 顺序处理。"""
+        self.calls.append(("discover", ""))
+        return (
+            MailScope("synthetic-folder-sent", "Synthetic Sent", "sentitems"),
+            MailScope("synthetic-folder-inbox", "Synthetic Inbox", "inbox"),
+        )
+
+    async def initial_pages(
+        self, scope_key: str, *, since: datetime
+    ) -> AsyncIterator[MailSyncPage]:
+        """inbox 抛出暂态错误，sent 返回可提交的合成页面。"""
+        del since
+        self.calls.append(("initial", scope_key))
+        if scope_key == "synthetic-folder-inbox":
+            raise TransientProviderError(
+                error_code="synthetic_folder_failure",
+                message="synthetic folder failure",
+            )
+        yield MailSyncPage(
+            (_message("synthetic-partial-message", scope_key=scope_key),),
+            None,
+            "synthetic-partial-cursor",
+        )
+
+    async def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
+        """该场景只覆盖初始目录同步；不应读取已有 Delta。"""
+        del scope_key, cursor
+        if False:
+            yield MailSyncPage((), None, None)
 
 
 @asynccontextmanager
@@ -760,7 +798,81 @@ async def test_worker_discovers_microsoft_folders_and_keeps_cursors_independent(
             "synthetic-folder-inbox": "synthetic-cursor-synthetic-folder-inbox",
             "synthetic-folder-sent": "synthetic-cursor-synthetic-folder-sent",
         }
+        mailbox = next(cursor for cursor in cursors if cursor.scope_key == "mailbox")
+        assert mailbox.last_success_at is not None
         assert message_count == 2
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mailbox_owner_commits_successful_folder_when_another_folder_fails(
+    database_url: str,
+) -> None:
+    """目录 owner 遇到单 folder 暂态失败仍完成其余 folder，失败 scope 可重试。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"p" * 32)
+    reader = _PartiallyFailingMailReader([])
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={
+                "mailbox": None,
+                "synthetic-folder-inbox": None,
+                "synthetic-folder-sent": None,
+            },
+        )
+        step = MailSyncTaskStep(
+            session_factory=sessions,
+            cipher=cipher,
+            oauth=object(),
+            microsoft_oauth=MicrosoftOAuthAdapter(
+                client_id="synthetic-client",
+                client_secret="synthetic-secret",
+                redirect_uri="https://app.example.test/callback",
+            ),
+            microsoft_reader=reader,
+        )
+
+        with pytest.raises(TransientProviderError) as raised:
+            await step.execute(
+                LeasedTask(
+                    task_id=UUID("10000000-0000-0000-0000-0000000000a1"),
+                    kind="sync_mail",
+                    input_payload={
+                        "connection_id": str(CONNECTION_ONE),
+                        "scope_key": "mailbox",
+                    },
+                    started_at=datetime(2030, 1, 8, tzinfo=UTC),
+                    user_id=USER_ONE,
+                )
+            )
+
+        assert raised.value.error_code == "synthetic_folder_failure"
+        assert reader.calls == [
+            ("discover", ""),
+            ("initial", "synthetic-folder-inbox"),
+            ("initial", "synthetic-folder-sent"),
+        ]
+        async with sessions() as session:
+            cursors = {
+                cursor.scope_key: cursor
+                for cursor in (
+                    await session.scalars(
+                        select(SyncCursorModel).where(
+                            SyncCursorModel.connection_id == CONNECTION_ONE,
+                            SyncCursorModel.resource_kind == "mail",
+                        )
+                    )
+                ).all()
+            }
+        assert cursors["mailbox"].cursor is None
+        assert cursors["mailbox"].last_success_at is not None
+        assert cursors["synthetic-folder-inbox"].cursor is None
+        assert cursors["synthetic-folder-sent"].cursor == "synthetic-partial-cursor"
     finally:
         await sessions.dispose()
 

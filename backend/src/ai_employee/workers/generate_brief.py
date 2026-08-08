@@ -212,6 +212,7 @@ class GenerateBriefTaskStep:
             )
         )
         stale: list[tuple[str, UUID, str | None]] = []
+        microsoft_mail_owners: set[UUID] = set()
         for (
             row_connection_id,
             provider,
@@ -222,6 +223,19 @@ class GenerateBriefTaskStep:
             last_success_at,
         ) in rows:
             expected_resource_kind = "mail" if capability == "mail.read" else "calendar"
+            if provider == "microsoft" and expected_resource_kind == "mail":
+                # mailbox 是目录发现触发器而非 Delta scope：它只按 last_success 判断目录
+                # 新鲜度；任一真实 folder 缺游标或过期时也统一交给同一个 owner 修复。
+                is_mailbox_owner = scope_key == "mailbox"
+                if (
+                    resource_kind is None
+                    or scope_key is None
+                    or last_success_at is None
+                    or last_success_at < cutoff - SYNC_FRESHNESS
+                    or (not is_mailbox_owner and cursor is None)
+                ):
+                    microsoft_mail_owners.add(row_connection_id)
+                continue
             if resource_kind is None or scope_key is None:
                 # 兼容补缺必须同时满足 connected + enabled capability；provider 只决定能否
                 # 无歧义推断 M1 默认 scope，不能替代能力授权。
@@ -244,6 +258,10 @@ class GenerateBriefTaskStep:
                 or last_success_at < cutoff - SYNC_FRESHNESS
             ):
                 stale.append((expected_resource_kind, row_connection_id, scope_key))
+        stale.extend(
+            ("mail", owner_connection_id, "mailbox")
+            for owner_connection_id in sorted(microsoft_mail_owners, key=str)
+        )
         return tuple(stale)
 
     async def _refresh_stale_sources(
@@ -257,7 +275,18 @@ class GenerateBriefTaskStep:
         把简报伪装为 complete。
         """
         warnings: list[str] = []
+        mailbox_owners = {
+            connection_id
+            for resource_kind, connection_id, scope_key in stale
+            if resource_kind == "mail" and scope_key == "mailbox"
+        }
         for resource_kind, connection_id, scope_key in stale:
+            if (
+                resource_kind == "mail"
+                and connection_id in mailbox_owners
+                and scope_key != "mailbox"
+            ):
+                continue
             if scope_key is None:
                 warnings.append(f"missing:{resource_kind};last_success:never;repair:retry")
                 continue

@@ -157,6 +157,14 @@ async def dispatch_google_incremental_syncs() -> None:
         SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
     )
     for scope in await SqlAlchemyEnabledSyncScopeReader(session_factory).enabled_scopes():
+        # Reader 已在 SQL 层执行同一过滤；此处保留 fail-closed 防线，避免测试替身或未来
+        # reader 误把 Microsoft folder cursor 当作第二个周期 owner。
+        if (
+            scope.provider == "microsoft"
+            and scope.resource_kind == "mail"
+            and scope.scope_key != "mailbox"
+        ):
+            continue
         kind = "sync_mail" if scope.resource_kind == "mail" else "sync_calendar"
         # scope 可能是包含帐号标识的 512 字符 opaque ID；任务载荷必须保留精确值，但
         # 幂等键只使用稳定摘要，既满足列长度上限，也避免在运维界面重复暴露该标识。

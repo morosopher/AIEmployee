@@ -22,6 +22,15 @@ from ai_employee.domain.errors import InternalInvariantError
 class MailSyncStore(Protocol):
     """定义单个邮件 scope 同步所需的最小事务存储。"""
 
+    async def mark_directory_success(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        completed_at: datetime,
+        folder_count: int,
+    ) -> None: ...
+
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
     ) -> MailConnectionState | None: ...

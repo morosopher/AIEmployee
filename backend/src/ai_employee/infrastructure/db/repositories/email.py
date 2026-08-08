@@ -122,6 +122,78 @@ class SqlAlchemyMailSyncRepository:
             )
         cursor.cursor = None
 
+    async def mark_directory_success(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        completed_at: datetime,
+        folder_count: int,
+    ) -> None:
+        """记录 Microsoft mailbox 目录发现成功，但永远不写入 Delta cursor。
+
+        mailbox placeholder 是周期 owner 的协调事实；真实 folder 的增量恢复位置仍由各自
+        ``finish_sync`` 事务维护。独立短事务让目录成功时间即使后续某个 folder 失败也可供
+        Brief 展示，同时不会把不透明 Graph URL 伪装成 mailbox 游标。
+        """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .join(
+                ConnectionCapabilityModel,
+                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
+                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
+            )
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.capability == "mail.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            raise StateConflictError(
+                error_code="mail_connection_not_syncable",
+                message="Mail connection is no longer available for discovery",
+            )
+        cursor = await self._session.scalar(
+            select(SyncCursorModel)
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "mail",
+                SyncCursorModel.scope_key == "mailbox",
+            )
+            .with_for_update()
+        )
+        if cursor is None:
+            cursor = SyncCursorModel(
+                connection_id=connection_id,
+                resource_kind="mail",
+                scope_key="mailbox",
+                cursor=None,
+            )
+            self._session.add(cursor)
+        elif cursor.cursor is not None:
+            # 旧数据若把 mailbox 当作 Delta scope，宁可阻断并人工修复，也不覆盖 opaque 状态。
+            raise StateConflictError(
+                error_code="mailbox_cursor_must_be_null",
+                message="Microsoft mailbox discovery cursor must remain empty",
+            )
+        cursor.last_success_at = completed_at
+        cursor.last_attempt_at = completed_at
+        cursor.last_error_code = None
+        self._session.add(
+            AuditEventModel(
+                user_id=user_id,
+                task_id=None,
+                event_type="source.mail.directory_discovered",
+                actor_type="system",
+                actor_id=str(connection_id),
+                event_metadata={"folder_count": folder_count},
+            )
+        )
+
     async def get_credentials(
         self, *, user_id: UUID, connection_id: UUID
     ) -> MailConnectionCredentials | None:

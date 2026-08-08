@@ -615,7 +615,7 @@ async def test_brief_readback_excludes_disconnected_and_capability_disabled_cach
     (
         ("google", "mail.read", ("mail", "mailbox")),
         ("google", "calendar.read", ("calendar", "primary")),
-        ("microsoft", "mail.read", ("mail", None)),
+        ("microsoft", "mail.read", ("mail", "mailbox")),
         ("microsoft", "calendar.read", ("calendar", None)),
     ),
 )
@@ -625,7 +625,7 @@ async def test_missing_cursor_defaults_only_for_enabled_legacy_google_scope(
     capability: str,
     expected: tuple[str, str | None],
 ) -> None:
-    """Google 可补 M1 默认 scope；Microsoft 只能报告缺口，绝不猜测供应商目录键。"""
+    """Google 补 M1 默认 scope；Microsoft mail 缺目录时只触发固定 mailbox owner。"""
     sessions = build_session_factory(database_url)
     user_id, connection_id = uuid4(), uuid4()
     cutoff = datetime(2026, 8, 2, 10, 0, tzinfo=UTC)
@@ -685,10 +685,10 @@ async def test_missing_cursor_defaults_only_for_enabled_legacy_google_scope(
 
 
 @pytest.mark.asyncio
-async def test_generate_brief_marks_missing_microsoft_cursor_partial_without_guessing_scope(
+async def test_generate_brief_refreshes_missing_microsoft_mail_through_mailbox_owner(
     database_url: str,
 ) -> None:
-    """Microsoft enabled 邮件源缺游标时必须稳定降级，且不能调用未知 scope 的同步。"""
+    """Microsoft enabled 邮件源缺目录时只调用一次 mailbox owner，并可恢复完整简报。"""
     sessions = build_session_factory(database_url)
     user_id, task_id, connection_id = uuid4(), uuid4(), uuid4()
     cutoff = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
@@ -700,7 +700,7 @@ async def test_generate_brief_marks_missing_microsoft_cursor_partial_without_gue
         callback_user_id: UUID,
         scope_key: str,
     ) -> None:
-        """记录任何错误的 scope 猜测；正确实现不会调用此边界。"""
+        """记录目录 owner 调用；真实 folder key 必须由该 owner 从 Graph 发现。"""
         sync_attempts.append((resource_kind, callback_connection_id, callback_user_id, scope_key))
 
     try:
@@ -797,9 +797,9 @@ async def test_generate_brief_marks_missing_microsoft_cursor_partial_without_gue
                 select(DailyBriefModel).where(DailyBriefModel.task_id == task_id)
             )
         assert brief is not None
-        assert brief.completeness == "partial"
-        assert brief.warnings == ["missing:mail;last_success:never;repair:retry"]
-        assert sync_attempts == []
+        assert brief.completeness == "complete"
+        assert brief.warnings == []
+        assert sync_attempts == [("mail", connection_id, user_id, "mailbox")]
     finally:
         await sessions.dispose()
 

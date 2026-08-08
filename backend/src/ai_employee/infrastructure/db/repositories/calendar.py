@@ -321,6 +321,13 @@ class SqlAlchemyEnabledSyncScopeReader:
                 .where(
                     OAuthConnectionModel.status == "connected",
                     ConnectionCapabilityModel.status == "enabled",
+                    # Microsoft 的真实 folder cursor 是恢复事实，但普通周期只能触发一次
+                    # mailbox 目录 owner；显式 folder task 仍可由维修/恢复路径直接创建。
+                    or_(
+                        OAuthConnectionModel.provider != "microsoft",
+                        SyncCursorModel.resource_kind != "mail",
+                        SyncCursorModel.scope_key == "mailbox",
+                    ),
                     or_(
                         and_(
                             ConnectionCapabilityModel.capability == "mail.read",
