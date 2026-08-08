@@ -29,8 +29,15 @@ class MailSyncStore(Protocol):
         user_id: UUID,
         connection_id: UUID,
         completed_at: datetime,
-        folder_count: int,
-    ) -> None: ...
+        folder_scope_keys: tuple[str, ...],
+    ) -> None:
+        """原子记录目录成功，并为已验证、稳定排序的新 folder 建立空游标事实。
+
+        已有 folder 的 cursor、成功/尝试时间和错误状态必须保持不变；未出现在本次目录的
+        历史 scope 也不能删除。placeholder 只表示已发现但尚未完成同步，不能伪装成 folder
+        尝试或成功。调用前供应商网络 I/O 必须已经结束。
+        """
+        ...
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str

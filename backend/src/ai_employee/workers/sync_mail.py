@@ -297,7 +297,12 @@ class MailSyncTaskStep:
                             user_id=user_id,
                             connection_id=connection_id,
                             completed_at=datetime.now(UTC),
-                            folder_count=len(discovered_scopes),
+                            # 只有完整目录读取、格式校验、去重与稳定排序全部完成后，才把
+                            # 精确 scope tuple 交给短事务建立 placeholder；任意未验证 key
+                            # 都不能先于目录成功事实进入 PostgreSQL。
+                            folder_scope_keys=tuple(
+                                discovered.scope_key for discovered in discovered_scopes
+                            ),
                         )
                     first_folder_error: Exception | None = None
                     for discovered in discovered_scopes:

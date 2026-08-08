@@ -155,14 +155,29 @@ class SqlAlchemyMailSyncRepository:
         user_id: UUID,
         connection_id: UUID,
         completed_at: datetime,
-        folder_count: int,
+        folder_scope_keys: tuple[str, ...],
     ) -> None:
-        """记录 Microsoft mailbox 目录发现成功，但永远不写入 Delta cursor。
+        """记录 Microsoft mailbox 目录成功，并保存所有已验证 folder 的存在事实。
 
         mailbox placeholder 是周期 owner 的协调事实；真实 folder 的增量恢复位置仍由各自
-        ``finish_sync`` 事务维护。独立短事务让目录成功时间即使后续某个 folder 失败也可供
-        Brief 展示，同时不会把不透明 Graph URL 伪装成 mailbox 游标。
+        ``finish_sync`` 事务维护。这里仅为首次发现且尚无行的 folder 建立 ``cursor=NULL``
+        placeholder，不写 last_attempt/error/success；因此后续首次同步失败仍会被 Brief 识别为
+        partial，而不会把 discovery 冒充 folder 尝试。已有 cursor 与时间全部保留，本次目录
+        未返回的历史 scope 也不删除。供应商 I/O 已在进入本短事务前结束。
+
+        Raises:
+            StateConflictError: 连接不可同步、mailbox 含伪造 Delta cursor，或 scope tuple 未经
+                非空、去重和稳定排序验证。
         """
+        if (
+            any(scope_key == "" or scope_key == "mailbox" for scope_key in folder_scope_keys)
+            or len(set(folder_scope_keys)) != len(folder_scope_keys)
+            or tuple(sorted(folder_scope_keys)) != folder_scope_keys
+        ):
+            raise StateConflictError(
+                error_code="mail_directory_scopes_invalid",
+                message="Mail directory scopes are not validated and stably sorted",
+            )
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .join(
@@ -210,6 +225,32 @@ class SqlAlchemyMailSyncRepository:
         cursor.last_success_at = completed_at
         cursor.last_attempt_at = completed_at
         cursor.last_error_code = None
+        if folder_scope_keys:
+            existing_scope_keys = set(
+                (
+                    await self._session.scalars(
+                        select(SyncCursorModel.scope_key)
+                        .where(
+                            SyncCursorModel.connection_id == connection_id,
+                            SyncCursorModel.resource_kind == "mail",
+                            SyncCursorModel.scope_key.in_(folder_scope_keys),
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for folder_scope_key in folder_scope_keys:
+                if folder_scope_key not in existing_scope_keys:
+                    # placeholder 只证明目录已发现该 folder。真正的尝试、错误或成功时间只能
+                    # 由独立 folder 同步事务写入，不能在 discovery 阶段提前制造完整度事实。
+                    self._session.add(
+                        SyncCursorModel(
+                            connection_id=connection_id,
+                            resource_kind="mail",
+                            scope_key=folder_scope_key,
+                            cursor=None,
+                        )
+                    )
         self._session.add(
             AuditEventModel(
                 user_id=user_id,
@@ -217,7 +258,7 @@ class SqlAlchemyMailSyncRepository:
                 event_type="source.mail.directory_discovered",
                 actor_type="system",
                 actor_id=str(connection_id),
-                event_metadata={"folder_count": folder_count},
+                event_metadata={"folder_count": len(folder_scope_keys)},
             )
         )
 

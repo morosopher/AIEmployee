@@ -50,6 +50,7 @@ from ai_employee.infrastructure.security.encryption import AeadCipher, Encrypted
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers import sync_mail as sync_mail_worker
+from ai_employee.workers.generate_brief import GenerateBriefTaskStep
 from ai_employee.workers.sync_mail import MailSyncTaskStep, build_mail_sync_task_step
 
 FIXTURE_DIR = Path(__file__).parents[2] / "contract" / "microsoft" / "fixtures"
@@ -279,6 +280,37 @@ class _PartiallyFailingMailReader:
 
     async def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
         """该场景只覆盖初始目录同步；不应读取已有 Delta。"""
+        del scope_key, cursor
+        if False:
+            yield MailSyncPage((), None, None)
+
+
+@dataclass(slots=True)
+class _NewFolderFailingMailReader:
+    """首次发现一个新 folder 后立即失败，验证目录事实不会随同步异常消失。"""
+
+    calls: list[tuple[str, str]]
+
+    async def list_sync_scopes(self) -> tuple[MailScope, ...]:
+        """返回此前 PostgreSQL 中不存在的单一合成 folder。"""
+        self.calls.append(("discover", ""))
+        return (MailScope("synthetic-folder-new", "Synthetic New", "inbox"),)
+
+    async def initial_pages(
+        self, scope_key: str, *, since: datetime
+    ) -> AsyncIterator[MailSyncPage]:
+        """记录精确新 scope，并在任何页面持久化前抛出暂态错误。"""
+        del since
+        self.calls.append(("initial", scope_key))
+        raise TransientProviderError(
+            error_code="synthetic_new_folder_failure",
+            message="synthetic new folder failure",
+        )
+        if False:
+            yield MailSyncPage((), None, None)
+
+    async def sync_pages(self, scope_key: str, cursor: str) -> AsyncIterator[MailSyncPage]:
+        """新 folder 没有既有 cursor，因此本场景不允许进入增量读取。"""
         del scope_key, cursor
         if False:
             yield MailSyncPage((), None, None)
@@ -1225,6 +1257,150 @@ async def test_mailbox_owner_commits_successful_folder_when_another_folder_fails
         assert cursors["mailbox"].last_success_at is not None
         assert cursors["synthetic-folder-inbox"].cursor is None
         assert cursors["synthetic-folder-sent"].cursor == "synthetic-partial-cursor"
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_new_failed_folder_remains_partial_mailbox_owner_fact(
+    database_url: str,
+) -> None:
+    """首次发现的新 folder 失败后仍须留空游标，并让 Brief 只刷新 mailbox owner。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"n" * 32)
+    reader = _NewFolderFailingMailReader([])
+    fresh_at = datetime(2030, 1, 8, tzinfo=UTC)
+    refresh_calls: list[tuple[str, UUID, UUID, str]] = []
+
+    async def fail_brief_refresh(
+        resource_kind: str,
+        connection_id: UUID,
+        user_id: UUID,
+        scope_key: str,
+    ) -> None:
+        """记录 Brief 的聚合 owner 调用，并模拟同一暂态 folder 故障仍未恢复。"""
+        refresh_calls.append((resource_kind, connection_id, user_id, scope_key))
+        raise TransientProviderError(
+            error_code="synthetic_new_folder_failure",
+            message="synthetic new folder failure",
+        )
+
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={
+                "mailbox": None,
+                "synthetic-folder-historical": "synthetic-historical-cursor",
+            },
+        )
+        async with sessions.begin() as session:
+            historical = await session.scalar(
+                select(SyncCursorModel).where(
+                    SyncCursorModel.connection_id == CONNECTION_ONE,
+                    SyncCursorModel.resource_kind == "mail",
+                    SyncCursorModel.scope_key == "synthetic-folder-historical",
+                )
+            )
+            assert historical is not None
+            historical.last_success_at = fresh_at
+
+        step = MailSyncTaskStep(
+            session_factory=sessions,
+            cipher=cipher,
+            oauth=object(),
+            microsoft_oauth=MicrosoftOAuthAdapter(
+                client_id="synthetic-client",
+                client_secret="synthetic-secret",
+                redirect_uri="https://app.example.test/callback",
+            ),
+            microsoft_reader=reader,
+        )
+        with pytest.raises(TransientProviderError) as raised:
+            await step.execute(
+                LeasedTask(
+                    task_id=UUID("10000000-0000-0000-0000-0000000000a2"),
+                    kind="sync_mail",
+                    input_payload={
+                        "connection_id": str(CONNECTION_ONE),
+                        "scope_key": "mailbox",
+                    },
+                    started_at=fresh_at,
+                    user_id=USER_ONE,
+                )
+            )
+
+        async with sessions() as session:
+            cursor_models = {
+                cursor.scope_key: cursor
+                for cursor in (
+                    await session.scalars(
+                        select(SyncCursorModel).where(
+                            SyncCursorModel.connection_id == CONNECTION_ONE,
+                            SyncCursorModel.resource_kind == "mail",
+                        )
+                    )
+                ).all()
+            }
+            mailbox_success_at = cursor_models["mailbox"].last_success_at
+            assert mailbox_success_at is not None
+            cursors = {
+                scope_key: (
+                    cursor.cursor,
+                    cursor.last_success_at is not None,
+                    cursor.last_attempt_at is not None,
+                    cursor.last_error_code,
+                )
+                for scope_key, cursor in cursor_models.items()
+            }
+            historical_success_preserved = (
+                cursor_models["synthetic-folder-historical"].last_success_at == fresh_at
+            )
+            brief_step = GenerateBriefTaskStep(
+                sessions,
+                sync_source=fail_brief_refresh,
+                now=lambda: mailbox_success_at,
+            )
+            stale = await brief_step._stale_resources(
+                session,
+                USER_ONE,
+                mailbox_success_at,
+                CONNECTION_ONE,
+            )
+        warnings = await brief_step._refresh_stale_sources(USER_ONE, stale)
+
+        assert raised.value.error_code == "synthetic_new_folder_failure"
+        assert reader.calls == [
+            ("discover", ""),
+            ("initial", "synthetic-folder-new"),
+        ]
+        assert (
+            cursors,
+            stale,
+            refresh_calls,
+            len(warnings),
+            historical_success_preserved,
+        ) == (
+            {
+                "mailbox": (None, True, True, None),
+                "synthetic-folder-historical": (
+                    "synthetic-historical-cursor",
+                    True,
+                    False,
+                    None,
+                ),
+                "synthetic-folder-new": (None, False, False, None),
+            },
+            (("mail", CONNECTION_ONE, "mailbox"),),
+            [("mail", CONNECTION_ONE, USER_ONE, "mailbox")],
+            1,
+            True,
+        )
+        assert warnings[0].startswith("missing:mail;last_success:")
+        assert warnings[0].endswith(";repair:retry")
+        assert "last_success:never" not in warnings[0]
     finally:
         await sessions.dispose()
 
