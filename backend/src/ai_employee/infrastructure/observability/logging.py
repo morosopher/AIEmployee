@@ -121,9 +121,10 @@ class _HttpClientLogRecordFactory:
     """在保留宿主记录工厂的前提下，固定第三方 HTTP 记录的可观测内容。
 
     ``logging`` 在创建 ``LogRecord`` 时调用全局 factory；``Logger.makeRecord`` 随后才注入
-    ``extra``。handle、makeRecord 与 factory 三个边界都完成收窄后，同一记录经过父/子
-    logger、重配置后的 handler 以及 ``lastResort`` 时都共享安全字段。委托原 factory 可
-    保留宿主已经安装的记录类型，不改变应用 ``ai_employee`` 日志的既有行为。
+    ``extra``。callHandlers、handle、makeRecord 与 factory 四个边界都完成收窄后，同一
+    HTTP 来源记录经过父/子 logger、重配置后的 handler 以及 ``lastResort`` 时都共享安全
+    字段。委托原 factory 可保留宿主已经安装的记录类型，不改变应用 ``ai_employee`` 日志
+    的既有行为。
     """
 
     def __init__(self, delegate: Callable[..., logging.LogRecord]) -> None:
@@ -137,7 +138,7 @@ class _HttpClientLogRecordFactory:
 
 
 def _wrap_http_client_handle(delegate: Callable[..., None]) -> Callable[..., None]:
-    """包装宿主 ``Logger.handle``，覆盖已在旧 makeRecord 中途的记录。"""
+    """包装宿主 ``Logger.handle``，以调用方来源覆盖已在旧 makeRecord 中途的记录。"""
 
     def wrapped(
         logger: logging.Logger,
@@ -145,8 +146,8 @@ def _wrap_http_client_handle(delegate: Callable[..., None]) -> Callable[..., Non
         *args: object,
         **kwargs: object,
     ) -> None:
-        """在 logger filter/handler 链之前执行最终记录清理，再委托宿主实现。"""
-        scrubbed_record = _scrub_http_client_record(record)
+        """在 filter 链前按可信 logger.name 清理记录，再委托宿主实现。"""
+        scrubbed_record = _scrub_http_client_record_from_logger(logger, record)
         delegate(logger, scrubbed_record, *args, **kwargs)
 
     setattr(wrapped, _HTTP_CLIENT_HANDLE_MARKER_ATTR, _HTTP_CLIENT_HANDLE_MARKER)

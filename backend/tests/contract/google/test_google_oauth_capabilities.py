@@ -598,7 +598,7 @@ def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
         emitter.start()
         assert make_record_entered.wait(timeout=5)
 
-        # 线程 A 暂停在旧 makeRecord 内；线程 B 完成新的三层安装后再放行线程 A。
+        # 线程 A 暂停在旧 makeRecord 内；线程 B 完成新的四层安装后再放行线程 A。
         configure_http_client_logging()
         release_make_record.set()
         assert handler.emitted.wait(timeout=5)
@@ -870,6 +870,166 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
                 "synthetic-replacement-token",
                 "synthetic-replacement-secret",
                 "synthetic-replacement-extra-token",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None:
+    """应用 logger 直接处理 HTTP 命名记录时，不得误清洗其消息与扩展字段。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获 direct handle 的最终记录，验证应用 logger 行为不变。"""
+
+        def __init__(self) -> None:
+            """初始化消息和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存应用 handler 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "ai_employee.direct_handle_source"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    handler = RecordingHandler()
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        configure_http_client_logging()
+        foreign_record = logging.LogRecord(
+            "httpx.synthetic_serialized",
+            logging.INFO,
+            __file__,
+            1,
+            "application-direct-handle %s",
+            ("synthetic-application-payload",),
+            None,
+        )
+        foreign_record.application_marker = "synthetic-application-extra"
+
+        logger.handle(foreign_record)
+
+        assert handler.messages == ["application-direct-handle synthetic-application-payload"]
+        assert "synthetic-application-extra" in handler.snapshots[0]
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_scrubs_http_source_direct_handle_record() -> None:
+    """HTTP logger 直接处理被改名记录时，仍必须按可信调用方来源强制清洗。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获 direct handle 的最终记录，验证 HTTP 来源优先于记录 name。"""
+
+        def __init__(self) -> None:
+            """初始化消息、名称和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.names: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 HTTP handler 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.names.append(record.name)
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "httpx.direct_handle_source"
+    record_name = "ai_employee.direct_handle_alias"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    handler = RecordingHandler()
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        configure_http_client_logging()
+        foreign_record = logging.LogRecord(
+            record_name,
+            logging.WARNING,
+            __file__,
+            1,
+            "HTTP Request: GET %s Authorization: %s",
+            (
+                "https://oauth2.googleapis.com/tokeninfo?access_token=synthetic-direct-token",
+                "Bearer synthetic-direct-secret",
+            ),
+            None,
+        )
+        foreign_record.opaque = "synthetic-direct-extra-token"
+
+        logger.handle(foreign_record)
+
+        assert handler.messages == ["http_client_event"]
+        assert handler.names == [record_name]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-direct-token",
+                "synthetic-direct-secret",
+                "synthetic-direct-extra-token",
             )
         )
     finally:
