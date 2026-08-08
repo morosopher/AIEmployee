@@ -664,12 +664,25 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 
 ### 12.1 邮件
 
+- Microsoft 的 `mailbox` scope 是目录发现触发器，不是 Graph folder 或 Delta scope；周期
+  Scheduler 与每日简报对每个 connection 只触发一次 mailbox owner。owner 成功发现目录后，
+  按稳定 `scope_key` 顺序串行调用每个真实 folder 的独立同步；folder task 只用于显式恢复或
+  人工维修。每个真实 folder 的 cursor 仍是增量同步事实，mailbox placeholder 不保存 Delta URL。
 - 初始读取最近 7 天的可访问邮件，排除 Deleted Items 和 Junk Email，并确保覆盖 Sent Items。
-- 使用 Microsoft Graph Delta 保存每个资源的 `deltaLink`。
+- 使用 Microsoft Graph Delta 保存每个真实 folder 的 `deltaLink`，不得用 connection 级游标覆盖多个
+  folder；目录发现成功时间单独记录在 mailbox placeholder 的 `last_success_at`。
 - 规范化 Graph message ID、conversation ID、internetMessageId、参与者、主题、正文、时间、
-  分类和 webLink。
+  分类和 webLink；Graph `lastModifiedDateTime` 必须规范化为可选的 `provider_updated_at`。
+  较旧的 provider projection 不得覆盖较新的版本；缺失或畸形的 Microsoft 版本字段按永久响应
+  错误处理，Google/Fake 可保持 `NULL` 兼容。
+- `@removed` tombstone 不伪造版本，只按 `(user_id, connection_id, mailbox_scope_key,
+  provider_message_id)` 精确删除；旧 folder 的移动墓碑不得删除新 folder projection。
 - 原始 Graph JSON、附件和完整 MIME 不持久化。
 - Delta 失效时清除游标并执行受限 7 天重新同步。
+- collection 与 Delta 的单次 HTTP 响应上限为 5 MiB；同步链还必须有固定总 wire/规范化字节预算，
+  并同时受页数和 item 数上限约束。必须流式读取、超限立即中止并关闭响应；不得把超限数据带入
+  持久化事务或推进 cursor。`@odata.nextLink` 即使同主机也必须精确匹配预期 collection/folder
+  path，错误 path 在发请求前拒绝，opaque query 原样转发。
 
 ### 12.2 日历
 
@@ -686,6 +699,10 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 现有 `EmailThread`、`EmailMessage` 和 `CalendarEvent` 继续以
 `connection_id + provider_object_id` 唯一。所有硬编码 `provider == "google"` 的共享查询必须
 改为通过连接类型和供应商适配器选择，不能复制第二套 Microsoft 领域模型。
+
+邮件消息额外保存 nullable `provider_updated_at`；历史 Google 行允许为 `NULL`。消息与线程的
+描述字段更新必须遵守供应商版本排序，`latest_message_at` 只能单调增加。消息身份和线程归属
+使用 connection/user/thread 组合约束，禁止跨用户或跨 connection 的 projection 覆盖。
 
 ## 13. 幂等、结果核对与补偿
 
@@ -811,11 +828,16 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 
 ### 14.3 迁移策略
 
-1. 只增加新表、新列、新索引和新状态值。
-2. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
-3. 先让代码兼容旧审批数据，再切换 M2 写入路径。
-4. 将共享 Repository 的 Google 常量过滤改为显式供应商参数。
-5. M2 不删除旧列，不依赖破坏性 downgrade。
+1. 邮件身份迁移采用两阶段 online expand/contract：0016 只添加 nullable
+   `email_messages.connection_id` 与 `provider_updated_at`、回填并 fail-closed 检查，保留旧
+   unique/约束；0017 在短 metadata 事务外使用 `CREATE UNIQUE INDEX CONCURRENTLY`，再通过
+   `USING INDEX`、`NOT VALID`/`VALIDATE` 复合 ownership FK 和 validated `NOT NULL` check 完成
+   contract，最后才移除旧 unique。CONCURRENTLY 失败留下的 valid/invalid index 必须可安全探测、
+   清理和重跑，不得假设 Alembic 单事务包住该操作。
+2. 只增加新表、新列、新索引和新状态值；不删除业务行，不依赖破坏性 downgrade。
+3. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
+4. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式
+   供应商参数。
 
 ## 15. API 与 SSE
 

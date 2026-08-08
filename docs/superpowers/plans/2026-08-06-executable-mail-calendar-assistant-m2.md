@@ -1112,7 +1112,7 @@ Create migration `20260806_0013` with `down_revision = "20260806_0012"`; update 
 
 Create an explicit `ProviderAdapterRegistry` with fixed keys `google` and `microsoft`; its read methods return typed ports and raise `UnsupportedProviderError` for anything else. It is not a tool registry and cannot accept runtime registration.
 
-Register new task kind `sync_mail`. `execute_task.py` must continue accepting persisted legacy `sync_gmail` tasks by routing them to the same mail step. Schedules query enabled read capabilities and create one mail task per mailbox/folder scope plus one calendar task per synchronized calendar scope.
+Register new task kind `sync_mail`. `execute_task.py` must continue accepting persisted legacy `sync_gmail` tasks by routing them to the same mail step. Schedules query enabled read capabilities provider-specifically: Google continues to create one task per enabled mail/calendar scope; Microsoft mail is scheduled only through the connection's `mailbox` directory-discovery owner, which then runs real folders sequentially. Microsoft folder tasks are reserved for explicit recovery/maintenance; each folder cursor remains independent and authoritative.
 
 - [ ] **Step 5: Run old and new synchronization suites**
 
@@ -1526,11 +1526,25 @@ class MicrosoftMailAdapter:
         )
 ~~~
 
-Follow absolute `@odata.nextLink` only when its scheme/host are exactly `https://graph.microsoft.com`; persist the final opaque `deltaLink` but never log it. Send `Prefer: IdType="ImmutableId"` on folder, Delta, source-message, and Sent-item reads so a move within the mailbox does not silently change the stored Graph message identity. Normalize `id`, `conversationId`, `internetMessageId`, sender/recipients, body text, dates, categories, `webLink`, and removal facts into `MailMessage`.
+Follow absolute `@odata.nextLink` only when its scheme/host/path exactly matches the expected Graph collection or folder Delta path; preserve its opaque query unchanged and reject same-host wrong-path links before making a request. Persist the final opaque `deltaLink` but never log it. Send `Prefer: IdType="ImmutableId"` on folder, Delta, source-message, and Sent-item reads so a move within the mailbox does not silently change the stored Graph message identity. Normalize `id`, `conversationId`, `internetMessageId`, sender/recipients, body text, dates, categories, `webLink`, removal facts, and `lastModifiedDateTime` as optional `provider_updated_at` into `MailMessage`.
 
 - [ ] **Step 4: Persist Microsoft messages through the shared repository**
 
 Update the mail repository to use `connection_id + provider message/thread IDs`, store `mailbox_scope_key`, and advance only the locked `(connection_id, "mail", scope_key)` cursor after every page succeeds. A cursor-expired result must clear only that scope and rerun the bounded seven-day read.
+
+The mailbox owner is the only periodic Microsoft mail entry point: discovery results are sorted by stable
+`scope_key`, each folder is committed independently, and a partial folder failure leaves successful folder
+cursors advanced while failed folders remain retryable. Brief refreshes use the same mailbox owner and must
+not enqueue a second task for every stale folder. Add a 5 MiB per-response streaming limit and a fixed
+collection/Delta chain wire/normalized byte budget in addition to the 100-page/10,000-item limits; budget
+failure must occur before persistence/CAS and close the response. Add regressions for ownership, version
+ordering, path validation, streaming budgets, and cursor non-advancement.
+
+The mail identity migration is deliberately split into an online expand/contract pair: 0016 adds nullable
+columns and fail-closed backfill while retaining legacy constraints; 0017 creates concurrent unique indexes,
+composite ownership foreign keys, validated checks/NOT NULL, and only then removes legacy uniqueness. Test
+fresh 0015-to-head and already-applied 0016 databases, downgrade row preservation, and rerunnable
+valid/invalid concurrent-index paths.
 
 - [ ] **Step 5: Run Microsoft mail and provider-neutral regressions**
 
