@@ -154,6 +154,7 @@ async def test_retention_role_runs_source_cleanup_and_application_cannot_mutate_
             session.add_all([
                 EmailMessageModel(
                     user_id=user.id,
+                    connection_id=connection.id,
                     thread_id=thread.id,
                     provider_message_id="role-permission-message",
                     received_at=datetime.now(UTC),

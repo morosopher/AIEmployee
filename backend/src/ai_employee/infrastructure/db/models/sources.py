@@ -335,20 +335,32 @@ class EmailThreadModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 class EmailMessageModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """保存规范化邮件及加密正文；附件与原始供应商响应明确不落库。
 
-    M1 历史邮件均来自唯一 Gmail mailbox，因此 ``mailbox_scope_key`` 的 Python 兼容默认值
-    可以安全设为 ``mailbox``。Internet Message-ID、供应商 conversation ID 和发送时间若
-    供应商未提供则保持为空，不能由线程 ID 或接收时间伪造。
+    ``connection_id + provider_message_id`` 是供应商 ImmutableId 的唯一事实边界；thread
+    或 folder 投影变化只能更新同一行。组合连接外键同时验证 ``user_id`` 归属。M1 历史邮件
+    均来自唯一 Gmail mailbox，因此 ``mailbox_scope_key`` 的 Python 兼容默认值仍可安全设为
+    ``mailbox``。Internet Message-ID、conversation ID 和发送时间未知时保持为空。
     """
 
     __tablename__ = "email_messages"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["connection_id", "user_id"],
+            ["oauth_connections.id", "oauth_connections.user_id"],
+            name="fk_email_messages_connection_user",
+            ondelete="CASCADE",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         UniqueConstraint(
-            "thread_id", "provider_message_id", name="uq_email_messages_thread_provider_message"
+            "connection_id",
+            "provider_message_id",
+            name="uq_email_messages_connection_provider_message",
         ),
     )
     user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    connection_id: Mapped[UUID] = mapped_column(nullable=False)
     thread_id: Mapped[UUID] = mapped_column(
         ForeignKey("email_threads.id", ondelete="CASCADE"), nullable=False
     )

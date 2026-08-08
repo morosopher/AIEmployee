@@ -126,6 +126,7 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
             session.add(
                 EmailMessageModel(
                     user_id=user_id,
+                    connection_id=connection_id,
                     thread_id=thread.id,
                     provider_message_id="message",
                     received_at=datetime(2026, 7, 30, 16, tzinfo=UTC),
@@ -556,6 +557,7 @@ async def test_brief_readback_excludes_disconnected_and_capability_disabled_cach
                 session.add(
                     EmailMessageModel(
                         user_id=user_id,
+                        connection_id=connection_id,
                         thread_id=thread.id,
                         provider_message_id="brief-cache-message-blocked",
                         received_at=datetime(2026, 8, 2, 9, tzinfo=UTC),
@@ -895,6 +897,7 @@ async def test_generate_brief_preserves_persisted_deterministic_reply_facts(
             session.add(
                 EmailMessageModel(
                     user_id=user_id,
+                    connection_id=connection_id,
                     thread_id=thread.id,
                     provider_message_id="deterministic-message",
                     received_at=received_at,

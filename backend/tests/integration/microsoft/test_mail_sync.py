@@ -23,7 +23,7 @@ import pytest
 import respx
 from sqlalchemy import func, select
 
-from ai_employee.application.ports.mail import MailMessage, MailScope, MailSyncPage
+from ai_employee.application.ports.mail import MailMessage, MailRemoval, MailScope, MailSyncPage
 from ai_employee.application.use_cases.sync_mail import (
     MailConnectionNotFoundError,
     SyncMailUseCase,
@@ -40,7 +40,8 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     SyncCursorModel,
 )
-from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 from ai_employee.integrations.registry import ProviderAdapterRegistry
@@ -80,23 +81,32 @@ def _fixture(name: str) -> dict[str, object]:
     return payload
 
 
-def _message(message_id: str, *, scope_key: str) -> MailMessage:
-    """构造无真实数据的 provider-neutral 消息供 CAS/隔离测试使用。"""
+def _message(
+    message_id: str,
+    *,
+    scope_key: str,
+    thread_id: str | None = None,
+    subject: str = "Synthetic subject",
+    body: str = "Synthetic body",
+    received_at: datetime | None = None,
+) -> MailMessage:
+    """构造可改变 thread/scope/metadata 的合成规范消息。"""
+    resolved_thread_id = thread_id or f"synthetic-thread-{message_id}"
     return MailMessage(
         provider_message_id=message_id,
-        provider_thread_id=f"synthetic-thread-{message_id}",
-        provider_conversation_id=f"synthetic-conversation-{message_id}",
+        provider_thread_id=resolved_thread_id,
+        provider_conversation_id=f"synthetic-conversation-{resolved_thread_id}",
         internet_message_id=f"<{message_id}@example.test>",
         mailbox_scope_key=scope_key,
         sender={"name": "Synthetic Sender", "email": "sender@example.test"},
         recipients=({"name": "Synthetic Recipient", "email": "recipient@example.test"},),
-        subject="Synthetic subject",
-        sanitized_body="Synthetic body",
-        received_at=datetime(2030, 1, 8, tzinfo=UTC),
+        subject=subject,
+        sanitized_body=body,
+        received_at=received_at or datetime(2030, 1, 8, tzinfo=UTC),
         sent_at=datetime(2030, 1, 8, tzinfo=UTC),
         labels=("Synthetic",),
         normalized_reply_headers={"from": "sender@example.test"},
-        provider_url="https://outlook.office.example.test/mail/synthetic",
+        provider_url=f"https://outlook.office.example.test/mail/{resolved_thread_id}",
     )
 
 
@@ -181,6 +191,28 @@ async def _repository_factory(sessions):
 
     async with sessions.begin() as session:
         yield SqlAlchemyMailSyncRepository(session)
+
+
+async def _upsert_repository_message(
+    sessions: ManagedAsyncSessionMaker,
+    cipher: AeadCipher,
+    *,
+    user_id: UUID,
+    connection_id: UUID,
+    message: MailMessage,
+) -> None:
+    """在独立事务中执行一次真实 repository upsert，供重复/并发投递测试。"""
+    encrypted_body = cipher.encrypt(
+        message.sanitized_body.encode("utf-8"),
+        f"{user_id}:{connection_id}:{message.provider_message_id}:body".encode("ascii"),
+    )
+    async with sessions.begin() as session:
+        await SqlAlchemyMailSyncRepository(session).upsert_message(
+            user_id=user_id,
+            connection_id=connection_id,
+            message=message,
+            encrypted_body=encrypted_body,
+        )
 
 
 async def _seed_connection(
@@ -348,6 +380,311 @@ async def test_initial_delta_persists_messages_scope_cursor_and_idempotent_repla
             )
             == b"Synthetic incremental body"
         )
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_same_connection_message_replay_moves_one_fact_to_latest_thread_and_scope(
+    database_url: str,
+) -> None:
+    """同一 ImmutableId 改变 thread/scope 后只能更新一条连接级消息事实。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"s" * 32)
+    message_id = "synthetic-immutable-message"
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+        first = _message(
+            message_id,
+            thread_id="synthetic-thread-before-move",
+            scope_key="synthetic-folder-inbox",
+            subject="Synthetic subject before move",
+            body="Synthetic body before move",
+            received_at=datetime(2030, 1, 8, 9, tzinfo=UTC),
+        )
+        latest = _message(
+            message_id,
+            thread_id="synthetic-thread-after-move",
+            scope_key="synthetic-folder-archive",
+            subject="Synthetic subject after move",
+            body="Synthetic body after move",
+            received_at=datetime(2030, 1, 8, 10, tzinfo=UTC),
+        )
+
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            message=first,
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            message=latest,
+        )
+
+        async with sessions() as session:
+            rows = tuple(
+                (
+                    await session.execute(
+                        select(EmailMessageModel, EmailThreadModel.provider_thread_id)
+                        .join(EmailThreadModel, EmailThreadModel.id == EmailMessageModel.thread_id)
+                        .where(
+                            EmailThreadModel.connection_id == CONNECTION_ONE,
+                            EmailMessageModel.provider_message_id == message_id,
+                        )
+                    )
+                ).all()
+            )
+
+        assert len(rows) == 1
+        stored, provider_thread_id = rows[0]
+        assert provider_thread_id == "synthetic-thread-after-move"
+        assert stored.mailbox_scope_key == "synthetic-folder-archive"
+        assert stored.subject == "Synthetic subject after move"
+        assert stored.received_at == datetime(2030, 1, 8, 10, tzinfo=UTC)
+        assert stored.body_ciphertext is not None
+        assert stored.body_nonce is not None
+        assert stored.body_key_version is not None
+        assert (
+            cipher.decrypt(
+                EncryptedValue(
+                    stored.body_ciphertext,
+                    stored.body_nonce,
+                    stored.body_key_version,
+                ),
+                f"{USER_ONE}:{CONNECTION_ONE}:{message_id}:body".encode("ascii"),
+            )
+            == b"Synthetic body after move"
+        )
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_different_connections_may_keep_the_same_provider_message_id(
+    database_url: str,
+) -> None:
+    """连接级唯一性不能错误扩成供应商 ID 的全局唯一性。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"t" * 32)
+    message_id = "synthetic-shared-provider-message"
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_TWO,
+            connection_id=CONNECTION_TWO,
+            scope_cursors={},
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            message=_message(
+                message_id,
+                thread_id="synthetic-thread-connection-one",
+                scope_key="synthetic-folder-inbox",
+            ),
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_TWO,
+            connection_id=CONNECTION_TWO,
+            message=_message(
+                message_id,
+                thread_id="synthetic-thread-connection-two",
+                scope_key="synthetic-folder-inbox",
+            ),
+        )
+
+        async with sessions() as session:
+            counts = tuple(
+                (
+                    await session.execute(
+                        select(EmailThreadModel.connection_id, func.count(EmailMessageModel.id))
+                        .join(EmailMessageModel, EmailMessageModel.thread_id == EmailThreadModel.id)
+                        .where(EmailMessageModel.provider_message_id == message_id)
+                        .group_by(EmailThreadModel.connection_id)
+                        .order_by(EmailThreadModel.connection_id)
+                    )
+                ).all()
+            )
+
+        assert dict(counts) == {CONNECTION_ONE: 1, CONNECTION_TWO: 1}
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_connection_replays_are_serialized_by_database_identity(
+    database_url: str,
+) -> None:
+    """两事务同时写不同 thread 投影时仍由数据库唯一约束收敛为一行。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"u" * 32)
+    message_id = "synthetic-concurrent-immutable-message"
+    start = asyncio.Event()
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+
+        async def write_projection(*, thread_id: str, scope_key: str) -> None:
+            """在共同起跑信号后用独立事务写入一个完整合成投影。"""
+            await start.wait()
+            await _upsert_repository_message(
+                sessions,
+                cipher,
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                message=_message(
+                    message_id,
+                    thread_id=thread_id,
+                    scope_key=scope_key,
+                    subject=f"Synthetic concurrent {thread_id}",
+                ),
+            )
+
+        first = asyncio.create_task(
+            write_projection(
+                thread_id="synthetic-thread-concurrent-a",
+                scope_key="synthetic-folder-inbox",
+            )
+        )
+        second = asyncio.create_task(
+            write_projection(
+                thread_id="synthetic-thread-concurrent-b",
+                scope_key="synthetic-folder-archive",
+            )
+        )
+        start.set()
+        await asyncio.gather(first, second)
+
+        async with sessions() as session:
+            rows = tuple(
+                (
+                    await session.execute(
+                        select(EmailThreadModel.provider_thread_id)
+                        .join(EmailMessageModel, EmailMessageModel.thread_id == EmailThreadModel.id)
+                        .where(
+                            EmailThreadModel.connection_id == CONNECTION_ONE,
+                            EmailMessageModel.provider_message_id == message_id,
+                        )
+                    )
+                ).scalars()
+            )
+
+        assert len(rows) == 1
+        assert rows[0] in {
+            "synthetic-thread-concurrent-a",
+            "synthetic-thread-concurrent-b",
+        }
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tombstone_requires_exact_user_connection_scope_and_message_id(
+    database_url: str,
+) -> None:
+    """错 scope tombstone 不得删除，精确删除也不能影响另一连接的同 ID。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"v" * 32)
+    message_id = "synthetic-tombstone-identity"
+    try:
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            scope_cursors={},
+        )
+        await _seed_connection(
+            sessions,
+            cipher,
+            user_id=USER_TWO,
+            connection_id=CONNECTION_TWO,
+            scope_cursors={},
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_ONE,
+            connection_id=CONNECTION_ONE,
+            message=_message(
+                message_id,
+                thread_id="synthetic-thread-tombstone-one",
+                scope_key="synthetic-folder-archive",
+            ),
+        )
+        await _upsert_repository_message(
+            sessions,
+            cipher,
+            user_id=USER_TWO,
+            connection_id=CONNECTION_TWO,
+            message=_message(
+                message_id,
+                thread_id="synthetic-thread-tombstone-two",
+                scope_key="synthetic-folder-inbox",
+            ),
+        )
+
+        async with sessions.begin() as session:
+            repository = SqlAlchemyMailSyncRepository(session)
+            await repository.remove_message(
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                removal=MailRemoval(message_id, "synthetic-folder-inbox"),
+            )
+        async with sessions() as session:
+            after_wrong_scope = await session.scalar(
+                select(func.count())
+                .select_from(EmailMessageModel)
+                .where(EmailMessageModel.provider_message_id == message_id)
+            )
+        assert after_wrong_scope == 2
+
+        async with sessions.begin() as session:
+            repository = SqlAlchemyMailSyncRepository(session)
+            await repository.remove_message(
+                user_id=USER_ONE,
+                connection_id=CONNECTION_ONE,
+                removal=MailRemoval(message_id, "synthetic-folder-archive"),
+            )
+        async with sessions() as session:
+            remaining_connections = tuple(
+                (
+                    await session.execute(
+                        select(EmailThreadModel.connection_id)
+                        .join(EmailMessageModel, EmailMessageModel.thread_id == EmailThreadModel.id)
+                        .where(EmailMessageModel.provider_message_id == message_id)
+                    )
+                ).scalars()
+            )
+        assert remaining_connections == (CONNECTION_TWO,)
     finally:
         await sessions.dispose()
 

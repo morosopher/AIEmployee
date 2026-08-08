@@ -458,6 +458,7 @@ async def test_model_invalid_twice_persists_partial_brief_through_real_runner(
                     ),
                     EmailMessageModel(
                         user_id=user_id,
+                        connection_id=connection_id,
                         thread_id=thread.id,
                         provider_message_id="model-invalid-message",
                         received_at=now - timedelta(minutes=1),

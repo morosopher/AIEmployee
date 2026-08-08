@@ -107,7 +107,7 @@ async def test_all_data_deletion_attempts_revocation_once_without_blocking_local
             thread = EmailThreadModel(user_id=user.id, connection_id=connection.id, provider_thread_id="all-data-email", subject="Synthetic subject", participants=[], latest_message_at=datetime.now(UTC), provider_url="https://example.test/email", provider_updated_at=None)
             session.add(thread)
             await session.flush()
-            session.add(EmailMessageModel(user_id=user.id, thread_id=thread.id, provider_message_id="all-data-message", received_at=datetime.now(UTC), sender={}, recipients=[], subject="Synthetic subject", snippet="Synthetic body", body_ciphertext=None, body_nonce=None, body_key_version=None, labels=[], headers={}, provider_url="https://example.test/email"))
+            session.add(EmailMessageModel(user_id=user.id, connection_id=connection.id, thread_id=thread.id, provider_message_id="all-data-message", received_at=datetime.now(UTC), sender={}, recipients=[], subject="Synthetic subject", snippet="Synthetic body", body_ciphertext=None, body_nonce=None, body_key_version=None, labels=[], headers={}, provider_url="https://example.test/email"))
             task = TaskRunModel(user_id=user.id, kind="daily_brief", status="succeeded", idempotency_key="all-data-task", input_payload={})
             conversation = ConversationModel(user_id=user.id, title="Synthetic")
             session.add_all((task, conversation, UserSessionModel(user_id=user.id, token_hash=b"t" * 32, csrf_hash=b"c" * 32, created_at=datetime.now(UTC), expires_at=datetime(2031, 1, 1, tzinfo=UTC), last_seen_at=datetime.now(UTC))))

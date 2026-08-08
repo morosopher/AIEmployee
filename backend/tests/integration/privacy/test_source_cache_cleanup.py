@@ -59,7 +59,7 @@ async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(
             session.add(thread)
             await session.flush()
             session.add(EmailMessageModel(
-                user_id=user.id, thread_id=thread.id, provider_message_id="message-source-cleanup",
+                user_id=user.id, connection_id=connection.id, thread_id=thread.id, provider_message_id="message-source-cleanup",
                 received_at=datetime.now(UTC), sender={}, recipients=[], subject="Synthetic source",
                 snippet="Synthetic", body_ciphertext=b"synthetic", body_nonce=b"123456789012",
                 body_key_version=1, labels=[], headers={}, provider_url="https://example.test/message",
@@ -79,7 +79,7 @@ async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(
             other_thread = EmailThreadModel(user_id=other.id, connection_id=other_connection.id, provider_thread_id="thread-other", subject="Other", participants=[], latest_message_at=datetime.now(UTC), provider_url="https://example.test/other", provider_updated_at=None)
             session.add(other_thread)
             await session.flush()
-            session.add(EmailMessageModel(user_id=other.id, thread_id=other_thread.id, provider_message_id="message-other", received_at=datetime.now(UTC), sender={}, recipients=[], subject="Other", snippet="Other", body_ciphertext=None, body_nonce=None, body_key_version=None, labels=[], headers={}, provider_url="https://example.test/other"))
+            session.add(EmailMessageModel(user_id=other.id, connection_id=other_connection.id, thread_id=other_thread.id, provider_message_id="message-other", received_at=datetime.now(UTC), sender={}, recipients=[], subject="Other", snippet="Other", body_ciphertext=None, body_nonce=None, body_key_version=None, labels=[], headers={}, provider_url="https://example.test/other"))
             user_id = user.id
 
         await PrivacyDeletionWorker(session_factory).clear_source_cache(user_id=user_id, batch_size=10)

@@ -141,6 +141,7 @@ class TestSupportFixtureService:
             session.add(
                 EmailMessageModel(
                     user_id=user_id,
+                    connection_id=connection_id,
                     thread_id=thread.id,
                     provider_message_id=f"e2e-message-{connection_id}",
                     received_at=current,

@@ -30,7 +30,7 @@ from ai_employee.infrastructure.testing.test_support import (
     TestSupportFixtureService as SupportFixtureService,
 )
 
-M2_REVISION = "20260808_0015"
+M2_REVISION = "20260808_0016"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
@@ -48,6 +48,7 @@ DEFAULT_WORKING_HOURS = {
 
 CAPABILITY_CONNECTION_OWNER_FK = "fk_connection_capabilities_connection_user"
 PROVIDER_CALENDAR_CONNECTION_OWNER_FK = "fk_provider_calendars_connection_user"
+EMAIL_MESSAGE_CONNECTION_OWNER_FK = "fk_email_messages_connection_user"
 DEFAULT_MAIL_CONNECTION_OWNER_FK = "fk_users_default_mail_connection_id_user_id"
 DEFAULT_CALENDAR_CONNECTION_OWNER_FK = "fk_users_default_calendar_connection_id_user_id"
 MICROSOFT_IDENTITY_CHECK = "ck_oauth_connections_microsoft_identity"
@@ -848,8 +849,9 @@ def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
                 message_row = (
                     await connection.execute(
                         text(
-                            "SELECT internet_message_id, provider_conversation_id, sent_at, "
-                            "mailbox_scope_key FROM email_messages WHERE id = :message_id"
+                            "SELECT connection_id, internet_message_id, "
+                            "provider_conversation_id, sent_at, mailbox_scope_key "
+                            "FROM email_messages WHERE id = :message_id"
                         ),
                         {"message_id": message_id},
                     )
@@ -924,6 +926,7 @@ def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
         ("", "google")
     }
     message_row = result["message"]
+    assert message_row.connection_id == enabled_connection_id
     assert message_row.internet_message_id is None
     assert message_row.provider_conversation_id is None
     assert message_row.sent_at is None
@@ -964,6 +967,58 @@ async def test_cross_user_connection_capability_is_rejected(database_url: str) -
         assert _integrity_error_details(raised.value) == (
             "23503",
             CAPABILITY_CONNECTION_OWNER_FK,
+        )
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cross_user_email_message_connection_is_rejected(database_url: str) -> None:
+    """消息 direct connection 与显式 user 不同属时必须由组合外键拒绝。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        (
+            first_user_id,
+            _,
+            first_connection_id,
+            second_connection_id,
+        ) = await _seed_two_users_and_connections(session_factory)
+        with pytest.raises(IntegrityError) as raised:
+            async with session_factory.begin() as session:
+                thread = db_models.EmailThreadModel(
+                    user_id=first_user_id,
+                    connection_id=first_connection_id,
+                    provider_thread_id="synthetic-cross-user-message-thread",
+                    subject="Synthetic ownership guard",
+                    participants=[],
+                    latest_message_at=datetime(2026, 8, 8, tzinfo=UTC),
+                    provider_url="https://example.test/cross-user-message-thread",
+                )
+                session.add(thread)
+                await session.flush()
+                session.add(
+                    db_models.EmailMessageModel(
+                        user_id=first_user_id,
+                        connection_id=second_connection_id,
+                        thread_id=thread.id,
+                        provider_message_id="synthetic-cross-user-message",
+                        received_at=datetime(2026, 8, 8, tzinfo=UTC),
+                        sender={},
+                        recipients=[],
+                        subject="Synthetic ownership guard",
+                        snippet="",
+                        body_ciphertext=None,
+                        body_nonce=None,
+                        body_key_version=None,
+                        labels=[],
+                        headers={},
+                        provider_url="https://example.test/cross-user-message",
+                    )
+                )
+
+        assert _integrity_error_details(raised.value) == (
+            "23503",
+            EMAIL_MESSAGE_CONNECTION_OWNER_FK,
         )
     finally:
         await session_factory.dispose()

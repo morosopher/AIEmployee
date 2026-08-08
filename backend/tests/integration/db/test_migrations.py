@@ -193,7 +193,9 @@ def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
                         "AND attribute.attnum = key_info.attnum "
                         "WHERE constraint_info.conname IN ("
                         "'fk_oauth_attempts_target_connection_user', "
+                        "'fk_email_messages_connection_user', "
                         "'uq_oauth_connections_id_user_id', "
+                        "'uq_email_messages_connection_provider_message', "
                         "'uq_sync_cursors_connection_resource', "
                         "'uq_sync_cursors_connection_resource_scope', "
                         "'uq_connection_capabilities_user_connection_capability', "
@@ -224,6 +226,7 @@ def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]
                         "WHERE conname IN ("
                         "'fk_oauth_attempts_target_connection_user', "
                         "'fk_connection_capabilities_connection_user', "
+                        "'fk_email_messages_connection_user', "
                         "'fk_provider_calendars_connection_user', "
                         "'fk_users_default_mail_connection_id_user_id', "
                         "'fk_users_default_calendar_connection_id_user_id'"
@@ -235,6 +238,40 @@ def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]
             await engine.dispose()
 
     return asyncio.run(read_modes())
+
+
+def _email_message_identity_metadata(
+    database_url: URL,
+) -> tuple[tuple[str, str] | None, set[str]]:
+    """读取邮件直接连接列及其唯一约束，锁定连接级 ImmutableId Schema。"""
+
+    async def read_metadata() -> tuple[tuple[str, str] | None, set[str]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                column = (
+                    await connection.execute(
+                        text(
+                            "SELECT data_type, is_nullable FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name = 'email_messages' "
+                            "AND column_name = 'connection_id'"
+                        )
+                    )
+                ).one_or_none()
+                constraints = await connection.execute(
+                    text(
+                        "SELECT conname FROM pg_catalog.pg_constraint "
+                        "WHERE conrelid = 'email_messages'::regclass AND contype = 'u'"
+                    )
+                )
+                return (
+                    (str(column[0]), str(column[1])) if column is not None else None,
+                    {str(row[0]) for row in constraints},
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_metadata())
 
 
 def _oauth_attempt_binding_columns(
@@ -426,6 +463,136 @@ def _seed_provider_neutral_cursor_migration_rows(database_url: URL) -> None:
     asyncio.run(seed_rows())
 
 
+def _seed_pre_identity_mail_rows(database_url: URL, *, duplicate: bool) -> None:
+    """在 0015 Schema 写入可回填邮件；可选制造旧约束允许的连接级重复。"""
+
+    async def seed_rows() -> None:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO users ("
+                        "id, email, display_name, password_hash, timezone, locale, "
+                        "brief_time, is_active, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'mail-identity-owner@example.test', 'Mail Identity Owner', NULL, "
+                        "'UTC', 'zh-CN', '08:00:00', true, now(), now()"
+                        ")"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO oauth_connections ("
+                        "id, user_id, provider, provider_account_id, account_email, scopes, "
+                        "status, last_error_code, created_at, updated_at"
+                        ") VALUES ("
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'00000000-0000-0000-0000-000000000201', 'google', "
+                        "'synthetic-mail-identity-account', "
+                        "'mail-identity-owner@example.test', '[]'::jsonb, "
+                        "'connected', NULL, now(), now()"
+                        ")"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO email_threads ("
+                        "id, user_id, connection_id, provider_thread_id, subject, "
+                        "participants, latest_message_at, provider_url, created_at, updated_at"
+                        ") VALUES "
+                        "('00000000-0000-0000-0000-000000000211', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'synthetic-thread-before-migration', 'Synthetic thread one', "
+                        "'[]'::jsonb, now(), 'https://example.test/thread-one', now(), now()), "
+                        "('00000000-0000-0000-0000-000000000212', "
+                        "'00000000-0000-0000-0000-000000000201', "
+                        "'00000000-0000-0000-0000-000000000202', "
+                        "'synthetic-thread-duplicate-migration', 'Synthetic thread two', "
+                        "'[]'::jsonb, now(), 'https://example.test/thread-two', now(), now())"
+                    )
+                )
+                message_rows = [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000221",
+                        "thread_id": "00000000-0000-0000-0000-000000000211",
+                        "scope_key": "mailbox",
+                    }
+                ]
+                if duplicate:
+                    message_rows.append(
+                        {
+                            "id": "00000000-0000-0000-0000-000000000222",
+                            "thread_id": "00000000-0000-0000-0000-000000000212",
+                            "scope_key": "archive",
+                        }
+                    )
+                for row in message_rows:
+                    await connection.execute(
+                        text(
+                            "INSERT INTO email_messages ("
+                            "id, user_id, thread_id, provider_message_id, received_at, "
+                            "mailbox_scope_key, sender, recipients, subject, snippet, "
+                            "body_ciphertext, body_nonce, body_key_version, labels, headers, "
+                            "provider_url, created_at, updated_at"
+                            ") VALUES ("
+                            ":id, '00000000-0000-0000-0000-000000000201', :thread_id, "
+                            "'synthetic-message-before-migration', now(), :scope_key, "
+                            "'{}'::jsonb, '[]'::jsonb, 'Synthetic message', '', "
+                            "NULL, NULL, NULL, '[]'::jsonb, '{}'::jsonb, "
+                            "'https://example.test/message', now(), now()"
+                            ")"
+                        ),
+                        row,
+                    )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_rows())
+
+
+def _mail_identity_migration_state(database_url: URL) -> tuple[set[str], int, str | None, bool]:
+    """读取迁移版本、消息数、回填连接与 direct column 是否存在。"""
+
+    async def read_state() -> tuple[set[str], int, str | None, bool]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                revisions = {
+                    str(value)
+                    for value in (
+                        await connection.execute(text("SELECT version_num FROM alembic_version"))
+                    ).scalars()
+                }
+                message_count = int(
+                    await connection.scalar(text("SELECT count(*) FROM email_messages")) or 0
+                )
+                column_exists = bool(
+                    await connection.scalar(
+                        text(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_schema = 'public' AND table_name = 'email_messages' "
+                            "AND column_name = 'connection_id'"
+                            ")"
+                        )
+                    )
+                )
+                connection_id: str | None = None
+                if column_exists and message_count == 1:
+                    value = await connection.scalar(
+                        text("SELECT connection_id FROM email_messages LIMIT 1")
+                    )
+                    connection_id = str(value) if value is not None else None
+                return revisions, message_count, connection_id, column_exists
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_state())
+
+
 @pytest.mark.filterwarnings("error:Cannot correctly sort tables")
 def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
     empty_migration_database: URL,
@@ -475,7 +642,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260808_0015"}
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0016"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -501,6 +668,10 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "fk_tool_executions_step_id_task_id": (True, True),
     }
     assert _m2_constraint_columns(empty_migration_database) == {
+        "fk_email_messages_connection_user": (
+            "connection_id",
+            "user_id",
+        ),
         "fk_oauth_attempts_target_connection_user": (
             "target_connection_id",
             "user_id",
@@ -517,6 +688,10 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
             "user_id",
             "connection_id",
             "capability",
+        ),
+        "uq_email_messages_connection_provider_message": (
+            "connection_id",
+            "provider_message_id",
         ),
         "uq_oauth_connections_id_user_id": ("id", "user_id"),
         "uq_provider_calendars_connection_provider_calendar": (
@@ -537,12 +712,17 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         ),
     }
     assert _m2_ownership_guard_modes(empty_migration_database) == {
+        "fk_email_messages_connection_user": (True, True),
         "fk_oauth_attempts_target_connection_user": (True, True),
         "fk_connection_capabilities_connection_user": (True, True),
         "fk_provider_calendars_connection_user": (True, True),
         "fk_users_default_calendar_connection_id_user_id": (True, True),
         "fk_users_default_mail_connection_id_user_id": (True, True),
     }
+    assert _email_message_identity_metadata(empty_migration_database) == (
+        ("uuid", "NO"),
+        {"uq_email_messages_connection_provider_message"},
+    )
     binding_columns = _oauth_attempt_binding_columns(empty_migration_database)
     assert binding_columns[("oauth_attempts", "target_connection_id")] == ("uuid", "YES", None)
     assert binding_columns[("oauth_attempts", "target_authorization_generation")] == (
@@ -570,6 +750,62 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         empty_migration_database
     )
     command.check(alembic_config)
+
+
+def test_mail_message_identity_migration_backfills_and_downgrades_without_row_loss(
+    empty_migration_database: URL,
+) -> None:
+    """0016 必须从 thread 安全回填连接，并能无损恢复旧结构。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+
+    command.upgrade(alembic_config, "20260808_0016")
+
+    assert _mail_identity_migration_state(empty_migration_database) == (
+        {"20260808_0016"},
+        1,
+        "00000000-0000-0000-0000-000000000202",
+        True,
+    )
+
+    command.downgrade(alembic_config, "20260808_0015")
+
+    assert _mail_identity_migration_state(empty_migration_database) == (
+        {"20260808_0015"},
+        1,
+        None,
+        False,
+    )
+
+
+def test_mail_message_identity_migration_fails_closed_on_historical_duplicates(
+    empty_migration_database: URL,
+) -> None:
+    """旧 Schema 已有连接级重复时不得任意删除或选择一条完成升级。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=True)
+
+    with pytest.raises(RuntimeError, match="connection-level duplicate"):
+        command.upgrade(alembic_config, "20260808_0016")
+
+    assert _mail_identity_migration_state(empty_migration_database) == (
+        {"20260808_0015"},
+        2,
+        None,
+        False,
+    )
 
 
 def test_provider_neutral_cursor_migration_renames_only_gmail_resource_kind(

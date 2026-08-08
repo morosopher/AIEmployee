@@ -178,8 +178,9 @@ class SqlAlchemyMailSyncRepository:
         """原子 upsert 一个规范化线程及其消息，保持幂等键和用户归属不变量。
 
         线程先按 ``connection_id + provider_thread_id`` 写入，消息随后以取得的本地主键按
-        ``thread_id + provider_message_id`` 写入。重复投递只覆盖供应商可变元数据与新密文，
-        不会制造第二个事实行，也不会保留原始 MIME 或附件。
+        ``connection_id + provider_message_id`` 写入。Graph ImmutableId 在 folder move 或
+        conversation 投影变化后仍代表同一消息，因此冲突更新必须同步切换 ``thread_id``、
+        scope、规范元数据与新密文，不能制造第二个事实行或保留原始 MIME/附件。
         """
         participants = self._participants(message)
         thread_statement = insert(EmailThreadModel).values(
@@ -209,6 +210,7 @@ class SqlAlchemyMailSyncRepository:
             raise RuntimeError("Mail thread upsert did not return an ID")
         message_statement = insert(EmailMessageModel).values(
             user_id=user_id,
+            connection_id=connection_id,
             thread_id=thread_id,
             provider_message_id=message.provider_message_id,
             internet_message_id=message.internet_message_id,
@@ -230,8 +232,9 @@ class SqlAlchemyMailSyncRepository:
         )
         await self._session.execute(
             message_statement.on_conflict_do_update(
-                constraint="uq_email_messages_thread_provider_message",
+                constraint="uq_email_messages_connection_provider_message",
                 set_={
+                    "thread_id": message_statement.excluded.thread_id,
                     "received_at": message_statement.excluded.received_at,
                     "sent_at": message_statement.excluded.sent_at,
                     "internet_message_id": message_statement.excluded.internet_message_id,
@@ -262,20 +265,15 @@ class SqlAlchemyMailSyncRepository:
     ) -> None:
         """按用户、连接、folder scope 和不可变消息 ID安全删除一个墓碑对象。
 
-        ``email_messages`` 通过线程间接持有 ``connection_id``，因此删除谓词同时约束消息
-        自身的 ``user_id``、所属线程的连接/用户以及精确 ``mailbox_scope_key``。即使供应商
-        重复投递同一 tombstone 或另一个用户拥有相同 provider ID，也不会越过连接边界。
-        空线程暂时保留其无敏感正文的索引元数据，避免删除墓碑与分析/审计外键形成级联副作用。
+        direct ``connection_id`` 与 ``user_id``、scope、ImmutableId 共同形成完整删除谓词；
+        即使供应商重复投递同一 tombstone，或另一连接拥有相同 ID，也不会扩大删除范围。
+        空线程暂时保留其无敏感正文的索引元数据，避免墓碑与分析/审计外键形成级联副作用。
         """
-        thread_ids = select(EmailThreadModel.id).where(
-            EmailThreadModel.connection_id == connection_id,
-            EmailThreadModel.user_id == user_id,
-        )
         statement = delete(EmailMessageModel).where(
             EmailMessageModel.user_id == user_id,
+            EmailMessageModel.connection_id == connection_id,
             EmailMessageModel.provider_message_id == removal.provider_message_id,
             EmailMessageModel.mailbox_scope_key == removal.mailbox_scope_key,
-            EmailMessageModel.thread_id.in_(thread_ids),
         )
         await self._session.execute(statement)
 
