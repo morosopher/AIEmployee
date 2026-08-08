@@ -136,7 +136,7 @@ class SqlAlchemyCalendarSyncRepository:
         encrypted_description: EncryptedValue,
         encrypted_location: EncryptedValue,
     ) -> None:
-        """按连接和供应商 event ID 幂等覆盖事件，取消状态保留 tombstone。
+        """按连接、日历和供应商 event ID 幂等覆盖事件，取消状态保留 tombstone。
 
         事件自身的 ``locked``/等价事实只能缩小修改能力；真正账户 ACL 必须来自同用户、
         同连接、同 calendar 的目录行。两者取交集后持久化，目录缺失时 fail closed，避免
@@ -183,11 +183,10 @@ class SqlAlchemyCalendarSyncRepository:
         )
         await self._session.execute(
             stmt.on_conflict_do_update(
-                constraint="uq_calendar_events_connection_provider_event",
+                constraint="uq_calendar_events_connection_calendar_provider_event",
                 set_={
                     key: getattr(stmt.excluded, key)
                     for key in (
-                        "calendar_id",
                         "title",
                         "description_ciphertext",
                         "description_nonce",

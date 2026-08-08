@@ -179,6 +179,47 @@ class DirectoryCalendarReader:
         )
 
 
+@dataclass(slots=True)
+class SharedProviderEventReader(DirectoryCalendarReader):
+    """让两个日历返回同一供应商事件 ID，同时保留各自独立的事件版本。"""
+
+    primary_version: int = 1
+    readonly_version: int = 1
+
+    def _event(self, calendar_id: str) -> CalendarEvent:
+        """构造仅在目标日历内唯一的合成事件，复现 Google 自定义 ID 语义。"""
+        version = self.primary_version if calendar_id == "primary" else self.readonly_version
+        hour = 1 if calendar_id == "primary" else 3
+        return CalendarEvent(
+            event_id="shared-event-id",
+            calendar_id=calendar_id,
+            title=f"Synthetic {calendar_id} v{version}",
+            description=f"private description {calendar_id}",
+            location=f"private location {calendar_id}",
+            starts_at=datetime(2030, 1, 2, hour, tzinfo=UTC),
+            ends_at=datetime(2030, 1, 2, hour + 1, tzinfo=UTC),
+            all_day=False,
+            transparency="opaque",
+            status="confirmed",
+            timezone="UTC",
+            recurring_event_id=None,
+            etag=f"etag-{calendar_id}-v{version}",
+            provider_url=(f"https://calendar.example.test/{calendar_id}/shared-event-id"),
+            updated_at=datetime(2030, 1, version, tzinfo=UTC),
+            organizer={
+                "email": f"organizer-{calendar_id}@example.test",
+                "displayName": f"Synthetic {calendar_id} Organizer",
+            },
+            attendees=(
+                {
+                    "email": f"attendee-{calendar_id}@example.test",
+                    "responseStatus": "accepted",
+                },
+            ),
+            can_edit=True,
+        )
+
+
 def _directory_calendars() -> tuple[ProviderCalendar, ...]:
     """返回一个可写主日历和一个只读日历的合成目录。"""
     return (
@@ -200,6 +241,36 @@ def _directory_calendars() -> tuple[ProviderCalendar, ...]:
             can_write=False,
             provider_url="https://calendar.example.test/readonly",
         ),
+    )
+
+
+def _non_sensitive_event_projection(event: CalendarEventModel) -> tuple[object, ...]:
+    """返回完整供应商非敏感投影，证明未返回的日历行不会被跨 scope 改写。
+
+    ``created_at``/``updated_at`` 是本地同步 bookkeeping 时间，不属于供应商投影；目录
+    ACL 复核可能触发后者更新，因此不能把它们误当成事件事实差异。
+    """
+    return (
+        event.id,
+        event.user_id,
+        event.connection_id,
+        event.provider_event_id,
+        event.calendar_id,
+        event.title,
+        event.starts_at,
+        event.ends_at,
+        event.all_day,
+        event.transparency,
+        event.status,
+        event.timezone,
+        event.recurring_event_id,
+        event.etag,
+        event.organizer,
+        event.attendees,
+        event.access_role,
+        event.can_edit,
+        event.provider_url,
+        event.provider_updated_at,
     )
 
 
@@ -1941,6 +2012,93 @@ async def test_directory_sync_keeps_other_calendar_success_when_one_scope_fails(
         "readonly@example.test": "readonly@example.test-token-2",
     }
     assert event_calendars == ("primary", "readonly@example.test")
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_same_provider_event_id_is_scoped_per_calendar(database_url: str) -> None:
+    """相同 provider event ID 必须按日历隔离，单 scope 增量不能覆盖另一行。"""
+    sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    stores = _calendar_stores(sessions)
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(google_calendar=SharedProviderEventReader(_directory_calendars())),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        first_rows = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel)
+                    .where(
+                        CalendarEventModel.user_id == user_id,
+                        CalendarEventModel.connection_id == connection_id,
+                    )
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+
+    assert [row.calendar_id for row in first_rows] == [
+        "primary",
+        "readonly@example.test",
+    ]
+    assert [
+        (row.provider_event_id, row.title, row.etag, row.provider_url) for row in first_rows
+    ] == [
+        (
+            "shared-event-id",
+            "Synthetic primary v1",
+            "etag-primary-v1",
+            "https://calendar.example.test/primary/shared-event-id",
+        ),
+        (
+            "shared-event-id",
+            "Synthetic readonly@example.test v1",
+            "etag-readonly@example.test-v1",
+            "https://calendar.example.test/readonly@example.test/shared-event-id",
+        ),
+    ]
+    readonly_before = _non_sensitive_event_projection(first_rows[1])
+
+    await SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(
+            google_calendar=SharedProviderEventReader(
+                _directory_calendars(),
+                directory_tokens=("directory-token-2",),
+                event_generation=2,
+                empty_delta_scopes=frozenset({"readonly@example.test"}),
+                primary_version=2,
+            )
+        ),
+        cipher,
+    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+    async with sessions() as session:
+        second_rows = tuple(
+            (
+                await session.scalars(
+                    select(CalendarEventModel)
+                    .where(
+                        CalendarEventModel.user_id == user_id,
+                        CalendarEventModel.connection_id == connection_id,
+                    )
+                    .order_by(CalendarEventModel.calendar_id)
+                )
+            ).all()
+        )
+
+    assert [row.calendar_id for row in second_rows] == [
+        "primary",
+        "readonly@example.test",
+    ]
+    assert (second_rows[0].title, second_rows[0].etag) == (
+        "Synthetic primary v2",
+        "etag-primary-v2",
+    )
+    assert _non_sensitive_event_projection(second_rows[1]) == readonly_before
     await sessions.dispose()
 
 

@@ -108,12 +108,16 @@ class FakeCalendarReader:
         )
 
     async def initial_pages(self, calendar_id: str = "primary") -> AsyncIterator[CalendarSyncPage]:
-        """读取本地事件 JSON 并按调用方日历 ID规范化，保证 fixture 与真实端口一致。"""
+        """读取 primary 事件 JSON；其他日历返回稳定空页，避免伪造供应商事件。"""
         if await self._consume_scenario() == "calendar_5xx":
             raise TransientProviderError(
                 error_code="google_service_unavailable",
                 message="Google Calendar is temporarily unavailable",
             )
+        if calendar_id != "primary":
+            # fixture 只描述 primary collection；为 secondary 伪造同一事件会制造错误身份。
+            yield CalendarSyncPage((), None, f"fake-empty-{calendar_id}")
+            return
         payload = json.loads(self._fixture.read_text(encoding="utf-8"))
         adapter = CalendarAdapter(
             access_token="fake", user_timezone="UTC", now=lambda: datetime(2030, 1, 9, tzinfo=UTC)
@@ -131,7 +135,7 @@ class FakeCalendarReader:
     async def sync_pages(
         self, calendar_id: str, cursor: str | None = None
     ) -> AsyncIterator[CalendarSyncPage]:
-        """增量模式使用同一脱敏 fixture，调用方只能观察稳定游标行为。"""
+        """primary 使用脱敏 fixture，其他日历返回稳定空页和合成游标。"""
         if cursor is None:
             cursor, calendar_id = calendar_id, "primary"
         del cursor
@@ -141,7 +145,10 @@ class FakeCalendarReader:
     async def get_current_event(
         self, calendar_id: str, provider_event_id: str
     ) -> CalendarEvent | None:
-        """精确从合成事件 fixture 读取当前事件，不构造供应商网络请求。"""
+        """仅从 primary fixture 精确读取当前事件，secondary 未知时安全返回 ``None``。"""
+        if calendar_id != "primary":
+            # 在检查 fixture 前拒绝 secondary，避免把 primary 事实投影到错误日历。
+            return None
         payload = json.loads(self._fixture.read_text(encoding="utf-8"))
         adapter = CalendarAdapter(access_token="fake", user_timezone="UTC")
         for item in payload.get("items", []):

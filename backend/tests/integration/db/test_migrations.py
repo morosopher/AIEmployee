@@ -209,6 +209,7 @@ def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
                         "'uq_sync_cursors_connection_resource_scope', "
                         "'uq_connection_capabilities_user_connection_capability', "
                         "'uq_provider_calendars_connection_provider_calendar', "
+                        "'uq_calendar_events_connection_calendar_provider_event', "
                         "'fk_users_default_mail_connection_id_user_id', "
                         "'fk_users_default_calendar_connection_id_user_id'"
                         ") GROUP BY constraint_info.conname"
@@ -219,6 +220,42 @@ def _m2_constraint_columns(database_url: URL) -> dict[str, tuple[str, ...]]:
             await engine.dispose()
 
     return asyncio.run(read_columns())
+
+
+def _calendar_event_identity_constraints(database_url: URL) -> dict[str, tuple[str, ...]]:
+    """读取 CalendarEvent 的全部唯一约束及其有序列，排除主键等非身份约束。"""
+
+    async def read_constraints() -> dict[str, tuple[str, ...]]:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                rows = await connection.execute(
+                    text(
+                        "SELECT constraint_info.conname, "
+                        "ARRAY_AGG(attribute.attname ORDER BY key_info.position) "
+                        "FROM pg_catalog.pg_constraint AS constraint_info "
+                        "JOIN pg_catalog.pg_class AS table_info "
+                        "ON table_info.oid = constraint_info.conrelid "
+                        "JOIN pg_catalog.pg_namespace AS namespace_info "
+                        "ON namespace_info.oid = table_info.relnamespace "
+                        "JOIN unnest(constraint_info.conkey) WITH ORDINALITY "
+                        "AS key_info(attnum, position) ON TRUE "
+                        "JOIN pg_catalog.pg_attribute AS attribute "
+                        "ON attribute.attrelid = table_info.oid "
+                        "AND attribute.attnum = key_info.attnum "
+                        "WHERE namespace_info.nspname = 'public' "
+                        "AND table_info.relname = 'calendar_events' "
+                        "AND constraint_info.contype = 'u' "
+                        "GROUP BY constraint_info.conname"
+                    )
+                )
+                return {
+                    str(row[0]): tuple(str(column_name) for column_name in row[1]) for row in rows
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read_constraints())
 
 
 def _m2_ownership_guard_modes(database_url: URL) -> dict[str, tuple[bool, bool]]:
@@ -887,7 +924,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",
@@ -952,6 +989,11 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "uq_provider_calendars_connection_provider_calendar": (
             "connection_id",
             "provider_calendar_id",
+        ),
+        "uq_calendar_events_connection_calendar_provider_event": (
+            "connection_id",
+            "calendar_id",
+            "provider_event_id",
         ),
         # 旧约束名只作为现有 M1 ON CONFLICT SQL 的三列兼容入口；此断言防止它退回
         # 会阻断多 scope 的两列约束。
@@ -2147,6 +2189,300 @@ def test_mail_message_identity_contract_attaches_existing_valid_indexes(
     assert _m2_constraint_columns(empty_migration_database)[
         "uq_email_threads_id_connection_user"
     ] == ("id", "connection_id", "user_id")
+
+
+def test_calendar_event_identity_migration_attaches_existing_valid_index(
+    empty_migration_database: URL,
+) -> None:
+    """0018 可复用已完成但尚未挂载的三元索引，避免重复并发建索引。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0017")
+
+    async def create_valid_index() -> None:
+        """模拟并发索引已完成但 metadata contract 尚未提交的中断窗口。"""
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_calendar_events_connection_calendar_provider_event "
+                        "ON calendar_events (connection_id, calendar_id, provider_event_id)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create_valid_index())
+    command.upgrade(alembic_config, "20260809_0018")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
+    assert _calendar_event_identity_constraints(empty_migration_database) == {
+        "uq_calendar_events_connection_calendar_provider_event": (
+            "connection_id",
+            "calendar_id",
+            "provider_event_id",
+        )
+    }
+
+
+def test_calendar_event_identity_migration_rejects_wrong_shape_named_index(
+    empty_migration_database: URL,
+) -> None:
+    """同名但列形状错误的索引必须保留并 fail closed，不能被迁移误删重建。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0017")
+
+    async def create_wrong_shape_index() -> None:
+        """创建同名二列索引，复现人工/错误部署对象。"""
+        engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        "uq_calendar_events_connection_calendar_provider_event "
+                        "ON calendar_events (connection_id, provider_event_id)"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create_wrong_shape_index())
+    with pytest.raises(RuntimeError, match="unexpected index definition"):
+        command.upgrade(alembic_config, "20260809_0018")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+
+    async def read_index_columns() -> tuple[str, ...]:
+        """读取错误对象，证明 fail closed 没有清理非本迁移目标。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                row = await connection.execute(
+                    text(
+                        "SELECT ARRAY("
+                        "SELECT attribute.attname FROM unnest(index_info.indkey) "
+                        "WITH ORDINALITY AS index_key(attnum, position) "
+                        "JOIN pg_catalog.pg_attribute AS attribute "
+                        "ON attribute.attrelid = index_info.indrelid "
+                        "AND attribute.attnum = index_key.attnum "
+                        "ORDER BY index_key.position) "
+                        "FROM pg_catalog.pg_index AS index_info "
+                        "JOIN pg_catalog.pg_class AS index_class "
+                        "ON index_class.oid = index_info.indexrelid "
+                        "WHERE index_class.relname = "
+                        "'uq_calendar_events_connection_calendar_provider_event'"
+                    )
+                )
+                row_value = row.scalar_one()
+                return tuple(str(column) for column in row_value)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_index_columns()) == ("connection_id", "provider_event_id")
+
+
+def test_calendar_event_identity_migration_downgrades_without_cross_calendar_duplicates(
+    empty_migration_database: URL,
+) -> None:
+    """没有跨日历重复时 downgrade 可恢复旧约束且不保留三元身份。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260809_0018")
+    command.downgrade(alembic_config, "20260808_0017")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _calendar_event_identity_constraints(empty_migration_database) == {
+        "uq_calendar_events_connection_provider_event": (
+            "connection_id",
+            "provider_event_id",
+        )
+    }
+
+
+def test_calendar_event_identity_migration_scopes_ids_per_calendar(
+    empty_migration_database: URL,
+) -> None:
+    """0018 保留历史事件、放宽跨日历同 ID，并继续拒绝相同三元组。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0017")
+
+    user_id = "00000000-0000-0000-0000-000000000301"
+    connection_id = "00000000-0000-0000-0000-000000000302"
+    historical_event_id = "00000000-0000-0000-0000-000000000303"
+
+    async def seed_historical_event() -> None:
+        """只使用 0017 已存在列写入一个合成 primary 历史事件。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO users ("
+                        "email, display_name, password_hash, timezone, locale, brief_time, "
+                        "is_active, id"
+                        ") VALUES ("
+                        "'calendar-identity@example.test', 'Calendar Identity', NULL, "
+                        "'UTC', 'zh-CN', '08:00', TRUE, CAST(:user_id AS uuid)"
+                        ")"
+                    ),
+                    {"user_id": user_id},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO oauth_connections ("
+                        "user_id, provider, provider_account_id, account_email, scopes, "
+                        "status, last_error_code, id"
+                        ") VALUES ("
+                        "CAST(:user_id AS uuid), 'google', 'calendar-identity-subject', "
+                        "'calendar-identity@example.test', '[]'::jsonb, 'connected', NULL, "
+                        "CAST(:connection_id AS uuid)"
+                        ")"
+                    ),
+                    {"user_id": user_id, "connection_id": connection_id},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO calendar_events ("
+                        "user_id, connection_id, provider_event_id, calendar_id, title, "
+                        "starts_at, ends_at, all_day, transparency, status, timezone, etag, "
+                        "provider_url, id"
+                        ") VALUES ("
+                        "CAST(:user_id AS uuid), CAST(:connection_id AS uuid), "
+                        "'shared-event-id', 'primary', 'Historical primary event', "
+                        "'2030-01-02T01:00:00+00:00', '2030-01-02T02:00:00+00:00', FALSE, "
+                        "'opaque', 'confirmed', 'UTC', 'historical-etag', "
+                        "'https://calendar.example.test/primary/shared-event-id', "
+                        "CAST(:event_id AS uuid)"
+                        ")"
+                    ),
+                    {
+                        "user_id": user_id,
+                        "connection_id": connection_id,
+                        "event_id": historical_event_id,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_historical_event())
+    command.upgrade(alembic_config, "20260809_0018")
+
+    async def read_events() -> tuple[tuple[str, str, str], ...]:
+        """读取迁移后的业务行，验证迁移不删除、合并或重写历史投影。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                rows = await connection.execute(
+                    text(
+                        "SELECT id::text, calendar_id, title FROM calendar_events "
+                        "ORDER BY calendar_id, id"
+                    )
+                )
+                return tuple((str(row[0]), str(row[1]), str(row[2])) for row in rows)
+        finally:
+            await engine.dispose()
+
+    assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
+    read_events_result = asyncio.run(read_events())
+    assert read_events_result
+    assert read_events_result == ((historical_event_id, "primary", "Historical primary event"),)
+    assert _calendar_event_identity_constraints(empty_migration_database) == {
+        "uq_calendar_events_connection_calendar_provider_event": (
+            "connection_id",
+            "calendar_id",
+            "provider_event_id",
+        )
+    }
+
+    async def insert_event(*, event_id: str, calendar_id: str, title: str) -> None:
+        """插入一个完整合成事件，用真实唯一约束验证三元身份语义。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO calendar_events ("
+                        "user_id, connection_id, provider_event_id, calendar_id, title, "
+                        "starts_at, ends_at, all_day, transparency, status, timezone, etag, "
+                        "provider_url, id"
+                        ") VALUES ("
+                        "CAST(:user_id AS uuid), CAST(:connection_id AS uuid), "
+                        "'shared-event-id', :calendar_id, :title, "
+                        "'2030-01-03T01:00:00+00:00', '2030-01-03T02:00:00+00:00', FALSE, "
+                        "'opaque', 'confirmed', 'UTC', 'secondary-etag', "
+                        "'https://calendar.example.test/secondary/shared-event-id', "
+                        "CAST(:event_id AS uuid)"
+                        ")"
+                    ),
+                    {
+                        "user_id": user_id,
+                        "connection_id": connection_id,
+                        "calendar_id": calendar_id,
+                        "title": title,
+                        "event_id": event_id,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    secondary_event_id = "00000000-0000-0000-0000-000000000304"
+    asyncio.run(
+        insert_event(
+            event_id=secondary_event_id,
+            calendar_id="readonly@example.test",
+            title="Readonly event with shared ID",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        asyncio.run(
+            insert_event(
+                event_id="00000000-0000-0000-0000-000000000305",
+                calendar_id="readonly@example.test",
+                title="Duplicate readonly identity",
+            )
+        )
+
+    assert asyncio.run(read_events()) == (
+        (historical_event_id, "primary", "Historical primary event"),
+        (
+            secondary_event_id,
+            "readonly@example.test",
+            "Readonly event with shared ID",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="cannot restore legacy calendar event identity"):
+        command.downgrade(alembic_config, "20260808_0017")
+    assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
+    assert len(asyncio.run(read_events())) == 2
 
 
 def test_provider_neutral_cursor_migration_renames_only_gmail_resource_kind(

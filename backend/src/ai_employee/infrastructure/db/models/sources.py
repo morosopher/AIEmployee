@@ -440,6 +440,8 @@ class EmailAnalysisModel(UUIDPrimaryKeyMixin, Base):
 class CalendarEventModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """保存供应商日历事件和字段级加密的描述、地点。
 
+    ``provider_event_id`` 只在同一 ``connection_id + calendar_id`` 作用域内唯一；不同
+    日历允许返回相同的供应商事件 ID，不能因此互相覆盖。
     organizer、attendees 与 access role 对历史 M1 行可能未知，因此允许为空。``can_edit``
     是写入授权的只读投影，未知时必须 fail-safe 为 ``False``，后续同步只能依据供应商明确
     返回的权限提升该值。
@@ -449,8 +451,9 @@ class CalendarEventModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint(
             "connection_id",
+            "calendar_id",
             "provider_event_id",
-            name="uq_calendar_events_connection_provider_event",
+            name="uq_calendar_events_connection_calendar_provider_event",
         ),
         Index("ix_calendar_events_connection_starts", "connection_id", "starts_at"),
     )
