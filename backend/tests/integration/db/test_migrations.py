@@ -1244,6 +1244,174 @@ def test_mail_message_identity_contract_catches_up_0016_window_null_rows(
     )
 
 
+def test_mail_repository_falls_back_to_legacy_during_new_index_build(
+    empty_migration_database: URL,
+) -> None:
+    """新唯一索引正在并发构建时，仍须通过精确 legacy constraint 保持可写。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0015")
+    _seed_pre_identity_mail_rows(empty_migration_database, duplicate=False)
+    command.upgrade(alembic_config, "20260808_0016")
+
+    async def exercise_build_window() -> tuple[str | None, MailMessageUpsertResult | None]:
+        """用条件轮询观察真实 ``indisready=true/indisvalid=false`` 中间态。"""
+        index_name = "uq_email_messages_connection_provider_message"
+        blocker_engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="REPEATABLE READ",
+        )
+        builder_engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        # 轮询连接只读 catalog；AUTOCOMMIT 防止每次 SELECT 留下第二个长快照，
+        # 否则释放显式 blocker 后 CREATE INDEX CONCURRENTLY 仍会无法进入 valid。
+        observer_engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        cleanup_engine = create_async_engine(
+            empty_migration_database,
+            poolclass=NullPool,
+            isolation_level="AUTOCOMMIT",
+        )
+        blocker_connection = await blocker_engine.connect()
+        builder_connection = await builder_engine.connect()
+        observer_connection = await observer_engine.connect()
+        blocker_transaction = None
+        build_task: asyncio.Task[None] | None = None
+        error_message: str | None = None
+        upsert_result: MailMessageUpsertResult | None = None
+        try:
+            blocker_transaction = await blocker_connection.begin()
+            # REPEATABLE READ snapshot 必须在 CREATE INDEX CONCURRENTLY 之前读取目标表，
+            # 这样索引在第二次扫描后会稳定等待该事务，而不是偶然直接完成到 valid。
+            await blocker_connection.execute(text("SELECT count(*) FROM email_messages"))
+
+            async def build_index() -> None:
+                await builder_connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX CONCURRENTLY "
+                        f"{index_name} ON email_messages (connection_id, provider_message_id)"
+                    )
+                )
+
+            build_task = asyncio.create_task(build_index())
+            async with asyncio.timeout(30):
+                while True:
+                    row = (
+                        await observer_connection.execute(
+                            text(
+                                "SELECT index_class.relkind::text, table_class.relname, "
+                                "index_info.indisready, index_info.indisvalid, "
+                                "index_info.indisunique, index_info.indpred IS NULL, "
+                                "index_info.indexprs IS NULL, index_info.indnkeyatts, "
+                                "index_info.indnatts, ARRAY("
+                                "SELECT CASE WHEN index_key.attnum = 0 THEN NULL "
+                                "ELSE attribute.attname::text END "
+                                "FROM unnest(index_info.indkey) WITH ORDINALITY "
+                                "AS index_key(attnum, position) "
+                                "LEFT JOIN pg_catalog.pg_attribute AS attribute "
+                                "ON attribute.attrelid = index_info.indrelid "
+                                "AND attribute.attnum = index_key.attnum "
+                                "ORDER BY index_key.position) "
+                                "FROM pg_catalog.pg_class AS index_class "
+                                "JOIN pg_catalog.pg_namespace AS namespace "
+                                "ON namespace.oid = index_class.relnamespace "
+                                "JOIN pg_catalog.pg_index AS index_info "
+                                "ON index_info.indexrelid = index_class.oid "
+                                "JOIN pg_catalog.pg_class AS table_class "
+                                "ON table_class.oid = index_info.indrelid "
+                                "WHERE namespace.nspname = current_schema() "
+                                "AND index_class.relname = :index_name"
+                            ),
+                            {"index_name": index_name},
+                        )
+                    ).one_or_none()
+                    if row is not None and (
+                        row[0] == "i"
+                        and row[1] == "email_messages"
+                        and bool(row[2])
+                        and not bool(row[3])
+                        and bool(row[4])
+                        and bool(row[5])
+                        and bool(row[6])
+                        and int(row[7]) == 2
+                        and int(row[8]) == 2
+                        and tuple(row[9]) == ("connection_id", "provider_message_id")
+                    ):
+                        break
+                    if build_task.done():
+                        build_task.result()
+                        raise AssertionError(
+                            "CREATE INDEX CONCURRENTLY completed before invalid build state"
+                        )
+                    # 这是条件轮询的让步间隔；退出条件始终是 catalog 状态或任务结果，
+                    # 不是依赖某个固定睡眠时长猜测 PostgreSQL 的构建进度。
+                    await asyncio.sleep(0.02)
+
+            try:
+                upsert_result = await asyncio.to_thread(
+                    _upsert_identity_migration_message,
+                    empty_migration_database,
+                    provider_thread_id="synthetic-index-build-window-thread",
+                    provider_updated_at=datetime(2026, 8, 9, 1, tzinfo=UTC),
+                    mailbox_scope_key="synthetic-index-build-window",
+                )
+            except RuntimeError as error:
+                error_message = str(error)
+
+            await blocker_transaction.rollback()
+            blocker_transaction = None
+            await asyncio.wait_for(build_task, timeout=30)
+            build_task = None
+            return error_message, upsert_result
+        finally:
+            if blocker_transaction is not None:
+                await blocker_transaction.rollback()
+            if build_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(build_task, return_exceptions=True),
+                        timeout=30,
+                    )
+                except TimeoutError:
+                    build_task.cancel()
+                    await asyncio.gather(build_task, return_exceptions=True)
+            try:
+                async with cleanup_engine.connect() as connection:
+                    await connection.execute(
+                        text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+                    )
+            finally:
+                await blocker_connection.close()
+                await builder_connection.close()
+                await observer_connection.close()
+                await blocker_engine.dispose()
+                await builder_engine.dispose()
+                await observer_engine.dispose()
+                await cleanup_engine.dispose()
+
+    error_message, upsert_result = asyncio.run(exercise_build_window())
+    assert (error_message, upsert_result) == (None, MailMessageUpsertResult.APPLIED)
+    assert _identity_message_projection_rows(empty_migration_database) == (
+        (
+            "00000000-0000-0000-0000-000000000202",
+            datetime(2026, 8, 9, 1, tzinfo=UTC),
+            "synthetic-index-build-window-thread",
+            "synthetic-index-build-window",
+        ),
+    )
+
+
 def test_mail_message_identity_migration_fails_closed_on_historical_duplicates(
     empty_migration_database: URL,
 ) -> None:

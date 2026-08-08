@@ -490,7 +490,14 @@ class SqlAlchemyMailSyncRepository:
         return target
 
     async def _resolve_message_identity_conflict_target(self) -> _MailMessageConflictTarget:
-        """验证新 constraint/index 或 legacy constraint 的完整 PostgreSQL 形状。"""
+        """按真实 catalog 选择当前事务可用且不会误删的邮件 identity target。
+
+        0017 使用 ``CREATE UNIQUE INDEX CONCURRENTLY`` 时，精确新索引会短暂处于
+        ``indisready=true``、``indisvalid=false``。只要它的完整键形状已被验证，且
+        0016 legacy constraint 仍是有效的精确 ``(thread_id, provider_message_id)``，
+        就必须回退到 legacy conflict target，保持 online expand/contract 窗口可写。
+        错误表、表达式、INCLUDE、谓词、列数或列顺序永远不能触发 fallback。
+        """
         new_constraints = await self._constraint_catalog_rows(_NEW_MESSAGE_IDENTITY)
         if new_constraints:
             if len(new_constraints) != 1 or not self._is_exact_identity_constraint(
@@ -504,12 +511,15 @@ class SqlAlchemyMailSyncRepository:
             await self._session.execute(
                 text(
                     "SELECT index_class.relkind::text, table_class.relname, "
-                    "index_info.indisvalid, index_info.indisunique, "
-                    "index_info.indpred IS NULL, index_info.indexprs IS NULL, "
-                    "ARRAY(SELECT attribute.attname "
+                    "index_info.indisready, index_info.indisvalid, "
+                    "index_info.indisunique, index_info.indpred IS NULL, "
+                    "index_info.indexprs IS NULL, index_info.indnkeyatts, "
+                    "index_info.indnatts, ARRAY("
+                    "SELECT CASE WHEN index_key.attnum = 0 THEN NULL "
+                    "ELSE attribute.attname::text END "
                     "FROM unnest(index_info.indkey) WITH ORDINALITY "
                     "AS index_key(attnum, position) "
-                    "JOIN pg_catalog.pg_attribute AS attribute "
+                    "LEFT JOIN pg_catalog.pg_attribute AS attribute "
                     "ON attribute.attrelid = index_info.indrelid "
                     "AND attribute.attnum = index_key.attnum "
                     "ORDER BY index_key.position) "
@@ -527,19 +537,26 @@ class SqlAlchemyMailSyncRepository:
             )
         ).one_or_none()
         if new_index is not None:
-            index_columns = self._catalog_columns(new_index[6])
-            if (
-                new_index[0] != "i"
-                or new_index[1] != "email_messages"
-                or not bool(new_index[2])
-                or not bool(new_index[3])
-                or not bool(new_index[4])
-                or not bool(new_index[5])
-                or index_columns != ("connection_id", "provider_message_id")
+            new_index_row = tuple(new_index)
+            if not self._is_exact_identity_index(
+                new_index_row,
+                expected_columns=("connection_id", "provider_message_id"),
             ):
                 # invalid CONCURRENTLY 索引只能由 0017 在明确迁移窗口内处理；应用继续写入
                 # 会让 catalog 状态和冲突语义更难判定，因此必须立即 fail closed。
                 raise RuntimeError(_MESSAGE_IDENTITY_CATALOG_ERROR)
+            if not bool(new_index_row[3]):
+                # 精确目标索引尚未 valid 时，0016 legacy constraint 仍是安全可用的
+                # conflict target。先完整验证 legacy，拒绝把恶意同名约束当作降级入口。
+                legacy_constraints = await self._constraint_catalog_rows(
+                    _LEGACY_MESSAGE_IDENTITY
+                )
+                if len(legacy_constraints) != 1 or not self._is_exact_identity_constraint(
+                    legacy_constraints[0],
+                    expected_columns=("thread_id", "provider_message_id"),
+                ):
+                    raise RuntimeError(_MESSAGE_IDENTITY_CATALOG_ERROR)
+                return _MailMessageConflictTarget.LEGACY_CONSTRAINT
             return _MailMessageConflictTarget.NEW_INDEX
 
         legacy_constraints = await self._constraint_catalog_rows(_LEGACY_MESSAGE_IDENTITY)
@@ -558,19 +575,22 @@ class SqlAlchemyMailSyncRepository:
         rows = await self._session.execute(
             text(
                 "SELECT table_class.relname, constraint_info.contype::text, "
-                "ARRAY(SELECT attribute.attname "
+                "ARRAY(SELECT attribute.attname::text "
                 "FROM unnest(constraint_info.conkey) WITH ORDINALITY "
                 "AS constraint_key(attnum, position) "
-                "JOIN pg_catalog.pg_attribute AS attribute "
+                "LEFT JOIN pg_catalog.pg_attribute AS attribute "
                 "ON attribute.attrelid = constraint_info.conrelid "
                 "AND attribute.attnum = constraint_key.attnum "
                 "ORDER BY constraint_key.position), "
                 "index_info.indisvalid, index_info.indisunique, "
                 "index_info.indpred IS NULL, index_info.indexprs IS NULL, "
-                "ARRAY(SELECT attribute.attname "
+                "index_info.indisready, index_info.indnkeyatts, "
+                "index_info.indnatts, ARRAY("
+                "SELECT CASE WHEN index_key.attnum = 0 THEN NULL "
+                "ELSE attribute.attname::text END "
                 "FROM unnest(index_info.indkey) WITH ORDINALITY "
                 "AS index_key(attnum, position) "
-                "JOIN pg_catalog.pg_attribute AS attribute "
+                "LEFT JOIN pg_catalog.pg_attribute AS attribute "
                 "ON attribute.attrelid = index_info.indrelid "
                 "AND attribute.attnum = index_key.attnum "
                 "ORDER BY index_key.position) "
@@ -594,11 +614,11 @@ class SqlAlchemyMailSyncRepository:
         *,
         expected_columns: tuple[str, ...],
     ) -> bool:
-        """确认唯一 constraint 与其有效、无谓词 backing index 均精确匹配。"""
-        if len(row) != 8:
+        """确认唯一 constraint 与其 backing index 的完整形状均精确匹配。"""
+        if len(row) != 11:
             return False
         constraint_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[2])
-        index_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[7])
+        index_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[10])
         return (
             row[0] == "email_messages"
             and row[1] == "u"
@@ -607,6 +627,30 @@ class SqlAlchemyMailSyncRepository:
             and bool(row[4])
             and bool(row[5])
             and bool(row[6])
+            and bool(row[7])
+            and row[8] == len(expected_columns)
+            and row[9] == len(expected_columns)
+            and index_columns == expected_columns
+        )
+
+    @staticmethod
+    def _is_exact_identity_index(
+        row: tuple[object, ...],
+        *,
+        expected_columns: tuple[str, ...],
+    ) -> bool:
+        """确认 standalone index 的表、键类型、谓词和完整列形状均符合契约。"""
+        if len(row) != 10:
+            return False
+        index_columns = SqlAlchemyMailSyncRepository._catalog_columns(row[9])
+        return (
+            row[0] == "i"
+            and row[1] == "email_messages"
+            and bool(row[4])
+            and bool(row[5])
+            and bool(row[6])
+            and row[7] == len(expected_columns)
+            and row[8] == len(expected_columns)
             and index_columns == expected_columns
         )
 
