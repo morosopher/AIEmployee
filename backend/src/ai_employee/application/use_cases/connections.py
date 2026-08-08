@@ -1000,9 +1000,10 @@ class ConnectionsUseCase:
     ) -> ManualSyncResult:
         """为已连接且归属当前用户的帐号幂等创建邮件、日历两项异步任务。
 
-        新任务必须使用供应商中立的 ``sync_mail`` 与显式 mailbox scope；幂等键仍保留
-        M1 的 ``gmail`` 后缀，使升级前后重复提交收敛到既有任务。旧 ``sync_gmail`` kind
-        只由 Worker 读取已持久化任务，不再从当前 API 创建。
+        新任务必须使用供应商中立的 ``sync_mail``，并显式绑定 mailbox 与 calendar
+        directory 两个目录 owner；幂等键仍保留 M1 的 ``gmail`` 后缀，使升级前后重复提交
+        收敛到既有任务。旧 ``sync_gmail`` kind 和缺少 calendar scope 的任务只由 Worker
+        读取已持久化记录，不再从当前 API 创建。
         """
         async with self._stores() as store:
             connection = await store.get_connection(
@@ -1024,7 +1025,10 @@ class ConnectionsUseCase:
                 ),
                 CreateTaskBatchItem(
                     "sync_calendar",
-                    {"connection_id": str(connection_id)},
+                    {
+                        "connection_id": str(connection_id),
+                        "scope_key": "directory",
+                    },
                     f"{idempotency_key}:calendar",
                 ),
             ),

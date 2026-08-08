@@ -10,16 +10,23 @@ from uuid import UUID
 from ai_employee.application.ports.calendar import (
     CalendarConnectionState,
     CalendarCursorExpiredError,
+    CalendarDirectoryPage,
     CalendarEvent,
     CalendarReader,
     CalendarSyncPage,
+    ProviderCalendar,
 )
 from ai_employee.application.ports.encryption import EncryptedValue, Encryption
-from ai_employee.domain.errors import InternalInvariantError
+from ai_employee.domain.errors import (
+    InternalInvariantError,
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 
 
 class CalendarSyncStore(Protocol):
-    """定义一个日历 scope 必须在同一事务完成的存储操作。"""
+    """定义目录和单日历 scope 必须在同一事务完成的存储操作。"""
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
@@ -34,6 +41,17 @@ class CalendarSyncStore(Protocol):
         encrypted_description: EncryptedValue,
         encrypted_location: EncryptedValue,
     ) -> None: ...
+
+    async def mark_directory_success(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendars: tuple[ProviderCalendar, ...],
+        expected_cursor: str | None,
+        next_cursor: str,
+        completed_at: datetime,
+    ) -> tuple[str, ...]: ...
 
     async def clear_cursor(
         self,
@@ -91,7 +109,7 @@ class CalendarConnectionNotFoundError(Exception):
 
 
 class SyncCalendarUseCase:
-    """按连接 provider 选择适配器，并原子写入一个日历及其最终游标。"""
+    """先同步目录，再按 provider calendar ID 原子写入每个日历及其游标。"""
 
     def __init__(
         self,
@@ -107,7 +125,12 @@ class SyncCalendarUseCase:
     async def execute(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
     ) -> CalendarSyncResult:
-        """读取一个日历增量；游标失效时只清除同一 scope 并受限重同步。"""
+        """读取目录或一个日历增量，并把游标失效限制在对应 scope。
+
+        ``directory`` 是唯一的目录 owner。目录成功后会建立新发现日历的 NULL cursor
+        placeholder，再逐一调用同一供应商中立事件路径；某个日历失败不会回滚已经成功提交的
+        其他日历，最终把首个稳定错误交给 Durable Worker 重试失败 scope。
+        """
         if scope_key == "":
             raise ValueError("scope_key must not be empty")
         async with self._stores() as store:
@@ -128,6 +151,135 @@ class SyncCalendarUseCase:
             connection_id=connection_id,
             scope_key=scope_key,
         )
+        if scope_key == "directory":
+            return await self._execute_directory(
+                user_id=user_id,
+                connection_id=connection_id,
+                state=state,
+                reader=reader,
+            )
+        return await self._execute_calendar_scope(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key=scope_key,
+            state=state,
+            reader=reader,
+        )
+
+    async def _execute_directory(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        state: CalendarConnectionState,
+        reader: CalendarReader,
+    ) -> CalendarSyncResult:
+        """完成目录 CAS 后按稳定 calendar ID 顺序同步各事件 scope。"""
+        used_full = state.cursor is None
+        try:
+            pages = await self._collect_directory(reader.directory_pages(state.cursor))
+        except CalendarCursorExpiredError as error:
+            if state.cursor is None:
+                raise InternalInvariantError(
+                    error_code="calendar_initial_directory_cursor_expired",
+                    message="Calendar initial directory sync cannot have an expired cursor",
+                ) from error
+            if error.provider != state.provider or error.scope_key != "directory":
+                raise InternalInvariantError(
+                    error_code="calendar_directory_cursor_expiry_scope_mismatch",
+                    message="Calendar directory cursor expiry does not match requested scope",
+                ) from error
+            async with self._stores() as store:
+                await store.clear_cursor(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    scope_key="directory",
+                    expected_cursor=state.cursor,
+                )
+            used_full = True
+            pages = await self._collect_directory(reader.directory_pages(None))
+            state = CalendarConnectionState(
+                provider=state.provider,
+                scope_key="directory",
+                cursor=None,
+            )
+
+        next_cursor = self._last_cursor(pages, state.cursor)
+        calendars = self._validated_directory_calendars(pages)
+        completed_at = datetime.now(UTC)
+        async with self._stores() as store:
+            calendar_ids = await store.mark_directory_success(
+                user_id=user_id,
+                connection_id=connection_id,
+                calendars=calendars,
+                expected_cursor=state.cursor,
+                next_cursor=next_cursor,
+                completed_at=completed_at,
+            )
+
+        total_events = 0
+        first_error: Exception | None = None
+        for calendar_id in calendar_ids:
+            try:
+                result = await self._sync_calendar_by_id(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    calendar_id=calendar_id,
+                    reader=reader,
+                )
+            except (
+                CalendarConnectionNotFoundError,
+                InternalInvariantError,
+                PermanentProviderError,
+                TransientProviderError,
+                UserActionRequiredError,
+            ) as error:
+                # 目录已经是独立事务事实；继续处理其他日历，避免一个失效 cursor 阻断整
+                # 个连接。只在循环完成后抛出第一个错误，确保失败 scope 可单独重试。
+                if first_error is None:
+                    first_error = error
+            else:
+                total_events += result.events_upserted
+                used_full = used_full or result.used_full_resync
+        if first_error is not None:
+            raise first_error
+        return CalendarSyncResult(total_events, next_cursor, used_full)
+
+    async def _sync_calendar_by_id(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendar_id: str,
+        reader: CalendarReader,
+    ) -> CalendarSyncResult:
+        """读取一个已由目录证明存在的日历，不重新触发目录发现。"""
+        async with self._stores() as store:
+            state = await store.get_state(
+                user_id=user_id,
+                connection_id=connection_id,
+                scope_key=calendar_id,
+            )
+        if state is None:
+            raise CalendarConnectionNotFoundError
+        return await self._execute_calendar_scope(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key=calendar_id,
+            state=state,
+            reader=reader,
+        )
+
+    async def _execute_calendar_scope(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        scope_key: str,
+        state: CalendarConnectionState,
+        reader: CalendarReader,
+    ) -> CalendarSyncResult:
+        """读取一个日历增量；游标失效时只清除同一 scope 并受限重同步。"""
         used_full = state.cursor is None
         try:
             pages = await self._collect(
@@ -206,6 +358,42 @@ class SyncCalendarUseCase:
     async def _collect(pages: AsyncIterator[CalendarSyncPage]) -> tuple[CalendarSyncPage, ...]:
         """在事务外完成有限分页，避免供应商网络请求持有数据库锁。"""
         return tuple([page async for page in pages])
+
+    @staticmethod
+    async def _collect_directory(
+        pages: AsyncIterator[CalendarDirectoryPage],
+    ) -> tuple[CalendarDirectoryPage, ...]:
+        """在事务外收集有限目录分页，避免供应商网络请求持有数据库锁。"""
+        return tuple([page async for page in pages])
+
+    @staticmethod
+    def _last_cursor(pages: tuple[CalendarDirectoryPage, ...], fallback: str | None) -> str:
+        """取得目录最终 cursor；增量空页保留既有 opaque cursor。"""
+        for page in reversed(pages):
+            if page.next_cursor:
+                return page.next_cursor
+        if fallback:
+            return fallback
+        raise InternalInvariantError(
+            error_code="calendar_directory_final_cursor_missing",
+            message="Calendar directory pages are missing a final cursor",
+        )
+
+    @staticmethod
+    def _validated_directory_calendars(
+        pages: tuple[CalendarDirectoryPage, ...],
+    ) -> tuple[ProviderCalendar, ...]:
+        """合并目录页并拒绝空、重复或不稳定的 provider calendar ID。"""
+        calendars = tuple(calendar for page in pages for calendar in page.calendars)
+        ids = tuple(calendar.calendar_id for calendar in calendars)
+        if any(calendar_id in {"", "directory"} for calendar_id in ids) or len(set(ids)) != len(
+            ids
+        ):
+            raise InternalInvariantError(
+                error_code="calendar_directory_scopes_invalid",
+                message="Calendar directory contains invalid or duplicate IDs",
+            )
+        return tuple(sorted(calendars, key=lambda calendar: calendar.calendar_id))
 
     def _encrypt_event_fields(
         self,

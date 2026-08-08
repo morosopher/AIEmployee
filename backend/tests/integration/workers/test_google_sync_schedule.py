@@ -20,7 +20,7 @@ class _Scope:
 
 
 class _Reader:
-    """返回一个邮箱与两个日历 scope，证明调度不再按连接固定创建双任务。"""
+    """返回过渡期邮箱与两个日历 scope，验证 Scheduler 的目录 owner 防线。"""
 
     async def enabled_scopes(self) -> tuple[_Scope, ...]:
         """仅返回具备 enabled 读能力且已有持久恢复 scope 的事实。"""
@@ -34,8 +34,8 @@ class _Reader:
 
 
 @pytest.mark.asyncio
-async def test_provider_scheduler_creates_one_bucket_task_per_enabled_scope(monkeypatch) -> None:
-    """每个启用 scope 每桶创建一项任务，载荷和幂等键都绑定同一 opaque scope。"""
+async def test_provider_scheduler_uses_one_google_calendar_directory_owner(monkeypatch) -> None:
+    """Google Calendar 普通周期必须把多个事件 scope 聚合为一个 directory owner。"""
     created: list[dict[str, object]] = []
 
     class _Creator:
@@ -56,23 +56,21 @@ async def test_provider_scheduler_creates_one_bucket_task_per_enabled_scope(monk
     assert [item["kind"] for item in created] == [
         "sync_mail",
         "sync_calendar",
-        "sync_calendar",
     ]
     assert [item["input_payload"]["scope_key"] for item in created] == [
         "mailbox",
-        "primary",
-        "team-calendar",
+        "directory",
     ]
     assert all(
         str(item["idempotency_key"]).startswith("sync:google:00000000-0000-0000-0000-000000000002:")
         for item in created
     )
     idempotency_keys = [str(item["idempotency_key"]) for item in created]
-    assert len(set(idempotency_keys)) == 3
+    assert len(set(idempotency_keys)) == 2
     # opaque folder/calendar ID 可能含帐号标识且最长 512；键只保存稳定摘要，避免超长或泄露。
     assert all(
         scope not in key
-        for scope in ("mailbox", "primary", "team-calendar")
+        for scope in ("mailbox", "directory", "primary", "team-calendar")
         for key in idempotency_keys
     )
 

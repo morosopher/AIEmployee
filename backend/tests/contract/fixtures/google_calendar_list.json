@@ -1,0 +1,21 @@
+{
+  "items": [
+    {
+      "id": "primary",
+      "summary": "Primary calendar",
+      "timeZone": "Asia/Shanghai",
+      "primary": true,
+      "accessRole": "owner",
+      "htmlLink": "https://calendar.google.test/calendar/primary"
+    },
+    {
+      "id": "readonly@example.test",
+      "summary": "Read only calendar",
+      "timeZone": "UTC",
+      "primary": false,
+      "accessRole": "reader",
+      "htmlLink": "https://calendar.google.test/calendar/readonly"
+    }
+  ],
+  "nextSyncToken": "directory-token-1"
+}

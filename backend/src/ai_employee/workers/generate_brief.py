@@ -42,14 +42,14 @@ SyncSource = Callable[[str, UUID, UUID, str], Awaitable[None]]
 UtcNow = Callable[[], datetime]
 SYNC_FRESHNESS = timedelta(minutes=15)
 
-# stale 检测以能力事实为入口；只有缺失 M1 Google 游标行时才能推断规范默认 scope。
+# stale 检测以能力事实为入口；缺失 Google 游标时只能推断固定目录 owner。
 _READ_CAPABILITY_BY_RESOURCE = {
     "mail": "mail.read",
     "calendar": "calendar.read",
 }
 _LEGACY_GOOGLE_SCOPE_BY_RESOURCE = {
     "mail": "mailbox",
-    "calendar": "primary",
+    "calendar": "directory",
 }
 
 
@@ -160,10 +160,11 @@ class GenerateBriefTaskStep:
     ) -> tuple[tuple[str, UUID, str | None], ...]:
         """返回 enabled read capability 下缺失或过期的精确同步 scope。
 
-        已存在游标时，每个 mailbox/folder/calendar 都独立判断新鲜度。没有任何持久游标行时，
-        只有 Google M1 兼容连接能推断 ``mailbox`` 或 ``primary``；Microsoft 等多 scope
-        供应商无法安全猜测目录对象，以 ``None`` 标记缺口并 fail closed 告警，等待目录同步
-        建立精确游标。
+        已存在游标时，邮件 scope 独立判断新鲜度；Google Calendar 只要 directory 缺失或
+        任一事件 scope 陈旧，就聚合为一次连接级 ``directory`` owner 刷新，由该用例按稳定
+        provider calendar ID 顺序串行恢复各自 cursor。没有任何持久游标行时，Google 只能
+        推断 ``mailbox`` 或 ``directory``；Microsoft 等尚未实现的多 scope 目录无法安全猜测，
+        以 ``None`` 标记缺口并 fail closed 告警。
         """
         rows = await session.execute(
             select(
@@ -213,6 +214,9 @@ class GenerateBriefTaskStep:
         )
         stale: list[tuple[str, UUID, str | None]] = []
         microsoft_mail_owners: set[UUID] = set()
+        google_calendar_connections: set[UUID] = set()
+        google_calendar_directories: set[UUID] = set()
+        google_calendar_owners: set[UUID] = set()
         for (
             row_connection_id,
             provider,
@@ -223,6 +227,20 @@ class GenerateBriefTaskStep:
             last_success_at,
         ) in rows:
             expected_resource_kind = "mail" if capability == "mail.read" else "calendar"
+            if provider == "google" and expected_resource_kind == "calendar":
+                google_calendar_connections.add(row_connection_id)
+                if resource_kind is None or scope_key is None:
+                    google_calendar_owners.add(row_connection_id)
+                    continue
+                if scope_key == "directory":
+                    google_calendar_directories.add(row_connection_id)
+                if (
+                    cursor is None
+                    or last_success_at is None
+                    or last_success_at < cutoff - SYNC_FRESHNESS
+                ):
+                    google_calendar_owners.add(row_connection_id)
+                continue
             if provider == "microsoft" and expected_resource_kind == "mail":
                 # mailbox 是目录发现触发器而非 Delta scope：它只按 last_success 判断目录
                 # 新鲜度；任一真实 folder 缺游标或过期时也统一交给同一个 owner 修复。
@@ -258,9 +276,16 @@ class GenerateBriefTaskStep:
                 or last_success_at < cutoff - SYNC_FRESHNESS
             ):
                 stale.append((expected_resource_kind, row_connection_id, scope_key))
+        # 只有迁移遗留 primary/event cursor 的 Google 连接还没有 directory 行；即使这些
+        # cursor 暂时新鲜，也必须先运行一次目录 owner，才能发现其他可见日历。
+        google_calendar_owners.update(google_calendar_connections - google_calendar_directories)
         stale.extend(
             ("mail", owner_connection_id, "mailbox")
             for owner_connection_id in sorted(microsoft_mail_owners, key=str)
+        )
+        stale.extend(
+            ("calendar", owner_connection_id, "directory")
+            for owner_connection_id in sorted(google_calendar_owners, key=str)
         )
         return tuple(stale)
 

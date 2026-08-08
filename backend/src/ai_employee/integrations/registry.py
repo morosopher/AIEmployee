@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from ai_employee.application.ports.calendar import (
@@ -52,6 +52,22 @@ class LegacyGoogleCalendarReader(Protocol):
     def sync_pages(self, cursor: str) -> AsyncIterator[CalendarSyncPage]: ...
 
 
+class _GoogleCalendarProviderNeutralReader(Protocol):
+    """描述 Task 12 后 Google 适配器的目录与分日历端口。"""
+
+    def directory_pages(
+        self, cursor: str | None = None
+    ) -> AsyncIterator[CalendarDirectoryPage]: ...
+
+    def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]: ...
+
+    def sync_pages(self, calendar_id: str, cursor: str) -> AsyncIterator[CalendarSyncPage]: ...
+
+    async def get_current_event(
+        self, calendar_id: str, provider_event_id: str
+    ) -> CalendarEvent | None: ...
+
+
 class _GoogleMailCompatibilityAdapter:
     """把 M1 单 mailbox Gmail 读取器适配为 provider-neutral 邮件端口。"""
 
@@ -83,31 +99,46 @@ class _GoogleMailCompatibilityAdapter:
 class _GoogleCalendarCompatibilityAdapter:
     """把 M1 固定 primary Calendar 读取器适配为显式日历 ID 端口。"""
 
-    def __init__(self, reader: LegacyGoogleCalendarReader) -> None:
+    def __init__(
+        self, reader: LegacyGoogleCalendarReader | _GoogleCalendarProviderNeutralReader
+    ) -> None:
         self._reader = reader
 
     async def directory_pages(
         self, cursor: str | None = None
     ) -> AsyncIterator[CalendarDirectoryPage]:
-        """Task 12 前不伪造供应商目录页；调用者必须使用已迁移 primary scope。"""
+        """委托 Task 12 目录端口；旧 primary reader 继续 fail closed。"""
+        if hasattr(self._reader, "directory_pages"):
+            async for page in self._reader.directory_pages(cursor):
+                yield page
+            return
         del cursor
         if False:
             yield CalendarDirectoryPage((), None, None)
 
     def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
-        """验证 primary 后委托旧适配器的受限初始窗口。"""
+        """按 provider calendar ID 委托新适配器，旧 reader 仅允许 primary。"""
+        if hasattr(self._reader, "directory_pages"):
+            reader = cast(_GoogleCalendarProviderNeutralReader, self._reader)
+            return reader.initial_pages(calendar_id)
         self._require_primary(calendar_id)
         return self._reader.initial_pages()
 
     def sync_pages(self, calendar_id: str, cursor: str) -> AsyncIterator[CalendarSyncPage]:
-        """验证 primary 后委托旧适配器的 syncToken 读取。"""
+        """按 provider calendar ID 委托新适配器，旧 reader 仅允许 primary。"""
+        if hasattr(self._reader, "directory_pages"):
+            reader = cast(_GoogleCalendarProviderNeutralReader, self._reader)
+            return reader.sync_pages(calendar_id, cursor)
         self._require_primary(calendar_id)
         return self._reader.sync_pages(cursor)
 
     async def get_current_event(
         self, calendar_id: str, provider_event_id: str
     ) -> CalendarEvent | None:
-        """Task 12 实现精确 GET 前明确拒绝，不用列表结果伪造当前事件。"""
+        """委托新适配器精确 GET；旧 reader 不用列表结果伪造当前事件。"""
+        if hasattr(self._reader, "directory_pages"):
+            reader = cast(_GoogleCalendarProviderNeutralReader, self._reader)
+            return await reader.get_current_event(calendar_id, provider_event_id)
         del calendar_id, provider_event_id
         raise ProviderAdapterUnavailableError
 
@@ -128,7 +159,9 @@ class ProviderAdapterRegistry:
         *,
         google_mail: LegacyGoogleMailReader | None = None,
         microsoft_mail: MailReader | None = None,
-        google_calendar: LegacyGoogleCalendarReader | None = None,
+        google_calendar: LegacyGoogleCalendarReader
+        | _GoogleCalendarProviderNeutralReader
+        | None = None,
         microsoft_calendar: CalendarReader | None = None,
     ) -> None:
         """以四个显式构造参数冻结注册表；未知键无法动态加入。"""

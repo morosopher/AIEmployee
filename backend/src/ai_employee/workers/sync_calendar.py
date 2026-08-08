@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 
+from ai_employee.application.ports.calendar import CalendarReader
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarSyncStoreFactory,
     SyncCalendarUseCase,
@@ -23,11 +24,10 @@ from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.observability.sync import observe_google_sync
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
-from ai_employee.integrations.google.calendar import CalendarAdapter
+from ai_employee.integrations.google.calendar import GoogleCalendarAdapter
 from ai_employee.integrations.google.fake import FakeCalendarReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.oauth import GoogleOAuthClient
 from ai_employee.integrations.registry import (
-    LegacyGoogleCalendarReader,
     ProviderAdapterRegistry,
 )
 
@@ -43,7 +43,7 @@ class CalendarSyncTaskStep:
         session_factory: ManagedAsyncSessionMaker,
         cipher: AeadCipher,
         oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
-        reader: LegacyGoogleCalendarReader | FakeCalendarReader | None = None,
+        reader: CalendarReader | FakeCalendarReader | None = None,
         metrics: Metrics | None = None,
     ) -> None:
         """注入进程资源；凭据读取和同步写入始终使用各自短事务。"""
@@ -58,15 +58,7 @@ class CalendarSyncTaskStep:
         raw_connection = task.input_payload.get("connection_id")
         if not isinstance(raw_connection, str) or task.user_id is None:
             raise ValueError("sync_calendar requires connection_id")
-        raw_scope_key = task.input_payload.get("scope_key")
-        # Task 7 前的 ``sync_calendar`` 任务来自固定 primary 架构；同一 kind 无法区分新旧，
-        # 因此仅在字段缺失时使用可证明的兼容 scope，显式空串仍拒绝。
-        if raw_scope_key is None:
-            scope_key = "primary"
-        elif isinstance(raw_scope_key, str) and raw_scope_key != "":
-            scope_key = raw_scope_key
-        else:
-            raise ValueError("sync_calendar requires scope_key")
+        scope_key = self._resolve_scope_key(task.input_payload.get("scope_key"))
         connection_id, user_id = UUID(raw_connection), task.user_id
         async with self._credential_stores() as store:
             credentials = await store.get_credentials(user_id=user_id, connection_id=connection_id)
@@ -143,15 +135,19 @@ class CalendarSyncTaskStep:
             async with self._credential_stores() as store:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
-        adapter: LegacyGoogleCalendarReader = (
-            self._reader.for_user(user_id)
-            if isinstance(self._reader, FakeCalendarReader)
-            else self._reader
-        ) or CalendarAdapter(
-            access_token=access,
-            user_timezone=timezone,
-            refresh_access_token=refresh_access_token if refresh else None,
-            mark_expired=mark_expired,
+        adapter = cast(
+            CalendarReader,
+            (
+                self._reader.for_user(user_id)
+                if isinstance(self._reader, FakeCalendarReader)
+                else self._reader
+            )
+            or GoogleCalendarAdapter(
+                access_token=access,
+                user_timezone=timezone,
+                refresh_access_token=refresh_access_token if refresh else None,
+                mark_expired=mark_expired,
+            ),
         )
         registry = ProviderAdapterRegistry(google_calendar=adapter)
         await observe_google_sync(
@@ -167,6 +163,20 @@ class CalendarSyncTaskStep:
                 scope_key=scope_key,
             ),
         )
+
+    @staticmethod
+    def _resolve_scope_key(raw_scope_key: object) -> str:
+        """解析任务 scope，并把 ``primary`` 回退严格限制在历史缺字段任务。
+
+        Task 12 之后所有新建手动/周期任务都必须显式携带 ``directory``；但数据库中可能仍有
+        Task 7 前固定 primary 架构创建的 ``sync_calendar`` 任务。同一 kind 无法区分版本，
+        因此仅当字段完全缺失时采用可证明的 primary 兼容值，显式空串或非字符串继续拒绝。
+        """
+        if raw_scope_key is None:
+            return "primary"
+        if isinstance(raw_scope_key, str) and raw_scope_key != "":
+            return raw_scope_key
+        raise ValueError("sync_calendar requires scope_key")
 
     @staticmethod
     def _credential_aad(user_id: UUID, connection_id: UUID, kind: str) -> bytes:

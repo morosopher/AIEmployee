@@ -6,7 +6,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from ai_employee.application.ports.calendar import CalendarSyncPage
+from ai_employee.application.ports.calendar import (
+    CalendarDirectoryPage,
+    CalendarEvent,
+    CalendarSyncPage,
+)
 from ai_employee.application.ports.gmail import GmailSyncPage
 from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.integrations.google.calendar import CalendarAdapter
@@ -60,27 +64,51 @@ class FakeGoogleOAuthClient:
 
 
 class FakeCalendarReader:
-    """从仓库合成 fixture 装载固定 Calendar 页，永不创建 HTTP 客户端。"""
+    """从仓库合成 fixture 装载目录和分日历页，永不创建 HTTP 客户端。"""
 
     def __init__(
         self,
         fixture: Path,
         *,
+        directory_fixture: Path | None = None,
         scenario_consumer: ScenarioConsumer | None = None,
         user_id: UUID | None = None,
     ) -> None:
         self._fixture = fixture
+        self._directory_fixture = directory_fixture or fixture.with_name(
+            "google_calendar_list.json"
+        )
         self._scenario_consumer = scenario_consumer
         self._user_id = user_id
 
     def for_user(self, user_id: UUID) -> "FakeCalendarReader":
         """为单次 Worker 执行绑定用户，避免共享 reader 串用 Redis 场景。"""
         return type(self)(
-            self._fixture, scenario_consumer=self._scenario_consumer, user_id=user_id
+            self._fixture,
+            directory_fixture=self._directory_fixture,
+            scenario_consumer=self._scenario_consumer,
+            user_id=user_id,
         )
 
-    async def initial_pages(self) -> AsyncIterator[CalendarSyncPage]:
-        """读取本地 JSON 并复用真实规范化逻辑，保证 fixture 与端口一致。"""
+    async def directory_pages(
+        self, cursor: str | None = None
+    ) -> AsyncIterator[CalendarDirectoryPage]:
+        """读取本地 CalendarList fixture 并复用真实目录规范化逻辑。"""
+        del cursor
+        payload = json.loads(self._directory_fixture.read_text(encoding="utf-8"))
+        adapter = CalendarAdapter(access_token="fake", user_timezone="UTC")
+        yield CalendarDirectoryPage(
+            tuple(
+                adapter._normalize_calendar(item)
+                for item in payload.get("items", [])
+                if isinstance(item, dict) and item.get("deleted") is not True
+            ),
+            None,
+            payload.get("nextSyncToken"),
+        )
+
+    async def initial_pages(self, calendar_id: str = "primary") -> AsyncIterator[CalendarSyncPage]:
+        """读取本地事件 JSON 并按调用方日历 ID规范化，保证 fixture 与真实端口一致。"""
         if await self._consume_scenario() == "calendar_5xx":
             raise TransientProviderError(
                 error_code="google_service_unavailable",
@@ -91,16 +119,35 @@ class FakeCalendarReader:
             access_token="fake", user_timezone="UTC", now=lambda: datetime(2030, 1, 9, tzinfo=UTC)
         )
         yield CalendarSyncPage(
-            tuple(adapter._normalize(item) for item in payload.get("items", [])),
+            tuple(
+                adapter._normalize(item, calendar_id=calendar_id)
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            ),
             None,
             payload.get("nextSyncToken"),
         )
 
-    async def sync_pages(self, cursor: str) -> AsyncIterator[CalendarSyncPage]:
+    async def sync_pages(
+        self, calendar_id: str, cursor: str | None = None
+    ) -> AsyncIterator[CalendarSyncPage]:
         """增量模式使用同一脱敏 fixture，调用方只能观察稳定游标行为。"""
+        if cursor is None:
+            cursor, calendar_id = calendar_id, "primary"
         del cursor
-        async for page in self.initial_pages():
+        async for page in self.initial_pages(calendar_id):
             yield page
+
+    async def get_current_event(
+        self, calendar_id: str, provider_event_id: str
+    ) -> CalendarEvent | None:
+        """精确从合成事件 fixture 读取当前事件，不构造供应商网络请求。"""
+        payload = json.loads(self._fixture.read_text(encoding="utf-8"))
+        adapter = CalendarAdapter(access_token="fake", user_timezone="UTC")
+        for item in payload.get("items", []):
+            if isinstance(item, dict) and item.get("id") == provider_event_id:
+                return adapter._normalize(item, calendar_id=calendar_id)
+        return None
 
     async def execute_request(self, parameters: dict[str, str]) -> object:
         """禁止通过 fake 绕过分页 API 访问网络。"""
@@ -131,9 +178,7 @@ class FakeGmailReader:
 
     def for_user(self, user_id: UUID) -> "FakeGmailReader":
         """为单次 Worker 执行绑定用户，避免共享 reader 串用 Redis 场景。"""
-        return type(self)(
-            self._fixture, scenario_consumer=self._scenario_consumer, user_id=user_id
-        )
+        return type(self)(self._fixture, scenario_consumer=self._scenario_consumer, user_id=user_id)
 
     async def initial_pages(self) -> AsyncIterator[GmailSyncPage]:
         """返回合成的空消息页和 fixture history ID，供 Playwright 预测连接状态。"""

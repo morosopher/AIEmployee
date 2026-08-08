@@ -10,13 +10,18 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_employee.application.ports.calendar import CalendarConnectionState, CalendarEvent
+from ai_employee.application.ports.calendar import (
+    CalendarConnectionState,
+    CalendarEvent,
+    ProviderCalendar,
+)
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     ConnectionCapabilityModel,
     OAuthConnectionModel,
+    ProviderCalendarModel,
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
@@ -28,6 +33,7 @@ class SqlAlchemyCalendarSyncRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+        self._calendar_permissions: dict[tuple[UUID, UUID, str], tuple[str, bool] | None] = {}
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
@@ -84,7 +90,24 @@ class SqlAlchemyCalendarSyncRepository:
         encrypted_description: EncryptedValue,
         encrypted_location: EncryptedValue,
     ) -> None:
-        """按连接和供应商 event ID 幂等覆盖事件，取消状态保留 tombstone。"""
+        """按连接和供应商 event ID 幂等覆盖事件，取消状态保留 tombstone。
+
+        事件自身的 ``locked``/等价事实只能缩小修改能力；真正账户 ACL 必须来自同用户、
+        同连接、同 calendar 的目录行。两者取交集后持久化，目录缺失时 fail closed，避免
+        旧 primary 兼容任务或伪造 scope 把事件标记为可写。
+        """
+        permission = await self._calendar_permission_projection(
+            user_id=user_id,
+            connection_id=connection_id,
+            calendar_id=event.calendar_id,
+        )
+        access_role = permission[0] if permission is not None else event.access_role
+        can_edit = (
+            permission is not None
+            and permission[1]
+            and event.can_edit
+            and event.status != "cancelled"
+        )
         stmt = insert(CalendarEventModel).values(
             user_id=user_id,
             connection_id=connection_id,
@@ -107,8 +130,8 @@ class SqlAlchemyCalendarSyncRepository:
             etag=event.etag,
             organizer=dict(event.organizer) if event.organizer is not None else None,
             attendees=[dict(attendee) for attendee in event.attendees],
-            access_role=event.access_role,
-            can_edit=event.can_edit,
+            access_role=access_role,
+            can_edit=can_edit,
             provider_url=event.provider_url,
             provider_updated_at=event.updated_at,
         )
@@ -144,6 +167,215 @@ class SqlAlchemyCalendarSyncRepository:
                 },
             )
         )
+
+    async def _calendar_permission_projection(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendar_id: str,
+    ) -> tuple[str, bool] | None:
+        """读取并缓存同一短事务内的目录访问角色与写能力。
+
+        一个事件同步事务只处理一个 calendar scope，但可能包含多页和大量事件；缓存避免
+        为每个事件重复查询相同 ACL。缓存键仍包含用户和连接，不能跨所有权边界复用。
+        """
+        key = (user_id, connection_id, calendar_id)
+        if key not in self._calendar_permissions:
+            row = (
+                await self._session.execute(
+                    select(
+                        ProviderCalendarModel.access_role,
+                        ProviderCalendarModel.can_write,
+                    ).where(
+                        ProviderCalendarModel.user_id == user_id,
+                        ProviderCalendarModel.connection_id == connection_id,
+                        ProviderCalendarModel.provider_calendar_id == calendar_id,
+                    )
+                )
+            ).one_or_none()
+            self._calendar_permissions[key] = (
+                (row.access_role, row.can_write) if row is not None else None
+            )
+        return self._calendar_permissions[key]
+
+    async def mark_directory_success(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendars: tuple[ProviderCalendar, ...],
+        expected_cursor: str | None,
+        next_cursor: str,
+        completed_at: datetime,
+    ) -> tuple[str, ...]:
+        """原子保存目录事实、建立日历 placeholder 并推进独立目录游标。
+
+        目录页已在供应商 I/O 边界完成分页、字段校验和稳定排序；此方法只在一个短事务内
+        做用户/连接能力复核、目录 upsert、日历 cursor placeholder 与 directory CAS。已有
+        日历 cursor 和最后成功时间绝不被目录重放清除，因而 CalendarList 410 回退不会影响
+        任一事件增量恢复位置。
+
+        Args:
+            user_id: 当前管理员用户。
+            connection_id: 已连接的 Google/Microsoft 连接主键。
+            calendars: 已规范化且按 provider calendar ID 稳定排序的目录页聚合。
+            expected_cursor: 读取目录前观察到的 directory cursor。
+            next_cursor: 供应商最终确认的 directory cursor。
+            completed_at: 注入的 UTC 完成时间。
+
+        Returns:
+            该连接当前已发现的全部日历 ID，供后续逐日历同步使用。
+
+        Raises:
+            StateConflictError: 连接能力撤销、目录对象不安全或 CAS 竞争。
+        """
+        if next_cursor == "":
+            raise StateConflictError(
+                error_code="calendar_directory_cursor_invalid",
+                message="Calendar directory cursor is invalid",
+            )
+        calendar_ids = tuple(calendar.calendar_id for calendar in calendars)
+        if (
+            any(calendar_id in {"", "directory"} for calendar_id in calendar_ids)
+            or len(set(calendar_ids)) != len(calendar_ids)
+            or tuple(sorted(calendar_ids)) != calendar_ids
+        ):
+            raise StateConflictError(
+                error_code="calendar_directory_scopes_invalid",
+                message="Calendar directory scopes are not validated and stably sorted",
+            )
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .join(
+                ConnectionCapabilityModel,
+                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
+                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
+            )
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.capability == "calendar.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            raise StateConflictError(
+                error_code="calendar_connection_not_syncable",
+                message="Calendar connection is no longer available for discovery",
+            )
+
+        directory_cursor = await self._session.scalar(
+            select(SyncCursorModel)
+            .where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+            .with_for_update()
+        )
+        if directory_cursor is None:
+            directory_cursor = SyncCursorModel(
+                connection_id=connection_id,
+                resource_kind="calendar",
+                scope_key="directory",
+                cursor=None,
+            )
+            self._session.add(directory_cursor)
+            await self._session.flush()
+        if directory_cursor.cursor != expected_cursor:
+            raise TransientProviderError(
+                error_code="calendar_directory_cursor_conflict",
+                message="Calendar directory cursor changed during provider read",
+                retry_after=1,
+            )
+
+        for calendar in calendars:
+            statement = insert(ProviderCalendarModel).values(
+                user_id=user_id,
+                connection_id=connection_id,
+                provider_calendar_id=calendar.calendar_id,
+                name=calendar.display_name,
+                timezone=calendar.timezone,
+                is_primary=calendar.is_primary,
+                access_role=calendar.access_role,
+                can_write=calendar.can_write,
+                provider_url=calendar.provider_url,
+            )
+            await self._session.execute(
+                statement.on_conflict_do_update(
+                    constraint="uq_provider_calendars_connection_provider_calendar",
+                    set_={
+                        "name": statement.excluded.name,
+                        "timezone": statement.excluded.timezone,
+                        "is_primary": statement.excluded.is_primary,
+                        "access_role": statement.excluded.access_role,
+                        "can_write": statement.excluded.can_write,
+                        "provider_url": statement.excluded.provider_url,
+                    },
+                )
+            )
+
+        if calendar_ids:
+            existing_cursor_ids = set(
+                (
+                    await self._session.scalars(
+                        select(SyncCursorModel.scope_key)
+                        .where(
+                            SyncCursorModel.connection_id == connection_id,
+                            SyncCursorModel.resource_kind == "calendar",
+                            SyncCursorModel.scope_key.in_(calendar_ids),
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for calendar_id in calendar_ids:
+                if calendar_id not in existing_cursor_ids:
+                    # placeholder 只证明目录已发现该 calendar；事件同步的尝试/成功时间和
+                    # opaque token 必须由该日历独立的 finish_sync 事务写入。
+                    self._session.add(
+                        SyncCursorModel(
+                            connection_id=connection_id,
+                            resource_kind="calendar",
+                            scope_key=calendar_id,
+                            cursor=None,
+                        )
+                    )
+
+        directory_cursor.cursor = next_cursor
+        directory_cursor.last_success_at = completed_at
+        directory_cursor.last_attempt_at = completed_at
+        directory_cursor.last_error_code = None
+        all_calendar_ids = tuple(
+            (
+                await self._session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id)
+                    .where(
+                        ProviderCalendarModel.user_id == user_id,
+                        ProviderCalendarModel.connection_id == connection_id,
+                    )
+                    .order_by(ProviderCalendarModel.provider_calendar_id)
+                )
+            ).all()
+        )
+        self._session.add(
+            AuditEventModel(
+                user_id=user_id,
+                task_id=None,
+                event_type="source.calendar.directory_discovered",
+                actor_type="system",
+                actor_id=str(connection_id),
+                event_metadata={
+                    "calendar_count": len(calendar_ids),
+                    "scope_key": "directory",
+                    "cutoff": completed_at.isoformat(),
+                },
+            )
+        )
+        return tuple(all_calendar_ids)
 
     async def clear_cursor(
         self,
@@ -287,18 +519,20 @@ class EnabledSyncScope:
 
 
 class SqlAlchemyEnabledSyncScopeReader:
-    """读取所有供应商已启用 read capability 对应的持久游标 scope。"""
+    """读取所有供应商已启用 read capability 对应的普通周期 owner。"""
 
     def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
         """保存短会话工厂，不接触凭据密文。"""
         self._session_factory = session_factory
 
     async def enabled_scopes(self) -> tuple[EnabledSyncScope, ...]:
-        """返回 connected 且能力 enabled 的 mail/calendar scopes。
+        """返回 connected 且能力 enabled 的 mail/calendar 周期 owners。
 
-        调度器只消费 PostgreSQL 已有的恢复位置：一个连接可以有多个 mailbox/folder 或
-        provider calendar，查询不会以连接级固定双任务覆盖它们。未知资源种类和 disabled
-        能力在 SQL 层直接排除，Scheduler 不需要重复领域判断。
+        邮件仍消费 PostgreSQL 已有的 mailbox owner；Task 12 后 Google Calendar 无论持久层
+        仍只有迁移保留的 primary，还是已经包含 directory 与多个 provider calendar cursor，
+        都只向普通周期投影一个连接级 ``directory`` owner。每个事件 cursor 继续是独立权威
+        恢复位置，只是不再由普通周期并发排队；显式维修任务可直接使用原 calendar ID。
+        未知资源种类和 disabled 能力在 SQL 层直接排除。
         """
         async with self._session_factory() as session:
             rows = await session.execute(
@@ -346,13 +580,23 @@ class SqlAlchemyEnabledSyncScopeReader:
                     SyncCursorModel.scope_key,
                 )
             )
-            return tuple(
-                EnabledSyncScope(
-                    user_id=row.user_id,
-                    connection_id=row.connection_id,
-                    provider=row.provider,
-                    resource_kind=row.resource_kind,
-                    scope_key=row.scope_key,
+            result: list[EnabledSyncScope] = []
+            seen_google_calendar_owners: set[tuple[UUID, UUID]] = set()
+            for row in rows:
+                scope_key = row.scope_key
+                if row.provider == "google" and row.resource_kind == "calendar":
+                    owner = (row.user_id, row.connection_id)
+                    if owner in seen_google_calendar_owners:
+                        continue
+                    seen_google_calendar_owners.add(owner)
+                    scope_key = "directory"
+                result.append(
+                    EnabledSyncScope(
+                        user_id=row.user_id,
+                        connection_id=row.connection_id,
+                        provider=row.provider,
+                        resource_kind=row.resource_kind,
+                        scope_key=scope_key,
+                    )
                 )
-                for row in rows
-            )
+            return tuple(result)

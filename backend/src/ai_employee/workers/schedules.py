@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from contextlib import suppress
 from datetime import UTC, datetime
+from uuid import UUID
 
 from taskiq import TaskiqEvents
 
@@ -150,12 +151,19 @@ async def dispatch_due_briefs() -> None:
 
 @broker.task(schedule=[{"cron": "*/10 * * * *", "schedule_id": "google-incremental-sync"}])
 async def dispatch_google_incremental_syncs() -> None:
-    """每十分钟为每个 enabled read scope 创建一项耐久幂等同步任务。"""
+    """每十分钟为 enabled read owner 创建耐久幂等同步任务。
+
+    Task 12 将 Google Calendar 的普通周期收敛到连接级 ``directory`` owner：该任务在
+    同一供应商中立用例内按稳定 calendar ID 串行推进每个事件 scope。这里仍保留对旧
+    ``EnabledSyncScopeReader`` 输出的防线，避免过渡期 reader 同时返回 directory 与旧
+    primary/team scope 时重复排队；显式单日历维修任务不经过本周期入口。
+    """
     now = datetime.now(UTC)
     bucket = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
     creator = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
     )
+    calendar_owners: set[tuple[UUID, UUID, str]] = set()
     for scope in await SqlAlchemyEnabledSyncScopeReader(session_factory).enabled_scopes():
         # Reader 已在 SQL 层执行同一过滤；此处保留 fail-closed 防线，避免测试替身或未来
         # reader 误把 Microsoft folder cursor 当作第二个周期 owner。
@@ -166,15 +174,24 @@ async def dispatch_google_incremental_syncs() -> None:
         ):
             continue
         kind = "sync_mail" if scope.resource_kind == "mail" else "sync_calendar"
+        scope_key = scope.scope_key
+        if scope.provider == "google" and scope.resource_kind == "calendar":
+            # 目录是 Google Calendar 的周期 owner；事件 scope 只在目录用例内部或维修
+            # 路径显式执行，不能因旧 reader 返回多个游标而重复访问供应商。
+            owner_key = (scope.user_id, scope.connection_id, scope.provider)
+            if owner_key in calendar_owners:
+                continue
+            calendar_owners.add(owner_key)
+            scope_key = "directory"
         # scope 可能是包含帐号标识的 512 字符 opaque ID；任务载荷必须保留精确值，但
         # 幂等键只使用稳定摘要，既满足列长度上限，也避免在运维界面重复暴露该标识。
-        scope_digest = hashlib.sha256(scope.scope_key.encode("utf-8")).hexdigest()[:16]
+        scope_digest = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:16]
         await creator.execute(
             user_id=scope.user_id,
             kind=kind,
             input_payload={
                 "connection_id": str(scope.connection_id),
-                "scope_key": scope.scope_key,
+                "scope_key": scope_key,
             },
             idempotency_key=(
                 f"sync:{scope.provider}:{scope.connection_id}:{scope.resource_kind}:"

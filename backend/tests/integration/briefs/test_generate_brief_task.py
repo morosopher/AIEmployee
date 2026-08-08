@@ -225,7 +225,10 @@ async def test_generate_brief_selects_local_day_events_after_stale_mail_sync_fai
                 )
                 is not None
             )
-        assert sync_attempts == [("mail", connection_id, user_id, "mailbox")]
+        assert sync_attempts == [
+            ("mail", connection_id, user_id, "mailbox"),
+            ("calendar", connection_id, user_id, "directory"),
+        ]
     finally:
         await sessions.dispose()
 
@@ -294,9 +297,7 @@ async def test_brief_stale_refresh_and_last_success_keep_calendar_scopes_indepen
         scope_key: str,
     ) -> None:
         """记录 stale scope 后模拟临时失败，使告警路径读取同一 scope 的持久时间。"""
-        sync_attempts.append(
-            (resource_kind, callback_connection_id, callback_user_id, scope_key)
-        )
+        sync_attempts.append((resource_kind, callback_connection_id, callback_user_id, scope_key))
         raise TransientProviderError(
             error_code="synthetic_calendar_sync_failure",
             message="synthetic calendar sync failure",
@@ -379,6 +380,98 @@ async def test_brief_stale_refresh_and_last_success_keep_calendar_scopes_indepen
         assert sync_attempts == [
             ("calendar", connection_id, user_id, "team-calendar"),
         ]
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_google_brief_aggregates_stale_calendars_through_directory_owner(
+    database_url: str,
+) -> None:
+    """Google 多个日历任一陈旧时，简报刷新只能调用一次 directory owner。"""
+    sessions = build_session_factory(database_url)
+    user_id, connection_id = uuid4(), uuid4()
+    cutoff = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
+    sync_attempts: list[tuple[str, UUID, UUID, str]] = []
+
+    async def sync_source(
+        resource_kind: str,
+        callback_connection_id: UUID,
+        callback_user_id: UUID,
+        scope_key: str,
+    ) -> None:
+        """记录简报触发的唯一 Google Calendar 目录 owner。"""
+        sync_attempts.append((resource_kind, callback_connection_id, callback_user_id, scope_key))
+
+    try:
+        async with sessions.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email="google-directory-brief@example.test",
+                    display_name="Google Directory Brief",
+                    password_hash=None,
+                    timezone="UTC",
+                    locale="en-US",
+                    brief_time=time(8),
+                    is_active=True,
+                )
+            )
+            session.add(
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=user_id,
+                    provider="google",
+                    provider_account_id="google-directory-brief",
+                    account_email="google-directory-brief@example.test",
+                    scopes=[],
+                    status="connected",
+                    last_error_code=None,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability="calendar.read",
+                        status="enabled",
+                        actual_scopes=[],
+                        last_verified_at=cutoff,
+                        last_error_code=None,
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        scope_key="directory",
+                        cursor="directory-token",
+                        last_success_at=cutoff - timedelta(minutes=5),
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        scope_key="primary",
+                        cursor="primary-token",
+                        last_success_at=cutoff - timedelta(hours=1),
+                    ),
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind="calendar",
+                        scope_key="team-calendar",
+                        cursor="team-token",
+                        last_success_at=cutoff - timedelta(hours=2),
+                    ),
+                ]
+            )
+
+        step = GenerateBriefTaskStep(sessions, sync_source=sync_source, now=lambda: cutoff)
+        async with sessions() as session:
+            stale = await step._stale_resources(session, user_id, cutoff, None)
+
+        assert stale == (("calendar", connection_id, "directory"),)
+        assert await step._refresh_stale_sources(user_id, stale) == []
+        assert sync_attempts == [("calendar", connection_id, user_id, "directory")]
     finally:
         await sessions.dispose()
 
@@ -614,7 +707,7 @@ async def test_brief_readback_excludes_disconnected_and_capability_disabled_cach
     ("provider", "capability", "expected"),
     (
         ("google", "mail.read", ("mail", "mailbox")),
-        ("google", "calendar.read", ("calendar", "primary")),
+        ("google", "calendar.read", ("calendar", "directory")),
         ("microsoft", "mail.read", ("mail", "mailbox")),
         ("microsoft", "calendar.read", ("calendar", None)),
     ),
@@ -625,7 +718,7 @@ async def test_missing_cursor_defaults_only_for_enabled_legacy_google_scope(
     capability: str,
     expected: tuple[str, str | None],
 ) -> None:
-    """Google 补 M1 默认 scope；Microsoft mail 缺目录时只触发固定 mailbox owner。"""
+    """Google 补目录 owner；Microsoft mail 缺目录时只触发固定 mailbox owner。"""
     sessions = build_session_factory(database_url)
     user_id, connection_id = uuid4(), uuid4()
     cutoff = datetime(2026, 8, 2, 10, 0, tzinfo=UTC)

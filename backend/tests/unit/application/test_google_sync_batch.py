@@ -15,6 +15,7 @@ from ai_employee.application.use_cases.tasks import (
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.workers.sync_calendar import CalendarSyncTaskStep
 
 
 @dataclass
@@ -144,8 +145,8 @@ async def test_batch_creation_rolls_back_both_tasks_when_second_persistence_fail
 
 
 @pytest.mark.asyncio
-async def test_manual_sync_creates_canonical_mail_task_with_explicit_mailbox_scope() -> None:
-    """新手动同步只能创建 ``sync_mail``，旧 kind 仅供已持久化任务兼容读取。"""
+async def test_manual_sync_creates_canonical_tasks_with_explicit_owner_scopes() -> None:
+    """新手动同步显式创建 mailbox 与 directory owner，旧任务才允许缺 scope。"""
     user_id, connection_id = uuid4(), uuid4()
     connection = OAuthConnectionModel(
         id=connection_id,
@@ -188,7 +189,15 @@ async def test_manual_sync_creates_canonical_mail_task_with_explicit_mailbox_sco
         ),
         CreateTaskBatchItem(
             "sync_calendar",
-            {"connection_id": str(connection_id)},
+            {"connection_id": str(connection_id), "scope_key": "directory"},
             "manual-sync-key:calendar",
         ),
     )
+
+
+def test_calendar_worker_reserves_primary_fallback_for_legacy_missing_scope() -> None:
+    """显式新 owner 保持 directory；只有持久旧任务缺字段时才回退 primary。"""
+    assert CalendarSyncTaskStep._resolve_scope_key("directory") == "directory"
+    assert CalendarSyncTaskStep._resolve_scope_key(None) == "primary"
+    with pytest.raises(ValueError, match="requires scope_key"):
+        CalendarSyncTaskStep._resolve_scope_key("")
