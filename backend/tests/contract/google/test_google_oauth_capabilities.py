@@ -241,24 +241,49 @@ async def test_google_oauth_request_logs_never_contain_credentials(
     )
     # 模拟第三方 logger 未来在异常或调试模式下记录 Authorization/header；安全默认必须
     # 统一阻断，而不能只针对当前 HTTPX INFO 模板做字符串替换。
-    logging.getLogger("httpx").warning(
-        "HTTP Request: GET %s Authorization: %s id_token=%s",
-        f"{GOOGLE_TOKEN_INFO_URL}?id_token={id_token}",
-        authorization_value,
-        id_token,
+    app_logger_name = "ai_employee.test"
+    manager = logging.Logger.manager
+    app_entry = manager.loggerDict.get(app_logger_name)
+    app_logger = logging.getLogger(app_logger_name)
+    app_state = (
+        app_logger.level,
+        app_logger.propagate,
+        app_logger.disabled,
+        app_logger.handlers[:],
+        app_logger.filters[:],
     )
-    logging.getLogger("httpcore.http11").warning(
-        "send_request_headers Authorization: %s", authorization_value
-    )
-    logging.getLogger("ai_employee.test").info("safe-structured-event")
-    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    try:
+        logging.getLogger("httpx").warning(
+            "HTTP Request: GET %s Authorization: %s id_token=%s",
+            f"{GOOGLE_TOKEN_INFO_URL}?id_token={id_token}",
+            authorization_value,
+            id_token,
+        )
+        logging.getLogger("httpcore.http11").warning(
+            "send_request_headers Authorization: %s", authorization_value
+        )
+        app_logger.info("safe-structured-event")
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
 
-    assert access_token not in rendered
-    assert id_token not in rendered
-    assert authorization_value not in rendered
-    assert "access_token=" not in rendered
-    assert "id_token=" not in rendered
-    assert any(record.name == "ai_employee.test" for record in caplog.records)
+        assert access_token not in rendered
+        assert id_token not in rendered
+        assert authorization_value not in rendered
+        assert "access_token=" not in rendered
+        assert "id_token=" not in rendered
+        assert any(record.name == app_logger_name for record in caplog.records)
+    finally:
+        for handler in tuple(app_logger.handlers):
+            app_logger.removeHandler(handler)
+        for handler in app_state[3]:
+            app_logger.addHandler(handler)
+        app_logger.setLevel(app_state[0])
+        app_logger.propagate = app_state[1]
+        app_logger.disabled = app_state[2]
+        app_logger.filters[:] = app_state[4]
+        if app_entry is None:
+            manager.loggerDict.pop(app_logger_name, None)
+        else:
+            manager.loggerDict[app_logger_name] = app_entry
 
 
 @pytest.mark.parametrize(
