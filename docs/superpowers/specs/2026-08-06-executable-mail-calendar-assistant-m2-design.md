@@ -610,6 +610,27 @@ Graph `/me` 的当前用户身份投影，不是目录权限或应用权限；�
 `Mail.ReadWrite` 或任何超出 M2 写动作边界的权限。连接唯一身份由供应商、tenant/account
 类型和 Graph 用户 ID 共同规范化，不能只使用邮箱。
 
+Trusted Action 允许列表与认领边界使用供应商固定为小写 `google` 或 `microsoft` 的精确三段
+canonical key：
+`provider:encoded_tenant:encoded_account`。Google 的 tenant 是空段，形成
+`google::<encoded_account>`；Microsoft 保留现有 `provider_account_id=<tenant>:<graph_user_id>`
+持久格式，但 canonical key 去除重复 tenant，形成
+`microsoft:<encoded_tenant>:<encoded_graph_user_id>`。这只是物理编码，逻辑身份仍是供应商、
+tenant 与稳定 provider account ID 三部分。
+
+tenant/account 都按 opaque 文本处理：RFC 3986 unreserved 字符
+`A-Z a-z 0-9 - . _ ~` 保持原样，其他字符先编码为 UTF-8 字节，再使用大写 `%HH`。因此普通
+合成键仍保持 `google::synthetic-account` 或
+`microsoft:synthetic-tenant:synthetic-graph-user`，而 `@`、`:`、`%` 与非 ASCII 字符必须编码。
+每个解码后的 raw component 最长 255 个 Unicode 字符，每个 encoded segment 最长 3060 个
+ASCII 字符，以覆盖 255 个四字节 Unicode 字符。Microsoft 现有
+`<tenant>:<graph_user_id>` 持久复合值总长仍不得超过 255，内嵌 tenant 必须一致；Graph 用户
+ID 含原始 `:` 时因旧复合格式存在歧义，OAuth 边界必须 fail closed。
+
+parser 必须严格拒绝 malformed escape、小写 hex、对 unreserved 字符的过度编码、未编码保留
+字符、空白/控制字符、非法 UTF-8、长度越界和任何非 canonical 表示。完整 raw 或 canonical
+身份键不得进入日志、异常、指标、审计、SSE、API 响应或提交的验收证据。
+
 ### 11.4 渐进授权
 
 - 首次连接允许只申请读取能力。

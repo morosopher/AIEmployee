@@ -9,7 +9,7 @@ Token、Cookie、OAuth 凭据、Secret、原始允许列表身份键、完整邮
 ## 范围、权限与默认关闭
 
 - [ ] 完成 API、Worker、前端入口、命令注册表和 OAuth scope 审计，证明真实写动作仅有 `mail.send`、`calendar.create`、`calendar.update`、`calendar.restore`，且未出现附件、HTML 邮件、转发、Contacts、日程删除/取消、重复日程写入、通用工具、多用户或产品多 Agent 能力。
-- [ ] 保存 `.env.example` 与生产/开发 Compose 渲染证据，确认全局、Google、Microsoft 写入开关均默认 `false`，非生产启用任一供应商写入时空 `WRITE_TEST_ACCOUNT_ALLOWLIST` 会拒绝启动。
+- [ ] 保存 `.env.example` 与生产/开发 Compose 渲染证据，确认全局、Google、Microsoft 写入开关均默认 `false`，非生产启用任一供应商写入时空 `WRITE_TEST_ACCOUNT_ALLOWLIST` 会拒绝启动；同时审计允许列表仅接受三段 canonical key、规范大写 `%HH` 与既定长度边界，所有异常格式 fail closed 且不输出完整身份键。
 - [ ] 分别审核 Google 与 Microsoft 的渐进委托 scope，证明每个连接只按能力申请 `mail.read`、`mail.send`、`calendar.read`、`calendar.write`，未申请 Contacts、Gmail Draft、Microsoft `Mail.ReadWrite`、应用权限或目录管理权限。
 
 ## 功能、审批与唯一执行

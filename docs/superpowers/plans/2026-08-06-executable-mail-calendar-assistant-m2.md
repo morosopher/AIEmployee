@@ -236,10 +236,19 @@ Extend `Settings` in `backend/src/ai_employee/config.py`:
 
 Extend the existing cross-field validator so `APP_ENV != "production"` plus an enabled global
 and provider write switch requires a non-empty `WRITE_TEST_ACCOUNT_ALLOWLIST`. Each entry is the
-normalized connection identity `provider:provider_tenant_id:provider_account_id`; it is never an
-email address and is never emitted to logs, metrics, audit, SSE, or API responses. Production may
-leave the list empty, in which case the approved three normal write gates still apply; a non-empty
-production list is an additional restriction and is enforced identically.
+canonical connection identity `provider:encoded_tenant:encoded_account`, retaining the logical
+three-part provider/tenant/stable-account semantics. Google uses an empty tenant segment. Microsoft
+keeps the stored `provider_account_id=<tenant>:<graph_user_id>` composite but emits only the Graph ID
+in the encoded account segment after verifying the embedded tenant matches. RFC 3986 unreserved
+characters remain literal; every other opaque UTF-8 byte uses uppercase `%HH`. Each decoded raw
+component is limited to 255 Unicode characters, each encoded segment to 3060 ASCII characters, and
+the existing Microsoft stored composite remains limited to 255 characters. A raw `:` in the Graph
+ID is rejected because that stored composite would be ambiguous. Validation must reject malformed,
+non-canonical, overlong, whitespace/control, or invalid UTF-8 entries without echoing the value.
+The key is derived from the stable provider account ID, never from the account email, and the full
+key is never emitted to logs, metrics, audit, SSE, API responses, or committed evidence. Production
+may leave the list empty, in which case the approved three normal write gates still apply; a
+non-empty production list is an additional restriction and is enforced identically.
 
 Add these exact non-secret defaults to `.env.example` and both Compose service environments:
 
@@ -2368,7 +2377,24 @@ The registry exposes adapters only for the fixed Google/Microsoft provider and f
 
 `TrustedActionState` contains `task_id`, `approval_id`, `operation_id`, `payload_hash`, `decision`, and content-free messages only. The graph nodes are `load_approval → await_approval → claim → execute_or_reconcile → finalize`.
 
-The first claim transaction must lock task/approval, require the owning user to remain active, compare approved status/version/deadline and the payload hash with `hmac.compare_digest()`, recheck the global/provider switches and connection capability, derive the stable connection identity key `provider:provider_tenant_id:provider_account_id`, and require `settings.write_account_allowed()` before inserting a ToolExecution. If the five-minute deadline already expired, atomically invalidate the approval, fail the task with `approval_execution_deadline_expired`, return the local object to `editing`, and create no ToolExecution; that consumed version still requires a new save before resubmission. This allowlist check is mandatory in the separately configured non-production real-provider environment and is an optional extra restriction in production. Insert this exact key before any provider call:
+The first claim transaction must lock task/approval, require the owning user to remain active,
+compare approved status/version/deadline and the payload hash with `hmac.compare_digest()`, and
+recheck the global/provider switches and connection capability. It must derive the stable connection
+identity by calling
+`canonical_provider_identity_key(connection.provider, connection.provider_tenant_id, connection.provider_account_id)`;
+claim code must not hand-compose raw fields. The returned physical key is the exact three-segment
+`provider:encoded_tenant:encoded_account` form from Task 1 while retaining the logical
+provider/tenant/stable-account semantics, including Microsoft tenant binding and fail-closed colon
+handling. It must use the same unreserved-literal and uppercase `%HH` rules, 255-character raw and
+3060-character encoded segment limits, and strict canonical parser from Task 1; malformed or
+non-canonical values always fail closed. Require `settings.write_account_allowed()` with that
+canonical key before inserting a ToolExecution. If the five-minute deadline already expired, atomically invalidate the approval,
+fail the task with `approval_execution_deadline_expired`, return the local object to `editing`, and
+create no ToolExecution; that consumed version still requires a new save before resubmission. This
+allowlist check is mandatory in the separately configured non-production real-provider environment
+and is an optional extra restriction in production. Neither the raw components nor complete
+canonical key may be emitted to logs, metrics, audit, SSE, API responses, or committed evidence.
+Insert this exact idempotency key before any provider call:
 
 ~~~python
 idempotency_key = ":".join(
