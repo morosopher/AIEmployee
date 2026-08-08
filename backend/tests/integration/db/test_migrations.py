@@ -2235,6 +2235,80 @@ def test_calendar_event_identity_migration_attaches_existing_valid_index(
     }
 
 
+def test_calendar_event_identity_migration_rejects_deferrable_named_constraint(
+    empty_migration_database: URL,
+) -> None:
+    """同名可延迟约束不能作为 ``ON CONFLICT`` 身份仲裁器复用。"""
+    backend_root = Path(__file__).resolve().parents[3]
+    alembic_config = Config(backend_root / "alembic.ini")
+    set_alembic_database_url(
+        alembic_config,
+        empty_migration_database.render_as_string(hide_password=False),
+    )
+    command.upgrade(alembic_config, "20260808_0017")
+
+    async def create_deferrable_constraint() -> None:
+        """模拟列形状正确但不能供 PostgreSQL upsert 使用的人工约束。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE calendar_events ADD CONSTRAINT "
+                        "uq_calendar_events_connection_calendar_provider_event "
+                        "UNIQUE (connection_id, calendar_id, provider_event_id) "
+                        "DEFERRABLE INITIALLY DEFERRED"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create_deferrable_constraint())
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        command.upgrade(alembic_config, "20260809_0018")
+
+    assert _alembic_revisions(empty_migration_database) == {"20260808_0017"}
+    assert _calendar_event_identity_constraints(empty_migration_database) == {
+        "uq_calendar_events_connection_calendar_provider_event": (
+            "connection_id",
+            "calendar_id",
+            "provider_event_id",
+        ),
+        "uq_calendar_events_connection_provider_event": (
+            "connection_id",
+            "provider_event_id",
+        ),
+    }
+
+    async def read_constraint_mode() -> tuple[bool, bool]:
+        """读取错误约束模式，证明迁移没有删除或替换同名对象。"""
+        engine = create_async_engine(empty_migration_database, poolclass=NullPool)
+        try:
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            "SELECT constraint_info.condeferrable, "
+                            "constraint_info.condeferred "
+                            "FROM pg_catalog.pg_constraint AS constraint_info "
+                            "JOIN pg_catalog.pg_class AS table_info "
+                            "ON table_info.oid = constraint_info.conrelid "
+                            "JOIN pg_catalog.pg_namespace AS namespace_info "
+                            "ON namespace_info.oid = table_info.relnamespace "
+                            "WHERE namespace_info.nspname = current_schema() "
+                            "AND table_info.relname = 'calendar_events' "
+                            "AND constraint_info.conname = "
+                            "'uq_calendar_events_connection_calendar_provider_event'"
+                        )
+                    )
+                ).one()
+                return bool(row[0]), bool(row[1])
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(read_constraint_mode()) == (True, True)
+
+
 def test_calendar_event_identity_migration_rejects_wrong_shape_named_index(
     empty_migration_database: URL,
 ) -> None:

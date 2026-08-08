@@ -155,9 +155,13 @@ def _verify_named_identity(*, name: str, columns: tuple[str, ...]) -> tuple[str,
         expected_columns=columns,
     )
     if constraint is not None:
+        # PostgreSQL 不允许 ON CONFLICT ON CONSTRAINT 使用可延迟唯一约束；错误对象必须
+        # fail closed，不能把迁移后的 Repository 留在无法执行 upsert 的状态。
         if (
             constraint[1] != "u"
             or not bool(constraint[2])
+            or bool(constraint[3])
+            or bool(constraint[4])
             or _constraint_columns(_TABLE, name) != columns
         ):
             raise RuntimeError(f"{name} has an unexpected definition")
