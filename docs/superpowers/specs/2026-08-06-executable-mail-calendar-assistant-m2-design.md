@@ -588,6 +588,8 @@ Prompt 使用版本文件 `mail_draft_v1.md`，模型输出只包含正文候选
 - `openid`
 - `profile`
 - `email`
+- `User.Read`：Microsoft Graph `/me` 获取当前用户稳定 ID 和邮箱地址所需的最小
+  delegated permission；个人账户与工作/学校账户均适用。
 - `offline_access`
 
 读取能力：
@@ -603,8 +605,10 @@ Prompt 使用版本文件 `mail_draft_v1.md`，模型输出只包含正文候选
 
 - `Calendars.ReadWrite`
 
-Microsoft OAuth 使用允许个人 Microsoft 账户和工作/学校账户的端点。连接唯一身份由供应商、
-tenant/account 类型和 Graph 用户 ID 共同规范化，不能只使用邮箱。
+Microsoft OAuth 使用允许个人 Microsoft 账户和工作/学校账户的端点。`User.Read` 仅用于
+Graph `/me` 的当前用户身份投影，不是目录权限或应用权限；不得借此申请 Contacts、
+`Mail.ReadWrite` 或任何超出 M2 写动作边界的权限。连接唯一身份由供应商、tenant/account
+类型和 Graph 用户 ID 共同规范化，不能只使用邮箱。
 
 ### 11.4 渐进授权
 
@@ -1090,7 +1094,8 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 
 ### 21.4 安全与隐私
 
-- OAuth scope 与能力矩阵一致，不请求 Contacts、Gmail Draft 或 Mail.ReadWrite。
+- OAuth scope 与能力矩阵一致；Microsoft 仅额外使用 delegated `User.Read` 获取 Graph `/me`
+  的稳定身份，不请求目录/应用权限、Contacts、Gmail Draft 或 `Mail.ReadWrite`。
 - Token、真实命令、正文和日程敏感字段按规格加密。
 - 日志、Trace、指标、SSE 和 fixture 不包含敏感内容。
 - 所有修改 API 通过会话、CSRF、用户隔离和版本验证。
@@ -1145,7 +1150,7 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 | 多账户选择错误 | 回复绑定原连接、新建使用可切换默认值、审批展示精确账户 |
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
-| Microsoft 个人与企业授权差异 | `common` 类委托授权、tenant/account 规范身份、管理员同意状态 |
+| Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
 | 敏感审批载荷明文落库 | 完整命令 AEAD、哈希绑定、受控内存解密、内容保留清理 |
 | 无持续试用遗漏偶发问题 | 强化故障注入、两家专用账户人工 E2E、明确接受残余风险 |
@@ -1159,6 +1164,7 @@ M2 供应商行为以实施时的官方文档和契约测试为准，当前设�
 - [Google Calendar create events](https://developers.google.com/workspace/calendar/api/guides/create-events)
 - [Google Calendar events.insert](https://developers.google.com/workspace/calendar/api/v3/reference/events/insert)
 - [Microsoft Graph permissions reference](https://learn.microsoft.com/graph/permissions-reference)
+- [Microsoft Graph get user](https://learn.microsoft.com/graph/api/user-get?view=graph-rest-1.0)
 - [Microsoft Graph sendMail](https://learn.microsoft.com/graph/api/user-sendmail)
 - [Microsoft Graph message delta](https://learn.microsoft.com/graph/delta-query-messages)
 - [Microsoft Graph calendarView delta](https://learn.microsoft.com/graph/delta-query-events)

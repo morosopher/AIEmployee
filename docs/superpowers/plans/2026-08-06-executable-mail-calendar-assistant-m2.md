@@ -1368,7 +1368,15 @@ def test_microsoft_mail_send_scope_depends_on_mail_read() -> None:
     )
 
     assert scopes == frozenset(
-        {"openid", "profile", "email", "offline_access", "Mail.Read", "Mail.Send"}
+        {
+            "openid",
+            "profile",
+            "email",
+            "User.Read",
+            "offline_access",
+            "Mail.Read",
+            "Mail.Send",
+        }
     )
 ~~~
 
@@ -1391,6 +1399,9 @@ MICROSOFT_AUTHORIZATION_URL = "https://login.microsoftonline.com/common/oauth2/v
 MICROSOFT_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 MICROSOFT_DISCOVERY_URL = "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration"
 MICROSOFT_GRAPH_ME_URL = "https://graph.microsoft.com/v1.0/me"
+MICROSOFT_BASE_SCOPES = frozenset(
+    {"openid", "profile", "email", "User.Read", "offline_access"}
+)
 MICROSOFT_CAPABILITY_SCOPES = {
     ConnectionCapability.MAIL_READ: frozenset({"Mail.Read"}),
     ConnectionCapability.MAIL_SEND: frozenset({"Mail.Send"}),
@@ -1399,7 +1410,14 @@ MICROSOFT_CAPABILITY_SCOPES = {
 }
 ~~~
 
-Fetch discovery and JWKS with bounded cache lifetime; validate signature, audience, expiration, issuer template, and nonce hash before accepting identity. Use Graph `/me` for the stable user ID and mailbox address, and the validated `tid`/issuer to derive `provider_tenant_id` plus `personal` or `work_school` account type. Store a normalized provider account key containing tenant and Graph user ID so the existing uniqueness constraint remains safe.
+`User.Read` is the minimum delegated Microsoft Graph permission needed for the `/me` request that
+returns the stable user ID and mailbox address for both personal and work/school accounts. It is
+not a directory or application permission and must not be replaced with Contacts, `Mail.ReadWrite`,
+or any broader permission. Fetch discovery and JWKS with bounded cache lifetime; validate signature,
+audience, expiration, issuer template, and nonce hash before accepting identity. Use Graph `/me`
+for the stable user ID and mailbox address, and the validated `tid`/issuer to derive
+`provider_tenant_id` plus `personal` or `work_school` account type. Store a normalized provider
+account key containing tenant and Graph user ID so the existing uniqueness constraint remains safe.
 
 Map `AADSTS65001` or equivalent consent-required callback errors to `microsoft_admin_consent_required`; never persist raw error descriptions.
 
