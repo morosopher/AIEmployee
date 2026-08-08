@@ -40,23 +40,24 @@ class SqlAlchemyCalendarSyncRepository:
         *,
         user_id: UUID,
         connection_id: UUID,
-    ) -> bool:
+    ) -> OAuthConnectionModel | None:
         """按固定 connection→capability 顺序锁定并验证日历读取前提。
 
-        ``clear_cursor`` 不能用从 cursor 出发的多表 ``JOIN ... FOR UPDATE``：PostgreSQL
-        可按执行计划交错锁定 cursor、connection 与 capability，和正常完成路径形成反向等待。
-        这里先用所有权、connected 状态锁住唯一 connection，再锁定同用户的 enabled
-        ``calendar.read`` 行；后续调用方才允许获取精确 cursor 锁。
+        PostgreSQL 无需保证多表 ``JOIN ... FOR UPDATE`` 的 rowmark 锁顺序与 SQL 书写顺序
+        一致；各同步入口若各自依赖 JOIN，仍可能交错锁定 connection、capability 与 cursor。
+        因此所有状态读取、目录提交、游标清理和同步完成都复用本方法：先按所有权与 connected
+        状态锁住唯一 connection，再锁定同用户的 enabled ``calendar.read`` 行，调用方随后
+        才能获取目录、日历或精确 cursor 锁。
 
         Args:
             user_id: 当前管理员用户。
             connection_id: 待验证的 OAuth 连接。
 
         Returns:
-            连接与读取能力均存在且已按固定顺序锁定时返回 ``True``，否则返回 ``False``。
+            连接与读取能力均存在且已按固定顺序锁定时返回连接行，否则返回 ``None``。
         """
         connection = await self._session.scalar(
-            select(OAuthConnectionModel.id)
+            select(OAuthConnectionModel)
             .where(
                 OAuthConnectionModel.id == connection_id,
                 OAuthConnectionModel.user_id == user_id,
@@ -65,7 +66,7 @@ class SqlAlchemyCalendarSyncRepository:
             .with_for_update()
         )
         if connection is None:
-            return False
+            return None
         capability = await self._session.scalar(
             select(ConnectionCapabilityModel.id)
             .where(
@@ -76,27 +77,15 @@ class SqlAlchemyCalendarSyncRepository:
             )
             .with_for_update()
         )
-        return capability is not None
+        return connection if capability is not None else None
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
     ) -> CalendarConnectionState | None:
         """按用户、启用能力和精确日历 scope 锁定 cursor。"""
-        connection = await self._session.scalar(
-            select(OAuthConnectionModel)
-            .join(
-                ConnectionCapabilityModel,
-                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
-                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
-            )
-            .where(
-                OAuthConnectionModel.id == connection_id,
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.status == "connected",
-                ConnectionCapabilityModel.capability == "calendar.read",
-                ConnectionCapabilityModel.status == "enabled",
-            )
-            .with_for_update()
+        connection = await self._lock_syncable_connection(
+            user_id=user_id,
+            connection_id=connection_id,
         )
         if connection is None:
             return None
@@ -303,21 +292,9 @@ class SqlAlchemyCalendarSyncRepository:
                 error_code="calendar_directory_scopes_invalid",
                 message="Calendar directory scopes are not validated and stably sorted",
             )
-        connection = await self._session.scalar(
-            select(OAuthConnectionModel)
-            .join(
-                ConnectionCapabilityModel,
-                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
-                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
-            )
-            .where(
-                OAuthConnectionModel.id == connection_id,
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.status == "connected",
-                ConnectionCapabilityModel.capability == "calendar.read",
-                ConnectionCapabilityModel.status == "enabled",
-            )
-            .with_for_update()
+        connection = await self._lock_syncable_connection(
+            user_id=user_id,
+            connection_id=connection_id,
         )
         if connection is None:
             raise StateConflictError(
@@ -515,11 +492,11 @@ class SqlAlchemyCalendarSyncRepository:
         expected_cursor: str,
     ) -> None:
         """按 connection→capability→cursor 固定锁序执行单 scope 失效 CAS。"""
-        syncable = await self._lock_syncable_connection(
+        connection = await self._lock_syncable_connection(
             user_id=user_id,
             connection_id=connection_id,
         )
-        if not syncable:
+        if connection is None:
             raise TransientProviderError(
                 error_code="calendar_sync_cursor_conflict",
                 message="Calendar sync cursor changed during provider read",
@@ -555,21 +532,9 @@ class SqlAlchemyCalendarSyncRepository:
         completed_at: datetime,
     ) -> None:
         """CAS 验证原 scoped cursor 后推进最终 token，同时追加无敏感字段审计。"""
-        connection = await self._session.scalar(
-            select(OAuthConnectionModel)
-            .join(
-                ConnectionCapabilityModel,
-                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
-                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
-            )
-            .where(
-                OAuthConnectionModel.id == connection_id,
-                OAuthConnectionModel.user_id == user_id,
-                OAuthConnectionModel.status == "connected",
-                ConnectionCapabilityModel.capability == "calendar.read",
-                ConnectionCapabilityModel.status == "enabled",
-            )
-            .with_for_update()
+        connection = await self._lock_syncable_connection(
+            user_id=user_id,
+            connection_id=connection_id,
         )
         if connection is None:
             raise StateConflictError(
