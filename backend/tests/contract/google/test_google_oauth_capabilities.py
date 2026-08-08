@@ -15,6 +15,7 @@ import httpx
 import pytest
 import respx
 
+import ai_employee.infrastructure.observability.logging as observability_logging
 from ai_employee.application.ports.oauth import OAuthAuthorizationRequest, OAuthTokenSet
 from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import (
@@ -502,6 +503,171 @@ def test_http_client_logging_installation_window_scrubs_extra(
             manager.loggerDict[app_name] = app_entry
 
 
+def test_http_client_logging_first_layer_closes_partial_installation_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只安装 Handler.filter 的间隙内，标准 HTTP 记录也必须 fail-closed。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获第一层安装后、第二层安装前的 handler 输入。"""
+
+        def __init__(self) -> None:
+            """初始化安装 barrier、消息和完整记录快照。"""
+            super().__init__()
+            self.emitted = Event()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存 partial-install 窗口中的最终记录。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+            self.emitted.set()
+
+    def baseline_make_record(
+        _logger: logging.Logger,
+        *args: object,
+        **kwargs: object,
+    ) -> logging.LogRecord:
+        """复现无 wrapper 的标准 makeRecord，保留 factory 后置 extra 时序。"""
+        extra = kwargs.get("extra")
+        factory_args = args
+        if len(args) >= 9:
+            extra = args[8]
+            factory_args = (*args[:8], *args[9:])
+        elif "extra" in kwargs:
+            kwargs = {key: value for key, value in kwargs.items() if key != "extra"}
+        record = logging.getLogRecordFactory()(*factory_args, **kwargs)
+        if extra is not None:
+            extra_values = extra  # type: ignore[assignment]
+            for key in extra_values:  # type: ignore[union-attr]
+                if (key in {"message", "asctime"}) or (key in record.__dict__):
+                    raise KeyError(f"Attempt to overwrite {key!r} in LogRecord")
+                record.__dict__[key] = extra_values[key]  # type: ignore[index]
+        return record
+
+    def baseline_handle(logger: logging.Logger, record: logging.LogRecord) -> None:
+        """复现无 wrapper 的标准 Logger.handle。"""
+        if logger.disabled:
+            return
+        maybe_record = logger.filter(record)
+        if not maybe_record:
+            return
+        if isinstance(maybe_record, logging.LogRecord):
+            record = maybe_record
+        logger.callHandlers(record)
+
+    def baseline_call_handlers(logger: logging.Logger, record: logging.LogRecord) -> None:
+        """复现当前测试所需的最小 handler dispatch。"""
+        for handler in logger.handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+
+    logger_name = "httpx.partial_installation_race"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
+    real_type = type
+    replacements: list[tuple[type[object], str]] = []
+    first_replacement_installed = Event()
+    release_first_replacement = Event()
+    second_replacement_installed = Event()
+    installation_timeout = Event()
+    handler = RecordingHandler()
+    installer: Thread | None = None
+
+    class GatedType:
+        """代理模块内的 type.__setattr__，门控第一与第二个类属性替换。"""
+
+        @staticmethod
+        def __setattr__(target: type[object], name: str, value: object) -> None:
+            """完成替换后在第一层暂停，并记录第二层已经开始安装。"""
+            real_type.__setattr__(target, name, value)
+            replacements.append((target, name))
+            if len(replacements) == 1:
+                first_replacement_installed.set()
+                if not release_first_replacement.wait(timeout=5):
+                    installation_timeout.set()
+            elif len(replacements) == 2:
+                second_replacement_installed.set()
+
+    try:
+        logging.setLogRecordFactory(logging.LogRecord)
+        type.__setattr__(logging.Logger, "makeRecord", baseline_make_record)
+        type.__setattr__(logging.Logger, "handle", baseline_handle)
+        type.__setattr__(logging.Logger, "callHandlers", baseline_call_handlers)
+        type.__setattr__(logging.Handler, "filter", logging.Filterer.filter)
+        monkeypatch.setattr(observability_logging, "type", GatedType, raising=False)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+
+        installer = Thread(target=configure_http_client_logging)
+        installer.start()
+        assert first_replacement_installed.wait(timeout=5)
+
+        logger.warning(
+            "HTTP Request: GET https://oauth2.googleapis.com/tokeninfo?"
+            "access_token=synthetic-partial-install-token",
+            extra={
+                "authorization": "Bearer synthetic-partial-install-extra-secret",
+                "opaque": "synthetic-partial-install-extra-token",
+            },
+        )
+        assert handler.emitted.wait(timeout=5)
+        release_first_replacement.set()
+        installer.join(timeout=5)
+
+        assert not installation_timeout.is_set()
+        assert second_replacement_installed.is_set()
+        assert replacements[:2] == [
+            (logging.Handler, "filter"),
+            (logging.Logger, "callHandlers"),
+        ]
+        assert handler.messages == ["http_client_event"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-partial-install-token",
+                "synthetic-partial-install-extra-secret",
+                "synthetic-partial-install-extra-token",
+            )
+        )
+    finally:
+        release_first_replacement.set()
+        if installer is not None:
+            installer.join(timeout=5)
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
 def test_http_client_logging_scrubs_in_flight_old_make_record_extra() -> None:
     """旧 makeRecord 已在途时，恢复后注入的 extra 也必须在 handle 边界被清理。"""
 
@@ -903,11 +1069,11 @@ def test_http_client_logging_scrubs_filter_replacement_record_before_dispatch() 
             manager.loggerDict[logger_name] = logger_entry
 
 
-def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None:
-    """应用 logger 直接处理 HTTP 命名记录时，不得误清洗其消息与扩展字段。"""
+def test_http_client_logging_scrubs_unproven_http_named_app_direct_handle_record() -> None:
+    """应用 logger 直接处理自称 HTTP 的手工记录时，也必须 fail-closed 清洗。"""
 
     class RecordingHandler(logging.Handler):
-        """捕获 direct handle 的最终记录，验证应用 logger 行为不变。"""
+        """捕获 direct handle 的最终记录，验证不可信 HTTP name 不能绕过边界。"""
 
         def __init__(self) -> None:
             """初始化消息和完整记录快照。"""
@@ -944,7 +1110,7 @@ def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None
         logger.addHandler(handler)
 
         def preserve_application_record(record: logging.LogRecord) -> bool:
-            """模拟应用 handler filter，确认伪造 HTTP name 不会触发全局清洗。"""
+            """模拟应用 handler filter，在最终边界前重新注入扩展字段。"""
             record.application_filter_marker = "synthetic-application-filter-marker"
             return True
 
@@ -963,8 +1129,82 @@ def test_http_client_logging_preserves_app_logger_direct_handle_record() -> None
 
         logger.handle(foreign_record)
 
-        assert handler.messages == ["application-direct-handle synthetic-application-payload"]
-        assert "synthetic-application-extra" in handler.snapshots[0]
+        assert handler.messages == ["http_client_event"]
+        assert all(
+            secret not in handler.snapshots[0]
+            for secret in (
+                "synthetic-application-payload",
+                "synthetic-application-extra",
+                "synthetic-application-filter-marker",
+            )
+        )
+    finally:
+        logging.setLogRecordFactory(original_factory)
+        type.__setattr__(logging.Logger, "makeRecord", original_make_record)
+        type.__setattr__(logging.Logger, "handle", original_handle)
+        type.__setattr__(logging.Logger, "callHandlers", original_call_handlers)
+        type.__setattr__(logging.Handler, "filter", original_handler_filter)
+        for existing_handler in tuple(logger.handlers):
+            logger.removeHandler(existing_handler)
+        for existing_handler in logger_state[3]:
+            logger.addHandler(existing_handler)
+        logger.setLevel(logger_state[0])
+        logger.propagate = logger_state[1]
+        logger.disabled = logger_state[2]
+        logger.filters[:] = logger_state[4]
+        if logger_entry is None:
+            manager.loggerDict.pop(logger_name, None)
+        else:
+            manager.loggerDict[logger_name] = logger_entry
+
+
+def test_http_client_logging_preserves_standard_app_logger_message_and_extra() -> None:
+    """标准 ai_employee 记录不声明 HTTP 来源时，消息与业务安全 extra 必须保持原样。"""
+
+    class RecordingHandler(logging.Handler):
+        """捕获标准应用记录，验证 fail-closed fallback 不扩大作用域。"""
+
+        def __init__(self) -> None:
+            """初始化消息和完整记录快照。"""
+            super().__init__()
+            self.messages: list[str] = []
+            self.snapshots: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """保存应用 handler 实际接收的记录。"""
+            self.messages.append(record.getMessage())
+            self.snapshots.append(repr(record.__dict__))
+
+    logger_name = "ai_employee.standard_application_logging"
+    manager = logging.Logger.manager
+    logger = logging.getLogger(logger_name)
+    logger_state = (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        logger.handlers[:],
+        logger.filters[:],
+    )
+    logger_entry = manager.loggerDict.get(logger_name)
+    original_factory = logging.getLogRecordFactory()
+    original_make_record = logging.Logger.makeRecord
+    original_handle = logging.Logger.handle
+    original_call_handlers = logging.Logger.callHandlers
+    original_handler_filter = logging.Handler.filter
+    handler = RecordingHandler()
+
+    try:
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        configure_http_client_logging()
+        logger.info(
+            "standard-application-event",
+            extra={"application_marker": "synthetic-standard-application-extra"},
+        )
+
+        assert handler.messages == ["standard-application-event"]
+        assert "synthetic-standard-application-extra" in handler.snapshots[0]
     finally:
         logging.setLogRecordFactory(original_factory)
         type.__setattr__(logging.Logger, "makeRecord", original_make_record)

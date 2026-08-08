@@ -103,6 +103,22 @@ def _http_client_source_for_record(record: logging.LogRecord) -> str | None:
         return fallback if isinstance(fallback, str) else None
 
 
+def _resolve_http_client_source(record: logging.LogRecord) -> str | None:
+    """解析已登记来源；无来源但 name 声称 HTTP 客户端时按最小命名空间 fail-closed。"""
+    source_name = _http_client_source_for_record(record)
+    if source_name is not None:
+        return source_name
+    if not _is_http_client_logger(record.name):
+        return None
+
+    # Handler.filter 是五层安装中的第一层，可能先于 provenance-producing wrapper 生效。
+    # 对未证明来源但自称 HTTPX/HTTPCore 的反序列化或手工记录按安全边界处理，只登记
+    # canonical namespace，绝不信任可能包含 token 的动态 name 后缀。
+    source_name = _canonical_http_client_name(record.name)
+    _remember_http_client_source(record, source_name)
+    return source_name
+
+
 def _scrub_http_client_record(record: logging.LogRecord) -> logging.LogRecord:
     """在记录进入任意 handler 前固定 HTTP 客户端字段并清空未知扩展值。
 
@@ -164,8 +180,9 @@ def _scrub_http_client_record_from_logger(
 
     ``Logger.filter`` 可以原地改写 ``LogRecord.name``，也可以返回全新的记录；这两个字段
     都不再代表最初的 HTTPX/HTTPCore 调用方。``Logger.callHandlers`` 收到的 ``logger``
-    是真实调用方对象，因此只在其名称属于 HTTP 客户端命名空间时强制执行字段收窄；应用
-    logger 即使处理一个名称看似 ``httpx`` 的自定义记录，也保持原有行为。
+    是真实调用方对象，因此该入口只在其名称属于 HTTP 客户端命名空间时登记可信来源。
+    下游 ``Handler.filter`` 另对无 provenance 但自称 HTTP 客户端的手工/反序列化记录执行
+    fail-closed，避免部分安装窗口或不可信记录绕过安全边界。
     """
     if not _is_http_client_logger(logger.name):
         return record
@@ -244,10 +261,10 @@ def _wrap_http_client_handler_filter(
         **kwargs: object,
     ) -> object:
         """保留 filter 返回值与后续 lock/emit 流程，同时清理原地或 replacement 记录。"""
-        source_name = _http_client_source_for_record(record)
+        source_name = _resolve_http_client_source(record)
         result = delegate(handler, record, *args, **kwargs)
         if source_name is None and isinstance(result, logging.LogRecord):
-            source_name = _http_client_source_for_record(result)
+            source_name = _resolve_http_client_source(result)
 
         # 即使宿主 Python 版本尚未把 replacement 传给 emit，也先清理原记录；支持 3.12
         # 的 replacement 语义时，再对 replacement 独立清理并原样返回其对象身份。
@@ -292,17 +309,19 @@ def configure_http_client_logging() -> None:
     该 helper 只包装当前 ``Handler.filter``、``Logger.callHandlers``、``Logger.handle``、
     ``Logger.makeRecord`` 与 ``LogRecordFactory``，不删除宿主 handler、不修改 logger level
     或 ``propagate``。Handler.filter 是标准 ``Handler.handle`` 在 emit 前的最后可控边界，
+    对已登记来源以及无 provenance 但 name 声称 HTTPX/HTTPCore 的记录都 fail-closed；
     callHandlers 覆盖 logger filter 重新写入的字段以及已在旧 handle 调用栈中的记录；handle
     覆盖已在旧 makeRecord 调用栈中的记录；makeRecord 覆盖标准库在 factory 返回后注入
-    ``extra`` 的时序；factory 则保护直接创建记录的路径。应用自己的 ``ai_employee.*``
-    logger 完全沿用原行为。
+    ``extra`` 的时序；factory 则保护直接创建记录的路径。名称仍为 ``ai_employee.*`` 的标准
+    应用记录完全沿用原行为。
     """
     # 五个全局入口必须在同一把锁下按 Handler.filter → callHandlers → handle → makeRecord →
     # factory 顺序安装：Handler.filter 在全部 handler filter 后、emit 前清理原地突变或
-    # replacement；callHandlers 在最终 dispatch 前再次清理 logger filter 的突变，并覆盖
-    # 已进入旧 handle 的 in-flight 调用；handle 再覆盖已进入旧 makeRecord 的调用；makeRecord
-    # 覆盖 factory 之后的 extra 注入步骤；最后由 factory 保护直接创建记录的路径。记录创建
-    # 本身无需持有该锁，减少 OAuth 并发请求的额外争用。
+    # replacement，并对尚无 provenance 的 HTTP name 自足 fail-closed；callHandlers 在最终
+    # dispatch 前再次清理 logger filter 的突变，并覆盖已进入旧 handle 的 in-flight 调用；
+    # handle 再覆盖已进入旧 makeRecord 的调用；makeRecord 覆盖 factory 之后的 extra 注入
+    # 步骤；最后由 factory 保护直接创建记录的路径。记录创建本身无需持有该锁，减少 OAuth
+    # 并发请求的额外争用。
     with _HTTP_CLIENT_LOGGING_LOCK:
         current_handler_filter = logging.Handler.filter
         if (
