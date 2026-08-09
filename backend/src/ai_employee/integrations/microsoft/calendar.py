@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from types import MappingProxyType
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ from ai_employee.domain.errors import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.domain.mail_actions import normalize_mailbox_address
 from ai_employee.integrations.microsoft.timezones import to_iana_timezone
 
 MICROSOFT_GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -43,8 +44,14 @@ MICROSOFT_CALENDAR_MAX_NORMALIZED_BYTES = 32 * 1024 * 1024
 MICROSOFT_CALENDAR_MAX_PAGES = 100
 MICROSOFT_CALENDAR_MAX_ITEMS = 10_000
 MICROSOFT_CALENDAR_MAX_ID_LENGTH = 512
+MICROSOFT_CALENDAR_MAX_EVENT_ID_LENGTH = 255
+MICROSOFT_CALENDAR_MAX_VERSION_LENGTH = 255
+MICROSOFT_CALENDAR_MAX_ENUM_LENGTH = 32
+MICROSOFT_CALENDAR_MAX_TIMEZONE_LENGTH = 64
 MICROSOFT_CALENDAR_MAX_STRING_LENGTH = 16_384
 _CALENDAR_SELECT = "id,name,isDefaultCalendar,canEdit,canShare,owner,hexColor"
+_FRACTIONAL_SECONDS = re.compile(r"(\.\d{6})\d+(?=Z$|[+-]\d{2}:\d{2}$|$)")
+_GRAPH_EVENT_TYPES = frozenset({"singleInstance", "occurrence", "exception", "seriesMaster"})
 _RefreshAccessToken = Callable[[], Awaitable[str]]
 _MarkExpired = Callable[[], Awaitable[None]]
 
@@ -83,40 +90,39 @@ class MicrosoftCalendarAdapter(CalendarReader):
     async def directory_pages(
         self, cursor: str | None = None
     ) -> AsyncIterator[CalendarDirectoryPage]:
-        """读取可见日历目录，并只在最终页返回目录 deltaLink。"""
+        """从固定 collection 读取有界完整目录，不制造 provider cursor。"""
         self._reset_budget()
+        if cursor is not None:
+            # Graph v1.0 /me/calendars 没有目录 Delta。任何历史非空值都不是可恢复位置，
+            # 必须在构造请求和附加 Bearer Header 前 fail closed。
+            raise PermanentProviderError(
+                error_code="microsoft_calendar_directory_cursor_unsupported",
+                message="Microsoft calendar directory cursor is unsupported",
+            )
         current_url = MICROSOFT_CALENDARS_URL
         params: Mapping[str, str] | None = {"$select": _CALENDAR_SELECT}
-        if cursor is not None:
-            # Microsoft 目录游标持久化的是完整 deltaLink；不能把任意短 token 当作
-            # ``$deltatoken`` 拼回请求，否则会绕过 host/path 绑定并把畸形值送到 Graph。
-            current_url = self._validate_directory_url(cursor)
-            params = None
         seen: set[str] = set()
         item_count = 0
         for _ in range(MICROSOFT_CALENDAR_MAX_PAGES):
             if current_url in seen:
                 raise self._pagination_invalid()
             seen.add(current_url)
-            payload = await self._get_json(current_url, params=params, cursor_scope="directory")
+            payload = await self._get_json(current_url, params=params, cursor_scope=None)
             params = None
             values = self._values(payload)
             item_count += len(values)
             if item_count > MICROSOFT_CALENDAR_MAX_ITEMS:
                 raise self._pagination_invalid()
+            if any(item.get("@removed") is not None for item in values):
+                raise self._invalid_response()
             calendars = tuple(self._normalize_calendar(item) for item in values)
             next_link, delta_link = self._links(payload)
-            if next_link is not None and delta_link is not None:
-                # Graph 分页页只能给出一种后继语义；同时出现会让最终目录游标不确定，
-                # 因而必须在发起下一次请求前拒绝，避免把不完整目录标记为成功。
+            if delta_link is not None:
+                # /me/calendars 不是 Delta collection；接受该字段会把供应商异常响应伪装成
+                # 可恢复游标，并重新引入目录 cursor 与本地 revision 混淆。
                 raise self._pagination_invalid()
             safe_next = self._validate_directory_url(next_link) if next_link is not None else None
-            safe_delta = (
-                self._validate_directory_url(delta_link) if delta_link is not None else None
-            )
-            if safe_next is None and safe_delta is None:
-                raise self._missing_cursor()
-            yield CalendarDirectoryPage(calendars, safe_next, safe_delta)
+            yield CalendarDirectoryPage(calendars, safe_next, None, full_snapshot=True)
             if safe_next is None:
                 return
             current_url = safe_next
@@ -137,7 +143,10 @@ class MicrosoftCalendarAdapter(CalendarReader):
             "endDateTime": (local_midnight + timedelta(days=30)).isoformat(),
         }
         async for page in self._delta_pages(
-            calendar_id, self._event_delta_url(calendar_id), params
+            calendar_id,
+            self._event_delta_url(calendar_id),
+            params,
+            persisted_cursor=False,
         ):
             yield page
 
@@ -152,7 +161,12 @@ class MicrosoftCalendarAdapter(CalendarReader):
             raise ValueError("calendar sync cursor must not be empty")
         safe_cursor = self._validate_delta_url(cursor, calendar_id)
         self._reset_budget()
-        async for page in self._delta_pages(calendar_id, safe_cursor, None):
+        async for page in self._delta_pages(
+            calendar_id,
+            safe_cursor,
+            None,
+            persisted_cursor=True,
+        ):
             yield page
 
     async def get_current_event(
@@ -167,30 +181,24 @@ class MicrosoftCalendarAdapter(CalendarReader):
                 self._event_url(calendar_id, provider_event_id),
                 params=None,
                 cursor_scope=None,
+                allow_not_found=True,
             )
         except _NotFound:
             return None
         return self._normalize_event(payload, calendar_id=calendar_id)
-
-    async def execute_request(
-        self,
-        parameters: Mapping[str, str] | None = None,
-        *,
-        url: str = MICROSOFT_CALENDARS_URL,
-    ) -> Mapping[str, object]:
-        """执行一个受控只读 GET，保留给契约和诊断测试使用。"""
-        self._reset_budget()
-        return await self._get_json(url, params=parameters, cursor_scope=None)
 
     async def _delta_pages(
         self,
         calendar_id: str,
         first_url: str,
         params: Mapping[str, str] | None,
+        *,
+        persisted_cursor: bool,
     ) -> AsyncIterator[CalendarSyncPage]:
-        """执行有限 Delta 分页，只有最终页携带 delta cursor。"""
+        """执行有限 Delta 分页，只把已持久 cursor 的首请求分类为失效。"""
         current_url = first_url
         current_params = params
+        first_request = True
         seen: set[str] = set()
         item_count = 0
         for _ in range(MICROSOFT_CALENDAR_MAX_PAGES):
@@ -200,8 +208,9 @@ class MicrosoftCalendarAdapter(CalendarReader):
             payload = await self._get_json(
                 current_url,
                 params=current_params,
-                cursor_scope=calendar_id if current_params is None else None,
+                cursor_scope=calendar_id if persisted_cursor and first_request else None,
             )
+            first_request = False
             current_params = None
             values = self._values(payload)
             item_count += len(values)
@@ -233,8 +242,9 @@ class MicrosoftCalendarAdapter(CalendarReader):
         *,
         params: Mapping[str, str] | None,
         cursor_scope: str | None,
+        allow_not_found: bool = False,
     ) -> Mapping[str, object]:
-        """流式读取 Graph JSON，分类授权、限流、网络和游标错误。"""
+        """流式读取 Graph JSON，按请求来源分类精确 GET 与持久 cursor 错误。"""
         for attempt in range(2):
             timeout = httpx.Timeout(
                 MICROSOFT_CALENDAR_TIMEOUT_SECONDS,
@@ -275,7 +285,7 @@ class MicrosoftCalendarAdapter(CalendarReader):
                         )
                     if response.status_code in {404, 410} and cursor_scope is not None:
                         raise CalendarCursorExpiredError("microsoft", cursor_scope)
-                    if response.status_code == 404:
+                    if response.status_code == 404 and allow_not_found:
                         raise _NotFound
                     if response.status_code == 429:
                         raise TransientProviderError(
@@ -290,6 +300,10 @@ class MicrosoftCalendarAdapter(CalendarReader):
                             retry_after=self._retry_after(response),
                         )
                     if not 200 <= response.status_code < 300:
+                        if cursor_scope is not None and await self._is_sync_state_not_found(
+                            response
+                        ):
+                            raise CalendarCursorExpiredError("microsoft", cursor_scope)
                         raise PermanentProviderError(
                             error_code="microsoft_calendar_request_rejected",
                             message="Microsoft calendar request was rejected",
@@ -374,6 +388,7 @@ class MicrosoftCalendarAdapter(CalendarReader):
             if isinstance(timezone_value, str) and timezone_value != ""
             else self._timezone_name
         )
+        self._validate_bounded_string(timezone, MICROSOFT_CALENDAR_MAX_TIMEZONE_LENGTH)
         can_edit = item.get("canEdit") is True
         can_share = item.get("canShare") is True
         owner = self._owner(item.get("owner"))
@@ -383,6 +398,7 @@ class MicrosoftCalendarAdapter(CalendarReader):
             if isinstance(access_role_value, str) and access_role_value != ""
             else ("owner" if can_edit else "reader")
         )
+        self._validate_bounded_string(access_role, MICROSOFT_CALENDAR_MAX_ENUM_LENGTH)
         provider_url = self._safe_url(item.get("webUrl") or item.get("webLink"))
         hex_color = item.get("hexColor")
         if not isinstance(hex_color, str) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", hex_color):
@@ -403,7 +419,16 @@ class MicrosoftCalendarAdapter(CalendarReader):
 
     def _normalize_event(self, item: Mapping[str, object], *, calendar_id: str) -> CalendarEvent:
         """把 Graph event 或 removed tombstone 收窄为 CalendarEvent。"""
-        event_id = self._required_identifier(item, "id")
+        self._validate_identifier(
+            calendar_id,
+            "calendar_id",
+            max_length=MICROSOFT_CALENDAR_MAX_ID_LENGTH,
+        )
+        event_id = self._required_identifier(
+            item,
+            "id",
+            max_length=MICROSOFT_CALENDAR_MAX_EVENT_ID_LENGTH,
+        )
         removed = item.get("@removed")
         if removed is not None:
             if not isinstance(removed, Mapping):
@@ -428,13 +453,18 @@ class MicrosoftCalendarAdapter(CalendarReader):
                 attendees=(),
                 access_role=None,
                 can_edit=False,
-                change_key=self._optional_string(item, "changeKey"),
+                change_key=self._optional_string(
+                    item,
+                    "changeKey",
+                    max_length=MICROSOFT_CALENDAR_MAX_VERSION_LENGTH,
+                ),
                 recurrence_metadata=None,
             )
         status = "cancelled" if item.get("isCancelled") is True else "confirmed"
         status_value = item.get("status")
         if isinstance(status_value, str) and status_value != "":
             status = status_value
+        self._validate_bounded_string(status, MICROSOFT_CALENDAR_MAX_ENUM_LENGTH)
         start_value = item.get("start")
         end_value = item.get("end")
         all_day = item.get("isAllDay") is True
@@ -445,6 +475,15 @@ class MicrosoftCalendarAdapter(CalendarReader):
         timezone = start_timezone or end_timezone or self._timezone_name
         if start_timezone and end_timezone and start_timezone != end_timezone:
             raise self._invalid_response()
+        if ends_at <= starts_at:
+            raise self._invalid_response()
+        if all_day:
+            event_timezone = ZoneInfo(timezone)
+            if (
+                starts_at.astimezone(event_timezone).timetz().replace(tzinfo=None) != time.min
+                or ends_at.astimezone(event_timezone).timetz().replace(tzinfo=None) != time.min
+            ):
+                raise self._invalid_response()
         body = item.get("body")
         description = ""
         if body is not None:
@@ -453,15 +492,14 @@ class MicrosoftCalendarAdapter(CalendarReader):
             content = body.get("content", "")
             if not isinstance(content, str):
                 raise self._invalid_response()
-            description = content
+            description = self._body_text(content)
         location_value = item.get("location")
         location = ""
         if isinstance(location_value, Mapping):
             location = self._text(location_value.get("displayName"), default="")
         elif location_value is not None:
             raise self._invalid_response()
-        recurring_event_id = self._recurring_id(item, event_id)
-        recurrence_metadata = self._recurrence_metadata(item.get("recurrence"))
+        recurring_event_id, recurrence_metadata = self._recurrence_projection(item, event_id)
         return CalendarEvent(
             event_id=event_id,
             calendar_id=calendar_id,
@@ -471,7 +509,11 @@ class MicrosoftCalendarAdapter(CalendarReader):
             starts_at=starts_at,
             ends_at=ends_at,
             all_day=all_day,
-            transparency=self._text(item.get("showAs"), default="opaque"),
+            transparency=self._bounded_text(
+                item.get("showAs"),
+                default="opaque",
+                max_length=MICROSOFT_CALENDAR_MAX_ENUM_LENGTH,
+            ),
             status=status,
             timezone=timezone,
             recurring_event_id=recurring_event_id,
@@ -480,50 +522,107 @@ class MicrosoftCalendarAdapter(CalendarReader):
             updated_at=self._datetime_value(item.get("lastModifiedDateTime"), optional=True),
             organizer=self._person(item.get("organizer"), optional=True),
             attendees=self._attendees(item.get("attendees")),
-            access_role=self._optional_string(item, "accessRole"),
+            access_role=self._optional_string(
+                item,
+                "accessRole",
+                max_length=MICROSOFT_CALENDAR_MAX_ENUM_LENGTH,
+            ),
             can_edit=item.get("canEdit") is True or item.get("isOrganizer") is True,
-            change_key=self._optional_string(item, "changeKey"),
+            change_key=self._optional_string(
+                item,
+                "changeKey",
+                max_length=MICROSOFT_CALENDAR_MAX_VERSION_LENGTH,
+            ),
             recurrence_metadata=recurrence_metadata,
         )
 
     def _event_time(self, value: Mapping[str, object]) -> tuple[datetime, str]:
-        """解析 Graph dateTimeTimeZone，返回 UTC instant 与 canonical IANA。"""
+        """解析 Graph dateTimeTimeZone，验证 offset/zone 并返回 UTC instant。
+
+        Graph 常返回七位小数，而 Python 只保留微秒。截断时必须保留尾部 ``Z`` 或数值
+        offset；显式 offset 还必须属于声明时区在该本地时刻的有效 offset 集合。对没有
+        offset 的本地时间，使用 ZoneInfo 往返校验拒绝 DST 跳时中不存在的墙上时间。
+        """
         raw_datetime = value.get("dateTime")
         raw_timezone = value.get("timeZone")
         if not isinstance(raw_datetime, str) or not isinstance(raw_timezone, str):
             raise self._invalid_response()
         timezone = to_iana_timezone(raw_timezone)
+        self._validate_bounded_string(timezone, MICROSOFT_CALENDAR_MAX_TIMEZONE_LENGTH)
         try:
-            normalized = raw_datetime
-            if "." in normalized:
-                prefix, fraction = normalized.split(".", 1)
-                suffix = ""
-                if fraction.endswith("Z"):
-                    fraction, suffix = fraction[:-1], "Z"
-                normalized = f"{prefix}.{fraction[:6]}{suffix}"
+            normalized = _FRACTIONAL_SECONDS.sub(r"\1", raw_datetime)
             parsed = datetime.fromisoformat(
                 normalized[:-1] + "+00:00" if normalized.endswith("Z") else normalized
             )
         except (TypeError, ValueError):
             raise self._invalid_response() from None
+        zone = ZoneInfo(timezone)
+        local_value = parsed.replace(tzinfo=None)
+        candidates = self._valid_local_candidates(local_value, zone)
         if parsed.tzinfo is None or parsed.utcoffset() is None:
-            parsed = parsed.replace(tzinfo=ZoneInfo(timezone))
+            if not candidates:
+                raise self._invalid_response()
+            parsed = candidates[0]
+        elif parsed.utcoffset() not in {candidate.utcoffset() for candidate in candidates}:
+            raise self._invalid_response()
         return parsed.astimezone(UTC), timezone
 
+    @staticmethod
+    def _valid_local_candidates(value: datetime, zone: ZoneInfo) -> tuple[datetime, ...]:
+        """返回能经 UTC 往返恢复同一墙上时间的稳定 ZoneInfo 候选。
+
+        正常时刻两个 fold 会收敛为同一 offset；DST 回拨歧义时保留两个不同 offset；春季
+        跳时中不存在的本地时间无法往返，因此返回空集合并由调用方永久拒绝。
+        """
+        result: list[datetime] = []
+        seen_offsets: set[timedelta | None] = set()
+        for fold in (0, 1):
+            candidate = value.replace(tzinfo=zone, fold=fold)
+            round_trip = candidate.astimezone(UTC).astimezone(zone)
+            if round_trip.replace(tzinfo=None) != value:
+                continue
+            offset = candidate.utcoffset()
+            if offset in seen_offsets:
+                continue
+            seen_offsets.add(offset)
+            result.append(candidate)
+        return tuple(result)
+
     @classmethod
-    def _recurring_id(cls, item: Mapping[str, object], event_id: str) -> str | None:
-        """保留 Graph seriesMasterId 或非空 recurrence sentinel。"""
-        series = item.get("seriesMasterId")
-        if series is not None:
-            if not isinstance(series, str) or series == "":
-                raise cls._invalid_response()
-            return series
-        recurrence = item.get("recurrence")
-        if isinstance(recurrence, Mapping) and recurrence:
-            return event_id
-        if recurrence is not None:
+    def _recurrence_projection(
+        cls,
+        item: Mapping[str, object],
+        event_id: str,
+    ) -> tuple[str | None, Mapping[str, str] | None]:
+        """按 Graph event type 验证重复关系并返回只读投影。
+
+        ``singleInstance`` 不得携带 series/recurrence；``occurrence`` 与 ``exception`` 必须
+        绑定 seriesMasterId 且不能重复声明 recurrence；``seriesMaster`` 必须携带非空
+        recurrence 且不能反向绑定另一个 series master。
+        """
+        event_type = item.get("type")
+        if not isinstance(event_type, str) or event_type not in _GRAPH_EVENT_TYPES:
             raise cls._invalid_response()
-        return None
+        series = item.get("seriesMasterId")
+        recurrence = item.get("recurrence")
+        if event_type == "singleInstance":
+            if series is not None or recurrence is not None:
+                raise cls._invalid_response()
+            return None, None
+        if event_type in {"occurrence", "exception"}:
+            if recurrence is not None:
+                raise cls._invalid_response()
+            if not isinstance(series, str):
+                raise cls._invalid_response()
+            cls._validate_identifier(
+                series,
+                "seriesMasterId",
+                max_length=MICROSOFT_CALENDAR_MAX_EVENT_ID_LENGTH,
+            )
+            return series, None
+        if series is not None or not isinstance(recurrence, Mapping) or not recurrence:
+            raise cls._invalid_response()
+        return event_id, cls._recurrence_metadata(recurrence)
 
     @classmethod
     def _recurrence_metadata(cls, value: object) -> Mapping[str, str] | None:
@@ -594,17 +693,30 @@ class MicrosoftCalendarAdapter(CalendarReader):
         name = address_value.get("name", "")
         if not isinstance(address, str) or address == "" or not isinstance(name, str):
             raise cls._invalid_response()
+        try:
+            normalized_address = normalize_mailbox_address(address)
+        except ValueError:
+            raise cls._invalid_response() from None
         normalized: dict[str, str] = {
-            "name": name.replace("\r", " ").replace("\n", " ").strip(),
-            "email": address,
+            "name": cls._text(name, default=""),
+            "email": normalized_address,
         }
         status = value.get("status")
         if isinstance(status, Mapping) and isinstance(status.get("response"), str):
-            normalized["responseStatus"] = status["response"]
+            response_status = status["response"]
+            cls._validate_bounded_string(
+                response_status,
+                MICROSOFT_CALENDAR_MAX_ENUM_LENGTH,
+            )
+            normalized["responseStatus"] = response_status
         elif status is not None:
             raise cls._invalid_response()
         person_type = value.get("type")
         if isinstance(person_type, str):
+            cls._validate_bounded_string(
+                person_type,
+                MICROSOFT_CALENDAR_MAX_ENUM_LENGTH,
+            )
             normalized["type"] = person_type
         elif person_type is not None:
             raise cls._invalid_response()
@@ -620,26 +732,60 @@ class MicrosoftCalendarAdapter(CalendarReader):
         except PermanentProviderError:
             return None
 
-    @staticmethod
-    def _text(value: object, *, default: str) -> str:
-        """读取有限展示文本并清除换行控制字符。"""
+    @classmethod
+    def _text(cls, value: object, *, default: str) -> str:
+        """读取有限展示文本并拒绝所有 C0/DEL 控制字符。"""
+        return cls._bounded_text(
+            value,
+            default=default,
+            max_length=MICROSOFT_CALENDAR_MAX_STRING_LENGTH,
+        )
+
+    @classmethod
+    def _bounded_text(cls, value: object, *, default: str, max_length: int) -> str:
+        """读取可 trim 的展示标量，并按目标列上限 fail closed。"""
         if value is None:
             return default
-        if not isinstance(value, str) or len(value) > MICROSOFT_CALENDAR_MAX_STRING_LENGTH:
-            raise MicrosoftCalendarAdapter._invalid_response()
-        return value.replace("\r", " ").replace("\n", " ").strip()
+        if not isinstance(value, str):
+            raise cls._invalid_response()
+        cls._validate_bounded_string(value, max_length, allow_empty=True)
+        return value.strip()
 
-    @staticmethod
-    def _safe_url(value: object) -> str | None:
-        """仅保留绝对 HTTPS 展示链接，畸形供应商值按缺失处理。"""
-        if not isinstance(value, str) or value == "":
+    @classmethod
+    def _body_text(cls, value: str) -> str:
+        """保留纯文本换行/制表，同时拒绝 NUL、其他 C0 与 DEL。"""
+        if len(value) > MICROSOFT_CALENDAR_MAX_STRING_LENGTH or any(
+            (ord(character) < 32 and character not in {"\t", "\n", "\r"}) or ord(character) == 127
+            for character in value
+        ):
+            raise cls._invalid_response()
+        return value
+
+    @classmethod
+    def _safe_url(cls, value: object) -> str | None:
+        """只接受绝对 HTTPS 展示链接；已出现的畸形值不得静默丢弃。"""
+        if value is None or value == "":
             return None
+        if (
+            not isinstance(value, str)
+            or value.strip() != value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise cls._invalid_response()
         try:
             parsed = urlsplit(value)
+            _ = parsed.port
         except ValueError:
-            return None
-        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
-            return None
+            raise cls._invalid_response() from None
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.netloc == ""
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment != ""
+        ):
+            raise cls._invalid_response()
         return value
 
     @classmethod
@@ -663,38 +809,79 @@ class MicrosoftCalendarAdapter(CalendarReader):
         value = item.get("@odata.etag", item.get("etag"))
         if value is None:
             return None
-        if not isinstance(value, str) or value == "":
+        if not isinstance(value, str):
             raise cls._invalid_response()
+        cls._validate_bounded_string(value, MICROSOFT_CALENDAR_MAX_VERSION_LENGTH)
         return value
 
     @classmethod
-    def _optional_string(cls, item: Mapping[str, object], key: str) -> str | None:
-        """读取可选非空字符串，畸形类型统一为安全永久错误。"""
+    def _optional_string(
+        cls,
+        item: Mapping[str, object],
+        key: str,
+        *,
+        max_length: int = MICROSOFT_CALENDAR_MAX_STRING_LENGTH,
+    ) -> str | None:
+        """读取可选非空标量，并按调用方目标列长度校验。"""
         value = item.get(key)
         if value is None:
             return None
-        if not isinstance(value, str) or value == "":
+        if not isinstance(value, str):
             raise cls._invalid_response()
+        cls._validate_bounded_string(value, max_length)
         return value
 
     @classmethod
-    def _required_identifier(cls, item: Mapping[str, object], key: str) -> str:
+    def _required_identifier(
+        cls,
+        item: Mapping[str, object],
+        key: str,
+        *,
+        max_length: int = MICROSOFT_CALENDAR_MAX_ID_LENGTH,
+    ) -> str:
         """读取不含空白/控制字符且受持久化长度约束的 provider ID。"""
         value = item.get(key)
         if not isinstance(value, str):
             raise cls._invalid_response()
-        cls._validate_identifier(value, key)
+        cls._validate_identifier(value, key, max_length=max_length)
         return value
 
     @classmethod
-    def _validate_identifier(cls, value: object, key: str) -> None:
+    def _validate_identifier(
+        cls,
+        value: object,
+        key: str,
+        *,
+        max_length: int = MICROSOFT_CALENDAR_MAX_ID_LENGTH,
+    ) -> None:
         """验证 opaque ID，不在错误中回显实际值。"""
+        del key
         if (
             not isinstance(value, str)
             or value == ""
             or value.strip() != value
-            or len(value) > MICROSOFT_CALENDAR_MAX_ID_LENGTH
-            or any(character.isspace() or ord(character) < 32 for character in value)
+            or len(value) > max_length
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise cls._invalid_response()
+
+    @classmethod
+    def _validate_bounded_string(
+        cls,
+        value: str,
+        max_length: int,
+        *,
+        allow_empty: bool = False,
+    ) -> None:
+        """验证无 padding/control 且不超过共享列长度的标量。"""
+        if (
+            (value == "" and not allow_empty)
+            or value.strip() != value
+            or len(value) > max_length
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
         ):
             raise cls._invalid_response()
 
@@ -758,7 +945,7 @@ class MicrosoftCalendarAdapter(CalendarReader):
 
     @classmethod
     def _validate_directory_url(cls, value: str) -> str:
-        """验证目录 next/delta 链仍绑定 /me/calendars path。"""
+        """验证目录 nextLink 仍绑定固定 /me/calendars collection path。"""
         safe = cls._validate_absolute_graph_url(value, "microsoft_calendar_invalid_directory_url")
         if urlsplit(safe).path != "/v1.0/me/calendars":
             raise PermanentProviderError(
@@ -814,6 +1001,36 @@ class MicrosoftCalendarAdapter(CalendarReader):
         except (TypeError, ValueError):
             return None
         return value if value >= 0 else None
+
+    @classmethod
+    async def _is_sync_state_not_found(cls, response: httpx.Response) -> bool:
+        """有限读取 Graph 错误码，不回显错误正文或 opaque cursor。
+
+        该分支只用于已经通过 host/path 绑定的持久 CalendarView deltaLink。响应无论是否
+        畸形都会在本次请求后终止，因此只执行单页上限，不把错误正文计入后续成功链预算。
+
+        Args:
+            response: Graph 的非成功流式响应。
+
+        Returns:
+            错误对象明确给出 ``syncStateNotFound`` 时返回 ``True``。
+        """
+        content_length = cls._content_length(response)
+        if content_length is not None and content_length > MICROSOFT_CALENDAR_MAX_RESPONSE_BYTES:
+            return False
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(body) + len(chunk) > MICROSOFT_CALENDAR_MAX_RESPONSE_BYTES:
+                return False
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        error = payload.get("error")
+        return isinstance(error, Mapping) and error.get("code") == "syncStateNotFound"
 
     @staticmethod
     def _invalid_response() -> PermanentProviderError:

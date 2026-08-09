@@ -48,8 +48,10 @@ class CalendarSyncStore(Protocol):
         user_id: UUID,
         connection_id: UUID,
         calendars: tuple[ProviderCalendar, ...],
+        full_snapshot: bool,
         expected_cursor: str | None,
-        next_cursor: str,
+        expected_revision: datetime | None,
+        next_cursor: str | None,
         completed_at: datetime,
     ) -> tuple[str, ...]: ...
 
@@ -95,11 +97,11 @@ class CalendarSyncResult:
     """返回不含日程敏感字段的单 scope 同步聚合结果。"""
 
     events_upserted: int
-    next_cursor: str
+    next_cursor: str | None
     used_full_resync: bool
 
     @property
-    def cursor(self) -> str:
+    def cursor(self) -> str | None:
         """返回 M1 ``CalendarSyncResult.cursor`` 的只读兼容属性。"""
         return self.next_cursor
 
@@ -175,7 +177,6 @@ class SyncCalendarUseCase:
         reader: CalendarReader,
     ) -> CalendarSyncResult:
         """完成目录 CAS 后按稳定 calendar ID 顺序同步各事件 scope。"""
-        used_full = state.cursor is None
         try:
             pages = await self._collect_directory(reader.directory_pages(state.cursor))
         except CalendarCursorExpiredError as error:
@@ -202,9 +203,15 @@ class SyncCalendarUseCase:
                 provider=state.provider,
                 scope_key="directory",
                 cursor=None,
+                revision=state.revision,
             )
 
-        next_cursor = self._last_cursor(pages)
+        full_snapshot = self._directory_snapshot_mode(pages)
+        next_cursor = self._last_directory_cursor(
+            pages,
+            full_snapshot=full_snapshot,
+            provider=state.provider,
+        )
         calendars = self._validated_directory_calendars(pages)
         completed_at = datetime.now(UTC)
         async with self._stores() as store:
@@ -212,12 +219,15 @@ class SyncCalendarUseCase:
                 user_id=user_id,
                 connection_id=connection_id,
                 calendars=calendars,
+                full_snapshot=full_snapshot,
                 expected_cursor=state.cursor,
+                expected_revision=state.revision,
                 next_cursor=next_cursor,
                 completed_at=completed_at,
             )
 
         total_events = 0
+        used_full = full_snapshot
         first_error: Exception | None = None
         for calendar_id in calendar_ids:
             try:
@@ -227,12 +237,15 @@ class SyncCalendarUseCase:
                     calendar_id=calendar_id,
                     reader=reader,
                 )
+            except UserActionRequiredError:
+                # 权限撤销或重新授权要求是连接级安全状态；继续读取其他日历会扩大已知无权
+                # 访问后的供应商请求面，也会延迟 Worker 对能力状态的持久化，因此立即停止。
+                raise
             except (
                 CalendarConnectionNotFoundError,
                 InternalInvariantError,
                 PermanentProviderError,
                 TransientProviderError,
-                UserActionRequiredError,
             ) as error:
                 # 目录已经是独立事务事实；继续处理其他日历，避免一个失效 cursor 阻断整
                 # 个连接。只在循环完成后抛出第一个错误，确保失败 scope 可单独重试。
@@ -387,14 +400,53 @@ class SyncCalendarUseCase:
         return tuple([page async for page in pages])
 
     @staticmethod
-    def _last_cursor(pages: tuple[CalendarDirectoryPage, ...]) -> str:
-        """只接受目录最终页明确返回的非空 opaque cursor。
+    def _directory_snapshot_mode(pages: tuple[CalendarDirectoryPage, ...]) -> bool:
+        """返回整条目录链的显式快照模式并拒绝分页中途切换。
+
+        Raises:
+            InternalInvariantError: 供应商没有返回页面，或同一分页链混用了完整与增量语义。
+        """
+        if not pages:
+            raise InternalInvariantError(
+                error_code="calendar_directory_pages_missing",
+                message="Calendar directory reader returned no pages",
+            )
+        full_snapshot = pages[0].full_snapshot
+        if any(page.full_snapshot is not full_snapshot for page in pages[1:]):
+            raise InternalInvariantError(
+                error_code="calendar_directory_snapshot_mode_mismatch",
+                message="Calendar directory pages changed snapshot mode",
+            )
+        return full_snapshot
+
+    @staticmethod
+    def _last_directory_cursor(
+        pages: tuple[CalendarDirectoryPage, ...],
+        *,
+        full_snapshot: bool,
+        provider: str,
+    ) -> str | None:
+        """验证最终目录 provider cursor，同时允许无 cursor 的完整快照。
 
         Google CalendarList 仅保证最终页的 ``nextSyncToken`` 有效；扫描前页或复用旧 token
-        会把不完整分页错误记录为成功，并跳过后续目录变化，因此两种情况都必须 fail closed。
+        会把不完整增量分页错误记录为成功。Microsoft 完整 collection 没有 provider cursor，
+        因而只有显式 ``full_snapshot=True`` 的链可以在最终页返回 ``None``。
         """
-        if pages and pages[-1].next_cursor:
-            return pages[-1].next_cursor
+        next_cursor = pages[-1].next_cursor
+        if next_cursor == "":
+            raise InternalInvariantError(
+                error_code="calendar_directory_final_cursor_invalid",
+                message="Calendar directory final cursor is invalid",
+            )
+        if provider == "microsoft":
+            if full_snapshot and next_cursor is None:
+                return None
+            raise InternalInvariantError(
+                error_code="calendar_directory_provider_contract_invalid",
+                message="Calendar directory provider contract is invalid",
+            )
+        if next_cursor is not None:
+            return next_cursor
         raise InternalInvariantError(
             error_code="calendar_directory_final_cursor_missing",
             message="Calendar directory pages are missing a final cursor",

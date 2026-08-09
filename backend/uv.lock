@@ -33,6 +33,7 @@ dependencies = [
     { name = "structlog" },
     { name = "taskiq" },
     { name = "taskiq-redis" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -73,6 +74,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=25,<26" },
     { name = "taskiq", specifier = ">=0.11,<1" },
     { name = "taskiq-redis", specifier = ">=1,<2" },
+    { name = "tzdata", specifier = ">=2025.2,<2027" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
 ]
 

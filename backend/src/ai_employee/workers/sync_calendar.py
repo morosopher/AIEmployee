@@ -59,9 +59,10 @@ class _FakeMicrosoftCalendarReader:
     """
 
     def __init__(self, directory_fixture: Path, event_fixture: Path) -> None:
-        """保存仓库内 fixture 路径，不接受外部 URL。"""
+        """保存仓库内 fixture 路径，并冻结事件 fixture 的唯一日历归属。"""
         self._directory_fixture = directory_fixture
         self._event_fixture = event_fixture
+        self._event_calendar_id = self._primary_calendar_id()
 
     def for_user(self, user_id: UUID) -> "_FakeMicrosoftCalendarReader":
         """按用户返回独立 reader；fixture 本身不含用户数据。"""
@@ -71,8 +72,12 @@ class _FakeMicrosoftCalendarReader:
     async def directory_pages(
         self, cursor: str | None = None
     ) -> AsyncIterator[CalendarDirectoryPage]:
-        """读取合成目录并保留 fixture 的最终 deltaLink。"""
-        del cursor
+        """读取合成完整目录；测试模式同样不得制造 Microsoft provider cursor。"""
+        if cursor is not None:
+            raise PermanentProviderError(
+                error_code="microsoft_calendar_directory_cursor_unsupported",
+                message="Microsoft calendar directory cursor is unsupported",
+            )
         payload = self._load(self._directory_fixture)
         adapter = MicrosoftCalendarAdapter(access_token="fake", user_timezone="UTC")
         values = payload.get("value", [])
@@ -84,16 +89,22 @@ class _FakeMicrosoftCalendarReader:
         calendars = tuple(
             adapter._normalize_calendar(item) for item in values if isinstance(item, dict)
         )
-        delta = payload.get("@odata.deltaLink")
-        if not isinstance(delta, str) or delta == "":
+        if payload.get("@odata.deltaLink") is not None or any(
+            item.get("@removed") is not None for item in values if isinstance(item, dict)
+        ):
             raise PermanentProviderError(
-                error_code="microsoft_calendar_delta_missing_cursor",
-                message="Microsoft calendar delta response is missing a cursor",
+                error_code="microsoft_calendar_invalid_response",
+                message="Microsoft calendar response is invalid",
             )
-        yield CalendarDirectoryPage(calendars, None, delta)
+        yield CalendarDirectoryPage(calendars, None, None, full_snapshot=True)
 
     async def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
         """读取合成事件并以 calendar ID 绑定事件事实。"""
+        if calendar_id != self._event_calendar_id:
+            # 单份事件 fixture 只描述目录中的 primary collection；未知或只读日历必须返回
+            # 独立空页，不能通过改写 calendar_id 复制同一供应商事实。
+            yield CalendarSyncPage((), None, f"fake-microsoft-calendar-{calendar_id}-v1")
+            return
         payload = self._load(self._event_fixture)
         adapter = MicrosoftCalendarAdapter(access_token="fake", user_timezone="UTC")
         values = payload.get("value", [])
@@ -118,6 +129,9 @@ class _FakeMicrosoftCalendarReader:
         self, calendar_id: str, provider_event_id: str
     ) -> CalendarEvent | None:
         """从同一 fixture 精确读取当前事件，未知 ID 安全返回 None。"""
+        if calendar_id != self._event_calendar_id:
+            # exact GET 的稳定身份是 (calendar_id, event_id)，不能只按 event ID 命中。
+            return None
         payload = self._load(self._event_fixture)
         values = payload.get("value", [])
         if not isinstance(values, list):
@@ -127,6 +141,31 @@ class _FakeMicrosoftCalendarReader:
             if isinstance(item, dict) and item.get("id") == provider_event_id:
                 return adapter._normalize_event(item, calendar_id=calendar_id)
         return None
+
+    def _primary_calendar_id(self) -> str:
+        """从目录 fixture 解析事件 fixture 唯一对应的 primary calendar ID。
+
+        测试模式不得猜测或复制日历归属。目录缺少唯一 primary、ID 为空或类型异常时，组合
+        根必须以稳定供应商响应错误失败，而不是把事件投影到调用方任意传入的 calendar ID。
+        """
+        payload = self._load(self._directory_fixture)
+        values = payload.get("value", [])
+        if not isinstance(values, list):
+            raise PermanentProviderError(
+                error_code="microsoft_calendar_invalid_response",
+                message="Microsoft calendar response is invalid",
+            )
+        primary_ids = [
+            item.get("id")
+            for item in values
+            if isinstance(item, dict) and item.get("isDefaultCalendar") is True
+        ]
+        if len(primary_ids) != 1 or not isinstance(primary_ids[0], str) or primary_ids[0] == "":
+            raise PermanentProviderError(
+                error_code="microsoft_calendar_invalid_response",
+                message="Microsoft calendar response is invalid",
+            )
+        return primary_ids[0]
 
     @staticmethod
     def _load(path: Path) -> dict[str, object]:
@@ -203,6 +242,7 @@ class CalendarSyncTaskStep:
             if credentials.refresh_token
             else None
         )
+        current_microsoft_refresh_token = refresh
 
         async def refresh_access_token() -> str:
             """严格对齐 Gmail：一次 refresh 后 AEAD 轮换，按状态分类失败。"""
@@ -257,14 +297,22 @@ class CalendarSyncTaskStep:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
 
         async def refresh_microsoft_access_token() -> str:
-            """刷新 Microsoft delegated token，并原子轮换 AEAD 密文。"""
-            if refresh is None or self._microsoft_oauth is None:
+            """使用进程内最新 Microsoft refresh token，并原子轮换 AEAD 密文。
+
+            同一次目录任务可能在不同 CalendarView 资源链分别遇到 401。Graph 首次刷新若
+            轮换了 refresh token，后续资源必须使用新值；若响应省略轮换值，则数据库密文
+            与闭包中的当前值都继续保留，不能退回任务启动时解密出的旧 token。
+            """
+            nonlocal current_microsoft_refresh_token
+            if current_microsoft_refresh_token is None or self._microsoft_oauth is None:
                 raise UserActionRequiredError(
                     error_code="microsoft_reauthorization_required",
                     message="Microsoft authorization requires user action",
                 )
             try:
-                refreshed: _RefreshedTokens = await self._microsoft_oauth.refresh(refresh)
+                refreshed: _RefreshedTokens = await self._microsoft_oauth.refresh(
+                    current_microsoft_refresh_token
+                )
             except TransientProviderError:
                 raise
             except PermanentProviderError as error:
@@ -310,6 +358,8 @@ class CalendarSyncTaskStep:
                         else None
                     ),
                 )
+            if refreshed.refresh_token is not None:
+                current_microsoft_refresh_token = refreshed.refresh_token
             return refreshed.access_token
 
         async def mark_calendar_permission_required(error_code: str) -> None:

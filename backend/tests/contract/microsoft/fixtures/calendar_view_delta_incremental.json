@@ -21,7 +21,8 @@
       "webLink": "https://outlook.example.test/event-all-day",
       "organizer": {"emailAddress": {"name": "Owner", "address": "owner@example.test"}},
       "attendees": [],
-      "isOrganizer": true
+      "isOrganizer": true,
+      "type": "singleInstance"
     }
   ],
   "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendars/calendar-primary/calendarView/delta?$deltatoken=synthetic-delta-2"

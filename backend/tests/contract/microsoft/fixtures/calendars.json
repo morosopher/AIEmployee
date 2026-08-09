@@ -33,6 +33,5 @@
       "webUrl": "https://outlook.example.test/calendar-readonly",
       "timeZone": "Pacific Standard Time"
     }
-  ],
-  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/calendars?$deltatoken=synthetic-directory-final"
+  ]
 }

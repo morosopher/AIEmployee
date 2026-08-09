@@ -4,18 +4,24 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
+from ai_employee.domain.errors import PermanentProviderError
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel, SyncCursorModel
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.observability.metrics import create_metrics
-from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
+from ai_employee.infrastructure.observability.sync import (
+    observe_provider_sync,
+    refresh_sync_age_metrics,
+)
 from ai_employee.workers.observability import refresh_stuck_task_metrics
 
 
 @pytest.mark.asyncio
-async def test_stuck_task_probe_groups_only_running_tasks_with_expired_lease(database_url: str) -> None:
+async def test_stuck_task_probe_groups_only_running_tasks_with_expired_lease(
+    database_url: str,
+) -> None:
     """探针必须按 kind 汇总租约过期的 RUNNING 任务，不能把排队或终态任务算入。"""
     sessions = build_session_factory(database_url)
     now = datetime(2030, 1, 2, tzinfo=UTC)
@@ -34,9 +40,29 @@ async def test_stuck_task_probe_groups_only_running_tasks_with_expired_lease(dat
             await session.flush()
             session.add_all(
                 (
-                    TaskRunModel(user_id=user.id, kind="sync_mail", status=TaskStatus.RUNNING.value, idempotency_key="stuck-mail", input_payload={}, lease_expires_at=now - timedelta(seconds=1)),
-                    TaskRunModel(user_id=user.id, kind="daily_brief", status=TaskStatus.RUNNING.value, idempotency_key="stuck-brief", input_payload={}, lease_expires_at=now - timedelta(seconds=1)),
-                    TaskRunModel(user_id=user.id, kind="daily_brief", status=TaskStatus.QUEUED.value, idempotency_key="queued", input_payload={}),
+                    TaskRunModel(
+                        user_id=user.id,
+                        kind="sync_mail",
+                        status=TaskStatus.RUNNING.value,
+                        idempotency_key="stuck-mail",
+                        input_payload={},
+                        lease_expires_at=now - timedelta(seconds=1),
+                    ),
+                    TaskRunModel(
+                        user_id=user.id,
+                        kind="daily_brief",
+                        status=TaskStatus.RUNNING.value,
+                        idempotency_key="stuck-brief",
+                        input_payload={},
+                        lease_expires_at=now - timedelta(seconds=1),
+                    ),
+                    TaskRunModel(
+                        user_id=user.id,
+                        kind="daily_brief",
+                        status=TaskStatus.QUEUED.value,
+                        idempotency_key="queued",
+                        input_payload={},
+                    ),
                 )
             )
         metrics = create_metrics()
@@ -127,3 +153,33 @@ async def test_sync_age_probe_recovers_last_success_without_resetting_failed_att
         )
     finally:
         await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_sync_observer_records_permanent_error_code() -> None:
+    """固定供应商错误也必须进入脱敏指标，并保持原异常语义。"""
+    metrics = create_metrics()
+    expected = PermanentProviderError(
+        error_code="microsoft_calendar_invalid_response",
+        message="sensitive provider response must not become a metric label",
+    )
+
+    async def fail_permanently() -> None:
+        """模拟适配器在规范化边界拒绝畸形供应商响应。"""
+        raise expected
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await observe_provider_sync(
+            provider="microsoft",
+            metrics=metrics,
+            resource="calendar",
+            operation=fail_permanently,
+        )
+
+    rendered = metrics.render().body.decode("utf-8")
+    assert raised.value is expected
+    assert (
+        'ai_employee_provider_errors_total{error_code="microsoft_calendar_invalid_response",provider="microsoft"} 1.0'
+        in rendered
+    )
+    assert "sensitive provider response" not in rendered

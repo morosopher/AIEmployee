@@ -43,11 +43,18 @@ class ProviderCalendar:
 
 @dataclass(frozen=True, slots=True)
 class CalendarDirectoryPage:
-    """表示日历目录的一页及独立于事件游标的目录增量游标。"""
+    """表示日历目录的一页、provider cursor 与显式快照完备性。
+
+    ``full_snapshot`` 是供应商边界确认的强事实，不能再由 ``next_cursor`` 是否为空推断。
+    Google 初始/410 回退目录为完整快照但仍会返回 nextSyncToken；Microsoft 每轮目录都是
+    完整快照且 provider cursor 永远为空。应用层据此验证整条分页链模式一致，仓储也只在
+    该字段为真时对缺席日历执行差集删除。
+    """
 
     calendars: tuple[ProviderCalendar, ...]
     next_page_token: str | None
     next_cursor: str | None
+    full_snapshot: bool
 
     def __post_init__(self) -> None:
         """复制日历集合，防止目录分页完成后被调用方篡改。"""
@@ -142,11 +149,16 @@ class CalendarSyncPage:
 
 @dataclass(frozen=True, slots=True)
 class CalendarConnectionState:
-    """表示已验证连接 provider 与一个精确 calendar scope 的持久游标。"""
+    """表示已验证连接、精确 scope、provider cursor 与本地观察 revision。
+
+    ``revision`` 仅用于目录并发 CAS，当前复用 directory cursor 行的 ``last_success_at``。
+    它不是供应商 token，尤其不能为 Microsoft `/me/calendars` 伪造字符串 cursor。
+    """
 
     cursor: str | None
     provider: str = "google"
     scope_key: str = "primary"
+    revision: datetime | None = None
 
 
 class CalendarCursorExpiredError(PermanentProviderError):

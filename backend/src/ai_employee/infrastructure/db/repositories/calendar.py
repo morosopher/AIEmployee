@@ -125,6 +125,7 @@ class SqlAlchemyCalendarSyncRepository:
             provider=connection.provider,
             scope_key=scope_key,
             cursor=cursor.cursor,
+            revision=cursor.last_success_at if scope_key == "directory" else None,
         )
 
     async def upsert_event(
@@ -250,8 +251,10 @@ class SqlAlchemyCalendarSyncRepository:
         user_id: UUID,
         connection_id: UUID,
         calendars: tuple[ProviderCalendar, ...],
+        full_snapshot: bool,
         expected_cursor: str | None,
-        next_cursor: str,
+        expected_revision: datetime | None,
+        next_cursor: str | None,
         completed_at: datetime,
     ) -> tuple[str, ...]:
         """原子保存目录事实、建立日历 placeholder 并推进独立目录游标。
@@ -266,7 +269,9 @@ class SqlAlchemyCalendarSyncRepository:
             user_id: 当前管理员用户。
             connection_id: 已连接的 Google/Microsoft 连接主键。
             calendars: 已规范化且按 provider calendar ID 稳定排序的可见项与删除项聚合。
+            full_snapshot: 当前分页链是否由供应商确认覆盖完整目录。
             expected_cursor: 读取目录前观察到的 directory cursor。
+            expected_revision: 读取目录前观察到的本地 ``last_success_at`` revision。
             next_cursor: 供应商最终确认的 directory cursor。
             completed_at: 注入的 UTC 完成时间。
 
@@ -325,6 +330,15 @@ class SqlAlchemyCalendarSyncRepository:
                 message="Calendar directory cursor changed during provider read",
                 retry_after=1,
             )
+        if directory_cursor.last_success_at != expected_revision:
+            # Microsoft provider cursor 永远为 NULL；独立 revision CAS 防止两个从同一完整
+            # 快照观察点出发的事务依次成功并让较旧目录覆盖较新事实。Google 同样复用该
+            # 防线，避免 cursor 恰好相同或 410 清空 cursor 后失去本地并发检测。
+            raise TransientProviderError(
+                error_code="calendar_directory_revision_conflict",
+                message="Calendar directory revision changed during provider read",
+                retry_after=1,
+            )
 
         # 必须在删除 tombstone 与 upsert 新目录行之前记录当前可见集合。cursor 行会跨目录
         # 删除保留，仅凭 cursor 是否存在无法区分持续可见与重新出现，正是空 delta 无法恢复
@@ -348,9 +362,9 @@ class SqlAlchemyCalendarSyncRepository:
             calendar.calendar_id for calendar in calendars if calendar.is_deleted
         )
         removed_calendar_ids = set(explicit_deleted_calendar_ids)
-        if expected_cursor is None:
-            # 初始同步与 410 回退返回完整目录快照；未再次出现的历史行已经不再可见，
-            # 必须与显式 tombstone 合并清理。增量 delta 不具备该完备性，绝不能做差集。
+        if full_snapshot:
+            # 是否完整只能来自供应商页面强事实。provider cursor 为空既可能是 Microsoft
+            # 正常成功，也可能是尚未建立 token 的本地状态，绝不能再作为差集删除依据。
             removed_calendar_ids.update(
                 existing_visible_calendar_ids.difference(visible_calendar_ids)
             )

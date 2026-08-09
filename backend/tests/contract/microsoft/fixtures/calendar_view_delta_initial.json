@@ -19,8 +19,8 @@
       "attendees": [
         {"type": "required", "status": {"response": "accepted"}, "emailAddress": {"name": "Synthetic Attendee", "address": "attendee@example.test"}}
       ],
-      "seriesMasterId": "series-1",
-      "recurrence": {"pattern": {"type": "weekly", "interval": 1}, "range": {"type": "endDate", "startDate": "2030-01-02", "endDate": "2030-02-01"}}
+      "type": "occurrence",
+      "seriesMasterId": "series-1"
     }
   ],
   "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/calendars/calendar-primary/calendarView/delta?$skiptoken=synthetic-next-1"

@@ -104,6 +104,7 @@ class DirectoryCalendarReader:
             self.calendars,
             None,
             self.directory_tokens[token_index],
+            full_snapshot=cursor is None,
         )
 
     async def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
@@ -1481,6 +1482,77 @@ async def test_full_empty_directory_snapshot_removes_only_current_cache_and_keep
 
 
 @pytest.mark.asyncio
+async def test_directory_absence_deletion_uses_explicit_snapshot_mode_not_cursor_shape(
+    database_url: str,
+) -> None:
+    """仓储只能依据 full_snapshot 差集删除，不能再从 provider cursor 是否为空推断。"""
+    sessions, _, user_id, connection_id = await _seed_google_calendar_connection(database_url)
+    async with sessions.begin() as session:
+        for calendar in _directory_calendars():
+            session.add(
+                ProviderCalendarModel(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider_calendar_id=calendar.calendar_id,
+                    name=calendar.display_name,
+                    timezone=calendar.timezone,
+                    is_primary=calendar.is_primary,
+                    access_role=calendar.access_role,
+                    can_write=calendar.can_write,
+                    provider_url=calendar.provider_url,
+                )
+            )
+
+    incremental_completed_at = datetime(2030, 1, 1, tzinfo=UTC)
+    async with sessions.begin() as session:
+        await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
+            user_id=user_id,
+            connection_id=connection_id,
+            calendars=(),
+            full_snapshot=False,
+            expected_cursor=None,
+            expected_revision=None,
+            next_cursor="directory-token-1",
+            completed_at=incremental_completed_at,
+        )
+    async with sessions() as session:
+        after_incremental = tuple(
+            (
+                await session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id)
+                    .where(ProviderCalendarModel.connection_id == connection_id)
+                    .order_by(ProviderCalendarModel.provider_calendar_id)
+                )
+            ).all()
+        )
+    assert after_incremental == ("primary", "readonly@example.test")
+
+    async with sessions.begin() as session:
+        await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
+            user_id=user_id,
+            connection_id=connection_id,
+            calendars=(),
+            full_snapshot=True,
+            expected_cursor="directory-token-1",
+            expected_revision=incremental_completed_at,
+            next_cursor="directory-token-2",
+            completed_at=datetime(2030, 1, 2, tzinfo=UTC),
+        )
+    async with sessions() as session:
+        after_full_snapshot = tuple(
+            (
+                await session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id).where(
+                        ProviderCalendarModel.connection_id == connection_id
+                    )
+                )
+            ).all()
+        )
+    assert after_full_snapshot == ()
+    await sessions.dispose()
+
+
+@pytest.mark.asyncio
 async def test_incremental_empty_directory_delta_preserves_every_visible_calendar(
     database_url: str,
 ) -> None:
@@ -1714,8 +1786,9 @@ async def test_initial_directory_requires_sync_token_on_final_page(database_url:
                 _directory_calendars(),
                 "directory-page-2",
                 "token-illegally-on-first-page",
+                full_snapshot=True,
             ),
-            CalendarDirectoryPage((), None, None),
+            CalendarDirectoryPage((), None, None, full_snapshot=True),
         ),
     )
 
@@ -1775,7 +1848,7 @@ async def test_incremental_directory_missing_final_token_preserves_old_success(
 
     reader = DirectoryCalendarReader(
         _directory_calendars(),
-        directory_pages_override=(CalendarDirectoryPage((), None, None),),
+        directory_pages_override=(CalendarDirectoryPage((), None, None, full_snapshot=False),),
     )
     with pytest.raises(InternalInvariantError) as raised:
         await SyncCalendarUseCase(

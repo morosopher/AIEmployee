@@ -34,6 +34,9 @@ dependencies = [
   "structlog>=25,<26",
   "taskiq>=0.11,<1",
   "taskiq-redis>=1,<2",
+  # tzdata 采用 Apache-2.0 许可证且持续维护；仅为 zoneinfo 提供锁定的 IANA 数据，
+  # 防止 Microsoft 时区校验静默依赖宿主镜像是否安装系统时区数据库。
+  "tzdata>=2025.2,<2027",
   "uvicorn[standard]>=0.35,<1"
 ]
 

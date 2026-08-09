@@ -114,7 +114,7 @@ class _GoogleCalendarCompatibilityAdapter:
             return
         del cursor
         if False:
-            yield CalendarDirectoryPage((), None, None)
+            yield CalendarDirectoryPage((), None, None, full_snapshot=True)
 
     def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
         """按 provider calendar ID 委托新适配器，旧 reader 仅允许 primary。"""

@@ -94,7 +94,7 @@ class FakeCalendarReader:
         self, cursor: str | None = None
     ) -> AsyncIterator[CalendarDirectoryPage]:
         """读取本地 CalendarList fixture 并复用真实目录规范化逻辑。"""
-        del cursor
+        full_snapshot = cursor is None
         payload = json.loads(self._directory_fixture.read_text(encoding="utf-8"))
         adapter = CalendarAdapter(access_token="fake", user_timezone="UTC")
         yield CalendarDirectoryPage(
@@ -105,6 +105,7 @@ class FakeCalendarReader:
             ),
             None,
             payload.get("nextSyncToken"),
+            full_snapshot=full_snapshot,
         )
 
     async def initial_pages(self, calendar_id: str = "primary") -> AsyncIterator[CalendarSyncPage]:

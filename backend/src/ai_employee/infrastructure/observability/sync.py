@@ -6,7 +6,11 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
-from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
+from ai_employee.domain.errors import (
+    PermanentProviderError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel, SyncCursorModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
@@ -29,6 +33,7 @@ async def observe_google_sync[ResultT](
         原样返回同步操作的结果。
 
     Raises:
+        PermanentProviderError: 记录稳定错误码后原样抛出，供耐久 Runner 终止重试。
         TransientProviderError: 记录稳定错误码后原样抛出，供耐久 Runner 安排重试。
         UserActionRequiredError: 记录稳定错误码后原样抛出，供上层提示重新授权。
 
@@ -57,12 +62,21 @@ async def observe_provider_sync[ResultT](
         metrics: 当前 Worker 的进程级指标；禁用指标时为 None。
         resource: 受控的 mail 或 calendar 资源名称。
         operation: 不接收观测参数的实际同步协程。
+
+    Raises:
+        PermanentProviderError: 记录规范化错误码后原样抛出。
+        TransientProviderError: 记录规范化错误码后原样抛出。
+        UserActionRequiredError: 记录规范化错误码后原样抛出。
     """
     if provider not in {"google", "microsoft"}:
         raise ValueError("provider is unsupported")
     try:
         result = await operation()
-    except (TransientProviderError, UserActionRequiredError) as error:
+    except (
+        PermanentProviderError,
+        TransientProviderError,
+        UserActionRequiredError,
+    ) as error:
         if metrics is not None:
             metrics.record_provider_error(provider=provider, error_code=error.error_code)
         raise

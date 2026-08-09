@@ -67,6 +67,7 @@ class GoogleCalendarAdapter:
         self, cursor: str | None = None
     ) -> AsyncIterator[CalendarDirectoryPage]:
         """增量读取可见日历目录，并在最终页返回目录 ``nextSyncToken``。"""
+        full_snapshot = cursor is None
         parameters: dict[str, str] = {"showDeleted": "true"}
         if cursor is not None:
             if cursor == "":
@@ -92,6 +93,7 @@ class GoogleCalendarAdapter:
                 calendars=calendars,
                 next_page_token=page_token,
                 next_cursor=page.next_cursor,
+                full_snapshot=full_snapshot,
             )
             if page_token is None:
                 return

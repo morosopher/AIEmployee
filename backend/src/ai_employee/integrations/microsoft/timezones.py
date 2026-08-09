@@ -7,15 +7,18 @@ Graph 的 dateTimeTimeZone.timeZone 使用 Windows 名称，而应用内部统�
 
 from __future__ import annotations
 
+import importlib.resources
+from importlib.resources.abc import Traversable
 from types import MappingProxyType
-from typing import Final
-from zoneinfo import ZoneInfo
+from typing import Final, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from babel.core import get_global
 
 from ai_employee.domain.errors import PermanentProviderError
 
 _UNSUPPORTED_CODE: Final[str] = "calendar_timezone_mapping_unsupported"
+type _CldrMappingName = Literal["windows_zone_mapping", "zone_aliases"]
 
 
 def _unsupported() -> PermanentProviderError:
@@ -26,46 +29,97 @@ def _unsupported() -> PermanentProviderError:
     )
 
 
-def _canonical_iana(value: object) -> str:
-    """验证并收敛 IANA alias，显式把所有 UTC 变体归一为 'UTC'。"""
+def _validated_name(value: object) -> str:
+    """验证 CLDR 或调用方时区名称，不在错误中回显原始内容。"""
     if not isinstance(value, str) or value == "" or value.strip() != value:
         raise _unsupported()
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise _unsupported()
-    aliases = get_global("zone_aliases")
-    current = value
+    return value
+
+
+def _cldr_mapping(name: _CldrMappingName) -> dict[str, str]:
+    """读取并完整验证一个 Babel CLDR 字符串映射。
+
+    CLDR 是供应商边界的静态事实。根对象缺失、任一键值类型错误、空白或控制字符都说明
+    当前运行镜像中的映射不可证明完整；此时必须整体失败，不能跳过坏项后生成部分表。
+    """
+    try:
+        raw_mapping = get_global(name)
+    except (LookupError, OSError, TypeError, ValueError):
+        raise _unsupported() from None
+    if not isinstance(raw_mapping, dict) or not raw_mapping:
+        raise _unsupported()
+    validated: dict[str, str] = {}
+    for raw_key, raw_value in raw_mapping.items():
+        key = _validated_name(raw_key)
+        value = _validated_name(raw_value)
+        validated[key] = value
+    return validated
+
+
+def _tzdata_root() -> Traversable:
+    """返回锁定的 Python tzdata 资源根，拒绝宿主 TZPATH 隐式兜底。"""
+    try:
+        root = importlib.resources.files("tzdata.zoneinfo")
+        # UTC 会在 canonical 分支提前返回，因此必须在根校验时主动解析其 TZif 内容；只做
+        # 文件存在检查会让损坏包借宿主 TZPATH 掩盖错误。
+        _validate_packaged_zone(root, "UTC")
+    except PermanentProviderError:
+        raise
+    except (ModuleNotFoundError, OSError, TypeError, ValueError):
+        raise _unsupported() from None
+    return root
+
+
+def _validate_packaged_zone(root: Traversable, zone_name: str) -> None:
+    """从 Python tzdata 文件本身验证 IANA zone，不读取或修改进程 TZPATH。"""
+    try:
+        resource = root.joinpath(*zone_name.split("/"))
+        if not resource.is_file():
+            raise _unsupported()
+        with resource.open("rb") as zone_file:
+            ZoneInfo.from_file(zone_file, key=zone_name)
+    except PermanentProviderError:
+        raise
+    except (EOFError, OSError, TypeError, ValueError, ZoneInfoNotFoundError):
+        raise _unsupported() from None
+
+
+def _canonical_iana(
+    value: object,
+    *,
+    aliases: dict[str, str] | None = None,
+    tzdata_root: Traversable | None = None,
+) -> str:
+    """验证并收敛 IANA alias，显式把所有 UTC 变体归一为 'UTC'。"""
+    current = _validated_name(value)
+    alias_mapping = aliases if aliases is not None else _cldr_mapping("zone_aliases")
     seen: set[str] = set()
-    while isinstance(aliases, dict) and current in aliases:
+    while current in alias_mapping:
         if current in seen:
             raise _unsupported()
         seen.add(current)
-        target = aliases[current]
-        if not isinstance(target, str) or target == "":
-            raise _unsupported()
-        current = target
+        current = alias_mapping[current]
     if current in {"UTC", "Etc/UTC", "Etc/GMT", "GMT"}:
         return "UTC"
-    try:
-        ZoneInfo(current)
-    except (KeyError, ValueError):
-        raise _unsupported() from None
+    _validate_packaged_zone(tzdata_root or _tzdata_root(), current)
     return current
 
 
 def _build_mappings() -> tuple[dict[str, str], dict[str, str]]:
-    """从 Babel CLDR 数据构造固定双向映射并选择稳定 canonical 值。"""
-    raw_mapping = get_global("windows_zone_mapping")
-    if not isinstance(raw_mapping, dict):
-        raise TypeError("Babel windows timezone mapping is unavailable")
+    """从完整 CLDR 与锁定 tzdata 构造固定双向映射。"""
+    raw_mapping = _cldr_mapping("windows_zone_mapping")
+    aliases = _cldr_mapping("zone_aliases")
+    tzdata_root = _tzdata_root()
     windows_to_iana: dict[str, str] = {"UTC": "UTC"}
     iana_to_windows: dict[str, str] = {"UTC": "UTC"}
     for windows_name, raw_iana in raw_mapping.items():
-        if not isinstance(windows_name, str) or not isinstance(raw_iana, str):
-            continue
-        try:
-            iana_name = _canonical_iana(raw_iana)
-        except PermanentProviderError:
-            continue
+        iana_name = _canonical_iana(
+            raw_iana,
+            aliases=aliases,
+            tzdata_root=tzdata_root,
+        )
         windows_to_iana.setdefault(windows_name, iana_name)
         # 同一 IANA 可能对应多个 Windows 区域，按字典序保留确定结果。
         previous = iana_to_windows.get(iana_name)

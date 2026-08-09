@@ -44,6 +44,7 @@ async def test_google_calendar_directory_normalizes_each_calendar_and_write_role
         ("readonly@example.test", False),
     ]
     assert pages[0].next_cursor == "directory-token-1"
+    assert pages[0].full_snapshot is True
     assert route.calls[0].request.url.params["showDeleted"] == "true"
 
 
@@ -70,6 +71,7 @@ async def test_google_calendar_directory_preserves_deleted_tombstone() -> None:
     assert removed.is_deleted is True
     assert removed.access_role == "unknown"
     assert removed.can_write is False
+    assert pages[0].full_snapshot is False
 
 
 @pytest.mark.asyncio
@@ -88,6 +90,7 @@ async def test_google_calendar_directory_paginates_and_preserves_sync_token() ->
 
     assert len(pages) == 2
     assert pages[0].next_cursor is None and pages[-1].next_cursor == "directory-final"
+    assert all(page.full_snapshot is False for page in pages)
     assert route.calls[0].request.url.params["syncToken"] == "old-directory-token"
     assert route.calls[1].request.url.params["pageToken"] == "directory-page-2"
 

@@ -10,7 +10,9 @@ import pytest
 
 from ai_employee.application.ports.calendar import (
     CalendarConnectionState,
+    CalendarDirectoryPage,
     CalendarEvent,
+    CalendarReader,
     CalendarSyncPage,
 )
 from ai_employee.application.ports.mail import (
@@ -90,7 +92,7 @@ class FakeReadAdapterRegistry:
     """记录应用层按连接 provider 与精确 scope 请求的读取适配器。"""
 
     mail_readers: dict[str, FakeMailReader] = field(default_factory=dict)
-    calendar_readers: dict[str, FakeCalendarReader] = field(default_factory=dict)
+    calendar_readers: dict[str, CalendarReader] = field(default_factory=dict)
     requested: list[tuple[str, UUID, str]] = field(default_factory=list)
 
     def mail_reader(self, *, provider: str, connection_id: UUID, scope_key: str) -> FakeMailReader:
@@ -100,10 +102,42 @@ class FakeReadAdapterRegistry:
 
     def calendar_reader(
         self, *, provider: str, connection_id: UUID, scope_key: str
-    ) -> FakeCalendarReader:
+    ) -> CalendarReader:
         """按固定供应商键返回日历读取器并记录选择事实。"""
         self.requested.append((provider, connection_id, scope_key))
         return self.calendar_readers[provider]
+
+
+@dataclass(slots=True)
+class FakeDirectoryCalendarReader:
+    """返回测试指定的目录分页，不执行任何真实事件读取。"""
+
+    pages: tuple[CalendarDirectoryPage, ...]
+
+    async def directory_pages(
+        self, cursor: str | None = None
+    ) -> AsyncIterator[CalendarDirectoryPage]:
+        """返回显式携带完整快照模式的供应商中立目录页。"""
+        del cursor
+        for page in self.pages:
+            yield page
+
+    async def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
+        """空目录不得启动任何日历事件读取。"""
+        raise AssertionError(f"unexpected initial calendar read: {calendar_id}")
+        yield CalendarSyncPage((), None, "unreachable")
+
+    async def sync_pages(self, calendar_id: str, cursor: str) -> AsyncIterator[CalendarSyncPage]:
+        """空目录不得启动任何日历增量读取。"""
+        raise AssertionError(f"unexpected incremental calendar read: {calendar_id}, {cursor}")
+        yield CalendarSyncPage((), None, "unreachable")
+
+    async def get_current_event(
+        self, calendar_id: str, provider_event_id: str
+    ) -> CalendarEvent | None:
+        """目录同步测试不使用精确事件读取。"""
+        del calendar_id, provider_event_id
+        return None
 
 
 @dataclass(slots=True)
@@ -198,6 +232,63 @@ class FakeCalendarStore:
         self.states[scope_key] = CalendarConnectionState(
             provider="google", scope_key=scope_key, cursor=next_cursor
         )
+
+
+@dataclass(slots=True)
+class FakeDirectoryCalendarStore:
+    """记录目录提交参数，验证 cursor 与本地 revision 分离传递。"""
+
+    state: CalendarConnectionState
+    connection_id: UUID
+    mark_calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def get_state(
+        self, *, user_id: UUID, connection_id: UUID, scope_key: str
+    ) -> CalendarConnectionState | None:
+        """返回一个精确的 directory 状态快照。"""
+        assert user_id == USER_ID
+        assert connection_id == self.connection_id
+        assert scope_key == "directory"
+        return self.state
+
+    async def mark_directory_success(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        calendars: tuple[object, ...],
+        full_snapshot: bool,
+        expected_cursor: str | None,
+        expected_revision: datetime | None,
+        next_cursor: str | None,
+        completed_at: datetime,
+    ) -> tuple[str, ...]:
+        """捕获完整快照事实和两类独立 CAS 观察值。"""
+        assert user_id == USER_ID
+        assert connection_id == self.connection_id
+        self.mark_calls.append(
+            {
+                "calendars": calendars,
+                "full_snapshot": full_snapshot,
+                "expected_cursor": expected_cursor,
+                "expected_revision": expected_revision,
+                "next_cursor": next_cursor,
+                "completed_at": completed_at,
+            }
+        )
+        return ()
+
+    async def clear_cursor(self, **kwargs: object) -> None:
+        """本组目录页面不模拟供应商 cursor 失效。"""
+        raise AssertionError(f"unexpected cursor clear: {kwargs!r}")
+
+    async def upsert_event(self, **kwargs: object) -> None:
+        """空目录不应写入事件。"""
+        raise AssertionError(f"unexpected event write: {kwargs!r}")
+
+    async def finish_sync(self, **kwargs: object) -> None:
+        """空目录不应进入事件 scope 完成路径。"""
+        raise AssertionError(f"unexpected event finish: {kwargs!r}")
 
 
 @asynccontextmanager
@@ -316,6 +407,78 @@ async def test_calendar_sync_advances_only_the_requested_calendar_cursor() -> No
     assert store.states[calendar_a].cursor == f"{calendar_a}-cursor-2"
     assert store.states[calendar_b].cursor == f"{calendar_b}-cursor-1"
     assert registry.requested == [("google", GOOGLE_CONNECTION_ID, calendar_a)]
+
+
+@pytest.mark.asyncio
+async def test_microsoft_full_directory_snapshot_keeps_nullable_cursor_and_revision() -> None:
+    """Microsoft 完整目录以 ``NULL`` provider cursor 成功，并独立传递本地 revision。"""
+    revision = datetime(2030, 1, 1, tzinfo=UTC)
+    store = FakeDirectoryCalendarStore(
+        state=CalendarConnectionState(
+            provider="microsoft",
+            scope_key="directory",
+            cursor=None,
+            revision=revision,
+        ),
+        connection_id=MICROSOFT_CONNECTION_ID,
+    )
+    reader = FakeDirectoryCalendarReader(
+        pages=(
+            CalendarDirectoryPage(
+                calendars=(),
+                next_page_token=None,
+                next_cursor=None,
+                full_snapshot=True,
+            ),
+        )
+    )
+    registry = FakeReadAdapterRegistry(calendar_readers={"microsoft": reader})
+
+    result = await SyncCalendarUseCase(lambda: _store_factory(store), registry).execute(
+        user_id=USER_ID,
+        connection_id=MICROSOFT_CONNECTION_ID,
+        scope_key="directory",
+    )
+
+    assert result.next_cursor is None
+    assert result.cursor is None
+    assert result.used_full_resync is True
+    assert len(store.mark_calls) == 1
+    assert store.mark_calls[0]["full_snapshot"] is True
+    assert store.mark_calls[0]["expected_cursor"] is None
+    assert store.mark_calls[0]["expected_revision"] == revision
+    assert store.mark_calls[0]["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_calendar_directory_rejects_mixed_snapshot_modes_before_store_mutation() -> None:
+    """同一分页链不能从完整快照切换为增量语义或反向切换。"""
+    store = FakeDirectoryCalendarStore(
+        state=CalendarConnectionState(
+            provider="google",
+            scope_key="directory",
+            cursor="directory-token-1",
+            revision=datetime(2030, 1, 1, tzinfo=UTC),
+        ),
+        connection_id=GOOGLE_CONNECTION_ID,
+    )
+    reader = FakeDirectoryCalendarReader(
+        pages=(
+            CalendarDirectoryPage((), "page-2", None, full_snapshot=False),
+            CalendarDirectoryPage((), None, "directory-token-2", full_snapshot=True),
+        )
+    )
+    registry = FakeReadAdapterRegistry(calendar_readers={"google": reader})
+
+    with pytest.raises(InternalInvariantError) as raised:
+        await SyncCalendarUseCase(lambda: _store_factory(store), registry).execute(
+            user_id=USER_ID,
+            connection_id=GOOGLE_CONNECTION_ID,
+            scope_key="directory",
+        )
+
+    assert raised.value.error_code == "calendar_directory_snapshot_mode_mismatch"
+    assert store.mark_calls == []
 
 
 def test_task_runner_routes_new_and_legacy_mail_kinds_to_the_same_step(
