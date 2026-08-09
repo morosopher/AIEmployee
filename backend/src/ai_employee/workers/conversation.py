@@ -1,6 +1,8 @@
-"""执行 M1 限定对话并持久化最终 assistant 消息。"""
+"""执行受控简报/本地草稿对话并持久化最终 assistant 消息。"""
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -11,7 +13,11 @@ from ai_employee.agents.daily_brief.nodes import (
     classify_conversation_intent,
 )
 from ai_employee.application.ports.model import ModelGateway
-from ai_employee.application.use_cases.conversations import unsupported_response
+from ai_employee.application.use_cases.conversations import (
+    parse_mail_draft_conversation_request,
+    unsupported_response,
+)
+from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.infrastructure.db.models.briefs import (
@@ -19,14 +25,17 @@ from ai_employee.infrastructure.db.models.briefs import (
     LLMInvocationModel,
     MessageModel,
 )
+from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
+from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.llm.fake import FakeModelGateway, build_model_gateway
 
 
 class ConversationTaskStep:
-    """只处理生成/查看简报，其他意图永远不调用工具或供应商。"""
+    """处理简报与明确本地草稿意图，绝不提交审批或调用邮件供应商。"""
     name = "conversation_respond"
 
     def __init__(
@@ -36,16 +45,22 @@ class ConversationTaskStep:
         model_gateway: ModelGateway | None = None,
         model_name: str = "fake",
         model_redaction_patterns: tuple[str, ...] = (),
+        action_cipher: ActionPayloadCipher | None = None,
+        action_cipher_file: Path | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """保存数据库工厂以在短事务中读取并写入消息。"""
+        """保存短事务资源；主密钥只在明确草稿请求实际发生时延迟读取。"""
         self._session_factory = session_factory
         # 直接构造仅供单测与本地编排使用，必须保持无网络；生产 factory 显式注入配置网关。
         self._model_gateway = model_gateway or FakeModelGateway()
         self._model_name = model_name
         self._model_redaction_patterns = model_redaction_patterns
+        self._action_cipher = action_cipher
+        self._action_cipher_file = action_cipher_file
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def execute(self, task: LeasedTask) -> None:
-        """按 Task15 确定性意图规则写入一个最终 assistant 消息。"""
+        """按窄意图规则写入一个最终 assistant 消息，并对重复投递先行短路。"""
         if task.user_id is None:
             raise ValueError("conversation.respond requires user_id")
         raw_conversation_id = task.input_payload.get("conversation_id")
@@ -92,6 +107,31 @@ class ConversationTaskStep:
                     idempotency_key=f"daily_brief:{task.user_id}:conversation:{task.task_id}",
                 )
                 text = f"已创建每日简报任务：`{generated.task_id}`。"
+            elif intent == "prepare_mail_draft":
+                request = parse_mail_draft_conversation_request(raw_content)
+                if request is None:
+                    # 模型即使错误选择该意图，也不能绕过明确文本解析创建动作。
+                    text = unsupported_response()
+                else:
+                    repository = SqlAlchemyMailDraftRepository(
+                        session,
+                        self._mail_draft_cipher(),
+                    )
+                    use_case = MailDraftUseCase(
+                        drafts=repository,
+                        connections=repository,
+                        clock=self._clock,
+                    )
+                    draft = await use_case.create_new(
+                        user_id=task.user_id,
+                        idempotency_key=f"conversation-mail-draft:{task.task_id}",
+                        to=request.to_recipients,
+                    )
+                    text = (
+                        "已创建可编辑的本地邮件草稿："
+                        f"[打开草稿](/api/v1/mail/drafts/{draft.draft_id})。"
+                        "草稿仍需由你编辑并单独提交审批，当前不会发送。"
+                    )
             else:
                 text = unsupported_response()
             session.add_all(
@@ -116,6 +156,17 @@ class ConversationTaskStep:
             )
             session.add(MessageModel(user_id=task.user_id, conversation_id=conversation_id, role="assistant", content_markdown=text, task_id=task.task_id, created_at=datetime.now(UTC)))
 
+    def _mail_draft_cipher(self) -> ActionPayloadCipher:
+        """返回本地草稿 AEAD，并只在首次明确草稿请求时读取受控 Secret 文件。"""
+        if self._action_cipher is not None:
+            return self._action_cipher
+        if self._action_cipher_file is None:
+            raise RuntimeError("mail draft encryption is not configured")
+        self._action_cipher = ActionPayloadCipher(
+            AeadCipher.from_file(self._action_cipher_file)
+        )
+        return self._action_cipher
+
 
 def build_conversation_task_step(
     *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None, metrics: Metrics | None = None
@@ -128,4 +179,5 @@ def build_conversation_task_step(
         model_gateway=build_model_gateway(settings, metrics=metrics),
         model_name=settings.model_name,
         model_redaction_patterns=tuple(settings.model_redaction_patterns),
+        action_cipher_file=settings.app_master_key_file,
     )

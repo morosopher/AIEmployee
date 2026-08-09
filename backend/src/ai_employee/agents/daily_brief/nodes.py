@@ -6,6 +6,9 @@ from hashlib import sha256
 from typing import Any
 
 from ai_employee.application.ports.task_steps import TaskStepEvent
+from ai_employee.application.use_cases.conversations import (
+    parse_mail_draft_conversation_request,
+)
 from ai_employee.domain.briefs import (
     BriefItem,
     BriefPriority,
@@ -47,6 +50,12 @@ def load_sources(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("mail_threads", [])
     state.setdefault("calendar_events", [])
     state.setdefault("warnings", [])
+    state["replyable_thread_ids"] = {
+        thread_id
+        for thread in state["mail_threads"]
+        for thread_id in (str(thread.get("thread_id", "")),)
+        if thread_id
+    }
     _event(state, "load_sources", "completed")
     return state
 
@@ -256,6 +265,12 @@ def detect_calendar_conflicts(state: dict[str, Any]) -> dict[str, Any]:
 def classify_conversation_intent(text: str) -> dict[str, Any]:
     """用窄范围中英文规则分类对话，拒绝任意工具动词。"""
     normalized = text.casefold()
+    if parse_mail_draft_conversation_request(text) is not None:
+        return {
+            "intent": "prepare_mail_draft",
+            "confidence": 1.0,
+            "reason_code": "deterministic_prepare_mail_draft",
+        }
     if any(
         token in normalized
         for token in (
@@ -320,6 +335,12 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
             "intent": "generate_daily_brief",
             "confidence": 1.0,
             "reason_code": "deterministic_generate",
+        }
+    if any(token in normalized for token in ("email", "mail", "邮件", "邮箱")):
+        return {
+            "intent": "explain_capabilities",
+            "confidence": 1.0,
+            "reason_code": "ambiguous_mail_request",
         }
     return {"intent": "explain_capabilities", "confidence": 0.5, "reason_code": "ambiguous_request"}
 
@@ -432,17 +453,33 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
     for item in state.get("classifications", []) + state.get("model_items", []):
         if item.get("category") == "notification":
             continue
+        thread_id = str(item["thread_id"])
+        suggested_action_kind = (
+            "mail.reply"
+            if bool(item.get("needs_reply"))
+            and thread_id in state.get("replyable_thread_ids", set())
+            else None
+        )
         items.append(
             BriefItem(
-                section=BriefSection.MAIL_SUMMARY,
-                title=f"邮件线程 {item['thread_id']}",
+                section=(
+                    BriefSection.NEEDS_REPLY
+                    if suggested_action_kind is not None
+                    else BriefSection.MAIL_SUMMARY
+                ),
+                title=f"邮件线程 {thread_id}",
                 body_markdown="已完成分类。",
                 source_refs=[
-                    BriefSourceRef(source_type="email_thread", source_id=item["thread_id"], provider_url=thread_urls.get(str(item["thread_id"])))
+                    BriefSourceRef(
+                        source_type="email_thread",
+                        source_id=thread_id,
+                        provider_url=thread_urls.get(thread_id),
+                    )
                 ],
                 priority=BriefPriority.HIGH
                 if item.get("urgency") == "urgent"
                 else BriefPriority.NORMAL,
+                suggested_action_kind=suggested_action_kind,
             ).model_dump()
         )
     notification_refs = [

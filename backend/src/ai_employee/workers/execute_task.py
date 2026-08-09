@@ -32,6 +32,7 @@ from ai_employee.infrastructure.queue.broker import DEFAULT_RETRY_COUNT, broker
 from ai_employee.workers.conversation import build_conversation_task_step
 from ai_employee.workers.diagnostics import build_overdue_brief_diagnostic_task_step
 from ai_employee.workers.generate_brief import build_generate_brief_task_step
+from ai_employee.workers.generate_mail_draft import build_generate_mail_draft_task_step
 from ai_employee.workers.observability import (
     build_process_session_factory,
     initialize_process_observability,
@@ -288,6 +289,12 @@ def build_task_runner_for_session(
                 ),
             )
             if task.kind == "daily_brief"
+            else (
+                build_generate_mail_draft_task_step(
+                    session_factory=session_factory, settings=settings, metrics=_worker_metrics
+                ),
+            )
+            if task.kind == "mail_draft.generate"
             else (
                 build_conversation_task_step(
                     session_factory=session_factory, settings=settings, metrics=_worker_metrics

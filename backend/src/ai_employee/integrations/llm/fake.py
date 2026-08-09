@@ -81,6 +81,11 @@ class FakeModelGateway:
                 confidence=1,
                 reason_codes=["fake_deterministic"],
             )
+        elif response_model.__name__ == "MailDraftModelOutput":
+            # 避免反向导入 Worker 形成循环；严格 Schema 名只用于已批准的离线草稿评测。
+            value = response_model.model_validate(
+                {"body_text": "Synthetic mail draft body."}
+            )
         else:
             value = response_model.model_validate({})
         usage = ModelUsage(output_tokens=1 if self.scenario == "partial" else 0)

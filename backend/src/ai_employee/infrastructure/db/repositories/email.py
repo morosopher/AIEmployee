@@ -12,11 +12,16 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
+from ai_employee.application.ports.encryption import EncryptedValue as ApplicationEncryptedValue
 from ai_employee.application.ports.mail import (
     MailConnectionState,
     MailMessage,
     MailMessageUpsertResult,
     MailRemoval,
+)
+from ai_employee.application.use_cases.mail_drafts import (
+    MailDraftSourceMessage,
+    MailRecipientHistoryEntry,
 )
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.db.models.identity import UserModel
@@ -30,7 +35,7 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
-from ai_employee.infrastructure.security.encryption import EncryptedValue
+from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,14 +63,19 @@ _MESSAGE_IDENTITY_CATALOG_ERROR = "mail message identity catalog is unsafe"
 class SqlAlchemyMailSyncRepository:
     """在调用方事务内维护邮件可审计事实；所有方法均不自行提交。"""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, cipher: AeadCipher | None = None) -> None:
         """绑定由用例拥有的异步会话，禁止仓储跨边界提交。
 
         邮件 identity target 只允许在同一个数据库事务内缓存。0016/0017 online 部署期间
         不同事务可能看到 legacy constraint、已完成但未挂载的新索引或最终新约束；跨事务
         复用一次探测结果会把迁移窗口重新变成不可用窗口。
+
+        Args:
+            session: 调用方拥有的短事务会话。
+            cipher: 可选源邮件正文 AEAD；同步写入不需要解密，草稿生成读取时必须注入。
         """
         self._session = session
+        self._cipher = cipher
         self._message_conflict_transaction: object | None = None
         self._message_conflict_target: _MailMessageConflictTarget | None = None
 
@@ -306,6 +316,221 @@ class SqlAlchemyMailSyncRepository:
     async def get_user_timezone(self, *, user_id: UUID) -> str | None:
         """读取已验证用户 IANA 时区，Calendar 适配器不能退回宿主机或硬编码 UTC。"""
         return await self._session.scalar(select(UserModel.timezone).where(UserModel.id == user_id))
+
+    async def get_draft_source_message(
+        self,
+        *,
+        user_id: UUID,
+        source_thread_id: str | None,
+        source_message_id: str | None,
+        source_connection_id: UUID | None,
+    ) -> MailDraftSourceMessage | None:
+        """读取一封可访问的本地来源消息，并验证线程/消息/连接三者一致。
+
+        ``source_thread_id`` 与 ``source_message_id`` 同时兼容本地 UUID 和供应商 opaque ID，
+        但返回值始终规范为供应商 thread/message ID 供草稿冻结。连接必须仍为 connected 且
+        ``mail.read`` enabled；跨用户、错线程、错连接或能力撤销统一返回 ``None``。
+
+        Args:
+            user_id: 当前认证用户。
+            source_thread_id: 可选本地线程 UUID 或供应商线程 ID。
+            source_message_id: 可选本地消息 UUID 或供应商消息 ID；缺失时选线程最新消息。
+            source_connection_id: 可选调用方声称的精确来源连接。
+
+        Returns:
+            已验证的来源投影；无法证明完整绑定时返回 ``None``。
+        """
+        if source_thread_id is None and source_message_id is None:
+            return None
+        statement = (
+            select(EmailMessageModel, EmailThreadModel)
+            .join(
+                EmailThreadModel,
+                (EmailThreadModel.id == EmailMessageModel.thread_id)
+                & (EmailThreadModel.user_id == EmailMessageModel.user_id)
+                & (EmailThreadModel.connection_id == EmailMessageModel.connection_id),
+            )
+            .join(
+                OAuthConnectionModel,
+                (OAuthConnectionModel.id == EmailMessageModel.connection_id)
+                & (OAuthConnectionModel.user_id == EmailMessageModel.user_id),
+            )
+            .join(
+                ConnectionCapabilityModel,
+                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
+                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
+            )
+            .where(
+                EmailMessageModel.user_id == user_id,
+                EmailThreadModel.user_id == user_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.capability == "mail.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .order_by(EmailMessageModel.received_at.desc(), EmailMessageModel.id)
+        )
+        if source_connection_id is not None:
+            statement = statement.where(EmailMessageModel.connection_id == source_connection_id)
+        if source_thread_id is not None:
+            statement = statement.where(
+                _local_or_provider_identifier(
+                    source_thread_id,
+                    local_column=EmailThreadModel.id,
+                    provider_column=EmailThreadModel.provider_thread_id,
+                )
+            )
+        if source_message_id is not None:
+            statement = statement.where(
+                _local_or_provider_identifier(
+                    source_message_id,
+                    local_column=EmailMessageModel.id,
+                    provider_column=EmailMessageModel.provider_message_id,
+                )
+            )
+        row = (await self._session.execute(statement.limit(1))).one_or_none()
+        if row is None:
+            return None
+        message, thread = row
+        return self._draft_source_projection(message=message, thread=thread)
+
+    async def list_draft_context_messages(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        source_thread_id: str,
+    ) -> tuple[MailDraftSourceMessage, ...]:
+        """返回同一可访问线程的本地消息，按最近时间倒序并排除垃圾邮件。
+
+        本方法不自行裁剪正文字符；Worker 的纯函数负责最终三封/12000 字符边界，便于
+        单元测试独立证明。正文密文已清除或未注入 cipher 的消息仅返回空正文，不伪造
+        保留内容，也不会阻止其他可用消息进入上下文。
+        """
+        statement = (
+            select(EmailMessageModel, EmailThreadModel)
+            .join(
+                EmailThreadModel,
+                (EmailThreadModel.id == EmailMessageModel.thread_id)
+                & (EmailThreadModel.user_id == EmailMessageModel.user_id)
+                & (EmailThreadModel.connection_id == EmailMessageModel.connection_id),
+            )
+            .join(
+                OAuthConnectionModel,
+                (OAuthConnectionModel.id == EmailMessageModel.connection_id)
+                & (OAuthConnectionModel.user_id == EmailMessageModel.user_id),
+            )
+            .join(
+                ConnectionCapabilityModel,
+                (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
+                & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
+            )
+            .where(
+                EmailMessageModel.user_id == user_id,
+                EmailMessageModel.connection_id == connection_id,
+                EmailThreadModel.user_id == user_id,
+                _local_or_provider_identifier(
+                    source_thread_id,
+                    local_column=EmailThreadModel.id,
+                    provider_column=EmailThreadModel.provider_thread_id,
+                ),
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.capability == "mail.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+            .order_by(EmailMessageModel.received_at.desc(), EmailMessageModel.id)
+        )
+        rows = (await self._session.execute(statement)).all()
+        result: list[MailDraftSourceMessage] = []
+        for message, thread in rows:
+            if _is_spam_labels(message.labels):
+                continue
+            result.append(self._draft_source_projection(message=message, thread=thread))
+        return tuple(result)
+
+    async def list_recipient_history(
+        self, *, user_id: UUID
+    ) -> tuple[MailRecipientHistoryEntry, ...]:
+        """从本地同步 sender/recipient JSONB 派生地址最近出现事实。
+
+        查询只使用当前用户行，并排除带 spam 标签的消息；返回值仍可能含历史 malformed
+        地址，由应用层统一使用邮件领域规则规范化和去重。这里不访问 Contacts、供应商或模型。
+        """
+        rows = (
+            await self._session.execute(
+                select(
+                    EmailMessageModel.sender,
+                    EmailMessageModel.recipients,
+                    EmailMessageModel.received_at,
+                    EmailMessageModel.labels,
+                )
+                .where(EmailMessageModel.user_id == user_id)
+                .order_by(EmailMessageModel.received_at.desc(), EmailMessageModel.id)
+            )
+        ).all()
+        result: list[MailRecipientHistoryEntry] = []
+        for sender, recipients, received_at, labels in rows:
+            if _is_spam_labels(labels):
+                continue
+            for participant in (sender, *recipients):
+                address = participant.get("email") if isinstance(participant, dict) else None
+                if isinstance(address, str):
+                    result.append(
+                        MailRecipientHistoryEntry(
+                            address=address,
+                            last_seen_at=received_at,
+                        )
+                    )
+        return tuple(result)
+
+    def _draft_source_projection(
+        self,
+        *,
+        message: EmailMessageModel,
+        thread: EmailThreadModel,
+    ) -> MailDraftSourceMessage:
+        """复制来源 ORM 行并仅在完整 AEAD 三元组存在时解密正文。"""
+        sender = message.sender.get("email") if isinstance(message.sender, dict) else None
+        if not isinstance(sender, str):
+            sender = ""
+        recipients = tuple(
+            address
+            for value in message.recipients
+            if isinstance(value, dict)
+            for address in (value.get("email"),)
+            if isinstance(address, str)
+        )
+        body_text = ""
+        if (
+            self._cipher is not None
+            and message.body_ciphertext is not None
+            and message.body_nonce is not None
+            and message.body_key_version is not None
+        ):
+            body_text = self._cipher.decrypt(
+                ApplicationEncryptedValue(
+                    message.body_ciphertext,
+                    message.body_nonce,
+                    message.body_key_version,
+                ),
+                (
+                    f"{message.user_id}:{message.connection_id}:"
+                    f"{message.provider_message_id}:body"
+                ).encode("ascii"),
+            ).decode("utf-8")
+        return MailDraftSourceMessage(
+            connection_id=message.connection_id,
+            thread_id=thread.provider_thread_id,
+            message_id=message.provider_message_id,
+            sender=sender,
+            recipients=recipients,
+            subject=message.subject,
+            received_at=message.received_at,
+            body_text=body_text,
+            labels=tuple(message.labels),
+            thread_summary="",
+        )
 
     async def upsert_message(
         self,
@@ -1026,15 +1251,45 @@ class SqlAlchemyMailSyncRepository:
 class SqlAlchemyMailSyncRepositoryFactory:
     """为邮件同步用例提供每次操作独立、自动提交或回滚的数据库事务。"""
 
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
-        """保存 Worker 进程拥有的 session factory，而不持有跨任务 session。"""
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        cipher: AeadCipher | None = None,
+    ) -> None:
+        """保存 Worker 进程会话工厂及可选正文解密器，不持有跨任务 session。"""
         self._session_factory = session_factory
+        self._cipher = cipher
 
     @asynccontextmanager
     async def __call__(self) -> AsyncIterator[SqlAlchemyMailSyncRepository]:
         """在正常返回时提交，在异常时回滚所有邮件事实及 scope 游标推进。"""
         async with self._session_factory.begin() as session:
-            yield SqlAlchemyMailSyncRepository(session)
+            yield SqlAlchemyMailSyncRepository(session, self._cipher)
+
+
+def _local_or_provider_identifier(
+    value: str,
+    *,
+    local_column: SQLColumnExpression[UUID],
+    provider_column: SQLColumnExpression[str],
+) -> ColumnElement[bool]:
+    """把用户可见来源引用限制为精确本地 UUID 或供应商 opaque ID 比较。
+
+    ``UUID`` 解析失败不会把输入拼入 SQL，而是只保留 provider 列的参数化等值条件。
+    解析成功时两种表示都允许，方便简报本地 source ref 与后续 provider ref 共享同一入口。
+    """
+    try:
+        local_id = UUID(value)
+    except ValueError:
+        return provider_column == value
+    return or_(local_column == local_id, provider_column == value)
+
+
+def _is_spam_labels(labels: object) -> bool:
+    """只把字符串标签中的精确 ``spam`` 视为垃圾邮件，异常 JSON fail closed 跳过。"""
+    if not isinstance(labels, list):
+        return True
+    return any(isinstance(label, str) and label.casefold() == "spam" for label in labels)
 
 
 # M2 迁移期间保留旧类名，避免已持久化任务和现有测试导入立即失效；实现语义已经完全

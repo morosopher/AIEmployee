@@ -1,5 +1,7 @@
 """以 PostgreSQL CAS 和记录绑定 AEAD 持久化本地邮件草稿。"""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hmac import compare_digest
@@ -10,13 +12,21 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.use_cases.mail_drafts import MailDraftRecipient
 from ai_employee.domain.actions import MailDraftStatus, transition_mail_draft
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode
 from ai_employee.infrastructure.db.models.actions import (
     MailDraftModel,
     MailDraftVersionModel,
 )
+from ai_employee.infrastructure.db.models.identity import UserModel
+from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
+    OAuthConnectionModel,
+)
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
 MAIL_DRAFT_CONTENT_KIND = "mail_draft_body"
@@ -24,17 +34,19 @@ MAIL_DRAFT_ACTION = "mail.draft"
 MAIL_DRAFT_SCHEMA_VERSION = "mail_draft_body.v1"
 
 
+# 兼容 Task 6 已公开的基础设施导入名；实际值对象定义在应用边界，使新用例不反向依赖 ORM。
+MailRecipient = MailDraftRecipient
+
+
 @dataclass(frozen=True, slots=True)
-class MailRecipient:
-    """表示草稿版本中的单个地址元数据，不承载邮件正文。
+class MailDraftConnectionSnapshot:
+    """返回草稿连接选择所需且不含 token/scope 原文的最小投影。"""
 
-    Attributes:
-        address: 调用方已完成语法处理的邮箱地址。
-        display_name: 可选显示名；缺失时不会在 JSONB 中写入伪造空字符串。
-    """
-
-    address: str
-    display_name: str | None = None
+    id: UUID
+    user_id: UUID
+    provider: str
+    account_email: str
+    status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +244,123 @@ class SqlAlchemyMailDraftRepository:
             )
         )
         return None if draft is None else await self._snapshot(draft)
+
+    async def list_current(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+    ) -> tuple[MailDraftSnapshot, ...]:
+        """按最近编辑时间倒序列出当前用户的有界草稿快照。
+
+        Args:
+            user_id: 当前认证用户，查询不得省略。
+            limit: 本次最多返回一百条。
+            offset: 非负分页偏移。
+
+        Returns:
+            已解密的当前版本 tuple；跨用户行不会进入候选集合。
+
+        Raises:
+            ValueError: 分页参数越界。
+            StateConflictError: 任一候选当前正文已按保留策略清除。
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("mail draft list limit must be between 1 and 100")
+        if offset < 0:
+            raise ValueError("mail draft list offset must be non-negative")
+        rows = tuple(
+            (
+                await self._session.scalars(
+                    select(MailDraftModel)
+                    .where(MailDraftModel.user_id == user_id)
+                    .order_by(MailDraftModel.updated_at.desc(), MailDraftModel.id)
+                    .limit(limit)
+                    .offset(offset)
+                )
+            ).all()
+        )
+        return tuple([await self._snapshot(row) for row in rows])
+
+    async def get_default_mail_connection(
+        self, *, user_id: UUID
+    ) -> MailDraftConnectionSnapshot | None:
+        """读取用户显式配置的默认邮件连接，不对其他连接做隐式回退。"""
+        row = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .join(
+                UserModel,
+                (UserModel.default_mail_connection_id == OAuthConnectionModel.id)
+                & (UserModel.id == OAuthConnectionModel.user_id),
+            )
+            .where(UserModel.id == user_id, OAuthConnectionModel.user_id == user_id)
+        )
+        return None if row is None else _connection_snapshot(row)
+
+    async def get_connection(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> MailDraftConnectionSnapshot | None:
+        """按用户与主键读取显式发送连接，跨用户连接表现为不存在。"""
+        row = await self._session.scalar(
+            select(OAuthConnectionModel).where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+            )
+        )
+        return None if row is None else _connection_snapshot(row)
+
+    async def list_connections(
+        self, *, user_id: UUID
+    ) -> tuple[MailDraftConnectionSnapshot, ...]:
+        """列出用户全部连接主账户地址，供 reply-all 与自动补全排除自身。"""
+        rows = await self._session.scalars(
+            select(OAuthConnectionModel)
+            .where(OAuthConnectionModel.user_id == user_id)
+            .order_by(OAuthConnectionModel.id)
+        )
+        return tuple(_connection_snapshot(row) for row in rows)
+
+    async def get_enabled_capabilities(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> frozenset[ConnectionCapability] | None:
+        """返回精确连接的 enabled 能力；不存在、跨用户或断开时返回空。"""
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel.id).where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.status == "connected",
+            )
+        )
+        if connection is None:
+            return None
+        values = tuple(
+            (
+                await self._session.scalars(
+                    select(ConnectionCapabilityModel.capability).where(
+                        ConnectionCapabilityModel.user_id == user_id,
+                        ConnectionCapabilityModel.connection_id == connection_id,
+                        ConnectionCapabilityModel.status == "enabled",
+                    )
+                )
+            ).all()
+        )
+        try:
+            return frozenset(ConnectionCapability(value) for value in values)
+        except ValueError as error:
+            raise RuntimeError("connection contains an unknown enabled capability") from error
+
+    async def get_mail_draft_retention_days(self, *, user_id: UUID) -> int | None:
+        """读取用户邮件正文保留天数，缺失用户返回空且不使用宿主机配置。"""
+        return await self._session.scalar(
+            select(UserModel.email_body_retention_days).where(UserModel.id == user_id)
+        )
 
     async def save_next_version(
         self,
@@ -483,11 +612,22 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _connection_snapshot(row: OAuthConnectionModel) -> MailDraftConnectionSnapshot:
+    """复制 ORM 连接为不会在事务外触发隐式 I/O 的最小快照。"""
+    return MailDraftConnectionSnapshot(
+        id=row.id,
+        user_id=row.user_id,
+        provider=row.provider,
+        account_email=row.account_email,
+        status=row.status,
+    )
+
+
 def _recipients_to_json(recipients: tuple[MailRecipient, ...]) -> list[dict[str, str]]:
     """把不可变地址元数据复制为 ORM JSONB 白名单结构。"""
     result: list[dict[str, str]] = []
     for recipient in recipients:
-        if type(recipient) is not MailRecipient:
+        if type(recipient) is not MailDraftRecipient:
             raise TypeError("mail recipients must contain MailRecipient values")
         value = {"address": recipient.address}
         if recipient.display_name is not None:
@@ -534,12 +674,33 @@ def _mail_content_unavailable() -> StateConflictError:
     )
 
 
+class SqlAlchemyMailDraftRepositoryFactory:
+    """为每次草稿用例提供自动提交或回滚的短事务 Repository。"""
+
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        cipher: ActionPayloadCipher,
+    ) -> None:
+        """保存进程级会话工厂与记录绑定加密器，不提前占用数据库连接。"""
+        self._session_factory = session_factory
+        self._cipher = cipher
+
+    @asynccontextmanager
+    async def __call__(self) -> AsyncIterator[SqlAlchemyMailDraftRepository]:
+        """把一次草稿读写限制为同一提交/回滚边界。"""
+        async with self._session_factory.begin() as session:
+            yield SqlAlchemyMailDraftRepository(session, self._cipher)
+
+
 __all__ = [
     "MAIL_DRAFT_ACTION",
     "MAIL_DRAFT_CONTENT_KIND",
     "MAIL_DRAFT_SCHEMA_VERSION",
+    "MailDraftConnectionSnapshot",
     "MailDraftSnapshot",
     "MailDraftStateSnapshot",
     "MailRecipient",
     "SqlAlchemyMailDraftRepository",
+    "SqlAlchemyMailDraftRepositoryFactory",
 ]

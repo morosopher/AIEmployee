@@ -64,13 +64,8 @@ class BriefItem(BaseModel):
     @field_validator("suggested_action_kind")
     @classmethod
     def safe_action(cls, value: str | None) -> str | None:
-        if value is not None and value.lower() in {
-            "send_email",
-            "modify_calendar",
-            "execute",
-            "auto_execute",
-        }:
-            raise ValueError("suggested actions cannot imply automatic execution")
+        if value is not None and value != "mail.reply":
+            raise ValueError("brief suggested action must be a verifiable mail.reply")
         return value
 
 
@@ -102,7 +97,12 @@ class ConversationIntent(BaseModel):
     @field_validator("intent")
     @classmethod
     def valid_intent(cls, value: str) -> str:
-        allowed = {"generate_daily_brief", "show_latest_brief", "explain_capabilities"}
+        allowed = {
+            "generate_daily_brief",
+            "show_latest_brief",
+            "prepare_mail_draft",
+            "explain_capabilities",
+        }
         if value not in allowed:
             raise ValueError("unsupported conversation intent")
         return value

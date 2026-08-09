@@ -22,6 +22,14 @@ def test_brief_item_requires_source_and_safe_action() -> None:
             source_refs=[BriefSourceRef(source_type="mail", source_id="1")],
             suggested_action_kind="send_email",
         )
+    item = BriefItem(
+        section="needs_reply",
+        title="x",
+        body_markdown="x",
+        source_refs=[BriefSourceRef(source_type="email_thread", source_id="thread-1")],
+        suggested_action_kind="mail.reply",
+    )
+    assert item.suggested_action_kind == "mail.reply"
 
 
 def test_intent_rejects_unknown_value() -> None:
@@ -111,7 +119,12 @@ async def test_ambiguous_intent_redacts_before_model() -> None:
         ("plan my work", "explain_capabilities"),
         ("generate today's brief", "generate_daily_brief"),
         ("refresh today's brief", "generate_daily_brief"),
+        ("summarize today's mail", "generate_daily_brief"),
+        ("总结今天邮件", "generate_daily_brief"),
         ("show today's brief", "show_latest_brief"),
+        ("prepare an email draft for recipient@example.test", "prepare_mail_draft"),
+        ("draft email to recipient@example.test", "prepare_mail_draft"),
+        ("请为 recipient@example.test 准备邮件草稿", "prepare_mail_draft"),
     ],
 )
 async def test_explicit_intents_never_call_model(text: str, expected: str) -> None:
@@ -135,6 +148,30 @@ async def test_write_and_planning_verbs_never_call_model(text: str) -> None:
     )
     assert result.intent == "explain_capabilities"
     assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_needs_reply_item_exposes_only_verifiable_mail_reply_suggestion() -> None:
+    """只有输入中真实存在且明确需要回复的线程才暴露准备回复入口。"""
+    result = await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [
+                {
+                    "thread_id": "replyable-thread",
+                    "sender": "sender@work.example",
+                    "subject": "Synthetic question",
+                    "needs_reply": True,
+                }
+            ],
+            "calendar_events": [],
+            "work_email_domains": ["work.example"],
+        }
+    )
+
+    assert len(result["content"]["items"]) == 1
+    item = result["content"]["items"][0]
+    assert item["source_refs"][0]["source_id"] == "replyable-thread"
+    assert item["suggested_action_kind"] == "mail.reply"
 
 
 @pytest.mark.asyncio

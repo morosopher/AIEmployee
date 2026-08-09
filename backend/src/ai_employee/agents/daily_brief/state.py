@@ -16,6 +16,8 @@ class DailyBriefState(TypedDict, total=False):
     model_name: str
     classifications: list[dict[str, Any]]
     spam_thread_ids: set[str]
+    # 只保存入口真实存在的非空线程 ID；模型不能新增可点击的回复来源。
+    replyable_thread_ids: set[str]
     conflicts: list[dict[str, Any]]
     deterministic_items: list[dict[str, Any]]
     model_items: list[dict[str, Any]]
