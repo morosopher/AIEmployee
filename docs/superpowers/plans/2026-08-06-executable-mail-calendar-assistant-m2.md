@@ -2273,6 +2273,368 @@ git add backend/src/ai_employee/domain/calendar_availability.py backend/src/ai_e
 git commit -m "feat: add calendar change proposals"
 ~~~
 
+### Task 16A: Harden calendar proposal trust boundaries and rotate event-field AAD
+
+**Files:**
+- Create: `backend/migrations/versions/20260809_0019_calendar_event_field_aad_v2.py` — forward-only CalendarEvent field-AAD versioning and scoped resync marker migration.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_availability.py` — two-short-transaction availability read/save adapter; it returns frozen DTOs and never performs candidate computation.
+- Create: `backend/tests/integration/m2/test_calendar_availability_repository.py` — fixed-query, minimal-projection, freshness-clock, no-open-transaction, large-event-set, and CAS coverage.
+- Modify: `backend/src/ai_employee/infrastructure/db/models/sources.py` — independent description/location AAD versions and four-column atomic constraints.
+- Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py` — v2-only CalendarEvent field encryption with the complete calendar identity.
+- Modify: `backend/src/ai_employee/application/use_cases/calendar_proposals.py` — independent freshness observation, frozen availability DTO/port, validated confirmation reconstruction, submission readiness, and shared idempotency-key validation.
+- Modify: `backend/src/ai_employee/domain/calendar_availability.py` — filtered, sorted, merged buffered intervals and monotonic candidate scanning.
+- Modify: `backend/src/ai_employee/workers/prepare_calendar_restore.py` — exact task-input shape and canonical UUID/idempotency validation before resolver or provider access.
+- Modify: `backend/src/ai_employee/application/use_cases/task_execution.py` — document the time-valid lease contract consumed by `DurableTaskRunner` terminal/retry writes.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/calendar.py` — set-based availability projection plus v2-only CalendarEvent field reader.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_execution.py` — require an unexpired same-owner lease at each running-task state write.
+- Modify: `backend/tests/integration/db/test_migrations.py` — 0019 data, constraint, cursor, audit-safe error-code, and forward-only migration regressions.
+- Modify: `backend/tests/integration/google/test_calendar_sync.py` — Google v2 AAD write/decrypt and same-event-ID calendar isolation.
+- Modify: `backend/tests/integration/microsoft/test_calendar_sync.py` — Microsoft v2 AAD write/decrypt and same-event-ID calendar isolation.
+- Modify: `backend/tests/unit/application/test_calendar_proposals.py` — confirmation partition, validated reconstruction, readiness, historical snapshot, and observed-at tests.
+- Modify: `backend/tests/unit/domain/test_calendar_availability.py` — merged-interval and large deterministic result tests.
+- Modify: `backend/tests/integration/m2/test_calendar_proposal_versions.py` — exact event-field reads, AAD swap/tamper failures, restore-input fail-closed behavior, and real-runner takeover regression.
+- Modify: `backend/tests/integration/workers/test_outbox_dispatch.py` — PostgreSQL finish/retry/internal-failure lease-expiry CAS coverage.
+- Modify: `backend/tests/unit/workers/test_execution_lease.py` — runner contract regression for a rejected terminal CAS.
+
+All provider behavior in this task uses Fake readers, synthetic encrypted values, or checked-in contract fixtures. Do not configure or access a real Google or Microsoft account, and do not add approval, `ToolExecution`, or provider-write behavior from Task 18 or later.
+
+- [ ] **Step 1: Write failing lease and restore-input trust-boundary tests**
+
+In `backend/tests/integration/workers/test_outbox_dispatch.py`, extend the existing PostgreSQL lease cases with all of these assertions:
+
+~~~python
+expired_finish = await store.finish(
+    task_id=task_id,
+    lease_owner="worker-a",
+    status=TaskStatus.SUCCEEDED,
+    finished_at=lease_expires_at,
+    error_code=None,
+)
+expired_retry = await store.schedule_retry(
+    task_id=retry_task_id,
+    lease_owner="worker-a",
+    scheduled_at=lease_expires_at,
+    retry_available_at=lease_expires_at + timedelta(seconds=5),
+    error_code="synthetic_retry",
+    attempt_count=1,
+)
+expired_internal_failure = await store.fail_internal(
+    task_id=running_task_id,
+    lease_owner="worker-a",
+    failed_at=lease_expires_at,
+    error_code="task_execution_internal_error",
+)
+
+assert expired_finish is False
+assert expired_retry is False
+assert expired_internal_failure is False
+assert await retry_outbox_count(retry_task_id) == 0
+~~~
+
+Use a strict `>` boundary: equality with `lease_expires_at` is expired. Preserve the existing CREATED, QUEUED, and RETRY_SCHEDULED unowned `fail_internal` cases as successful safe-precondition failures, while an expired RUNNING row remains untouched. Add a takeover case in which the old owner cannot finish or schedule after expiry and the replacement owner can finish only before its new deadline.
+
+In `backend/tests/integration/m2/test_calendar_proposal_versions.py`, add malformed persisted inputs for missing keys, extra keys, non-string values, non-canonical UUID spellings, empty/blank/padded/over-255 creation keys, and C0/DEL control characters. Every case must assert that both `resolver.calls` and `reader.calls` remain empty. Accept a valid arbitrary key such as `synthetic-restore-key`; do not require a route-level prefix that Task 17 has not defined.
+
+Add one real `DurableTaskRunner` + `SqlAlchemyTaskExecutionStore` + PostgreSQL regression. Reuse the existing restore source seed and transaction-probing Fake reader, advance the injected clock beyond the first lease during `get_current_event()`, and assert the first runner returns `False`, leaves `result_payload is None`, and does not mark the task `succeeded`. Then run a replacement owner with a fresh lease and a Fake provider result; assert it creates exactly one restore proposal, persists a non-null result marker, and is the only attempt allowed to mark the task `succeeded`.
+
+- [ ] **Step 2: Run the lease and restore-input RED tests**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/integration/m2/test_calendar_proposal_versions.py backend/tests/unit/workers/test_execution_lease.py -q
+~~~
+
+Expected: FAIL because same-owner RUNNING writes currently ignore lease expiry, the real runner can accept that stale terminal CAS, and `_restore_input()` currently accepts extra keys, non-canonical UUID text, and keys outside the shared creation-idempotency boundary.
+
+- [ ] **Step 3: Enforce time-valid leases and validate restore input before resolution**
+
+In `SqlAlchemyTaskExecutionStore`, add the timestamp-specific lease predicates to the existing conditional updates:
+
+~~~python
+TaskRunModel.lease_expires_at.is_not(None),
+TaskRunModel.lease_expires_at > finished_at,
+~~~
+
+Use `scheduled_at` in `schedule_retry()`. In `fail_internal()`, keep the CREATED/QUEUED/RETRY_SCHEDULED unowned branch unchanged and place `lease_expires_at IS NOT NULL AND lease_expires_at > failed_at` only inside `same_owner_running`. Update the `TaskExecutionStore` and concrete repository docstrings so `DurableTaskRunner` callers know a `False` completion means the lease was absent, expired, or replaced; do not add a fallback overwrite after a CAS miss.
+
+In `prepare_calendar_restore.py`, perform all payload validation before `CalendarRestoreReaderResolver.resolve()` and before `CalendarReader.get_current_event()`:
+
+~~~python
+_RESTORE_INPUT_KEYS = frozenset(
+    {"source_snapshot_id", "creation_idempotency_key"}
+)
+
+
+def _restore_input(payload: Mapping[str, object]) -> tuple[UUID, str]:
+    """只接受精确、规范且可重放的恢复准备输入。"""
+    if set(payload) != _RESTORE_INPUT_KEYS:
+        raise TypeError("calendar.restore.prepare input is invalid")
+    raw_snapshot = payload["source_snapshot_id"]
+    creation_key = payload["creation_idempotency_key"]
+    if not isinstance(raw_snapshot, str) or not isinstance(creation_key, str):
+        raise TypeError("calendar.restore.prepare input is invalid")
+    parsed_snapshot = UUID(raw_snapshot)
+    if str(parsed_snapshot) != raw_snapshot:
+        raise ValueError("calendar.restore.prepare snapshot id is not canonical")
+    return parsed_snapshot, _idempotency_key(creation_key)
+~~~
+
+Move the shared creation-key validator to a callable location in `calendar_proposals.py` that the Worker can import without importing SQLAlchemy or provider code. Preserve the existing non-empty, no-padding, maximum-255 boundary and reject every Unicode `Cc` control character; create/update/restore proposal entry points and `_restore_input()` must call the same validator. This is shape and boundary validation only—there is no fixed prefix requirement.
+
+- [ ] **Step 4: Re-run the lease and restore-input tests GREEN**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/integration/m2/test_calendar_proposal_versions.py backend/tests/unit/workers/test_execution_lease.py -q
+~~~
+
+Expected: PASS; expired same-owner writes affect zero rows, safe unowned precondition failures still persist, corrupt restore inputs make zero resolver/provider calls, and only the replacement runner can persist the restore result and terminal success.
+
+- [ ] **Step 5: Write failing freshness, availability, transaction-boundary, and confirmation tests**
+
+In `backend/tests/unit/application/test_calendar_proposals.py`, make the Fake calendar port record both timestamps and add future/past searches:
+
+~~~python
+await use_case.suggest_times(
+    user_id=USER_ID,
+    proposal_id=proposal.proposal_id,
+    expected_version=proposal.current_version,
+    search_start=FUTURE_SEARCH_START,
+)
+
+assert source.availability_requests == [
+    (NOW, FUTURE_SEARCH_START, CALENDAR_AVAILABILITY_HORIZON_DAYS)
+]
+~~~
+
+Add the inverse case with `search_start < NOW`; both must use `observed_at == NOW` from the injected clock. Add model tests proving an explicit-confirmation shell rejects overlap between `confirmed_fields` and `required_confirmations`, rejects a missing member from their union, and accepts historical `requires_explicit_confirmation=False` before snapshots with both tuples empty.
+
+Exercise `confirm()`, `_apply_user_changes()` through public `edit()`, and `create_restore()` with inputs that would be invalid if Pydantic validation ran after the update. Assert each path raises rather than persisting a malformed snapshot. Add readiness cases with these exact rules:
+
+- all four shell confirmations are present and `required_confirmations` is empty;
+- `title.strip()` and `calendar_id.strip()` are non-empty;
+- update/restore require non-empty `target_event_id`, non-empty `base_etag`, non-null `before_snapshot_id`, and non-empty `changed_fields`;
+- create requires `target_event_id`, `base_etag`, and `before_snapshot_id` all to be `None`;
+- ordinary complete create, update, and restore proposals remain ready, while a fully filled shell remains unready until all four typed confirmations are persisted.
+
+In `backend/tests/integration/m2/test_calendar_availability_repository.py`, seed one user with a future search window whose cursors are fresh at `observed_at`, then a past search window whose cursors are stale at `observed_at`. The first result must be complete and the second partial, proving freshness never derives from `search_start`.
+
+Attach a SQLAlchemy statement counter and run the availability read with 1 and 32 relevant calendar connections. Assert both executions issue the same fixed number of SELECT statements. Inspect the captured event SELECT and assert it projects only `starts_at`, `ends_at`, `all_day`, `transparency`, and `status`; directory/cursor reads project only ownership, capability, scope, freshness, and error-code fields. Assert no statement selects CalendarEvent title, description/location AEAD columns, organizer, attendees, ETag, or provider URL, and assert all qualifying events are returned without `LIMIT` truncation.
+
+Instrument transaction begin/end events, invoke the real availability adapter through `CalendarProposalUseCase.suggest_times()`, and make the injected pure suggestion function assert the active database-transaction count is zero while it computes. Mutate the proposal version between the frozen read and save phases and assert the second short transaction loses the `expected_version` CAS without overwriting the newer proposal.
+
+In `backend/tests/unit/domain/test_calendar_availability.py`, create a deterministic large set containing cancelled/transparent rows, nested/adjacent busy ranges, and at least 10,000 non-truncated busy events. Compare the returned candidates with a small brute-force oracle for the same input; this proves prefiltering/merging preserves correctness without measuring wall-clock time.
+
+- [ ] **Step 6: Run the freshness, availability, and confirmation RED tests**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/unit/application/test_calendar_proposals.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/integration/m2/test_calendar_availability_repository.py backend/tests/integration/m2/test_calendar_proposal_versions.py -q
+~~~
+
+Expected: FAIL because `search_start` currently doubles as the freshness observation time, availability performs per-connection directory/cursor queries and materializes ORM rows, candidate overlap scans every busy event, suggestion computation shares the caller's transaction, `model_copy(update=...)` skips validation, and readiness does not enforce operation-specific bindings or all four confirmations.
+
+- [ ] **Step 7: Implement frozen reads, transaction-free computation, CAS save, and validated proposal invariants**
+
+Change the application port to carry independent timestamps:
+
+~~~python
+async def get_availability_context(
+    self,
+    *,
+    user_id: UUID,
+    observed_at: datetime,
+    search_start: datetime,
+    horizon_days: int,
+) -> CalendarAvailabilityContext | None: ...
+~~~
+
+`CalendarProposalUseCase.suggest_times()` must call `observed_at = _aware_utc(self._clock(), field="calendar proposal clock")` once, pass that value independently from the caller's `search_start`, and use a narrow availability persistence port implemented in the new repository module. The adapter performs exactly this sequence:
+
+1. open a short read transaction, load the current proposal/version, target retention facts, settings, capability/directory/cursor projections, and minimal availability-event DTOs, then close the transaction;
+2. run `suggest_meeting_times()` after the read transaction has ended;
+3. open a new short write transaction and save the next immutable desired snapshot only through `expected_version` CAS.
+
+The write phase must not reuse ORM instances from the read phase. A lost CAS returns the existing stable proposal-version conflict and never retries the computation against a silently changed version.
+
+Rewrite `SqlAlchemyCalendarSyncRepository.get_availability_context()` as set queries: one minimal user-settings projection, one connection/capability projection, one provider-calendar projection, one scoped-cursor projection, and one minimal event projection. Query count must remain fixed as relevant connections grow. Compute `cutoff = observed_at - _AVAILABILITY_FRESHNESS`; use `search_start` only for `window_start/window_end`. Do not load sensitive CalendarEvent ORM rows and do not cap the event result set.
+
+In the domain algorithm, filter cancelled and transparent/free facts first, sort buffered half-open intervals by `(start, end)`, merge overlapping or adjacent intervals, and scan them monotonically while candidates advance:
+
+~~~python
+busy_index = 0
+for candidate_start, candidate_end in ordered_candidates:
+    while busy_index < len(merged_busy) and merged_busy[busy_index][1] <= candidate_start:
+        busy_index += 1
+    if busy_index < len(merged_busy) and merged_busy[busy_index][0] < candidate_end:
+        continue
+    accept(candidate_start, candidate_end)
+~~~
+
+Do not truncate events before merging. Preserve DST, grid, working-hours, buffer, completeness, and attendee-Free/Busy invariants from Task 16.
+
+Add an after-model validator for explicit shells only:
+
+~~~python
+if self.requires_explicit_confirmation:
+    confirmed = set(self.confirmed_fields)
+    required = set(self.required_confirmations)
+    shell = set(_SHELL_CONFIRMATIONS)
+    if confirmed & required or confirmed | required != shell:
+        raise ValueError("calendar proposal confirmations must partition the shell fields")
+~~~
+
+Historical before snapshots with `requires_explicit_confirmation=False` remain readable. Replace validation-sensitive `model_copy(update=...)` calls in `confirm()`, `_apply_user_changes()`, and both reconstruction points in `create_restore()` with `CalendarProposalContent.model_validate()` over a dumped-and-updated mapping:
+
+~~~python
+values = content.model_dump(mode="python")
+values.update(updates)
+updated = CalendarProposalContent.model_validate(values)
+~~~
+
+Make `CalendarProposalView.submission_ready` enforce the exact create/update/restore binding rules from the RED tests. This property remains a local edit-readiness signal only; it must not create an approval, task, ToolExecution, or external write.
+
+- [ ] **Step 8: Re-run the freshness, availability, and confirmation tests GREEN**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/unit/application/test_calendar_proposals.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/integration/m2/test_calendar_availability_repository.py backend/tests/integration/m2/test_calendar_proposal_versions.py -q
+~~~
+
+Expected: PASS with independent freshness observation, fixed query count, minimal projections, no transaction during pure computation, correct large-event results, expected-version CAS, validated confirmation partitions, and operation-specific readiness.
+
+- [ ] **Step 9: Write failing 0019 and CalendarEvent v2 AAD tests**
+
+In `backend/tests/integration/db/test_migrations.py`, upgrade a synthetic database to `20260809_0018`, seed all of these facts, then upgrade to `20260809_0019`:
+
+- one event with a complete description AEAD triple and an empty location triple;
+- one event with complete description and location triples;
+- exact calendar event cursors for affected and unaffected calendars;
+- a `directory` cursor with non-null cursor, `last_success_at`, and existing error state.
+
+Assert 0019 preserves event IDs, calendar IDs, ciphertext, nonce, key version, timestamps, and every non-AAD business field byte-for-byte; sets version 1 only on complete historical triples; leaves fully empty groups at `NULL`; clears only affected non-directory `cursor` and `last_success_at`; writes only `calendar_event_resync_required` to their `last_error_code`; and leaves directory cursor/freshness/revision/error values unchanged. Add a separate preflight test where either field has a partial historical triple and assert the upgrade fails closed at 0018 without altering or deleting that event.
+
+After upgrade, assert each description/location group accepts only all-null or all-non-null with `aad_version IN (1, 2)`, rejects partial groups and versions outside 1/2, and keeps the two field versions independent. Assert `command.downgrade(..., "20260809_0018")` raises the migration's forward-only error and does not drop columns or constraints.
+
+In Google and Microsoft sync integration tests, decrypt each newly synchronized description and location with exactly:
+
+~~~python
+aad = (
+    f"{user_id}:{connection_id}:{calendar_id}:{provider_event_id}:{field}"
+).encode("ascii")
+assert aad_version == 2
+assert cipher.decrypt(EncryptedValue(ciphertext, nonce, key_version), aad) == expected
+~~~
+
+Assert the old v1 AAD cannot decrypt the new value. For each provider, synchronize two calendars that share one `provider_event_id` and prove both rows remain independently decryptable only with their own calendar ID.
+
+In `backend/tests/integration/m2/test_calendar_proposal_versions.py`, cover the public precise-event reader with all-null fields, v1 fields, a v2 `InvalidTag`, and a complete four-column ciphertext swap between two calendars sharing one provider event ID. All-null reads as `""`; v1, unknown version, swapped ciphertext, and ciphertext/nonce/key-version/version tampering raise `StateConflictError(error_code="calendar_event_resync_required")`. Use a recording Fake cipher for the fail-closed cases and assert there is no second decrypt attempt with v1 AAD, an omitted calendar ID, or unauthenticated plaintext.
+
+- [ ] **Step 10: Run the 0019 and v2 AAD RED tests**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/db/test_migrations.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/m2/test_calendar_proposal_versions.py -q
+~~~
+
+Expected: FAIL because revision 0019 and AAD-version columns do not exist, sync still uses the legacy connection/event AAD, and the repository reader neither selects a field version nor maps v1/unknown/`InvalidTag` to `calendar_event_resync_required`.
+
+- [ ] **Step 11: Add forward-only 0019, v2-only writes, and fail-closed reads**
+
+Create `20260809_0019_calendar_event_field_aad_v2.py` with:
+
+~~~python
+revision = "20260809_0019"
+down_revision = "20260809_0018"
+
+_AAD_V1 = 1
+_AAD_V2 = 2
+_RESYNC_REQUIRED = "calendar_event_resync_required"
+~~~
+
+The upgrade must preflight both legacy triples for partial-null rows before any DDL/data mutation; add nullable `description_aad_version` and `location_aad_version`; backfill 1 only where that field's legacy triple is fully non-null; and create independent named checks equivalent to:
+
+~~~sql
+(
+  description_ciphertext IS NULL
+  AND description_nonce IS NULL
+  AND description_key_version IS NULL
+  AND description_aad_version IS NULL
+)
+OR
+(
+  description_ciphertext IS NOT NULL
+  AND description_nonce IS NOT NULL
+  AND description_key_version IS NOT NULL
+  AND description_aad_version IN (1, 2)
+)
+~~~
+
+Repeat the complete expression for location. Derive affected `(connection_id, calendar_id)` pairs from fields marked v1, update only `sync_cursors.resource_kind = 'calendar' AND scope_key = calendar_id AND scope_key <> 'directory'`, set `cursor` and `last_success_at` to `NULL`, and set the content-free `last_error_code` to `calendar_event_resync_required`. Do not alter `last_attempt_at`, directory rows, event content, event identity, or AEAD bytes. `downgrade()` must raise a stable forward-only `RuntimeError` before issuing DDL or DML.
+
+Mirror the columns and checks in `CalendarEventModel`. In `SyncCalendarUseCase`, build AAD as `user_id:connection_id:calendar_id:provider_event_id:field`; pass `event.calendar_id` explicitly; and have `SqlAlchemyCalendarSyncRepository.upsert_event()` set each field's version to 2 on insert and update.
+
+Replace the reader with an independent four-column policy per field:
+
+~~~python
+parts = (ciphertext, nonce, key_version, aad_version)
+if all(part is None for part in parts):
+    return ""
+if any(part is None for part in parts) or aad_version != 2:
+    raise _calendar_event_resync_required()
+try:
+    plaintext = self._field_cipher.decrypt(
+        EncryptedValue(ciphertext, nonce, key_version),
+        (
+            f"{event.user_id}:{event.connection_id}:{event.calendar_id}:"
+            f"{event.provider_event_id}:{field}"
+        ).encode("ascii"),
+    )
+except InvalidTag as error:
+    raise _calendar_event_resync_required() from error
+return plaintext.decode("utf-8")
+~~~
+
+Unknown versions, unavailable cipher state, invalid key versions, and authenticated-decryption failures must produce the same content-free resync error. Never attempt v1 AAD, omit `calendar_id`, return partial plaintext, decrypt/re-encrypt inside the migration, or delete/merge an event.
+
+- [ ] **Step 12: Run focused, adjacent, and full verification**
+
+Focused migration/security run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/db/test_migrations.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/m2/test_calendar_proposal_versions.py -q
+~~~
+
+Expected: PASS.
+
+Adjacent calendar/worker run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/unit/application/test_calendar_proposals.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/integration/m2/test_calendar_availability_repository.py backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/unit/workers/test_execution_lease.py backend/tests/contract/test_calendar_adapter.py backend/tests/contract/microsoft/test_calendar_adapter.py -q
+~~~
+
+Expected: PASS with only Fake/synthetic provider data.
+
+Full repository gate:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test just check
+~~~
+
+Expected: PASS with fresh backend/frontend unit tests, lint, type checking, and no real-provider access. Then run `git diff --check` and inspect the complete diff for accidental Task 18 approval/ToolExecution/provider-write work, unbounded sensitive ORM loads, legacy AAD fallback, or any database URL other than the Task 13 synthetic test database.
+
+- [ ] **Step 13: Commit**
+
+~~~bash
+git add backend/migrations/versions/20260809_0019_calendar_event_field_aad_v2.py backend/src/ai_employee/infrastructure/db/models/sources.py backend/src/ai_employee/application/use_cases/sync_calendar.py backend/src/ai_employee/application/use_cases/calendar_proposals.py backend/src/ai_employee/domain/calendar_availability.py backend/src/ai_employee/workers/prepare_calendar_restore.py backend/src/ai_employee/application/use_cases/task_execution.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/infrastructure/db/repositories/calendar_availability.py backend/src/ai_employee/infrastructure/db/repositories/task_execution.py backend/tests/integration/db/test_migrations.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/unit/application/test_calendar_proposals.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/integration/m2/test_calendar_proposal_versions.py backend/tests/integration/m2/test_calendar_availability_repository.py backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/unit/workers/test_execution_lease.py
+git commit -m "fix: harden calendar proposal trust boundaries"
+~~~
+
 ### Task 17: Expose calendar proposal, restore, and working-settings APIs
 
 **Files:**
@@ -3734,8 +4096,10 @@ git commit -m "test: freeze M2 release evidence"
 - Typed commands, canonical hashes, encrypted storage, exact approval, 10-minute decision window, five-minute claim window, invalidation, and legacy fake-write compatibility: Tasks 2–6 and 18–19.
 - Draft generation/editing, reply/reply-all rules, recipient limits, model minimization, empty fallback, and no provider draft: Tasks 2, 11, 14–15, 21, and 23.
 - Calendar directory, working hours, buffer, 15-minute grid, 14-day horizon, three candidates, completeness, create/update/restore, ETag, attendees, and notification policy: Tasks 4, 12–13, 16–17, 22, and 24.
+- Calendar proposal trust hardening, including time-valid Worker leases, independent freshness observation, fixed-query minimal projections, transaction-free merged-interval computation, expected-version CAS, exact restore input, explicit-confirmation invariants, and operation-specific readiness: Task 16A.
+- CalendarEvent field AAD v2, forward-only 0019 rotation, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A, with provider read foundations from Tasks 12–13 and later retention/operations coverage from Tasks 25–27.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
-- Idempotent claim, safe retry, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 18–25, and 30.
+- Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, and 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.
 - Security, no-store, redaction, retention, source deletion, all-data barrier, metrics, alerts, deployment switches, rollback, incident response, and release evidence: Tasks 1, 5–6, 25–27, and 30.
 
@@ -3743,7 +4107,7 @@ git commit -m "test: freeze M2 release evidence"
 
 1. Tasks 1–6 establish the approved scope, pure contracts, migrations, and encrypted persistence. Checkpoint: empty-database migration and AAD/user-isolation tests pass before any provider expansion.
 2. Tasks 7–13 generalize reads and add Microsoft/Google parity. Checkpoint: both providers pass OAuth plus incremental mail/calendar contract tests with real writes still disabled.
-3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14, then Task 16, Task 18, Task 15, Task 17, and finally Tasks 19–20. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
+3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14 → Task 16 → Task 16A → Task 18 → Task 15 → Task 17 → Tasks 19–20. Task 16A must close calendar lease, freshness, bounded-query, transaction, confirmation, restore-input, and CalendarEvent AAD v2/0019 trust gaps before any proposal version can be frozen. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
 4. Tasks 21–24 add one high-risk provider write path per task and commit. Checkpoint: each adapter independently passes success, rejection, timeout, unknown-result, reconciliation, and duplicate-delivery contracts before starting the next adapter.
 5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, and retention-role suites pass.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.

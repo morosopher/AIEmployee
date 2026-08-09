@@ -20,6 +20,29 @@
 
 生产环境不得对该迁移执行破坏性 downgrade。若迁移后已经存在跨日历相同 provider event ID，旧二元约束无法无损恢复，downgrade 必须 fail closed；不得删除、合并或改写事件行来强行回退，应停止发布并制定人工数据保留方案。
 
+### M2 CalendarEvent 字段 AAD 0019 发布
+
+`20260809_0019_calendar_event_field_aad_v2.py` 的 `down_revision` 是 `20260809_0018`，因此必须在 0018 完成后应用。描述与地点分别维护独立的 AAD 版本：v1 仅用于标记历史三元组，v2 使用包含 `calendar_id` 的 `user_id:connection_id:calendar_id:provider_event_id:field`。新 Calendar writer 只能写 v2；reader 遇到 v1、未知版本或 v2 `InvalidTag` 时，必须返回 `calendar_event_resync_required`，绝不尝试 v1、缺少 `calendar_id` 或未经认证明文等 legacy fallback。
+
+发布期间保持真实写入开关关闭，并严格按以下顺序执行：
+
+1. 关闭 Calendar 周期调度。
+2. 排空并停止全部旧 `sync_calendar` Worker，确认没有旧事件 upsert 事务仍在运行。
+3. 完成加密备份，确认数据库已经位于 `20260809_0018`，再应用 `20260809_0019`。
+4. 在恢复任何 Worker 前验证：Schema 只新增描述/地点版本列与对应原子约束；完整历史密文三元组标记为 v1，全空字段组的四列均保持 `NULL`；相关非 `directory` scope 的 `cursor` 与 `last_success_at` 已清空且 `last_error_code` 为 `calendar_event_resync_required`；`directory` scope 完全不变；事件业务内容、密文、nonce 与 key version 均未改变。
+5. 部署 v2-only 的 API、Worker 与 Scheduler，禁止任何旧 Worker 在 0019 后回流或继续 upsert。
+6. 先恢复新 Worker，再恢复 Calendar 调度；仅对被标记的 `(connection_id, calendar_id)` scope 执行有界重同步，不扩大读取范围。
+7. 验证每个受影响 scope 的 `cursor` 与 freshness 已恢复、`calendar_event_resync_required` 已清除，且重同步产生的非空描述/地点行版本均为 v2；这些条件全部满足后才继续后续发布。
+
+以下命令从仓库根目录运行，不包含任何账号或凭据；执行数据库升级前仍必须先完成上述备份、排空和基线确认：
+
+```bash
+just db-upgrade
+just health
+```
+
+0019 只能通过新应用镜像前滚修复，其 downgrade 必须 fail closed。不得删除事件或游标、移除 AAD 版本列或约束、恢复 v1 reader，亦不得让旧 writer 回流。若有 scope 的有界重同步失败，保持真实写入开关关闭，按该精确 scope 排查连接能力、同步错误和供应商读取状态；不得通过扩大同步范围、删除事实或启用 legacy fallback 绕过故障。
+
 ## 备份与恢复演练
 
 备份命令需要显式 `BACKUP_DIR`、`BACKUP_PASSPHRASE_FILE` 与 PostgreSQL `PG*`/`PGPASSFILE` 连接环境：

@@ -732,6 +732,11 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 日历级操作。所有硬编码 `provider == "google"` 的共享查询必须改为通过连接类型和供应商适配器
 选择，不能复制第二套 Microsoft 领域模型。
 
+`CalendarEvent` 的描述和地点密文必须绑定同一完整事件身份。历史 v1 AAD
+`user_id:connection_id:provider_event_id:field` 只用于识别需要重同步的旧记录；v2 AAD 固定为
+`user_id:connection_id:calendar_id:provider_event_id:field`，其中 `field` 只能是 `description` 或
+`location`。所有新同步写入必须使用 v2，不能继续按旧连接级身份生成字段密文。
+
 邮件消息额外保存 nullable `provider_updated_at`；历史 Google 行允许为 `NULL`。消息与线程的
 描述字段更新必须遵守供应商版本排序，`latest_message_at` 只能单调增加。消息身份和线程归属
 使用 connection/user/thread 组合约束，禁止跨用户或跨 connection 的 projection 覆盖。
@@ -822,6 +827,12 @@ CalendarEvent 的供应商身份从旧 `(connection_id, provider_event_id)` 放�
 `(connection_id, calendar_id, provider_event_id)`。迁移不得删除、合并或重写任何事件业务行；
 必须先建立并验证新的三元唯一索引，再把它挂载为稳定命名约束，最后才移除旧二元约束。
 
+现有 `CalendarEvent` 还增加 `description_aad_version` 和 `location_aad_version`。
+`description_ciphertext + description_nonce + description_key_version + description_aad_version` 必须
+全为 `NULL` 或全为非空；`location_ciphertext + location_nonce + location_key_version +
+location_aad_version` 使用相同的独立四列约束，两个字段不能共用版本标记。`aad_version` 是封闭
+版本标记：仅识别历史 `v1` 和当前 `v2`，其他值不得被当作任一已知格式读取。
+
 ### 14.2 扩展实体
 
 `ApprovalRequest` 增加：
@@ -885,10 +896,20 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    upsert 事务后应用迁移；再部署引用新三元约束的 API/Worker/Scheduler，最后恢复 Worker 与调度。
    迁移后禁止旧 Worker 回流。若 downgrade 前已产生跨日历同 ID，旧二元约束无法无损恢复，必须
    fail closed 并先由人工制定数据保留方案，迁移不得删除任一事件来强行回退。
-3. 除本节明确批准且已先建立替代事实的约束 contract 外，迁移只增加新表、新列、新索引和新状态
+3. `0019` 是紧随 CalendarEvent 身份迁移的前向 AAD 轮换 revision。Schema 变更只增加
+   `description_aad_version`、`location_aad_version` 及两个字段各自“四列全空或全非空”的检查约束；
+   数据变更仅将既有全非空 `ciphertext + nonce + key_version` 三元组标记为历史 `v1`，既有全空
+   三元组继续保持 `aad_version=NULL`。若发现任一旧三元组部分为空，升级必须 fail closed，不能
+   猜测、补齐或删除该事件。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。
+   对每个包含至少一个 v1 字段的 `(connection_id, calendar_id)`，只失效对应的非 `directory`
+   Calendar 事件 scope 游标：将 `cursor` 与 `last_success_at` 置空，并把 `last_error_code` 设为不含
+   内容的 `calendar_event_resync_required`；`directory` 游标及其 freshness、revision 和错误状态
+   必须原样保留。0019 是 forward-only；downgrade 必须拒绝移除版本列、约束或恢复 legacy AAD
+   读取，不能通过破坏性回退重新引入跨日历替换风险。
+4. 除本节明确批准且已先建立替代事实的约束 contract 外，迁移只增加新表、新列、新索引和新状态
    值；任何迁移都不得删除业务行，也不得依赖破坏性 downgrade。
-4. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
-5. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式
+5. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
+6. 先让代码兼容旧审批数据，再切换 M2 写入路径；将共享 Repository 的 Google 常量过滤改为显式
    供应商参数。
 
 ## 15. API 与 SSE
@@ -1012,6 +1033,14 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
   属性是强制边界。
 - Provider Token 继续使用带版本 AEAD；明文只存在于受控内存。
 - M2 命令、邮件正文、日程描述、地点和补偿快照使用字段或记录级 AEAD。
+- CalendarEvent 描述和地点分别验证自己的四列原子组。四列全空时字段读取为空字符串；四列非空
+  且版本为 v2 时，必须使用
+  `user_id:connection_id:calendar_id:provider_event_id:field` 作为 AAD 解密。v1 只作为历史迁移标记，
+  新写入和正常读取都禁止生成或解密 v1；读取 v1 或未知版本统一返回
+  `calendar_event_resync_required`，等待该日历受限重同步。
+- v2 解密出现 `InvalidTag` 时必须以同一稳定错误 fail closed，不能尝试 v1 AAD、去掉
+  `calendar_id`、忽略认证或返回部分明文。密文、nonce、key version、AAD version 任一被篡改，
+  都不得触发 legacy fallback。
 - 地址、主题和参会人不得进入日志、指标 label、Trace attribute 或 URL query。
 - 正式与开发默认不允许真实写入；显式运行开关和连接能力缺一不可。
 
@@ -1029,6 +1058,9 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 
 未发送草稿按最后编辑时间应用邮件正文周期。正文到期后，草稿不可再次提交，但可以保留一个
 不含内容的历史占位。
+
+CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时清空其 `ciphertext`、`nonce`、
+`key_version` 和 `aad_version`，不得留下只有版本或部分 AEAD 列非空的记录。
 
 ### 17.3 删除能力
 
@@ -1056,6 +1088,7 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 | `mail_recipient_limit_exceeded` | 422，减少地址 |
 | `mail_thread_binding_conflict` | 409，源线程已变化或不可访问 |
 | `calendar_event_version_conflict` | 409，基于最新事件重新提案 |
+| `calendar_event_resync_required` | 409/任务安全失败，等待精确日历 scope 受限重同步后重试 |
 | `calendar_recurring_event_unsupported` | 422，不支持的 M2 操作 |
 | `calendar_notification_mapping_unsupported` | 422，供应商不能无损映射 |
 | `provider_write_outcome_unknown` | 任务进入 `needs_attention` |
@@ -1107,6 +1140,7 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 能力启用、关闭、断开和执行时复核。
 - 工作时间、DST、全天事件、缓冲和候选时间算法。
 - ETag、before snapshot 和恢复规则。
+- CalendarEvent v2 AAD 的精确序列、描述/地点独立版本选择，以及全空字段读取为空。
 - ProviderWriteOutcome 与重试安全判断。
 - 模型输入裁剪、签名清洗和输出 Schema。
 
@@ -1122,6 +1156,12 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 能力在等待审批、排队和执行期间被关闭。
 - `needs_attention` 核对和人工结论竞争。
 - 日程修改与恢复的 ETag 竞争。
+- `0019` 只增加 AAD 版本列与约束，正确标记 v1/NULL，保留全部事件与 `directory` 游标，并仅把
+  相关非 directory 事件 scope 的 cursor/freshness 置空且留下 content-free
+  `calendar_event_resync_required`。
+- 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
+  v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
+  且任何路径都不得回退尝试 v1 AAD。
 - Google 增量目录与 Microsoft 完整目录快照的显式语义、空快照、缺席删除、重新出现重建和
   directory revision CAS；陈旧 Microsoft 快照不得覆盖先提交的目录事实。
 - Microsoft Calendar Worker 的 access/refresh token 轮换、无新 refresh token 保留、连续独立
@@ -1196,15 +1236,20 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - 同步游标失效能够受限回退，不扩大数据读取窗口。
 - Microsoft 完整日历目录不伪造 provider cursor；并发快照通过独立 revision CAS 拒绝陈旧提交，
   只有已声明完整的快照才执行缺席删除。
+- `0019` 不改变或删除 CalendarEvent 业务行和 directory revision；受影响事件 scope 会失去旧
+  cursor/freshness，并在 v2-only Worker 下完成受限重同步后清除
+  `calendar_event_resync_required`。
 
 ### 21.4 安全与隐私
 
 - OAuth scope 与能力矩阵一致；Microsoft 仅额外使用 delegated `User.Read` 获取 Graph `/me`
   的稳定身份，不请求目录/应用权限、Contacts、Gmail Draft 或 `Mail.ReadWrite`。
 - Token、真实命令、正文和日程敏感字段按规格加密。
+- 所有新同步的 CalendarEvent 描述和地点都标记为 v2 并绑定完整日历身份；跨日历同 event ID
+  密文互换、v2 篡改、v1/未知版本读取均 fail closed，且没有 legacy fallback。
 - 日志、Trace、指标、SSE 和 fixture 不包含敏感内容。
 - 所有修改 API 通过会话、CSRF、用户隔离和版本验证。
-- 保留和删除任务覆盖 M2 新实体及密文三元组。
+- 保留和删除任务覆盖 M2 新实体、既有密文三元组及 CalendarEvent 四列密文原子组。
 
 ### 21.5 发布门禁
 
@@ -1235,12 +1280,17 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 
 部署顺序：
 
-1. 生成加密备份并执行向前兼容迁移。
-2. 部署默认关闭外部写入的新代码。
-3. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
-4. 只为允许列表中的专用测试账户启用供应商写入。
-5. 完成人工 E2E 与审计检查。
-6. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
+1. 生成加密备份，保持外部写入默认关闭，并关闭 Calendar 周期调度。
+2. 排空并停止所有旧 Calendar Worker，确认没有旧 `sync_calendar` 任务或事件 upsert 事务仍在运行。
+3. 应用前向 `0019`，验证只新增版本列/约束、v1 标记和精确事件 scope 游标失效，且 directory
+   cursor/revision 未变化；此时仍不得恢复旧 Worker。
+4. 部署只写 v2、正常读取拒绝 v1 的 API/Worker/Scheduler 组件。0019 不支持旧新 Calendar writer
+   混跑，任何旧 Worker 都不得在迁移后回流。
+5. 重启新 Calendar Worker 与调度，对 `calendar_event_resync_required` scope 执行受限重同步；验证
+   新密文均为 v2、对应 cursor/freshness 恢复且错误清除后，才继续发布验证。
+6. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
+7. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查。
+8. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
 
 回滚应用镜像时，新表和列保留。旧 M1 版本不得读取 M2 加密命令或把新任务状态解释为普通
 失败；因此只有在所有 M2 任务均为终态时才允许回滚到 M1 代码。若仍有 `reconciling` 或
@@ -1254,6 +1304,7 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 | 会话被短暂接管后批准写入 | Secure/HttpOnly/SameSite、CSRF、10 分钟决定窗口、5 分钟认领窗口、会话撤销 |
 | 多账户选择错误 | 回复绑定原连接、新建使用可切换默认值、审批展示精确账户 |
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
+| CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
