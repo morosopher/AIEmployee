@@ -1,8 +1,8 @@
 """验证 M1 对话 API、幂等消息及 worker 意图边界。"""
 
 import asyncio
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import TypeVar
 from uuid import UUID, uuid4
 
@@ -10,11 +10,14 @@ import pytest
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 
-from ai_employee.application.ports.model import ModelResponse, ModelUsage
+from ai_employee.application.ports.model import ModelGateway, ModelResponse, ModelUsage
 from ai_employee.application.use_cases.conversations import UNSUPPORTED_RESPONSE
-from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
+from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.application.use_cases.task_views import CancelTaskUseCase
 from ai_employee.domain.briefs import ConversationIntent
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.actions import MailDraftModel, MailDraftVersionModel
 from ai_employee.infrastructure.db.models.briefs import (
@@ -35,6 +38,11 @@ from ai_employee.infrastructure.db.models.tasks import (
     TaskRunModel,
     ToolExecutionModel,
 )
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
+from ai_employee.infrastructure.db.repositories.task_views import SqlAlchemyTaskViewStore
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.conversation import ConversationTaskStep
@@ -104,6 +112,90 @@ async def _create_conversation(clients: AuthenticatedApiClients) -> UUID:
     response = await clients.owner.post("/api/v1/conversations", headers={"X-CSRF-Token": csrf})
     assert response.status_code == 201
     return UUID(response.json()["id"])
+
+
+async def _seed_conversation_runner_task(
+    clients: AuthenticatedApiClients,
+    *,
+    content: str,
+    gateway: ModelGateway,
+    now: datetime,
+    configure_mail: bool = False,
+) -> tuple[UUID, UUID, ConversationTaskStep]:
+    """创建真实会话和 QUEUED 任务，并按需配置可用默认发信连接。"""
+    conversation_id = await _create_conversation(clients)
+    async with clients.session_factory.begin() as session:
+        if configure_mail:
+            connection = OAuthConnectionModel(
+                user_id=clients.owner_id,
+                provider="google",
+                provider_account_id=f"runner-conversation-{uuid4()}",
+                account_email="owner@example.test",
+                scopes=[],
+                status="connected",
+            )
+            session.add(connection)
+            await session.flush()
+            session.add_all(
+                ConnectionCapabilityModel(
+                    user_id=clients.owner_id,
+                    connection_id=connection.id,
+                    capability=capability.value,
+                    status="enabled",
+                    actual_scopes=[],
+                )
+                for capability in (
+                    ConnectionCapability.MAIL_READ,
+                    ConnectionCapability.MAIL_SEND,
+                )
+            )
+            owner = await session.get(UserModel, clients.owner_id)
+            assert owner is not None
+            owner.default_mail_connection_id = connection.id
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status=TaskStatus.QUEUED.value,
+            idempotency_key=f"conversation-runner:{uuid4()}",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": content,
+            },
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+    step = ConversationTaskStep(
+        clients.session_factory,
+        model_gateway=gateway,
+        action_cipher=ActionPayloadCipher.from_key(b"v" * 32),
+        clock=lambda: now,
+    )
+    return conversation_id, task_id, step
+
+
+def _conversation_runner(
+    session_factory: ManagedAsyncSessionMaker,
+    *,
+    step: ConversationTaskStep,
+    now: datetime,
+) -> DurableTaskRunner:
+    """构造仅执行真实 ConversationTaskStep 的 PostgreSQL DurableTaskRunner。"""
+    return DurableTaskRunner(
+        store=SqlAlchemyTaskExecutionStore(session_factory),
+        clock=lambda: now,
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=30,
+        max_transient_retries=0,
+        resolve_steps=lambda _task: (step,),
+    )
+
+
+async def _wait_for_blocked_cancel(cancel: Awaitable[object]) -> None:
+    """要求取消在短观察窗内仍等待，证明 Worker 正持有 TaskRun 行锁。"""
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(cancel), timeout=0.1)
 
 
 @pytest.mark.asyncio
@@ -218,6 +310,265 @@ async def test_conversation_drops_result_when_lease_changes_during_model_call(
     assert reply_count == 0
     assert invocation_count == 0
     assert draft_count == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_committed_result_beats_cancel_waiting_on_task_lock(
+    authenticated_api_clients: AuthenticatedApiClients,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最终事务先持锁时，排队取消必须在对话结果提交后冲突且任务成功。"""
+    clients = authenticated_api_clients
+    now = datetime(2026, 8, 9, 11, 0, tzinfo=UTC)
+    draft_created = asyncio.Event()
+    release_create = asyncio.Event()
+    original_create_new = MailDraftUseCase.create_new
+
+    async def create_new_then_block(
+        use_case: MailDraftUseCase,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """完成真实草稿写入后阻塞，保持外层 TaskRun 行锁和事务尚未提交。"""
+        result = await original_create_new(  # type: ignore[arg-type]
+            use_case,
+            *args,
+            **kwargs,
+        )
+        draft_created.set()
+        await release_create.wait()
+        return result
+
+    monkeypatch.setattr(MailDraftUseCase, "create_new", create_new_then_block)
+    try:
+        conversation_id, task_id, step = await _seed_conversation_runner_task(
+            clients,
+            content="Please prepare an email to recipient@example.test",
+            gateway=FakeModelGateway(),
+            now=now,
+            configure_mail=True,
+        )
+        runner_task = asyncio.create_task(
+            _conversation_runner(clients.session_factory, step=step, now=now).run(
+                task_id,
+                lease_owner="conversation-lock-owner",
+            )
+        )
+        await asyncio.wait_for(draft_created.wait(), timeout=2)
+        cancel_task = asyncio.create_task(
+            CancelTaskUseCase(SqlAlchemyTaskViewStore(clients.session_factory)).execute(
+                task_id=task_id,
+                user_id=clients.owner_id,
+                now=now + timedelta(seconds=1),
+            )
+        )
+        await _wait_for_blocked_cancel(cancel_task)
+
+        release_create.set()
+        runner_result, cancel_result = await asyncio.gather(
+            runner_task,
+            cancel_task,
+            return_exceptions=True,
+        )
+
+        assert runner_result is True
+        assert isinstance(cancel_result, StateConflictError)
+        assert cancel_result.error_code == "task_state_conflict"
+        async with clients.session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            reply = await session.scalar(
+                select(MessageModel).where(
+                    MessageModel.user_id == clients.owner_id,
+                    MessageModel.task_id == task_id,
+                    MessageModel.role == "assistant",
+                )
+            )
+            draft_count = await session.scalar(
+                select(func.count()).select_from(MailDraftModel).where(
+                    MailDraftModel.user_id == clients.owner_id
+                )
+            )
+            version_count = await session.scalar(
+                select(func.count()).select_from(MailDraftVersionModel).where(
+                    MailDraftVersionModel.user_id == clients.owner_id
+                )
+            )
+            cancelled_audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type == "task.cancelled",
+                )
+            )
+        assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+        assert reply is not None
+        assert task.result_payload == {
+            "conversation_id": str(conversation_id),
+            "assistant_message_id": str(reply.id),
+        }
+        assert draft_count == 1
+        assert version_count == 1
+        assert cancelled_audit_count == 0
+    finally:
+        release_create.set()
+
+
+@pytest.mark.asyncio
+async def test_conversation_cancel_wins_before_final_result_transaction(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """取消在模型 I/O 阶段先提交时，Worker 不得留下回复、草稿或调用元数据。"""
+    clients = authenticated_api_clients
+    now = datetime(2026, 8, 9, 11, 5, tzinfo=UTC)
+    gateway = _BlockingConversationGateway()
+    conversation_id, task_id, step = await _seed_conversation_runner_task(
+        clients,
+        content="Could you outline what this assistant can do?",
+        gateway=gateway,
+        now=now,
+    )
+    runner_task = asyncio.create_task(
+        _conversation_runner(clients.session_factory, step=step, now=now).run(
+            task_id,
+            lease_owner="conversation-cancel-first-owner",
+        )
+    )
+    await asyncio.wait_for(gateway.started.wait(), timeout=2)
+
+    cancelled = await CancelTaskUseCase(
+        SqlAlchemyTaskViewStore(clients.session_factory)
+    ).execute(
+        task_id=task_id,
+        user_id=clients.owner_id,
+        now=now + timedelta(seconds=1),
+    )
+    gateway.release.set()
+
+    assert cancelled is not None and cancelled.status is TaskStatus.CANCELLED
+    assert await runner_task is False
+    async with clients.session_factory() as session:
+        task = await session.get(TaskRunModel, task_id)
+        reply_count = await session.scalar(
+            select(func.count()).select_from(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.conversation_id == conversation_id,
+                MessageModel.task_id == task_id,
+                MessageModel.role == "assistant",
+            )
+        )
+        invocation_count = await session.scalar(
+            select(func.count()).select_from(LLMInvocationModel).where(
+                LLMInvocationModel.user_id == clients.owner_id,
+                LLMInvocationModel.task_id == task_id,
+            )
+        )
+        draft_count = await session.scalar(
+            select(func.count()).select_from(MailDraftModel).where(
+                MailDraftModel.user_id == clients.owner_id
+            )
+        )
+    assert task is not None
+    assert task.status == TaskStatus.CANCELLED.value
+    assert task.result_payload is None
+    assert reply_count == 0
+    assert invocation_count == 0
+    assert draft_count == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_crash_after_result_commit_replays_without_duplicate_side_effects(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """结果提交后未 finish 时，取消冲突且过期接管可补旧 assistant 缺失的结果标记。"""
+    clients = authenticated_api_clients
+    now = datetime(2026, 8, 9, 11, 10, tzinfo=UTC)
+    recovery_now = now + timedelta(seconds=2)
+    gateway = FakeModelGateway()
+    conversation_id, task_id, step = await _seed_conversation_runner_task(
+        clients,
+        content="what should I focus on",
+        gateway=gateway,
+        now=now,
+    )
+    store = SqlAlchemyTaskExecutionStore(clients.session_factory)
+    leased = await store.acquire(
+        task_id=task_id,
+        lease_owner="conversation-crashed-owner",
+        now=now,
+        lease_expires_at=now + timedelta(seconds=1),
+    )
+    assert leased is not None
+    await step.execute(leased)
+
+    async with clients.session_factory() as session:
+        committed_task = await session.get(TaskRunModel, task_id)
+        committed_reply = await session.scalar(
+            select(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task_id,
+                MessageModel.role == "assistant",
+            )
+        )
+    assert committed_task is not None and committed_reply is not None
+    assert committed_task.result_payload == {
+        "conversation_id": str(conversation_id),
+        "assistant_message_id": str(committed_reply.id),
+    }
+    with pytest.raises(StateConflictError) as conflict:
+        await CancelTaskUseCase(SqlAlchemyTaskViewStore(clients.session_factory)).execute(
+            task_id=task_id,
+            user_id=clients.owner_id,
+            now=now + timedelta(milliseconds=500),
+        )
+    assert conflict.value.error_code == "task_state_conflict"
+
+    # 模拟升级前已提交 assistant 但尚无 marker 的遗留窗口；接管必须只补标记。
+    async with clients.session_factory.begin() as session:
+        await session.execute(
+            update(TaskRunModel)
+            .where(TaskRunModel.id == task_id)
+            .values(result_payload=None)
+        )
+    recovered = await _conversation_runner(
+        clients.session_factory,
+        step=step,
+        now=recovery_now,
+    ).run(task_id, lease_owner="conversation-recovery-owner")
+
+    assert recovered is True
+    assert len(gateway.calls) == 1
+    async with clients.session_factory() as session:
+        task = await session.get(TaskRunModel, task_id)
+        replies = tuple(
+            (
+                await session.scalars(
+                    select(MessageModel).where(
+                        MessageModel.user_id == clients.owner_id,
+                        MessageModel.task_id == task_id,
+                        MessageModel.role == "assistant",
+                    )
+                )
+            ).all()
+        )
+        invocation_count = await session.scalar(
+            select(func.count()).select_from(LLMInvocationModel).where(
+                LLMInvocationModel.user_id == clients.owner_id,
+                LLMInvocationModel.task_id == task_id,
+            )
+        )
+        cancelled_audit_count = await session.scalar(
+            select(func.count()).select_from(AuditEventModel).where(
+                AuditEventModel.task_id == task_id,
+                AuditEventModel.event_type == "task.cancelled",
+            )
+        )
+    assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+    assert len(replies) == 1
+    assert task.result_payload == {
+        "conversation_id": str(conversation_id),
+        "assistant_message_id": str(replies[0].id),
+    }
+    assert invocation_count == 1
+    assert cancelled_audit_count == 0
 
 
 @pytest.mark.asyncio

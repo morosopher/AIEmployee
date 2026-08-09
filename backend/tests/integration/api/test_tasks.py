@@ -10,6 +10,7 @@ from fastapi import Response
 from sqlalchemy import select
 
 from ai_employee.config import get_settings
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel, TaskStepModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
@@ -316,6 +317,54 @@ async def test_cancel_and_retry_create_a_replacement(
         ),
         ("task.queued", {"status": "queued"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_running_task_with_committed_result(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """最终结果已与业务副作用提交后，通用取消不得覆盖仍待 Runner 收尾的任务。"""
+    client, session_factory, user_id = task_client
+    lease_owner = "committed-result-worker"
+    async with session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="mail_draft.generate",
+            status=TaskStatus.RUNNING.value,
+            lease_owner=lease_owner,
+            idempotency_key="cancel-committed-result",
+            input_payload={},
+            result_payload={"generation_status": "succeeded"},
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+    response = await client.post(
+        f"/api/v1/tasks/{task_id}/cancel",
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "task_state_conflict"
+    async with session_factory() as session:
+        persisted = await session.get(TaskRunModel, task_id)
+        cancelled_events = tuple(
+            (
+                await session.scalars(
+                    select(AuditEventModel).where(
+                        AuditEventModel.task_id == task_id,
+                        AuditEventModel.event_type == "task.cancelled",
+                    )
+                )
+            ).all()
+        )
+    assert persisted is not None
+    assert persisted.status == TaskStatus.RUNNING.value
+    assert persisted.lease_owner == lease_owner
+    assert persisted.result_payload == {"generation_status": "succeeded"}
+    assert cancelled_events == ()
 
 
 @pytest.mark.asyncio

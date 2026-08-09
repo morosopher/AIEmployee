@@ -109,6 +109,9 @@ class SqlAlchemyTaskViewStore:
 
         取消状态、审计事件必须同事务提交；响应快照则在提交后另开 ``REPEATABLE READ``
         事务读取，避免默认 ``READ COMMITTED`` 的多条查询让事件游标超前于任务或步骤。
+        Worker 的最终业务事务会在仍为 ``running`` 时写入无敏感内容的 ``result_payload``
+        marker；取消拿到同一行锁后若看到 marker，说明外部可见结果已经提交，只能让 Runner
+        继续以 owner CAS 收敛为成功，不能再把已完成事实改写为取消。
         """
         async with self._session_factory.begin() as session:
             task = await session.scalar(
@@ -118,7 +121,13 @@ class SqlAlchemyTaskViewStore:
             )
             if task is None:
                 return None
-            transition_task(TaskStatus(task.status), TaskStatus.CANCELLED)
+            current_status = TaskStatus(task.status)
+            if current_status is TaskStatus.RUNNING and task.result_payload is not None:
+                raise StateConflictError(
+                    error_code="task_state_conflict",
+                    message="task result is already committed",
+                )
+            transition_task(current_status, TaskStatus.CANCELLED)
             task.status = TaskStatus.CANCELLED.value
             task.finished_at = now
             task.lease_owner = None

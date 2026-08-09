@@ -24,7 +24,7 @@ from ai_employee.application.use_cases.mail_drafts import (
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.mail_actions import MailMode
-from ai_employee.domain.tasks import TaskStatus
+from ai_employee.domain.tasks import JsonValue, TaskStatus
 from ai_employee.infrastructure.db.models.briefs import (
     DailyBriefModel,
     LLMInvocationModel,
@@ -67,7 +67,12 @@ class ConversationTaskStep:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     async def execute(self, task: LeasedTask) -> None:
-        """按窄意图规则写入一个最终 assistant 消息，并对重复投递先行短路。"""
+        """按窄意图写最终 assistant 与结果 marker，并对重复投递先行短路。
+
+        assistant、可选本地草稿、模型调用元数据和不含正文的 ``result_payload`` 必须位于
+        同一最终事务。marker 既供崩溃接管短路，也让排队取消在取得 TaskRun 行锁后证明
+        业务结果已提交；Runner 随后只需以既有 owner CAS 收敛任务成功终态。
+        """
         if task.user_id is None:
             raise ValueError("conversation.respond requires user_id")
         lease_owner = _required_lease_owner(task)
@@ -79,7 +84,7 @@ class ConversationTaskStep:
         # 至少一次重复投递先在数据库短路，绝不在已完成任务上再次调用模型。
         async with self._session_factory() as session:
             owned_task = await session.scalar(
-                select(TaskRunModel.id).where(
+                select(TaskRunModel).where(
                     TaskRunModel.id == task.task_id,
                     TaskRunModel.user_id == task.user_id,
                     TaskRunModel.status == TaskStatus.RUNNING.value,
@@ -87,6 +92,8 @@ class ConversationTaskStep:
                 )
             )
             if owned_task is None:
+                return
+            if owned_task.result_payload is not None:
                 return
             existing = await session.scalar(
                 select(MessageModel.id).where(
@@ -96,7 +103,34 @@ class ConversationTaskStep:
                 )
             )
         if existing is not None:
-            return
+            # 升级前可能已提交 assistant 却没有 marker。接管者必须重新锁定同一 TaskRun，
+            # 确认 owner 未变后只补无内容 marker；不能重跑模型或制造第二条回复。
+            async with self._session_factory.begin() as session:
+                task_row = await session.scalar(
+                    select(TaskRunModel)
+                    .where(
+                        TaskRunModel.id == task.task_id,
+                        TaskRunModel.user_id == task.user_id,
+                        TaskRunModel.status == TaskStatus.RUNNING.value,
+                        TaskRunModel.lease_owner == lease_owner,
+                    )
+                    .with_for_update()
+                )
+                if task_row is None or task_row.result_payload is not None:
+                    return
+                existing = await session.scalar(
+                    select(MessageModel.id).where(
+                        MessageModel.user_id == task.user_id,
+                        MessageModel.task_id == task.task_id,
+                        MessageModel.role == "assistant",
+                    )
+                )
+                if existing is not None:
+                    task_row.result_payload = _conversation_result_payload(
+                        conversation_id=conversation_id,
+                        assistant_message_id=existing,
+                    )
+                    return
         deterministic = classify_conversation_intent(raw_content)
         intent = deterministic["intent"]
         invocation_metadata: list[dict[str, Any]] = []
@@ -111,8 +145,8 @@ class ConversationTaskStep:
                 )
             ).intent
         async with self._session_factory.begin() as session:
-            owned_task = await session.scalar(
-                select(TaskRunModel.id)
+            task_row = await session.scalar(
+                select(TaskRunModel)
                 .where(
                     TaskRunModel.id == task.task_id,
                     TaskRunModel.user_id == task.user_id,
@@ -121,8 +155,10 @@ class ConversationTaskStep:
                 )
                 .with_for_update()
             )
-            if owned_task is None:
+            if task_row is None:
                 # 分类 I/O 期间取消或换 owner 后，旧 Worker 不得写消息、草稿或模型元数据。
+                return
+            if task_row.result_payload is not None:
                 return
             existing = await session.scalar(
                 select(MessageModel.id).where(
@@ -132,6 +168,10 @@ class ConversationTaskStep:
                 )
             )
             if existing is not None:
+                task_row.result_payload = _conversation_result_payload(
+                    conversation_id=conversation_id,
+                    assistant_message_id=existing,
+                )
                 return
             if intent == "show_latest_brief":
                 brief = await session.scalar(select(DailyBriefModel).where(DailyBriefModel.user_id == task.user_id).order_by(DailyBriefModel.local_date.desc(), DailyBriefModel.version.desc()))
@@ -206,7 +246,21 @@ class ConversationTaskStep:
                 )
                 for metadata in invocation_metadata
             )
-            session.add(MessageModel(user_id=task.user_id, conversation_id=conversation_id, role="assistant", content_markdown=text, task_id=task.task_id, created_at=datetime.now(UTC)))
+            assistant = MessageModel(
+                user_id=task.user_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content_markdown=text,
+                task_id=task.task_id,
+                created_at=datetime.now(UTC),
+            )
+            session.add(assistant)
+            # UUID 默认值在 INSERT 时生成；显式 flush 后才能把稳定消息 ID 绑定进同一事务 marker。
+            await session.flush()
+            task_row.result_payload = _conversation_result_payload(
+                conversation_id=conversation_id,
+                assistant_message_id=assistant.id,
+            )
 
     def _mail_draft_cipher(self) -> ActionPayloadCipher:
         """返回本地草稿 AEAD，并只在首次明确草稿请求时读取受控 Secret 文件。"""
@@ -218,6 +272,18 @@ class ConversationTaskStep:
             AeadCipher.from_file(self._action_cipher_file)
         )
         return self._action_cipher
+
+
+def _conversation_result_payload(
+    *,
+    conversation_id: UUID,
+    assistant_message_id: UUID,
+) -> dict[str, JsonValue]:
+    """构造不含对话正文、Prompt 或草稿内容的稳定完成 marker。"""
+    return {
+        "conversation_id": str(conversation_id),
+        "assistant_message_id": str(assistant_message_id),
+    }
 
 
 def _required_lease_owner(task: LeasedTask) -> str:

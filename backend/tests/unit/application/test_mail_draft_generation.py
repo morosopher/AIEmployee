@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Self
 from uuid import uuid4
 
 import pytest
@@ -13,10 +14,27 @@ from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.generate_mail_draft import (
     MailDraftContextMessage,
     MailDraftModelOutput,
+    _mask_mailbox_addresses,
     build_mail_draft_context,
     load_mail_draft_prompt,
     mail_draft_model_messages,
 )
+
+
+class _IndexCountingText(str):
+    """统计生产扫描器通过整数索引访问字符的次数，不改变字符串语义。"""
+
+    def __new__(cls, value: str) -> Self:
+        """创建携带独立访问计数的不可变字符串实例。"""
+        instance = super().__new__(cls, value)
+        instance.index_accesses = 0
+        return instance
+
+    def __getitem__(self, key: int | slice) -> str:
+        """整数索引计为一次字符访问；切片只用于构造候选，不按长度放大计数。"""
+        if isinstance(key, int):
+            self.index_accesses += 1
+        return super().__getitem__(key)
 
 
 def test_model_output_forbids_recipient_and_subject_fields() -> None:
@@ -138,6 +156,25 @@ def test_model_context_preserves_non_mailbox_at_sign_text() -> None:
     assert payload["related_body_facts"] == [
         "Keep @team, A @ B, file@localhost and 版本@草案 literal."
     ]
+
+
+def test_mailbox_masking_visits_adversarial_escaped_quotes_linearly() -> None:
+    """大量转义引号加 ``@`` 不得触发对既有前缀的重复回扫。"""
+    text = _IndexCountingText('\\"@' * 8_000)
+
+    masked = _mask_mailbox_addresses(text)
+
+    assert masked == text
+    assert text.index_accesses <= len(text) * 12
+
+
+def test_mailbox_masking_handles_escaped_quote_and_quoted_smtputf8_boundaries() -> None:
+    """quoted local-part 内的转义引号与 Unicode/IDN 地址必须整段掩码并保留标点。"""
+    text = 'Keep \\"@ literal; send to ("用户 \\"别名"@例子.测试)!'
+
+    assert _mask_mailbox_addresses(text) == (
+        'Keep \\"@ literal; send to ([ADDRESS_REMOVED])!'
+    )
 
 
 def test_prompt_forbids_model_control_and_requires_uncertainty() -> None:

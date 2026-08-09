@@ -547,12 +547,14 @@ def _sanitize_model_text(
 
 
 def _mask_mailbox_addresses(text: str) -> str:
-    """以有界扫描和语法校验掩码模型文本中的疑似 Internet 邮箱地址。
+    """以单遍状态机和语法校验掩码模型文本中的疑似 Internet 邮箱地址。
 
-    扫描器只围绕真实 ``@`` 定位候选，不把整段 prose 交给宽松 Header 解析器。候选必须同时
-    具有可解释的 local-part 和至少两段的 DNS/IDN 域；ASCII 与标准 quoted local-part 优先
-    复用领域地址解析器，SMTPUTF8 local-part 则在域通过 IDNA 校验后 fail-safe 掩码。这样既
-    覆盖 quoted、大小写和国际化地址，也保留 ``@team``、``A @ B`` 与 ``file@localhost``。
+    前向扫描只维护当前 unquoted local-part 起点、成对 quoted 起点、刚闭合 quoted span 和
+    连续反斜杠奇偶。遇到真实 ``@`` 才向前验证一次域，绝不为 quoted 候选重新扫描既有前缀，
+    因而即使输入含大量转义引号也保持线性访问。候选必须同时具有可解释的 local-part 和至少
+    两段的 DNS/IDN 域；ASCII 与标准 quoted local-part 优先复用领域地址解析器，SMTPUTF8
+    local-part 则在域通过 IDNA 校验后 fail-safe 掩码。这样既覆盖 quoted、大小写和国际化
+    地址，也保留 ``@team``、``A @ B`` 与 ``file@localhost``。
 
     Args:
         text: 尚未进入模型、可包含自然语言标点的本地文本。
@@ -562,37 +564,91 @@ def _mask_mailbox_addresses(text: str) -> str:
     """
     pieces: list[str] = []
     copied_until = 0
-    search_from = 0
-    while (at_index := text.find("@", search_from)) >= 0:
-        span = _mailbox_span_at(text, at_index)
-        if span is None:
-            search_from = at_index + 1
+    index = 0
+    unquoted_start: int | None = None
+    quoted_start: int | None = None
+    closed_quoted_start: int | None = None
+    backslash_run = 0
+    text_length = len(text)
+
+    while index < text_length:
+        character = text[index]
+        if character == "\\":
+            # 反斜杠不属于 unquoted local-part；连续数量留到下一字符判断 quote 是否转义。
+            backslash_run += 1
+            unquoted_start = None
+            closed_quoted_start = None
+            index += 1
             continue
-        start, end = span
-        if start < copied_until:
-            search_from = at_index + 1
+
+        escaped = backslash_run % 2 == 1
+        backslash_run = 0
+        if character == '"':
+            unquoted_start = None
+            closed_quoted_start = None
+            if not escaped:
+                if quoted_start is None:
+                    quoted_start = index
+                else:
+                    # 只把未转义 quote 配成闭合 span；转义 quote 永远不能伪装 local-part 结尾。
+                    closed_quoted_start = quoted_start
+                    quoted_start = None
+            index += 1
             continue
-        pieces.extend((text[copied_until:start], _ADDRESS_REPLACEMENT))
-        copied_until = end
-        search_from = end
+
+        if character == "@":
+            local_start = (
+                closed_quoted_start
+                if closed_quoted_start is not None
+                else unquoted_start
+            )
+            closed_quoted_start = None
+            unquoted_start = None
+            if local_start is not None and local_start >= copied_until:
+                end = _validated_mailbox_end(
+                    text,
+                    local_start=local_start,
+                    at_index=index,
+                )
+                if end is not None:
+                    pieces.extend(
+                        (text[copied_until:local_start], _ADDRESS_REPLACEMENT)
+                    )
+                    copied_until = end
+                    # 域字符已由验证器访问，直接跳到 span 末尾，避免主循环再次扫描。
+                    index = end
+                    continue
+            index += 1
+            continue
+
+        closed_quoted_start = None
+        if _is_unquoted_local_character(character):
+            if unquoted_start is None:
+                unquoted_start = index
+        else:
+            unquoted_start = None
+        index += 1
+
     pieces.append(text[copied_until:])
     return "".join(pieces)
 
 
-def _mailbox_span_at(text: str, at_index: int) -> tuple[int, int] | None:
-    """返回指定 ``@`` 所属的可信候选 span；普通 prose 分隔符返回 ``None``。"""
-    start = _local_part_start(text, at_index)
-    if start is None:
-        return None
+def _validated_mailbox_end(
+    text: str,
+    *,
+    local_start: int,
+    at_index: int,
+) -> int | None:
+    """验证状态机定位的 local-part，并返回可信邮箱候选的域末尾。"""
     end = _domain_end(text, at_index + 1)
     if end is None:
         return None
 
-    local_part = text[start:at_index]
+    local_part = text[local_start:at_index]
     domain = text[at_index + 1 : end]
     if not _is_plausible_mail_domain(domain):
         return None
-    candidate = text[start:end]
+    candidate = text[local_start:end]
     try:
         normalize_mailbox_address(candidate)
     except ValueError:
@@ -601,38 +657,7 @@ def _mailbox_span_at(text: str, at_index: int) -> tuple[int, int] | None:
         # 高度疑似邮箱的国际化形式，不把原始候选带入异常或日志。
         if not _is_plausible_mail_local_part(local_part):
             return None
-    return start, end
-
-
-def _local_part_start(text: str, at_index: int) -> int | None:
-    """从 ``@`` 向左提取 unquoted 或成对 quoted local-part 的起点。"""
-    if at_index == 0:
-        return None
-    local_end = at_index
-    if text[local_end - 1] == '"':
-        opening_quote = _find_unescaped_opening_quote(text, local_end - 1)
-        return opening_quote
-
-    start = local_end
-    while start > 0 and _is_unquoted_local_character(text[start - 1]):
-        start -= 1
-    return start if start < local_end else None
-
-
-def _find_unescaped_opening_quote(text: str, closing_quote: int) -> int | None:
-    """向左寻找与 quoted local-part 结尾配对且未被反斜杠转义的双引号。"""
-    index = closing_quote - 1
-    while index >= 0:
-        if text[index] == '"':
-            backslashes = 0
-            cursor = index - 1
-            while cursor >= 0 and text[cursor] == "\\":
-                backslashes += 1
-                cursor -= 1
-            if backslashes % 2 == 0:
-                return index
-        index -= 1
-    return None
+    return end
 
 
 def _domain_end(text: str, start: int) -> int | None:

@@ -1,8 +1,9 @@
 """验证 Task 14 用例与现有不可变草稿 Repository 的组合行为。"""
 
 import asyncio
+from collections.abc import Awaitable
 from datetime import UTC, datetime, time, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select, update
@@ -12,7 +13,8 @@ from ai_employee.application.use_cases.mail_drafts import (
     MailDraftUseCase,
     UpdateMailDraftInput,
 )
-from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.application.use_cases.task_views import CancelTaskUseCase
 from ai_employee.domain.actions import MailDraftStatus
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
@@ -30,7 +32,11 @@ from ai_employee.infrastructure.db.models.sources import (
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
-from ai_employee.infrastructure.db.session import build_session_factory
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
+from ai_employee.infrastructure.db.repositories.task_views import SqlAlchemyTaskViewStore
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.llm.fake import FakeModelGateway
@@ -58,6 +64,112 @@ class _BlockingMailDraftGateway(FakeModelGateway):
         self.started.set()
         await self.release.wait()
         return await super().complete(**kwargs)
+
+
+async def _seed_generation_runner_task(
+    session_factory: ManagedAsyncSessionMaker,
+    *,
+    action_cipher: ActionPayloadCipher,
+    gateway: FakeModelGateway,
+    now: datetime,
+) -> tuple[UUID, UUID, UUID, GenerateMailDraftTaskStep]:
+    """创建真实用户、连接、版本一草稿和 QUEUED 生成任务，供 Runner 时序测试复用。"""
+    user_id, connection_id = uuid4(), uuid4()
+    async with session_factory.begin() as session:
+        session.add_all(
+            (
+                UserModel(
+                    id=user_id,
+                    email=f"runner-generation-{user_id}@example.test",
+                    display_name="Synthetic Runner Generation User",
+                    password_hash=None,
+                    timezone="UTC",
+                    locale="en-US",
+                    brief_time=time(8, 0),
+                ),
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=user_id,
+                    provider="google",
+                    provider_account_id=f"runner-generation-{connection_id}",
+                    account_email="owner@example.test",
+                    scopes=[],
+                    status="connected",
+                ),
+                ConnectionCapabilityModel(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    capability=ConnectionCapability.MAIL_READ.value,
+                    status=CapabilityStatus.ENABLED.value,
+                    actual_scopes=[],
+                ),
+                ConnectionCapabilityModel(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    capability=ConnectionCapability.MAIL_SEND.value,
+                    status=CapabilityStatus.ENABLED.value,
+                    actual_scopes=[],
+                ),
+            )
+        )
+    async with session_factory.begin() as session:
+        repository = SqlAlchemyMailDraftRepository(session, action_cipher)
+        draft = await MailDraftUseCase(
+            drafts=repository,
+            connections=repository,
+            clock=lambda: now,
+        ).create_new(
+            user_id=user_id,
+            connection_id=connection_id,
+            idempotency_key=f"runner-generation-draft:{user_id}",
+        )
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="mail_draft.generate",
+            status=TaskStatus.QUEUED.value,
+            idempotency_key=f"runner-generation-task:{user_id}",
+            input_payload={
+                "draft_id": str(draft.draft_id),
+                "expected_version": 1,
+                "instruction": "Write a synthetic body",
+            },
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+    step = GenerateMailDraftTaskStep(
+        session_factory=session_factory,
+        action_cipher=action_cipher,
+        source_cipher=AeadCipher(b"s" * 32),
+        model_gateway=gateway,
+        model_name="fake-mail-model",
+        clock=lambda: now,
+    )
+    return user_id, draft.draft_id, task_id, step
+
+
+def _generation_runner(
+    session_factory: ManagedAsyncSessionMaker,
+    *,
+    step: GenerateMailDraftTaskStep,
+    now: datetime,
+) -> DurableTaskRunner:
+    """构造仅执行真实生成步骤的 PostgreSQL DurableTaskRunner。"""
+    return DurableTaskRunner(
+        store=SqlAlchemyTaskExecutionStore(session_factory),
+        clock=lambda: now,
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=30,
+        max_transient_retries=0,
+        resolve_steps=lambda _task: (step,),
+    )
+
+
+async def _wait_for_blocked_cancel(cancel: Awaitable[object]) -> None:
+    """要求取消在短观察窗内仍未返回，证明它正等待 Worker 持有的 TaskRun 行锁。"""
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(cancel), timeout=0.1)
 
 
 @pytest.mark.asyncio
@@ -241,6 +353,226 @@ async def test_generation_drops_result_when_lease_changes_during_model_call(
         assert audit_count == 0
     finally:
         gateway.release.set()
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generation_committed_result_beats_cancel_waiting_on_task_lock(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生成最终事务先持锁时，排队取消必须在结果提交后冲突且任务最终成功。"""
+    now = datetime(2026, 8, 9, 10, 0, tzinfo=UTC)
+    session_factory = build_session_factory(database_url)
+    action_cipher = ActionPayloadCipher.from_key(b"g" * 32)
+    update_completed = asyncio.Event()
+    release_update = asyncio.Event()
+    original_update = MailDraftUseCase.update
+
+    async def update_then_block(
+        use_case: MailDraftUseCase,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """完成真实草稿 CAS/flush 后阻塞，保持外层 TaskRun 行锁和事务尚未提交。"""
+        result = await original_update(use_case, *args, **kwargs)  # type: ignore[arg-type]
+        update_completed.set()
+        await release_update.wait()
+        return result
+
+    monkeypatch.setattr(MailDraftUseCase, "update", update_then_block)
+    try:
+        user_id, draft_id, task_id, step = await _seed_generation_runner_task(
+            session_factory,
+            action_cipher=action_cipher,
+            gateway=FakeModelGateway(),
+            now=now,
+        )
+        runner_task = asyncio.create_task(
+            _generation_runner(session_factory, step=step, now=now).run(
+                task_id,
+                lease_owner="generation-lock-owner",
+            )
+        )
+        await asyncio.wait_for(update_completed.wait(), timeout=2)
+        cancel_task = asyncio.create_task(
+            CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+                task_id=task_id,
+                user_id=user_id,
+                now=now + timedelta(seconds=1),
+            )
+        )
+        await _wait_for_blocked_cancel(cancel_task)
+
+        release_update.set()
+        runner_result, cancel_result = await asyncio.gather(
+            runner_task,
+            cancel_task,
+            return_exceptions=True,
+        )
+
+        assert runner_result is True
+        assert isinstance(cancel_result, StateConflictError)
+        assert cancel_result.error_code == "task_state_conflict"
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            draft = await session.get(MailDraftModel, draft_id)
+            invocation_count = await session.scalar(
+                select(func.count()).select_from(LLMInvocationModel).where(
+                    LLMInvocationModel.task_id == task_id
+                )
+            )
+            business_audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type == "mail_draft.generated",
+                )
+            )
+            cancelled_audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type == "task.cancelled",
+                )
+            )
+        assert task is not None
+        assert task.status == TaskStatus.SUCCEEDED.value
+        assert task.result_payload is not None
+        assert draft is not None and draft.current_version == 2
+        assert invocation_count == 1
+        assert business_audit_count == 1
+        assert cancelled_audit_count == 0
+    finally:
+        release_update.set()
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generation_cancel_wins_before_final_result_transaction(
+    database_url: str,
+) -> None:
+    """取消在模型 I/O 阶段先锁定任务时，Worker 不得留下任何生成结果。"""
+    now = datetime(2026, 8, 9, 10, 5, tzinfo=UTC)
+    session_factory = build_session_factory(database_url)
+    gateway = _BlockingMailDraftGateway()
+    try:
+        user_id, draft_id, task_id, step = await _seed_generation_runner_task(
+            session_factory,
+            action_cipher=ActionPayloadCipher.from_key(b"h" * 32),
+            gateway=gateway,
+            now=now,
+        )
+        runner_task = asyncio.create_task(
+            _generation_runner(session_factory, step=step, now=now).run(
+                task_id,
+                lease_owner="generation-cancel-first-owner",
+            )
+        )
+        await asyncio.wait_for(gateway.started.wait(), timeout=2)
+
+        cancelled = await CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+            task_id=task_id,
+            user_id=user_id,
+            now=now + timedelta(seconds=1),
+        )
+        gateway.release.set()
+
+        assert cancelled is not None and cancelled.status is TaskStatus.CANCELLED
+        assert await runner_task is False
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            draft = await session.get(MailDraftModel, draft_id)
+            invocation_count = await session.scalar(
+                select(func.count()).select_from(LLMInvocationModel).where(
+                    LLMInvocationModel.task_id == task_id
+                )
+            )
+            business_audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type.in_(
+                        ("mail_draft.generated", "mail_draft.generation_failed")
+                    ),
+                )
+            )
+        assert task is not None
+        assert task.status == TaskStatus.CANCELLED.value
+        assert task.result_payload is None
+        assert draft is not None and draft.current_version == 1
+        assert invocation_count == 0
+        assert business_audit_count == 0
+    finally:
+        gateway.release.set()
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generation_crash_after_result_commit_replays_without_duplicate_side_effects(
+    database_url: str,
+) -> None:
+    """结果提交后进程未 finish 时，取消冲突且过期接管只补任务成功终态。"""
+    now = datetime(2026, 8, 9, 10, 10, tzinfo=UTC)
+    recovery_now = now + timedelta(seconds=2)
+    session_factory = build_session_factory(database_url)
+    gateway = FakeModelGateway()
+    try:
+        user_id, draft_id, task_id, step = await _seed_generation_runner_task(
+            session_factory,
+            action_cipher=ActionPayloadCipher.from_key(b"i" * 32),
+            gateway=gateway,
+            now=now,
+        )
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        leased = await store.acquire(
+            task_id=task_id,
+            lease_owner="generation-crashed-owner",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=1),
+        )
+        assert leased is not None
+        await step.execute(leased)
+
+        with pytest.raises(StateConflictError) as conflict:
+            await CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+                task_id=task_id,
+                user_id=user_id,
+                now=now + timedelta(milliseconds=500),
+            )
+        assert conflict.value.error_code == "task_state_conflict"
+
+        recovered = await _generation_runner(
+            session_factory,
+            step=step,
+            now=recovery_now,
+        ).run(task_id, lease_owner="generation-recovery-owner")
+
+        assert recovered is True
+        assert len(gateway.calls) == 1
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            draft = await session.get(MailDraftModel, draft_id)
+            version_count = await session.scalar(
+                select(func.count()).select_from(MailDraftVersionModel).where(
+                    MailDraftVersionModel.draft_id == draft_id
+                )
+            )
+            invocation_count = await session.scalar(
+                select(func.count()).select_from(LLMInvocationModel).where(
+                    LLMInvocationModel.task_id == task_id
+                )
+            )
+            business_audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id,
+                    AuditEventModel.event_type == "mail_draft.generated",
+                )
+            )
+        assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+        assert task.result_payload is not None
+        assert draft is not None and draft.current_version == 2
+        assert version_count == 2
+        assert invocation_count == 1
+        assert business_audit_count == 1
+    finally:
         await session_factory.dispose()
 
 
