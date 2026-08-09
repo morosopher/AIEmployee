@@ -6,7 +6,7 @@ PostgreSQL CAS 与 ORM 映射由基础设施适配器负责；本模块不会创
 """
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -40,6 +40,58 @@ class MailDraftRecipient:
 
     address: str
     display_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MailDraftConnectionSnapshot:
+    """表示连接选择与自有地址排除所需的最小应用投影。
+
+    Token、scope 原文和供应商响应不得进入该边界；基础设施适配器只返回用户归属、稳定连接
+    标识、供应商代号、主账户地址和连接状态。
+    """
+
+    id: UUID
+    user_id: UUID
+    provider: str
+    account_email: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class MailDraftStateSnapshot:
+    """表示不含地址、主题或正文的草稿状态写入结果。"""
+
+    draft_id: UUID
+    current_version: int
+    status: MailDraftStatus
+
+
+@dataclass(frozen=True, slots=True)
+class MailDraftSnapshot:
+    """表示 Repository 返回的精确当前不可变草稿版本。
+
+    该应用类型是持久化端口的唯一公共返回结构。基础设施负责在构造前验证 ORM 归属、当前
+    版本连接、JSONB 白名单与 AEAD；用例不再通过 ``Mapping`` 或 ``getattr`` 猜测字段。
+    """
+
+    draft_id: UUID
+    connection_id: UUID
+    source_thread_id: str | None
+    source_message_id: str | None
+    mode: MailMode
+    current_version: int
+    status: MailDraftStatus
+    retain_until: datetime
+    version_id: UUID
+    version: int
+    to_recipients: tuple[MailDraftRecipient, ...]
+    cc_recipients: tuple[MailDraftRecipient, ...]
+    bcc_recipients: tuple[MailDraftRecipient, ...]
+    subject: str
+    body_text: str
+    prompt_version: str | None
+    model_name: str | None
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,11 +262,13 @@ class MailDraftRepository(Protocol):
 
     async def list_current(
         self, *, user_id: UUID, limit: int, offset: int
-    ) -> tuple[object, ...]:
+    ) -> tuple[MailDraftSnapshot, ...]:
         """列出当前用户的解密草稿快照。"""
         ...
 
-    async def get_current(self, *, user_id: UUID, draft_id: UUID) -> object | None:
+    async def get_current(
+        self, *, user_id: UUID, draft_id: UUID
+    ) -> MailDraftSnapshot | None:
         """读取当前用户的一封精确当前版本。"""
         ...
 
@@ -238,7 +292,7 @@ class MailDraftRepository(Protocol):
         body_text: str,
         prompt_version: str | None,
         model_name: str | None,
-    ) -> object:
+    ) -> MailDraftSnapshot:
         """幂等创建版本一；具体适配器必须哈希绑定创建键。"""
         ...
 
@@ -257,11 +311,13 @@ class MailDraftRepository(Protocol):
         prompt_version: str | None,
         model_name: str | None,
         retain_until: datetime,
-    ) -> object | None:
+    ) -> MailDraftSnapshot | None:
         """以 ``expected_version`` CAS 保存下一不可变版本。"""
         ...
 
-    async def cancel(self, *, user_id: UUID, draft_id: UUID) -> object | None:
+    async def cancel(
+        self, *, user_id: UUID, draft_id: UUID
+    ) -> MailDraftStateSnapshot | None:
         """取消尚未发送且状态机允许取消的本地草稿。"""
         ...
 
@@ -281,15 +337,21 @@ class MailDraftCapabilitySnapshot:
 class MailDraftConnectionReader(Protocol):
     """读取用户默认连接、显式连接、能力与保留设置的应用端口。"""
 
-    async def get_default_mail_connection(self, *, user_id: UUID) -> object | None:
+    async def get_default_mail_connection(
+        self, *, user_id: UUID
+    ) -> MailDraftConnectionSnapshot | None:
         """返回用户显式配置的默认发送连接；缺失时不得猜测回退。"""
         ...
 
-    async def get_connection(self, *, user_id: UUID, connection_id: UUID) -> object | None:
+    async def get_connection(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> MailDraftConnectionSnapshot | None:
         """按当前用户读取显式连接。"""
         ...
 
-    async def list_connections(self, *, user_id: UUID) -> tuple[object, ...]:
+    async def list_connections(
+        self, *, user_id: UUID
+    ) -> tuple[MailDraftConnectionSnapshot, ...]:
         """列出用户全部连接，供排除所有主账户地址。"""
         ...
 
@@ -397,7 +459,7 @@ class MailDraftUseCase:
         )
         subject = _resolved_subject(request=request, source=source)
         creation_payload_hash = _creation_payload_hash(
-            connection_id=_uuid_attr(connection, "id"),
+            connection_id=connection.id,
             mode=request.mode,
             source=source,
             to=to,
@@ -421,7 +483,7 @@ class MailDraftUseCase:
             draft_id=self._id_factory(),
             version_id=self._id_factory(),
             user_id=request.user_id,
-            connection_id=_uuid_attr(connection, "id"),
+            connection_id=connection.id,
             creation_idempotency_key=request.idempotency_key,
             creation_payload_hash=creation_payload_hash,
             source_thread_id=source.thread_id if source is not None else None,
@@ -436,10 +498,9 @@ class MailDraftUseCase:
             prompt_version=None,
             model_name=None,
         )
-        return replace(
-            _snapshot_to_view(snapshot),
-            recipient_suggestions=await self.recipient_suggestions(user_id=request.user_id),
-        )
+        # 自动补全只属于显式读取视图；写事务返回刚持久化的精确事实，避免在锁内追加
+        # 与创建成功无关的历史邮件查询。调用方需要建议时应随后调用 get/list。
+        return _snapshot_to_view(snapshot)
 
     async def create_new(
         self,
@@ -585,10 +646,9 @@ class MailDraftUseCase:
         )
         if saved is None:
             raise MailDraftNotFoundError
-        return replace(
-            _snapshot_to_view(saved),
-            recipient_suggestions=await self.recipient_suggestions(user_id=request.user_id),
-        )
+        # Worker 生成正文也复用本路径；这里不计算 UI 建议，确保模型版本 CAS 持锁期间
+        # 不扫描邮件历史，也不让展示字段影响业务写入是否成功。
+        return _snapshot_to_view(saved)
 
     async def cancel(self, *, user_id: UUID, draft_id: UUID) -> MailDraftView:
         """取消一个未发送本地草稿，不创建任何外部副作用。"""
@@ -601,12 +661,8 @@ class MailDraftUseCase:
         cancelled = await self._drafts.cancel(user_id=user_id, draft_id=draft_id)
         if cancelled is None:
             raise MailDraftNotFoundError
-        status = _status_attr(cancelled)
-        return replace(
-            current,
-            status=status,
-            recipient_suggestions=await self.recipient_suggestions(user_id=user_id),
-        )
+        # 取消只收敛草稿状态；自动补全由后续 get/list 读取按需附加。
+        return replace(current, status=cancelled.status)
 
     async def recipient_suggestions(self, *, user_id: UUID) -> tuple[str, ...]:
         """从本地邮件历史派生最多二十个唯一非自有地址。
@@ -638,7 +694,7 @@ class MailDraftUseCase:
 
     async def _resolve_connection_and_source(
         self, request: CreateMailDraftInput
-    ) -> tuple[object, MailDraftSourceMessage | None]:
+    ) -> tuple[MailDraftConnectionSnapshot, MailDraftSourceMessage | None]:
         """解析新邮件默认连接或回复来源，并验证 ``mail.send`` 能力。"""
         if request.mode is MailMode.NEW:
             connection = (
@@ -648,7 +704,10 @@ class MailDraftUseCase:
                 if request.connection_id is not None
                 else await self._connections.get_default_mail_connection(user_id=request.user_id)
             )
-            await self._require_send_connection(user_id=request.user_id, connection=connection)
+            connection = await self._require_send_connection(
+                user_id=request.user_id,
+                connection=connection,
+            )
             return connection, None
 
         if self._sources is None:
@@ -666,21 +725,28 @@ class MailDraftUseCase:
         connection = await self._connections.get_connection(
             user_id=request.user_id, connection_id=source.connection_id
         )
-        await self._require_send_connection(user_id=request.user_id, connection=connection)
+        connection = await self._require_send_connection(
+            user_id=request.user_id,
+            connection=connection,
+        )
         return connection, source
 
-    async def _require_send_connection(self, *, user_id: UUID, connection: object | None) -> None:
+    async def _require_send_connection(
+        self,
+        *,
+        user_id: UUID,
+        connection: MailDraftConnectionSnapshot | None,
+    ) -> MailDraftConnectionSnapshot:
         """要求连接属于用户、保持 connected 且读写能力均为 enabled。
 
         ``action_required``、``revoked`` 或显式 ``connection_scope_missing`` 表示用户
         必须重新授权；其余本地不可用状态返回 capability disabled。两类错误不能由前端
         猜测，也不能通过寻找另一个非默认连接静默回退。
         """
-        if connection is None or _str_attr(connection, "status") != "connected":
+        if connection is None or connection.status != "connected":
             raise _connection_capability_disabled()
-        connection_id = _uuid_attr(connection, "id")
         capabilities = await self._connections.get_capability_states(
-            user_id=user_id, connection_id=connection_id
+            user_id=user_id, connection_id=connection.id
         )
         if capabilities is None:
             raise _connection_capability_disabled()
@@ -709,6 +775,7 @@ class MailDraftUseCase:
             for snapshot in required_states
         ):
             raise _connection_capability_disabled()
+        return connection
 
     async def _resolve_recipients(
         self,
@@ -745,112 +812,34 @@ class MailDraftUseCase:
         addresses: set[str] = set()
         for connection in await self._connections.list_connections(user_id=user_id):
             try:
-                addresses.add(normalize_mailbox_address(_str_attr(connection, "account_email")))
-            except (TypeError, ValueError):
+                addresses.add(normalize_mailbox_address(connection.account_email))
+            except ValueError:
                 # selected connection 的状态/能力会另行 fail closed；其他历史坏行不能让
                 # 自动补全或 reply-all 泄漏异常原值。
                 continue
         return frozenset(addresses)
 
 
-def _snapshot_to_view(snapshot: object) -> MailDraftView:
-    """把结构化 Repository 快照或测试 Mapping 复制为应用视图。"""
+def _snapshot_to_view(snapshot: MailDraftSnapshot) -> MailDraftView:
+    """把精确 Repository 快照复制为不含显示名的应用/API 视图。"""
     return MailDraftView(
-        draft_id=_uuid_attr(snapshot, "draft_id"),
-        connection_id=_uuid_attr(snapshot, "connection_id"),
-        mode=_mail_mode_attr(snapshot),
-        source_thread_id=_optional_str_attr(snapshot, "source_thread_id"),
-        source_message_id=_optional_str_attr(snapshot, "source_message_id"),
-        current_version=_int_attr(snapshot, "current_version"),
-        status=_status_attr(snapshot),
-        to_recipients=_addresses_attr(snapshot, "to_recipients"),
-        cc_recipients=_addresses_attr(snapshot, "cc_recipients"),
-        bcc_recipients=_addresses_attr(snapshot, "bcc_recipients"),
-        subject=_str_attr(snapshot, "subject"),
-        body_text=_str_attr(snapshot, "body_text"),
-        prompt_version=_optional_str_attr(snapshot, "prompt_version"),
-        model_name=_optional_str_attr(snapshot, "model_name"),
-        retain_until=_optional_datetime_attr(snapshot, "retain_until"),
-        created_at=_optional_datetime_attr(snapshot, "created_at"),
+        draft_id=snapshot.draft_id,
+        connection_id=snapshot.connection_id,
+        mode=snapshot.mode,
+        source_thread_id=snapshot.source_thread_id,
+        source_message_id=snapshot.source_message_id,
+        current_version=snapshot.current_version,
+        status=snapshot.status,
+        to_recipients=tuple(recipient.address for recipient in snapshot.to_recipients),
+        cc_recipients=tuple(recipient.address for recipient in snapshot.cc_recipients),
+        bcc_recipients=tuple(recipient.address for recipient in snapshot.bcc_recipients),
+        subject=snapshot.subject,
+        body_text=snapshot.body_text,
+        prompt_version=snapshot.prompt_version,
+        model_name=snapshot.model_name,
+        retain_until=_utc_datetime(snapshot.retain_until, field="retain_until"),
+        created_at=_utc_datetime(snapshot.created_at, field="created_at"),
     )
-
-
-def _value(snapshot: object, field: str, default: object = None) -> object:
-    """在应用边界读取结构化属性或测试 Mapping，不让 ORM 类型进入签名。"""
-    if isinstance(snapshot, Mapping):
-        return snapshot.get(field, default)
-    return getattr(snapshot, field, default)
-
-
-def _uuid_attr(snapshot: object, field: str) -> UUID:
-    """读取必须为 UUID 的稳定标识。"""
-    value = _value(snapshot, field)
-    if not isinstance(value, UUID):
-        raise TypeError(f"{field} must be a UUID")
-    return value
-
-
-def _str_attr(snapshot: object, field: str) -> str:
-    """读取必须为字符串的安全字段。"""
-    value = _value(snapshot, field)
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    return value
-
-
-def _optional_str_attr(snapshot: object, field: str) -> str | None:
-    """读取可选字符串字段。"""
-    value = _value(snapshot, field)
-    if value is not None and not isinstance(value, str):
-        raise TypeError(f"{field} must be a string or None")
-    return value
-
-
-def _int_attr(snapshot: object, field: str) -> int:
-    """读取正整数版本字段并拒绝 bool。"""
-    value = _value(snapshot, field)
-    if type(value) is not int or value <= 0:
-        raise TypeError(f"{field} must be a positive integer")
-    return value
-
-
-def _optional_datetime_attr(snapshot: object, field: str) -> datetime | None:
-    """读取可选带时区时间。"""
-    value = _value(snapshot, field)
-    if value is None:
-        return None
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise TypeError(f"{field} must be timezone-aware or None")
-    return value.astimezone(UTC)
-
-
-def _mail_mode_attr(snapshot: object) -> MailMode:
-    """读取精确邮件模式枚举或稳定持久字符串。"""
-    value = _value(snapshot, "mode")
-    return value if type(value) is MailMode else MailMode(str(value))
-
-
-def _status_attr(snapshot: object) -> MailDraftStatus:
-    """读取精确草稿状态枚举或稳定持久字符串。"""
-    value = _value(snapshot, "status")
-    return value if type(value) is MailDraftStatus else MailDraftStatus(str(value))
-
-
-def _addresses_attr(snapshot: object, field: str) -> tuple[str, ...]:
-    """复制 Repository 地址元数据为不含显示名的应用 tuple。"""
-    raw = _value(snapshot, field, ())
-    if not isinstance(raw, (tuple, list)):
-        raise TypeError(f"{field} must be a sequence")
-    result: list[str] = []
-    for item in raw:
-        if isinstance(item, str):
-            result.append(item)
-            continue
-        address = _value(item, "address")
-        if not isinstance(address, str):
-            raise TypeError(f"{field} entries must contain an address")
-        result.append(address)
-    return tuple(result)
 
 
 def _normalize_and_limit_recipients(

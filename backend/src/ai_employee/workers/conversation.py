@@ -24,11 +24,13 @@ from ai_employee.application.use_cases.mail_drafts import (
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.mail_actions import MailMode
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.briefs import (
     DailyBriefModel,
     LLMInvocationModel,
     MessageModel,
 )
+from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
@@ -68,6 +70,7 @@ class ConversationTaskStep:
         """按窄意图规则写入一个最终 assistant 消息，并对重复投递先行短路。"""
         if task.user_id is None:
             raise ValueError("conversation.respond requires user_id")
+        lease_owner = _required_lease_owner(task)
         raw_conversation_id = task.input_payload.get("conversation_id")
         raw_content = task.input_payload.get("content")
         if not isinstance(raw_conversation_id, str) or not isinstance(raw_content, str):
@@ -75,6 +78,16 @@ class ConversationTaskStep:
         conversation_id = UUID(raw_conversation_id)
         # 至少一次重复投递先在数据库短路，绝不在已完成任务上再次调用模型。
         async with self._session_factory() as session:
+            owned_task = await session.scalar(
+                select(TaskRunModel.id).where(
+                    TaskRunModel.id == task.task_id,
+                    TaskRunModel.user_id == task.user_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+            )
+            if owned_task is None:
+                return
             existing = await session.scalar(
                 select(MessageModel.id).where(
                     MessageModel.user_id == task.user_id,
@@ -98,7 +111,26 @@ class ConversationTaskStep:
                 )
             ).intent
         async with self._session_factory.begin() as session:
-            existing = await session.scalar(select(MessageModel.id).where(MessageModel.user_id == task.user_id, MessageModel.task_id == task.task_id, MessageModel.role == "assistant"))
+            owned_task = await session.scalar(
+                select(TaskRunModel.id)
+                .where(
+                    TaskRunModel.id == task.task_id,
+                    TaskRunModel.user_id == task.user_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+                .with_for_update()
+            )
+            if owned_task is None:
+                # 分类 I/O 期间取消或换 owner 后，旧 Worker 不得写消息、草稿或模型元数据。
+                return
+            existing = await session.scalar(
+                select(MessageModel.id).where(
+                    MessageModel.user_id == task.user_id,
+                    MessageModel.task_id == task.task_id,
+                    MessageModel.role == "assistant",
+                )
+            )
             if existing is not None:
                 return
             if intent == "show_latest_brief":
@@ -186,6 +218,14 @@ class ConversationTaskStep:
             AeadCipher.from_file(self._action_cipher_file)
         )
         return self._action_cipher
+
+
+def _required_lease_owner(task: LeasedTask) -> str:
+    """返回真实非空租约 owner；直接调用 Worker 未持有租约时 fail closed。"""
+    owner = task.lease_owner
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("conversation.respond requires lease_owner")
+    return owner
 
 
 def build_conversation_task_step(

@@ -45,7 +45,12 @@ def _event(state: dict[str, Any], name: str, status: str) -> None:
 
 
 def load_sources(state: dict[str, Any]) -> dict[str, Any]:
-    """规范化输入源并记录步骤事件。"""
+    """规范化输入源并记录步骤事件。
+
+    只有上游原值本身是非空、非空白字符串时，线程 ID 才能进入可点击回复来源集合。这里
+    不把 ``None``、整数或其他松散 JSON 值字符串化，否则它们会在后续渲染阶段与同样的
+    ``str(...)`` 结果匹配并错误授权 ``mail.reply`` 建议。
+    """
     _event(state, "load_sources", "started")
     state.setdefault("mail_threads", [])
     state.setdefault("calendar_events", [])
@@ -53,8 +58,8 @@ def load_sources(state: dict[str, Any]) -> dict[str, Any]:
     state["replyable_thread_ids"] = {
         thread_id
         for thread in state["mail_threads"]
-        for thread_id in (str(thread.get("thread_id", "")),)
-        if thread_id
+        for thread_id in (thread.get("thread_id"),)
+        if isinstance(thread_id, str) and thread_id.strip()
     }
     _event(state, "load_sources", "completed")
     return state

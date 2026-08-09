@@ -1,5 +1,6 @@
 """验证 Task 14 用例与现有不可变草稿 Repository 的组合行为。"""
 
+import asyncio
 from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from ai_employee.domain.actions import MailDraftStatus
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.actions import MailDraftModel, MailDraftVersionModel
 from ai_employee.infrastructure.db.models.briefs import LLMInvocationModel
 from ai_employee.infrastructure.db.models.identity import UserModel
@@ -41,6 +43,205 @@ class _TimeoutModelGateway(FakeModelGateway):
     async def complete(self, **_kwargs: object) -> object:
         """模拟适配器在返回结构化响应前抛出原生超时。"""
         raise TimeoutError("synthetic model timeout")
+
+
+class _BlockingMailDraftGateway(FakeModelGateway):
+    """在模型边界阻塞，允许测试并发修改持久租约后再释放旧 Worker。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(self, **kwargs: object) -> object:
+        """通知测试模型调用已开始，并在显式释放后返回严格合成正文。"""
+        self.started.set()
+        await self.release.wait()
+        return await super().complete(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_generation_rejects_missing_real_lease_owner(database_url: str) -> None:
+    """真实生成步骤缺少租约 owner 时必须在模型或数据库业务读取前 fail closed。"""
+    session_factory = build_session_factory(database_url)
+    gateway = FakeModelGateway()
+    try:
+        step = GenerateMailDraftTaskStep(
+            session_factory=session_factory,
+            action_cipher=ActionPayloadCipher.from_key(b"o" * 32),
+            source_cipher=AeadCipher(b"s" * 32),
+            model_gateway=gateway,
+            model_name="fake-mail-model",
+        )
+
+        with pytest.raises(ValueError, match="lease_owner"):
+            await step.execute(
+                LeasedTask(
+                    task_id=uuid4(),
+                    user_id=uuid4(),
+                    kind="mail_draft.generate",
+                    input_payload={
+                        "draft_id": str(uuid4()),
+                        "instruction": "Synthetic instruction",
+                    },
+                    started_at=datetime(2026, 8, 9, tzinfo=UTC),
+                )
+            )
+
+        assert gateway.calls == []
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutated_status", "mutated_owner"),
+    (
+        (TaskStatus.CANCELLED, None),
+        (TaskStatus.RUNNING, "worker-replacement"),
+    ),
+    ids=("cancelled", "owner-replaced"),
+)
+async def test_generation_drops_result_when_lease_changes_during_model_call(
+    database_url: str,
+    mutated_status: TaskStatus,
+    mutated_owner: str | None,
+) -> None:
+    """模型返回前任务被取消或换 owner 时，旧 Worker 不得提交任何生成副作用。"""
+    session_factory = build_session_factory(database_url)
+    user_id, connection_id = uuid4(), uuid4()
+    lease_owner = "worker-original"
+    action_cipher = ActionPayloadCipher.from_key(b"l" * 32)
+    gateway = _BlockingMailDraftGateway()
+    try:
+        async with session_factory.begin() as session:
+            session.add_all(
+                (
+                    UserModel(
+                        id=user_id,
+                        email=f"lease-{user_id}@example.test",
+                        display_name="Synthetic Lease User",
+                        password_hash=None,
+                        timezone="UTC",
+                        locale="en-US",
+                        brief_time=time(8, 0),
+                    ),
+                    OAuthConnectionModel(
+                        id=connection_id,
+                        user_id=user_id,
+                        provider="google",
+                        provider_account_id=f"lease-{connection_id}",
+                        account_email="owner@example.test",
+                        scopes=[],
+                        status="connected",
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability=ConnectionCapability.MAIL_READ.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=[],
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=user_id,
+                        connection_id=connection_id,
+                        capability=ConnectionCapability.MAIL_SEND.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=[],
+                    ),
+                )
+            )
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyMailDraftRepository(session, action_cipher)
+            draft = await MailDraftUseCase(
+                drafts=repository,
+                connections=repository,
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            ).create_new(
+                user_id=user_id,
+                connection_id=connection_id,
+                idempotency_key=f"lease-draft-{mutated_status.value}-{mutated_owner}",
+            )
+            task_row = TaskRunModel(
+                user_id=user_id,
+                kind="mail_draft.generate",
+                status=TaskStatus.RUNNING.value,
+                lease_owner=lease_owner,
+                idempotency_key=f"lease-task-{mutated_status.value}-{mutated_owner}",
+                input_payload={
+                    "draft_id": str(draft.draft_id),
+                    "expected_version": 1,
+                    "instruction": "Write a synthetic body",
+                },
+            )
+            session.add(task_row)
+            await session.flush()
+            task_id = task_row.id
+
+        step = GenerateMailDraftTaskStep(
+            session_factory=session_factory,
+            action_cipher=action_cipher,
+            source_cipher=AeadCipher(b"s" * 32),
+            model_gateway=gateway,
+            model_name="fake-mail-model",
+            clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+        )
+        execution = asyncio.create_task(
+            step.execute(
+                LeasedTask(
+                    task_id=task_id,
+                    user_id=user_id,
+                    kind="mail_draft.generate",
+                    input_payload={
+                        "draft_id": str(draft.draft_id),
+                        "expected_version": 1,
+                        "instruction": "Write a synthetic body",
+                    },
+                    started_at=datetime(2026, 8, 9, tzinfo=UTC),
+                    lease_owner=lease_owner,
+                )
+            )
+        )
+        await asyncio.wait_for(gateway.started.wait(), timeout=2)
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == task_id, TaskRunModel.user_id == user_id)
+                .values(
+                    status=mutated_status.value,
+                    lease_owner=mutated_owner,
+                )
+            )
+        gateway.release.set()
+        await execution
+
+        async with session_factory() as session:
+            persisted_task = await session.get(TaskRunModel, task_id)
+            version_count = await session.scalar(
+                select(func.count()).select_from(MailDraftVersionModel).where(
+                    MailDraftVersionModel.draft_id == draft.draft_id
+                )
+            )
+            invocation_count = await session.scalar(
+                select(func.count()).select_from(LLMInvocationModel).where(
+                    LLMInvocationModel.task_id == task_id
+                )
+            )
+            audit_count = await session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.task_id == task_id
+                )
+            )
+        assert persisted_task is not None
+        assert persisted_task.status == mutated_status.value
+        assert persisted_task.lease_owner == mutated_owner
+        assert persisted_task.result_payload is None
+        assert version_count == 1
+        assert invocation_count == 0
+        assert audit_count == 0
+    finally:
+        gateway.release.set()
+        await session_factory.dispose()
 
 
 @pytest.mark.asyncio
@@ -519,6 +720,105 @@ async def test_local_uuid_source_reference_never_matches_another_connections_pro
 
 
 @pytest.mark.asyncio
+async def test_recipient_history_is_spam_filtered_recent_and_database_bounded(
+    database_url: str,
+) -> None:
+    """自动补全候选必须在 PostgreSQL 中按最近排序、排除 spam 并限制为 200 行。"""
+    session_factory = build_session_factory(database_url)
+    user_id, connection_id, thread_id = uuid4(), uuid4(), uuid4()
+    now = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    try:
+        async with session_factory.begin() as session:
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email=f"recipient-history-{user_id}@example.test",
+                    display_name="Synthetic Recipient History User",
+                    password_hash=None,
+                    timezone="UTC",
+                    locale="en-US",
+                    brief_time=time(8, 0),
+                )
+            )
+            await session.flush()
+            session.add(
+                OAuthConnectionModel(
+                    id=connection_id,
+                    user_id=user_id,
+                    provider="google",
+                    provider_account_id=f"recipient-history-{connection_id}",
+                    account_email="owner@example.test",
+                    scopes=[],
+                    status="connected",
+                )
+            )
+            await session.flush()
+            session.add(
+                EmailThreadModel(
+                    id=thread_id,
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider_thread_id="recipient-history-thread",
+                    subject="Synthetic recipient history",
+                    participants=[],
+                    latest_message_at=now,
+                    provider_url="https://provider.example.test/thread/recipient-history",
+                )
+            )
+            await session.flush()
+            session.add_all(
+                EmailMessageModel(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    thread_id=thread_id,
+                    provider_message_id=f"recipient-history-message-{index:03d}",
+                    received_at=now - timedelta(minutes=index),
+                    mailbox_scope_key="mailbox",
+                    sender={"email": f"peer-{index:03d}@example.test"},
+                    recipients=[],
+                    subject="Synthetic recipient history",
+                    snippet="Synthetic snippet",
+                    labels=["INBOX"],
+                    headers={},
+                    provider_url=(
+                        "https://provider.example.test/message/"
+                        f"recipient-history-{index:03d}"
+                    ),
+                )
+                for index in range(205)
+            )
+            session.add(
+                EmailMessageModel(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    thread_id=thread_id,
+                    provider_message_id="recipient-history-spam",
+                    received_at=now + timedelta(minutes=1),
+                    mailbox_scope_key="mailbox",
+                    sender={"email": "spam-peer@example.test"},
+                    recipients=[],
+                    subject="Synthetic spam",
+                    snippet="Synthetic spam snippet",
+                    labels=["SPAM"],
+                    headers={},
+                    provider_url="https://provider.example.test/message/recipient-history-spam",
+                )
+            )
+
+        async with session_factory() as session:
+            history = await SqlAlchemyMailSyncRepository(session).list_recipient_history(
+                user_id=user_id
+            )
+
+        assert len(history) == 200
+        assert history[0].address == "peer-000@example.test"
+        assert history[-1].address == "peer-199@example.test"
+        assert all(entry.address != "spam-peer@example.test" for entry in history)
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 async def test_draft_context_filters_spam_and_limits_three_rows_before_decryption(
     database_url: str,
 ) -> None:
@@ -649,6 +949,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
     """失败不清空草稿；空白与人工正文均保留，元数据不保存 Prompt 或正文。"""
     session_factory = build_session_factory(database_url)
     user_id, connection_id = uuid4(), uuid4()
+    lease_owner = "mail-draft-generation-worker"
     action_cipher = ActionPayloadCipher.from_key(b"f" * 32)
     try:
         async with session_factory.begin() as session:
@@ -706,6 +1007,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                 user_id=user_id,
                 kind="mail_draft.generate",
                 status="running",
+                lease_owner=lease_owner,
                 idempotency_key="generation-failure-task",
                 input_payload={
                     "draft_id": str(draft.draft_id),
@@ -736,6 +1038,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                     "instruction": "Sensitive synthetic instruction that must not be stored",
                 },
                 started_at=datetime(2026, 8, 9, tzinfo=UTC),
+                lease_owner=lease_owner,
             )
         )
 
@@ -809,6 +1112,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                 user_id=user_id,
                 kind="mail_draft.generate",
                 status="running",
+                lease_owner=lease_owner,
                 idempotency_key="generation-timeout-task",
                 input_payload={
                     "draft_id": str(draft.draft_id),
@@ -839,6 +1143,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                     "instruction": "Rewrite the synthetic manual body",
                 },
                 started_at=datetime(2026, 8, 9, tzinfo=UTC),
+                lease_owner=lease_owner,
             )
         )
 
@@ -879,6 +1184,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                 user_id=user_id,
                 kind="mail_draft.generate",
                 status="running",
+                lease_owner=lease_owner,
                 idempotency_key="generation-success-task",
                 input_payload={
                     "draft_id": str(draft.draft_id),
@@ -908,6 +1214,7 @@ async def test_model_failures_keep_blank_editable_and_preserve_existing_manual_b
                     "instruction": "Reply with the supplied synthetic facts only",
                 },
                 started_at=datetime(2026, 8, 9, tzinfo=UTC),
+                lease_owner=lease_owner,
             )
         )
         async with session_factory() as session:

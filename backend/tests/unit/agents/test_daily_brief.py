@@ -5,7 +5,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from pydantic import ValidationError
 
 from ai_employee.agents.daily_brief.graph import build_daily_brief_graph
-from ai_employee.agents.daily_brief.nodes import classify_ambiguous_conversation_intent
+from ai_employee.agents.daily_brief.nodes import (
+    classify_ambiguous_conversation_intent,
+    load_sources,
+)
 from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.domain.briefs import BriefItem, BriefSourceRef, ConversationIntent
 from ai_employee.integrations.llm.fake import FakeModelGateway
@@ -172,6 +175,36 @@ async def test_needs_reply_item_exposes_only_verifiable_mail_reply_suggestion() 
     item = result["content"]["items"][0]
     assert item["source_refs"][0]["source_id"] == "replyable-thread"
     assert item["suggested_action_kind"] == "mail.reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", (None, 7, "", "   "))
+async def test_invalid_raw_thread_ids_never_become_replyable_actions(
+    thread_id: object,
+) -> None:
+    """None、非字符串和空白 ID 不得进入可信来源集合或生成 ``mail.reply``。"""
+    mail_threads = [
+        {
+            "thread_id": thread_id,
+            "sender": "sender@work.example",
+            "subject": "Synthetic question",
+            "needs_reply": True,
+        }
+    ]
+
+    loaded = load_sources({"mail_threads": mail_threads, "calendar_events": []})
+    result = await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": mail_threads,
+            "calendar_events": [],
+            "work_email_domains": ["work.example"],
+        }
+    )
+
+    assert loaded["replyable_thread_ids"] == set()
+    assert all(
+        item.get("suggested_action_kind") is None for item in result["content"]["items"]
+    )
 
 
 @pytest.mark.asyncio

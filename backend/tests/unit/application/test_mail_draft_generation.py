@@ -1,5 +1,6 @@
 """验证邮件草稿 body-only 模型输入与严格输出边界。"""
 
+import json
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -80,6 +81,63 @@ def test_model_messages_exclude_addresses_subject_thread_and_removed_history() -
     assert "Secret subject" not in serialized
     assert "secret-thread-id" not in serialized
     assert "secret-message-id" not in serialized
+
+
+def test_model_messages_mask_quoted_unicode_idn_and_punctuated_mailboxes() -> None:
+    """指令、摘要与正文中的疑似邮箱都必须在本地掩码，并保留周围标点。"""
+    context = build_mail_draft_context(
+        messages=(
+            MailDraftContextMessage(
+                message_id="synthetic-message",
+                thread_id="synthetic-thread",
+                sender="",
+                recipients=(),
+                subject="",
+                body_text=(
+                    "Primary (Case.Sensitive+Tag@Sub.Example.TEST); "
+                    "international 用户@例子.测试!"
+                ),
+                received_at=datetime(2026, 8, 9, tzinfo=UTC),
+            ),
+        ),
+        instruction='Draft to "quoted local"@Example.Test, please.',
+        thread_summary="备用地址是 owner@例子.测试。",
+    )
+
+    payload = json.loads(mail_draft_model_messages(context)[1]["content"])
+
+    assert payload["instruction"] == "Draft to [ADDRESS_REMOVED], please."
+    assert payload["thread_summary"] == "备用地址是 [ADDRESS_REMOVED]。"
+    assert payload["related_body_facts"] == [
+        "Primary ([ADDRESS_REMOVED]); international [ADDRESS_REMOVED]!"
+    ]
+
+
+def test_model_context_preserves_non_mailbox_at_sign_text() -> None:
+    """提及、分隔符和无 DNS 域的普通 ``@`` 文本不得被邮箱扫描器破坏。"""
+    context = build_mail_draft_context(
+        messages=(
+            MailDraftContextMessage(
+                message_id="synthetic-message",
+                thread_id="synthetic-thread",
+                sender="",
+                recipients=(),
+                subject="",
+                body_text="Keep @team, A @ B, file@localhost and 版本@草案 literal.",
+                received_at=datetime(2026, 8, 9, tzinfo=UTC),
+            ),
+        ),
+        instruction="Mention @team and keep A @ B unchanged.",
+        thread_summary="file@localhost 与 版本@草案 都只是普通文本。",
+    )
+
+    payload = json.loads(mail_draft_model_messages(context)[1]["content"])
+
+    assert payload["instruction"] == "Mention @team and keep A @ B unchanged."
+    assert payload["thread_summary"] == "file@localhost 与 版本@草案 都只是普通文本。"
+    assert payload["related_body_facts"] == [
+        "Keep @team, A @ B, file@localhost and 版本@草案 literal."
+    ]
 
 
 def test_prompt_forbids_model_control_and_requires_uncertainty() -> None:

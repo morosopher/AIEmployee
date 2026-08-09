@@ -58,6 +58,8 @@ class _MailMessageConflictTarget(StrEnum):
 _NEW_MESSAGE_IDENTITY = "uq_email_messages_connection_provider_message"
 _LEGACY_MESSAGE_IDENTITY = "uq_email_messages_thread_provider_message"
 _MESSAGE_IDENTITY_CATALOG_ERROR = "mail message identity catalog is unsafe"
+_RECIPIENT_HISTORY_MESSAGE_LIMIT = 500
+_RECIPIENT_HISTORY_CANDIDATE_LIMIT = 200
 
 
 class SqlAlchemyMailSyncRepository:
@@ -482,34 +484,65 @@ class SqlAlchemyMailSyncRepository:
     ) -> tuple[MailRecipientHistoryEntry, ...]:
         """从本地同步 sender/recipient JSONB 派生地址最近出现事实。
 
-        查询只使用当前用户行，并排除带 spam 标签的消息；返回值仍可能含历史 malformed
-        地址，由应用层统一使用邮件领域规则规范化和去重。这里不访问 Contacts、供应商或模型。
+        PostgreSQL 先在当前用户范围内排除 spam、截取最近五百封消息、展开 sender/recipient、
+        按原始地址聚合最近时间并最多返回二百个候选。返回值仍可能含历史 malformed 地址，
+        由应用层统一使用邮件领域规则规范化、排除自身、去重并截取二十条。这里不访问
+        Contacts、供应商或模型，也不会把用户全部邮件搬入 Python。
         """
+        statement = text(
+            """
+            WITH eligible_messages AS MATERIALIZED (
+                SELECT sender, recipients, received_at
+                FROM email_messages
+                WHERE user_id = :user_id
+                  AND jsonb_typeof(labels) = 'array'
+                  AND NOT labels @? '$[*] ? (@ like_regex "^spam$" flag "i")'::jsonpath
+                ORDER BY received_at DESC, id
+                LIMIT :message_limit
+            ),
+            participant_history AS (
+                SELECT sender ->> 'email' AS address, received_at
+                FROM eligible_messages
+                UNION ALL
+                SELECT recipient.value ->> 'email' AS address, message.received_at
+                FROM eligible_messages AS message
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    CASE
+                        WHEN jsonb_typeof(message.recipients) = 'array'
+                        THEN message.recipients
+                        ELSE '[]'::jsonb
+                    END
+                ) AS recipient(value)
+            )
+            SELECT address, max(received_at) AS last_seen_at
+            FROM participant_history
+            WHERE address IS NOT NULL
+            GROUP BY address
+            ORDER BY max(received_at) DESC, address
+            LIMIT :candidate_limit
+            """
+        )
         rows = (
             await self._session.execute(
-                select(
-                    EmailMessageModel.sender,
-                    EmailMessageModel.recipients,
-                    EmailMessageModel.received_at,
-                    EmailMessageModel.labels,
-                )
-                .where(EmailMessageModel.user_id == user_id)
-                .order_by(EmailMessageModel.received_at.desc(), EmailMessageModel.id)
+                statement,
+                {
+                    "user_id": user_id,
+                    "message_limit": _RECIPIENT_HISTORY_MESSAGE_LIMIT,
+                    "candidate_limit": _RECIPIENT_HISTORY_CANDIDATE_LIMIT,
+                },
             )
-        ).all()
+        ).tuples()
         result: list[MailRecipientHistoryEntry] = []
-        for sender, recipients, received_at, labels in rows:
-            if _is_spam_labels(labels):
+        for address, last_seen_at in rows:
+            if type(address) is not str or not isinstance(last_seen_at, datetime):
+                # 历史 JSONB 异常结构不应中断整个建议列表；应用层仍会执行完整地址与时区校验。
                 continue
-            for participant in (sender, *recipients):
-                address = participant.get("email") if isinstance(participant, dict) else None
-                if isinstance(address, str):
-                    result.append(
-                        MailRecipientHistoryEntry(
-                            address=address,
-                            last_seen_at=received_at,
-                        )
-                    )
+            result.append(
+                MailRecipientHistoryEntry(
+                    address=address,
+                    last_seen_at=last_seen_at,
+                )
+            )
         return tuple(result)
 
     def _draft_source_projection(

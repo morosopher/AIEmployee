@@ -10,10 +10,11 @@ from uuid import UUID
 
 import pytest
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import func, select, text, update
+from sqlalchemy import event, func, select, text, update
 
 from ai_employee.application.commands import trusted_command_hash
 from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.use_cases.mail_drafts import MailDraftRecipient
 from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode
@@ -37,10 +38,7 @@ from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     CALENDAR_SNAPSHOT_SCHEMA_VERSION,
     SqlAlchemyCalendarProposalRepository,
 )
-from ai_employee.infrastructure.db.repositories.mail_drafts import (
-    MailRecipient,
-    SqlAlchemyMailDraftRepository,
-)
+from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepository,
 )
@@ -64,6 +62,8 @@ MAIL_VERSION_TWO_FIRST_ID = UUID("00000000-0000-0000-0000-000000000617")
 MAIL_VERSION_TWO_SECOND_ID = UUID("00000000-0000-0000-0000-000000000618")
 SECOND_MAIL_DRAFT_ID = UUID("00000000-0000-0000-0000-000000000619")
 SECOND_MAIL_VERSION_ID = UUID("00000000-0000-0000-0000-000000000620")
+THIRD_MAIL_DRAFT_ID = UUID("00000000-0000-0000-0000-000000000640")
+THIRD_MAIL_VERSION_ID = UUID("00000000-0000-0000-0000-000000000641")
 CALENDAR_PROPOSAL_ID = UUID("00000000-0000-0000-0000-000000000621")
 CALENDAR_DESIRED_ONE_ID = UUID("00000000-0000-0000-0000-000000000622")
 CALENDAR_DESIRED_TWO_ID = UUID("00000000-0000-0000-0000-000000000623")
@@ -413,7 +413,7 @@ async def _create_mail_draft(
             source_message_id=None,
             mode=MailMode.NEW,
             retain_until=FIXED_RETAIN_UNTIL,
-            to_recipients=(MailRecipient(address="recipient@example.test"),),
+            to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
             cc_recipients=(),
             bcc_recipients=(),
             subject="Synthetic subject",
@@ -443,7 +443,7 @@ async def test_mail_creation_replay_is_hash_bound_and_user_scoped(database_url: 
                 source_message_id=None,
                 mode=MailMode.NEW,
                 retain_until=FIXED_RETAIN_UNTIL,
-                to_recipients=(MailRecipient(address="recipient@example.test"),),
+                to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
                 cc_recipients=(),
                 bcc_recipients=(),
                 subject="Synthetic subject",
@@ -462,7 +462,7 @@ async def test_mail_creation_replay_is_hash_bound_and_user_scoped(database_url: 
                 source_message_id=None,
                 mode=MailMode.NEW,
                 retain_until=FIXED_RETAIN_UNTIL,
-                to_recipients=(MailRecipient(address="recipient@example.test"),),
+                to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
                 cc_recipients=(),
                 bcc_recipients=(),
                 subject="Synthetic subject",
@@ -495,7 +495,7 @@ async def test_mail_creation_replay_is_hash_bound_and_user_scoped(database_url: 
                     source_message_id=None,
                     mode=MailMode.NEW,
                     retain_until=FIXED_RETAIN_UNTIL,
-                    to_recipients=(MailRecipient(address="recipient@example.test"),),
+                    to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
                     cc_recipients=(),
                     bcc_recipients=(),
                     subject="Synthetic subject",
@@ -520,13 +520,82 @@ async def test_mail_creation_replay_is_hash_bound_and_user_scoped(database_url: 
 
 
 @pytest.mark.asyncio
+async def test_mail_list_current_loads_all_current_versions_in_one_query(
+    database_url: str,
+) -> None:
+    """有界草稿列表必须批量连接当前版本，查询数不能随返回草稿数量增长。"""
+    session_factory = build_session_factory(database_url)
+    cipher = ActionPayloadCipher.from_key(b"q" * 32)
+    statements: list[str] = []
+    listener_installed = False
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        """只记录命中草稿父表或版本表的 SQL，忽略连接池探活。"""
+        if "mail_drafts" in statement or "mail_draft_versions" in statement:
+            statements.append(statement)
+
+    try:
+        facts = await _seed_users_and_connections(session_factory)
+        await _create_mail_draft(session_factory, facts, cipher)
+        await _create_mail_draft(
+            session_factory,
+            facts,
+            cipher,
+            draft_id=SECOND_MAIL_DRAFT_ID,
+            version_id=SECOND_MAIL_VERSION_ID,
+            creation_key="mail:create:two",
+            body_text="synthetic-mail-body-two",
+        )
+        await _create_mail_draft(
+            session_factory,
+            facts,
+            cipher,
+            draft_id=THIRD_MAIL_DRAFT_ID,
+            version_id=THIRD_MAIL_VERSION_ID,
+            creation_key="mail:create:three",
+            body_text="synthetic-mail-body-three",
+        )
+        event.listen(
+            session_factory.engine.sync_engine,
+            "before_cursor_execute",
+            capture_statement,
+        )
+        listener_installed = True
+
+        async with session_factory() as session:
+            drafts = await SqlAlchemyMailDraftRepository(session, cipher).list_current(
+                user_id=facts.first_user_id,
+                limit=10,
+                offset=0,
+            )
+
+        assert len(drafts) == 3
+        assert len(statements) == 1
+    finally:
+        if listener_installed:
+            event.remove(
+                session_factory.engine.sync_engine,
+                "before_cursor_execute",
+                capture_statement,
+            )
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 async def test_mail_create_preparation_failure_commits_no_partial_rows(
     database_url: str,
 ) -> None:
     """recipient 转换失败被调用方捕获后，正常提交也不能留下孤立草稿头。"""
     session_factory = build_session_factory(database_url)
     cipher = ActionPayloadCipher.from_key(b"k" * 32)
-    invalid_recipients = cast(tuple[MailRecipient, ...], ("invalid-recipient",))
+    invalid_recipients = cast(tuple[MailDraftRecipient, ...], ("invalid-recipient",))
     try:
         facts = await _seed_users_and_connections(session_factory)
         caught_error: TypeError | ValueError | None = None
@@ -581,7 +650,7 @@ async def test_mail_next_version_preparation_failure_keeps_parent_and_versions_u
     """recipient 转换失败被捕获并提交后，CAS 版本和保留截止时间必须原样保留。"""
     session_factory = build_session_factory(database_url)
     cipher = ActionPayloadCipher.from_key(b"k" * 32)
-    invalid_recipients = cast(tuple[MailRecipient, ...], ("invalid-recipient",))
+    invalid_recipients = cast(tuple[MailDraftRecipient, ...], ("invalid-recipient",))
     try:
         facts = await _seed_users_and_connections(session_factory)
         await _create_mail_draft(session_factory, facts, cipher)
@@ -642,7 +711,7 @@ async def test_concurrent_mail_next_version_uses_cas_and_never_stores_plaintext(
                     user_id=facts.first_user_id,
                     draft_id=MAIL_DRAFT_ID,
                     expected_version=1,
-                    to_recipients=(MailRecipient(address="recipient@example.test"),),
+                    to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
                     cc_recipients=(),
                     bcc_recipients=(),
                     subject="Synthetic next subject",
@@ -672,7 +741,7 @@ async def test_concurrent_mail_next_version_uses_cas_and_never_stores_plaintext(
                     user_id=facts.first_user_id,
                     draft_id=MAIL_DRAFT_ID,
                     expected_version=1,
-                    to_recipients=(MailRecipient(address="recipient@example.test"),),
+                    to_recipients=(MailDraftRecipient(address="recipient@example.test"),),
                     cc_recipients=(),
                     bcc_recipients=(),
                     subject="Synthetic stale subject",

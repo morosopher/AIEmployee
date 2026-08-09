@@ -1,5 +1,6 @@
 """验证 M1 对话 API、幂等消息及 worker 意图边界。"""
 
+import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TypeVar
@@ -7,15 +8,20 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.application.use_cases.conversations import UNSUPPORTED_RESPONSE
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.domain.briefs import ConversationIntent
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.actions import MailDraftModel, MailDraftVersionModel
-from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, MessageModel
+from ai_employee.infrastructure.db.models.briefs import (
+    DailyBriefModel,
+    LLMInvocationModel,
+    MessageModel,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
@@ -65,12 +71,153 @@ class _PrepareMailDraftIntentGateway:
         return ModelResponse(value=value, usage=ModelUsage())
 
 
+class _BlockingConversationGateway(_PrepareMailDraftIntentGateway):
+    """在歧义分类模型边界阻塞，允许测试取消或替换持久租约。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(
+        self,
+        *,
+        model_name: str,
+        prompt_version: str,
+        messages: Sequence[dict[str, str]],
+        response_model: type[TModel],
+    ) -> ModelResponse[TModel]:
+        """通知模型已开始，并在显式释放后返回确定性分类。"""
+        self.started.set()
+        await self.release.wait()
+        return await super().complete(
+            model_name=model_name,
+            prompt_version=prompt_version,
+            messages=messages,
+            response_model=response_model,
+        )
+
+
 async def _create_conversation(clients: AuthenticatedApiClients) -> UUID:
     """经 CSRF 保护的真实 API 创建用户自己的空会话。"""
     csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
     response = await clients.owner.post("/api/v1/conversations", headers={"X-CSRF-Token": csrf})
     assert response.status_code == 201
     return UUID(response.json()["id"])
+
+
+@pytest.mark.asyncio
+async def test_conversation_worker_rejects_missing_real_lease_owner(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """真实对话步骤缺少租约 owner 时必须在模型与业务写入前 fail closed。"""
+    gateway = FakeModelGateway()
+    step = ConversationTaskStep(
+        authenticated_api_clients.session_factory,
+        model_gateway=gateway,
+    )
+
+    with pytest.raises(ValueError, match="lease_owner"):
+        await step.execute(
+            LeasedTask(
+                task_id=uuid4(),
+                user_id=authenticated_api_clients.owner_id,
+                kind="conversation.respond",
+                input_payload={
+                    "conversation_id": str(uuid4()),
+                    "content": "what should I focus on",
+                },
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutated_status", "mutated_owner"),
+    (
+        (TaskStatus.CANCELLED, None),
+        (TaskStatus.RUNNING, "conversation-worker-replacement"),
+    ),
+    ids=("cancelled", "owner-replaced"),
+)
+async def test_conversation_drops_result_when_lease_changes_during_model_call(
+    authenticated_api_clients: AuthenticatedApiClients,
+    mutated_status: TaskStatus,
+    mutated_owner: str | None,
+) -> None:
+    """歧义模型返回前取消或换 owner 时，旧 Worker 不得写回复或调用元数据。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-worker-original"
+    gateway = _BlockingConversationGateway()
+    async with clients.session_factory.begin() as session:
+        task_row = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status=TaskStatus.RUNNING.value,
+            lease_owner=lease_owner,
+            idempotency_key=f"conversation-lease-{mutated_status.value}-{mutated_owner}",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": "Could you outline what this assistant can do?",
+            },
+        )
+        session.add(task_row)
+        await session.flush()
+        task_id = task_row.id
+
+    step = ConversationTaskStep(clients.session_factory, model_gateway=gateway)
+    execution = asyncio.create_task(
+        step.execute(
+            LeasedTask(
+                task_id=task_id,
+                user_id=clients.owner_id,
+                kind="conversation.respond",
+                input_payload=task_row.input_payload,
+                started_at=datetime.now(UTC),
+                lease_owner=lease_owner,
+            )
+        )
+    )
+    await asyncio.wait_for(gateway.started.wait(), timeout=2)
+    async with clients.session_factory.begin() as session:
+        await session.execute(
+            update(TaskRunModel)
+            .where(TaskRunModel.id == task_id, TaskRunModel.user_id == clients.owner_id)
+            .values(status=mutated_status.value, lease_owner=mutated_owner)
+        )
+    gateway.release.set()
+    await execution
+
+    async with clients.session_factory() as session:
+        persisted_task = await session.get(TaskRunModel, task_id)
+        reply_count = await session.scalar(
+            select(func.count()).select_from(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task_id,
+                MessageModel.role == "assistant",
+            )
+        )
+        invocation_count = await session.scalar(
+            select(func.count()).select_from(LLMInvocationModel).where(
+                LLMInvocationModel.user_id == clients.owner_id,
+                LLMInvocationModel.task_id == task_id,
+            )
+        )
+        draft_count = await session.scalar(
+            select(func.count()).select_from(MailDraftModel).where(
+                MailDraftModel.user_id == clients.owner_id
+            )
+        )
+    assert persisted_task is not None
+    assert persisted_task.status == mutated_status.value
+    assert persisted_task.lease_owner == mutated_owner
+    assert reply_count == 0
+    assert invocation_count == 0
+    assert draft_count == 0
 
 
 @pytest.mark.asyncio
@@ -101,10 +248,11 @@ async def test_worker_handles_supported_and_unsupported_intents_without_provider
     """生成、读取最新简报与范围外请求均走确定性 worker，不引入供应商或写工具。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-supported-intents-worker"
     async with clients.session_factory.begin() as session:
         tasks = []
         for index, content in enumerate(("生成今日简报", "查看今日简报", "帮我发送邮件")):
-            task = TaskRunModel(user_id=clients.owner_id, kind="conversation.respond", status="running", idempotency_key=f"conversation-worker-{index}", input_payload={"conversation_id": str(conversation_id), "content": content})
+            task = TaskRunModel(user_id=clients.owner_id, kind="conversation.respond", status="running", lease_owner=lease_owner, idempotency_key=f"conversation-worker-{index}", input_payload={"conversation_id": str(conversation_id), "content": content})
             tasks.append(task)
             session.add(task)
         await session.flush()
@@ -114,7 +262,7 @@ async def test_worker_handles_supported_and_unsupported_intents_without_provider
         session.add(DailyBriefModel(user_id=clients.owner_id, local_date=datetime(2026, 8, 4, tzinfo=UTC).date(), version=1, task_id=latest_task.id, completeness="complete", source_cutoff=datetime.now(UTC), headline="Latest", structured_content={}, markdown="# Latest synthetic brief", warnings=[], created_at=datetime.now(UTC)))
     step = ConversationTaskStep(clients.session_factory)
     for task in tasks:
-        await step.execute(LeasedTask(task_id=task.id, user_id=clients.owner_id, kind=task.kind, input_payload=task.input_payload, started_at=datetime.now(UTC)))
+        await step.execute(LeasedTask(task_id=task.id, user_id=clients.owner_id, kind=task.kind, input_payload=task.input_payload, started_at=datetime.now(UTC), lease_owner=lease_owner))
     async with clients.session_factory() as session:
         replies = (await session.scalars(select(MessageModel).where(MessageModel.conversation_id == conversation_id, MessageModel.role == "assistant").order_by(MessageModel.created_at))).all()
         generated_count = await session.scalar(select(func.count()).select_from(TaskRunModel).where(TaskRunModel.kind == "daily_brief"))
@@ -132,11 +280,13 @@ async def test_replayed_ambiguous_conversation_skips_model_and_duplicate_reply(
     """同一会话任务重放必须在网关调用前短路，且只保留一条 assistant 回复。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-ambiguous-replay-worker"
     async with clients.session_factory.begin() as session:
         task = TaskRunModel(
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key="conversation-ambiguous-replay",
             input_payload={"conversation_id": str(conversation_id), "content": "what should I focus on"},
         )
@@ -144,7 +294,7 @@ async def test_replayed_ambiguous_conversation_skips_model_and_duplicate_reply(
         await session.flush()
     gateway = FakeModelGateway()
     step = ConversationTaskStep(clients.session_factory, model_gateway=gateway)
-    leased = LeasedTask(task_id=task.id, user_id=clients.owner_id, kind=task.kind, input_payload=task.input_payload, started_at=datetime.now(UTC))
+    leased = LeasedTask(task_id=task.id, user_id=clients.owner_id, kind=task.kind, input_payload=task.input_payload, started_at=datetime.now(UTC), lease_owner=lease_owner)
     await step.execute(leased)
     calls_after_first = len(gateway.calls)
     await step.execute(leased)
@@ -162,6 +312,7 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
     """明确草拟请求创建本地版本与链接，但绝不创建审批、工具执行或供应商调用。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-explicit-mail-worker"
     async with clients.session_factory.begin() as session:
         connection = OAuthConnectionModel(
             user_id=clients.owner_id,
@@ -193,6 +344,7 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key="conversation-explicit-mail-draft",
             input_payload={
                 "conversation_id": str(conversation_id),
@@ -209,25 +361,18 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
         clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
     )
 
-    await step.execute(
-        LeasedTask(
-            task_id=task.id,
-            user_id=clients.owner_id,
-            kind=task.kind,
-            input_payload=task.input_payload,
-            started_at=datetime.now(UTC),
-        )
+    leased = LeasedTask(
+        task_id=task.id,
+        user_id=clients.owner_id,
+        kind=task.kind,
+        input_payload=task.input_payload,
+        started_at=datetime.now(UTC),
+        lease_owner=lease_owner,
     )
-    # Taskiq 至少一次重复投递不得创建第二封草稿或第二条 assistant 回复。
-    await step.execute(
-        LeasedTask(
-            task_id=task.id,
-            user_id=clients.owner_id,
-            kind=task.kind,
-            input_payload=task.input_payload,
-            started_at=datetime.now(UTC),
-        )
-    )
+    # 两个同 owner 执行同时越过只读快照，最终写事务仍必须串行成一封草稿和一条回复。
+    await asyncio.gather(step.execute(leased), step.execute(leased))
+    # Taskiq 后续至少一次重放也必须在模型或业务写入前短路。
+    await step.execute(leased)
 
     async with clients.session_factory() as session:
         draft = await session.scalar(
@@ -245,6 +390,13 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
                 MessageModel.role == "assistant",
             )
         )
+        reply_count = await session.scalar(
+            select(func.count()).select_from(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
         approval_count = await session.scalar(
             select(func.count()).select_from(ApprovalRequestModel)
         )
@@ -256,6 +408,7 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
         {"address": '"quoted local"@example.test'}
     ]
     assert reply is not None
+    assert reply_count == 1
     assert f"/api/v1/mail/drafts/{draft.id}" in reply.content_markdown
     assert "不会发送" in reply.content_markdown
     assert approval_count == 0 and execution_count == 0
@@ -280,6 +433,7 @@ async def test_explicit_local_thread_reply_creates_bound_draft_once_without_writ
     # 本地 PostgreSQL UUID 并不限定版本；使用规范 UUIDv7 防止命令正则意外只接受 v1-v5。
     thread_id = UUID("00000000-0000-7000-8000-000000000701")
     message_id = uuid4()
+    lease_owner = "conversation-explicit-thread-reply-worker"
     async with clients.session_factory.begin() as session:
         connection = OAuthConnectionModel(
             user_id=clients.owner_id,
@@ -343,6 +497,7 @@ async def test_explicit_local_thread_reply_creates_bound_draft_once_without_writ
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key="conversation-explicit-thread-reply",
             input_payload={
                 "conversation_id": str(conversation_id),
@@ -365,6 +520,7 @@ async def test_explicit_local_thread_reply_creates_bound_draft_once_without_writ
         kind=task.kind,
         input_payload=task.input_payload,
         started_at=datetime.now(UTC),
+        lease_owner=lease_owner,
     )
 
     await step.execute(leased)
@@ -428,11 +584,13 @@ async def test_mail_questions_and_negations_never_create_drafts(
     """能力询问、说明性文本和中英文否定句都必须 fail closed 为边界说明。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-negative-mail-worker"
     async with clients.session_factory.begin() as session:
         task = TaskRunModel(
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key=f"conversation-negative-mail-{uuid4()}",
             input_payload={
                 "conversation_id": str(conversation_id),
@@ -455,6 +613,7 @@ async def test_mail_questions_and_negations_never_create_drafts(
             kind=task.kind,
             input_payload=task.input_payload,
             started_at=datetime.now(UTC),
+            lease_owner=lease_owner,
         )
     )
 
@@ -482,11 +641,13 @@ async def test_model_selected_mail_draft_intent_is_rejected_without_explicit_com
     """模型只能分类歧义文本，不能凭结构化输出选择收件人、账户或线程并创建动作。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-model-intent-worker"
     async with clients.session_factory.begin() as session:
         task = TaskRunModel(
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key="conversation-model-cannot-create-draft",
             input_payload={
                 "conversation_id": str(conversation_id),
@@ -505,6 +666,7 @@ async def test_model_selected_mail_draft_intent_is_rejected_without_explicit_com
             kind=task.kind,
             input_payload=task.input_payload,
             started_at=datetime.now(UTC),
+            lease_owner=lease_owner,
         )
     )
 
@@ -533,11 +695,13 @@ async def test_ambiguous_mail_chat_explains_capabilities_without_creating_action
     """未明确要求草稿的邮件闲聊继续解释边界，不创建任何本地或真实动作。"""
     clients = authenticated_api_clients
     conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-ambiguous-mail-worker"
     async with clients.session_factory.begin() as session:
         task = TaskRunModel(
             user_id=clients.owner_id,
             kind="conversation.respond",
             status="running",
+            lease_owner=lease_owner,
             idempotency_key="conversation-ambiguous-mail-help",
             input_payload={
                 "conversation_id": str(conversation_id),
@@ -556,6 +720,7 @@ async def test_ambiguous_mail_chat_explains_capabilities_without_creating_action
             kind=task.kind,
             input_payload=task.input_payload,
             started_at=datetime.now(UTC),
+            lease_owner=lease_owner,
         )
     )
 

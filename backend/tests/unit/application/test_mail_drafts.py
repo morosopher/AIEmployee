@@ -1,13 +1,21 @@
 """验证本地邮件草稿用例的用户隔离、绑定与版本不变量。"""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from typing import get_type_hints
+from uuid import UUID, uuid4
 
 import pytest
 
 from ai_employee.application.use_cases.mail_drafts import (
     CreateMailDraftInput,
+    MailDraftCapabilitySnapshot,
+    MailDraftConnectionReader,
+    MailDraftConnectionSnapshot,
+    MailDraftRepository,
+    MailDraftSnapshot,
     MailDraftSourceMessage,
+    MailDraftStateSnapshot,
     MailDraftUseCase,
     MailRecipientHistoryEntry,
     UpdateMailDraftInput,
@@ -24,33 +32,50 @@ SOURCE_MESSAGE_ID = "message-synthetic"
 NOW = datetime(2026, 8, 9, 0, 0, tzinfo=UTC)
 
 
-class _Connection:
-    def __init__(self, *, connection_id=CONNECTION_ID, email="owner@example.test") -> None:
-        self.id = connection_id
-        self.user_id = USER_ID
-        self.account_email = email
-        self.status = "connected"
-        self.provider = "google"
+def test_mail_draft_ports_publish_exact_application_snapshot_types() -> None:
+    """公共端口必须声明应用层快照，不能以 ``object`` 隐藏结构契约。"""
+    from ai_employee.application.use_cases import mail_drafts as mail_drafts_module
 
+    draft_snapshot = getattr(mail_drafts_module, "MailDraftSnapshot", None)
+    connection_snapshot = getattr(mail_drafts_module, "MailDraftConnectionSnapshot", None)
+    state_snapshot = getattr(mail_drafts_module, "MailDraftStateSnapshot", None)
 
-class _CapabilityState:
-    """测试用最小能力投影，不包含 scope、token 或供应商响应。"""
-
-    def __init__(
-        self,
-        *,
-        capability: ConnectionCapability,
-        status: CapabilityStatus,
-        last_error_code: str | None = None,
-    ) -> None:
-        self.capability = capability
-        self.status = status
-        self.last_error_code = last_error_code
+    assert draft_snapshot is not None
+    assert connection_snapshot is not None
+    assert state_snapshot is not None
+    repository_hints = {
+        name: get_type_hints(getattr(MailDraftRepository, name))["return"]
+        for name in ("list_current", "get_current", "create", "save_next_version", "cancel")
+    }
+    assert repository_hints == {
+        "list_current": tuple[draft_snapshot, ...],
+        "get_current": draft_snapshot | None,
+        "create": draft_snapshot,
+        "save_next_version": draft_snapshot | None,
+        "cancel": state_snapshot | None,
+    }
+    connection_hints = {
+        name: get_type_hints(getattr(MailDraftConnectionReader, name))["return"]
+        for name in ("get_default_mail_connection", "get_connection", "list_connections")
+    }
+    assert connection_hints == {
+        "get_default_mail_connection": connection_snapshot | None,
+        "get_connection": connection_snapshot | None,
+        "list_connections": tuple[connection_snapshot, ...],
+    }
 
 
 class _Connections:
     def __init__(self) -> None:
-        self.connections = [_Connection()]
+        self.connections = [
+            MailDraftConnectionSnapshot(
+                id=CONNECTION_ID,
+                user_id=USER_ID,
+                provider="google",
+                account_email="owner@example.test",
+                status="connected",
+            )
+        ]
         self.capabilities = {ConnectionCapability.MAIL_SEND, ConnectionCapability.MAIL_READ}
         self.capability_overrides: dict[
             ConnectionCapability, tuple[CapabilityStatus, str | None]
@@ -91,7 +116,7 @@ class _Connections:
             else:
                 continue
             states.append(
-                _CapabilityState(
+                MailDraftCapabilitySnapshot(
                     capability=capability,
                     status=status,
                     last_error_code=last_error_code,
@@ -111,6 +136,7 @@ class _Sources:
         self, *, history: tuple[MailRecipientHistoryEntry, ...] = ()
     ) -> None:
         self.history = history
+        self.history_calls = 0
 
     async def get_draft_source_message(
         self,
@@ -139,32 +165,38 @@ class _Sources:
         )
 
     async def list_recipient_history(self, *, user_id):
+        self.history_calls += 1
         return self.history if user_id == USER_ID else ()
 
 
 class _Drafts:
     def __init__(self) -> None:
-        self.values = {}
-        self.calls = []
+        self.values: dict[UUID, MailDraftSnapshot] = {}
+        self.calls: list[tuple[str, dict[str, object]]] = []
 
     async def create(self, **values):
         self.calls.append(("create", values))
-        value = {
-            "draft_id": values["draft_id"],
-            "connection_id": values["connection_id"],
-            "mode": values["mode"],
-            "source_thread_id": values["source_thread_id"],
-            "source_message_id": values["source_message_id"],
-            "current_version": 1,
-            "version": 1,
-            "status": MailDraftStatus.EDITING,
-            "to_recipients": values["to_recipients"],
-            "cc_recipients": values["cc_recipients"],
-            "bcc_recipients": values["bcc_recipients"],
-            "subject": values["subject"],
-            "body_text": values["body_text"],
-        }
-        self.values[value["draft_id"]] = value
+        value = MailDraftSnapshot(
+            draft_id=values["draft_id"],
+            connection_id=values["connection_id"],
+            mode=values["mode"],
+            source_thread_id=values["source_thread_id"],
+            source_message_id=values["source_message_id"],
+            current_version=1,
+            status=MailDraftStatus.EDITING,
+            retain_until=values["retain_until"],
+            version_id=values["version_id"],
+            version=1,
+            to_recipients=values["to_recipients"],
+            cc_recipients=values["cc_recipients"],
+            bcc_recipients=values["bcc_recipients"],
+            subject=values["subject"],
+            body_text=values["body_text"],
+            prompt_version=values["prompt_version"],
+            model_name=values["model_name"],
+            created_at=NOW,
+        )
+        self.values[value.draft_id] = value
         return value
 
     async def list_current(self, *, user_id, limit, offset):
@@ -179,26 +211,39 @@ class _Drafts:
     async def save_next_version(self, **values):
         self.calls.append(("save_next_version", values))
         value = self.values[values["draft_id"]]
-        if value["current_version"] != values["expected_version"]:
+        if value.current_version != values["expected_version"]:
             raise StateConflictError(
                 error_code="draft_version_conflict", message="mail draft version changed"
             )
-        value.update(
-            current_version=value["current_version"] + 1,
-            version=value["current_version"] + 1,
+        next_version = value.current_version + 1
+        value = replace(
+            value,
+            current_version=next_version,
+            version_id=values["version_id"],
+            version=next_version,
             to_recipients=values["to_recipients"],
             cc_recipients=values["cc_recipients"],
             bcc_recipients=values["bcc_recipients"],
             subject=values["subject"],
             body_text=values["body_text"],
+            prompt_version=values["prompt_version"],
+            model_name=values["model_name"],
+            retain_until=values["retain_until"],
+            created_at=NOW,
         )
+        self.values[value.draft_id] = value
         return value
 
     async def cancel(self, *, user_id, draft_id):
         value = await self.get_current(user_id=user_id, draft_id=draft_id)
-        if value is not None:
-            value["status"] = MailDraftStatus.CANCELLED
-        return value
+        if value is None:
+            return None
+        self.values[draft_id] = replace(value, status=MailDraftStatus.CANCELLED)
+        return MailDraftStateSnapshot(
+            draft_id=draft_id,
+            current_version=value.current_version,
+            status=MailDraftStatus.CANCELLED,
+        )
 
 
 @pytest.mark.asyncio
@@ -338,7 +383,10 @@ async def test_stale_patch_and_approval_lock_have_distinct_conflicts() -> None:
         )
     assert stale.value.error_code == "draft_version_conflict"
 
-    drafts.values[created.draft_id]["status"] = MailDraftStatus.AWAITING_APPROVAL
+    drafts.values[created.draft_id] = replace(
+        drafts.values[created.draft_id],
+        status=MailDraftStatus.AWAITING_APPROVAL,
+    )
     with pytest.raises(StateConflictError) as locked:
         await use_case.update(
             UpdateMailDraftInput(
@@ -360,13 +408,16 @@ async def test_cancel_cannot_bypass_pending_approval_withdrawal() -> None:
         user_id=USER_ID,
         idempotency_key="cancel-approval-lock",
     )
-    drafts.values[created.draft_id]["status"] = MailDraftStatus.AWAITING_APPROVAL
+    drafts.values[created.draft_id] = replace(
+        drafts.values[created.draft_id],
+        status=MailDraftStatus.AWAITING_APPROVAL,
+    )
 
     with pytest.raises(StateConflictError) as locked:
         await use_case.cancel(user_id=USER_ID, draft_id=created.draft_id)
 
     assert locked.value.error_code == "mail_draft_approval_withdrawal_required"
-    assert drafts.values[created.draft_id]["status"] is MailDraftStatus.AWAITING_APPROVAL
+    assert drafts.values[created.draft_id].status is MailDraftStatus.AWAITING_APPROVAL
 
 
 @pytest.mark.asyncio
@@ -452,7 +503,13 @@ async def test_recipient_suggestions_are_local_unique_recent_and_exclude_self() 
     """自动补全只使用本地历史，按最近时间排序并限制二十个非自有地址。"""
     connections = _Connections()
     connections.connections.append(
-        _Connection(connection_id=uuid4(), email="second-owner@example.test")
+        MailDraftConnectionSnapshot(
+            id=uuid4(),
+            user_id=USER_ID,
+            provider="microsoft",
+            account_email="second-owner@example.test",
+            status="connected",
+        )
     )
     history = tuple(
         MailRecipientHistoryEntry(
@@ -479,3 +536,79 @@ async def test_recipient_suggestions_are_local_unique_recent_and_exclude_self() 
     assert len(set(suggestions)) == len(suggestions)
     assert "owner@example.test" not in suggestions
     assert "second-owner@example.test" not in suggestions
+
+
+@pytest.mark.asyncio
+async def test_create_does_not_compute_ui_recipient_suggestions() -> None:
+    """创建写路径只返回持久化结果，不在同一事务中追加 UI 自动补全查询。"""
+    sources = _Sources(
+        history=(MailRecipientHistoryEntry(address="peer@example.test", last_seen_at=NOW),)
+    )
+    use_case = MailDraftUseCase(
+        drafts=_Drafts(),
+        connections=_Connections(),
+        sources=sources,
+        clock=lambda: NOW,
+    )
+
+    created = await use_case.create_new(user_id=USER_ID, idempotency_key="no-create-suggest")
+
+    assert created.recipient_suggestions == ()
+    assert sources.history_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_compute_ui_recipient_suggestions() -> None:
+    """版本 CAS 完成后不得在仍持有草稿锁的事务中读取历史建议。"""
+    drafts = _Drafts()
+    created = await MailDraftUseCase(
+        drafts=drafts,
+        connections=_Connections(),
+        clock=lambda: NOW,
+    ).create_new(user_id=USER_ID, idempotency_key="no-update-suggest")
+    sources = _Sources(
+        history=(MailRecipientHistoryEntry(address="peer@example.test", last_seen_at=NOW),)
+    )
+    use_case = MailDraftUseCase(
+        drafts=drafts,
+        connections=_Connections(),
+        sources=sources,
+        clock=lambda: NOW,
+    )
+
+    updated = await use_case.update(
+        UpdateMailDraftInput(
+            user_id=USER_ID,
+            draft_id=created.draft_id,
+            expected_version=1,
+            body_text="Synthetic update",
+        )
+    )
+
+    assert updated.recipient_suggestions == ()
+    assert sources.history_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_does_not_compute_ui_recipient_suggestions() -> None:
+    """取消状态写入不附带与状态迁移无关的 UI 历史查询。"""
+    drafts = _Drafts()
+    created = await MailDraftUseCase(
+        drafts=drafts,
+        connections=_Connections(),
+        clock=lambda: NOW,
+    ).create_new(user_id=USER_ID, idempotency_key="no-cancel-suggest")
+    sources = _Sources(
+        history=(MailRecipientHistoryEntry(address="peer@example.test", last_seen_at=NOW),)
+    )
+    use_case = MailDraftUseCase(
+        drafts=drafts,
+        connections=_Connections(),
+        sources=sources,
+        clock=lambda: NOW,
+    )
+
+    cancelled = await use_case.cancel(user_id=USER_ID, draft_id=created.draft_id)
+
+    assert cancelled.recipient_suggestions == ()
+    assert sources.history_calls == 0

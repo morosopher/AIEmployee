@@ -2,7 +2,6 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from hmac import compare_digest
 from uuid import UUID
@@ -14,7 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.use_cases.mail_drafts import (
     MailDraftCapabilitySnapshot,
+    MailDraftConnectionSnapshot,
     MailDraftRecipient,
+    MailDraftSnapshot,
+    MailDraftStateSnapshot,
 )
 from ai_employee.domain.actions import MailDraftStatus, transition_mail_draft
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
@@ -35,54 +37,6 @@ from ai_employee.infrastructure.security.action_payloads import ActionPayloadCip
 MAIL_DRAFT_CONTENT_KIND = "mail_draft_body"
 MAIL_DRAFT_ACTION = "mail.draft"
 MAIL_DRAFT_SCHEMA_VERSION = "mail_draft_body.v1"
-
-
-# 兼容 Task 6 已公开的基础设施导入名；实际值对象定义在应用边界，使新用例不反向依赖 ORM。
-MailRecipient = MailDraftRecipient
-
-
-@dataclass(frozen=True, slots=True)
-class MailDraftConnectionSnapshot:
-    """返回草稿连接选择所需且不含 token/scope 原文的最小投影。"""
-
-    id: UUID
-    user_id: UUID
-    provider: str
-    account_email: str
-    status: str
-
-
-@dataclass(frozen=True, slots=True)
-class MailDraftStateSnapshot:
-    """返回不含正文的草稿头状态，供取消等状态操作使用。"""
-
-    draft_id: UUID
-    current_version: int
-    status: MailDraftStatus
-
-
-@dataclass(frozen=True, slots=True)
-class MailDraftSnapshot:
-    """把 ORM 草稿头和解密后的精确当前版本映射为稳定基础设施快照。"""
-
-    draft_id: UUID
-    connection_id: UUID
-    source_thread_id: str | None
-    source_message_id: str | None
-    mode: MailMode
-    current_version: int
-    status: MailDraftStatus
-    retain_until: datetime
-    version_id: UUID
-    version: int
-    to_recipients: tuple[MailRecipient, ...]
-    cc_recipients: tuple[MailRecipient, ...]
-    bcc_recipients: tuple[MailRecipient, ...]
-    subject: str
-    body_text: str
-    prompt_version: str | None
-    model_name: str | None
-    created_at: datetime
 
 
 class SqlAlchemyMailDraftRepository:
@@ -116,9 +70,9 @@ class SqlAlchemyMailDraftRepository:
         source_message_id: str | None,
         mode: MailMode,
         retain_until: datetime,
-        to_recipients: tuple[MailRecipient, ...],
-        cc_recipients: tuple[MailRecipient, ...],
-        bcc_recipients: tuple[MailRecipient, ...],
+        to_recipients: tuple[MailDraftRecipient, ...],
+        cc_recipients: tuple[MailDraftRecipient, ...],
+        bcc_recipients: tuple[MailDraftRecipient, ...],
         subject: str,
         body_text: str,
         prompt_version: str | None,
@@ -273,18 +227,25 @@ class SqlAlchemyMailDraftRepository:
             raise ValueError("mail draft list limit must be between 1 and 100")
         if offset < 0:
             raise ValueError("mail draft list offset must be non-negative")
-        rows = tuple(
-            (
-                await self._session.scalars(
-                    select(MailDraftModel)
-                    .where(MailDraftModel.user_id == user_id)
-                    .order_by(MailDraftModel.updated_at.desc(), MailDraftModel.id)
-                    .limit(limit)
-                    .offset(offset)
+        rows = (
+            await self._session.execute(
+                select(MailDraftModel, MailDraftVersionModel)
+                .join(
+                    MailDraftVersionModel,
+                    (MailDraftVersionModel.user_id == MailDraftModel.user_id)
+                    & (MailDraftVersionModel.draft_id == MailDraftModel.id)
+                    & (MailDraftVersionModel.version == MailDraftModel.current_version),
                 )
-            ).all()
+                .where(MailDraftModel.user_id == user_id)
+                .order_by(MailDraftModel.updated_at.desc(), MailDraftModel.id)
+                .limit(limit)
+                .offset(offset)
+            )
+        ).all()
+        return tuple(
+            self._snapshot_from_version(draft=draft, version=version)
+            for draft, version in rows
         )
-        return tuple([await self._snapshot(row) for row in rows])
 
     async def get_default_mail_connection(
         self, *, user_id: UUID
@@ -410,9 +371,9 @@ class SqlAlchemyMailDraftRepository:
         user_id: UUID,
         draft_id: UUID,
         expected_version: int,
-        to_recipients: tuple[MailRecipient, ...],
-        cc_recipients: tuple[MailRecipient, ...],
-        bcc_recipients: tuple[MailRecipient, ...],
+        to_recipients: tuple[MailDraftRecipient, ...],
+        cc_recipients: tuple[MailDraftRecipient, ...],
+        bcc_recipients: tuple[MailDraftRecipient, ...],
         subject: str,
         body_text: str,
         prompt_version: str | None,
@@ -616,6 +577,20 @@ class SqlAlchemyMailDraftRepository:
         )
         if version is None:
             raise _mail_content_unavailable()
+        return self._snapshot_from_version(draft=draft, version=version)
+
+    def _snapshot_from_version(
+        self,
+        *,
+        draft: MailDraftModel,
+        version: MailDraftVersionModel,
+    ) -> MailDraftSnapshot:
+        """校验并解密已经与父草稿当前版本精确连接的 ORM 行。
+
+        ``list_current`` 在一个 SQL 中批量取得父行和当前版本，精确读取则可先查询父行再复用
+        本函数。两条路径共享同一 AEAD、JSONB 白名单和状态映射，避免为消除 N+1 引入第二套
+        内容解释规则。
+        """
         if (
             version.body_ciphertext is None
             or version.body_nonce is None
@@ -677,12 +652,14 @@ def _connection_snapshot(row: OAuthConnectionModel) -> MailDraftConnectionSnapsh
     )
 
 
-def _recipients_to_json(recipients: tuple[MailRecipient, ...]) -> list[dict[str, str]]:
+def _recipients_to_json(
+    recipients: tuple[MailDraftRecipient, ...],
+) -> list[dict[str, str]]:
     """把不可变地址元数据复制为 ORM JSONB 白名单结构。"""
     result: list[dict[str, str]] = []
     for recipient in recipients:
         if type(recipient) is not MailDraftRecipient:
-            raise TypeError("mail recipients must contain MailRecipient values")
+            raise TypeError("mail recipients must contain MailDraftRecipient values")
         value = {"address": recipient.address}
         if recipient.display_name is not None:
             value["display_name"] = recipient.display_name
@@ -690,9 +667,11 @@ def _recipients_to_json(recipients: tuple[MailRecipient, ...]) -> list[dict[str,
     return result
 
 
-def _recipients_from_json(values: list[dict[str, str]]) -> tuple[MailRecipient, ...]:
+def _recipients_from_json(
+    values: list[dict[str, str]],
+) -> tuple[MailDraftRecipient, ...]:
     """验证数据库 JSONB 地址白名单，阻止异常结构逃逸为应用快照。"""
-    recipients: list[MailRecipient] = []
+    recipients: list[MailDraftRecipient] = []
     for value in values:
         if not isinstance(value, dict) or not set(value).issubset({"address", "display_name"}):
             raise _mail_content_unavailable()
@@ -700,7 +679,7 @@ def _recipients_from_json(values: list[dict[str, str]]) -> tuple[MailRecipient, 
         display_name = value.get("display_name")
         if type(address) is not str or (display_name is not None and type(display_name) is not str):
             raise _mail_content_unavailable()
-        recipients.append(MailRecipient(address=address, display_name=display_name))
+        recipients.append(MailDraftRecipient(address=address, display_name=display_name))
     return tuple(recipients)
 
 
@@ -751,10 +730,6 @@ __all__ = [
     "MAIL_DRAFT_ACTION",
     "MAIL_DRAFT_CONTENT_KIND",
     "MAIL_DRAFT_SCHEMA_VERSION",
-    "MailDraftConnectionSnapshot",
-    "MailDraftSnapshot",
-    "MailDraftStateSnapshot",
-    "MailRecipient",
     "SqlAlchemyMailDraftRepository",
     "SqlAlchemyMailDraftRepositoryFactory",
 ]

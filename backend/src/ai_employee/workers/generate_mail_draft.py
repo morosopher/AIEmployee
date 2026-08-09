@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
+from unicodedata import category
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -22,7 +23,9 @@ from ai_employee.application.use_cases.mail_drafts import (
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
 from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.mail_actions import normalize_mailbox_address
 from ai_employee.domain.model_redaction import redact_for_model
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.briefs import LLMInvocationModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
@@ -40,12 +43,8 @@ MAX_MAIL_DRAFT_CONTEXT_CHARACTERS = 12_000
 
 _URL_PATTERN = re.compile(r"(?i)https?://[^\s<>()]+")
 _TRACKING_IMAGE_PATTERN = re.compile(r"(?is)<img\b[^>]*>")
-_MAILBOX_PATTERN = re.compile(
-    r"(?i)(?<![\w.!#$%&'*+/=?^`{|}~-])"
-    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
-)
+_ASCII_LOCAL_CHARACTERS = frozenset(".!#$%&'*+/=?^_`{|}~-")
+_ADDRESS_REPLACEMENT = "[ADDRESS_REMOVED]"
 _QUOTED_HISTORY_PATTERNS = (
     re.compile(r"(?i)^on .+ wrote:\s*$"),
     re.compile(r"(?i)^from:\s+.+$"),
@@ -273,6 +272,10 @@ class GenerateMailDraftTaskStep:
         """
         if task.user_id is None:
             raise ValueError("mail draft generation requires user_id")
+        lease_owner = _required_lease_owner(
+            task,
+            error_message="mail draft generation requires lease_owner",
+        )
         raw_draft_id = task.input_payload.get("draft_id")
         raw_instruction = task.input_payload.get("instruction", "")
         raw_expected_version = task.input_payload.get("expected_version")
@@ -288,6 +291,17 @@ class GenerateMailDraftTaskStep:
         draft_id = UUID(raw_draft_id)
 
         async with self._session_factory() as session:
+            owned_task = await session.scalar(
+                select(TaskRunModel.id).where(
+                    TaskRunModel.id == task.task_id,
+                    TaskRunModel.user_id == task.user_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
+            )
+            if owned_task is None:
+                # 预读只减少失租后的模型披露；最终写事务仍必须重新锁定并校验同一 owner。
+                return
             existing = await session.scalar(
                 select(LLMInvocationModel.id).where(
                     LLMInvocationModel.user_id == task.user_id,
@@ -382,14 +396,24 @@ class GenerateMailDraftTaskStep:
         """在一个短事务内幂等保存版本、LLMInvocation、任务摘要和无内容审计。"""
         if task.user_id is None:
             raise ValueError("mail draft generation requires user_id")
+        lease_owner = _required_lease_owner(
+            task,
+            error_message="mail draft generation requires lease_owner",
+        )
         async with self._session_factory.begin() as session:
             task_row = await session.scalar(
                 select(TaskRunModel)
-                .where(TaskRunModel.id == task.task_id, TaskRunModel.user_id == task.user_id)
+                .where(
+                    TaskRunModel.id == task.task_id,
+                    TaskRunModel.user_id == task.user_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                )
                 .with_for_update()
             )
             if task_row is None:
-                raise ValueError("mail draft generation task was not found")
+                # 模型 I/O 期间取消或换 owner 后，旧 Worker 不得留下任何业务或审计事实。
+                return
             existing = await session.scalar(
                 select(LLMInvocationModel.id).where(
                     LLMInvocationModel.user_id == task.user_id,
@@ -490,7 +514,7 @@ def build_generate_mail_draft_task_step(
 
 
 def _sanitize_mail_body(text: str, *, configured_patterns: tuple[str, ...]) -> str:
-    """移除引用、签名、tracking/URL 和明显敏感模式，保留纯文本换行。"""
+    """移除引用、签名、tracking/URL、邮箱和明显敏感模式，保留纯文本换行。"""
     without_tracking = _TRACKING_IMAGE_PATTERN.sub("", text)
     without_urls = _URL_PATTERN.sub("", without_tracking)
     kept_lines: list[str] = []
@@ -507,7 +531,7 @@ def _sanitize_mail_body(text: str, *, configured_patterns: tuple[str, ...]) -> s
     return _sanitize_model_text(
         compact,
         configured_patterns=configured_patterns,
-        remove_addresses=False,
+        remove_addresses=True,
     )
 
 
@@ -518,8 +542,161 @@ def _sanitize_model_text(
     remove_addresses: bool,
 ) -> str:
     """执行共同本地脱敏，并可进一步移除邮箱地址。"""
-    value = _MAILBOX_PATTERN.sub("[ADDRESS_REMOVED]", text) if remove_addresses else text
+    value = _mask_mailbox_addresses(text) if remove_addresses else text
     return redact_for_model(value, configured_patterns=configured_patterns).text.strip()
+
+
+def _mask_mailbox_addresses(text: str) -> str:
+    """以有界扫描和语法校验掩码模型文本中的疑似 Internet 邮箱地址。
+
+    扫描器只围绕真实 ``@`` 定位候选，不把整段 prose 交给宽松 Header 解析器。候选必须同时
+    具有可解释的 local-part 和至少两段的 DNS/IDN 域；ASCII 与标准 quoted local-part 优先
+    复用领域地址解析器，SMTPUTF8 local-part 则在域通过 IDNA 校验后 fail-safe 掩码。这样既
+    覆盖 quoted、大小写和国际化地址，也保留 ``@team``、``A @ B`` 与 ``file@localhost``。
+
+    Args:
+        text: 尚未进入模型、可包含自然语言标点的本地文本。
+
+    Returns:
+        仅把疑似邮箱 span 替换为固定占位符、其余字符顺序不变的文本。
+    """
+    pieces: list[str] = []
+    copied_until = 0
+    search_from = 0
+    while (at_index := text.find("@", search_from)) >= 0:
+        span = _mailbox_span_at(text, at_index)
+        if span is None:
+            search_from = at_index + 1
+            continue
+        start, end = span
+        if start < copied_until:
+            search_from = at_index + 1
+            continue
+        pieces.extend((text[copied_until:start], _ADDRESS_REPLACEMENT))
+        copied_until = end
+        search_from = end
+    pieces.append(text[copied_until:])
+    return "".join(pieces)
+
+
+def _mailbox_span_at(text: str, at_index: int) -> tuple[int, int] | None:
+    """返回指定 ``@`` 所属的可信候选 span；普通 prose 分隔符返回 ``None``。"""
+    start = _local_part_start(text, at_index)
+    if start is None:
+        return None
+    end = _domain_end(text, at_index + 1)
+    if end is None:
+        return None
+
+    local_part = text[start:at_index]
+    domain = text[at_index + 1 : end]
+    if not _is_plausible_mail_domain(domain):
+        return None
+    candidate = text[start:end]
+    try:
+        normalize_mailbox_address(candidate)
+    except ValueError:
+        # stdlib ``Address`` 不接受 SMTPUTF8 local-part；域已通过 IDNA 后，对结构合理的
+        # Unicode local-part 宁可掩码也不向模型披露。相同 fallback 也覆盖解析器未识别但
+        # 高度疑似邮箱的国际化形式，不把原始候选带入异常或日志。
+        if not _is_plausible_mail_local_part(local_part):
+            return None
+    return start, end
+
+
+def _local_part_start(text: str, at_index: int) -> int | None:
+    """从 ``@`` 向左提取 unquoted 或成对 quoted local-part 的起点。"""
+    if at_index == 0:
+        return None
+    local_end = at_index
+    if text[local_end - 1] == '"':
+        opening_quote = _find_unescaped_opening_quote(text, local_end - 1)
+        return opening_quote
+
+    start = local_end
+    while start > 0 and _is_unquoted_local_character(text[start - 1]):
+        start -= 1
+    return start if start < local_end else None
+
+
+def _find_unescaped_opening_quote(text: str, closing_quote: int) -> int | None:
+    """向左寻找与 quoted local-part 结尾配对且未被反斜杠转义的双引号。"""
+    index = closing_quote - 1
+    while index >= 0:
+        if text[index] == '"':
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= 0 and text[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2 == 0:
+                return index
+        index -= 1
+    return None
+
+
+def _domain_end(text: str, start: int) -> int | None:
+    """提取 DNS/IDN 域结尾，并把句末点号留给原始 prose。"""
+    if start >= len(text):
+        return None
+    end = start
+    while end < len(text) and _is_domain_character(text[end]):
+        end += 1
+    while end > start and text[end - 1] == ".":
+        end -= 1
+    return end if end > start else None
+
+
+def _is_unquoted_local_character(character: str) -> bool:
+    """判断字符是否可组成无需空白边界的 ASCII/SMTPUTF8 local-part 候选。"""
+    return (
+        character.isascii()
+        and (character.isalnum() or character in _ASCII_LOCAL_CHARACTERS)
+    ) or category(character)[0] in {"L", "M", "N"}
+
+
+def _is_domain_character(character: str) -> bool:
+    """判断字符是否可继续组成 DNS 或 Unicode IDN 标签。"""
+    return character in {".", "-"} or category(character)[0] in {"L", "M", "N"}
+
+
+def _is_plausible_mail_domain(domain: str) -> bool:
+    """验证至少两段的 DNS/IDN 域，排除 mention、主机名和普通版本文本。"""
+    labels = domain.split(".")
+    if len(labels) < 2 or any(not label for label in labels):
+        return False
+    encoded_length = 0
+    for label in labels:
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if any(not _is_domain_character(character) or character == "." for character in label):
+            return False
+        try:
+            encoded = label.encode("idna")
+        except UnicodeError:
+            return False
+        if not 1 <= len(encoded) <= 63:
+            return False
+        encoded_length += len(encoded) + 1
+    # 公共邮件域的末段必须含字母；该约束避免把 ``version@2.0`` 之类 prose 当地址。
+    if not any(category(character)[0] == "L" for character in labels[-1]):
+        return False
+    return encoded_length - 1 <= 253
+
+
+def _is_plausible_mail_local_part(local_part: str) -> bool:
+    """为解析器不支持的 SMTPUTF8 候选执行无空白、无控制字符的保守验证。"""
+    if not local_part:
+        return False
+    if local_part.startswith('"') and local_part.endswith('"'):
+        inner = local_part[1:-1]
+        return bool(inner) and all(
+            character not in {"\r", "\n"} and not category(character).startswith("C")
+            for character in inner
+        )
+    return all(_is_unquoted_local_character(character) for character in local_part) and any(
+        category(character)[0] in {"L", "N"} for character in local_part
+    )
 
 
 def _context_message_from_source(source: MailDraftSourceMessage) -> MailDraftContextMessage:
@@ -547,6 +724,14 @@ def _model_error_code(error: Exception) -> str:
         return "model_timeout"
     code = getattr(error, "code", None)
     return code if isinstance(code, str) and code else "mail_draft_model_output_invalid"
+
+
+def _required_lease_owner(task: LeasedTask, *, error_message: str) -> str:
+    """返回真实非空租约 owner；直接调用 Worker 而未持有租约时 fail closed。"""
+    owner = task.lease_owner
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError(error_message)
+    return owner
 
 
 def _invocation_model(
