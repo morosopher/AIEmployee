@@ -2,9 +2,10 @@
 
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import cast
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -12,6 +13,7 @@ from ai_employee.application.ports.calendar import CalendarEvent
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarAvailabilityContext,
     CalendarProposalContent,
+    CalendarProposalEventBinding,
     CalendarProposalEventSnapshot,
     CalendarProposalSnapshot,
     CalendarProposalTargetSnapshot,
@@ -30,6 +32,7 @@ from ai_employee.domain.tasks import JsonValue
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000911")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000912")
+ALTERNATE_CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000927")
 EVENT_ID = UUID("00000000-0000-0000-0000-000000000913")
 PROPOSAL_ID = UUID("00000000-0000-0000-0000-000000000914")
 DESIRED_ID = UUID("00000000-0000-0000-0000-000000000915")
@@ -220,8 +223,10 @@ class _ProposalRepository:
         expected_version: int,
         desired_state: Mapping[str, object],
         retain_until: datetime,
+        connection_id: UUID | None = None,
+        calendar_id: str | None = None,
     ) -> CalendarProposalSnapshot | None:
-        """执行与 PostgreSQL 父行相同的版本 CAS。"""
+        """执行与 PostgreSQL 父行相同的版本 CAS 与可选精确 retarget。"""
         del user_id
         current = self.proposals.get(proposal_id)
         if current is None:
@@ -244,6 +249,8 @@ class _ProposalRepository:
         )
         saved = replace(
             current,
+            connection_id=connection_id or current.connection_id,
+            calendar_id=calendar_id or current.calendar_id,
             current_version=version,
             retain_until=retain_until,
             desired_snapshot=snapshot,
@@ -298,9 +305,7 @@ class _ProposalRepository:
             )
         return snapshot
 
-    async def load_snapshot(
-        self, *, user_id: UUID, snapshot_id: UUID
-    ) -> CalendarSnapshot | None:
+    async def load_snapshot(self, *, user_id: UUID, snapshot_id: UUID) -> CalendarSnapshot | None:
         """按 ID 读取合成快照。"""
         del user_id
         return self.snapshots.get(snapshot_id)
@@ -350,19 +355,36 @@ class _CalendarSource:
     ) -> CalendarProposalTargetSnapshot | None:
         """只允许精确连接与日历 ID 命中。"""
         del user_id
-        if (
-            connection_id != self.target.connection_id
-            or calendar_id != self.target.calendar_id
-        ):
+        if connection_id != self.target.connection_id or calendar_id != self.target.calendar_id:
             return None
         return self.target
 
-    async def get_proposal_event(
+    async def get_proposal_event_binding(
         self, *, user_id: UUID, event_id: UUID
-    ) -> CalendarProposalEventSnapshot | None:
-        """按本地 UUID 返回已经绑定供应商三元身份的事件。"""
+    ) -> CalendarProposalEventBinding | None:
+        """只返回当前 Fake 事件的非敏感精确身份。"""
         del user_id
-        return self.event if event_id == self.event.event_id else None
+        if event_id != self.event.event_id:
+            return None
+        return CalendarProposalEventBinding(
+            event_id=self.event.event_id,
+            connection_id=self.event.connection_id,
+            calendar_id=self.event.calendar_id,
+            provider_event_id=self.event.provider_event_id,
+        )
+
+    async def get_proposal_event(
+        self, *, user_id: UUID, binding: CalendarProposalEventBinding
+    ) -> CalendarProposalEventSnapshot | None:
+        """只有 local/connection/calendar/provider 四项都匹配才返回完整事件。"""
+        del user_id
+        expected = CalendarProposalEventBinding(
+            event_id=self.event.event_id,
+            connection_id=self.event.connection_id,
+            calendar_id=self.event.calendar_id,
+            provider_event_id=self.event.provider_event_id,
+        )
+        return self.event if binding == expected else None
 
     async def get_availability_context(
         self,
@@ -539,9 +561,7 @@ async def test_read_only_calendar_is_rejected_before_snapshot_creation() -> None
 @pytest.mark.asyncio
 async def test_disabled_calendar_write_capability_is_rejected() -> None:
     """连接未启用 calendar.write 时不得只凭目录 ACL 创建本地写提案。"""
-    source = _CalendarSource(
-        target=_target(write_status=CapabilityStatus.DISABLED)
-    )
+    source = _CalendarSource(target=_target(write_status=CapabilityStatus.DISABLED))
     use_case, repository, _ = _use_case(calendar=source)
 
     with pytest.raises(StateConflictError) as error:
@@ -625,9 +645,7 @@ async def test_suggest_uses_only_personal_calendar_context_and_marks_partial() -
     assert source.availability_calls == 1
     assert suggested.content.availability is not None
     assert suggested.content.availability.completeness == "partial"
-    assert suggested.content.availability.missing_connection_ids == (
-        MISSING_CONNECTION_ID,
-    )
+    assert suggested.content.availability.missing_connection_ids == (MISSING_CONNECTION_ID,)
     assert suggested.content.availability.attendee_availability_checked is False
 
 
@@ -715,11 +733,76 @@ async def test_restore_uses_current_etag_complete_diff_and_new_operation_identit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("timezone", ["Asia/Shanghai", "America/Los_Angeles"])
+async def test_all_day_update_and_restore_snapshots_preserve_local_dates(
+    timezone: str,
+) -> None:
+    """全天 update/restore 的日期必须按事件 IANA 时区往返，不能按 UTC 偏移。"""
+
+    def local_midnight(day: date) -> datetime:
+        """把合成本地日期边界转换为同步层保存的 UTC 瞬间。"""
+        return datetime.combine(day, datetime.min.time(), ZoneInfo(timezone)).astimezone(UTC)
+
+    source_start = date(2030, 3, 11)
+    source_end = date(2030, 3, 12)
+    current_start = date(2030, 3, 13)
+    current_end = date(2030, 3, 14)
+    source = _CalendarSource(
+        target=replace(_target(), timezone=timezone),
+        event=replace(
+            _event(),
+            starts_at=local_midnight(source_start),
+            ends_at=local_midnight(source_end),
+            all_day=True,
+            timezone=timezone,
+        ),
+    )
+    ids = (
+        PROPOSAL_ID,
+        DESIRED_ID,
+        OPERATION_ID,
+        BEFORE_ID,
+        UUID("00000000-0000-0000-0000-000000000924"),
+        UUID("00000000-0000-0000-0000-000000000925"),
+        NEXT_OPERATION_ID,
+        UUID("00000000-0000-0000-0000-000000000926"),
+    )
+    use_case, repository, _ = _use_case(calendar=source, ids=ids)
+
+    updated = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"title": "Historical all-day title"},
+    )
+    assert updated.before_snapshot_id is not None
+    update_before = repository.snapshots[updated.before_snapshot_id]
+    restored = await use_case.create_restore(
+        user_id=USER_ID,
+        source_snapshot_id=updated.before_snapshot_id,
+        current_event=replace(
+            _provider_event(),
+            starts_at=local_midnight(current_start),
+            ends_at=local_midnight(current_end),
+            all_day=True,
+            timezone=timezone,
+        ),
+        idempotency_key=f"restore-all-day-{timezone}",
+    )
+    assert restored.before_snapshot_id is not None
+    restore_before = repository.snapshots[restored.before_snapshot_id]
+
+    assert update_before.content["starts_at"] == source_start.isoformat()
+    assert update_before.content["ends_at"] == source_end.isoformat()
+    assert restored.content.starts_at == source_start.isoformat()
+    assert restored.content.ends_at == source_end.isoformat()
+    assert restore_before.content["starts_at"] == current_start.isoformat()
+    assert restore_before.content["ends_at"] == current_end.isoformat()
+
+
+@pytest.mark.asyncio
 async def test_unsupported_notification_mapping_is_rejected_before_submission() -> None:
     """所选供应商不能无损表达通知策略时，编辑态也必须稳定拒绝。"""
-    source = _CalendarSource(
-        target=_target(supported=frozenset({NotificationPolicy.ALL}))
-    )
+    source = _CalendarSource(target=_target(supported=frozenset({NotificationPolicy.ALL})))
     use_case, _, _ = _use_case(calendar=source)
     created = await use_case.create_update(
         user_id=USER_ID,
@@ -808,12 +891,169 @@ async def test_conversation_shell_requires_explicit_confirmation_before_submissi
     assert proposal.content.confirmed_fields == ()
 
 
+@pytest.mark.asyncio
+async def test_shell_partial_edit_does_not_confirm_unrelated_required_fields() -> None:
+    """填写标题和完整时间只更新值，不得替用户确认日历、时间、参会人或通知。"""
+    use_case, _, _ = _use_case()
+    shell = await use_case.create_shell(
+        user_id=USER_ID,
+        idempotency_key="partial-calendar-shell",
+    )
+
+    edited = await use_case.edit(
+        user_id=USER_ID,
+        proposal_id=shell.proposal_id,
+        expected_version=shell.current_version,
+        changes={
+            "title": "Synthetic meeting",
+            "starts_at": datetime(2030, 3, 12, 9, tzinfo=UTC),
+            "ends_at": datetime(2030, 3, 12, 10, tzinfo=UTC),
+            "timezone": "UTC",
+            "all_day": False,
+        },
+    )
+
+    assert edited.submission_ready is False
+    assert edited.content.confirmed_fields == ()
+    assert edited.required_confirmations == (
+        "calendar",
+        "time",
+        "attendees",
+        "notification_policy",
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_becomes_ready_only_after_each_typed_confirmation() -> None:
+    """四项确认必须分别推进版本，缺少任一项时都不能 submission ready。"""
+    ids = tuple(UUID(f"00000000-0000-0000-0000-{value:012d}") for value in range(951, 959))
+    use_case, _, _ = _use_case(ids=ids)
+    shell = await use_case.create_shell(
+        user_id=USER_ID,
+        idempotency_key="confirmed-calendar-shell",
+    )
+    current = await use_case.edit(
+        user_id=USER_ID,
+        proposal_id=shell.proposal_id,
+        expected_version=shell.current_version,
+        changes={
+            "title": "Synthetic meeting",
+            "starts_at": datetime(2030, 3, 12, 9, tzinfo=UTC),
+            "ends_at": datetime(2030, 3, 12, 10, tzinfo=UTC),
+            "timezone": "UTC",
+            "all_day": False,
+            "attendees": (),
+            "notification_policy": "none",
+        },
+    )
+
+    expected_remaining = (
+        ("time", "attendees", "notification_policy"),
+        ("attendees", "notification_policy"),
+        ("notification_policy",),
+        (),
+    )
+    for confirmation, remaining in zip(
+        ("calendar", "time", "attendees", "notification_policy"),
+        expected_remaining,
+        strict=True,
+    ):
+        current = await use_case.confirm(
+            user_id=USER_ID,
+            proposal_id=current.proposal_id,
+            expected_version=current.current_version,
+            confirmation=confirmation,
+            connection_id=CONNECTION_ID if confirmation == "calendar" else None,
+            calendar_id=CALENDAR_ID if confirmation == "calendar" else None,
+        )
+        assert current.required_confirmations == remaining
+        assert current.submission_ready is (remaining == ())
+
+
+@pytest.mark.asyncio
+async def test_shell_calendar_confirmation_can_select_an_exact_writable_target() -> None:
+    """默认日历只建立 shell 归属；显式确认可把编辑提案原子切换到另一可写日历。"""
+    source = _CalendarSource()
+    use_case, repository, _ = _use_case(calendar=source)
+    shell = await use_case.create_shell(
+        user_id=USER_ID,
+        idempotency_key="retarget-calendar-shell",
+    )
+    source.target = replace(
+        _target(),
+        connection_id=ALTERNATE_CONNECTION_ID,
+        calendar_id="alternate-calendar",
+    )
+
+    selected = await use_case.confirm(
+        user_id=USER_ID,
+        proposal_id=shell.proposal_id,
+        expected_version=shell.current_version,
+        confirmation="calendar",
+        connection_id=ALTERNATE_CONNECTION_ID,
+        calendar_id="alternate-calendar",
+    )
+
+    assert selected.connection_id == ALTERNATE_CONNECTION_ID
+    assert selected.calendar_id == "alternate-calendar"
+    assert selected.required_confirmations == (
+        "time",
+        "attendees",
+        "notification_policy",
+    )
+    assert repository.proposals[selected.proposal_id].connection_id == ALTERNATE_CONNECTION_ID
+
+
+@pytest.mark.asyncio
+async def test_shell_calendar_confirmation_rejects_a_read_only_target() -> None:
+    """显式日历选择仍必须通过连接能力与目录 can_write 双重校验。"""
+    source = _CalendarSource()
+    use_case, repository, _ = _use_case(calendar=source)
+    shell = await use_case.create_shell(
+        user_id=USER_ID,
+        idempotency_key="read-only-calendar-shell",
+    )
+    source.target = replace(
+        _target(can_write=False),
+        connection_id=ALTERNATE_CONNECTION_ID,
+        calendar_id="read-only-calendar",
+    )
+
+    with pytest.raises(StateConflictError) as error:
+        await use_case.confirm(
+            user_id=USER_ID,
+            proposal_id=shell.proposal_id,
+            expected_version=shell.current_version,
+            confirmation="calendar",
+            connection_id=ALTERNATE_CONNECTION_ID,
+            calendar_id="read-only-calendar",
+        )
+
+    assert error.value.error_code == "calendar_read_only"
+    assert repository.proposals[shell.proposal_id].current_version == 1
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     (
         ("Please prepare a calendar proposal", True),
+        ("Prepare a calendar proposal.", True),
         ("Draft a meeting proposal", True),
         ("请准备一个日程提案", True),
+        ("请起草会议提案。", True),
+        ("Can you prepare a calendar proposal?", False),
+        ("Could you maybe draft a meeting proposal?", False),
+        ("Would you prepare an event proposal?", False),
+        ("Maybe prepare a calendar proposal", False),
+        ("I do not want you to prepare a calendar proposal", False),
+        ("I don't want you to draft a meeting proposal", False),
+        ("Please do not prepare a calendar proposal", False),
+        ("Prepare a calendar proposal for Tuesday", False),
+        ("你能准备一个日程提案吗？", False),
+        ("可以帮我准备一个日历提案吗？", False),
+        ("我不想让你准备一个日程提案", False),
+        ("请不要起草会议提案", False),
+        ("也许准备一个日历提案", False),
         ("Can you explain calendar proposals?", False),
         ("Do not prepare a calendar proposal", False),
         ("create calendar event", False),
@@ -836,3 +1076,82 @@ def test_proposal_content_rejects_recurrence_fields() -> None:
                 "recurrence": ["RRULE:FREQ=DAILY"],
             }
         )
+
+
+def test_proposal_content_normalizes_legacy_confirmation_order() -> None:
+    """修复前已持久化的字母序确认字段仍应可读，并规范为产品顺序。"""
+    content = CalendarProposalContent(
+        operation_id=OPERATION_ID,
+        confirmed_fields=("attendees", "calendar", "notification_policy", "time"),
+    )
+
+    assert content.confirmed_fields == (
+        "calendar",
+        "time",
+        "attendees",
+        "notification_policy",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "recurrence_field"),
+    (
+        ("create", "recurrence"),
+        ("update", "recurrence_rule"),
+        ("edit", "recurring_event_id"),
+    ),
+)
+async def test_recurrence_input_uses_stable_domain_error(
+    operation: str,
+    recurrence_field: str,
+) -> None:
+    """create/update/edit 的 recurrence 输入必须统一返回稳定领域错误码。"""
+    use_case, _, _ = _use_case()
+
+    with pytest.raises(StateConflictError) as error:
+        if operation == "create":
+            await use_case.create_event(
+                user_id=USER_ID,
+                connection_id=CONNECTION_ID,
+                calendar_id=CALENDAR_ID,
+                idempotency_key="recurring-create",
+                values={recurrence_field: ["RRULE:FREQ=DAILY"]},
+            )
+        elif operation == "update":
+            await use_case.create_update(
+                user_id=USER_ID,
+                event_id=EVENT_ID,
+                changes={recurrence_field: "FREQ=DAILY"},
+            )
+        else:
+            created = await use_case.create_update(
+                user_id=USER_ID,
+                event_id=EVENT_ID,
+                changes={"location": "Synthetic room"},
+            )
+            await use_case.edit(
+                user_id=USER_ID,
+                proposal_id=created.proposal_id,
+                expected_version=created.current_version,
+                changes={recurrence_field: PROVIDER_EVENT_ID},
+            )
+
+    assert error.value.error_code == "calendar_recurring_event_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_unknown_calendar_extension_is_not_misreported_as_recurrence() -> None:
+    """普通未知扩展仍是输入错误，不能伪装成重复日程领域事实。"""
+    use_case, _, _ = _use_case()
+
+    with pytest.raises(ValueError) as error:
+        await use_case.create_event(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            calendar_id=CALENDAR_ID,
+            idempotency_key="unknown-calendar-extension",
+            values={"conference_data": {"provider": "synthetic"}},
+        )
+
+    assert not isinstance(error.value, StateConflictError)

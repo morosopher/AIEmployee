@@ -41,6 +41,7 @@ CALENDAR_SNAPSHOT_CONTENT_KIND = "calendar_snapshot"
 CALENDAR_SNAPSHOT_ACTION = "calendar.snapshot"
 CALENDAR_SNAPSHOT_SCHEMA_VERSION = "calendar_snapshot.v1"
 
+
 @dataclass(frozen=True, slots=True)
 class _PreparedCalendarSnapshot:
     """保存首个数据库 mutation 前已完成的 snapshot 内容准备结果。"""
@@ -90,8 +91,7 @@ class SqlAlchemyCalendarProposalRepository:
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel).where(
                 CalendarChangeProposalModel.user_id == user_id,
-                CalendarChangeProposalModel.creation_idempotency_key
-                == creation_idempotency_key,
+                CalendarChangeProposalModel.creation_idempotency_key == creation_idempotency_key,
             )
         )
         return None if proposal is None else await self._proposal_snapshot(proposal)
@@ -229,8 +229,10 @@ class SqlAlchemyCalendarProposalRepository:
         expected_version: int,
         desired_state: Mapping[str, object],
         retain_until: datetime,
+        connection_id: UUID | None = None,
+        calendar_id: str | None = None,
     ) -> CalendarProposalSnapshot | None:
-        """以父行 CAS 推进版本，并由赢家插入下一条 desired snapshot。
+        """以父行 CAS 推进版本，并可原子切换 editing shell 的精确日历目标。
 
         Args:
             snapshot_id: 新 desired snapshot ID，也是该密文 AAD 记录维度。
@@ -239,6 +241,8 @@ class SqlAlchemyCalendarProposalRepository:
             expected_version: 客户端观察到的正整数当前版本。
             desired_state: 新版本完整期望状态。
             retain_until: 新 snapshot 密文保留截止时间。
+            connection_id: 显式日历确认选择的新连接；必须与 ``calendar_id`` 同时提供。
+            calendar_id: 显式日历确认选择的新目录 ID；必须与 ``connection_id`` 同时提供。
 
         Returns:
             保存后的当前提案；不存在或跨用户时返回 ``None``。
@@ -248,6 +252,10 @@ class SqlAlchemyCalendarProposalRepository:
         """
         if type(expected_version) is not int or expected_version <= 0:
             raise ValueError("expected_version must be a positive integer")
+        if (connection_id is None) != (calendar_id is None):
+            raise ValueError("calendar retarget identity must be provided together")
+        if calendar_id is not None and (not isinstance(calendar_id, str) or not calendar_id):
+            raise ValueError("calendar retarget calendar_id is invalid")
         next_version = expected_version + 1
         prepared_snapshot = self._prepare_snapshot(
             snapshot_id=snapshot_id,
@@ -257,6 +265,15 @@ class SqlAlchemyCalendarProposalRepository:
             content=desired_state,
             retain_until=retain_until,
         )
+        update_values: dict[str, object] = {
+            "current_version": next_version,
+            "retain_until": prepared_snapshot.retain_until,
+        }
+        if connection_id is not None and calendar_id is not None:
+            update_values.update(
+                connection_id=connection_id,
+                calendar_id=calendar_id,
+            )
         updated_id = await self._session.scalar(
             update(CalendarChangeProposalModel)
             .where(
@@ -265,10 +282,7 @@ class SqlAlchemyCalendarProposalRepository:
                 CalendarChangeProposalModel.current_version == expected_version,
                 CalendarChangeProposalModel.status == CalendarProposalStatus.EDITING.value,
             )
-            .values(
-                current_version=next_version,
-                retain_until=prepared_snapshot.retain_until,
-            )
+            .values(**update_values)
             .returning(CalendarChangeProposalModel.id)
         )
         if updated_id is None:
@@ -395,8 +409,7 @@ class SqlAlchemyCalendarProposalRepository:
                 )
                 .join(
                     CalendarChangeProposalModel,
-                    CalendarChangeProposalModel.id
-                    == CalendarChangeSnapshotModel.proposal_id,
+                    CalendarChangeProposalModel.id == CalendarChangeSnapshotModel.proposal_id,
                 )
                 .where(
                     CalendarChangeSnapshotModel.id == source_snapshot_id,

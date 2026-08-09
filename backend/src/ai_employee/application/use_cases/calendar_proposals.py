@@ -34,6 +34,12 @@ from ai_employee.domain.tasks import JsonValue
 
 type CalendarOperationKind = Literal["create", "update", "restore"]
 type CalendarSnapshotKind = Literal["desired", "before"]
+type CalendarConfirmation = Literal[
+    "calendar",
+    "time",
+    "attendees",
+    "notification_policy",
+]
 
 DEFAULT_CALENDAR_CONTENT_RETENTION_DAYS = 365
 CALENDAR_AVAILABILITY_HORIZON_DAYS = 14
@@ -53,27 +59,19 @@ _EVENT_FIELDS = (
     "attendees",
 )
 _EDITABLE_FIELDS = frozenset(_EVENT_FIELDS) | {"notification_policy"}
+_RECURRENCE_FIELDS = frozenset({"recurrence", "recurrence_rule", "recurring_event_id", "rrule"})
 _SHELL_CONFIRMATIONS = (
     "calendar",
     "time",
     "attendees",
     "notification_policy",
 )
-_NEGATED_CALENDAR_COMMANDS = (
-    "do not prepare",
-    "don't prepare",
-    "dont prepare",
-    "not prepare",
-    "do not draft",
-    "don't draft",
-    "不要准备",
-    "别准备",
-    "不要起草",
-)
 _SAFE_CALENDAR_COMMANDS = (
-    re.compile(r"\bprepare\b.{0,32}\b(?:calendar|meeting|event)\b.{0,16}\bproposal\b"),
-    re.compile(r"\bdraft\b.{0,32}\b(?:calendar|meeting|event)\b.{0,16}\bproposal\b"),
-    re.compile(r"\bdraft\b.{0,32}\bmeeting proposal\b"),
+    re.compile(
+        r"(?:please\s+)?(?:prepare|draft)\s+(?:(?:a|an)\s+)?"
+        r"(?:calendar|meeting|event)\s+proposal[.!]?"
+    ),
+    re.compile(r"请?(?:准备|起草|草拟)(?:一个)?(?:日程|日历|会议)提案[。！!]?"),
 )
 
 
@@ -143,9 +141,17 @@ class CalendarProposalTargetSnapshot:
     write_capability_error_code: str | None
     can_write: bool
     retention_days: int = DEFAULT_CALENDAR_CONTENT_RETENTION_DAYS
-    supported_notification_policies: frozenset[NotificationPolicy] = frozenset(
-        NotificationPolicy
-    )
+    supported_notification_policies: frozenset[NotificationPolicy] = frozenset(NotificationPolicy)
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarProposalEventBinding:
+    """表示从本地 UUID 解析出的非敏感、不可拆分供应商事件身份。"""
+
+    event_id: UUID
+    connection_id: UUID
+    calendar_id: str
+    provider_event_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +213,7 @@ class CalendarProposalContent(BaseModel):
     required_confirmations: tuple[str, ...] = ()
     source_event_ids: tuple[str, ...] = ()
     notification_policy_user_set: bool = False
+    requires_explicit_confirmation: bool = False
     availability: AvailabilityResult | None = None
 
     @field_validator("title", "description", "location")
@@ -255,7 +262,18 @@ class CalendarProposalContent(BaseModel):
             raise ValueError("calendar proposal changed_fields are invalid")
         return value
 
-    @field_validator("confirmed_fields", "required_confirmations", "source_event_ids")
+    @field_validator("confirmed_fields", "required_confirmations")
+    @classmethod
+    def valid_confirmation_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """要求确认字段来自固定枚举且唯一，并规范旧 snapshot 的字母顺序。"""
+        if any(item not in _SHELL_CONFIRMATIONS for item in value):
+            raise ValueError("calendar proposal confirmation fields are invalid")
+        if len(set(value)) != len(value):
+            raise ValueError("calendar proposal confirmation fields must be unique")
+        ordered = tuple(item for item in _SHELL_CONFIRMATIONS if item in value)
+        return ordered
+
+    @field_validator("source_event_ids")
     @classmethod
     def unique_text_tuple(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         """拒绝空值或重复控制字段，保持冻结预览确定性。"""
@@ -364,6 +382,8 @@ class CalendarProposalRepository(Protocol):
         expected_version: int,
         desired_state: Mapping[str, object],
         retain_until: datetime,
+        connection_id: UUID | None = None,
+        calendar_id: str | None = None,
     ) -> CalendarProposalSnapshot | None: ...
 
     async def save_snapshot(
@@ -398,8 +418,12 @@ class CalendarProposalSourceReader(Protocol):
         self, *, user_id: UUID, connection_id: UUID, calendar_id: str
     ) -> CalendarProposalTargetSnapshot | None: ...
 
-    async def get_proposal_event(
+    async def get_proposal_event_binding(
         self, *, user_id: UUID, event_id: UUID
+    ) -> CalendarProposalEventBinding | None: ...
+
+    async def get_proposal_event(
+        self, *, user_id: UUID, binding: CalendarProposalEventBinding
     ) -> CalendarProposalEventSnapshot | None: ...
 
     async def get_availability_context(
@@ -450,6 +474,7 @@ class CalendarProposalUseCase:
             operation_id=operation_id,
             timezone=target.timezone,
             required_confirmations=_SHELL_CONFIRMATIONS,
+            requires_explicit_confirmation=True,
         )
         snapshot = await self._proposals.create(
             proposal_id=self._id_factory(),
@@ -523,20 +548,28 @@ class CalendarProposalUseCase:
         idempotency_key: str | None = None,
     ) -> CalendarProposalView:
         """从本地最新事件创建修改提案并保存加密 before snapshot。"""
-        event = await self._calendar.get_proposal_event(user_id=user_id, event_id=event_id)
-        if event is None:
+        binding = await self._calendar.get_proposal_event_binding(
+            user_id=user_id,
+            event_id=event_id,
+        )
+        if binding is None:
             raise CalendarProposalNotFoundError
         target = _require_writable_target(
             await self._calendar.get_proposal_target(
                 user_id=user_id,
-                connection_id=event.connection_id,
-                calendar_id=event.calendar_id,
+                connection_id=binding.connection_id,
+                calendar_id=binding.calendar_id,
             )
         )
+        event = await self._calendar.get_proposal_event(
+            user_id=user_id,
+            binding=binding,
+        )
+        if event is None:
+            raise CalendarProposalNotFoundError
         _validate_local_update_event(event, target)
         creation_key = _idempotency_key(
-            idempotency_key
-            or _derived_update_key(event_id=event_id, changes=changes)
+            idempotency_key or _derived_update_key(event_id=event_id, changes=changes)
         )
         # 创建哈希明确排除随机 operation_id，因此先用零 UUID 形成规范请求，才能在
         # 重放路径上不消耗任何新 ID，同时仍对同键异载荷执行常量时间拒绝。
@@ -567,9 +600,7 @@ class CalendarProposalUseCase:
             # 若首次事务只留下 desired，重放沿用已持久化 operation_id 修复同一逻辑
             # 位置的 before；绝不生成第二个提案或替换既有 desired。
             persisted = _to_view(existing)
-            before = hash_before.model_copy(
-                update={"operation_id": persisted.content.operation_id}
-            )
+            before = hash_before.model_copy(update={"operation_id": persisted.content.operation_id})
             snapshot = existing
             retain_until = existing.retain_until
         else:
@@ -650,6 +681,7 @@ class CalendarProposalUseCase:
             updated_values["availability"] = changes["availability"]
             updated = CalendarProposalContent.model_validate(updated_values)
         else:
+            _reject_recurrence_input(changes)
             if not set(changes).issubset(_EDITABLE_FIELDS):
                 raise ValueError("calendar proposal edit contains unsupported fields")
             updated = _apply_user_changes(
@@ -724,6 +756,96 @@ class CalendarProposalUseCase:
             internal_cache_update=True,
         )
 
+    async def confirm(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        expected_version: int,
+        confirmation: CalendarConfirmation,
+        connection_id: UUID | None = None,
+        calendar_id: str | None = None,
+    ) -> CalendarProposalView:
+        """逐项确认 shell 当前值，并可原子选择精确可写日历。
+
+        普通编辑永远不能调用本路径的等价隐式行为。日历确认必须携带连接与目录 ID；
+        其余确认只确认当前 snapshot 中已经完整、可验证的值。每次调用推进一个不可变版本，
+        使后续 API 能以版本 CAS 审计用户逐项确认顺序。
+        """
+        normalized_confirmation = _calendar_confirmation(confirmation)
+        current = await self._proposals.get_current(
+            user_id=user_id,
+            proposal_id=proposal_id,
+        )
+        if current is None:
+            raise CalendarProposalNotFoundError
+        if current.status is not CalendarProposalStatus.EDITING:
+            raise StateConflictError(
+                error_code="calendar_proposal_not_editable",
+                message="calendar proposal is not editable",
+            )
+        content = CalendarProposalContent.model_validate(current.desired_snapshot.content)
+        if not content.requires_explicit_confirmation:
+            raise StateConflictError(
+                error_code="calendar_confirmation_not_required",
+                message="calendar proposal does not require explicit field confirmation",
+            )
+
+        selected_connection_id = current.connection_id
+        selected_calendar_id = current.calendar_id
+        if normalized_confirmation == "calendar":
+            if (
+                not isinstance(connection_id, UUID)
+                or not isinstance(calendar_id, str)
+                or not calendar_id
+            ):
+                raise ValueError("calendar confirmation requires connection_id and calendar_id")
+            target = _require_writable_target(
+                await self._calendar.get_proposal_target(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    calendar_id=calendar_id,
+                )
+            )
+            selected_connection_id = connection_id
+            selected_calendar_id = calendar_id
+        else:
+            if connection_id is not None or calendar_id is not None:
+                raise ValueError("only calendar confirmation accepts a target identity")
+            target = _require_writable_target(
+                await self._calendar.get_proposal_target(
+                    user_id=user_id,
+                    connection_id=current.connection_id,
+                    calendar_id=current.calendar_id,
+                )
+            )
+
+        _require_confirmation_value(content, normalized_confirmation, target=target)
+        confirmed = _ordered_confirmations({*content.confirmed_fields, normalized_confirmation})
+        updated = content.model_copy(
+            update={
+                "confirmed_fields": confirmed,
+                "required_confirmations": _ordered_confirmations(
+                    set(_SHELL_CONFIRMATIONS).difference(confirmed)
+                ),
+            }
+        )
+        saved = await self._proposals.save_next_version(
+            snapshot_id=self._id_factory(),
+            user_id=user_id,
+            proposal_id=proposal_id,
+            expected_version=expected_version,
+            desired_state=_content_json(updated),
+            retain_until=_retain_until(self._clock, target.retention_days),
+            connection_id=(
+                selected_connection_id if normalized_confirmation == "calendar" else None
+            ),
+            calendar_id=(selected_calendar_id if normalized_confirmation == "calendar" else None),
+        )
+        if saved is None:
+            raise CalendarProposalNotFoundError
+        return _to_view(saved)
+
     async def create_restore(
         self,
         *,
@@ -769,8 +891,9 @@ class CalendarProposalUseCase:
                 "notification_policy": notification,
                 "notification_policy_user_set": False,
                 "changed_fields": changed_fields,
-                "confirmed_fields": tuple(sorted(_SHELL_CONFIRMATIONS)),
+                "confirmed_fields": _SHELL_CONFIRMATIONS,
                 "required_confirmations": (),
+                "requires_explicit_confirmation": False,
                 "source_event_ids": (source.provider_event_id,),
                 "availability": None,
             }
@@ -849,15 +972,8 @@ def parse_calendar_proposal_conversation_request(text: str) -> bool:
     if not isinstance(text, str):
         return False
     normalized = " ".join(text.casefold().strip().split())
-    if normalized == "" or any(token in normalized for token in _NEGATED_CALENDAR_COMMANDS):
-        return False
-    if any(pattern.search(normalized) is not None for pattern in _SAFE_CALENDAR_COMMANDS):
-        return True
-    return (
-        ("准备" in normalized or "起草" in normalized or "草拟" in normalized)
-        and any(token in normalized for token in ("日程提案", "日历提案", "会议提案"))
-        and "不要" not in normalized
-        and "吗" not in normalized
+    return normalized != "" and any(
+        pattern.fullmatch(normalized) is not None for pattern in _SAFE_CALENDAR_COMMANDS
     )
 
 
@@ -870,6 +986,7 @@ def _prepare_create_content(
     """规范创建输入、填充默认通知并拒绝 recurrence/扩展字段。"""
     if not isinstance(values, Mapping):
         raise TypeError("calendar create values must be a mapping")
+    _reject_recurrence_input(values)
     if not set(values).issubset(_EDITABLE_FIELDS):
         raise ValueError("calendar create values contain unsupported fields")
     normalized = _normalized_changes(values)
@@ -893,7 +1010,7 @@ def _prepare_create_content(
         attendees=attendees,
         notification_policy=notification,
         changed_fields=tuple(sorted(set(values).intersection(_EVENT_FIELDS))),
-        confirmed_fields=tuple(sorted(_SHELL_CONFIRMATIONS)),
+        confirmed_fields=_SHELL_CONFIRMATIONS,
         notification_policy_user_set=notification_raw is not None,
     )
     if not content.title:
@@ -912,8 +1029,16 @@ def _content_from_local_event(
         title=event.title,
         description=event.description,
         location=event.location,
-        starts_at=_snapshot_instant(event.starts_at, all_day=event.all_day),
-        ends_at=_snapshot_instant(event.ends_at, all_day=event.all_day),
+        starts_at=_snapshot_instant(
+            event.starts_at,
+            all_day=event.all_day,
+            timezone=event.timezone,
+        ),
+        ends_at=_snapshot_instant(
+            event.ends_at,
+            all_day=event.all_day,
+            timezone=event.timezone,
+        ),
         timezone=event.timezone,
         all_day=event.all_day,
         attendees=event.attendees,
@@ -934,8 +1059,16 @@ def _content_from_provider_event(
         title=event.title,
         description=event.description,
         location=event.location,
-        starts_at=_snapshot_instant(event.starts_at, all_day=event.all_day),
-        ends_at=_snapshot_instant(event.ends_at, all_day=event.all_day),
+        starts_at=_snapshot_instant(
+            event.starts_at,
+            all_day=event.all_day,
+            timezone=event.timezone,
+        ),
+        ends_at=_snapshot_instant(
+            event.ends_at,
+            all_day=event.all_day,
+            timezone=event.timezone,
+        ),
         timezone=event.timezone,
         all_day=event.all_day,
         attendees=_provider_attendees(event),
@@ -953,7 +1086,10 @@ def _apply_user_changes(
     before: CalendarProposalContent | None = None,
 ) -> CalendarProposalContent:
     """应用白名单编辑并重新计算 diff、通知默认和缓存失效。"""
-    if not isinstance(changes, Mapping) or not set(changes).issubset(_EDITABLE_FIELDS):
+    if not isinstance(changes, Mapping):
+        raise TypeError("calendar proposal changes must be a mapping")
+    _reject_recurrence_input(changes)
+    if not set(changes).issubset(_EDITABLE_FIELDS):
         raise ValueError("calendar proposal changes contain unsupported fields")
     normalized = _normalized_changes(changes)
     values = content.model_dump(mode="python")
@@ -979,13 +1115,20 @@ def _apply_user_changes(
     if notification is None:
         raise ValueError("calendar proposal notification policy is required")
     _require_supported_notification(target, notification)
+    if content.requires_explicit_confirmation:
+        invalidated = _invalidated_confirmations(set(changes))
+        confirmed = _ordered_confirmations(set(content.confirmed_fields).difference(invalidated))
+        required = _ordered_confirmations(set(_SHELL_CONFIRMATIONS).difference(confirmed))
+    else:
+        confirmed = _SHELL_CONFIRMATIONS
+        required = ()
     return candidate.model_copy(
         update={
             "notification_policy": notification,
             "notification_policy_user_set": user_set_notification,
             "changed_fields": changed_fields,
-            "required_confirmations": (),
-            "confirmed_fields": tuple(sorted(_SHELL_CONFIRMATIONS)),
+            "required_confirmations": required,
+            "confirmed_fields": confirmed,
         }
     )
 
@@ -1022,6 +1165,12 @@ def _normalized_changes(changes: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
+def _reject_recurrence_input(values: Mapping[str, object]) -> None:
+    """只把明确 recurrence 字段映射为 M2 稳定不支持错误。"""
+    if set(values).intersection(_RECURRENCE_FIELDS):
+        raise _calendar_recurring_event_unsupported()
+
+
 def _changed_fields(
     before: CalendarProposalContent,
     desired: CalendarProposalContent,
@@ -1029,11 +1178,62 @@ def _changed_fields(
     """比较完整期望状态并返回排序、唯一的字段名 diff。"""
     return tuple(
         sorted(
-            field
-            for field in _EVENT_FIELDS
-            if getattr(before, field) != getattr(desired, field)
+            field for field in _EVENT_FIELDS if getattr(before, field) != getattr(desired, field)
         )
     )
+
+
+def _invalidated_confirmations(changed_keys: set[str]) -> set[str]:
+    """把普通编辑映射为必须重新显式确认的字段组。"""
+    invalidated: set[str] = set()
+    if changed_keys.intersection(_TIME_FIELDS):
+        invalidated.add("time")
+    if "attendees" in changed_keys:
+        # 创建提案的默认通知取决于参会人；即使策略值恰好不变也需重新确认其语义。
+        invalidated.update(("attendees", "notification_policy"))
+    if "notification_policy" in changed_keys:
+        invalidated.add("notification_policy")
+    return invalidated
+
+
+def _ordered_confirmations(values: set[str]) -> tuple[str, ...]:
+    """按固定产品顺序返回确认字段子集。"""
+    return tuple(item for item in _SHELL_CONFIRMATIONS if item in values)
+
+
+def _calendar_confirmation(value: object) -> CalendarConfirmation:
+    """把动态调用值收窄为四种显式确认之一。"""
+    if value not in _SHELL_CONFIRMATIONS:
+        raise ValueError("calendar proposal confirmation is invalid")
+    return cast(CalendarConfirmation, value)
+
+
+def _require_confirmation_value(
+    content: CalendarProposalContent,
+    confirmation: CalendarConfirmation,
+    *,
+    target: CalendarProposalTargetSnapshot,
+) -> None:
+    """确认前证明当前 snapshot 已包含对应完整值且供应商可表达。"""
+    if confirmation == "time" and (
+        content.starts_at is None
+        or content.ends_at is None
+        or content.timezone is None
+        or content.all_day is None
+    ):
+        raise StateConflictError(
+            error_code="calendar_proposal_time_required",
+            message="calendar proposal time must be complete before confirmation",
+        )
+    if confirmation in {"calendar", "notification_policy"}:
+        if content.notification_policy is None:
+            if confirmation == "notification_policy":
+                raise StateConflictError(
+                    error_code="calendar_notification_policy_required",
+                    message="calendar notification policy must be selected before confirmation",
+                )
+        else:
+            _require_supported_notification(target, content.notification_policy)
 
 
 def _require_matching_creation_hash(
@@ -1200,10 +1400,7 @@ def _creation_hash(
 
 def _derived_update_key(*, event_id: UUID, changes: Mapping[str, object]) -> str:
     """为未显式提供请求键的内部调用生成稳定、内容绑定的创建键。"""
-    normalized = {
-        key: _hashable_change_value(value)
-        for key, value in sorted(changes.items())
-    }
+    normalized = {key: _hashable_change_value(value) for key, value in sorted(changes.items())}
     digest = sha256(
         json.dumps(
             normalized,
@@ -1233,10 +1430,16 @@ def _hashable_change_value(value: object) -> JsonValue:
     raise TypeError("calendar change contains a non-JSON value")
 
 
-def _snapshot_instant(value: datetime, *, all_day: bool) -> str:
-    """把同步瞬间规范为 UTC ISO；全天事件保存其 UTC 日期边界。"""
+def _snapshot_instant(value: datetime, *, all_day: bool, timezone: str) -> str:
+    """把定时事件规范为 UTC ISO，全天事件保存其事件时区本地日期。"""
     normalized = _aware_utc(value, field="calendar event instant")
-    return normalized.date().isoformat() if all_day else normalized.isoformat()
+    if not all_day:
+        return normalized.isoformat()
+    try:
+        zone = ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise ValueError("all-day calendar event requires a valid IANA timezone") from error
+    return normalized.astimezone(zone).date().isoformat()
 
 
 def _parse_snapshot_instant(value: str, *, all_day: bool) -> date | datetime:
@@ -1286,9 +1489,7 @@ def _retain_until(clock: Callable[[], datetime], retention_days: int) -> datetim
     """用显式 UTC 时钟计算敏感 snapshot 保留截止时间。"""
     if type(retention_days) is not int or not 1 <= retention_days <= 3650:
         retention_days = DEFAULT_CALENDAR_CONTENT_RETENTION_DAYS
-    return _aware_utc(clock(), field="calendar proposal clock") + timedelta(
-        days=retention_days
-    )
+    return _aware_utc(clock(), field="calendar proposal clock") + timedelta(days=retention_days)
 
 
 def _idempotency_key(value: str) -> str:
@@ -1362,6 +1563,7 @@ __all__ = [
     "CalendarAvailabilityContext",
     "CalendarOperationKind",
     "CalendarProposalContent",
+    "CalendarProposalEventBinding",
     "CalendarProposalEventSnapshot",
     "CalendarProposalNotFoundError",
     "CalendarProposalRepository",

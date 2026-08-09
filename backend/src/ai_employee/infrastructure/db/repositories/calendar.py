@@ -18,6 +18,7 @@ from ai_employee.application.ports.calendar import (
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarAvailabilityContext,
+    CalendarProposalEventBinding,
     CalendarProposalEventSnapshot,
     CalendarProposalTargetSnapshot,
 )
@@ -239,13 +240,42 @@ class SqlAlchemyCalendarSyncRepository:
             supported_notification_policies=frozenset(NotificationPolicy),
         )
 
-    async def get_proposal_event(
+    async def get_proposal_event_binding(
         self,
         *,
         user_id: UUID,
         event_id: UUID,
+    ) -> CalendarProposalEventBinding | None:
+        """把本地 UUID 收窄为后续敏感读取必须复核的非敏感完整身份。"""
+        row = (
+            await self._session.execute(
+                select(
+                    CalendarEventModel.id,
+                    CalendarEventModel.connection_id,
+                    CalendarEventModel.calendar_id,
+                    CalendarEventModel.provider_event_id,
+                ).where(
+                    CalendarEventModel.id == event_id,
+                    CalendarEventModel.user_id == user_id,
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return CalendarProposalEventBinding(
+            event_id=row.id,
+            connection_id=row.connection_id,
+            calendar_id=row.calendar_id,
+            provider_event_id=row.provider_event_id,
+        )
+
+    async def get_proposal_event(
+        self,
+        *,
+        user_id: UUID,
+        binding: CalendarProposalEventBinding,
     ) -> CalendarProposalEventSnapshot | None:
-        """按本地 UUID 和用户读取精确事件，并在受控内存中解密描述与地点。"""
+        """以绑定的五项身份复核事件，并只在命中后解密描述与地点。"""
         row = (
             await self._session.execute(
                 select(CalendarEventModel, OAuthConnectionModel.provider)
@@ -255,8 +285,11 @@ class SqlAlchemyCalendarSyncRepository:
                     & (OAuthConnectionModel.user_id == CalendarEventModel.user_id),
                 )
                 .where(
-                    CalendarEventModel.id == event_id,
+                    CalendarEventModel.id == binding.event_id,
                     CalendarEventModel.user_id == user_id,
+                    CalendarEventModel.connection_id == binding.connection_id,
+                    CalendarEventModel.calendar_id == binding.calendar_id,
+                    CalendarEventModel.provider_event_id == binding.provider_event_id,
                 )
             )
         ).one_or_none()
@@ -307,29 +340,66 @@ class SqlAlchemyCalendarSyncRepository:
         )
         if user is None:
             return None
-        connection_ids = tuple(
+        connection_rows = tuple(
             (
-                await self._session.scalars(
-                    select(OAuthConnectionModel.id)
-                    .join(
-                        ConnectionCapabilityModel,
-                        (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
-                        & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id),
-                    )
-                    .where(
-                        OAuthConnectionModel.user_id == user_id,
-                        OAuthConnectionModel.status == ConnectionStatus.CONNECTED.value,
-                        ConnectionCapabilityModel.capability == "calendar.read",
-                        ConnectionCapabilityModel.status == CapabilityStatus.ENABLED.value,
-                    )
+                await self._session.execute(
+                    select(OAuthConnectionModel.id, OAuthConnectionModel.status)
+                    .where(OAuthConnectionModel.user_id == user_id)
                     .order_by(OAuthConnectionModel.id)
                 )
             ).all()
         )
+        connection_statuses = {row.id: _connection_status(row.status) for row in connection_rows}
+        calendar_capabilities = tuple(
+            (
+                await self._session.scalars(
+                    select(ConnectionCapabilityModel).where(
+                        ConnectionCapabilityModel.user_id == user_id,
+                        ConnectionCapabilityModel.capability.in_(
+                            ("calendar.read", "calendar.write")
+                        ),
+                    )
+                )
+            ).all()
+        )
+        read_capabilities = {
+            capability.connection_id: capability
+            for capability in calendar_capabilities
+            if capability.capability == "calendar.read"
+        }
+        directory_connection_ids = set(
+            (
+                await self._session.scalars(
+                    select(ProviderCalendarModel.connection_id)
+                    .where(ProviderCalendarModel.user_id == user_id)
+                    .distinct()
+                )
+            ).all()
+        )
+        # 相关集合只来自 calendar 能力或既有目录事实；从未申请日历读取且没有目录的
+        # mail-only 连接不会被误报。相关连接即使授权失效也必须进入 missing，而不是
+        # 在 freshness 检查前消失并制造虚假的 complete。
+        relevant_connection_ids = tuple(
+            sorted(
+                {
+                    *(capability.connection_id for capability in calendar_capabilities),
+                    *directory_connection_ids,
+                },
+                key=str,
+            )
+        )
         cutoff = normalized_start - _AVAILABILITY_FRESHNESS
         available_connections: list[UUID] = []
         missing_connections: list[UUID] = []
-        for connection_id in connection_ids:
+        for connection_id in relevant_connection_ids:
+            read_capability = read_capabilities.get(connection_id)
+            if (
+                connection_statuses.get(connection_id) is not ConnectionStatus.CONNECTED
+                or read_capability is None
+                or _capability_status(read_capability.status) is not CapabilityStatus.ENABLED
+            ):
+                missing_connections.append(connection_id)
+                continue
             calendar_ids = tuple(
                 (
                     await self._session.scalars(
@@ -364,6 +434,9 @@ class SqlAlchemyCalendarSyncRepository:
         events: tuple[CalendarEventModel, ...] = ()
         if available_connections:
             window_end = normalized_start + timedelta(days=horizon_days + 1)
+            # 候选算法会把每个忙碌事件向后扩展 meeting buffer；查询也必须向前读取
+            # 同样长度，否则 search_start 前刚结束的事件会被数据库提前丢弃。
+            window_start = normalized_start - timedelta(minutes=user.meeting_buffer_minutes)
             events = tuple(
                 (
                     await self._session.scalars(
@@ -374,7 +447,7 @@ class SqlAlchemyCalendarSyncRepository:
                             CalendarEventModel.starts_at.is_not(None),
                             CalendarEventModel.ends_at.is_not(None),
                             CalendarEventModel.starts_at < window_end,
-                            CalendarEventModel.ends_at > normalized_start,
+                            CalendarEventModel.ends_at > window_start,
                         )
                         .order_by(
                             CalendarEventModel.starts_at,
@@ -414,22 +487,16 @@ class SqlAlchemyCalendarSyncRepository:
         key_version = getattr(event, f"{field}_key_version")
         if ciphertext is None and nonce is None and key_version is None:
             return ""
-        if (
-            self._field_cipher is None
-            or ciphertext is None
-            or nonce is None
-            or key_version is None
-        ):
+        if self._field_cipher is None or ciphertext is None or nonce is None or key_version is None:
             raise StateConflictError(
                 error_code="calendar_field_encryption_unavailable",
                 message="calendar event field encryption is unavailable",
             )
         return self._field_cipher.decrypt(
             EncryptedValue(ciphertext, nonce, key_version),
-            (
-                f"{event.user_id}:{event.connection_id}:"
-                f"{event.provider_event_id}:{field}"
-            ).encode("ascii"),
+            (f"{event.user_id}:{event.connection_id}:{event.provider_event_id}:{field}").encode(
+                "ascii"
+            ),
         ).decode("utf-8")
 
     async def _lock_syncable_connection(

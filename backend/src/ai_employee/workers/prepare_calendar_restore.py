@@ -15,7 +15,7 @@ from ai_employee.application.use_cases.calendar_proposals import (
     CalendarProposalUseCase,
     CalendarRestoreSourceSnapshot,
 )
-from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.application.use_cases.task_execution import LeasedTask, utc_instant
 from ai_employee.config import Settings
 from ai_employee.domain.connections import CapabilityStatus, ConnectionStatus
 from ai_employee.domain.errors import PermanentProviderError, StateConflictError
@@ -165,6 +165,7 @@ class PrepareCalendarRestoreTaskStep:
             read_plan.source.provider_event_id,
         )
 
+        write_now = utc_instant(self._clock(), field="calendar restore clock")
         async with self._session_factory.begin() as session:
             task_row = await session.scalar(
                 select(TaskRunModel)
@@ -174,14 +175,14 @@ class PrepareCalendarRestoreTaskStep:
                     TaskRunModel.kind == "calendar.restore.prepare",
                     TaskRunModel.status == TaskStatus.RUNNING.value,
                     TaskRunModel.lease_owner == lease_owner,
+                    TaskRunModel.lease_expires_at.is_not(None),
+                    TaskRunModel.lease_expires_at > write_now,
                 )
                 .with_for_update()
             )
             if task_row is None or task_row.result_payload is not None:
                 return
-            persisted_snapshot_id, persisted_creation_key = _restore_input(
-                task_row.input_payload
-            )
+            persisted_snapshot_id, persisted_creation_key = _restore_input(task_row.input_payload)
             if (
                 persisted_snapshot_id != read_plan.source.source_snapshot_id
                 or persisted_creation_key != read_plan.creation_idempotency_key
@@ -220,6 +221,7 @@ class PrepareCalendarRestoreTaskStep:
         lease_owner: str,
     ) -> _RestoreReadPlan | None:
         """首事务复核租约、source 归属和当前写能力，返回精确 GET 标识。"""
+        read_now = utc_instant(self._clock(), field="calendar restore clock")
         async with self._session_factory.begin() as session:
             task_row = await session.scalar(
                 select(TaskRunModel).where(
@@ -228,6 +230,8 @@ class PrepareCalendarRestoreTaskStep:
                     TaskRunModel.kind == "calendar.restore.prepare",
                     TaskRunModel.status == TaskStatus.RUNNING.value,
                     TaskRunModel.lease_owner == lease_owner,
+                    TaskRunModel.lease_expires_at.is_not(None),
+                    TaskRunModel.lease_expires_at > read_now,
                 )
             )
             if task_row is None or task_row.result_payload is not None:
