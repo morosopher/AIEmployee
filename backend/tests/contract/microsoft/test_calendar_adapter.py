@@ -182,6 +182,26 @@ async def test_directory_rejects_next_and_delta_links_in_same_page() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cursor",
+    (
+        "http://graph.microsoft.com/v1.0/me/calendars?$deltatoken=synthetic",
+        " https://graph.microsoft.com/v1.0/me/calendars?$deltatoken=synthetic",
+        "https://attacker.example.test/v1.0/me/calendars?$deltatoken=synthetic",
+        "https://graph.microsoft.com/v1.0/me/messages?$deltatoken=synthetic",
+    ),
+)
+@respx.mock
+async def test_directory_cursor_must_be_validated_before_any_request(cursor: str) -> None:
+    """目录增量 cursor 必须是 Graph 最终 deltaLink，不能降级为任意 token。"""
+    route = respx.get(CALENDARS_URL).respond(200, json=_fixture("calendars.json"))
+    with pytest.raises(PermanentProviderError) as raised:
+        await _collect(_adapter().directory_pages(cursor))
+    assert raised.value.error_code == "microsoft_calendar_invalid_directory_url"
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_error_mapping_refresh_403_429_5xx_and_cursor_expiry() -> None:
     """Graph 常见错误必须落入稳定领域错误类别。"""

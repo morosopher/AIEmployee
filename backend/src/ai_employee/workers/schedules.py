@@ -151,19 +151,19 @@ async def dispatch_due_briefs() -> None:
 
 @broker.task(schedule=[{"cron": "*/10 * * * *", "schedule_id": "google-incremental-sync"}])
 async def dispatch_google_incremental_syncs() -> None:
-    """每十分钟为 enabled read owner 创建耐久幂等同步任务。
+    """每十分钟为 Google/Microsoft enabled read owner 创建耐久幂等同步任务。
 
-    Task 12 将 Google Calendar 的普通周期收敛到连接级 ``directory`` owner：该任务在
-    同一供应商中立用例内按稳定 calendar ID 串行推进每个事件 scope。这里仍保留对旧
-    ``EnabledSyncScopeReader`` 输出的防线，避免过渡期 reader 同时返回 directory 与旧
-    primary/team scope 时重复排队；显式单日历维修任务不经过本周期入口。
+    Task 12/13 将所有支持 provider 的 Calendar 普通周期收敛到连接级 ``directory`` owner：
+    该任务在同一供应商中立用例内按稳定 calendar ID 串行推进每个事件 scope。这里仍保留
+    对旧 ``EnabledSyncScopeReader`` 输出的防线，避免过渡期 reader 同时返回 directory 与
+    旧单日历 scope 时重复排队；显式单日历维修任务不经过本周期入口。
     """
     now = datetime.now(UTC)
     bucket = now.replace(minute=now.minute - now.minute % 10, second=0, microsecond=0)
     creator = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory), dispatcher=_build_outbox_relay()
     )
-    calendar_owners: set[tuple[UUID, UUID, str]] = set()
+    calendar_owners: set[tuple[UUID, UUID]] = set()
     for scope in await SqlAlchemyEnabledSyncScopeReader(session_factory).enabled_scopes():
         # Reader 已在 SQL 层执行同一过滤；此处保留 fail-closed 防线，避免测试替身或未来
         # reader 误把 Microsoft folder cursor 当作第二个周期 owner。
@@ -175,10 +175,10 @@ async def dispatch_google_incremental_syncs() -> None:
             continue
         kind = "sync_mail" if scope.resource_kind == "mail" else "sync_calendar"
         scope_key = scope.scope_key
-        if scope.provider == "google" and scope.resource_kind == "calendar":
-            # 目录是 Google Calendar 的周期 owner；事件 scope 只在目录用例内部或维修
-            # 路径显式执行，不能因旧 reader 返回多个游标而重复访问供应商。
-            owner_key = (scope.user_id, scope.connection_id, scope.provider)
+        if scope.resource_kind == "calendar":
+            # 目录是所有支持 provider 的 Calendar 周期 owner；事件 scope 只在目录用例
+            # 内部或维修路径显式执行，不能因旧 reader 返回多个游标而重复访问供应商。
+            owner_key = (scope.user_id, scope.connection_id)
             if owner_key in calendar_owners:
                 continue
             calendar_owners.add(owner_key)

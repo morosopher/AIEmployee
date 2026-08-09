@@ -88,13 +88,10 @@ class MicrosoftCalendarAdapter(CalendarReader):
         current_url = MICROSOFT_CALENDARS_URL
         params: Mapping[str, str] | None = {"$select": _CALENDAR_SELECT}
         if cursor is not None:
-            if cursor == "":
-                raise ValueError("calendar directory cursor must not be empty")
-            if cursor.startswith("https://"):
-                current_url = self._validate_directory_url(cursor)
-                params = None
-            else:
-                params = {"$select": _CALENDAR_SELECT, "$deltatoken": cursor}
+            # Microsoft 目录游标持久化的是完整 deltaLink；不能把任意短 token 当作
+            # ``$deltatoken`` 拼回请求，否则会绕过 host/path 绑定并把畸形值送到 Graph。
+            current_url = self._validate_directory_url(cursor)
+            params = None
         seen: set[str] = set()
         item_count = 0
         for _ in range(MICROSOFT_CALENDAR_MAX_PAGES):
@@ -728,7 +725,12 @@ class MicrosoftCalendarAdapter(CalendarReader):
     @classmethod
     def _validate_absolute_graph_url(cls, value: object, error_code: str) -> str:
         """只接受无 userinfo/port/fragment 的精确 HTTPS Graph URL。"""
-        if not isinstance(value, str):
+        if (
+            not isinstance(value, str)
+            or value == ""
+            or value.strip() != value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
             raise PermanentProviderError(
                 error_code=error_code, message="Microsoft calendar URL is invalid"
             )

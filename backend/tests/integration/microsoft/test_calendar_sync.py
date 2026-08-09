@@ -19,7 +19,10 @@ from ai_employee.infrastructure.db.models.sources import (
     ProviderCalendarModel,
     SyncCursorModel,
 )
-from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyCalendarSyncRepository
+from ai_employee.infrastructure.db.repositories.calendar import (
+    SqlAlchemyCalendarSyncRepository,
+    SqlAlchemyEnabledSyncScopeReader,
+)
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
@@ -206,4 +209,12 @@ async def test_microsoft_calendar_sync_keeps_user_and_calendar_scopes_isolated(
         "m-cal-1": "delta-m-cal-1-1",
         "m-cal-2": "delta-m-cal-2-1",
     }
+    scheduled = await SqlAlchemyEnabledSyncScopeReader(sessions).enabled_scopes()
+    assert [
+        (scope.provider, scope.resource_kind, scope.scope_key)
+        for scope in scheduled
+        if scope.connection_id == owner_connection_id
+        and scope.provider == "microsoft"
+        and scope.resource_kind == "calendar"
+    ] == [("microsoft", "calendar", "directory")]
     await sessions.dispose()

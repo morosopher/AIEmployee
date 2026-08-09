@@ -74,36 +74,44 @@ async def observe_provider_sync[ResultT](
 async def refresh_sync_age_metrics(
     *, session_factory: ManagedAsyncSessionMaker, metrics: Metrics, now: datetime
 ) -> None:
-    """从持久 ``last_success_at`` 恢复每种 Google 资源的最旧同步年龄。
+    """从持久 ``last_success_at`` 恢复 Google/Microsoft 各资源的最旧同步年龄。
 
     API 与 Worker 重启后内存指标为空，此只读探针以 PostgreSQL 事实重建 Gauge。同步失败只会
     更新 ``last_attempt_at`` 或错误码而不会触及 ``last_success_at``，故该查询不会虚假降低
-    新鲜度。断开的连接不再代表可用的数据源，也不会输出为当前健康样本。
+    新鲜度。查询按真实 provider 与资源种类分组；断开的连接不再代表可用的数据源，也不会
+    输出为当前健康样本。标签只包含固定供应商和资源键，不含用户或连接标识。
     """
     try:
         async with session_factory() as session:
             rows = (
                 await session.execute(
-                    select(SyncCursorModel.resource_kind, func.min(SyncCursorModel.last_success_at))
+                    select(
+                        OAuthConnectionModel.provider,
+                        SyncCursorModel.resource_kind,
+                        func.min(SyncCursorModel.last_success_at),
+                    )
                     .join(
                         OAuthConnectionModel,
                         OAuthConnectionModel.id == SyncCursorModel.connection_id,
                     )
                     .where(
-                        OAuthConnectionModel.provider == "google",
+                        OAuthConnectionModel.provider.in_(("google", "microsoft")),
                         OAuthConnectionModel.status == "connected",
                         SyncCursorModel.last_success_at.is_not(None),
                     )
-                    .group_by(SyncCursorModel.resource_kind)
+                    .group_by(
+                        OAuthConnectionModel.provider,
+                        SyncCursorModel.resource_kind,
+                    )
                 )
             ).all()
     except SQLAlchemyError:
         # 指标探测不能改变主流程错误语义；短暂数据库故障只缺少当前采样。
         return
-    for resource, last_success_at in rows:
+    for provider, resource, last_success_at in rows:
         if last_success_at is not None:
             metrics.record_sync_age(
-                provider="google",
+                provider=str(provider),
                 resource=str(resource),
                 seconds=(now - last_success_at).total_seconds(),
             )

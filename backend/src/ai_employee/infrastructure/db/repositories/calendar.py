@@ -653,10 +653,11 @@ class SqlAlchemyEnabledSyncScopeReader:
     async def enabled_scopes(self) -> tuple[EnabledSyncScope, ...]:
         """返回 connected 且能力 enabled 的 mail/calendar 周期 owners。
 
-        邮件仍消费 PostgreSQL 已有的 mailbox owner；Task 12 后 Google Calendar 无论持久层
-        仍只有迁移保留的 primary，还是已经包含 directory 与多个 provider calendar cursor，
-        都只向普通周期投影一个连接级 ``directory`` owner。每个事件 cursor 继续是独立权威
-        恢复位置，只是不再由普通周期并发排队；显式维修任务可直接使用原 calendar ID。
+        邮件仍消费 PostgreSQL 已有的 mailbox owner；Task 12/13 后所有支持 provider 的
+        Calendar 无论持久层仍只有迁移保留的 primary，还是已经包含 directory 与多个 provider
+        calendar cursor，都只向普通周期投影一个连接级 ``directory`` owner。每个事件 cursor
+        继续是独立权威恢复位置，只是不再由普通周期并发排队；显式维修任务可直接使用原
+        calendar ID。
         未知资源种类和 disabled 能力在 SQL 层直接排除。
         """
         async with self._session_factory() as session:
@@ -706,14 +707,14 @@ class SqlAlchemyEnabledSyncScopeReader:
                 )
             )
             result: list[EnabledSyncScope] = []
-            seen_google_calendar_owners: set[tuple[UUID, UUID]] = set()
+            seen_calendar_owners: set[tuple[UUID, UUID]] = set()
             for row in rows:
                 scope_key = row.scope_key
-                if row.provider == "google" and row.resource_kind == "calendar":
+                if row.resource_kind == "calendar":
                     owner = (row.user_id, row.connection_id)
-                    if owner in seen_google_calendar_owners:
+                    if owner in seen_calendar_owners:
                         continue
-                    seen_google_calendar_owners.add(owner)
+                    seen_calendar_owners.add(owner)
                     scope_key = "directory"
                 result.append(
                     EnabledSyncScope(

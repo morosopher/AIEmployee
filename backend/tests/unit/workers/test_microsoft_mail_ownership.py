@@ -34,6 +34,7 @@ async def test_microsoft_mail_scheduler_uses_mailbox_owner_once(monkeypatch) -> 
                 _Scope(user_id, connection_id, "microsoft", "mail", "folder-inbox"),
                 _Scope(user_id, connection_id, "microsoft", "mail", "folder-sent"),
                 _Scope(user_id, connection_id, "microsoft", "calendar", "calendar-primary"),
+                _Scope(user_id, connection_id, "microsoft", "calendar", "calendar-shared"),
             )
 
     created: list[dict[str, object]] = []
@@ -53,7 +54,7 @@ async def test_microsoft_mail_scheduler_uses_mailbox_owner_once(monkeypatch) -> 
 
     assert [(item["kind"], item["input_payload"]["scope_key"]) for item in created] == [
         ("sync_mail", "mailbox"),
-        ("sync_calendar", "calendar-primary"),
+        ("sync_calendar", "directory"),
     ]
 
 

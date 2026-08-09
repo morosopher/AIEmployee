@@ -80,17 +80,39 @@ async def test_sync_age_probe_recovers_last_success_without_resetting_failed_att
                 status="connected",
                 last_error_code=None,
             )
-            session.add(connection)
+            microsoft_connection = OAuthConnectionModel(
+                user_id=user.id,
+                provider="microsoft",
+                provider_account_id="sync-telemetry-microsoft-account",
+                provider_tenant_id="sync-telemetry-tenant",
+                account_type="work_school",
+                account_email="sync-telemetry-microsoft@example.test",
+                scopes=[],
+                status="connected",
+                last_error_code=None,
+            )
+            session.add_all((connection, microsoft_connection))
             await session.flush()
-            session.add(
-                SyncCursorModel(
-                    connection_id=connection.id,
-                    resource_kind="mail",
-                    scope_key="mailbox",
-                    cursor="unchanged-after-failure",
-                    last_success_at=now - timedelta(minutes=20),
-                    last_attempt_at=now - timedelta(minutes=1),
-                    last_error_code="google_rate_limited",
+            session.add_all(
+                (
+                    SyncCursorModel(
+                        connection_id=connection.id,
+                        resource_kind="mail",
+                        scope_key="mailbox",
+                        cursor="unchanged-after-failure",
+                        last_success_at=now - timedelta(minutes=20),
+                        last_attempt_at=now - timedelta(minutes=1),
+                        last_error_code="google_rate_limited",
+                    ),
+                    SyncCursorModel(
+                        connection_id=microsoft_connection.id,
+                        resource_kind="calendar",
+                        scope_key="directory",
+                        cursor="microsoft-directory-cursor",
+                        last_success_at=now - timedelta(minutes=35),
+                        last_attempt_at=now - timedelta(minutes=2),
+                        last_error_code="microsoft_calendar_rate_limited",
+                    ),
                 )
             )
         metrics = create_metrics()
@@ -99,5 +121,9 @@ async def test_sync_age_probe_recovers_last_success_without_resetting_failed_att
 
         rendered = metrics.render().body.decode()
         assert 'ai_employee_sync_age_seconds{provider="google",resource="mail"} 1200.0' in rendered
+        assert (
+            'ai_employee_sync_age_seconds{provider="microsoft",resource="calendar"} 2100.0'
+            in rendered
+        )
     finally:
         await sessions.dispose()
