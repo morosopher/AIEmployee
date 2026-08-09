@@ -2154,6 +2154,7 @@ git commit -m "feat: expose mail draft APIs"
 **Files:**
 - Create: `backend/src/ai_employee/domain/calendar_availability.py`
 - Modify: `backend/src/ai_employee/domain/settings.py`
+- Modify: `backend/src/ai_employee/domain/briefs.py`
 - Create: `backend/src/ai_employee/application/use_cases/calendar_proposals.py`
 - Create: `backend/src/ai_employee/workers/prepare_calendar_restore.py`
 - Modify: `backend/src/ai_employee/workers/execute_task.py`
@@ -2268,7 +2269,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ~~~bash
-git add backend/src/ai_employee/domain/calendar_availability.py backend/src/ai_employee/domain/settings.py backend/src/ai_employee/application/use_cases/calendar_proposals.py backend/src/ai_employee/workers/prepare_calendar_restore.py backend/src/ai_employee/workers/execute_task.py backend/src/ai_employee/infrastructure/db/repositories/calendar_proposals.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/agents/daily_brief/nodes.py backend/src/ai_employee/workers/conversation.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/unit/application/test_calendar_proposals.py backend/tests/integration/m2/test_calendar_proposal_versions.py backend/tests/unit/agents/test_daily_brief.py backend/tests/integration/api/test_conversations.py
+git add backend/src/ai_employee/domain/calendar_availability.py backend/src/ai_employee/domain/settings.py backend/src/ai_employee/domain/briefs.py backend/src/ai_employee/application/use_cases/calendar_proposals.py backend/src/ai_employee/workers/prepare_calendar_restore.py backend/src/ai_employee/workers/execute_task.py backend/src/ai_employee/infrastructure/db/repositories/calendar_proposals.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/agents/daily_brief/nodes.py backend/src/ai_employee/workers/conversation.py backend/tests/unit/domain/test_calendar_availability.py backend/tests/unit/application/test_calendar_proposals.py backend/tests/integration/m2/test_calendar_proposal_versions.py backend/tests/unit/agents/test_daily_brief.py backend/tests/integration/api/test_conversations.py
 git commit -m "feat: add calendar change proposals"
 ~~~
 
