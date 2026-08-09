@@ -6,7 +6,7 @@
 
 **Architecture:** Preserve the modular monolith and the existing PostgreSQL-backed `TaskRun → ApprovalRequest → ToolExecution → Audit/Outbox/SSE` chain. Add a mail/calendar-only typed command union, encrypted draft/proposal storage, provider-neutral read/write ports, and isolated Google/Microsoft adapters; LangGraph coordinates pause/resume while application/domain code owns validation, state transitions, idempotency, and reconciliation.
 
-**Tech Stack:** Python 3.12, FastAPI, Pydantic 2, SQLAlchemy 2, Alembic, PostgreSQL, Redis, Taskiq, LangGraph 1.x, httpx, PyJWT, Babel, Vue 3, TypeScript, Vite, Pinia, Vitest, Playwright, Docker Compose, Caddy, uv, pnpm, just.
+**Tech Stack:** Python 3.12, FastAPI, Pydantic 2, SQLAlchemy 2, Alembic, PostgreSQL, Redis, Taskiq, LangGraph 1.x, httpx, PyJWT, Babel, Python tzdata, Vue 3, TypeScript, Vite, Pinia, Vitest, Playwright, Docker Compose, Caddy, uv, pnpm, just.
 
 ---
 
@@ -1799,23 +1799,76 @@ git commit -m "fix: scope calendar event identities per calendar"
 ### Task 13: Add Microsoft calendar directory and CalendarView Delta synchronization
 
 **Files:**
+- Modify: `docs/superpowers/specs/2026-08-06-executable-mail-calendar-assistant-m2-design.md`
+- Modify: `docs/superpowers/plans/2026-08-06-executable-mail-calendar-assistant-m2.md`
 - Modify: `backend/pyproject.toml`
 - Modify: `backend/uv.lock`
+- Modify: `backend/src/ai_employee/application/ports/calendar.py`
+- Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py`
 - Create: `backend/src/ai_employee/integrations/microsoft/timezones.py`
 - Create: `backend/src/ai_employee/integrations/microsoft/calendar.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/calendar.py`
+- Modify: `backend/src/ai_employee/infrastructure/observability/sync.py`
 - Modify: `backend/src/ai_employee/workers/sync_calendar.py`
+- Modify: `backend/src/ai_employee/workers/schedules.py`
 - Create: `backend/tests/contract/microsoft/fixtures/calendars.json`
 - Create: `backend/tests/contract/microsoft/fixtures/calendar_view_delta_initial.json`
 - Create: `backend/tests/contract/microsoft/fixtures/calendar_view_delta_incremental.json`
 - Create: `backend/tests/unit/integrations/test_microsoft_timezones.py`
 - Create: `backend/tests/contract/microsoft/test_calendar_adapter.py`
 - Create: `backend/tests/integration/microsoft/test_calendar_sync.py`
+- Modify: `backend/tests/unit/application/test_provider_neutral_sync.py`
+- Modify: `backend/tests/integration/google/test_calendar_sync.py`
+- Modify: `backend/tests/integration/google/test_test_mode_adapters.py`
+- Modify: `backend/tests/integration/observability/test_task_health_metrics.py`
+- Modify: `backend/tests/unit/workers/test_microsoft_mail_ownership.py`
+- Modify: `backend/tests/integration/workers/test_google_sync_schedule.py`
+
+- [ ] **Step 0: Correct the Microsoft Calendar source of truth**
+
+Update the M2 specification and this plan before changing code. Record that Graph v1.0
+`GET /me/calendars` is a paginated full collection without directory deltaLink/tombstones, while
+CalendarView Delta remains independent per calendar. Define explicit full-snapshot mode, nullable
+Microsoft directory provider cursor, separate `last_success_at` revision CAS, HTTP classification,
+normalization/time/recurrence boundaries, Worker token/403 behavior, tzdata dependency purpose, and the
+required regression matrix. Run `git diff --check`, review the complete documentation diff, then commit:
+
+~~~bash
+git add docs/superpowers/specs/2026-08-06-executable-mail-calendar-assistant-m2-design.md docs/superpowers/plans/2026-08-06-executable-mail-calendar-assistant-m2.md
+git commit -m "docs: correct Microsoft calendar directory semantics"
+~~~
 
 - [ ] **Step 1: Write failing Graph calendar tests**
 
-Contract tests must cover `/me/calendars`, primary/default projection, owner/read-only capability, CalendarView Delta past one day through future 30 days, absolute next/delta links, tombstones, `@odata.etag`/`changeKey`, attendees, organizer, recurrence read projection, 401 refresh, 403 scope loss, 429, 5xx, and cursor expiry fallback.
+Contract tests must use the real Graph v1.0 shapes. `/me/calendars` is a bounded full collection:
+follow only host/path-bound `@odata.nextLink`, accept a final page with neither nextLink nor deltaLink,
+reject directory deltaLink/`@removed`, and classify directory 404/410 as permanent provider errors. Each
+calendar's `calendarView/delta` independently covers the user's past-one-day/future-30-day window,
+absolute next/delta links, tombstones, `@odata.etag`/`changeKey`, attendees, organizer, recurrence read
+projection, 401 refresh, 403 scope loss, 429, 5xx, and calendar cursor expiry fallback. Exact event GET
+404 returns `None`; only a persisted CalendarView deltaLink may map 404/410 or `syncStateNotFound` to
+`CalendarCursorExpiredError`.
+
+Provider-neutral tests must first prove that directory pages explicitly distinguish full snapshots from
+incremental pages, a pagination chain cannot change mode, Microsoft full snapshots finish with
+`next_cursor=None`, and Google keeps its initial/full versus token-based incremental behavior. PostgreSQL
+tests must prove empty full snapshot deletion, missing-calendar cache deletion, reappearance forcing a
+bounded event rebuild, and local directory revision CAS: two reads from the same revision cannot both
+commit. The revision is separate from provider cursor and reuses the directory cursor row's
+`last_success_at`; no migration or Microsoft-specific ORM is allowed.
+
+Adapter boundary tests must cover calendar ID 512, event/series/ETag 255, status/transparency/access-role
+32, timezone 64, C0/DEL/NUL, invalid mailbox addresses, unsafe URLs, seven-or-more fractional seconds with
+`Z` and offsets, offset/timezone mismatch, `end <= start`, all-day midnight/zone rules, and Graph event
+`type` recurrence contradictions. Malformed data must fail before persistence and leave every cursor
+unchanged.
+
+Worker integration tests must instantiate `CalendarSyncTaskStep` with PostgreSQL, synthetic AEAD token
+rows, mocked Graph/OAuth, and fixed Microsoft metrics. Cover refresh-token rotation and no-rotation,
+separate later 401 chains using the latest refresh token, refresh rejection, second resource 401,
+403 stopping all remaining calendar reads while only `calendar.read` becomes action-required, and
+APP_TEST_MODE remaining completely offline.
 
 ~~~python
 @pytest.mark.asyncio
@@ -1833,7 +1886,8 @@ async def test_graph_calendar_event_keeps_version_and_read_only_recurrence() -> 
 
 The timezone unit suite must prove `Asia/Shanghai → China Standard Time`,
 `America/Los_Angeles → Pacific Standard Time`, reverse mapping for Graph responses, explicit `UTC`,
-canonical IANA aliases, and stable rejection of unknown Windows/IANA zone names.
+canonical IANA aliases, deterministic behavior when Babel mapping data is missing/malformed, and stable
+rejection of unknown Windows/IANA zone names without changing the process-global TZPATH.
 
 - [ ] **Step 2: Run tests and observe the expected failure**
 
@@ -1843,37 +1897,89 @@ Expected: FAIL because the shared timezone boundary and Graph calendar adapter d
 
 - [ ] **Step 3: Add and lock the shared Microsoft timezone boundary**
 
-Add `Babel>=2.17,<3` and regenerate `backend/uv.lock` with `uv lock --project backend`. Record that
-Babel is BSD-licensed, maintained, and used only for CLDR Windows/IANA mappings. Create
+Add `Babel>=2.17,<3` and `tzdata>=2025.2,<2027`, then regenerate `backend/uv.lock` with
+`uv lock --project backend`. Babel is BSD-licensed and used only for maintained CLDR Windows/IANA
+mappings. Python tzdata is actively maintained, Apache-2.0 licensed packaging of IANA timezone data and
+is used only so `zoneinfo` validation does not silently depend on the host image's optional tzdata. Create
 `microsoft/timezones.py` with deterministic `to_iana_timezone()` and `to_windows_timezone()` functions
 from `babel.core.get_global("windows_zone_mapping")`, explicit `UTC`, canonical IANA normalization,
-and stable `calendar_timezone_mapping_unsupported` errors. Never substitute the host timezone.
+and stable `calendar_timezone_mapping_unsupported` errors. Missing or malformed CLDR/tzdata must fail
+stably at the mapping boundary; never skip entries, substitute the host timezone, or mutate global TZPATH.
 
-- [ ] **Step 4: Implement directory and CalendarView Delta reads**
+- [ ] **Step 4: Implement the provider-neutral directory contract and Graph reads**
 
-Use `/me/calendars?$select=id,name,isDefaultCalendar,canEdit,canShare,owner,hexColor` for the directory and `/me/calendars/{id}/calendarView/delta?startDateTime={window_start}&endDateTime={window_end}` for initial event windows. Follow only validated Graph next/delta links and store the final link opaque.
+Extend `CalendarDirectoryPage` with an explicit strong `full_snapshot` fact and
+`CalendarConnectionState` with an optional local directory revision separate from cursor. All pages in a
+directory chain must use one mode. Google CalendarList initial/410 fallback pages are full snapshots;
+token-based directory pages are incremental. Microsoft always starts from
+`/me/calendars?$select=id,name,isDefaultCalendar,canEdit,canShare,owner,hexColor`; it rejects any non-null
+stored directory provider cursor before HTTP, follows only validated `@odata.nextLink`, rejects
+`@odata.deltaLink` and directory tombstones, and finishes with `next_cursor=None` plus
+`full_snapshot=True`.
 
-Normalize Graph `dateTimeTimeZone` values through the Task 13 shared mapping into aware UTC instants plus the internal IANA timezone. Implement the same port's exact current-event GET for proposal/restore preparation, including ETag/changeKey, deletion, recurrence, and permission facts. Read and expose recurrence metadata, but do not add recurrence to any write command schema.
+Use `/me/calendars/{id}/calendarView/delta?startDateTime={window_start}&endDateTime={window_end}` for
+initial event windows. Follow only validated event next/delta links and store each calendar's final
+deltaLink opaque. Delete the unused public `execute_request(url=...)` diagnostic entry point; every
+outbound request must come from fixed collection/resource builders or validated Graph links, and tests
+must prove an attacker URL receives no request or Bearer header.
 
-- [ ] **Step 5: Register Microsoft calendar scopes in shared persistence**
+Normalize Graph `dateTimeTimeZone` values through the Task 13 shared mapping into aware UTC instants plus
+the internal IANA timezone. Preserve offsets after truncating excessive fractional seconds, verify an
+explicit offset is valid for the declared zone at that local time, require `end > start`, and enforce
+same-zone local-midnight boundaries for all-day events. Implement exact current-event GET for
+proposal/restore preparation, including ETag/changeKey, deletion, recurrence, and permission facts. Read
+and expose recurrence metadata, validate it against Graph event `type`, but do not add recurrence to any
+write command schema.
 
-Use the same `provider_calendars`, `calendar_events`, and scoped cursor tables as Google. Provider selection comes from the connection row; no Microsoft-specific ORM table is allowed. Upserts and cursor CAS must remain user-filtered.
+- [ ] **Step 5: Persist full snapshots and independent revision CAS**
 
-- [ ] **Step 6: Run both providers' calendar suites and dependency checks**
+Use the same `provider_calendars`, `calendar_events`, and scoped cursor tables as Google. Provider
+selection comes from the connection row; no Microsoft-specific ORM table or migration is allowed.
+`CalendarSyncStore.mark_directory_success()` accepts `full_snapshot`, optional `next_cursor`, and
+`expected_revision`. It verifies provider cursor and local revision CAS independently. Only
+`full_snapshot=True` performs absence deletion; incremental Google pages delete only explicit tombstones.
+Microsoft directory keeps cursor `NULL` and advances only `last_success_at` as the local revision. Event
+scope final cursors remain mandatory and non-empty. All queries, deletes, upserts and CAS remain
+user-filtered.
 
-Run: `uv run --project backend pytest backend/tests/unit/integrations/test_microsoft_timezones.py backend/tests/contract/microsoft/test_calendar_adapter.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/contract/test_calendar_adapter.py backend/tests/integration/google/test_calendar_sync.py -q`
+- [ ] **Step 6: Harden normalization, Worker lifecycle, metrics, and test mode**
 
-Expected: PASS.
+Validate every normalized scalar against its shared PostgreSQL column length before returning a port
+object. Reject disallowed control characters; body text keeps legitimate line breaks but rejects NUL and
+unrepresentable controls. Normalize organizer/attendee addresses through
+`normalize_mailbox_address()` and map its errors to content-free
+`microsoft_calendar_invalid_response`. Safe provider URLs require absolute HTTPS, non-empty host, no
+userinfo/fragment/control characters.
 
-Run: `uv pip check --project backend`
+Microsoft refresh success updates the in-memory refresh-token closure; if the token response omits a new
+refresh token it retains the previous value. A directory `UserActionRequiredError` stops the remaining
+calendar loop immediately. Worker 403 only downgrades `calendar.read`; reauthorization marks the
+connection expired. `observe_provider_sync()` records fixed `PermanentProviderError` codes as well as
+transient/action-required errors. `_FakeMicrosoftCalendarReader` routes fixture events by calendar ID and
+exact GET matches `(calendar_id, event_id)`; unmatched calendars return empty pages and never clone one
+fixture across the directory.
 
-Expected: PASS.
+- [ ] **Step 7: Run both providers' calendar suites and dependency checks**
 
-- [ ] **Step 7: Commit**
+Run the Microsoft timezone/contract/PostgreSQL/Worker suites, provider-neutral calendar use-case and
+repository tests, Google Calendar contract/integration regressions, and schedule/observability/test-mode
+tests with the isolated Task 13 PostgreSQL URL. Then run:
 
 ~~~bash
-git add backend/pyproject.toml backend/uv.lock backend/src/ai_employee/integrations/microsoft/timezones.py backend/src/ai_employee/integrations/microsoft/calendar.py backend/src/ai_employee/integrations/registry.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/workers/sync_calendar.py backend/tests/unit/integrations/test_microsoft_timezones.py backend/tests/contract/microsoft/fixtures/calendars.json backend/tests/contract/microsoft/fixtures/calendar_view_delta_initial.json backend/tests/contract/microsoft/fixtures/calendar_view_delta_incremental.json backend/tests/contract/microsoft/test_calendar_adapter.py backend/tests/integration/microsoft/test_calendar_sync.py
-git commit -m "feat: sync Microsoft calendar delta"
+uv run --project backend ruff check backend/src backend/tests
+uv run --project backend ruff format --check backend/src backend/tests
+uv run --project backend mypy backend/src
+uv pip check --project backend
+git diff --check
+~~~
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+~~~bash
+git add backend/pyproject.toml backend/uv.lock backend/src/ai_employee/application/ports/calendar.py backend/src/ai_employee/application/use_cases/sync_calendar.py backend/src/ai_employee/integrations/microsoft/timezones.py backend/src/ai_employee/integrations/microsoft/calendar.py backend/src/ai_employee/integrations/registry.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/infrastructure/observability/sync.py backend/src/ai_employee/workers/sync_calendar.py backend/src/ai_employee/workers/schedules.py backend/tests/unit/integrations/test_microsoft_timezones.py backend/tests/unit/application/test_provider_neutral_sync.py backend/tests/contract/microsoft/fixtures/calendars.json backend/tests/contract/microsoft/fixtures/calendar_view_delta_initial.json backend/tests/contract/microsoft/fixtures/calendar_view_delta_incremental.json backend/tests/contract/microsoft/test_calendar_adapter.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/google/test_test_mode_adapters.py backend/tests/integration/observability/test_task_health_metrics.py backend/tests/unit/workers/test_microsoft_mail_ownership.py backend/tests/integration/workers/test_google_sync_schedule.py
+git commit -m "fix: correct Microsoft calendar synchronization"
 ~~~
 
 ### Task 14: Implement local mail drafts, immutable versions, and body-only model generation

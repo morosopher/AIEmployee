@@ -687,12 +687,35 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 ### 12.2 日历
 
 - 先同步用户可见日历目录，规范化日历 ID、名称、时区、primary 标记、访问角色、可写能力和
-  provider URL。
+  provider URL。Google CalendarList 目录使用供应商 sync token 增量读取；Microsoft Graph
+  v1.0 `GET /me/calendars` 不提供目录 Delta，每轮都必须从固定 collection URL 开始执行有界
+  完整快照，只跟随严格绑定 `graph.microsoft.com/v1.0/me/calendars` path 的
+  `@odata.nextLink`。Microsoft 最终目录页既不要求也不接受 `@odata.deltaLink`，目录响应也不
+  接受 `@removed` tombstone。
+- 供应商中立目录分页必须显式携带 `full_snapshot`（或等价强类型）事实，且同一分页链的语义
+  必须一致。仓储只有在 `full_snapshot=true` 时才可把快照中缺席的日历解释为删除；增量目录
+  只能应用供应商明确返回的 tombstone，不能再从 cursor 是否为空推断完整性。
+- Microsoft directory 的 provider cursor 永远保持 `NULL`；本地并发版本不得伪装成普通字符串
+  cursor、Delta token 或 Graph URL。并发陈旧快照使用与 provider cursor 分离的本地持久 revision
+  做 CAS；当前 Schema 复用 directory cursor 行的 `last_success_at` 作为观察 revision，无需新增
+  Microsoft 表或迁移。两个从同一 revision 开始的完整快照最多只有一个可以提交。
 - 初始读取用户时区下过去 1 天至未来 30 天的事件窗口，与 M1 Google 行为保持可比。
 - Google Sync Token 和 Microsoft Calendar View Delta 都按单个日历保存，不能用连接级游标覆盖
-  多个日历。
-- 规范化事件 ID、日历 ID、ETag/changeKey、时间、时区、参会人、状态和 webLink。
-- 重复和会议字段可以读取并展示，但 M2 写提案必须拒绝不支持的重复事件修改。
+  多个日历。Microsoft CalendarView Delta 的初始请求、后续 `@odata.nextLink` 和最终
+  `@odata.deltaLink` 必须始终绑定同一个真实 calendar ID；opaque query 原样保存和转发。
+- Microsoft directory 的 404/410 是固定永久供应商错误，不能伪装成不存在的目录 cursor
+  expiry；精确事件 GET 的 404 返回 `None`；已持久 CalendarView deltaLink 的后续请求遇到
+  404/410 或 `syncStateNotFound` 时，只使对应 calendar scope 的 cursor 失效并执行受限窗口重建。
+- 规范化事件 ID、日历 ID、ETag/changeKey、时间、时区、参会人、状态和 webLink。适配器在
+  持久化前必须执行与共享列长度一致的边界检查，拒绝 C0/DEL、NUL、非法邮箱和不安全 URL；
+  任何畸形供应商 item 都转换为不回显原值的固定永久错误，不能下沉为数据库 DataError。
+- Graph 显式 offset 必须与声明时区在该本地时刻一致，事件必须满足 `end > start`；全天事件还
+  必须在同一时区的本地午夜边界开始和结束。重复投影按 Graph event `type` 验证：series master、
+  occurrence、exception 和 single instance 的 recurrence/seriesMasterId 组合不得矛盾或降级为
+  看似可写的非重复事件。
+- 重复和会议字段可以读取并展示，但 M2 写提案必须拒绝不支持的重复事件修改。Microsoft 目录
+  或任一 CalendarView 请求返回 403 时立即停止该连接剩余日历读取，仅把 `calendar.read` 标记为
+  action required；401 reauthorization 才可按连接过期路径处理。
 
 ### 12.3 数据模型对齐
 
@@ -1099,6 +1122,10 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 能力在等待审批、排队和执行期间被关闭。
 - `needs_attention` 核对和人工结论竞争。
 - 日程修改与恢复的 ETag 竞争。
+- Google 增量目录与 Microsoft 完整目录快照的显式语义、空快照、缺席删除、重新出现重建和
+  directory revision CAS；陈旧 Microsoft 快照不得覆盖先提交的目录事实。
+- Microsoft Calendar Worker 的 access/refresh token 轮换、无新 refresh token 保留、连续独立
+  401、refresh 拒绝、403 立即停止、能力隔离、provider 指标标签和完全离线测试模式。
 
 ### 20.3 供应商契约测试
 
@@ -1110,6 +1137,10 @@ Google 与 Microsoft 分别覆盖：
 - 日程创建、修改、通知策略、ETag 和稳定关联标识。
 - 401 刷新、403 权限、429 Retry-After、5xx、超时和未知结果。
 - Microsoft 个人账户与工作/学校账户响应差异。
+- Microsoft `/me/calendars` 的真实完整 collection 形状、nextLink 分页、无 deltaLink 最终页、
+  directory 404/410 永久错误，以及每个 calendar 独立 CalendarView Delta 的 cursor expiry。
+- 日历字段长度/控制字符/邮箱/URL、七位以上小数与 offset、DST、全天边界、时间顺序和 Graph
+  recurrence type 矛盾；畸形 item 不能触碰持久事实或推进 cursor。
 
 CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 
@@ -1163,6 +1194,8 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - Redis 丢失不丢失草稿、提案、任务、审批或工具结果。
 - ETag 冲突不会覆盖供应商中的并发修改。
 - 同步游标失效能够受限回退，不扩大数据读取窗口。
+- Microsoft 完整日历目录不伪造 provider cursor；并发快照通过独立 revision CAS 拒绝陈旧提交，
+  只有已声明完整的快照才执行缺席删除。
 
 ### 21.4 安全与隐私
 
