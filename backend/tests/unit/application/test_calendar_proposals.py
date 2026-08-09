@@ -1141,6 +1141,31 @@ async def test_recurrence_input_uses_stable_domain_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recurrence_field", "recurrence_value"),
+    (
+        ("recurrence", {"pattern": {"type": "daily"}}),
+        ("rrule", {"freq": "daily"}),
+    ),
+)
+async def test_update_object_recurrence_is_rejected_before_idempotency_hashing(
+    recurrence_field: str,
+    recurrence_value: object,
+) -> None:
+    """对象形式 recurrence 必须先返回稳定领域错误，不能泄漏哈希类型错误。"""
+    use_case, _, _ = _use_case()
+
+    with pytest.raises(StateConflictError) as error:
+        await use_case.create_update(
+            user_id=USER_ID,
+            event_id=EVENT_ID,
+            changes={recurrence_field: recurrence_value},
+        )
+
+    assert error.value.error_code == "calendar_recurring_event_unsupported"
+
+
+@pytest.mark.asyncio
 async def test_unknown_calendar_extension_is_not_misreported_as_recurrence() -> None:
     """普通未知扩展仍是输入错误，不能伪装成重复日程领域事实。"""
     use_case, _, _ = _use_case()

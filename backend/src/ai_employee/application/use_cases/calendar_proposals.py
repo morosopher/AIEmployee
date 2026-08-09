@@ -568,6 +568,9 @@ class CalendarProposalUseCase:
         if event is None:
             raise CalendarProposalNotFoundError
         _validate_local_update_event(event, target)
+        # recurrence 必须先返回稳定领域错误；对象形状不能被通用幂等哈希边界
+        # 提前降级为没有 error_code 的 TypeError。
+        _reject_recurrence_input(changes)
         creation_key = _idempotency_key(
             idempotency_key or _derived_update_key(event_id=event_id, changes=changes)
         )
