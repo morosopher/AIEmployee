@@ -19,7 +19,12 @@ from ai_employee.domain.briefs import ConversationIntent
 from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import TaskStatus
-from ai_employee.infrastructure.db.models.actions import MailDraftModel, MailDraftVersionModel
+from ai_employee.infrastructure.db.models.actions import (
+    CalendarChangeProposalModel,
+    CalendarChangeSnapshotModel,
+    MailDraftModel,
+    MailDraftVersionModel,
+)
 from ai_employee.infrastructure.db.models.briefs import (
     DailyBriefModel,
     LLMInvocationModel,
@@ -31,12 +36,16 @@ from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
     OAuthConnectionModel,
+    ProviderCalendarModel,
 )
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
     AuditEventModel,
     TaskRunModel,
     ToolExecutionModel,
+)
+from ai_employee.infrastructure.db.repositories.calendar_proposals import (
+    SqlAlchemyCalendarProposalRepository,
 )
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
@@ -72,6 +81,30 @@ class _PrepareMailDraftIntentGateway:
         value = response_model.model_validate(
             ConversationIntent(
                 intent="prepare_mail_draft",
+                confidence=1,
+                reason_code="synthetic_model_choice",
+            ).model_dump()
+        )
+        return ModelResponse(value=value, usage=ModelUsage())
+
+
+class _PrepareCalendarProposalIntentGateway(_PrepareMailDraftIntentGateway):
+    """模拟模型错误选择日历提案意图，验证 Worker 仍要求明确本地命令。"""
+
+    async def complete(
+        self,
+        *,
+        model_name: str,
+        prompt_version: str,
+        messages: Sequence[dict[str, str]],
+        response_model: type[TModel],
+    ) -> ModelResponse[TModel]:
+        """返回合法但不可信的 ``prepare_calendar_proposal`` 分类。"""
+        del model_name, prompt_version
+        self.calls.append(messages)
+        value = response_model.model_validate(
+            ConversationIntent(
+                intent="prepare_calendar_proposal",
                 confidence=1,
                 reason_code="synthetic_model_choice",
             ).model_dump()
@@ -767,6 +800,143 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
 
 
 @pytest.mark.asyncio
+async def test_explicit_calendar_request_creates_only_editable_unconfirmed_proposal_shell(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """明确日历草案请求只建本地 shell；账户、时间、参会人和通知仍须用户确认。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-explicit-calendar-worker"
+    action_cipher = ActionPayloadCipher.from_key(b"p" * 32)
+    async with clients.session_factory.begin() as session:
+        connection = OAuthConnectionModel(
+            user_id=clients.owner_id,
+            provider="google",
+            provider_account_id="synthetic-conversation-calendar",
+            account_email="owner@example.test",
+            scopes=[],
+            status="connected",
+        )
+        session.add(connection)
+        await session.flush()
+        session.add_all(
+            ConnectionCapabilityModel(
+                user_id=clients.owner_id,
+                connection_id=connection.id,
+                capability=capability.value,
+                status="enabled",
+                actual_scopes=[],
+            )
+            for capability in (
+                ConnectionCapability.CALENDAR_READ,
+                ConnectionCapability.CALENDAR_WRITE,
+            )
+        )
+        session.add(
+            ProviderCalendarModel(
+                user_id=clients.owner_id,
+                connection_id=connection.id,
+                provider_calendar_id="synthetic-calendar",
+                name="Synthetic calendar",
+                timezone="UTC",
+                is_primary=True,
+                access_role="owner",
+                can_write=True,
+                provider_url="https://calendar.example.test/calendar",
+            )
+        )
+        owner = await session.get(UserModel, clients.owner_id)
+        assert owner is not None
+        owner.default_calendar_connection_id = connection.id
+        owner.default_calendar_id = "synthetic-calendar"
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            lease_owner=lease_owner,
+            idempotency_key="conversation-explicit-calendar-proposal",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": "Please prepare a calendar proposal",
+            },
+        )
+        session.add(task)
+        await session.flush()
+    gateway = FakeModelGateway()
+    step = ConversationTaskStep(
+        clients.session_factory,
+        model_gateway=gateway,
+        action_cipher=action_cipher,
+        clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+    )
+    leased = LeasedTask(
+        task_id=task.id,
+        user_id=clients.owner_id,
+        kind=task.kind,
+        input_payload=task.input_payload,
+        started_at=datetime.now(UTC),
+        lease_owner=lease_owner,
+    )
+
+    await asyncio.gather(step.execute(leased), step.execute(leased))
+    await step.execute(leased)
+
+    async with clients.session_factory() as session:
+        proposal = await session.scalar(
+            select(CalendarChangeProposalModel).where(
+                CalendarChangeProposalModel.user_id == clients.owner_id
+            )
+        )
+        proposal_count = await session.scalar(
+            select(func.count()).select_from(CalendarChangeProposalModel).where(
+                CalendarChangeProposalModel.user_id == clients.owner_id
+            )
+        )
+        snapshot_count = await session.scalar(
+            select(func.count()).select_from(CalendarChangeSnapshotModel).where(
+                CalendarChangeSnapshotModel.user_id == clients.owner_id
+            )
+        )
+        reply = await session.scalar(
+            select(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
+        approval_count = await session.scalar(
+            select(func.count()).select_from(ApprovalRequestModel)
+        )
+        execution_count = await session.scalar(
+            select(func.count()).select_from(ToolExecutionModel)
+        )
+        assert proposal is not None
+        snapshot = await SqlAlchemyCalendarProposalRepository(
+            session,
+            action_cipher,
+        ).get_current(
+            user_id=clients.owner_id,
+            proposal_id=proposal.id,
+        )
+    assert proposal.status == "editing" and proposal.current_version == 1
+    assert proposal_count == 1 and snapshot_count == 1
+    assert snapshot is not None
+    assert snapshot.desired_snapshot.content["notification_policy"] is None
+    assert snapshot.desired_snapshot.content["confirmed_fields"] == []
+    assert snapshot.desired_snapshot.content["required_confirmations"] == [
+        "calendar",
+        "time",
+        "attendees",
+        "notification_policy",
+    ]
+    assert reply is not None
+    assert f"/api/v1/calendar/proposals/{proposal.id}" in reply.content_markdown
+    assert "不会创建审批或写入日历" in reply.content_markdown
+    assert approval_count == 0 and execution_count == 0
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command_template",
     (
@@ -1036,6 +1206,70 @@ async def test_model_selected_mail_draft_intent_is_rejected_without_explicit_com
         )
     assert len(gateway.calls) == 1
     assert draft_count == 0
+    assert reply is not None and reply.content_markdown == UNSUPPORTED_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_model_selected_calendar_intent_cannot_create_or_freeze_proposal(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """模型只能分类歧义文本，不能据此选择日历字段、创建 shell、审批或执行。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    lease_owner = "conversation-model-calendar-intent-worker"
+    async with clients.session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            lease_owner=lease_owner,
+            idempotency_key="conversation-model-cannot-create-calendar-proposal",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": "Could you outline what this assistant can do?",
+            },
+        )
+        session.add(task)
+        await session.flush()
+    gateway = _PrepareCalendarProposalIntentGateway()
+    step = ConversationTaskStep(
+        clients.session_factory,
+        model_gateway=gateway,
+        action_cipher=ActionPayloadCipher.from_key(b"q" * 32),
+    )
+
+    await step.execute(
+        LeasedTask(
+            task_id=task.id,
+            user_id=clients.owner_id,
+            kind=task.kind,
+            input_payload=task.input_payload,
+            started_at=datetime.now(UTC),
+            lease_owner=lease_owner,
+        )
+    )
+
+    async with clients.session_factory() as session:
+        proposal_count = await session.scalar(
+            select(func.count()).select_from(CalendarChangeProposalModel).where(
+                CalendarChangeProposalModel.user_id == clients.owner_id
+            )
+        )
+        approval_count = await session.scalar(
+            select(func.count()).select_from(ApprovalRequestModel)
+        )
+        execution_count = await session.scalar(
+            select(func.count()).select_from(ToolExecutionModel)
+        )
+        reply = await session.scalar(
+            select(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
+    assert len(gateway.calls) == 1
+    assert proposal_count == 0 and approval_count == 0 and execution_count == 0
     assert reply is not None and reply.content_markdown == UNSUPPORTED_RESPONSE
 
 

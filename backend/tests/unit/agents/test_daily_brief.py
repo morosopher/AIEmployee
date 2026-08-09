@@ -33,6 +33,17 @@ def test_brief_item_requires_source_and_safe_action() -> None:
         suggested_action_kind="mail.reply",
     )
     assert item.suggested_action_kind == "mail.reply"
+    calendar_item = BriefItem(
+        section="conflicts",
+        title="x",
+        body_markdown="x",
+        source_refs=[
+            BriefSourceRef(source_type="calendar_event", source_id="event-1"),
+            BriefSourceRef(source_type="calendar_event", source_id="event-2"),
+        ],
+        suggested_action_kind="calendar.update",
+    )
+    assert calendar_item.suggested_action_kind == "calendar.update"
 
 
 def test_intent_rejects_unknown_value() -> None:
@@ -128,6 +139,9 @@ async def test_ambiguous_intent_redacts_before_model() -> None:
         ("prepare an email draft for recipient@example.test", "prepare_mail_draft"),
         ("draft email to recipient@example.test", "prepare_mail_draft"),
         ("请为 recipient@example.test 准备邮件草稿", "prepare_mail_draft"),
+        ("prepare a calendar proposal", "prepare_calendar_proposal"),
+        ("draft a meeting proposal", "prepare_calendar_proposal"),
+        ("请准备一个日程提案", "prepare_calendar_proposal"),
     ],
 )
 async def test_explicit_intents_never_call_model(text: str, expected: str) -> None:
@@ -175,6 +189,43 @@ async def test_needs_reply_item_exposes_only_verifiable_mail_reply_suggestion() 
     item = result["content"]["items"][0]
     assert item["source_refs"][0]["source_id"] == "replyable-thread"
     assert item["suggested_action_kind"] == "mail.reply"
+
+
+@pytest.mark.asyncio
+async def test_calendar_conflict_exposes_bound_update_proposal_suggestion() -> None:
+    """确定性冲突只绑定真实输入事件 ID，并暴露本地 calendar.update 提案入口。"""
+    result = await build_daily_brief_graph().ainvoke(
+        {
+            "mail_threads": [],
+            "calendar_events": [
+                {
+                    "event_id": "event-one",
+                    "start_at": "2030-03-11T09:00:00+00:00",
+                    "end_at": "2030-03-11T10:00:00+00:00",
+                    "status": "confirmed",
+                    "transparency": "opaque",
+                    "all_day": False,
+                },
+                {
+                    "event_id": "event-two",
+                    "start_at": "2030-03-11T09:30:00+00:00",
+                    "end_at": "2030-03-11T10:30:00+00:00",
+                    "status": "confirmed",
+                    "transparency": "opaque",
+                    "all_day": False,
+                },
+            ],
+        }
+    )
+
+    conflict = next(
+        item for item in result["content"]["items"] if item["section"] == "conflicts"
+    )
+    assert conflict["suggested_action_kind"] == "calendar.update"
+    assert [ref["source_id"] for ref in conflict["source_refs"]] == [
+        "event-one",
+        "event-two",
+    ]
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,10 @@ from ai_employee.agents.daily_brief.nodes import (
     classify_conversation_intent,
 )
 from ai_employee.application.ports.model import ModelGateway
+from ai_employee.application.use_cases.calendar_proposals import (
+    CalendarProposalUseCase,
+    parse_calendar_proposal_conversation_request,
+)
 from ai_employee.application.use_cases.conversations import (
     parse_mail_draft_conversation_request,
     unsupported_response,
@@ -31,6 +35,10 @@ from ai_employee.infrastructure.db.models.briefs import (
     MessageModel,
 )
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
+from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyCalendarSyncRepository
+from ai_employee.infrastructure.db.repositories.calendar_proposals import (
+    SqlAlchemyCalendarProposalRepository,
+)
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
@@ -190,13 +198,13 @@ class ConversationTaskStep:
                     # 模型即使错误选择该意图，也不能绕过明确文本解析创建动作。
                     text = unsupported_response()
                 else:
-                    repository = SqlAlchemyMailDraftRepository(
+                    mail_repository = SqlAlchemyMailDraftRepository(
                         session,
-                        self._mail_draft_cipher(),
+                        self._action_payload_cipher(),
                     )
                     use_case = MailDraftUseCase(
-                        drafts=repository,
-                        connections=repository,
+                        drafts=mail_repository,
+                        connections=mail_repository,
                         sources=SqlAlchemyMailSyncRepository(session),
                         clock=self._clock,
                     )
@@ -223,6 +231,30 @@ class ConversationTaskStep:
                         "已创建可编辑的本地邮件草稿："
                         f"[打开草稿](/api/v1/mail/drafts/{draft.draft_id})。"
                         "草稿仍需由你编辑并单独提交审批，当前不会发送。"
+                    )
+            elif intent == "prepare_calendar_proposal":
+                if not parse_calendar_proposal_conversation_request(raw_content):
+                    # ConversationIntent 允许模型表达该枚举仅为结构兼容；只有原始文本再次
+                    # 通过确定性整句解析时才可创建 shell，模型不能选择账户或写入字段。
+                    text = unsupported_response()
+                else:
+                    calendar_repository = SqlAlchemyCalendarProposalRepository(
+                        session,
+                        self._action_payload_cipher(),
+                    )
+                    proposal = await CalendarProposalUseCase(
+                        proposals=calendar_repository,
+                        calendar=SqlAlchemyCalendarSyncRepository(session),
+                        clock=self._clock,
+                    ).create_shell(
+                        user_id=task.user_id,
+                        idempotency_key=f"conversation-calendar-proposal:{task.task_id}",
+                    )
+                    text = (
+                        "已创建可编辑的本地日程提案："
+                        f"[打开提案](/api/v1/calendar/proposals/{proposal.proposal_id})。"
+                        "账户、时间、参会人和通知策略仍需由你明确确认；"
+                        "当前不会创建审批或写入日历。"
                     )
             else:
                 text = unsupported_response()
@@ -262,12 +294,12 @@ class ConversationTaskStep:
                 assistant_message_id=assistant.id,
             )
 
-    def _mail_draft_cipher(self) -> ActionPayloadCipher:
-        """返回本地草稿 AEAD，并只在首次明确草稿请求时读取受控 Secret 文件。"""
+    def _action_payload_cipher(self) -> ActionPayloadCipher:
+        """返回本地动作内容 AEAD，并只在首次明确草稿/提案请求时读取 Secret。"""
         if self._action_cipher is not None:
             return self._action_cipher
         if self._action_cipher_file is None:
-            raise RuntimeError("mail draft encryption is not configured")
+            raise RuntimeError("action payload encryption is not configured")
         self._action_cipher = ActionPayloadCipher(
             AeadCipher.from_file(self._action_cipher_file)
         )

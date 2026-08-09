@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hmac import compare_digest
-from typing import Literal, cast
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -13,11 +13,20 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.use_cases.calendar_proposals import (
+    CalendarOperationKind,
+    CalendarProposalSnapshot,
+    CalendarProposalStateSnapshot,
+    CalendarRestoreSourceSnapshot,
+    CalendarSnapshot,
+    CalendarSnapshotKind,
+)
 from ai_employee.domain.actions import (
     CalendarProposalStatus,
     transition_calendar_proposal,
 )
 from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.tasks import JsonValue
 from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeProposalModel,
     CalendarChangeSnapshotModel,
@@ -31,49 +40,6 @@ from ai_employee.infrastructure.security.action_payloads import (
 CALENDAR_SNAPSHOT_CONTENT_KIND = "calendar_snapshot"
 CALENDAR_SNAPSHOT_ACTION = "calendar.snapshot"
 CALENDAR_SNAPSHOT_SCHEMA_VERSION = "calendar_snapshot.v1"
-
-type CalendarOperationKind = Literal["create", "update", "restore"]
-type CalendarSnapshotKind = Literal["desired", "before"]
-
-
-@dataclass(frozen=True, slots=True)
-class CalendarSnapshot:
-    """表示已验证哈希并解密的一个不可变日历内容事实。"""
-
-    snapshot_id: UUID
-    proposal_id: UUID
-    version: int
-    snapshot_kind: CalendarSnapshotKind
-    content: dict[str, object]
-    canonical_hash: str
-    retain_until: datetime
-    created_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class CalendarProposalStateSnapshot:
-    """返回不含日程敏感字段的提案头状态。"""
-
-    proposal_id: UUID
-    current_version: int
-    status: CalendarProposalStatus
-
-
-@dataclass(frozen=True, slots=True)
-class CalendarProposalSnapshot:
-    """把提案头和当前 desired snapshot 映射为非 ORM 稳定快照。"""
-
-    proposal_id: UUID
-    connection_id: UUID
-    calendar_id: str
-    operation_kind: CalendarOperationKind
-    target_event_id: str | None
-    base_etag: str | None
-    current_version: int
-    status: CalendarProposalStatus
-    retain_until: datetime
-    desired_snapshot: CalendarSnapshot
-
 
 @dataclass(frozen=True, slots=True)
 class _PreparedCalendarSnapshot:
@@ -105,6 +71,30 @@ class SqlAlchemyCalendarProposalRepository:
         """
         self._session = session
         self._cipher = cipher
+
+    async def get_by_creation_key(
+        self,
+        *,
+        user_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CalendarProposalSnapshot | None:
+        """按用户创建键读取当前提案，供应用层在生成随机 ID 前识别重放。
+
+        Args:
+            user_id: 当前认证用户。
+            creation_idempotency_key: 已在应用边界验证的创建幂等键。
+
+        Returns:
+            当前用户同键提案；不存在或跨用户时返回 ``None``。
+        """
+        proposal = await self._session.scalar(
+            select(CalendarChangeProposalModel).where(
+                CalendarChangeProposalModel.user_id == user_id,
+                CalendarChangeProposalModel.creation_idempotency_key
+                == creation_idempotency_key,
+            )
+        )
+        return None if proposal is None else await self._proposal_snapshot(proposal)
 
     async def create(
         self,
@@ -376,6 +366,57 @@ class SqlAlchemyCalendarProposalRepository:
         )
         return None if row is None else self._decode_snapshot(row)
 
+    async def get_restore_source(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+    ) -> CalendarRestoreSourceSnapshot | None:
+        """从用户拥有的 before snapshot 解析不可拆分恢复目标身份。
+
+        本查询只返回 source/proposal/connection/calendar/event 标识，不解密历史日程内容，
+        供 Worker 在释放首个短事务前确定供应商精确 GET 目标。
+
+        Args:
+            user_id: 当前认证用户。
+            source_snapshot_id: 历史修改前快照 ID。
+
+        Returns:
+            目标身份；不存在、跨用户、不是 before 或没有目标事件时返回 ``None``。
+        """
+        row = (
+            await self._session.execute(
+                select(
+                    CalendarChangeSnapshotModel.id.label("source_snapshot_id"),
+                    CalendarChangeSnapshotModel.proposal_id.label("source_proposal_id"),
+                    CalendarChangeProposalModel.connection_id,
+                    CalendarChangeProposalModel.calendar_id,
+                    CalendarChangeProposalModel.target_event_id,
+                )
+                .join(
+                    CalendarChangeProposalModel,
+                    CalendarChangeProposalModel.id
+                    == CalendarChangeSnapshotModel.proposal_id,
+                )
+                .where(
+                    CalendarChangeSnapshotModel.id == source_snapshot_id,
+                    CalendarChangeSnapshotModel.user_id == user_id,
+                    CalendarChangeSnapshotModel.snapshot_kind == "before",
+                    CalendarChangeProposalModel.user_id == user_id,
+                    CalendarChangeProposalModel.target_event_id.is_not(None),
+                )
+            )
+        ).one_or_none()
+        if row is None or row.target_event_id is None:
+            return None
+        return CalendarRestoreSourceSnapshot(
+            source_snapshot_id=row.source_snapshot_id,
+            source_proposal_id=row.source_proposal_id,
+            connection_id=row.connection_id,
+            calendar_id=row.calendar_id,
+            provider_event_id=row.target_event_id,
+        )
+
     async def mark_stale(
         self,
         *,
@@ -619,7 +660,7 @@ class SqlAlchemyCalendarProposalRepository:
         self,
         proposal: CalendarChangeProposalModel,
     ) -> CalendarProposalSnapshot:
-        """读取父行指向的 desired snapshot 并返回无 ORM 稳定快照。"""
+        """读取当前 desired 与提案稳定 before 引用并返回无 ORM 快照。"""
         row = await self._session.scalar(
             select(CalendarChangeSnapshotModel).where(
                 CalendarChangeSnapshotModel.user_id == proposal.user_id,
@@ -630,6 +671,21 @@ class SqlAlchemyCalendarProposalRepository:
         )
         if row is None:
             raise _calendar_snapshot_unavailable()
+        before_snapshot_id = await self._session.scalar(
+            select(CalendarChangeSnapshotModel.id)
+            .where(
+                CalendarChangeSnapshotModel.user_id == proposal.user_id,
+                CalendarChangeSnapshotModel.proposal_id == proposal.id,
+                CalendarChangeSnapshotModel.snapshot_kind == "before",
+            )
+            # before 是提案生成时观察到的稳定事实；后续 desired 编辑不能把查询限制到
+            # current_version，否则版本二以后会错误丢失补偿来源。
+            .order_by(
+                CalendarChangeSnapshotModel.version,
+                CalendarChangeSnapshotModel.id,
+            )
+            .limit(1)
+        )
         return CalendarProposalSnapshot(
             proposal_id=proposal.id,
             connection_id=proposal.connection_id,
@@ -637,10 +693,12 @@ class SqlAlchemyCalendarProposalRepository:
             operation_kind=_operation_kind(proposal.operation_kind),
             target_event_id=proposal.target_event_id,
             base_etag=proposal.base_etag,
+            creation_payload_hash=proposal.creation_payload_hash,
             current_version=proposal.current_version,
             status=CalendarProposalStatus(proposal.status),
             retain_until=proposal.retain_until,
             desired_snapshot=self._decode_snapshot(row),
+            before_snapshot_id=before_snapshot_id,
         )
 
     def _decode_snapshot(self, row: CalendarChangeSnapshotModel) -> CalendarSnapshot:
@@ -673,7 +731,7 @@ class SqlAlchemyCalendarProposalRepository:
             proposal_id=row.proposal_id,
             version=row.version,
             snapshot_kind=snapshot_kind,
-            content=content,
+            content=cast(dict[str, JsonValue], content),
             canonical_hash=row.canonical_hash,
             retain_until=row.retain_until,
             created_at=row.created_at,

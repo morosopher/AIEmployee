@@ -64,8 +64,9 @@ class BriefItem(BaseModel):
     @field_validator("suggested_action_kind")
     @classmethod
     def safe_action(cls, value: str | None) -> str | None:
-        if value is not None and value != "mail.reply":
-            raise ValueError("brief suggested action must be a verifiable mail.reply")
+        """只允许由来源引用继续准备本地草稿或日历修改提案的动作。"""
+        if value is not None and value not in {"mail.reply", "calendar.update"}:
+            raise ValueError("brief suggested action is not supported")
         return value
 
 
@@ -101,6 +102,7 @@ class ConversationIntent(BaseModel):
             "generate_daily_brief",
             "show_latest_brief",
             "prepare_mail_draft",
+            "prepare_calendar_proposal",
             "explain_capabilities",
         }
         if value not in allowed:

@@ -38,6 +38,9 @@ from ai_employee.workers.observability import (
     initialize_process_observability,
     refresh_stuck_task_metrics,
 )
+from ai_employee.workers.prepare_calendar_restore import (
+    build_prepare_calendar_restore_task_step,
+)
 from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_deletion_worker
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_mail import build_mail_sync_task_step
@@ -301,6 +304,13 @@ def build_task_runner_for_session(
                 ),
             )
             if task.kind == "conversation.respond"
+            else (
+                build_prepare_calendar_restore_task_step(
+                    session_factory=session_factory,
+                    settings=settings,
+                ),
+            )
+            if task.kind == "calendar.restore.prepare"
             else (build_overdue_brief_diagnostic_task_step(session_factory=session_factory),)
             if task.kind == "brief.overdue_diagnostic"
             else (build_privacy_deletion_worker(),)

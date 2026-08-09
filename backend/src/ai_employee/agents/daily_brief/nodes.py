@@ -6,6 +6,9 @@ from hashlib import sha256
 from typing import Any
 
 from ai_employee.application.ports.task_steps import TaskStepEvent
+from ai_employee.application.use_cases.calendar_proposals import (
+    parse_calendar_proposal_conversation_request,
+)
 from ai_employee.application.use_cases.conversations import (
     parse_mail_draft_conversation_request,
 )
@@ -276,6 +279,12 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
             "confidence": 1.0,
             "reason_code": "deterministic_prepare_mail_draft",
         }
+    if parse_calendar_proposal_conversation_request(text):
+        return {
+            "intent": "prepare_calendar_proposal",
+            "confidence": 1.0,
+            "reason_code": "deterministic_prepare_calendar_proposal",
+        }
     if any(
         token in normalized
         for token in (
@@ -524,6 +533,9 @@ def compose_structured_brief(state: dict[str, Any]) -> dict[str, Any]:
                 body_markdown="两个忙碌日程发生重叠。",
                 priority=BriefPriority.HIGH,
                 source_refs=refs,
+                # 这里只暴露由 source_refs 绑定的本地提案入口；点击后仍需用户逐字段确认，
+                # 简报生成本身不得创建、冻结或执行任何日历写命令。
+                suggested_action_kind="calendar.update",
             ).model_dump()
         )
     state["deterministic_items"] = items
