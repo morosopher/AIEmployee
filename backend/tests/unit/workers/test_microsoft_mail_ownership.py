@@ -46,7 +46,9 @@ async def test_microsoft_mail_scheduler_uses_mailbox_owner_once(monkeypatch) -> 
         async def execute(self, **kwargs: object) -> None:
             created.append(kwargs)
 
-    monkeypatch.setattr(schedules, "SqlAlchemyEnabledSyncScopeReader", lambda _factory: _MixedReader())
+    monkeypatch.setattr(
+        schedules, "SqlAlchemyEnabledSyncScopeReader", lambda _factory: _MixedReader()
+    )
     monkeypatch.setattr(schedules, "CreateTaskUseCase", _Creator)
     monkeypatch.setattr(schedules, "_build_outbox_relay", lambda: object())
 
