@@ -900,12 +900,18 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    `description_aad_version`、`location_aad_version` 及两个字段各自“四列全空或全非空”的检查约束；
    数据变更仅将既有全非空 `ciphertext + nonce + key_version` 三元组标记为历史 `v1`，既有全空
    三元组继续保持 `aad_version=NULL`。若发现任一旧三元组部分为空，升级必须 fail closed，不能
-   猜测、补齐或删除该事件。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。
-   对每个包含至少一个 v1 字段的 `(connection_id, calendar_id)`，只失效对应的非 `directory`
-   Calendar 事件 scope 游标：将 `cursor` 与 `last_success_at` 置空，并把 `last_error_code` 设为不含
-   内容的 `calendar_event_resync_required`；`directory` 游标及其 freshness、revision 和错误状态
-   必须原样保留。0019 是 forward-only；downgrade 必须拒绝移除版本列、约束或恢复 legacy AAD
-   读取，不能通过破坏性回退重新引入跨日历替换风险。
+   猜测、补齐或删除该事件。迁移在任何 DDL/DML 前还必须推导每个受影响的精确
+   `(connection_id, calendar_id)` pair，并确认其非 `directory` Calendar 事件游标已存在；精确匹配
+   必须同时满足 `sync_cursors.connection_id = affected_connection_id`、
+   `sync_cursors.resource_kind = 'calendar'`、`sync_cursors.scope_key = affected_calendar_id` 和
+   `sync_cursors.scope_key <> 'directory'`。任一 pair 缺失该游标时，升级必须保持 revision
+   `20260809_0018` 和全部数据不变，也不得创建猜测 marker。迁移不得解密、重加密、删除、合并或
+   改写任何 CalendarEvent 内容。通过 preflight 后，只失效上述精确 pair 的游标：将 `cursor` 与
+   `last_success_at` 置空，并把 `last_error_code` 设为不含内容的
+   `calendar_event_resync_required`；其他 connection 即使复用相同 `calendar_id` 也不得变化，
+   `directory` 游标及其 freshness、revision 和错误状态必须原样保留。0019 是 forward-only；
+   downgrade 必须拒绝移除版本列、约束或恢复 legacy AAD 读取，不能通过破坏性回退重新引入
+   跨日历替换风险。
 4. 除本节明确批准且已先建立替代事实的约束 contract 外，迁移只增加新表、新列、新索引和新状态
    值；任何迁移都不得删除业务行，也不得依赖破坏性 downgrade。
 5. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
@@ -1038,9 +1044,12 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
   `user_id:connection_id:calendar_id:provider_event_id:field` 作为 AAD 解密。v1 只作为历史迁移标记，
   新写入和正常读取都禁止生成或解密 v1；读取 v1 或未知版本统一返回
   `calendar_event_resync_required`，等待该日历受限重同步。
-- v2 解密出现 `InvalidTag` 时必须以同一稳定错误 fail closed，不能尝试 v1 AAD、去掉
-  `calendar_id`、忽略认证或返回部分明文。密文、nonce、key version、AAD version 任一被篡改，
-  都不得触发 legacy fallback。
+- 单密钥 AEAD reader 必须在调用 AES-GCM 前精确比较持久 `key_version` 与当前密钥版本；不匹配时
+  抛出稳定类型化 key-version 错误，M2 不引入多 key keyring。CalendarEvent reader 遇到 cipher
+  不可用、该 key-version 错误、明确类型化的解密边界错误、无效 UTF-8 或 v2 `InvalidTag` 时，必须
+  以同一稳定业务错误 fail closed；只捕获这些明确类型，不捕获 `AttributeError` 或 broad
+  `Exception`。任何路径都不能尝试 v1 AAD、去掉 `calendar_id`、忽略认证或返回部分明文。密文、
+  nonce、key version、AAD version 任一被篡改，都不得触发 legacy fallback。
 - 地址、主题和参会人不得进入日志、指标 label、Trace attribute 或 URL query。
 - 正式与开发默认不允许真实写入；显式运行开关和连接能力缺一不可。
 
@@ -1157,8 +1166,11 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - `needs_attention` 核对和人工结论竞争。
 - 日程修改与恢复的 ETag 竞争。
 - `0019` 只增加 AAD 版本列与约束，正确标记 v1/NULL，保留全部事件与 `directory` 游标，并仅把
-  相关非 directory 事件 scope 的 cursor/freshness 置空且留下 content-free
-  `calendar_event_resync_required`。
+  相关精确 `(connection_id, calendar_id)` 非 directory 事件 scope 的 cursor/freshness 置空且留下
+  content-free `calendar_event_resync_required`。迁移测试必须包含两个 connection 复用同一
+  `calendar_id`、但只有一个 connection 存在 v1 字段的场景，证明另一 connection 的游标完全不变；
+  还必须证明缺失任一精确 scope 游标会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且数据
+  原样保留。
 - 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
   v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
   且任何路径都不得回退尝试 v1 AAD。
@@ -1280,17 +1292,21 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 
 部署顺序：
 
-1. 生成加密备份，保持外部写入默认关闭，并关闭 Calendar 周期调度。
-2. 排空并停止所有旧 Calendar Worker，确认没有旧 `sync_calendar` 任务或事件 upsert 事务仍在运行。
-3. 应用前向 `0019`，验证只新增版本列/约束、v1 标记和精确事件 scope 游标失效，且 directory
-   cursor/revision 未变化；此时仍不得恢复旧 Worker。
-4. 部署只写 v2、正常读取拒绝 v1 的 API/Worker/Scheduler 组件。0019 不支持旧新 Calendar writer
-   混跑，任何旧 Worker 都不得在迁移后回流。
-5. 先重启新 Calendar Worker，再恢复调度，对 `calendar_event_resync_required` scope 执行受限重同步；验证
-   新密文均为 v2、对应 cursor/freshness 恢复且错误清除后，才继续发布验证。
-6. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
-7. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查。
-8. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
+1. 保持外部写入默认关闭，关闭 Calendar 周期调度并停止新入口流量。
+2. 排空并停止所有 pre-0019 CalendarEvent reader/writer，包括 Caddy、API、Worker 与 Scheduler；确认
+   没有旧 `sync_calendar` 任务、事件 upsert 事务或旧 reader 仍在运行，PostgreSQL 与 Redis 保持运行。
+3. 生成加密备份并执行迁移前只读审计；审计必须证明数据库位于 0018、没有部分 AEAD 三元组，且
+   每个受影响 `(connection_id, calendar_id)` 都有精确的非 directory 游标。
+4. 应用前向 `0019` 并执行迁移后只读审计，验证只新增版本列/约束、v1 标记和精确 pair 的事件 scope
+   游标失效，其他 connection 的同名 calendar、directory cursor/revision 与全部事件 AEAD 字节均未变化。
+5. 部署只写 v2、正常读取拒绝 v1 的不可变 API/Worker/Scheduler/Caddy 镜像。0019 不支持旧新
+   Calendar reader/writer 混跑，任何旧组件都不得在迁移后回流。
+6. 通过 Task 27 提供的 v2-only 有界入口，只对 `calendar_event_resync_required` 的精确 pair 执行重同步；
+   再执行重同步后只读审计，验证新密文均为 v2、对应 cursor/freshness 恢复且错误清除后，才继续
+   发布验证。该入口在 Task 27 落地前不得以临时全量同步命令替代。
+7. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
+8. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查。
+9. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
 
 回滚应用镜像时，新表和列保留。一旦应用 `0019`，应用回滚下限就是理解 AAD 版本列、拒绝 v1
 读取并且只写 v2 的 0019-compatible 镜像；无论 M2 任务是否均为终态，都不得回滚到
