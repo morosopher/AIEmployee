@@ -27,11 +27,13 @@
 0019 变更窗口还必须绑定一个由 preflight 生成的 content-free rollout state artifact。对每个受影响 connection 只执行一次主动 OAuth refresh（按 connection UUID 去重并串行），并以刷新后持久化的 `token_expires_at` 计算固定截止时间：
 `rollout_deadline = min(token_expires_at) - 900 seconds`。900 秒是与现有 `task_timeout_seconds=900` 对齐的固定安全余量，不是可由运维输入的“足够新鲜”估计；所有时间使用 UTC。若不存在受影响 pair，artifact 必须记录可核验的零值并将 deadline 标为不适用；后续 guard 只能在重新证明 affected set 仍为空后走该显式 no-deadline 分支，不能把 `null` 当作可比较时间或跳过集合核验。
 
+preflight 还必须持有 revision-global PostgreSQL session lease。固定锁调用是 `pg_try_advisory_lock(20260809, 19)`，不包含 backup basename，因此相同或不同 basename 的并发窗口都互斥。CLI 使用独立数据库连接，在检查 rollout artifact 是否已存在、调用 OAuth/Calendar provider 或写 credential 前先 try-lock；失败以 `calendar_aad_rollout_locked` 返回，必须保持零 refresh、零持久写入。该连接贯穿完整 preflight 网络阶段且不承载跨网络业务事务；每次 provider call、credential commit 和 artifact 原子发布前都确认同一 session 仍持锁，连接断开或锁丢失立即 fail closed。进程退出或连接关闭后由 PostgreSQL 自动释放锁。
+
 发布期间保持真实写入开关关闭，并严格按以下顺序执行：
 
 1. 保持全局与供应商真实写开关关闭，关闭 Calendar 周期调度，并进入停止新入口流量的维护窗口。
 2. 优雅排空并停止全部 pre-0019 CalendarEvent reader/writer：Caddy、API、Worker、Scheduler；确认没有旧 `sync_calendar`、事件读取或 upsert 仍在运行。PostgreSQL 与 Redis 全程保持运行。
-3. 运行无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 从历史完整 AEAD 三元组推导精确 affected pairs，按 connection UUID 去重并串行解密每个 connection 的 refresh credential，主动调用现有 Google/Microsoft OAuth refresh；access-only、缺失/不可解密 refresh、refresh 被拒绝或返回 malformed access/expiry/scope 都必须在任何 `initial_pages` 前 fail closed。返回的 access token 必须非空且可用，`granted_scopes` 必须覆盖该 connection 保存的 canonical scopes 并包含 `calendar.read` 所需 provider scope；随后在短事务内安全轮换 access-token AEAD 和 `token_expires_at`，响应没有新 refresh token 时保留旧 refresh 密文。每个 rotation 提交前先证明该 token 的 expiry 晚于当前 UTC 加 900 秒；全部 connection refresh 成功后以持久化 expiry 的最小值计算 deadline，再按确定性 pair 顺序调用与迁移后恢复相同的 `initial_pages(scope_key)`，要求最终 cursor。不等待资源 401，主动刷新后的资源 401、403、权限不足、malformed page 或无最终 cursor 都直接失败。它不得调用 `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得写 CalendarEvent、cursor 或 marker；仅允许上述 credential rotation。preflight 启动时检查 revision、停止服务状态和 artifact 不存在/不冲突；非空 set 在每个 pair probe 前及 rollout artifact 原子提交前检查 `now < rollout_deadline`，zero branch 则在 artifact 提交前重新证明 affected set 仍为空。任何失败都返回非零并停止变更窗口。
+3. 运行无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 先取得上述 revision-global lease，再检查 revision、artifact 不存在/不冲突并从历史完整 AEAD 三元组推导精确 affected pairs。它按 connection UUID 去重并串行解密每个 connection 的 refresh credential，主动调用现有 Google/Microsoft OAuth refresh；access-only、缺失/不可解密 refresh、refresh 被拒绝或返回 malformed access/expiry/scope 都必须在任何 `initial_pages` 前 fail closed。provider 调用前冻结 access/refresh 两行的 `id`、用户/连接/kind、完整 AEAD、`token_expires_at` 和 `updated_at`；返回的 access token 必须非空且可用，`granted_scopes` 必须覆盖该 connection 保存的 canonical scopes 并包含 `calendar.read` 所需 provider scope。验证后只能在短事务中通过 0019 preflight 专用 repository CAS 精确匹配两行旧 snapshot，并重检 owning connection 与 `calendar.read` 能力，再轮换 access-token AEAD 和 `token_expires_at`；响应没有新 refresh token 时仍校验旧 refresh snapshot 并原样保留密文。现有无条件 credential upsert 禁止用于该路径。任一 CAS miss 回滚整次 rotation，不覆盖并发新 token、不执行后续 probe、不发布 artifact，revision 保持 0018。每个 rotation 提交前先证明该 token 的 expiry 晚于当前 UTC 加 900 秒；全部 connection refresh 成功后以持久化 expiry 的最小值计算 deadline，再按确定性 pair 顺序调用与迁移后恢复相同的 `initial_pages(scope_key)`，要求最终 cursor。不等待资源 401，主动刷新后的资源 401、403、权限不足、malformed page 或无最终 cursor 都直接失败。它不得调用 `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得写 CalendarEvent、cursor 或 marker；仅允许上述 credential CAS rotation。非空 set 在每个 pair probe 前及 rollout artifact 原子提交前检查 `now < rollout_deadline`，zero branch 则在 artifact 提交前重新证明 affected set 仍为空。任何失败都返回非零并停止变更窗口。
 4. 只有 preflight 全部通过且统一 rollout guard 通过后，才创建带固定 basename 的加密备份并运行 `pre-migration` 只读审计：非空 affected set 要求当前 UTC 早于 deadline；零 affected pair 则要求 artifact 为规范 zero/no-deadline 形状并重新证明数据库 affected set 仍为空。backup、audit 和其 artifact 原子发布前都必须重复同一 guard；审计必须确认 revision 仍为 0018、没有部分 AEAD 三元组，并重复证明每个 affected pair 的本地可恢复性事实和与 preflight 完全一致的 locally hashed pair set。
 5. 运行受统一 rollout guard 保护的独立 migration one-off 应用 0019。迁移自身必须在任何 DDL/DML 前、事务最终提交前重复本地 preflight/refresh-state、镜像绑定与非空 deadline/零集合分支检查；任一精确 pair 缺游标、连接非 connected、`calendar.read` 非 enabled、缺失 access 或 refresh credential、refresh scope 不足或缺失精确 `ProviderCalendar` 时都 fail closed，Alembic revision 保持 0018，全部数据不变，且不得创建猜测 marker。
 6. 运行 `post-migration` 只读审计，确认 Schema 只新增版本列与原子约束；历史完整三元组标记为 v1、全空组保持 NULL；事件身份/非 AAD 业务字段及 ciphertext/nonce/key-version 摘要不变；`directory` 完全不变；只有精确 affected pair 的 cursor/freshness/error marker 改变。两个 connection 即使复用同一 `calendar_id`，也禁止只按 `calendar_id` 扩大更新。随后使 v2-only 不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、普通 Worker 与 Scheduler 停止，禁止任何旧 reader/writer 回流。
@@ -40,7 +42,7 @@
 9. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy。
 10. 运行 `just health`；上述条件全部满足后才退出维护窗口并继续发布。
 
-以下命令从 `/srv/ai-employee` 运行，不包含账号、DSN、正文、原始 `calendar_id` 或凭据。migration one-off 继续从 Compose Secret 读取数据库凭据。`BACKUP_ARTIFACT_BASENAME`、content-free preflight state、`just calendar-aad-preflight-0019`、`just calendar-aad-migrate-0019`、`just calendar-aad-audit phase artifact`、`just calendar-aad-resync-0019`、`just calendar-aad-verify-restored-0018` 及其合成数据库测试属于 Task 27 要落地的运维契约；当前 recipe/CLI 尚未实现，未完成 Task 27 前不得执行生产 0019，也不得用临时命令替代。示例镜像标签必须替换为预先构建并固定的实际不可变标签，不得使用 `latest`。
+以下命令从 `/srv/ai-employee` 运行，不包含账号、DSN、正文、原始 `calendar_id` 或凭据。migration one-off 继续从 Compose Secret 读取数据库凭据。`BACKUP_ARTIFACT_BASENAME`、content-free preflight state、revision-global lease、credential snapshot CAS、`just calendar-aad-preflight-0019`、`just calendar-aad-migrate-0019`、`just calendar-aad-audit phase artifact`、`just calendar-aad-resync-0019`、专用 owner-role restore service、`just calendar-aad-verify-restored-0018` 及其合成数据库测试属于 Task 27 要落地的运维契约；当前 0019 recipe/CLI 和 owner restore 边界尚未实现。现有 `just restore` 复用 app-role `backup` 服务，不能执行受控整库 DDL restore，也不得被当作 sealed-window 恢复证据。未完成 Task 27 前不得执行生产 0019 或整库恢复，也不得用临时命令、额外 DDL 授权或直接 SQL 替代。示例镜像标签必须替换为预先构建并固定的实际不可变标签，不得使用 `latest`。
 
 ```bash
 cd /srv/ai-employee
@@ -75,9 +77,9 @@ docker compose up -d api worker scheduler caddy
 just health
 ```
 
-`calendar-aad-preflight-0019`、`calendar-aad-migrate-0019` 与 `calendar-aad-resync-0019` 都不接受 user、connection 或 calendar 参数，避免运维输入把范围改写为任意对象；三者都要求预先设置安全 basename `BACKUP_ARTIFACT_BASENAME`，并使用 `${BACKUP_DIR}/${BACKUP_ARTIFACT_BASENAME}.calendar-aad-preflight.json` 作为同一 rollout state。recipe 在启动 one-off 容器前检查 Compose 状态；只要 `caddy`、`api`、`worker` 或 `scheduler` 任一仍在运行就 fail closed。recipe 还必须从 Compose 选中的 backend image 引用解析本机实际镜像内容 ID，并以内部环境变量传给固定程序；该值不得由运维人员另行输入。preflight artifact 绑定该内容 ID，后续 backup、audit、migration、resync 与 restored-0018 verifier 都必须重新解析并拒绝镜像不匹配，避免可变 tag 或切错镜像绕过同一窗口。preflight 还要求数据库精确位于 0018，复用选定不可变镜像、`worker` 服务的 Secret/数据库配置和现有 Calendar credential/adapter resolver，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019`。它只输出 affected/connection count、locally hashed pair/connection digest、earliest UTC deadline 和稳定结果码；不得输出 token、scope 原文、正文、描述/地点或 raw `calendar_id`。
+`calendar-aad-preflight-0019`、`calendar-aad-migrate-0019` 与 `calendar-aad-resync-0019` 都不接受 user、connection 或 calendar 参数，避免运维输入把范围改写为任意对象；三者都要求预先设置安全 basename `BACKUP_ARTIFACT_BASENAME`，并使用 `${BACKUP_DIR}/${BACKUP_ARTIFACT_BASENAME}.calendar-aad-preflight.json` 作为同一 rollout state。recipe 在启动 one-off 容器前检查 Compose 状态；只要 `caddy`、`api`、`worker` 或 `scheduler` 任一仍在运行就 fail closed。recipe 还必须从 Compose 选中的 backend image 引用解析本机实际镜像内容 ID，并以内部环境变量传给固定程序；该值不得由运维人员另行输入。preflight artifact 绑定该内容 ID，后续 backup、audit、migration、resync 与 restored-0018 verifier 都必须重新解析并拒绝镜像不匹配，避免可变 tag 或切错镜像绕过同一窗口。宿主 recipe 只能验证 basename/path 形状和挂载边界，不能在 lease 之外检查 preflight artifact 是否存在；碰撞/存在性检查必须由 CLI 在成功取得 revision-global advisory lock 后完成。preflight 还要求数据库精确位于 0018，复用选定不可变镜像、`worker` 服务的 Secret/数据库配置和现有 Calendar credential/adapter resolver，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019`。它只输出 affected/connection count、locally hashed pair/connection digest、earliest UTC deadline 和稳定结果码；不得输出 token、scope 原文、正文、描述/地点或 raw `calendar_id`。
 
-preflight 的供应商表面严格只读；它先按 connection 去重并主动调用现有 OAuth refresh，验证返回 token、expiry 和实际 scope，再安全轮换 access-token AEAD。它不等待资源 401，也不在 probe 阶段再刷新；主动刷新后的资源 401、403 或 scope 缺失均是失败。除 credential rotation 外，不得写连接、能力或其他业务事实，也不得写 CalendarEvent、SyncCursor 或 marker。每个新 access token 的持久 `token_expires_at` 参与固定 `rollout_deadline = min(token_expires_at) - 900 seconds`；preflight state artifact 只保存 schema/revision、安全 basename、宿主机解析的 immutable image content ID、earliest expiry/deadline、固定 margin、affected/connection 计数、lowercase pair digest、hashed connection IDs 和稳定结果码，不保存 token、scope 原文、正文或 raw `calendar_id`。preflight、backup、migration、resync、audit 每个 CLI/recipe 都必须在启动和关键本地提交前读取并校验该 artifact。非空 affected set 的任何 `now >= rollout_deadline` 都 fail closed；zero/no-deadline state 只有在规范零值、镜像/basename 绑定有效且重新查询仍无 affected pair 时才通过，否则同样 fail closed。
+preflight 的供应商表面严格只读；它先按 connection 去重并主动调用现有 OAuth refresh，验证返回 token、expiry 和实际 scope，再通过完整旧 snapshot CAS 轮换 access-token AEAD。snapshot 对 access/refresh 每行都绑定 `id`、用户/连接/kind、ciphertext、nonce、key version、`token_expires_at` 与 `updated_at`；短事务还要重检 connection/capability。响应省略新 refresh token 时只保留精确匹配的旧 refresh 行；任一 CAS miss 都不会覆盖新 token 或发布 artifact。它不等待资源 401，也不在 probe 阶段再刷新；主动刷新后的资源 401、403 或 scope 缺失均是失败。除 credential CAS rotation 外，不得写连接、能力或其他业务事实，也不得写 CalendarEvent、SyncCursor 或 marker。revision-global lease 必须在每个 provider call、credential CAS 和 artifact publish 前仍可由同一 session 证明持有。每个新 access token 的持久 `token_expires_at` 参与固定 `rollout_deadline = min(token_expires_at) - 900 seconds`；preflight state artifact 只保存 schema/revision、安全 basename、宿主机解析的 immutable image content ID、earliest expiry/deadline、固定 margin、affected/connection 计数、lowercase pair digest、hashed connection IDs 和稳定结果码，不保存 token、scope 原文、正文或 raw `calendar_id`。preflight、backup、migration、resync、audit 每个 CLI/recipe 都必须在启动和关键本地提交前读取并校验该 artifact。非空 affected set 的任何 `now >= rollout_deadline` 都 fail closed；zero/no-deadline state 只有在规范零值、镜像/basename 绑定有效且重新查询仍无 affected pair 时才通过，否则同样 fail closed。
 
 任一 pair 或 connection 失败时不得继续备份、审计或 migration；数据库仍为 0018，运维人员应在写开关继续关闭的前提下恢复原 0018-compatible 服务，要求用户重新授权或先恢复精确目录事实后重新开启完整变更窗口。若数据只能按既有明确用户授权的处置流程删除，应走该流程并重新评估 affected set；禁止 waiver、直接 SQL、伪造 credential、access-only 迁移或先迁移再清 marker。
 
@@ -97,11 +99,15 @@ planner 将 `created`、`queued`、`running`、`retry_scheduled` 视为活动尝
 
 ### 0019 deadline 失败后的 sealed-window 整库恢复
 
-若 0019 已提交，且非空 rollout deadline 已到仍有 marker、任一 deadline guard 已失败，或运维人员已经不能证明 `post-resync` artifact 会在精确 deadline 前提交，则立即停止新的恢复 ordinal 和 provider probe。Caddy、API、普通 Worker、Scheduler 以及所有真实写入开关继续保持停止；只允许 PostgreSQL、Redis 和固定的 backup/audit one-off 运行。不得执行 `alembic downgrade`、直接 SQL、手工清 marker、跳过审计、临时 full-account sync，亦不得启动仅用于继续 refresh/probe 的 OAuth-only API 或 Worker。
+若 0019 已提交，且非空 rollout deadline 已到仍有 marker、任一 deadline guard 已失败，或运维人员已经不能证明 `post-resync` artifact 会在精确 deadline 前提交，则立即停止新的恢复 ordinal 和 provider probe。Caddy、API、普通 Worker、Scheduler 以及所有真实写入开关继续保持停止；恢复动作只要求 healthy PostgreSQL，Redis 即使继续运行也不是 restore service 的依赖。不得执行 `alembic downgrade`、直接 SQL、手工清 marker、跳过审计、临时 full-account sync，亦不得启动仅用于继续 refresh/probe 的 OAuth-only API 或 Worker。
 
 本路径只允许使用当前窗口在主动 refresh 之后、0019 之前创建并记录 basename/checksum 的加密整库备份。维护窗口从停止新入口开始，到 `post-resync`、通用服务启动和健康检查全部通过才结束；期间没有业务写入，且 preflight credential rotation 已包含在该备份中。因此整库恢复只撤销失败的 0019 migration/resync 本地事实，不会丢失窗口后的用户业务写入，也不会退回到 refresh 前已失效的 credential。
 
-以下命令沿用上文已导出的 `PRE_0019_APP_IMAGE_TAG`、`APP_IMAGE_TAG`、`BACKUP_DIR` 与 `BACKUP_ARTIFACT_BASENAME`。`just restore` 已有 `[confirm]` 保护，并再次要求输入完整、精确相同的 restore path；生产环境还必须显式设置 `ALLOW_PRODUCTION_RESTORE=yes`。恢复脚本会验证相邻 `.sha256`、解密到临时目录并运行 `pg_restore --clean --if-exists`：
+Task 27 必须把 `just restore` 升级为 operations profile 的专用 `restore` one-off；在此之前，当前复用 app-role `backup` service 的 recipe 明确禁止用于本路径。新 `restore` service 不得继承会等待/自动执行 migration 的 `backend-common`，`depends_on` 只能包含 healthy PostgreSQL；固定 `PGUSER=ai_employee_owner`，owner 密码只能读取 `/run/secrets/postgres_bootstrap_password`。容器还只读挂载 backup passphrase Secret、受控 backup volume，以及恢复成功后重授最小权限所需的 app/retention password Secrets。普通 API、Worker、Scheduler 与 backup service 均不得获得 owner/DDL 权限。
+
+`scripts/restore-postgres.sh` 先验证相邻 SHA-256，再在临时目录解密，并固定执行 `pg_restore --clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`。任一 restore 错误使整个事务回滚且不得留下部分 Schema/数据；只有 `pg_restore` 成功后，one-off 才以 owner session 运行现有 `scripts/init-db-roles.sh` 重建/重授 `ai_employee_app` 与 `ai_employee_retention` 最小权限。grant 失败仍视为恢复失败并保持通用服务停止。最后必须由使用 `app_database_password` 的 `calendar-aad-verify-restored-0018` 做只读 revision/artifact digest 核验；它不能复用 owner 连接或执行 DDL。
+
+以下命令沿用上文已导出的 `PRE_0019_APP_IMAGE_TAG`、`APP_IMAGE_TAG`、`BACKUP_DIR` 与 `BACKUP_ARTIFACT_BASENAME`。Task 27 落地后的 `just restore` 保留 `[confirm]` 保护，并再次要求输入完整、精确相同的 restore path；生产环境还必须显式设置 `ALLOW_PRODUCTION_RESTORE=yes`：
 
 ```bash
 cd /srv/ai-employee
@@ -113,7 +119,8 @@ BACKUP_DIR="${BACKUP_DIR}" \
 just restore "${RESTORE_TARGET}"
 
 # 在 recipe 的精确路径确认提示中再次输入 ${RESTORE_TARGET}；任一字符不符都会拒绝。
-# 继续保持通用服务停止；专用 verifier 不受已过期 rollout deadline 放行，只允许只读核验 0018。
+# restore service 只依赖 postgres，使用 owner Secret 原子恢复并在成功后重授 app/retention 权限。
+# 继续保持通用服务停止；专用 verifier 以 app role 只读核验，不受已过期 rollout deadline 放行。
 just calendar-aad-verify-restored-0018
 docker compose ps
 
@@ -123,7 +130,7 @@ docker compose up -d api worker scheduler caddy
 just health
 ```
 
-`calendar-aad-verify-restored-0018` 只在四个通用服务都停止时运行，要求数据库 revision 精确为 0018，验证本窗口 backup/checksum 与 preflight/pre-migration artifact 的 basename 绑定，并以同一确定性只读查询比较恢复后的 affected pair/connection count、locally hashed pair set、事件/游标/密文摘要和本地可恢复性事实；它不得因 deadline 已过而跳过任何数据比较，也不得写数据库。任一差异都必须保持服务停止并人工调查。只有原 0018-compatible immutable image 启动且 `just health` 通过后，才可退出本次失败的维护窗口；新的 0019 尝试必须从新的完整 preflight/refresh/deadline/backup 窗口重新开始。
+`calendar-aad-verify-restored-0018` 只在四个通用服务都停止时运行，固定通过 `ai_employee_app` 的 Secret 连接，要求数据库 revision 精确为 0018，验证本窗口 backup/checksum 与 preflight/pre-migration artifact 的 basename 绑定，并以同一确定性只读查询比较恢复后的 affected pair/connection count、locally hashed pair set、事件/游标/密文摘要和本地可恢复性事实；它不得因 deadline 已过而跳过任何数据比较，也不得写数据库、切换到 owner 或触发 migration。任一差异都必须保持服务停止并人工调查。只有原 0018-compatible immutable image 启动且 `just health` 通过后，才可退出本次失败的维护窗口；新的 0019 尝试必须从新的完整 preflight/refresh/deadline/backup 窗口重新开始。
 
 ## 备份与恢复演练
 
@@ -138,16 +145,15 @@ BACKUP_RCLONE_REMOTE='encrypted-remote:ai-employee' just backup
 
 脚本生成 PostgreSQL custom dump、AES-256-CBC PBKDF2 加密文件及 SHA-256 校验和，保留七份日备和四份周备，并复制 artifact 与校验和到异地 remote。生产缺失 remote 会拒绝执行。
 
-每月在隔离、非生产数据库执行一次恢复演练。先校验 artifact 的来源和 checksum，再显式授权：
+每月在隔离、非生产数据库执行一次恢复演练。先校验 artifact 的来源和 checksum，再通过 Task 27 的专用 owner-role Compose 边界显式授权；不要直接为 app role 增加 DDL，也不要在宿主机拼接 owner DSN：
 
 ```bash
 cd /srv/ai-employee
-APP_ENV=production ALLOW_PRODUCTION_RESTORE=yes \
-BACKUP_PASSPHRASE_FILE=/run/secrets/backup_passphrase \
-scripts/restore-postgres.sh /var/backups/ai-employee/ai_employee-YYYYMMDDTHHMMSSZ.dump.enc
+APP_ENV=test BACKUP_DIR=/var/backups/ai-employee \
+just restore /var/backups/ai-employee/ai_employee-YYYYMMDDTHHMMSSZ.dump.enc
 ```
 
-恢复会使用临时目录解密、执行 `pg_restore --clean --if-exists`，并通过 trap 清除明文。演练记录恢复时间点、校验结果、抽样任务和简报完整性验证，以及任何差异的处置结果。
+恢复会使用临时目录解密、以 owner 执行单事务且遇错退出的固定 `pg_restore` 参数，并通过 trap 清除明文；成功后重授 app/retention 权限，再用 app role 完成只读 revision/摘要验证。演练必须同时记录：app-role restore 被拒绝、owner restore 原子成功、注入中途错误无部分状态、grant 恢复、verifier 只读，以及抽样任务和简报完整性；任何差异都保持服务停止并记录处置结果。
 
 ## 主机与网络
 
