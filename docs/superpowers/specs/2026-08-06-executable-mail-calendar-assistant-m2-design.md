@@ -1088,9 +1088,10 @@ CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时
 过滤候选，只解析 content-free metadata，并为 `calendar.aad_0019.refresh_started` 使用 fence-aware
 清理：没有匹配 `refresh_confirmed` 或可证明安全关闭的 known-terminal 结果时，started 必须跨 cutoff
 保留。旧 fence 只允许通过以下事实解除：matching confirmed/安全 terminal；matching
-`oauth.refresh_credential_replaced` 证明事件，其 old generation/old refresh digest 精确匹配 started，且
-当前 generation/refresh digest 精确匹配 proof 的 new 值；或连接已进入可独立证明的永久断开/数据处置
-终态。access/full physical digest、`updated_at`、ciphertext、nonce、key version 或 generation 的变化都
+`oauth.refresh_credential_replaced` 证明事件，其原 attempt/`fence_generation=F` 精确匹配 started，满足
+`F <= S`、`T=S+1`、`post_generation=T`，且当前 generation/refresh digest 精确匹配 proof 的 post/new
+值；或连接已进入可独立证明的永久断开/数据处置终态。access/full physical digest、`updated_at`、
+ciphertext、nonce、key version 或 generation 的变化都
 不能单独证明 refresh plaintext 已替换；普通 refresh、access-token rotation、generation-only、相同明文
 重加密和 callback 未返回新 refresh token 均不得解除保护。known-terminal 若没有独立持久的不可调用
 状态作为重放防线，也必须继续按未决 fence 处理。
@@ -1139,33 +1140,51 @@ credential row；`authorization_generation` 不进入该摘要，而是 fence/pr
 `refresh_started` metadata 是关闭的 content-free schema，精确包含
 `fence_schema_version="calendar_aad_0019_refresh_fence.v1"`、
 `refresh_attempt_id=<canonical lowercase UUID>`、`rollout_digest_v1`、
-`connection_digest=<hashed connection>`、`authorization_generation`、
+`connection_digest=<hashed connection>`、`fence_generation=F`、
 `pre_credential_snapshot_digest_v1`、`pre_refresh_credential_snapshot_digest_v1` 与 `result_code`。
-matching `refresh_confirmed` 或
-`calendar.aad_0019.refresh_terminal` 必须绑定
-同一 attempt UUID、`rollout_digest_v1`、generation 和两个 pre-digest；confirmed 还可增加
-`post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1` 与规范 UTC
-`token_expires_at`。attempt UUID 不得按 basename、connection 或时间
-重新推导；每次获准的新尝试生成一次并由全部结果事件复用。任何 token、raw scope、provider response、
-正文、raw `calendar_id` 或 credential 时间戳都不得进入 fence metadata，confirmed 中明确允许的 expiry
-除外。
+matching `refresh_confirmed` 或 `calendar.aad_0019.refresh_terminal` 必须绑定同一 attempt UUID、
+`rollout_digest_v1`、`fence_generation=F` 和两个 pre-digest；confirmed 还必须包含
+`post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、从同一事务实际
+持久化 credential 读取的规范 UTC `token_expires_at`，以及确定性
+`rollout_deadline_candidate = token_expires_at - 900 seconds`。这些 confirmed 字段全部必填，不得按实现
+方便省略。attempt UUID 不得按 basename、connection 或时间重新推导；每次获准的新尝试生成一次并由
+全部结果事件复用。任何 token、raw scope、provider response、正文、raw `calendar_id` 或 credential
+时间戳都不得进入 fence metadata，confirmed 中上述明确允许的 persisted expiry/deadline 除外。
 
-唯一自动解锁证明是 append-only content-free `oauth.refresh_credential_replaced`。渐进授权/OAuth callback
-必须在短受控内存中解密旧 refresh token；只有供应商明确返回 non-empty 新 refresh token，且对规范 bytes
-执行 `secrets.compare_digest(old, new)` 为 false，才可在一个短事务内重检 old generation/old refresh
-digest，写入新 credential，递增 generation，并追加证明事件。事件 metadata 精确绑定
-`proof_schema_version="oauth_refresh_credential_replaced.v1"`、`connection_digest`、
-`old_refresh_credential_snapshot_digest_v1`、`new_refresh_credential_snapshot_digest_v1`、
-`old_authorization_generation`、`new_authorization_generation` 与 `result_code`；用户由 AuditEvent 的
-非空 `user_id` 绑定。事件不得保存 token、plaintext hash、raw scope 或 provider response。
+唯一自动解锁证明是 append-only content-free `oauth.refresh_credential_replaced`，并遵守以下三阶段代际
+状态机：
 
-callback 未返回 refresh token 而保留旧行、只更新 access token、generation-only、同 plaintext 重加密、
-普通 token refresh 或任意 physical digest 变化都不得生成 replacement proof。provider 已返回新 token
-但进程在本地原子事务提交前崩溃时，数据库中不得出现新 credential、generation 或证明事件的任一部分，
-旧未知 fence 继续阻断；不能根据网络响应推测解锁。未知 fence 只有在 matching confirmed/安全 terminal、
-old refresh digest/generation 精确匹配 started 且当前状态精确匹配 new refresh digest/generation 的
-replacement proof，或永久断开/数据处置终态时才解除。缺少明确 proof 时用户必须断开并重新连接取得
-真正新 token，或走既有永久数据处置流程。
+1. `refresh_started` 提交时把当前连接代际冻结为 `fence_generation=F`，同时冻结 full 与 refresh pre-digest。
+2. 用于恢复该未知 fence 的渐进重授权/重新同意只能针对仍为 `connected` 的原 connection。发起事务在
+   连接锁下读取当前 `start_generation=S`、当前 refresh snapshot 和恰好一个 matching unresolved fence；
+   必须满足 `S >= F` 且当前 refresh digest 仍精确等于该 fence 的
+   `pre_refresh_credential_snapshot_digest_v1`。随后复用既有 `set_capabilities_authorizing` 把 generation
+   递增一次到 `target_generation=T=S+1`；`OAuthAttempt` 继续只持久化现有
+   `target_authorization_generation=T`，不新增或伪造 start generation 字段。`F` 到 `S` 间的其他代际变化
+   不能单独解除 fence。
+3. token exchange 保持在数据库事务外。callback 保存阶段必须在连接锁下按既有 anti-replay 规则证明
+   `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`，由 `T-1`
+   确定 `S`，加载旧 refresh credential 与该唯一 unresolved fence，并再次证明 `F <= S` 和 old refresh
+   digest 精确匹配 fence/current CAS。陈旧或并发 callback 因 target generation 不匹配而 fail closed。
+
+只有供应商明确返回 non-empty 新 refresh token，且在短受控内存中对规范 bytes 执行
+`secrets.compare_digest(old, new)` 为 false，callback 才能在同一短事务以精确 CAS 保存新 access/refresh
+credential、连接实际 scopes、能力状态和 replacement proof；保存后 generation 保持
+`post_generation=T`，绝不能再次递增。证明事件 metadata 精确绑定
+`proof_schema_version="oauth_refresh_credential_replaced.v1"`、`connection_digest`、原 fence 的
+`refresh_attempt_id`、`fence_generation=F`、`start_generation=S`、`target_generation=T`、
+`post_generation=T`、`old_refresh_credential_snapshot_digest_v1`、
+`new_refresh_credential_snapshot_digest_v1` 与 `result_code`；用户由 AuditEvent 的非空 `user_id` 绑定。
+proof 校验必须同时证明 `F <= S`、`T=S+1`、post generation/current refresh digest 与提交结果精确匹配，
+不得保存 token、plaintext hash、raw scope 或 provider response。credential、scopes、capabilities、proof
+任一写入或 commit 失败都必须整体回滚；provider 网络响应本身从不是解锁证据。
+
+callback 未返回 refresh token、返回空值或相同 plaintext、只更新 access token、同 plaintext 重加密、
+普通 token refresh、connection 已 `disconnected`，或旧 plaintext 不可得时均不得生成 replacement proof。
+disconnect 会先删除旧 credential，因此之后无法完成 old/new plaintext 比较；重连、新建 connection 或
+映射新 token 不能补造 proof。此时该 0019 scope 继续阻断，只能走既有明确用户授权的数据处置/删除历史
+敏感字段流程，或经过审查的人工 forward-fix；禁止 fabricated proof、新连接映射、marker skip 或根据
+physical digest/generation 变化推测解锁。
 
 以下三个合成向量是协议常量。测试必须把 expected canonical bytes/base64 和 digest 写成固定常量，
 不得调用生产 helper 生成 expected 值。
@@ -1323,20 +1342,20 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   通过同一 session 核验连接与锁仍存在，连接断开或锁丢失立即 fail closed。进程退出或连接关闭依赖
   PostgreSQL 自动释放 session lock，不能用进程内 mutex 代替跨进程互斥。
 - 每个 affected connection 在任何事件 scope probe 前必须冻结 access/refresh 两行 credential snapshot
-  和当前 `authorization_generation`；每行 snapshot 包含 `id`、`user_id`、`connection_id`、
+  和当前 `fence_generation=F`；每行 snapshot 包含 `id`、`user_id`、`connection_id`、
   `credential_kind`、完整 AEAD 三列、`token_expires_at` 与 `updated_at`。本地 credential 存在性、归属和
   AEAD 可解密性校验成功后，但在调用 provider 前，preflight 必须用短事务向既有 append-only
   `audit_events` 提交 content-free
   `calendar.aad_0019.refresh_started`，不得为此新增 0018 Schema。该事件使用 `task_id=NULL`、
   `actor_type=system`，metadata 使用 `calendar_aad_0019_refresh_fence.v1`，只绑定 canonical lowercase
-  `refresh_attempt_id`、`rollout_digest_v1`、`connection_digest`、`authorization_generation`、
+  `refresh_attempt_id`、`rollout_digest_v1`、`connection_digest`、`fence_generation=F`、
   `pre_credential_snapshot_digest_v1`、`pre_refresh_credential_snapshot_digest_v1` 和稳定结果码，不含
-  token、raw scope、provider response、正文或 raw `calendar_id`。同一 authorization generation 存在
-  started-without-confirmed 或 needs-attention 结果时，相同或不同 basename 的后续 invocation 都必须在
-  provider 前失败。只有 matching `oauth.refresh_credential_replaced` 的 old generation/refresh digest
-  精确匹配 started，且当前状态精确匹配 proof new generation/refresh digest，才允许新尝试；任何未带
-  replacement proof 的 physical snapshot/generation 变化、普通 access-token rotation 和人工处置都不得
-  成为 replay waiver。
+  token、raw scope、provider response、正文或 raw `calendar_id`。存在 started-without-confirmed 或
+  needs-attention 结果时，相同或不同 basename 的后续 invocation 都必须在 provider 前失败。只有 matching
+  `oauth.refresh_credential_replaced` 的原 attempt/F 精确匹配 started、满足 `F <= S`、`T=S+1`、
+  `post_generation=T`，且当前 generation/refresh digest 精确匹配 proof post/new 值，才允许新尝试；任何
+  未带该精确 replacement proof 的 physical snapshot/generation 变化、普通 access-token rotation 和人工
+  处置都不得成为 replay waiver。
 - 只有没有未决 fence 且本地 credential 校验成功的 connection 才能使用已解密的 refresh credential，
   在 committed started 后确定性串行调用现有 Google/Microsoft OAuth adapter 的 refresh；同一
   connection 多个 pair 只调用一次且不并行。返回值
@@ -1345,22 +1364,28 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   connection、`authorization_generation` 与 `calendar.read` 能力，以完整旧 snapshot CAS 两行
   credential，写入新 access/可选 refresh credential 和精确 expiry，并同时追加 content-free
   `calendar.aad_0019.refresh_confirmed`。confirmed 必须复用 started 的 attempt UUID、
-  `rollout_digest_v1`、
-  generation 与两个 pre-digest，并绑定 `post_credential_snapshot_digest_v1` 和
-  `post_refresh_credential_snapshot_digest_v1`；响应没有新 refresh token 时仍
-  校验旧 refresh row snapshot 并原样保留。只有该事务成功提交才算 refresh 完成，现有无条件
+  `rollout_digest_v1`、`fence_generation=F` 与两个 pre-digest，并强制绑定
+  `post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、实际持久化
+  `token_expires_at` 和 `rollout_deadline_candidate = token_expires_at - 900 seconds`；响应没有新 refresh
+  token 时仍校验旧 refresh row snapshot 并原样保留。只有该事务成功提交才算 refresh 完成，现有无条件
   credential upsert 不能复用。网络未知、
   provider 调用后 lease 丢失、`invalid_grant`、malformed token/expiry/scope、scope shrink、CAS miss 或
   commit failure 都必须留下 started-without-confirmed 或稳定 needs-attention 结果，保持 revision 0018、
   不 probe、不发布 artifact，且不得对同 snapshot 再次调用 provider。若 confirmed 已提交但 artifact
   发布前崩溃，同一 rollout 必须从持久的新 credential/expiry 恢复后续 probe，refresh 调用数不得增加。
-- Google/Microsoft 渐进授权 callback 必须覆盖 replacement proof 原子性：在受控内存解密旧 refresh，
-  对明确返回的 non-empty 新值使用 `secrets.compare_digest`；只有 plaintext 不同才在同一事务写入新
-  refresh credential、递增 generation 并追加 `oauth.refresh_credential_replaced`。注入 credential 写后/
-  generation 更新后/event append 前及 commit 时崩溃，三者必须全部回滚。callback 无 refresh token、
-  空 token、同 plaintext、仅 access 更新、generation-only、同明文重加密和普通 refresh 都不得生成
-  proof，也不得让既有未知 fence 调用 provider。proof old 值不匹配 started 或 current 不匹配 proof new
-  时同样 fail closed；用户只能断开重连取得真正新 token，或走永久数据处置。
+- Google/Microsoft 渐进授权 callback 必须覆盖 F/S/T replacement proof 原子性。测试至少包含 `F=S` 与
+  `S>F`，并证明发起时原 connection 仍为 `connected`、恰有一个 matching unresolved fence、当前 refresh
+  digest 等于 fence pre-digest；既有 `set_capabilities_authorizing` 只把 `S` 递增一次到 `T=S+1`，
+  `OAuthAttempt` 只保存 target `T`。token exchange 在事务外；callback 以 target `T` 做 anti-replay，
+  由 `T-1` 推导 `S`，在 `T` 锁下加载旧 refresh 与唯一 fence，并在受控内存对明确返回的 non-empty 新值
+  使用 `secrets.compare_digest`。只有 plaintext 不同才在同一事务保存新 access/refresh credential、实际
+  scopes、能力状态与绑定 attempt/F/S/T/post generation/old-new digest 的
+  `oauth.refresh_credential_replaced`；generation 保持 `T`，不得再次递增。注入 credential、scope、能力或
+  proof 写入后及 commit 时崩溃，全部事实必须回滚。测试还必须覆盖 stale target、并发重授权导致的 target
+  mismatch、多个或零 matching fence、发起前/回调时 refresh digest CAS miss、无 refresh token、空 token、
+  同 plaintext、仅 access 更新、同明文重加密、普通 refresh、connection 已断开和旧 plaintext 不可得；
+  这些路径都不得生成 proof，也不得让既有未知 fence 调用 provider。disconnect 后重连、新 connection
+  映射或 generation-only 变化不能替代 proof，只能继续阻断并转入用户授权的数据处置或人工 forward-fix。
 - preflight 使用刷新后 access token，通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
   Calendar adapter 完成每个精确 `initial_pages(scope_key)` 探测并取得最终 cursor。它不等待资源 401，
   主动刷新后的 401 必须直接失败且 OAuth refresh 调用次数不增加。测试还必须证明它不调用
@@ -1518,10 +1543,12 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   probe。lease 使用独立连接贯穿全部网络阶段，业务短事务不得跨网络；锁连接或锁本身丢失时，下一次
   provider call、credential CAS 或 artifact publish 必须失败。lease 只解决并发；每次 refresh 还必须在
   provider 前提交既有 append-only AuditEvent 的 content-free `refresh_started` fence，并把完整旧
-  access/refresh snapshot CAS、新 credential/expiry 与 `refresh_confirmed` 放在 provider 后的同一短事务。
-  started 未 confirmed/needs-attention 会跨 basename 阻断同 authorization generation 的任何后续
-  provider 调用；只有 callback 原子提交、proof old generation/refresh digest 精确匹配 started 且当前
-  generation/refresh digest 精确匹配 proof new 值的 `oauth.refresh_credential_replaced` 才能自动解除。
+  access/refresh snapshot CAS、新 credential/expiry 与含必填 post digest、persisted expiry/deadline candidate
+  的 `refresh_confirmed` 放在 provider 后的同一短事务。started 未 confirmed/needs-attention 会跨 basename
+  阻断任何后续 provider 调用；只有原 connection 保持 connected 的渐进重授权 callback 原子提交、原
+  attempt/F 精确匹配 started、满足 `F <= S`、`T=S+1`、`post_generation=T` 且当前 generation/refresh
+  digest 精确匹配 proof post/new 值的 `oauth.refresh_credential_replaced` 才能自动解除。callback 保存后
+  generation 保持 OAuthAttempt target `T`，不得再次递增；disconnect/reconnect 不能产生或替代 proof。
   started/confirmed/known-terminal 使用同一 attempt UUID、`rollout_digest_v1`、full digest 与 refresh-row
   digest 协议；物理快照变化本身不证明 plaintext replacement。365 天审计清理不得删除仍未解决的
   started fence，也不得在 matching result/proof 尚未超过 cutoff 时提前清理旧 started。confirmed 后、
@@ -1546,7 +1573,8 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - 所有新同步的 CalendarEvent 描述和地点都标记为 v2 并绑定完整日历身份；跨日历同 event ID
   密文互换、v2 篡改、v1/未知版本读取均 fail closed，且没有 legacy fallback。
 - 0019 refresh fence 只使用既有 append-only AuditEvent，并以 attempt UUID、`rollout_digest_v1`、
-  `credential_snapshot_digest_v1`、`refresh_credential_snapshot_digest_v1`、授权代际、expiry 和稳定结果码
+  `credential_snapshot_digest_v1`、`refresh_credential_snapshot_digest_v1`、`fence_generation=F`、持久化
+  expiry/由其导出的 deadline candidate 和稳定结果码
   绑定精确尝试；plaintext replacement 只能由 callback 的 content-free
   `oauth.refresh_credential_replaced` 证明。不得保存 token、plaintext hash、raw
   scope、provider response、正文或 raw `calendar_id`，也不得为该 fence 新增 0018 Schema、OAuth-only
@@ -1607,16 +1635,17 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `calendar.read`、同时存在的 access/refresh AEAD credential 和精确 `ProviderCalendar`。
 
    preflight 按 connection UUID 去重并确定性串行处理。每个 connection 先冻结完整 access/refresh
-   snapshot 与 `authorization_generation`，检查既有 refresh fence：同一 rollout 已 confirmed 且当前
-   credential 匹配 post-snapshot 时，从持久 token/expiry 恢复后续 probe，不再次 refresh；同一 generation
-   存在 started-without-confirmed 或 needs-attention 时，相同或不同 basename 都以零 provider call 失败。
-   只有 `oauth.refresh_credential_replaced` 的 old generation/refresh digest 精确匹配 started，且当前
-   generation/refresh digest 精确匹配 proof new 值，才允许新尝试；其他 full/refresh physical digest、
+   snapshot 与 `fence_generation=F`，检查既有 refresh fence：同一 rollout 已 confirmed 且当前 credential
+   匹配 post-snapshot、persisted expiry/deadline candidate 时，从持久 token/expiry 恢复后续 probe，不再次
+   refresh；存在 started-without-confirmed 或 needs-attention 时，相同或不同 basename 都以零 provider call
+   失败。只有 `oauth.refresh_credential_replaced` 的原 attempt/F 精确匹配 started、满足 `F <= S`、
+   `T=S+1`、`post_generation=T`，且当前 generation/refresh digest 精确匹配 proof post/new 值，才允许
+   新尝试；其他 full/refresh physical digest、
    generation 或 access-token 变化都 fail closed。对允许的新
    snapshot，先完成 access/refresh 存在性、归属和 AEAD 可解密性等本地校验；通过后在紧邻 provider
    调用的短事务中向既有 append-only `audit_events` 提交 content-free
    `calendar.aad_0019.refresh_started`。事件使用新生成的 canonical lowercase attempt UUID，并绑定
-   `calendar_aad_0019_refresh_fence.v1`、`rollout_digest_v1`、generation 与
+   `calendar_aad_0019_refresh_fence.v1`、`rollout_digest_v1`、`fence_generation=F` 与
    `pre_credential_snapshot_digest_v1`、`pre_refresh_credential_snapshot_digest_v1`，再使用已解密
    refresh token 主动调用现有 Google/Microsoft OAuth refresh。access-only 或 AEAD 解密失败在
    started/provider 前 fail closed；`invalid_grant`、返回
@@ -1626,10 +1655,10 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    provider 返回后只允许专用短事务重检连接、能力与 generation，以完整旧 snapshot CAS 两行
    credential，并把新 access/可选 refresh AEAD、精确 `token_expires_at` 与 content-free
    `calendar.aad_0019.refresh_confirmed` 原子提交；confirmed 复用同一 attempt UUID、
-   `rollout_digest_v1`、
-   generation 与两个 pre-digest，并增加 `post_credential_snapshot_digest_v1`、
-   `post_refresh_credential_snapshot_digest_v1`。没有新 refresh token 时校验并
-   保留旧 refresh 密文，
+   `rollout_digest_v1`、`fence_generation=F` 与两个 pre-digest，并强制增加
+   `post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、实际持久化
+   `token_expires_at` 和 `rollout_deadline_candidate = token_expires_at - 900 seconds`。没有新 refresh token
+   时校验并保留旧 refresh 密文，
    禁止现有无条件 upsert。网络未知、调用后 lease 丢失、scope shrink、CAS/commit failure 均不得覆盖
    更新后的 token、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。confirmed 已提交但
    artifact 发布前崩溃时，同一 rollout 从持久 credential/expiry 继续。全部 connection confirmed 后重新
@@ -1721,7 +1750,7 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
 | 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
-| 并发或未知结果 preflight 重复 refresh，或陈旧 preflight 覆盖新 token | revision-global lease 互斥全部 basename；started/confirmed 精确绑定 attempt UUID、`rollout_digest_v1`、generation 与 full/refresh 两个物理摘要；provider 后以完整旧 snapshot CAS、新 credential 与 confirmed 原子提交；未确认 fence 跨 basename 阻断，只有 callback 对真正不同的 non-empty refresh plaintext 原子提交 matching `oauth.refresh_credential_replaced` proof 才能解锁，confirmed crash 从持久结果恢复 |
+| 并发或未知结果 preflight 重复 refresh，或陈旧 preflight 覆盖新 token | revision-global lease 互斥全部 basename；started/confirmed 精确绑定 attempt UUID、`rollout_digest_v1`、`fence_generation=F`、full/refresh 两个物理摘要与必填 persisted expiry/deadline candidate；provider 后以完整旧 snapshot CAS、新 credential 与 confirmed 原子提交；未确认 fence 跨 basename 阻断，只有仍 connected 的原 connection 以 `S→T=S+1` 渐进重授权并在 target `T` callback 中保持 generation 不变、对真正不同的 non-empty refresh plaintext 原子提交 matching F/S/T replacement proof 才能解锁，confirmed crash 从持久结果恢复 |
 | 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention；未匹配结果的 started 跨 cutoff 保留，统一锁序下重算两个摘要并重查 matching result/proof；安全组中每个事件都必须早于 cutoff，普通 access-token rotation、generation 或物理摘要变化不解锁，跨 365 天回归要求后续 provider call 为零 |
 | restore 镜像/工件被替换，app-role 无法完整恢复，或 `pg_restore` 中途失败留下部分状态 | owner 前宿主 artifact/image guard；精确 `sha256:` restore image、无 build/pull、`--pull never`，容器读取 Secret 前复核；专用 owner-role 单事务 restore，成功后重授最小权限；app-only verifier 由 `PGOPTIONS` 与 `BEGIN READ ONLY` 双重强制只读 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
