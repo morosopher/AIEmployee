@@ -908,14 +908,17 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
      `scope_key = affected_calendar_id` 和 `scope_key <> 'directory'`。
    - owning OAuth connection 存在、与事件/游标属于同一用户，且状态精确为 `connected`。
    - 同用户、同连接的 `calendar.read` 能力行存在且状态精确为 `enabled`。
-   - 当前 Calendar Worker 凭据解析必需的本地 AEAD credential 行存在并属于同一用户/连接；至少
-     必须有 `access_token`，不得从其他连接借用、复制或伪造凭据。
+   - 当前 Calendar Worker 凭据解析必需的本地 AEAD credential 行存在并属于同一用户/连接；每个
+     affected connection 必须同时具有 `access_token` 与 `refresh_token`，access-only 不得迁移，亦不得
+     从其他连接借用、复制或伪造凭据。迁移只能证明 credential 行与归属存在；refresh token 的 AEAD
+     可解密性和供应商可用性必须由生产窗口的独立 preflight 在 0019 前主动刷新证明。
    - 同用户、同连接、同 `provider_calendar_id` 的精确 `ProviderCalendar` 目录行存在。
 
    任一 pair 缺失上述事实，或连接已断开、能力为 disabled/revoked/其他非 enabled 状态时，升级都
    必须保持 revision `20260809_0018` 和全部数据不变，也不得创建猜测 marker。迁移本身不执行供应商
-   网络 I/O；生产变更窗口还必须在备份、审计和 migration 前通过第 22 节定义的独立只读供应商
-   preflight。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。通过 preflight 后，
+   网络 I/O；生产变更窗口还必须在备份、审计和 migration 前通过第 22 节定义的主动 refresh 加精确
+   pair 只读 probe preflight。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。通过
+   preflight 后，
    只失效上述精确 pair 的游标：将 `cursor` 与
    `last_success_at` 置空，并把 `last_error_code` 设为不含内容的
    `calendar_event_resync_required`；其他 connection 即使复用相同 `calendar_id` 也不得变化，
@@ -1180,26 +1183,49 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   content-free `calendar_event_resync_required`。迁移测试必须包含两个 connection 复用同一
   `calendar_id`、但只有一个 connection 存在 v1 字段的场景，证明另一 connection 的游标完全不变；
   还必须分别证明缺失任一精确 scope 游标、owning connection 已断开、`calendar.read` 为
-  disabled/revoked、缺失 Calendar Worker 必需 credential 或缺失精确 `ProviderCalendar` 时，都会在
-  任何 DDL/DML 前 fail closed，revision 仍为 0018 且全部数据原样保留。
-- `calendar-aad-preflight-0019` 只在 revision 0018 扫描历史完整 AEAD 三元组推导 affected pairs，逐
-  pair 复核相同本地可恢复性事实，并通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
-  Calendar adapter 完成精确 `initial_pages(scope_key)` 探测并取得最终 cursor。测试必须证明它不调用
+  disabled/revoked、缺失 access credential、缺失 refresh credential、仅 access-token 可用或缺失精确
+  `ProviderCalendar` 时，都会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且全部数据原样保留。
+- `calendar-aad-preflight-0019` 只在 revision 0018 扫描历史完整 AEAD 三元组推导 affected pairs，并按
+  connection UUID 去重、确定性串行处理。每个 affected connection 在任何事件 scope probe 前必须解密
+  自己的 refresh credential，主动调用现有 Google/Microsoft OAuth adapter 的 refresh，验证规范化
+  access token、正整数 expiry 和实际 `granted_scopes`；scope 必须覆盖连接保存的 canonical scopes，且
+  包含 `calendar.read` 所需 provider scope。测试必须覆盖 access-only、refresh 缺失/AEAD 不可解密、
+  refresh revoke/reject、malformed token/expiry/scope、scope shrink，以及同一 connection 多个 pair 只
+  refresh 一次且不并行。验证成功后才允许在短事务内轮换 access-token AEAD 与精确
+  `token_expires_at`；响应省略新 refresh token 时保留旧密文。除该 credential rotation 外，不更新连接、
+  能力或其他业务事实。
+- preflight 使用刷新后 access token，通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
+  Calendar adapter 完成每个精确 `initial_pages(scope_key)` 探测并取得最终 cursor。它不等待资源 401，
+  主动刷新后的 401 必须直接失败且 OAuth refresh 调用次数不增加。测试还必须证明它不调用
   `directory_pages()`、连接级 owner、其他 pair 或任何 Calendar 写适配器，不写 CalendarEvent、cursor
-  或 marker；若首次资源 401 触发既有 OAuth refresh，则只允许沿用现有 AEAD token rotation 边界，
-  不更新连接/能力状态或其他业务事实。refresh 拒绝、refresh 后仍为 401、403、权限缺失、无最终
-  cursor 或任何 pair 失败都必须返回非零并阻止 0019。
+  或 marker；403、权限缺失、malformed page、无最终 cursor 或任何 pair 失败都返回非零并阻止 0019。
+- 对每个已轮换 access token 使用同一注入 UTC clock 持久化 `token_expires_at`，并固定计算
+  `rollout_deadline = min(token_expires_at) - 900 seconds`；900 秒不是配置项或运维估计。测试必须覆盖
+  expiry 不足 900 秒、preflight probe/rollout artifact 提交时越过 deadline、多个 connection 取最早
+  expiry，以及零 affected pair 的显式 no-op。preflight artifact 只允许 schema/revision、安全 backup
+  basename、宿主机从 Compose 选定 backend image 解析的 immutable image content ID、earliest expiry/
+  deadline、固定 margin、affected/connection count、hashed connection IDs、pair digests 和稳定结果码，
+  权限为 `0600`；不得包含 token、scope 原文、正文、描述/地点、供应商响应或 raw `calendar_id`。镜像
+  content ID 不接受运维人员单独输入，所有后续 one-off 都必须重新解析实际镜像并与 artifact 比较。
 - `0019` 恢复入口只扫描 `calendar_event_resync_required` marker，并以稳定任务种类
-  `calendar.aad_0019.resync` 为每个精确 pair 的每个正整数恢复 ordinal 原子创建一个
-  `TaskRun + AuditEvent + Outbox`。集成测试必须证明 planner 锁定精确 cursor 行后复用
-  `created/queued/running/retry_scheduled` 活动尝试；两个并发 planner 对同一 ordinal 只产生一个任务和
-  一条初始 Outbox；首次 `failed` 后修复条件并再次显式运行会创建 ordinal+1 并成功；`cancelled` 可在
-  后续调用创建新 ordinal；`succeeded` 与 marker 并存、多个活动尝试或该恢复种类出现
+  `calendar.aad_0019.resync` 管理每个精确 pair 的正整数恢复 ordinal。首次无历史尝试时才原子创建
+  ordinal 1 的 `TaskRun + AuditEvent + Outbox`；任何 `created/queued/running/retry_scheduled` 活动尝试都
+  必须原样返回并复用，不能创建下一个 ordinal。集成测试还必须证明两个并发 planner 对同一新 ordinal
+  只产生一个任务和一条初始 Outbox；仅当上一尝试已 `failed` 后修复条件并再次显式运行才创建
+  ordinal+1 并成功；`cancelled` 可在后续调用创建新 ordinal；`succeeded` 与 marker 并存、多个活动尝试或该恢复种类出现
   `waiting_approval/reconciling/needs_attention` 都 fail closed。旧终态 TaskRun 必须保持不变，单次 CLI
   调用对每个 pair 最多创建一个新 ordinal，TaskRun 内部 `attempt_count` 仍只表示现有 runner 的有界
   自动重试。两个 connection 复用同一 `calendar_id` 时只读取被标记者，目录 reader 调用次数为零，
   普通 `sync_calendar` 队列事实保持未处理；成功只清除同一 marker 并恢复 cursor/freshness，失败保留
   marker，且整个流程不创建 ApprovalRequest、ToolExecution 或任何供应商写调用。
+- deadline 集成测试必须让 backup、`pre-migration`/`post-migration` audit、0019 migration、recovery
+  planner/Worker final CAS 与 `post-resync` artifact 分别在启动或关键提交前跨过同一 deadline，并证明
+  全部 fail closed、通用服务不启动、未创建额外 ordinal；还必须证明零 affected-pair state 只能在每个
+  边界重新得到空集合时走规范 no-deadline 分支，任何伪造零值、集合漂移或镜像 content ID 不匹配都
+  fail closed。测试还必须从本窗口 refresh 后且 0019 前创建的加密整库备份执行真实 PostgreSQL
+  restore，证明 revision 回到 0018、恢复后确定性本地 audit 与原 `pre-migration` artifact 一致，然后
+  才允许原 0018-compatible image 通过健康检查；任何路径都不得调用 Alembic downgrade、直接 SQL、
+  跳过 marker 或启动 OAuth-only 临时服务。
 - 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
   v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
   且任何路径都不得回退尝试 v1 AAD。
@@ -1282,10 +1308,19 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
   cursor 与 freshness 后清除 `calendar_event_resync_required`。该入口和 `post-resync` 审计完成前，
   通用 Scheduler、普通 Taskiq Worker、API 与 Caddy 必须保持停止。
-- 恢复失败或取消不会复活、改写或重新认领旧终态 TaskRun。只有运维人员再次显式运行无参数 one-off
-  时，planner 才能在精确 cursor 锁下为仍带 marker 的 pair 分配下一个 recovery ordinal；每个新
-  TaskRun 仍受持久 `started_at` 总超时、单步超时、`max_transient_retries` 与 `attempt_count` 上限约束，
-  因此既不会无限自动重试，也不会用新 ordinal 绕过单次调用边界。
+- 恢复 planner 遇到 `created/queued/running/retry_scheduled` 时必须始终复用该活动 ordinal，绝不分配
+  新 ordinal；多个活动尝试是 fail-closed 不变量错误。只有上一尝试已经 `failed` 或 `cancelled`、marker
+  仍存在且运维人员再次显式运行无参数 one-off 时，才能在精确 cursor 锁下分配下一个 ordinal。旧终态
+  TaskRun 不会被复活、改写或重新认领；每个新 TaskRun 仍受持久 `started_at` 总超时、单步超时、
+  `max_transient_retries` 与 `attempt_count` 上限约束，因此既不会无限自动重试，也不会用新 ordinal
+  绕过单次调用边界。
+- 0019 rollout 的所有 provider probes 和本地提交都受同一个 content-free rollout artifact 约束：非空
+  affected set 固定使用 `rollout_deadline = min(token_expires_at) - 900 seconds`；零 affected pair 只允许
+  使用规范 null deadline 且在每个边界重新证明集合仍为空。backup、migration、resync 与
+  `post-resync` audit 必须通过对应 guard；任何启动或关键提交 guard 失败都保持通用服务停止。若 0019
+  已提交且无法在 deadline 前清完 marker，只允许在尚未重开服务、没有业务写入的同一 sealed window
+  内，从指定的 refresh 后/迁移前加密整库备份恢复到 0018，再核验 checksum、原/恢复后 audit、revision
+  和原 0018 image 健康；禁止 downgrade、直接 SQL、marker waiver 或 OAuth-only 临时服务。
 
 ### 21.4 安全与隐私
 
@@ -1325,6 +1360,16 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 `APP_TEST_MODE` 只能注入 Fake 适配器。专用测试账户真实 API 验证使用独立环境、显式写入开关
 和账户允许列表；测试环境不得因误配连接其他账户。
 
+0019 使用一个固定、不可由运维覆盖的安全余量 `CALENDAR_AAD_ROLLOUT_SAFETY_MARGIN_SECONDS = 900`，
+与当前 durable task 总超时默认值对齐，但不随运行时配置漂移。preflight 为每个 distinct affected
+connection 主动 refresh 并安全轮换 access credential 后，以数据库中这些新 token 的最早
+`token_expires_at` 计算 `rollout_deadline = min(token_expires_at) - 900 seconds`。所有时间使用 UTC；
+禁止“token 足够新鲜”“窗口预计够用”等主观判断。零 affected pair 必须形成显式、可核验的 no-op
+artifact；所有后续 guard 都必须重新证明 affected set 仍为空才可接受其 null deadline。其他情况若
+preflight 完成时 `now >= rollout_deadline`，必须在备份前失败。宿主机 recipe 还必须从 Compose 实际
+选中的 backend image 解析内容 ID 并内部传入，artifact 绑定该 ID；运维人员不得手填 image ID，后续
+backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与 artifact 不一致。
+
 部署顺序：
 
 1. 保持外部写入默认关闭，关闭 Calendar 周期调度并停止新入口流量。
@@ -1332,50 +1377,74 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
    没有旧 `sync_calendar` 任务、事件 upsert 事务或旧 reader 仍在运行，PostgreSQL 与 Redis 保持运行。
 3. 运行 Task 27 提供的无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 只从
    历史完整 AEAD 三元组推导 affected pairs，逐 pair 复核精确 cursor、connected owning connection、
-   enabled `calendar.read`、Calendar Worker 所需 AEAD credential 和精确 `ProviderCalendar`，再通过
-   供应商只读 Calendar adapter 调用与恢复路径一致的 `initial_pages(scope_key)` 并要求最终 cursor。
-   它不得调用 `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得
-   写 CalendarEvent、cursor 或 marker。资源 401 可以复用既有单次 OAuth refresh 与 AEAD token
-   rotation 维护边界，但不更新连接/能力状态或其他业务事实；除此之外供应商侧严格只读。preflight
-   使用与恢复相同的
+   enabled `calendar.read`、同时存在的 access/refresh AEAD credential 和精确 `ProviderCalendar`。它先按
+   connection UUID 去重、确定性串行解密 refresh token，并在任何事件 probe 前主动调用现有
+   Google/Microsoft OAuth refresh；access-only、AEAD 解密失败、refresh 被拒绝、返回 token/expiry/scope
+   malformed 或实际 scope 未覆盖连接保存的 canonical scopes/`calendar.read` provider scope 都
+   fail closed。验证通过后在短事务中轮换 access-token AEAD 与 `token_expires_at`；provider 没有返回
+   新 refresh token 时保留旧密文。全部 connection rotation 完成后重新读取持久化 expiry 并计算
+   deadline，再通过供应商只读 Calendar adapter 调用与恢复路径一致的 `initial_pages(scope_key)` 并要求
+   最终 cursor；全部 probe 成功且最终 rollout guard 通过后才原子提交 content-free rollout artifact。
+   它不等待资源 401；主动
+   刷新后的 401 直接失败且不得进行第二次 refresh。它不得调用
+   `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得写
+   CalendarEvent、cursor 或 marker；除 credential rotation 外不更新连接/能力状态或其他业务事实。
+   preflight 使用与恢复相同的
    `SHA-256(20260809_0019 + NUL + connection_id + NUL + calendar_id)` locally hashed pair digest 输出
-   content-free 结果。任一 refresh 拒绝、refresh 后仍为 401、403、权限缺失或无最终 cursor 都阻止
-   迁移；禁止 waiver、直接 SQL、伪造 credential 或迁移后清 marker。
-4. preflight 全部通过后，生成加密备份并执行迁移前只读审计；审计必须证明数据库仍位于 0018、没有
-   部分 AEAD 三元组，并重复记录每个 affected pair 的本地可恢复性事实和 locally hashed scope 结果。
-5. 应用前向 `0019` 并执行迁移后只读审计，验证只新增版本列/约束、v1 标记和精确 pair 的事件 scope
-   游标失效，其他 connection 的同名 calendar、directory cursor/revision 与全部事件 AEAD 字节均未变化。
+   content-free 结果。artifact 只包含 schema/revision、安全 basename、实际 immutable image content ID、
+   earliest expiry/deadline、固定 margin、affected/connection count、hashed connection IDs、pair digests
+   和稳定结果码。任一失败都阻止迁移；禁止 waiver、直接 SQL、伪造 credential、access-only 迁移或
+   迁移后清 marker。
+4. preflight 全部通过后，生成加密备份并执行迁移前只读审计；backup/audit 在启动和 artifact 原子提交前
+   校验同一 rollout guard：非空集合要求 `now < deadline`，零分支要求重新证明 affected set 仍为空。
+   审计必须证明数据库仍位于 0018、没有部分 AEAD 三元组，并重复记录每个
+   affected pair 的本地可恢复性事实、必需 access/refresh credential 和完全一致的 locally hashed set。
+5. 通过受限 `calendar-aad-migrate-0019` one-off 应用前向 `0019`，在任何 DDL/DML 前和事务最终提交前
+   校验 preflight artifact、实际镜像内容 ID、精确 affected set、本地可恢复性和 rollout guard；再执行
+   迁移后只读审计。验证
+   只新增版本列/约束、v1 标记和精确 pair 的事件 scope 游标失效，其他 connection 的同名 calendar、
+   directory cursor/revision 与全部事件 AEAD 字节均未变化。
 6. 使只写 v2、正常读取拒绝 v1 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、
    普通 Worker 与 Scheduler 停止；0019 不支持旧新 Calendar reader/writer 混跑，任何旧组件都不得回流。
-7. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口只扫描
+7. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口在启动和每个任务最终本地提交前
+   校验同一 rollout guard，只扫描
    `calendar_event_resync_required` marker，并对每个精确 cursor 行使用 `FOR UPDATE` 或等价 CAS
    串行化 planner。逻辑 pair digest 是 revision、connection ID 与 calendar ID 的 SHA-256；首次 ordinal
    为 1，稳定任务键固定为 `calendar-aad-0019:<pair_digest>:attempt:<ordinal>`，输入精确包含
    `connection_id`、`scope_key`、`recovery_revision`、`pair_digest` 与
-   `recovery_attempt_ordinal`。`created/queued/running/retry_scheduled` 活动尝试必须复用；最新尝试为
-   `failed/cancelled` 且 marker 仍存在时，下一次显式 CLI 才能分配 `max_ordinal + 1`；多个活动尝试、
+   `recovery_attempt_ordinal`。`created/queued/running/retry_scheduled` 活动尝试始终返回并复用原 ordinal，
+   绝不分配新 ordinal；仅当上一尝试已 `failed/cancelled` 且 marker 仍存在时，下一次显式 CLI 才能
+   分配 `max_ordinal + 1`。多个活动尝试、
    `succeeded` 与 marker 并存，或 `waiting_approval/reconciling/needs_attention` 都 fail closed。旧终态
    TaskRun 不得复活或改写，单次 CLI 调用对每个 pair 最多创建一个新 ordinal，且 recovery ordinal 与
    单个 TaskRun 的 `attempt_count` 完全分离。每个 ordinal 的 TaskRun、审计与初始 Outbox 原子提交。
 8. CLI 只精确分派并以内联 `DurableTaskRunner` 执行本次 planner 返回的任务 ID，不启动 Taskiq Worker、
    不扫描普通队列，也不发布或执行无关 `sync_calendar` 任务。专用恢复任务步骤在供应商访问前重新
    计算 pair digest，并核对 canonical task input、ordinal、幂等键、TaskRun 用户归属、现存非
-   `directory` 精确 cursor、marker、连接读取能力、必需 AEAD credential 与目录中的同一 calendar；任一条件不满足都以无
-   供应商调用的幂等 no-op 或稳定失败结束。有效任务只调用单日历事件 scope 路径，不调用
+   `directory` 精确 cursor、marker、连接读取能力、必需 access/refresh AEAD credential 与目录中的同一
+   calendar；任一条件不满足都以无供应商调用的幂等 no-op 或稳定失败结束。有效任务只调用单日历事件 scope 路径，不调用
    `directory_pages()`、连接级 owner 或其他 provider/calendar；完成提交必须以 marker 为 CAS 前提，
    失败保留 marker。该流程只读供应商并写本地同步事实，不创建审批、ToolExecution 或真实写操作。
-9. 执行 `post-resync` 只读审计，验证新密文均为 v2、每个精确 pair 的 cursor/freshness 恢复且 marker
-   清除。任一 pair 失败时保持所有通用服务和真实写开关关闭，禁止改用直接 SQL、临时全量同步或
-   connection-level directory sync。
+9. 执行 `post-resync` 只读审计，在读取前和 artifact 原子提交前检查同一 rollout guard，验证新密文均为
+   v2、每个精确 pair 的 cursor/freshness 恢复且 marker 清除。任一 pair 失败、非空集合 deadline 已到
+   或 zero state 漂移时保持所有通用服务和真实写开关关闭。deadline 尚未到且精确失败条件可修复时，
+   只能由后续显式 CLI 按既定 ordinal 规则重试；deadline 已到或已不能证明会及时提交 artifact，且仍在
+   sealed maintenance window、没有任何业务写入时，才使用本窗口 refresh 后/0019 前指定的加密整库
+   备份恢复到 revision 0018，并核验 backup checksum、原始与恢复后 deterministic `pre-migration`
+   audit、revision 和原 0018-compatible image 健康。zero state 漂移或镜像/basename 不匹配必须先人工
+   调查，只有仍能独立证明没有业务写入时才可能使用同一恢复例外。禁止 Alembic downgrade、直接 SQL、
+   临时全量同步、connection-level directory sync、跳过 marker 或 OAuth-only 临时服务。
 10. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy，运行
    `just health`，并验证 M1 登录、普通同步、简报、审批假工具和任务恢复。
 11. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查；最后再打开正式环境
     供应商开关，每个连接仍需用户单独渐进授权。
 
-回滚应用镜像时，新表和列保留。一旦应用 `0019`，应用回滚下限就是理解 AAD 版本列、拒绝 v1
-读取并且只写 v2 的 0019-compatible 镜像；无论 M2 任务是否均为终态，都不得回滚到
-pre-0019/M1、v1 reader 或旧 Calendar writer。切换到较旧但仍兼容 0019 的 M2 镜像前，仍必须
-确认所有 M2 任务均为终态；若存在 `reconciling` 或 `needs_attention`，应部署保留 M2 Schema、
+回滚应用镜像时，新表和列保留。一旦 0019 的 `post-resync` 审计通过、任一通用服务启动或发生任一
+业务写入，应用回滚下限就是理解 AAD 版本列、拒绝 v1 读取并且只写 v2 的 0019-compatible 镜像；
+无论 M2 任务是否均为终态，都不得回滚到 pre-0019/M1、v1 reader 或旧 Calendar writer。仅在上述
+尚未重开服务且无业务写入的 sealed window，才允许通过指定迁移前整库备份恢复整个 PostgreSQL 到
+0018 后启动原 0018 image；不得用 downgrade 模拟该恢复。切换到较旧但仍兼容 0019 的 M2 镜像前，
+仍必须确认所有 M2 任务均为终态；若存在 `reconciling` 或 `needs_attention`，应部署保留 M2 Schema、
 v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回滚。
 
 ## 23. 主要风险与控制
@@ -1387,6 +1456,7 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 多账户选择错误 | 回复绑定原连接、新建使用可切换默认值、审批展示精确账户 |
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
+| 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
