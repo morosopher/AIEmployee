@@ -31,12 +31,13 @@
 3. 创建带固定 basename 的加密备份，再运行 `pre-migration` 只读审计。该审计必须确认 revision 为 0018、没有部分 AEAD 三元组，并且每个受影响的精确 `(connection_id, calendar_id)` pair 都存在非 `directory` Calendar 事件游标。
 4. 运行独立 migration service 应用 0019。迁移自身必须在任何 DDL/DML 前重复相同 preflight；任一精确 pair 缺游标时 fail closed，Alembic revision 保持 0018，数据不变，且不得创建猜测 marker。
 5. 运行 `post-migration` 只读审计，确认 Schema 只新增版本列与原子约束；历史完整三元组标记为 v1、全空组保持 NULL；事件身份/非 AAD 业务字段及 ciphertext/nonce/key-version 摘要不变；`directory` 完全不变；只有精确 affected pair 的 cursor/freshness/error marker 改变。两个 connection 即使复用同一 `calendar_id`，也禁止只按 `calendar_id` 扩大更新。
-6. 部署 v2-only 的不可变 API、Worker、Scheduler 与 Caddy 镜像；禁止任何旧 reader/writer 在 0019 后回流。
-7. 只通过 Task 27 定稿并测试的 v2-only Worker/scope 入口，对被标记的精确 pair 执行有界重同步，不扩大到整个连接或账户。
-8. 运行 `post-resync` 只读审计，确认每个 affected pair 的 marker 已清除、cursor/freshness 已恢复、此次新写入的非空描述/地点均为 v2，并只报告未读取内容的剩余历史 v1 数量。
-9. 运行健康检查；上述条件全部满足后才退出维护窗口并继续发布。
+6. 使 v2-only 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、普通 Worker 与 Scheduler 停止；禁止任何旧 reader/writer 在 0019 后回流。
+7. 运行无参数 `just calendar-aad-resync-0019`。该入口只扫描 `calendar_event_resync_required` marker，为每个精确 pair 原子创建专用 TaskRun/审计/Outbox，并在进程内只执行本次返回的 `calendar.aad_0019.resync` 任务；不得启动 Taskiq、扫描普通队列、运行 `directory` owner，或扩大到整个连接或账户。
+8. 运行 `post-resync` 只读审计，确认每个 affected pair 的 marker 已清除、cursor/freshness 已恢复、此次新写入的非空描述/地点均为 v2，并只报告未读取内容的剩余历史 v1 数量。任一 marker 未恢复都必须停止发布，Caddy、API、普通 Worker 与 Scheduler 继续保持停止。
+9. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy。
+10. 运行健康检查；上述条件全部满足后才退出维护窗口并继续发布。
 
-以下命令从 `/srv/ai-employee` 运行，不包含账号、DSN、正文、原始 `calendar_id` 或凭据。migration service 继续从 Compose Secret 读取数据库凭据。`BACKUP_ARTIFACT_BASENAME`、`just calendar-aad-audit phase artifact` 和其三阶段脚本属于 Task 27 要落地并通过合成数据库测试的运维契约；当前 recipe 尚未实现，未完成 Task 27 前不得执行生产 0019。示例 `2026.08.09-0019-v2` 必须替换为预先构建并固定的实际不可变镜像标签，不得使用 `latest`。
+以下命令从 `/srv/ai-employee` 运行，不包含账号、DSN、正文、原始 `calendar_id` 或凭据。migration service 继续从 Compose Secret 读取数据库凭据。`BACKUP_ARTIFACT_BASENAME`、`just calendar-aad-audit phase artifact`、`just calendar-aad-resync-0019` 及其合成数据库测试属于 Task 27 要落地的运维契约；当前 recipe 尚未实现，未完成 Task 27 前不得执行生产 0019，也不得用临时命令替代。示例 `2026.08.09-0019-v2` 必须替换为预先构建并固定的实际不可变镜像标签，不得使用 `latest`。
 
 ```bash
 cd /srv/ai-employee
@@ -56,14 +57,22 @@ just calendar-aad-audit pre-migration /backups/ai_employee-0019-20260809
 APP_ENV=production docker compose run --rm migration
 just calendar-aad-audit post-migration /backups/ai_employee-0019-20260809
 
-docker compose up -d api worker scheduler caddy
-
-# 此处仅运行 Task 27 写回本文并经测试的 v2-only 精确 pair 重同步入口；当前仓库没有现成 recipe。
-# 在该入口落地前必须停在这里，禁止用全量同步、直接 SQL 或临时命令替代。
+# 此时仍只允许 postgres 与 redis 运行。Task 27 落地前必须停在这里。
+docker compose ps
+just calendar-aad-resync-0019
 
 just calendar-aad-audit post-resync /backups/ai_employee-0019-20260809
+
+# post-resync 审计通过后，才允许启动通用服务。
+docker compose up -d api worker scheduler caddy
 just health
 ```
+
+`calendar-aad-resync-0019` 不接受 user、connection 或 calendar 参数，避免运维输入把恢复范围改写为任意对象。Recipe 在启动 one-off 容器前检查 Compose 状态；只要 `caddy`、`api`、`worker` 或 `scheduler` 任一仍在运行就 fail closed。它复用 `worker` 服务的 v2 镜像、Secret 和数据库配置，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_0019`；该 wrapper 不打印 Secret，也不会启动 Taskiq Worker、Scheduler 或普通 Redis queue consumer。
+
+CLI 只从 revision 0019 数据库中的精确 marker 推导用户与 pair。每个 pair 的任务种类固定为 `calendar.aad_0019.resync`，输入仅含 `connection_id`、`scope_key` 和 `recovery_revision=20260809_0019`；稳定幂等键使用 revision、connection ID 与 calendar ID 的 SHA-256 摘要。TaskRun、内容安全审计和初始 Outbox 在一个事务提交，随后仅通过精确 task ID 的内联 Outbox/`DurableTaskRunner` 路径执行，不发布或消费普通队列。Worker 在供应商访问前重新验证用户归属、连接读取能力、现存非 `directory` cursor、marker 与同一 ProviderCalendar，并只调用该 calendar 的事件页；目录 reader、其他 connection/calendar、ApprovalRequest、ToolExecution 和供应商写适配器调用次数都必须为零。
+
+成功提交以 marker 仍匹配为 CAS 前提，只恢复同一 pair 的 cursor/freshness、写入 v2 字段并清除其错误；marker 已清除的重放是无供应商调用的 no-op。任何权限、供应商读取、租约或 CAS 失败都保留 marker、返回非零并阻止后续服务启动，禁止改用直接 SQL、临时全量同步或 connection-level directory sync。零 marker 运行是可审计的成功 no-op。
 
 `calendar-aad-audit` 只接受 `pre-migration`、`post-migration`、`post-resync` 三个 phase，并分别写入 `${artifact}.calendar-aad-${phase}.json`。每阶段 artifact 权限固定为 `0600`，只保存 revision、行/密文摘要、locally hashed scope IDs 和 affected count；不得保存或输出 DSN、描述/地点正文、供应商响应或 raw `calendar_id`。三个 artifact 必须与备份 basename、迁移标识和不可变镜像标签一起进入 Task 30 发布证据。
 

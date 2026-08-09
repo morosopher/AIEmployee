@@ -2301,7 +2301,7 @@ git commit -m "feat: add calendar change proposals"
 
 All provider behavior in this task uses Fake readers, synthetic encrypted values, or checked-in contract fixtures. Do not configure or access a real Google or Microsoft account, and do not add approval, `ToolExecution`, or provider-write behavior from Task 18 or later.
 
-Task 16A only implements and verifies code plus migration behavior in synthetic environments. Because 0019 forbids old/new CalendarEvent readers or writers from coexisting, passing its focused or repository gates is not authorization for a rolling deployment and does not prove a production rollout. This task must not stop production services, apply the production migration, or start a resync. The actual release is an operator-controlled Task 27/30 procedure following `docs/operations.md`: keep PostgreSQL/Redis running, stop new ingress and Calendar scheduling, drain every pre-0019 Caddy/API/Worker/Scheduler reader or writer, apply 0019, deploy v2-only components, run bounded resync, then verify cursor/freshness recovery and error clearance before continuing.
+Task 16A only implements and verifies code plus migration behavior in synthetic environments. Because 0019 forbids old/new CalendarEvent readers or writers from coexisting, passing its focused or repository gates is not authorization for a rolling deployment and does not prove a production rollout. This task must not stop production services, apply the production migration, or start a resync. The actual release is an operator-controlled Task 27/30 procedure following `docs/operations.md`: keep PostgreSQL/Redis running, stop new ingress and Calendar scheduling, drain every pre-0019 Caddy/API/Worker/Scheduler reader or writer, apply 0019, make the v2-only image available without starting general services, run the dedicated exact-pair one-off recovery and `post-resync` audit, and only then start API/Worker/Scheduler/Caddy and continue release verification.
 
 - [ ] **Step 1: Write failing lease and restore-input trust-boundary tests**
 
@@ -3801,18 +3801,26 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
 - Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
+- Create: `backend/src/ai_employee/application/use_cases/calendar_aad_recovery.py` — marker-only recovery planning, stable pair idempotency, and exact-task execution orchestration.
+- Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py` — add a marker-gated exact-event-scope entry that never invokes directory discovery.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_recovery.py` — user-owned marker scan plus atomic TaskRun/AuditEvent/Outbox creation.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/calendar.py` — require an existing exact marker cursor and clear it only through final marker-aware CAS.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
+- Modify: `backend/src/ai_employee/workers/sync_calendar.py` — validate and execute the dedicated `calendar.aad_0019.resync` task kind without the legacy directory default.
+- Modify: `backend/src/ai_employee/workers/execute_task.py` — route the dedicated recovery kind to the marker-gated Calendar step.
+- Create: `backend/src/ai_employee/cli/calendar_aad_0019.py` — content-free one-off recovery CLI using the existing durable runner and an exact-task in-process dispatch boundary.
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py` — M2 retention plus CalendarEvent four-column atomic-clear regressions.
+- Create: `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py` — marker isolation, atomic task creation, exact provider reads, replay, and CLI lifecycle coverage.
 - Modify: `docs/operations.md` — non-rolling 0019 rollout, 0019-compatible rollback floor, and incident handling.
 - Modify: `docs/acceptance-checklist.md` — scope-by-scope 0019 resync recovery evidence and rollback-floor acceptance.
 - Create: `scripts/audit-calendar-aad-0019.sh` — content-free, read-only three-phase 0019 audit.
 - Create: `scripts/test-calendar-aad-0019-audit.sh` — Task 13 synthetic-database contract test for the audit phases and artifact redaction.
 - Modify: `scripts/backup-postgres.sh` — accept a validated explicit 0019 artifact basename, reject paths/collisions, and preserve encryption, retention, and remote-copy guarantees.
-- Modify: `justfiles/ops.just` — expose `calendar-aad-audit phase artifact` and pass the explicit backup basename without printing secrets.
-- Modify: `scripts/test-tooling.sh` — backup-basename validation/pass-through and audit recipe CLI regressions.
+- Modify: `justfiles/ops.just` — expose the three-phase audit and no-argument `calendar-aad-resync-0019` one-off recipes without printing secrets or starting Taskiq.
+- Modify: `scripts/test-tooling.sh` — backup-basename validation/pass-through, audit CLI, stopped-service gate, and one-off recovery command regressions.
 - Modify: `scripts/test-deployment.sh`
 
 - [ ] **Step 1: Write failing retention and deletion-barrier tests**
@@ -3892,11 +3900,125 @@ one selected token per connection in controlled memory, delete every provider cr
 then make one best-effort provider-specific revoke attempt. A provider without a safe delegated revoke
 endpoint records the token-free maintenance fact defined in Task 25; local deletion must still finish.
 
-- [ ] **Step 5: Update runbooks and deployment contracts**
+- [ ] **Step 5: Write failing exact-pair 0019 recovery tests**
+
+In `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py`, use the Task 13 synthetic
+PostgreSQL database and Fake Google/Microsoft readers. Seed two users and two connections that share the
+same opaque `calendar_id`; only one exact cursor carries
+`last_error_code="calendar_event_resync_required"`. Also seed a marked second calendar, an unmarked
+calendar, a `directory` cursor, and an unrelated ordinary `sync_calendar` TaskRun/Outbox fact.
+
+The application/repository tests must prove all of these contracts:
+
+- the scan requires Alembic revision `20260809_0019` and selects only existing non-`directory`
+  `resource_kind="calendar"` cursors with the exact marker;
+- the connection row is the source of `user_id`; cross-user task input, a missing connection/calendar,
+  disabled `calendar.read`, a missing cursor, a cleared marker, or `scope_key="directory"` fails before
+  provider access;
+- each selected pair creates one task of kind `calendar.aad_0019.resync` with the exact input keys
+  `{"connection_id", "scope_key", "recovery_revision"}` and fixed revision `20260809_0019`;
+- TaskRun, content-free `task.created` audit, and initial `task.execute` Outbox are committed together;
+  an injected persistence failure leaves none of the three facts;
+- the user-scoped idempotency key is a fixed prefix plus a SHA-256 digest of revision, connection ID,
+  and exact calendar ID, so sequential replay and two concurrent planners create one TaskRun and one
+  initial Outbox for the pair without storing the raw calendar ID in the key;
+- the one-off executor dispatches and runs only the task IDs returned by the recovery planner; the
+  unrelated ordinary TaskRun/Outbox remains in its original state and no general queue scan occurs;
+- the marked pair makes exactly one bounded event-scope read, `directory_pages()` is never called, the
+  same-ID calendar on the other connection and every unmarked provider/calendar receive zero calls, and
+  no connection-level directory owner is invoked;
+- success writes/decrypts only v2 description/location groups, restores the exact cursor/freshness, and
+  clears only that pair's marker; marker-clear replay is an idempotent no-op with zero provider calls;
+- provider/read, lease, or final marker-CAS failure leaves the marker in place and never broadens to a
+  full connection/account sync; and
+- no path creates an ApprovalRequest, ToolExecution, trusted command, or provider write call. CLI output,
+  logs, audit metadata, and test artifacts must not contain raw `calendar_id`, token, body, description,
+  or location values.
+
+Extend `scripts/test-tooling.sh` with a stubbed Compose boundary that proves
+`just calendar-aad-resync-0019` accepts no pair argument, refuses to run while `caddy`, `api`, `worker`,
+or `scheduler` is running, and otherwise overrides the `worker` service command with only
+the fixed Secret wrapper
+`export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_0019`;
+it must never start `taskiq worker`, the Taskiq scheduler, or a general Outbox/Redis queue consumer.
+
+- [ ] **Step 6: Run the recovery RED tests**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/integration/operations/test_calendar_aad_0019_recovery.py \
+  -q
+bash scripts/test-tooling.sh
+~~~
+
+Expected: FAIL because the marker-only task planner, dedicated task kind, marker-aware exact-scope path,
+one-off CLI, and stopped-service recipe do not exist.
+
+- [ ] **Step 7: Implement marker-only task creation and exact-scope execution**
+
+Create a typed recovery use case and SQLAlchemy repository; the CLI and Worker must not contain ad hoc SQL.
+The repository checks revision 0019, reads only rows matching all of:
+
+~~~sql
+sync_cursors.resource_kind = 'calendar'
+AND sync_cursors.scope_key <> 'directory'
+AND sync_cursors.last_error_code = 'calendar_event_resync_required'
+~~~
+
+Join each cursor to its owning OAuth connection and current ProviderCalendar; never accept an operator-supplied
+user, connection, or calendar filter. Order pairs deterministically by connection UUID and calendar ID. In the
+same application-owned transaction, create the pair's `calendar.aad_0019.resync` TaskRun, content-free audit,
+and initial Outbox. The stable idempotency key is
+`calendar-aad-0019:` plus the lowercase SHA-256 hex digest of
+`20260809_0019 + NUL + connection_id + NUL + calendar_id`; task input keeps the exact scope only inside the
+existing user-scoped PostgreSQL task payload. A uniqueness winner must return the existing task after verifying
+its kind and exact payload; a mismatch fails closed rather than reusing unrelated work.
+
+After commit, `calendar_aad_0019.py` must use the existing exact-task Outbox dispatch path with an in-process
+recovery-only queue port, then call `DurableTaskRunner` synchronously for only those returned task IDs. It must
+not publish to Redis, call an unfiltered `relay_once`, consume an existing queue, or start Taskiq. A crash before
+or after exact dispatch remains recoverable from PostgreSQL/Outbox; a later Outbox replay of a terminal task is
+a provider-call-free no-op. The CLI returns nonzero when any marker remains failed/unresolved and prints only
+counts plus stable content-free error codes.
+
+For `calendar.aad_0019.resync`, require exact input keys, a canonical UUID, non-empty/non-padded scope within the
+existing 512-character boundary, `scope_key != "directory"`, and the fixed recovery revision before resolving
+credentials or adapters. Recheck TaskRun `user_id` ownership, connected/enabled `calendar.read`, the exact
+ProviderCalendar row, and an existing cursor whose cursor/freshness are still invalidated and whose error is the
+marker. The recovery state lookup must never synthesize a missing cursor.
+
+Add a public `SyncCalendarUseCase.execute_marked_scope()` that reuses the ordinary bounded event-page and v2
+encryption path but cannot call `_execute_directory()`. Its final short transaction must recheck the same marker
+as a CAS precondition before any event upsert becomes visible, then atomically write events, exact cursor,
+freshness, content-free audit, and marker clearance. Marker absence before the provider call is a no-op; marker
+loss or ownership/capability change after the read rolls back the local write. A provider failure preserves the
+marker. Do not add a directory fallback, full-account sync, direct provider write, ApprovalRequest,
+ToolExecution, Task 18 command, or legacy v1 decrypt path.
+
+- [ ] **Step 8: Update runbooks, audit tooling, and deployment contracts**
 
 Document Google/Microsoft progressive authorization, Microsoft administrator consent, global/provider kill switches, dedicated test-account allowlist, unknown-result handling, calendar restore, and duplicate/mis-send incident response. Once 0019 has been applied, define the application rollback floor as an 0019-compatible image that understands the version columns and writes only v2: pre-0019/M1, v1 readers, and old Calendar writers are forbidden even when every Task is terminal. Preserve the stricter task-state rule that an older but still 0019-compatible M2 image may be selected only after all Tasks are terminal; `reconciling` or `needs_attention` requires a forward-fix image with reconciliation support.
 
-The runbook and acceptance checklist must define the non-rolling production sequence exactly: keep write switches off; disable Calendar scheduling and stop new ingress; gracefully drain and stop every pre-0019 CalendarEvent reader/writer—Caddy, API, Worker, and Scheduler—while PostgreSQL and Redis remain running; confirm no old `sync_calendar`, event read, or upsert remains; back up and run the pre-migration audit; apply 0019; run the post-migration audit; deploy the v2-only immutable API/Worker/Scheduler/Caddy images with no old component return; run only the bounded v2 scope-resync entry; run the post-resync audit; and then require `just health`. Cursor mutation and all evidence must use the exact `(connection_id, calendar_id)` pair, never `calendar_id` alone. Task 27 documents and tests this contract but does not execute production changes, and Task 16A test success must not be treated as rolling-deployment evidence.
+The runbook and acceptance checklist must define the non-rolling production sequence exactly: keep write switches off; disable Calendar scheduling and stop new ingress; gracefully drain and stop every pre-0019 CalendarEvent reader/writer—Caddy, API, Worker, and Scheduler—while PostgreSQL and Redis remain running; confirm no old `sync_calendar`, event read, or upsert remains; back up and run the pre-migration audit; apply 0019; run the post-migration audit; make the v2-only immutable image available while all four general services remain stopped; run only `just calendar-aad-resync-0019`; run the post-resync audit; only after it passes start API/Worker/Scheduler/Caddy; and then require `just health`. Cursor mutation and all evidence must use the exact `(connection_id, calendar_id)` pair, never `calendar_id` alone. Task 27 documents and tests this contract but does not execute production changes, and Task 16A test success must not be treated as rolling-deployment evidence.
+
+Implement `just calendar-aad-resync-0019` with no pair/user argument. Before starting its one-off container,
+the host recipe must inspect Compose state and fail when `caddy`, `api`, `worker`, or `scheduler` is running. It
+uses the already selected immutable v2 image and the `worker` service's existing Secret/environment mounts, but
+uses `--no-deps --entrypoint /bin/sh` and a fixed command that reads only
+`/run/secrets/app_database_password` into `PGPASSWORD` before `exec uv run --no-sync python -m
+ai_employee.cli.calendar_aad_0019`; PostgreSQL and Redis remain running, while no Taskiq process or general
+queue consumer starts. A zero-marker run succeeds as an evidenced no-op. Any failed or remaining marker stops
+the rollout before `post-resync` can pass.
+
+After the stopped-service precheck, the recipe's container invocation is exactly:
+
+~~~bash
+docker compose run --rm --no-deps --entrypoint /bin/sh worker -ec \
+  'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_0019'
+~~~
 
 Implement `just calendar-aad-audit phase artifact` with exactly three accepted phases: `pre-migration`, `post-migration`, and `post-resync`. Treat `artifact` as a safe basename/path prefix and write a distinct `${artifact}.calendar-aad-${phase}.json` file for each phase. The script is read-only, obtains database access from the existing Compose secret boundary, creates phase artifacts with mode `0600`, and never prints or stores a DSN, event body, description/location plaintext, or raw `calendar_id`. Artifacts contain only the Alembic revision, row/ciphertext digests, locally hashed scope identifiers, affected count, and the content-free checks needed for comparison.
 
@@ -3908,11 +4030,24 @@ The phase contract is fixed:
 - `post-migration` requires revision 0019, proves event identity/non-AAD business-row summaries and ciphertext/nonce/key-version digests are unchanged, verifies the expected v1/NULL version marking, confirms directory state is unchanged, and shows that only the exact affected pair's cursor/freshness/error marker changed.
 - `post-resync` proves all affected markers are cleared, cursor/freshness is restored, every non-empty field newly written during this recovery is v2, and reports the remaining historical v1 count without attempting to decrypt v1 content.
 
-`scripts/test-calendar-aad-0019-audit.sh` must use only the Task 13 synthetic PostgreSQL database and cover two connections sharing one `calendar_id`, a single affected connection, exact-pair marker isolation, missing-cursor preflight failure, all three phases, `0600` permissions, and forbidden-output scans. The repository currently has no production bounded Calendar resync recipe. Task 27 is not complete until it wires an existing typed v2-only Worker/scope application boundary into the deployment process and replaces the runbook's bounded-resync instruction with the exact tested entry; it must not invent a direct SQL mutation, use a full-account sync, or describe an unimplemented command as already available.
+`scripts/test-calendar-aad-0019-audit.sh` must use only the Task 13 synthetic PostgreSQL database and cover two connections sharing one `calendar_id`, a single affected connection, exact-pair marker isolation, missing-cursor preflight failure, all three phases, `0600` permissions, and forbidden-output scans. Task 27 is not complete until both the recovery integration test and tooling test prove the exact one-off entry above; it must not invent a direct SQL mutation, use a full-account sync, start the ordinary Scheduler/Worker, or describe an unimplemented command as already available.
 
 Extend `scripts/test-deployment.sh` to assert write switches default off, Microsoft secret-file mounts, no host publication of internal metrics ports, and no secret values in rendered Compose.
 
-- [ ] **Step 6: Run retention, privacy, deployment, and role checks**
+- [ ] **Step 9: Run recovery, retention, privacy, deployment, and role checks**
+
+Run the exact recovery integration first:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/integration/operations/test_calendar_aad_0019_recovery.py \
+  -q
+~~~
+
+Expected: PASS with marker-only task creation, one TaskRun/Outbox under replay and concurrency, zero directory
+reads, exact-pair provider isolation, marker-aware final CAS, unrelated queue preservation, and no trusted-write
+facts or calls.
 
 Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_role_permissions.py -q`
 
@@ -3928,14 +4063,26 @@ Expected: PASS.
 
 Run: `bash scripts/test-tooling.sh`
 
-Expected: PASS, including safe explicit backup basename handling, collision/path rejection, and the exact three-phase audit recipe CLI without secret output.
+Expected: PASS, including safe explicit backup basename handling, collision/path rejection, the exact three-phase audit recipe, refusal while any general service is running, and a one-off recovery command that starts neither Taskiq nor a general queue consumer.
 
-Then run `git diff --check` and inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, exact-pair preflight/mutation, three-phase artifact contract, bounded v2-only resync handoff, and 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
-
-- [ ] **Step 7: Commit**
+Run:
 
 ~~~bash
-git add backend/src/ai_employee/workers/retention.py backend/src/ai_employee/workers/privacy.py backend/src/ai_employee/application/use_cases/privacy.py backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py backend/src/ai_employee/integrations/registry.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_m2_action_retention.py docs/operations.md docs/acceptance-checklist.md scripts/audit-calendar-aad-0019.sh scripts/test-calendar-aad-0019-audit.sh scripts/backup-postgres.sh justfiles/ops.just scripts/test-tooling.sh scripts/test-deployment.sh
+uv run --project backend ruff check backend/src backend/tests
+uv run --project backend ruff format --check backend/src backend/tests
+uv run --project backend mypy backend/src
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test just check
+git diff --check
+~~~
+
+Expected: PASS with no real-provider access.
+
+Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, post-migration stopped-service interval, exact marker-only task creation and execution, exact-pair preflight/mutation, three-phase artifact contract, post-resync-before-start gate, and 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
+
+- [ ] **Step 10: Commit**
+
+~~~bash
+git add backend/src/ai_employee/workers/retention.py backend/src/ai_employee/workers/privacy.py backend/src/ai_employee/application/use_cases/privacy.py backend/src/ai_employee/application/use_cases/calendar_aad_recovery.py backend/src/ai_employee/application/use_cases/sync_calendar.py backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_recovery.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py backend/src/ai_employee/integrations/registry.py backend/src/ai_employee/workers/sync_calendar.py backend/src/ai_employee/workers/execute_task.py backend/src/ai_employee/cli/calendar_aad_0019.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/operations/test_calendar_aad_0019_recovery.py docs/operations.md docs/acceptance-checklist.md scripts/audit-calendar-aad-0019.sh scripts/test-calendar-aad-0019-audit.sh scripts/backup-postgres.sh justfiles/ops.just scripts/test-tooling.sh scripts/test-deployment.sh
 git commit -m "feat: protect M2 action lifecycle data"
 ~~~
 
@@ -4180,13 +4327,13 @@ Expected: PASS with fresh output from `just ci`, all crash cases, deployment con
 
 After the automated gate passes, stop before enabling real writes and request the user's explicit authorization plus out-of-band dedicated Google/Microsoft test-account configuration. Run the manual matrix only in a separate environment with the global/provider switches and exact account allowlist enabled. If authorization is not supplied, leave Task 30 incomplete and do not create a blank release-evidence document or claim M2 release completion.
 
-If the target release environment has not yet applied 0019, the release operator must use the approved change window to execute the non-rolling `docs/operations.md` sequence before enabling real writes: stop new ingress and scheduling; drain all pre-0019 Caddy/API/Worker/Scheduler CalendarEvent readers/writers while PostgreSQL/Redis remain running; back up and capture the pre-migration audit artifact; migrate and capture the post-migration artifact; deploy v2-only immutable components; perform bounded resync; capture the post-resync artifact; and verify each affected exact pair. Neither `scripts/test-m2-release.sh` nor Task 16A may automate these production actions. Do not continue to the provider matrix while any affected scope lacks recovered cursor/freshness, retains `calendar_event_resync_required`, or has synchronized non-empty fields that are not v2.
+If the target release environment has not yet applied 0019, the release operator must use the approved change window to execute the non-rolling `docs/operations.md` sequence before enabling real writes: stop new ingress and scheduling; drain all pre-0019 Caddy/API/Worker/Scheduler CalendarEvent readers/writers while PostgreSQL/Redis remain running; back up and capture the pre-migration audit artifact; migrate and capture the post-migration artifact; make the v2-only immutable image available while all general services remain stopped; run only `just calendar-aad-resync-0019`; capture and pass the post-resync artifact; then start API/Worker/Scheduler/Caddy, run health checks, and verify each affected exact pair. Neither `scripts/test-m2-release.sh` nor Task 16A may automate these production actions. Do not continue to the provider matrix while any affected scope lacks recovered cursor/freshness, retains `calendar_event_resync_required`, has synchronized non-empty fields that are not v2, or while the post-resync audit has not passed before general service startup.
 
 - [ ] **Step 7: Write the completed release-evidence record**
 
 Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision.
 
-The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; confirmation that no legacy reader or upsert remained; backup and migration identifiers without secrets; deployed v2-only image digest; and references plus checksums for the `pre-migration`, `post-migration`, and `post-resync` audit artifacts. Record the exact affected `(connection_id, calendar_id)` set using internal connection UUIDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and the v2-only bounded-resync result. If there were zero affected scopes, record an explicit evidenced zero rather than omitting the section. Record the immutable 0019-compatible rollback-floor image as well. Every row must contain evidence or an explicit failed result with disposition; the file must contain no blank field or future-action marker, and the artifacts must contain no DSN, plaintext content, or raw provider calendar ID.
+The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; confirmation that no legacy reader or upsert remained; backup and migration identifiers without secrets; deployed v2-only image digest; the one-off `calendar-aad-resync-0019` start/finish result; proof that no ordinary Worker/Scheduler/API/Caddy was running during recovery; the post-resync audit completion time preceding general service startup; and references plus checksums for the `pre-migration`, `post-migration`, and `post-resync` audit artifacts. Record the exact affected `(connection_id, calendar_id)` set using internal connection UUIDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and the dedicated exact-pair recovery task/result. If there were zero affected scopes, record an explicit evidenced zero rather than omitting the section. Record the immutable 0019-compatible rollback-floor image as well. Every row must contain evidence or an explicit failed result with disposition; the file must contain no blank field or future-action marker, and the artifacts must contain no DSN, plaintext content, or raw provider calendar ID.
 
 - [ ] **Step 8: Commit**
 
@@ -4202,7 +4349,7 @@ git commit -m "test: freeze M2 release evidence"
 - Draft generation/editing, reply/reply-all rules, recipient limits, model minimization, empty fallback, and no provider draft: Tasks 2, 11, 14–15, 21, and 23.
 - Calendar directory, working hours, buffer, 15-minute grid, 14-day horizon, three candidates, completeness, create/update/restore, ETag, attendees, and notification policy: Tasks 4, 12–13, 16–17, 22, and 24.
 - Calendar proposal trust hardening, including time-valid Worker leases, independent freshness observation, fixed-query minimal projections, transaction-free merged-interval computation, expected-version CAS, exact restore input, explicit-confirmation invariants, and operation-specific readiness: Task 16A.
-- CalendarEvent field AAD v2, forward-only 0019 rotation, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention and the non-rolling operations contract: Task 27; scope-by-scope rollout evidence and the 0019-compatible rollback floor: Task 30.
+- CalendarEvent field AAD v2, forward-only 0019 rotation, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention, marker-only `calendar.aad_0019.resync` task creation, exact-scope one-off execution, and the post-resync-before-start operations contract: Task 27; scope-by-scope rollout evidence and the 0019-compatible rollback floor: Task 30.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
 - Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, and 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.
@@ -4214,6 +4361,6 @@ git commit -m "test: freeze M2 release evidence"
 2. Tasks 7–13 generalize reads and add Microsoft/Google parity. Checkpoint: both providers pass OAuth plus incremental mail/calendar contract tests with real writes still disabled.
 3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14 → Task 16 → Task 16A → Task 18 → Task 15 → Task 17 → Tasks 19–20. Task 16A must close calendar lease, freshness, bounded-query, transaction, confirmation, restore-input, and CalendarEvent AAD v2/0019 trust gaps before any proposal version can be frozen. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
 4. Tasks 21–24 add one high-risk provider write path per task and commit. Checkpoint: each adapter independently passes success, rejection, timeout, unknown-result, reconciliation, and duplicate-delivery contracts before starting the next adapter.
-5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, and retention-role suites pass.
+5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, retention-role, marker-only exact-pair recovery, stopped-service one-off, and post-resync-before-start suites pass.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.
 7. Task 30 runs the full automated gate, pauses for explicit provider-account authorization, performs the dedicated Google/Microsoft matrix, and writes a fully evidenced final release record. Without that authorization, Task 30 remains incomplete.

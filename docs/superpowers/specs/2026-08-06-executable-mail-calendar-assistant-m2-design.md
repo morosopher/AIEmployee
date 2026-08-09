@@ -1171,6 +1171,12 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   `calendar_id`、但只有一个 connection 存在 v1 字段的场景，证明另一 connection 的游标完全不变；
   还必须证明缺失任一精确 scope 游标会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且数据
   原样保留。
+- `0019` 恢复入口只扫描 `calendar_event_resync_required` marker，并以稳定任务种类
+  `calendar.aad_0019.resync` 为每个精确 pair 原子创建 `TaskRun + AuditEvent + Outbox`。集成测试必须
+  证明同一 pair 的重复/并发入口只产生一个任务和一条初始 Outbox、两个 connection 复用同一
+  `calendar_id` 时只读取被标记者、目录 reader 调用次数为零、普通 `sync_calendar` 队列事实保持
+  未处理、成功时只清除同一 marker 并恢复 cursor/freshness、失败时保留 marker，且整个流程不创建
+  ApprovalRequest、ToolExecution 或任何供应商写调用。
 - 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
   v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
   且任何路径都不得回退尝试 v1 AAD。
@@ -1249,8 +1255,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - Microsoft 完整日历目录不伪造 provider cursor；并发快照通过独立 revision CAS 拒绝陈旧提交，
   只有已声明完整的快照才执行缺席删除。
 - `0019` 不改变或删除 CalendarEvent 业务行和 directory revision；受影响事件 scope 会失去旧
-  cursor/freshness，并在 v2-only Worker 下完成受限重同步后清除
-  `calendar_event_resync_required`。
+  cursor/freshness。恢复只能由 v2-only one-off 入口执行：它从 marker 推导精确
+  `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
+  cursor 与 freshness 后清除 `calendar_event_resync_required`。该入口和 `post-resync` 审计完成前，
+  通用 Scheduler、普通 Taskiq Worker、API 与 Caddy 必须保持停止。
 
 ### 21.4 安全与隐私
 
@@ -1299,14 +1307,26 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
    每个受影响 `(connection_id, calendar_id)` 都有精确的非 directory 游标。
 4. 应用前向 `0019` 并执行迁移后只读审计，验证只新增版本列/约束、v1 标记和精确 pair 的事件 scope
    游标失效，其他 connection 的同名 calendar、directory cursor/revision 与全部事件 AEAD 字节均未变化。
-5. 部署只写 v2、正常读取拒绝 v1 的不可变 API/Worker/Scheduler/Caddy 镜像。0019 不支持旧新
-   Calendar reader/writer 混跑，任何旧组件都不得在迁移后回流。
-6. 通过 Task 27 提供的 v2-only 有界入口，只对 `calendar_event_resync_required` 的精确 pair 执行重同步；
-   再执行重同步后只读审计，验证新密文均为 v2、对应 cursor/freshness 恢复且错误清除后，才继续
-   发布验证。该入口在 Task 27 落地前不得以临时全量同步命令替代。
-7. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
-8. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查。
-9. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
+5. 使只写 v2、正常读取拒绝 v1 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、
+   普通 Worker 与 Scheduler 停止；0019 不支持旧新 Calendar reader/writer 混跑，任何旧组件都不得回流。
+6. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口只扫描
+   `calendar_event_resync_required` marker，通过用户隔离的应用用例与 Repository 为每个精确 pair
+   原子创建 `calendar.aad_0019.resync` TaskRun、审计和初始 Outbox；任务输入固定为
+   `connection_id`、`scope_key` 与 `recovery_revision=20260809_0019`，幂等键由 revision 与精确 pair
+   的稳定摘要生成。CLI 只精确分派并以内联 `DurableTaskRunner` 执行本次返回的恢复任务，不启动
+   Taskiq Worker、不扫描普通队列，也不发布或执行无关 `sync_calendar` 任务。
+7. 专用恢复任务步骤在供应商访问前重新验证 canonical task input、TaskRun 用户归属、现存非
+   `directory` 精确 cursor、marker、连接读取能力与目录中的同一 calendar；任一条件不满足都以无
+   供应商调用的幂等 no-op 或稳定失败结束。有效任务只调用单日历事件 scope 路径，不调用
+   `directory_pages()`、连接级 owner 或其他 provider/calendar；完成提交必须以 marker 为 CAS 前提，
+   失败保留 marker。该流程只读供应商并写本地同步事实，不创建审批、ToolExecution 或真实写操作。
+8. 执行 `post-resync` 只读审计，验证新密文均为 v2、每个精确 pair 的 cursor/freshness 恢复且 marker
+   清除。任一 pair 失败时保持所有通用服务和真实写开关关闭，禁止改用直接 SQL、临时全量同步或
+   connection-level directory sync。
+9. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy，运行
+   `just health`，并验证 M1 登录、普通同步、简报、审批假工具和任务恢复。
+10. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查；最后再打开正式环境
+    供应商开关，每个连接仍需用户单独渐进授权。
 
 回滚应用镜像时，新表和列保留。一旦应用 `0019`，应用回滚下限就是理解 AAD 版本列、拒绝 v1
 读取并且只写 v2 的 0019-compatible 镜像；无论 M2 任务是否均为终态，都不得回滚到
