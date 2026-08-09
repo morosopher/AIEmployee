@@ -20,7 +20,7 @@ ScenarioConsumer = Callable[[UUID], Awaitable[str | None]]
 
 
 class FakeModelGateway:
-    """按 source_id 生成稳定结果，可模拟两次非法 JSON。"""
+    """按 source_id 生成稳定结果，可模拟非法 JSON 或注入草稿正文。"""
 
     def __init__(
         self,
@@ -29,6 +29,7 @@ class FakeModelGateway:
         metrics: Metrics | None = None,
         scenario_consumer: ScenarioConsumer | None = None,
         user_id: UUID | None = None,
+        mail_draft_body: str = "Synthetic mail draft body.",
     ) -> None:
         self.scenario = scenario or os.getenv("FAKE_MODEL_SCENARIO", "normal")
         self.calls: list[Sequence[dict[str, str]]] = []
@@ -36,6 +37,7 @@ class FakeModelGateway:
         self._metrics = metrics
         self._scenario_consumer = scenario_consumer
         self._user_id = user_id
+        self._mail_draft_body = mail_draft_body
 
     async def complete(
         self,
@@ -82,10 +84,9 @@ class FakeModelGateway:
                 reason_codes=["fake_deterministic"],
             )
         elif response_model.__name__ == "MailDraftModelOutput":
-            # 避免反向导入 Worker 形成循环；严格 Schema 名只用于已批准的离线草稿评测。
-            value = response_model.model_validate(
-                {"body_text": "Synthetic mail draft body."}
-            )
+            # 避免反向导入 Worker 形成循环；由传入 Schema 验证确定性的合成正文，
+            # 让离线评测穿过真实模型端口而不把 fixture 直接伪装成 Pydantic 输出。
+            value = response_model.model_validate({"body_text": self._mail_draft_body})
         else:
             value = response_model.model_validate({})
         usage = ModelUsage(output_tokens=1 if self.scenario == "partial" else 0)

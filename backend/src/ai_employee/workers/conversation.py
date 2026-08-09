@@ -17,14 +17,19 @@ from ai_employee.application.use_cases.conversations import (
     parse_mail_draft_conversation_request,
     unsupported_response,
 )
-from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
+from ai_employee.application.use_cases.mail_drafts import (
+    CreateMailDraftInput,
+    MailDraftUseCase,
+)
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
+from ai_employee.domain.mail_actions import MailMode
 from ai_employee.infrastructure.db.models.briefs import (
     DailyBriefModel,
     LLMInvocationModel,
     MessageModel,
 )
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
@@ -120,13 +125,28 @@ class ConversationTaskStep:
                     use_case = MailDraftUseCase(
                         drafts=repository,
                         connections=repository,
+                        sources=SqlAlchemyMailSyncRepository(session),
                         clock=self._clock,
                     )
-                    draft = await use_case.create_new(
-                        user_id=task.user_id,
-                        idempotency_key=f"conversation-mail-draft:{task.task_id}",
-                        to=request.to_recipients,
-                    )
+                    if request.mode is MailMode.NEW:
+                        draft = await use_case.create_new(
+                            user_id=task.user_id,
+                            idempotency_key=f"conversation-mail-draft:{task.task_id}",
+                            to=request.to_recipients,
+                        )
+                    else:
+                        if request.source_thread_id is None:
+                            raise ValueError("reply conversation command requires source thread")
+                        draft = await use_case.create(
+                            CreateMailDraftInput(
+                                user_id=task.user_id,
+                                mode=MailMode.REPLY,
+                                idempotency_key=(
+                                    f"conversation-mail-draft:{task.task_id}"
+                                ),
+                                source_thread_id=str(request.source_thread_id),
+                            )
+                        )
                     text = (
                         "已创建可编辑的本地邮件草稿："
                         f"[打开草稿](/api/v1/mail/drafts/{draft.draft_id})。"

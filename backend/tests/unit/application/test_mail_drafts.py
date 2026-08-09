@@ -13,7 +13,7 @@ from ai_employee.application.use_cases.mail_drafts import (
     UpdateMailDraftInput,
 )
 from ai_employee.domain.actions import MailDraftStatus
-from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode
 
@@ -33,10 +33,28 @@ class _Connection:
         self.provider = "google"
 
 
+class _CapabilityState:
+    """测试用最小能力投影，不包含 scope、token 或供应商响应。"""
+
+    def __init__(
+        self,
+        *,
+        capability: ConnectionCapability,
+        status: CapabilityStatus,
+        last_error_code: str | None = None,
+    ) -> None:
+        self.capability = capability
+        self.status = status
+        self.last_error_code = last_error_code
+
+
 class _Connections:
     def __init__(self) -> None:
         self.connections = [_Connection()]
         self.capabilities = {ConnectionCapability.MAIL_SEND, ConnectionCapability.MAIL_READ}
+        self.capability_overrides: dict[
+            ConnectionCapability, tuple[CapabilityStatus, str | None]
+        ] = {}
 
     async def get_connection(self, *, user_id, connection_id):
         return next(
@@ -55,6 +73,31 @@ class _Connections:
         if any(value.id == connection_id and value.user_id == user_id for value in self.connections):
             return frozenset(self.capabilities)
         return None
+
+    async def get_capability_states(self, *, user_id, connection_id):
+        """返回当前连接的类型化状态，供新错误分类边界测试。"""
+        if not any(
+            value.id == connection_id and value.user_id == user_id
+            for value in self.connections
+        ):
+            return None
+        states = []
+        for capability in ConnectionCapability:
+            override = self.capability_overrides.get(capability)
+            if override is not None:
+                status, last_error_code = override
+            elif capability in self.capabilities:
+                status, last_error_code = CapabilityStatus.ENABLED, None
+            else:
+                continue
+            states.append(
+                _CapabilityState(
+                    capability=capability,
+                    status=status,
+                    last_error_code=last_error_code,
+                )
+            )
+        return tuple(states)
 
     async def get_default_mail_connection(self, *, user_id):
         return self.connections[0] if user_id == USER_ID else None
@@ -357,6 +400,50 @@ async def test_send_connection_requires_enabled_mail_read_dependency() -> None:
         )
 
     assert unavailable.value.error_code == "connection_capability_disabled"
+    assert drafts.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "last_error_code", "expected_error_code"),
+    (
+        (CapabilityStatus.DISABLED, None, "connection_capability_disabled"),
+        (CapabilityStatus.AUTHORIZING, None, "connection_capability_disabled"),
+        (CapabilityStatus.DEGRADED, None, "connection_capability_disabled"),
+        (CapabilityStatus.ACTION_REQUIRED, None, "connection_scope_missing"),
+        (CapabilityStatus.REVOKED, None, "connection_scope_missing"),
+        (
+            CapabilityStatus.DEGRADED,
+            "connection_scope_missing",
+            "connection_scope_missing",
+        ),
+    ),
+)
+async def test_send_capability_state_distinguishes_local_disable_from_missing_scope(
+    status: CapabilityStatus,
+    last_error_code: str | None,
+    expected_error_code: str,
+) -> None:
+    """本地不可用与需重新授权必须返回不同稳定错误，且均不得创建草稿。"""
+    drafts = _Drafts()
+    connections = _Connections()
+    connections.capability_overrides[ConnectionCapability.MAIL_SEND] = (
+        status,
+        last_error_code,
+    )
+    use_case = MailDraftUseCase(
+        drafts=drafts,
+        connections=connections,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(StateConflictError) as captured:
+        await use_case.create_new(
+            user_id=USER_ID,
+            idempotency_key=f"capability-state-{status.value}",
+        )
+
+    assert captured.value.error_code == expected_error_code
     assert drafts.calls == []
 
 

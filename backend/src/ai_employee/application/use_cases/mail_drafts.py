@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ai_employee.domain.actions import MailDraftStatus
-from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import (
     MailMode,
@@ -266,6 +266,18 @@ class MailDraftRepository(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class MailDraftCapabilitySnapshot:
+    """表示草稿发送校验所需的最小连接能力投影。
+
+    该类型只携带稳定能力、状态和脱敏错误码，不暴露实际 scope、token 或供应商响应。
+    """
+
+    capability: ConnectionCapability
+    status: CapabilityStatus
+    last_error_code: str | None
+
+
 class MailDraftConnectionReader(Protocol):
     """读取用户默认连接、显式连接、能力与保留设置的应用端口。"""
 
@@ -281,10 +293,10 @@ class MailDraftConnectionReader(Protocol):
         """列出用户全部连接，供排除所有主账户地址。"""
         ...
 
-    async def get_enabled_capabilities(
+    async def get_capability_states(
         self, *, user_id: UUID, connection_id: UUID
-    ) -> frozenset[ConnectionCapability] | None:
-        """返回精确连接当前 enabled 能力集合。"""
+    ) -> tuple[MailDraftCapabilitySnapshot, ...] | None:
+        """返回精确连接的最小能力状态；不存在或断开时返回 ``None``。"""
         ...
 
     async def get_mail_draft_retention_days(self, *, user_id: UUID) -> int | None:
@@ -658,17 +670,44 @@ class MailDraftUseCase:
         return connection, source
 
     async def _require_send_connection(self, *, user_id: UUID, connection: object | None) -> None:
-        """要求连接属于用户、保持 connected 且精确启用 ``mail.send``。"""
+        """要求连接属于用户、保持 connected 且读写能力均为 enabled。
+
+        ``action_required``、``revoked`` 或显式 ``connection_scope_missing`` 表示用户
+        必须重新授权；其余本地不可用状态返回 capability disabled。两类错误不能由前端
+        猜测，也不能通过寻找另一个非默认连接静默回退。
+        """
         if connection is None or _str_attr(connection, "status") != "connected":
             raise _connection_capability_disabled()
         connection_id = _uuid_attr(connection, "id")
-        capabilities = await self._connections.get_enabled_capabilities(
+        capabilities = await self._connections.get_capability_states(
             user_id=user_id, connection_id=connection_id
         )
-        required = frozenset(
-            {ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND}
+        if capabilities is None:
+            raise _connection_capability_disabled()
+        by_capability = {snapshot.capability: snapshot for snapshot in capabilities}
+        required = (
+            ConnectionCapability.MAIL_SEND,
+            ConnectionCapability.MAIL_READ,
         )
-        if capabilities is None or not required.issubset(capabilities):
+        required_states = tuple(
+            by_capability.get(capability) for capability in required
+        )
+        if any(snapshot is None for snapshot in required_states):
+            raise _connection_capability_disabled()
+        if any(
+            snapshot is not None
+            and (
+                snapshot.last_error_code == "connection_scope_missing"
+                or snapshot.status
+                in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
+            )
+            for snapshot in required_states
+        ):
+            raise _connection_scope_missing()
+        if any(
+            snapshot is None or snapshot.status is not CapabilityStatus.ENABLED
+            for snapshot in required_states
+        ):
             raise _connection_capability_disabled()
 
     async def _resolve_recipients(
@@ -925,6 +964,14 @@ def _connection_capability_disabled() -> StateConflictError:
     )
 
 
+def _connection_scope_missing() -> StateConflictError:
+    """构造实际委托 scope 缺失或已撤销时的固定重新授权错误。"""
+    return StateConflictError(
+        error_code="connection_scope_missing",
+        message="mail send requires reauthorization for the selected connection",
+    )
+
+
 def _thread_binding_conflict() -> StateConflictError:
     """构造不回显来源 ID、地址或主题的线程绑定冲突。"""
     return StateConflictError(
@@ -950,6 +997,7 @@ __all__ = [
     "MAX_MAIL_RECIPIENTS",
     "MAX_RECIPIENT_SUGGESTIONS",
     "CreateMailDraftInput",
+    "MailDraftCapabilitySnapshot",
     "MailDraftConnectionReader",
     "MailDraftNotFoundError",
     "MailDraftRecipient",

@@ -1,19 +1,26 @@
 """验证 M1 对话 API、幂等消息及 worker 意图边界。"""
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from uuid import UUID
+from typing import TypeVar
+from uuid import UUID, uuid4
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from ai_employee.application.ports.model import ModelResponse, ModelUsage
 from ai_employee.application.use_cases.conversations import UNSUPPORTED_RESPONSE
 from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.domain.briefs import ConversationIntent
 from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.infrastructure.db.models.actions import MailDraftModel, MailDraftVersionModel
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel, MessageModel
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
+    EmailMessageModel,
+    EmailThreadModel,
     OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.models.tasks import (
@@ -27,6 +34,35 @@ from ai_employee.integrations.llm.fake import FakeModelGateway
 from ai_employee.workers.conversation import ConversationTaskStep
 
 from .conftest import AuthenticatedApiClients
+
+TModel = TypeVar("TModel", bound=BaseModel)
+
+
+class _PrepareMailDraftIntentGateway:
+    """模拟模型错误选择草稿意图，验证 Worker 仍重新执行确定性解析。"""
+
+    def __init__(self) -> None:
+        self.calls: list[Sequence[dict[str, str]]] = []
+
+    async def complete(
+        self,
+        *,
+        model_name: str,
+        prompt_version: str,
+        messages: Sequence[dict[str, str]],
+        response_model: type[TModel],
+    ) -> ModelResponse[TModel]:
+        """返回合法但不可信的 ``prepare_mail_draft`` 结构化分类。"""
+        del model_name, prompt_version
+        self.calls.append(messages)
+        value = response_model.model_validate(
+            ConversationIntent(
+                intent="prepare_mail_draft",
+                confidence=1,
+                reason_code="synthetic_model_choice",
+            ).model_dump()
+        )
+        return ModelResponse(value=value, usage=ModelUsage())
 
 
 async def _create_conversation(clients: AuthenticatedApiClients) -> UUID:
@@ -160,7 +196,7 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
             idempotency_key="conversation-explicit-mail-draft",
             input_payload={
                 "conversation_id": str(conversation_id),
-                "content": "请给Recipient@Example.Test起草邮件",
+                "content": 'Please prepare an email to "quoted local"@Example.Test',
             },
         )
         session.add(task)
@@ -173,6 +209,16 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
         clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
     )
 
+    await step.execute(
+        LeasedTask(
+            task_id=task.id,
+            user_id=clients.owner_id,
+            kind=task.kind,
+            input_payload=task.input_payload,
+            started_at=datetime.now(UTC),
+        )
+    )
+    # Taskiq 至少一次重复投递不得创建第二封草稿或第二条 assistant 回复。
     await step.execute(
         LeasedTask(
             task_id=task.id,
@@ -207,13 +253,277 @@ async def test_explicit_mail_draft_request_creates_only_editable_local_draft_and
         )
     assert draft is not None and draft.status == "editing" and draft.current_version == 1
     assert version is not None and version.to_recipients == [
-        {"address": "Recipient@example.test"}
+        {"address": '"quoted local"@example.test'}
     ]
     assert reply is not None
     assert f"/api/v1/mail/drafts/{draft.id}" in reply.content_markdown
     assert "不会发送" in reply.content_markdown
     assert approval_count == 0 and execution_count == 0
     assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command_template",
+    (
+        "prepare an email reply to thread {thread_id}",
+        "请准备对线程 {thread_id} 的邮件回复",
+    ),
+)
+async def test_explicit_local_thread_reply_creates_bound_draft_once_without_write_facts(
+    authenticated_api_clients: AuthenticatedApiClients,
+    command_template: str,
+) -> None:
+    """明确本地线程 UUID 回复命令必须绑定最新消息和原连接，重放仍只有一封草稿。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    # 本地 PostgreSQL UUID 并不限定版本；使用规范 UUIDv7 防止命令正则意外只接受 v1-v5。
+    thread_id = UUID("00000000-0000-7000-8000-000000000701")
+    message_id = uuid4()
+    async with clients.session_factory.begin() as session:
+        connection = OAuthConnectionModel(
+            user_id=clients.owner_id,
+            provider="google",
+            provider_account_id="synthetic-conversation-reply",
+            account_email="owner@example.test",
+            scopes=[],
+            status="connected",
+        )
+        session.add(connection)
+        await session.flush()
+        session.add_all(
+            ConnectionCapabilityModel(
+                user_id=clients.owner_id,
+                connection_id=connection.id,
+                capability=capability.value,
+                status="enabled",
+                actual_scopes=[],
+            )
+            for capability in (
+                ConnectionCapability.MAIL_READ,
+                ConnectionCapability.MAIL_SEND,
+            )
+        )
+        owner = await session.get(UserModel, clients.owner_id)
+        assert owner is not None
+        owner.default_mail_connection_id = connection.id
+        await session.flush()
+        session.add(
+            EmailThreadModel(
+                id=thread_id,
+                user_id=clients.owner_id,
+                connection_id=connection.id,
+                provider_thread_id="provider-conversation-thread",
+                subject="Synthetic reply subject",
+                participants=[],
+                latest_message_at=datetime(2026, 8, 9, 9, 0, tzinfo=UTC),
+                provider_url="https://provider.example.test/thread/reply",
+            )
+        )
+        await session.flush()
+        session.add(
+            EmailMessageModel(
+                id=message_id,
+                user_id=clients.owner_id,
+                connection_id=connection.id,
+                thread_id=thread_id,
+                provider_message_id="provider-conversation-message",
+                received_at=datetime(2026, 8, 9, 9, 0, tzinfo=UTC),
+                mailbox_scope_key="mailbox",
+                sender={"email": "peer@example.test"},
+                recipients=[{"email": "owner@example.test"}],
+                subject="Synthetic reply subject",
+                snippet="Synthetic reply snippet",
+                labels=["INBOX"],
+                headers={},
+                provider_url="https://provider.example.test/message/reply",
+            )
+        )
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            idempotency_key="conversation-explicit-thread-reply",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": command_template.format(thread_id=thread_id),
+            },
+        )
+        session.add(task)
+        await session.flush()
+
+    gateway = FakeModelGateway()
+    step = ConversationTaskStep(
+        clients.session_factory,
+        model_gateway=gateway,
+        action_cipher=ActionPayloadCipher.from_key(b"r" * 32),
+        clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+    )
+    leased = LeasedTask(
+        task_id=task.id,
+        user_id=clients.owner_id,
+        kind=task.kind,
+        input_payload=task.input_payload,
+        started_at=datetime.now(UTC),
+    )
+
+    await step.execute(leased)
+    await step.execute(leased)
+
+    async with clients.session_factory() as session:
+        drafts = tuple(
+            (
+                await session.scalars(
+                    select(MailDraftModel).where(
+                        MailDraftModel.user_id == clients.owner_id
+                    )
+                )
+            ).all()
+        )
+        version = await session.scalar(
+            select(MailDraftVersionModel).where(
+                MailDraftVersionModel.user_id == clients.owner_id
+            )
+        )
+        reply_count = await session.scalar(
+            select(func.count()).select_from(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
+        approval_count = await session.scalar(
+            select(func.count()).select_from(ApprovalRequestModel)
+        )
+        execution_count = await session.scalar(
+            select(func.count()).select_from(ToolExecutionModel)
+        )
+    assert len(drafts) == 1
+    assert drafts[0].mode == "reply"
+    assert drafts[0].connection_id == connection.id
+    assert drafts[0].source_thread_id == "provider-conversation-thread"
+    assert drafts[0].source_message_id == "provider-conversation-message"
+    assert version is not None
+    assert version.subject == "Re: Synthetic reply subject"
+    assert version.to_recipients == [{"address": "peer@example.test"}]
+    assert reply_count == 1
+    assert approval_count == 0 and execution_count == 0
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    (
+        "Can you explain how to prepare an email?",
+        "Do not prepare an email.",
+        "如何准备邮件？",
+        "不要创建邮件草稿",
+    ),
+)
+async def test_mail_questions_and_negations_never_create_drafts(
+    authenticated_api_clients: AuthenticatedApiClients,
+    content: str,
+) -> None:
+    """能力询问、说明性文本和中英文否定句都必须 fail closed 为边界说明。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    async with clients.session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            idempotency_key=f"conversation-negative-mail-{uuid4()}",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": content,
+            },
+        )
+        session.add(task)
+        await session.flush()
+    gateway = FakeModelGateway()
+    step = ConversationTaskStep(
+        clients.session_factory,
+        model_gateway=gateway,
+        action_cipher=ActionPayloadCipher.from_key(b"n" * 32),
+    )
+
+    await step.execute(
+        LeasedTask(
+            task_id=task.id,
+            user_id=clients.owner_id,
+            kind=task.kind,
+            input_payload=task.input_payload,
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    async with clients.session_factory() as session:
+        draft_count = await session.scalar(
+            select(func.count()).select_from(MailDraftModel).where(
+                MailDraftModel.user_id == clients.owner_id
+            )
+        )
+        reply = await session.scalar(
+            select(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
+    assert draft_count == 0
+    assert reply is not None and reply.content_markdown == UNSUPPORTED_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_model_selected_mail_draft_intent_is_rejected_without_explicit_command(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """模型只能分类歧义文本，不能凭结构化输出选择收件人、账户或线程并创建动作。"""
+    clients = authenticated_api_clients
+    conversation_id = await _create_conversation(clients)
+    async with clients.session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=clients.owner_id,
+            kind="conversation.respond",
+            status="running",
+            idempotency_key="conversation-model-cannot-create-draft",
+            input_payload={
+                "conversation_id": str(conversation_id),
+                "content": "Could you outline what this assistant can do?",
+            },
+        )
+        session.add(task)
+        await session.flush()
+    gateway = _PrepareMailDraftIntentGateway()
+    step = ConversationTaskStep(clients.session_factory, model_gateway=gateway)
+
+    await step.execute(
+        LeasedTask(
+            task_id=task.id,
+            user_id=clients.owner_id,
+            kind=task.kind,
+            input_payload=task.input_payload,
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    async with clients.session_factory() as session:
+        draft_count = await session.scalar(
+            select(func.count()).select_from(MailDraftModel).where(
+                MailDraftModel.user_id == clients.owner_id
+            )
+        )
+        reply = await session.scalar(
+            select(MessageModel).where(
+                MessageModel.user_id == clients.owner_id,
+                MessageModel.task_id == task.id,
+                MessageModel.role == "assistant",
+            )
+        )
+    assert len(gateway.calls) == 1
+    assert draft_count == 0
+    assert reply is not None and reply.content_markdown == UNSUPPORTED_RESPONSE
 
 
 @pytest.mark.asyncio

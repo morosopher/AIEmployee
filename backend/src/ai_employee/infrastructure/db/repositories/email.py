@@ -7,8 +7,8 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
-from sqlalchemy import and_, case, delete, func, or_, select, text
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, case, cast, delete, func, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONPATH, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
@@ -328,8 +328,10 @@ class SqlAlchemyMailSyncRepository:
         """读取一封可访问的本地来源消息，并验证线程/消息/连接三者一致。
 
         ``source_thread_id`` 与 ``source_message_id`` 同时兼容本地 UUID 和供应商 opaque ID，
-        但返回值始终规范为供应商 thread/message ID 供草稿冻结。连接必须仍为 connected 且
-        ``mail.read`` enabled；跨用户、错线程、错连接或能力撤销统一返回 ``None``。
+        但 UUID 字符串只按本地主键解释，不能再与另一连接的 provider ID 做 OR 匹配。纯
+        provider ID 未携带连接时必须先证明只有一个候选连接；否则 fail closed 返回 ``None``。
+        返回值始终规范为供应商 thread/message ID 供草稿冻结。连接必须仍为 connected 且
+        ``mail.read`` enabled；跨用户、错线程、错连接、歧义或能力撤销统一返回 ``None``。
 
         Args:
             user_id: 当前认证用户。
@@ -372,21 +374,42 @@ class SqlAlchemyMailSyncRepository:
         )
         if source_connection_id is not None:
             statement = statement.where(EmailMessageModel.connection_id == source_connection_id)
+        has_local_reference = False
         if source_thread_id is not None:
-            statement = statement.where(
-                _local_or_provider_identifier(
-                    source_thread_id,
-                    local_column=EmailThreadModel.id,
-                    provider_column=EmailThreadModel.provider_thread_id,
-                )
+            thread_condition, thread_is_local = _draft_source_identifier_condition(
+                source_thread_id,
+                local_column=EmailThreadModel.id,
+                provider_column=EmailThreadModel.provider_thread_id,
             )
+            statement = statement.where(thread_condition)
+            has_local_reference = has_local_reference or thread_is_local
         if source_message_id is not None:
+            message_condition, message_is_local = _draft_source_identifier_condition(
+                source_message_id,
+                local_column=EmailMessageModel.id,
+                provider_column=EmailMessageModel.provider_message_id,
+            )
+            statement = statement.where(message_condition)
+            has_local_reference = has_local_reference or message_is_local
+        if source_connection_id is None and not has_local_reference:
+            candidate_connections = tuple(
+                (
+                    await self._session.scalars(
+                        statement.with_only_columns(
+                            EmailMessageModel.connection_id,
+                            maintain_column_froms=True,
+                        )
+                        .order_by(None)
+                        .distinct()
+                        .limit(2)
+                    )
+                ).all()
+            )
+            if len(candidate_connections) != 1:
+                # provider ID 只在连接内唯一；缺少连接且出现多个候选时不得按时间猜账户。
+                return None
             statement = statement.where(
-                _local_or_provider_identifier(
-                    source_message_id,
-                    local_column=EmailMessageModel.id,
-                    provider_column=EmailMessageModel.provider_message_id,
-                )
+                EmailMessageModel.connection_id == candidate_connections[0]
             )
         row = (await self._session.execute(statement.limit(1))).one_or_none()
         if row is None:
@@ -401,11 +424,12 @@ class SqlAlchemyMailSyncRepository:
         connection_id: UUID,
         source_thread_id: str,
     ) -> tuple[MailDraftSourceMessage, ...]:
-        """返回同一可访问线程的本地消息，按最近时间倒序并排除垃圾邮件。
+        """返回同一可访问线程最近三封非垃圾本地消息。
 
-        本方法不自行裁剪正文字符；Worker 的纯函数负责最终三封/12000 字符边界，便于
-        单元测试独立证明。正文密文已清除或未注入 cipher 的消息仅返回空正文，不伪造
-        保留内容，也不会阻止其他可用消息进入上下文。
+        PostgreSQL 在任何正文解密前先验证 labels 为数组、大小写不敏感排除 ``spam``、
+        按最新时间排序并限制三行。Python 仍重复执行 fail-closed spam 校验；Worker 的纯
+        函数负责最终 12000 字符与第三道数量防线。正文密文已清除或未注入 cipher 的消息
+        仅返回空正文，不伪造保留内容，也不会阻止其他可用消息进入上下文。
         """
         statement = (
             select(EmailMessageModel, EmailThreadModel)
@@ -429,17 +453,21 @@ class SqlAlchemyMailSyncRepository:
                 EmailMessageModel.user_id == user_id,
                 EmailMessageModel.connection_id == connection_id,
                 EmailThreadModel.user_id == user_id,
-                _local_or_provider_identifier(
-                    source_thread_id,
-                    local_column=EmailThreadModel.id,
-                    provider_column=EmailThreadModel.provider_thread_id,
-                ),
+                EmailThreadModel.provider_thread_id == source_thread_id,
                 OAuthConnectionModel.user_id == user_id,
                 OAuthConnectionModel.status == "connected",
                 ConnectionCapabilityModel.capability == "mail.read",
                 ConnectionCapabilityModel.status == "enabled",
+                func.jsonb_typeof(EmailMessageModel.labels) == "array",
+                ~EmailMessageModel.labels.op("@?")(
+                    cast(
+                        '$[*] ? (@ like_regex "^spam$" flag "i")',
+                        JSONPATH,
+                    )
+                ),
             )
             .order_by(EmailMessageModel.received_at.desc(), EmailMessageModel.id)
+            .limit(3)
         )
         rows = (await self._session.execute(statement)).all()
         result: list[MailDraftSourceMessage] = []
@@ -1267,22 +1295,25 @@ class SqlAlchemyMailSyncRepositoryFactory:
             yield SqlAlchemyMailSyncRepository(session, self._cipher)
 
 
-def _local_or_provider_identifier(
+def _draft_source_identifier_condition(
     value: str,
     *,
     local_column: SQLColumnExpression[UUID],
     provider_column: SQLColumnExpression[str],
-) -> ColumnElement[bool]:
-    """把用户可见来源引用限制为精确本地 UUID 或供应商 opaque ID 比较。
+) -> tuple[ColumnElement[bool], bool]:
+    """把来源引用解释为互斥的本地 UUID 或供应商 opaque ID。
 
     ``UUID`` 解析失败不会把输入拼入 SQL，而是只保留 provider 列的参数化等值条件。
-    解析成功时两种表示都允许，方便简报本地 source ref 与后续 provider ref 共享同一入口。
+    解析成功时只允许本地主键比较，避免同一 UUID 字符串同时命中另一连接 provider ID。
+
+    Returns:
+        SQL 等值条件，以及该值是否被解释为本地 UUID。
     """
     try:
         local_id = UUID(value)
     except ValueError:
-        return provider_column == value
-    return or_(local_column == local_id, provider_column == value)
+        return provider_column == value, False
+    return local_column == local_id, True
 
 
 def _is_spam_labels(labels: object) -> bool:

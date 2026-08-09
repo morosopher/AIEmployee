@@ -12,9 +12,12 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.ports.encryption import EncryptedValue
-from ai_employee.application.use_cases.mail_drafts import MailDraftRecipient
+from ai_employee.application.use_cases.mail_drafts import (
+    MailDraftCapabilitySnapshot,
+    MailDraftRecipient,
+)
 from ai_employee.domain.actions import MailDraftStatus, transition_mail_draft
-from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode
 from ai_employee.infrastructure.db.models.actions import (
@@ -330,7 +333,33 @@ class SqlAlchemyMailDraftRepository:
         user_id: UUID,
         connection_id: UUID,
     ) -> frozenset[ConnectionCapability] | None:
-        """返回精确连接的 enabled 能力；不存在、跨用户或断开时返回空。"""
+        """兼容返回精确连接的 enabled 能力集合，不丢失新投影实现的校验。"""
+        states = await self.get_capability_states(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        if states is None:
+            return None
+        return frozenset(
+            state.capability
+            for state in states
+            if state.status is CapabilityStatus.ENABLED
+        )
+
+    async def get_capability_states(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+    ) -> tuple[MailDraftCapabilitySnapshot, ...] | None:
+        """返回发送校验所需的最小类型化能力状态，不读取 token 或完整 scope。
+
+        Returns:
+            连接属于当前用户且 connected 时返回稳定排序的能力投影；否则返回 ``None``。
+
+        Raises:
+            RuntimeError: 数据库含未知能力或状态，必须 fail closed 而不能猜测授权语义。
+        """
         connection = await self._session.scalar(
             select(OAuthConnectionModel.id).where(
                 OAuthConnectionModel.id == connection_id,
@@ -340,21 +369,33 @@ class SqlAlchemyMailDraftRepository:
         )
         if connection is None:
             return None
-        values = tuple(
+        rows = tuple(
             (
-                await self._session.scalars(
-                    select(ConnectionCapabilityModel.capability).where(
+                await self._session.execute(
+                    select(
+                        ConnectionCapabilityModel.capability,
+                        ConnectionCapabilityModel.status,
+                        ConnectionCapabilityModel.last_error_code,
+                    )
+                    .where(
                         ConnectionCapabilityModel.user_id == user_id,
                         ConnectionCapabilityModel.connection_id == connection_id,
-                        ConnectionCapabilityModel.status == "enabled",
                     )
+                    .order_by(ConnectionCapabilityModel.capability)
                 )
             ).all()
         )
         try:
-            return frozenset(ConnectionCapability(value) for value in values)
+            return tuple(
+                MailDraftCapabilitySnapshot(
+                    capability=ConnectionCapability(capability),
+                    status=CapabilityStatus(status),
+                    last_error_code=last_error_code,
+                )
+                for capability, status, last_error_code in rows
+            )
         except ValueError as error:
-            raise RuntimeError("connection contains an unknown enabled capability") from error
+            raise RuntimeError("connection contains an unknown capability state") from error
 
     async def get_mail_draft_retention_days(self, *, user_id: UUID) -> int | None:
         """读取用户邮件正文保留天数，缺失用户返回空且不使用宿主机配置。"""
@@ -510,7 +551,8 @@ class SqlAlchemyMailDraftRepository:
             取消后的无正文状态快照；跨用户或不存在时返回 ``None``。
 
         Raises:
-            StateConflictError: 当前状态为执行中或任一终态，状态机拒绝取消。
+            StateConflictError: 锁内状态不是精确 ``editing``；待审批与未知结果分别要求
+                走可信任务撤回或人工结果确认，执行中和终态由状态机拒绝。
         """
         draft = await self._session.scalar(
             select(MailDraftModel)
@@ -522,8 +564,20 @@ class SqlAlchemyMailDraftRepository:
         )
         if draft is None:
             return None
+        current = MailDraftStatus(draft.status)
+        if current is MailDraftStatus.AWAITING_APPROVAL:
+            # DELETE 只取消纯本地 editing 草稿；审批失效必须由 Task 18 的任务取消事务完成。
+            raise StateConflictError(
+                error_code="mail_draft_approval_withdrawal_required",
+                message="cancel the trusted task before editing this mail draft",
+            )
+        if current is MailDraftStatus.NEEDS_ATTENTION:
+            raise StateConflictError(
+                error_code="mail_draft_result_confirmation_required",
+                message="confirm the prior execution did not occur before editing",
+            )
         target = transition_mail_draft(
-            MailDraftStatus(draft.status),
+            current,
             MailDraftStatus.CANCELLED,
         )
         draft.status = target.value

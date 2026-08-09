@@ -330,7 +330,9 @@ class GenerateMailDraftTaskStep:
                 response_model=MailDraftModelOutput,
             )
             output = MailDraftModelOutput.model_validate(response.value)
-        except (ModelGatewayError, ValidationError, TypeError, ValueError) as error:
+        except (TimeoutError, ModelGatewayError, ValidationError, TypeError, ValueError) as error:
+            # Python 3.12 的 asyncio.TimeoutError 是内建 TimeoutError 的别名；在 Gateway
+            # 适配器尚未来得及规范化异常时，也必须落入同一可编辑草稿失败回退。
             metadata = MailDraftGenerationMetadata(
                 provider=_model_provider_name(self._model_gateway),
                 model_name=self._model_name,
@@ -541,6 +543,8 @@ def _model_provider_name(gateway: ModelGateway) -> str:
 
 def _model_error_code(error: Exception) -> str:
     """把模型/校验失败收敛为稳定错误码且不保留原始输出。"""
+    if isinstance(error, TimeoutError):
+        return "model_timeout"
     code = getattr(error, "code", None)
     return code if isinstance(code, str) and code else "mail_draft_model_output_invalid"
 

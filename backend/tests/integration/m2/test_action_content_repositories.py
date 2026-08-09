@@ -752,6 +752,49 @@ async def test_mail_lock_cancel_and_retention_fail_closed(database_url: str) -> 
                 is None
             )
 
+            await session.execute(
+                update(MailDraftModel)
+                .where(MailDraftModel.id == MAIL_DRAFT_ID)
+                .values(status=MailDraftStatus.AWAITING_APPROVAL.value)
+            )
+            with pytest.raises(StateConflictError) as awaiting_approval:
+                await repository.cancel(
+                    user_id=facts.first_user_id,
+                    draft_id=MAIL_DRAFT_ID,
+                )
+            assert (
+                awaiting_approval.value.error_code
+                == "mail_draft_approval_withdrawal_required"
+            )
+            awaiting_row = await session.get(MailDraftModel, MAIL_DRAFT_ID)
+            assert awaiting_row is not None
+            assert awaiting_row.status == MailDraftStatus.AWAITING_APPROVAL.value
+
+            await session.execute(
+                update(MailDraftModel)
+                .where(MailDraftModel.id == MAIL_DRAFT_ID)
+                .values(status=MailDraftStatus.NEEDS_ATTENTION.value)
+            )
+            with pytest.raises(StateConflictError) as needs_attention:
+                await repository.cancel(
+                    user_id=facts.first_user_id,
+                    draft_id=MAIL_DRAFT_ID,
+                )
+            assert (
+                needs_attention.value.error_code
+                == "mail_draft_result_confirmation_required"
+            )
+            attention_row = await session.get(MailDraftModel, MAIL_DRAFT_ID)
+            assert attention_row is not None
+            assert attention_row.status == MailDraftStatus.NEEDS_ATTENTION.value
+
+            # 后续正文保留断言与取消用例使用原有 editing 草稿；本测试不模拟任务撤回。
+            await session.execute(
+                update(MailDraftModel)
+                .where(MailDraftModel.id == MAIL_DRAFT_ID)
+                .values(status=MailDraftStatus.EDITING.value)
+            )
+
             cancelled = await repository.cancel(
                 user_id=facts.first_user_id,
                 draft_id=SECOND_MAIL_DRAFT_ID,

@@ -7,84 +7,107 @@ from typing import Protocol
 from uuid import UUID
 
 from ai_employee.application.use_cases.tasks import CreateTaskResult
-from ai_employee.domain.mail_actions import normalize_mailbox_address
+from ai_employee.domain.mail_actions import MailMode, normalize_mailbox_address
 
 UNSUPPORTED_RESPONSE = (
     "当前支持生成或查看每日简报，以及按明确请求准备可编辑的本地邮件草稿；"
     "不会直接发送邮件、执行其他外部写操作或进行通用规划。"
 )
 
-_MAIL_DRAFT_MARKERS = (
-    "draft an email",
-    "draft a mail",
-    "draft email to",
-    "draft mail to",
-    "prepare an email",
-    "prepare a mail",
-    "prepare email",
-    "prepare mail",
-    "create an email draft",
-    "create a mail draft",
-    "compose an email",
-    "compose a mail",
-    "write an email draft",
-    "write email to",
-    "write mail to",
-    "起草邮件",
-    "草拟邮件",
-    "准备邮件草稿",
-    "准备一封邮件",
-    "创建邮件草稿",
+# 命令层只约束规范连字符文本，不臆造数据库 UUID 版本策略；实际值仍由 ``UUID`` 解析。
+_UUID_TEXT = (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
-_DIRECT_SEND_MARKERS = ("send email", "send mail", "发送邮件", "发邮件")
-_MAILBOX_CANDIDATE_PATTERN = re.compile(
-    r"(?i)(?<![a-z0-9_.!#$%&'*+/=?^`{|}~-])"
-    r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
-    r"(?![a-z0-9_.!#$%&'*+/=?^`{|}~-])"
+_ENGLISH_REPLY_COMMAND = re.compile(
+    rf"(?i)^(?:(?:please|could you please|can you please)\s+)?"
+    rf"prepare\s+(?:an?\s+)?(?:email|mail)\s+reply\s+to\s+thread\s+"
+    rf"(?P<thread_id>{_UUID_TEXT})$"
 )
+_CHINESE_REPLY_COMMAND = re.compile(
+    rf"^(?:(?:请|麻烦|请帮我|麻烦帮我)\s*)?"
+    rf"准备\s*对线程\s*(?P<thread_id>{_UUID_TEXT})\s*的邮件回复$"
+)
+_ENGLISH_NEW_COMMAND = re.compile(
+    r"(?i)^(?:(?:please|could you please|can you please)\s+)?"
+    r"(?:prepare|draft|compose|create|write)\s+"
+    r"(?:(?:an?|the)\s+)?(?:email|mail)(?:\s+draft)?"
+    r"(?:\s+(?:to|for)\s+(?P<address>.+))?$"
+)
+_CHINESE_NEW_ADDRESS_FIRST_COMMAND = re.compile(
+    r"^(?:(?:请|麻烦|请帮我|麻烦帮我)\s*)?"
+    r"(?:给|为)\s*(?P<address>.+?)\s*"
+    r"(?:起草|草拟|准备|创建)(?:一封)?邮件(?:草稿)?$"
+)
+_CHINESE_NEW_VERB_FIRST_COMMAND = re.compile(
+    r"^(?:(?:请|麻烦|请帮我|麻烦帮我)\s*)?"
+    r"(?:准备|创建|起草|草拟)(?:一封)?邮件(?:草稿)?"
+    r"(?:(?:给|发给|为)\s*(?P<address>.+))?$"
+)
+_COMMAND_ENDINGS = frozenset(".!?。！？")
 
 
 @dataclass(frozen=True, slots=True)
 class MailDraftConversationRequest:
-    """表示从明确对话文本确定性提取的本地新邮件草稿请求。
+    """表示从明确整句命令确定性提取的新邮件或本地线程回复请求。
 
-    ``to_recipients`` 只能来自用户原始文本中语法有效的显式地址；模型不能补充地址、
-    选择账户或绑定线程。没有地址时仍可创建空白草稿供用户在编辑器中手工完成。
+    ``to_recipients`` 只能来自新邮件命令中的一个完整合法 addr-spec；``source_thread_id``
+    只能来自 reply 命令中的本地 UUID。模型不能补充地址、选择账户或绑定线程。
     """
 
-    to_recipients: tuple[str, ...]
+    mode: MailMode
+    to_recipients: tuple[str, ...] = ()
+    source_thread_id: UUID | None = None
 
 
 def parse_mail_draft_conversation_request(
     text: str,
 ) -> MailDraftConversationRequest | None:
-    """仅把明确“准备/起草邮件草稿”文本解析为可编辑本地草稿意图。
+    """仅把文档化的整句中英文命令解析为可编辑本地草稿意图。
 
-    直接发送措辞、普通邮件闲聊和任意模型分类都不会通过本解析器。地址候选从用户
-    原文确定性扫描，再复用领域 addr-spec 规范化；非法候选被忽略而不是交给模型修复。
+    允许 ``please``/“请”等礼貌前缀，但拒绝否定、能力询问、说明性文本、直接发送和
+    任意包含额外叙述的句子。新邮件地址作为完整 suffix 交给领域 addr-spec 解析器，
+    因而 quoted local part 等合法语法不会被另一个更窄正则误删。回复语法固定为
+    ``prepare an email reply to thread <uuid>`` 或“准备对线程 <uuid> 的邮件回复”。
     """
     if not isinstance(text, str):
         raise TypeError("conversation text must be a string")
-    normalized = text.casefold()
-    if any(marker in normalized for marker in _DIRECT_SEND_MARKERS):
+    if "\r" in text or "\n" in text:
         return None
-    if not any(marker in normalized for marker in _MAIL_DRAFT_MARKERS):
+    command = text.strip()
+    if not command:
         return None
+    if command[-1] in _COMMAND_ENDINGS:
+        command = command[:-1].rstrip()
 
-    recipients: list[str] = []
-    seen: set[str] = set()
-    for match in _MAILBOX_CANDIDATE_PATTERN.finditer(text):
-        candidate = match.group(0)
-        try:
-            address = normalize_mailbox_address(candidate)
-        except ValueError:
+    for pattern in (_ENGLISH_REPLY_COMMAND, _CHINESE_REPLY_COMMAND):
+        match = pattern.fullmatch(command)
+        if match is not None:
+            return MailDraftConversationRequest(
+                mode=MailMode.REPLY,
+                source_thread_id=UUID(match.group("thread_id")),
+            )
+
+    for pattern in (
+        _ENGLISH_NEW_COMMAND,
+        _CHINESE_NEW_ADDRESS_FIRST_COMMAND,
+        _CHINESE_NEW_VERB_FIRST_COMMAND,
+    ):
+        match = pattern.fullmatch(command)
+        if match is None:
             continue
-        if address not in seen:
-            seen.add(address)
-            recipients.append(address)
-    return MailDraftConversationRequest(to_recipients=tuple(recipients))
+        candidate = match.groupdict().get("address")
+        if candidate is None:
+            return MailDraftConversationRequest(mode=MailMode.NEW)
+        try:
+            address = normalize_mailbox_address(candidate.strip())
+        except ValueError:
+            return None
+        return MailDraftConversationRequest(
+            mode=MailMode.NEW,
+            to_recipients=(address,),
+        )
+    return None
 
 
 def unsupported_response() -> str:
