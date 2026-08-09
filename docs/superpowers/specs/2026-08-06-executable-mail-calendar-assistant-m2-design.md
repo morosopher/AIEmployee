@@ -1084,7 +1084,96 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时清空其 `ciphertext`、`nonce`、
 `key_version` 和 `aad_version`，不得留下只有版本或部分 AEAD 列非空的记录。
 
-### 17.3 删除能力
+365 天工作区历史清理不得把 0019 refresh fence 当作普通审计直接删除。retention 必须按用户显式
+过滤候选，只解析 content-free metadata，并为 `calendar.aad_0019.refresh_started` 使用 fence-aware
+清理：没有匹配 `refresh_confirmed` 或可证明安全关闭的 known-terminal 结果时，started 必须跨 cutoff
+保留。只有匹配结果已持久化、既有 OAuth 重新授权同时改变 `authorization_generation` 与当前
+`credential_snapshot_digest_v1`，或连接已进入可独立证明的永久断开/数据处置终态，旧 fence 才能按
+普通 cutoff 清理；generation 或摘要只变化一个时仍保留。普通 access-token rotation 只会改变摘要，
+不能解除保护。known-terminal 若没有独立持久的不可调用状态作为重放防线，也必须继续按未决 fence
+处理。
+
+清理锁序与 refresh confirmed 事务统一为 owning connection、access credential、refresh credential、
+started audit；锁后重新计算当前摘要并重查 matching result，再决定删除，避免 retention 与 refresh
+CAS/confirmed 并发时误删。通用审计 delete 必须排除 started/confirmed/terminal 三类 fence 事件；只有
+专用清理可在同一事务按 attempt 成组删除已证明安全的 started 与 matching result，不能先删结果再把
+started 误判为未决。其他用户的审计和同一用户的普通过期审计仍按既有周期清理，不得因 fence 例外
+被误保留。
+
+### 17.3 0019 refresh fence 摘要协议
+
+0019 refresh fence 只允许一个 credential identity：`credential_snapshot_digest_v1`。不得再保存或比较
+“合并 credential 摘要”和“独立 refresh 摘要”两套定义。started、confirmed、
+known-terminal、未知结果重放判定、retention 与发布证据必须复用同一个纯 helper 和同一版本协议。
+
+`credential_snapshot_digest_v1` 使用 SHA-256 并输出小写十六进制。规范字节以固定 domain
+`b"AIEMPLOYEE/calendar-aad/credential-snapshot/v1\x00"` 开头，随后每个字段使用同一 framing：
+`NULL` 编码为单字节 `0x00`；非 NULL 编码为 `0x01 || uint32_be(length) || raw_bytes`。空 bytes 是长度为
+零的非 NULL 值，与 NULL 不同。顶层字段顺序固定为：
+
+1. `authorization_generation`；
+2. access-token credential row；
+3. refresh-token credential row。
+
+每行字段顺序固定为 `credential_kind`、row `id`、`user_id`、`connection_id`、`ciphertext`、`nonce`、
+`key_version`、`token_expires_at`、`updated_at`。UUID 使用小写 canonical ASCII；整数使用无 `+`、无
+多余前导零的十进制 ASCII；时间使用 UTC RFC3339、固定六位 microseconds 和 `Z`；ciphertext/nonce
+使用原始 bytes；两行的 `credential_kind` 必须分别是 ASCII `access_token` 与 `refresh_token`。协议不
+包含 token plaintext、raw scope 或 raw `calendar_id`。字段、顺序、domain 或
+编码发生任何变化都必须新增 digest version，禁止静默修改 v1。
+
+`rollout_digest_v1` 使用相同 framing、SHA-256 和小写十六进制，固定 domain 为
+`b"AIEMPLOYEE/calendar-aad/rollout/v1\x00"`，字段顺序固定为
+`schema_version="calendar_aad_0019_preflight.v1"`、`source_revision="20260809_0018"`、
+`target_revision="20260809_0019"`、已验证的 `backup_artifact_basename`、精确小写
+`sha256:...` immutable image content ID、`safety_margin_seconds=900`。它绑定发布身份，不包含运行后
+才产生的 token、expiry、deadline 或 provider response。
+
+`refresh_started` metadata 是关闭的 content-free schema，精确包含
+`fence_schema_version="calendar_aad_0019_refresh_fence.v1"`、
+`refresh_attempt_id=<canonical lowercase UUID>`、`rollout_digest_v1`、
+`connection_digest=<hashed connection>`、`authorization_generation`、
+`pre_credential_snapshot_digest_v1` 与 `result_code`。matching `refresh_confirmed` 或
+`calendar.aad_0019.refresh_terminal` 必须绑定
+同一 attempt UUID、`rollout_digest_v1`、generation 和 pre-digest；confirmed 还可增加
+`post_credential_snapshot_digest_v1` 与规范 UTC `token_expires_at`。attempt UUID 不得按 basename、connection 或时间
+重新推导；每次获准的新尝试生成一次并由全部结果事件复用。任何 token、raw scope、provider response、
+正文、raw `calendar_id` 或 credential 时间戳都不得进入 fence metadata，confirmed 中明确允许的 expiry
+除外。
+
+以下两个合成向量是协议常量。测试必须把 expected canonical bytes/base64 和 digest 写成固定常量，
+不得调用生产 helper 生成 expected 值。
+
+Credential vector 输入：generation `7`，user
+`aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`，connection
+`bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`；access row 为 id
+`11111111-1111-4111-8111-111111111111`、ciphertext base64 `AAECA/Dx8vM=`、nonce base64
+`EBESExQVFhcYGRob`、key version `3`、expires `2030-01-02T03:04:05.123456Z`、updated
+`2030-01-02T02:00:00.000001Z`；refresh row 为 id
+`22222222-2222-4222-8222-222222222222`、ciphertext base64 `3q2+7wB/gP8=`、nonce base64
+`ICEiIyQlJicoKSor`、key version `4`、expires NULL、updated `2030-01-01T00:00:00.999999Z`。规范字节长度
+为 `503`，完整 base64 为：
+
+```text
+QUlFTVBMT1lFRS9jYWxlbmRhci1hYWQvY3JlZGVudGlhbC1zbmFwc2hvdC92MQABAAAAATcBAAAADGFjY2Vzc190b2tlbgEAAAAkMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExAQAAACRhYWFhYWFhYS1hYWFhLTRhYWEtOGFhYS1hYWFhYWFhYWFhYWEBAAAAJGJiYmJiYmJiLWJiYmItNGJiYi04YmJiLWJiYmJiYmJiYmJiYgEAAAAIAAECA/Dx8vMBAAAADBAREhMUFRYXGBkaGwEAAAABMwEAAAAbMjAzMC0wMS0wMlQwMzowNDowNS4xMjM0NTZaAQAAABsyMDMwLTAxLTAyVDAyOjAwOjAwLjAwMDAwMVoBAAAADXJlZnJlc2hfdG9rZW4BAAAAJDIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMgEAAAAkYWFhYWFhYWEtYWFhYS00YWFhLThhYWEtYWFhYWFhYWFhYWFhAQAAACRiYmJiYmJiYi1iYmJiLTRiYmItOGJiYi1iYmJiYmJiYmJiYmIBAAAACN6tvu8Af4D/AQAAAAwgISIjJCUmJygpKisBAAAAATQAAQAAABsyMDMwLTAxLTAxVDAwOjAwOjAwLjk5OTk5OVo=
+```
+
+expected lowercase SHA-256 为
+`1b6b8bdeebcab68101781b4e0b892838e96d969f2440118a675488fcec5abe49`。
+
+Rollout vector 输入依次为 `calendar_aad_0019_preflight.v1`、`20260809_0018`、`20260809_0019`、
+`calendar-aad-0019-synthetic`、
+`sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`、`900`。规范字节长度为
+`222`，完整 base64 为：
+
+```text
+QUlFTVBMT1lFRS9jYWxlbmRhci1hYWQvcm9sbG91dC92MQABAAAAHmNhbGVuZGFyX2FhZF8wMDE5X3ByZWZsaWdodC52MQEAAAANMjAyNjA4MDlfMDAxOAEAAAANMjAyNjA4MDlfMDAxOQEAAAAbY2FsZW5kYXItYWFkLTAwMTktc3ludGhldGljAQAAAEdzaGEyNTY6MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZgEAAAADOTAw
+```
+
+expected lowercase SHA-256 为
+`0746bb13c476b6009e8b73e5647daa6bbe8bc1a75f0f717a7632b36915c509e5`。
+
+### 17.4 删除能力
 
 - 清除邮箱缓存：取消并删除依赖对应线程且尚未认领的草稿和审批；已认领操作保留最小执行与
   核对事实，不能因删除来源缓存而伪装成未执行。
@@ -1163,6 +1252,9 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 工作时间、DST、全天事件、缓冲和候选时间算法。
 - ETag、before snapshot 和恢复规则。
 - CalendarEvent v2 AAD 的精确序列、描述/地点独立版本选择，以及全空字段读取为空。
+- `credential_snapshot_digest_v1` 与 `rollout_digest_v1` 的字段 framing、NULL/空 bytes 区分、UUID/整数/
+  UTC 时间规范化、固定字段顺序和上述完整合成向量；expected bytes/base64/hash 必须是独立固定常量，
+  不得由生产 helper 反向生成。
 - ProviderWriteOutcome 与重试安全判断。
 - 模型输入裁剪、签名清洗和输出 Schema。
 
@@ -1200,12 +1292,13 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   AEAD 可解密性校验成功后，但在调用 provider 前，preflight 必须用短事务向既有 append-only
   `audit_events` 提交 content-free
   `calendar.aad_0019.refresh_started`，不得为此新增 0018 Schema。该事件使用 `task_id=NULL`、
-  `actor_type=system`，metadata 只绑定 source/target revision、rollout digest、hashed connection、
-  `authorization_generation`、两行合并的旧 credential snapshot digest、独立旧 refresh snapshot digest
-  和稳定结果码，不含 token、raw scope、
+  `actor_type=system`，metadata 使用 `calendar_aad_0019_refresh_fence.v1`，只绑定 canonical lowercase
+  `refresh_attempt_id`、`rollout_digest_v1`、`connection_digest`、`authorization_generation`、
+  `pre_credential_snapshot_digest_v1` 和稳定结果码，不含 token、raw scope、
   provider response、正文或 raw `calendar_id`。同一 authorization generation 存在
   started-without-confirmed 或 needs-attention 结果时，相同或不同 basename 的后续 invocation 都必须在
-  provider 前失败；只有既有 OAuth 重新授权同时递增 generation 并改变 refresh credential snapshot，
+  provider 前失败；只有既有 OAuth 重新授权同时递增 generation 并改变当前
+  `credential_snapshot_digest_v1`，
   才能开启新尝试；普通 access-token rotation 和人工处置不得成为同 snapshot 的 replay waiver。
 - 只有没有未决 fence 且本地 credential 校验成功的 connection 才能使用已解密的 refresh credential，
   在 committed started 后确定性串行调用现有 Google/Microsoft OAuth adapter 的 refresh；同一
@@ -1214,8 +1307,11 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   scopes 与 `calendar.read` 所需 provider scope。provider 返回后只能在一个短事务内重检 owning
   connection、`authorization_generation` 与 `calendar.read` 能力，以完整旧 snapshot CAS 两行
   credential，写入新 access/可选 refresh credential 和精确 expiry，并同时追加 content-free
-  `calendar.aad_0019.refresh_confirmed`；响应没有新 refresh token 时仍校验旧 refresh snapshot 并原样
-  保留。只有该事务成功提交才算 refresh 完成，现有无条件 credential upsert 不能复用。网络未知、
+  `calendar.aad_0019.refresh_confirmed`。confirmed 必须复用 started 的 attempt UUID、
+  `rollout_digest_v1`、
+  generation 与 pre-digest，并绑定 `post_credential_snapshot_digest_v1`；响应没有新 refresh token 时仍
+  校验旧 refresh row snapshot 并原样保留。只有该事务成功提交才算 refresh 完成，现有无条件
+  credential upsert 不能复用。网络未知、
   provider 调用后 lease 丢失、`invalid_grant`、malformed token/expiry/scope、scope shrink、CAS miss 或
   commit failure 都必须留下 started-without-confirmed 或稳定 needs-attention 结果，保持 revision 0018、
   不 probe、不发布 artifact，且不得对同 snapshot 再次调用 provider。若 confirmed 已提交但 artifact
@@ -1228,8 +1324,8 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 对每个已轮换 access token 使用同一注入 UTC clock 持久化 `token_expires_at`，并固定计算
   `rollout_deadline = min(token_expires_at) - 900 seconds`；900 秒不是配置项或运维估计。测试必须覆盖
   expiry 不足 900 秒、preflight probe/rollout artifact 提交时越过 deadline、多个 connection 取最早
-  expiry，以及零 affected pair 的显式 no-op。preflight artifact 只允许 schema/revision、安全 backup
-  basename、宿主机从 Compose 选定 backend image 解析的 immutable image content ID、earliest expiry/
+  expiry，以及零 affected pair 的显式 no-op。preflight artifact 只允许 schema/revision、
+  `rollout_digest_v1`、安全 backup basename、宿主机从 Compose 选定 backend image 解析的 immutable image content ID、earliest expiry/
   deadline、固定 margin、affected/connection count、hashed connection IDs、pair digests 和稳定结果码，
   权限为 `0600`；不得包含 token、scope 原文、正文、描述/地点、供应商响应或 raw `calendar_id`。镜像
   content ID 不接受运维人员单独输入，所有后续 one-off 都必须重新解析实际镜像并与 artifact 比较。
@@ -1252,8 +1348,15 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   lease 只允许一个调用进入供应商；并覆盖 provider 前 started 提交、调用后锁丢失、网络未知、
   `invalid_grant`、malformed response、scope shrink、credential CAS/commit failure、confirmed 后 artifact
   发布前崩溃和下一次 invocation。started 未 confirmed/needs-attention 时，同一或不同 basename 的
-  provider 调用数必须为零；只有 generation 与 refresh snapshot 同时变化的重新授权才能建立新 fence；
+  provider 调用数必须为零；只有 generation 与 `credential_snapshot_digest_v1` 同时变化的重新授权才能
+  建立新 fence；
   confirmed crash recovery 必须复用持久 token/expiry，Fake refresh 调用数保持不变。
+- retention 跨越 365 天 cutoff 时，未匹配 confirmed/安全 known-terminal 的 started fence 必须仍存在，
+  且下一次同/异 basename invocation 的 `provider_calls == 0`。测试必须同时证明普通审计与另一用户的
+  审计仍按各自 cutoff 处理；matching confirmed/安全 terminal、generation 与 digest 均变化的重新授权、
+  以及永久断开/数据处置终态允许清理旧 fence；仅 access-token rotation 不允许清理或解锁。并发测试按
+  connection → access row → refresh row → started audit 的统一锁序制造 retention 与 confirmed CAS 竞争，
+  锁后重算 digest、重查 matching result，证明不会误删或死锁。
 - 测试必须从本窗口 refresh 后且 0019 前创建的加密整库备份执行真实 PostgreSQL restore。宿主在读取
   任一 owner Secret、建立 owner connection 或调用 `pg_restore` 前，必须验证安全 basename、dump 与
   checksum、preflight/`pre-migration` artifacts 及其 immutable image binding；移动 tag、缺失或错误
@@ -1371,7 +1474,9 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   provider 前提交既有 append-only AuditEvent 的 content-free `refresh_started` fence，并把完整旧
   access/refresh snapshot CAS、新 credential/expiry 与 `refresh_confirmed` 放在 provider 后的同一短事务。
   started 未 confirmed/needs-attention 会跨 basename 阻断同 authorization generation 的任何后续
-  provider 调用；重新授权只有同时递增 generation 并改变 refresh snapshot 才能解除。confirmed 后、
+  provider 调用；重新授权只有同时递增 generation 并改变 `credential_snapshot_digest_v1` 才能解除。
+  started/confirmed/known-terminal 使用同一 attempt UUID、`rollout_digest_v1` 和版本化 credential digest
+  协议；365 天审计清理不得删除仍未解决的 started fence。confirmed 后、
   artifact 前崩溃必须从持久 token/expiry 恢复，不能再次 refresh，也不能复用无条件 upsert 覆盖并发
   callback/Worker 已写入的新凭据。
 - whole-database restore 只能由 operations profile 的专用 owner-role one-off 执行。该服务不继承会自动
@@ -1392,9 +1497,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - Token、真实命令、正文和日程敏感字段按规格加密。
 - 所有新同步的 CalendarEvent 描述和地点都标记为 v2 并绑定完整日历身份；跨日历同 event ID
   密文互换、v2 篡改、v1/未知版本读取均 fail closed，且没有 legacy fallback。
-- 0019 refresh fence 只使用既有 append-only AuditEvent，并保存 digest、授权代际、revision、expiry 和
-  稳定结果码；不得保存 token、raw scope、provider response、正文或 raw `calendar_id`，也不得为该
-  fence 新增 0018 Schema、OAuth-only 服务或新的真实写动作。
+- 0019 refresh fence 只使用既有 append-only AuditEvent，并以 attempt UUID、`rollout_digest_v1`、唯一
+  `credential_snapshot_digest_v1`、授权代际、expiry 和稳定结果码绑定精确尝试；不得保存 token、raw
+  scope、provider response、正文或 raw `calendar_id`，也不得为该 fence 新增 0018 Schema、OAuth-only
+  服务或新的真实写动作。未决 started 受 retention 例外保护，不能因普通历史 cutoff 失去重放防线。
 - 日志、Trace、指标、SSE 和 fixture 不包含敏感内容。
 - 所有修改 API 通过会话、CSRF、用户隔离和版本验证。
 - 保留和删除任务覆盖 M2 新实体、既有密文三元组及 CalendarEvent 四列密文原子组。
@@ -1454,17 +1560,23 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    snapshot 与 `authorization_generation`，检查既有 refresh fence：同一 rollout 已 confirmed 且当前
    credential 匹配 post-snapshot 时，从持久 token/expiry 恢复后续 probe，不再次 refresh；同一 generation
    存在 started-without-confirmed 或 needs-attention 时，相同或不同 basename 都以零 provider call 失败。
-   只有既有 OAuth 重新授权同时递增 generation 并改变 refresh snapshot，才允许新尝试。对允许的新
+   只有既有 OAuth 重新授权同时递增 generation 并改变 `credential_snapshot_digest_v1`，才允许新尝试。
+   对允许的新
    snapshot，先完成 access/refresh 存在性、归属和 AEAD 可解密性等本地校验；通过后在紧邻 provider
    调用的短事务中向既有 append-only `audit_events` 提交 content-free
-   `calendar.aad_0019.refresh_started`，再使用已解密 refresh token 主动调用现有 Google/Microsoft OAuth
+   `calendar.aad_0019.refresh_started`。事件使用新生成的 canonical lowercase attempt UUID，并绑定
+   `calendar_aad_0019_refresh_fence.v1`、`rollout_digest_v1`、generation 与
+   `pre_credential_snapshot_digest_v1`，再使用已解密 refresh token 主动调用现有 Google/Microsoft OAuth
    refresh。access-only 或 AEAD 解密失败在 started/provider 前 fail closed；`invalid_grant`、返回
    token/expiry/scope malformed 或实际 scope 未覆盖连接保存的 canonical scopes/`calendar.read`
    provider scope 则留下 durable fence 并 fail closed。
 
    provider 返回后只允许专用短事务重检连接、能力与 generation，以完整旧 snapshot CAS 两行
    credential，并把新 access/可选 refresh AEAD、精确 `token_expires_at` 与 content-free
-   `calendar.aad_0019.refresh_confirmed` 原子提交；没有新 refresh token 时校验并保留旧 refresh 密文，
+   `calendar.aad_0019.refresh_confirmed` 原子提交；confirmed 复用同一 attempt UUID、
+   `rollout_digest_v1`、
+   generation 与 pre-digest，并增加 `post_credential_snapshot_digest_v1`。没有新 refresh token 时校验并
+   保留旧 refresh 密文，
    禁止现有无条件 upsert。网络未知、调用后 lease 丢失、scope shrink、CAS/commit failure 均不得覆盖
    更新后的 token、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。confirmed 已提交但
    artifact 发布前崩溃时，同一 rollout 从持久 credential/expiry 继续。全部 connection confirmed 后重新
@@ -1475,7 +1587,8 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    CalendarEvent、cursor 或 marker；除 refresh fence 与成功的 credential CAS/confirmed 事实外不更新
    连接、能力或其他业务事实。preflight 使用与恢复相同的
    `SHA-256(20260809_0019 + NUL + connection_id + NUL + calendar_id)` locally hashed pair digest 输出
-   content-free 结果。artifact 只包含 schema/revision、安全 basename、实际 immutable image content ID、
+   content-free 结果。artifact 只包含 schema/revision、`rollout_digest_v1`、安全 basename、实际
+   immutable image content ID、
    earliest expiry/deadline、固定 margin、affected/connection count、hashed connection IDs、pair digests
    和稳定结果码。任一失败都阻止迁移；禁止 retry waiver、直接 SQL、伪造 credential、access-only 迁移
    或迁移后清 marker。
@@ -1555,7 +1668,8 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
 | 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
-| 并发或未知结果 preflight 重复 refresh，或陈旧 preflight 覆盖新 token | revision-global lease 互斥全部 basename；provider 前提交 append-only `refresh_started`，provider 后以完整旧 snapshot CAS、新 credential 与 `refresh_confirmed` 原子提交；未确认 fence 跨 basename 阻断，同 snapshot 不得重放，confirmed crash 从持久结果恢复 |
+| 并发或未知结果 preflight 重复 refresh，或陈旧 preflight 覆盖新 token | revision-global lease 互斥全部 basename；started/confirmed 绑定 attempt UUID、`rollout_digest_v1` 与唯一 `credential_snapshot_digest_v1`；provider 后以完整旧 snapshot CAS、新 credential 与 confirmed 原子提交；未确认 fence 跨 basename 阻断，同 snapshot 不得重放，confirmed crash 从持久结果恢复 |
+| 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention；未匹配结果的 started 跨 cutoff 保留，统一锁序下重算 digest/重查结果；普通 access-token rotation 不解锁，跨 365 天回归要求后续 provider call 为零 |
 | restore 镜像/工件被替换，app-role 无法完整恢复，或 `pg_restore` 中途失败留下部分状态 | owner 前宿主 artifact/image guard；精确 `sha256:` restore image、无 build/pull、`--pull never`，容器读取 Secret 前复核；专用 owner-role 单事务 restore，成功后重授最小权限；app-only verifier 由 `PGOPTIONS` 与 `BEGIN READ ONLY` 双重强制只读 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
