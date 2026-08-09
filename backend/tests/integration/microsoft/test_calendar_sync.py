@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from uuid import UUID
 
 import httpx
@@ -25,6 +25,7 @@ from ai_employee.application.use_cases.sync_calendar import SyncCalendarUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.domain.errors import (
     PermanentProviderError,
+    StateConflictError,
     TransientProviderError,
     UserActionRequiredError,
 )
@@ -37,6 +38,7 @@ from ai_employee.infrastructure.db.models.sources import (
     ProviderCalendarModel,
     SyncCursorModel,
 )
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepository,
     SqlAlchemyEnabledSyncScopeReader,
@@ -426,11 +428,181 @@ async def test_microsoft_full_snapshot_deletes_absent_cache_and_reappearance_reb
 
 
 @pytest.mark.asyncio
-async def test_microsoft_directory_revision_cas_rejects_second_stale_snapshot(
+@pytest.mark.parametrize(
+    "completed_at",
+    (
+        pytest.param(datetime(2030, 1, 1, tzinfo=UTC), id="equal-revision"),
+        pytest.param(datetime(2029, 12, 31, tzinfo=UTC), id="clock-rollback"),
+    ),
+)
+async def test_directory_revision_strictly_advances_when_completion_clock_does_not(
+    database_url: str,
+    completed_at: datetime,
+) -> None:
+    """等值或回拨完成时间只改变本地 CAS revision，不得改写真实完成 cutoff。"""
+    sessions, _, user_id, connection_id = await _seed_microsoft_directory_connection(database_url)
+    observed_revision = datetime(2030, 1, 1, tzinfo=UTC)
+    async with sessions.begin() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert cursor is not None
+        cursor.last_success_at = observed_revision
+        cursor.last_attempt_at = observed_revision
+
+    async with sessions.begin() as session:
+        await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
+            user_id=user_id,
+            connection_id=connection_id,
+            calendars=(),
+            full_snapshot=True,
+            expected_cursor=None,
+            expected_revision=observed_revision,
+            next_cursor=None,
+            completed_at=completed_at,
+        )
+
+    async with sessions() as session:
+        persisted_revision, persisted_attempt = (
+            await session.execute(
+                select(
+                    SyncCursorModel.last_success_at,
+                    SyncCursorModel.last_attempt_at,
+                ).where(
+                    SyncCursorModel.connection_id == connection_id,
+                    SyncCursorModel.resource_kind == "calendar",
+                    SyncCursorModel.scope_key == "directory",
+                )
+            )
+        ).one()
+        audit_metadata = await session.scalar(
+            select(AuditEventModel.event_metadata)
+            .where(
+                AuditEventModel.user_id == user_id,
+                AuditEventModel.event_type == "source.calendar.directory_discovered",
+            )
+            .order_by(AuditEventModel.id.desc())
+        )
+    await sessions.dispose()
+
+    assert persisted_revision == observed_revision + timedelta(microseconds=1)
+    assert persisted_attempt == completed_at
+    assert audit_metadata is not None
+    assert audit_metadata["cutoff"] == completed_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_directory_revision_upper_bound_fails_closed_without_partial_facts(
     database_url: str,
 ) -> None:
-    """两个从相同本地 revision 读取的 NULL-cursor 快照最多一个可以提交。"""
+    """Python datetime 上界不能递增时返回固定冲突，且不得写入审计或部分目录事实。"""
     sessions, _, user_id, connection_id = await _seed_microsoft_directory_connection(database_url)
+    maximum_revision = datetime.max.replace(tzinfo=UTC)
+    async with sessions.begin() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert cursor is not None
+        cursor.last_success_at = maximum_revision
+
+    # 从 ORM 重新读取上界，避免 asyncpg 对 PostgreSQL infinity/时区表示的驱动差异影响
+    # 测试本身；仓储随后必须在这个真实持久值上安全处理 ``+1 微秒`` 溢出。
+    async with sessions.begin() as session:
+        state = await SqlAlchemyCalendarSyncRepository(session).get_state(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key="directory",
+        )
+    assert state is not None and state.revision is not None
+    maximum_revision = state.revision
+
+    error_code: str | None = None
+    try:
+        async with sessions.begin() as session:
+            await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
+                user_id=user_id,
+                connection_id=connection_id,
+                calendars=(ProviderCalendar("m-cal-1", "Unsafe", "UTC", True, "owner", True),),
+                full_snapshot=True,
+                expected_cursor=None,
+                expected_revision=maximum_revision,
+                next_cursor=None,
+                completed_at=maximum_revision,
+            )
+    except StateConflictError as error:
+        error_code = error.error_code
+
+    async with sessions() as session:
+        persisted_revision = await session.scalar(
+            select(SyncCursorModel.last_success_at).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id).where(
+                        ProviderCalendarModel.connection_id == connection_id
+                    )
+                )
+            ).all()
+        )
+        audit_ids = tuple(
+            (
+                await session.scalars(
+                    select(AuditEventModel.id).where(AuditEventModel.user_id == user_id)
+                )
+            ).all()
+        )
+    await sessions.dispose()
+
+    assert (
+        error_code,
+        persisted_revision,
+        calendar_ids,
+        audit_ids,
+    ) == (
+        "calendar_directory_revision_exhausted",
+        maximum_revision,
+        (),
+        (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_microsoft_directory_revision_cas_rejects_equal_time_stale_snapshot(
+    database_url: str,
+) -> None:
+    """同一 revision 的第二个完整快照不能删除先提交的目录与事件事实。"""
+    sessions, cipher, user_id, connection_id = await _seed_microsoft_directory_connection(
+        database_url
+    )
+    observed_revision = datetime(2030, 1, 1, tzinfo=UTC)
+    committed_calendar = ProviderCalendar(
+        "m-cal-1", "Committed snapshot", "UTC", True, "owner", True
+    )
+    stale_calendar = ProviderCalendar("m-cal-2", "Stale snapshot", "UTC", False, "reader", False)
+    async with sessions.begin() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert cursor is not None
+        cursor.last_success_at = observed_revision
+
     async with sessions.begin() as session:
         first_state = await SqlAlchemyCalendarSyncRepository(session).get_state(
             user_id=user_id,
@@ -445,33 +617,52 @@ async def test_microsoft_directory_revision_cas_rejects_second_stale_snapshot(
         )
     assert first_state is not None and second_state is not None
     assert first_state.cursor is None and second_state.cursor is None
-    assert first_state.revision == second_state.revision
+    assert first_state.revision == observed_revision
+    assert second_state.revision == observed_revision
 
-    first_completed_at = datetime(2030, 1, 1, tzinfo=UTC)
     async with sessions.begin() as session:
         await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
             user_id=user_id,
             connection_id=connection_id,
-            calendars=(),
+            calendars=(committed_calendar,),
             full_snapshot=True,
             expected_cursor=None,
             expected_revision=first_state.revision,
             next_cursor=None,
-            completed_at=first_completed_at,
+            completed_at=observed_revision,
         )
 
-    with pytest.raises(TransientProviderError) as raised:
+    protected_event = _event(committed_calendar.calendar_id)
+    async with sessions.begin() as session:
+        await SqlAlchemyCalendarSyncRepository(session).upsert_event(
+            user_id=user_id,
+            connection_id=connection_id,
+            event=protected_event,
+            encrypted_description=cipher.encrypt(
+                protected_event.description.encode("utf-8"),
+                b"synthetic-directory-cas-description",
+            ),
+            encrypted_location=cipher.encrypt(
+                protected_event.location.encode("utf-8"),
+                b"synthetic-directory-cas-location",
+            ),
+        )
+
+    conflict_error_code: str | None = None
+    try:
         async with sessions.begin() as session:
             await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
                 user_id=user_id,
                 connection_id=connection_id,
-                calendars=(),
+                calendars=(stale_calendar,),
                 full_snapshot=True,
                 expected_cursor=None,
                 expected_revision=second_state.revision,
                 next_cursor=None,
-                completed_at=datetime(2030, 1, 2, tzinfo=UTC),
+                completed_at=observed_revision + timedelta(days=1),
             )
+    except TransientProviderError as error:
+        conflict_error_code = error.error_code
 
     async with sessions() as session:
         persisted_revision = await session.scalar(
@@ -481,9 +672,52 @@ async def test_microsoft_directory_revision_cas_rejects_second_stale_snapshot(
                 SyncCursorModel.scope_key == "directory",
             )
         )
-    assert raised.value.error_code == "calendar_directory_revision_conflict"
-    assert persisted_revision == first_completed_at
+        calendar_facts = tuple(
+            (
+                await session.execute(
+                    select(
+                        ProviderCalendarModel.provider_calendar_id,
+                        ProviderCalendarModel.name,
+                    )
+                    .where(ProviderCalendarModel.connection_id == connection_id)
+                    .order_by(ProviderCalendarModel.provider_calendar_id)
+                )
+            ).all()
+        )
+        event_facts = tuple(
+            (
+                await session.execute(
+                    select(
+                        CalendarEventModel.calendar_id,
+                        CalendarEventModel.provider_event_id,
+                    )
+                    .where(CalendarEventModel.connection_id == connection_id)
+                    .order_by(CalendarEventModel.calendar_id, CalendarEventModel.provider_event_id)
+                )
+            ).all()
+        )
+        audit_ids = tuple(
+            (
+                await session.scalars(
+                    select(AuditEventModel.id).where(AuditEventModel.user_id == user_id)
+                )
+            ).all()
+        )
     await sessions.dispose()
+
+    assert (
+        conflict_error_code,
+        persisted_revision,
+        calendar_facts,
+        event_facts,
+        len(audit_ids),
+    ) == (
+        "calendar_directory_revision_conflict",
+        observed_revision + timedelta(microseconds=1),
+        (("m-cal-1", "Committed snapshot"),),
+        (("m-cal-1", "same-event-id"),),
+        1,
+    )
 
 
 @pytest.mark.asyncio

@@ -499,6 +499,164 @@ async def test_current_event_get_404_returns_none_and_preserves_exact_path() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "identifier"),
+    (
+        ("initial", "."),
+        ("initial", ".."),
+        ("sync", "."),
+        ("sync", ".."),
+        ("current_calendar", "."),
+        ("current_calendar", ".."),
+        ("current_event", "."),
+        ("current_event", ".."),
+    ),
+)
+@respx.mock
+async def test_caller_dot_segment_ids_fail_before_http(
+    operation: str,
+    identifier: str,
+) -> None:
+    """调用方 opaque ID 的精确 dot-segment 必须在 httpx 折叠 path 前固定拒绝。"""
+    params: dict[str, str] | None = None
+    if operation == "initial":
+        raw_url = f"{CALENDARS_URL}/{identifier}/calendarView/delta"
+        params = {
+            "startDateTime": "2030-01-08T00:00:00+08:00",
+            "endDateTime": "2030-02-08T00:00:00+08:00",
+        }
+        cursor = f"{raw_url}?$deltatoken=synthetic-dot-segment"
+        response_payload = {"value": [], "@odata.deltaLink": cursor}
+    elif operation == "sync":
+        raw_url = f"{CALENDARS_URL}/{identifier}/calendarView/delta"
+        cursor = f"{raw_url}?$deltatoken=synthetic-dot-segment"
+        raw_url = cursor
+        response_payload = {"value": [], "@odata.deltaLink": cursor}
+    elif operation == "current_calendar":
+        raw_url = f"{CALENDARS_URL}/{identifier}/events/synthetic-event"
+        cursor = None
+        response_payload = _single_event_payload()
+    else:
+        raw_url = f"{CALENDARS_URL}/{CALENDAR_ID}/events/{identifier}"
+        cursor = None
+        response_payload = _single_event_payload()
+        response_payload["id"] = identifier
+
+    # 用 httpx 自己解析测试路由，RED 会直接展示客户端真实折叠后的 path，而不是理论字符串。
+    request_url = httpx.Request("GET", raw_url, params=params).url
+    collapsed_route = respx.get(request_url).respond(200, json=response_payload)
+    error_code: str | None = None
+    try:
+        adapter = _adapter()
+        if operation == "initial":
+            await _collect(adapter.initial_pages(identifier))
+        elif operation == "sync":
+            assert cursor is not None
+            await _collect(adapter.sync_pages(identifier, cursor))
+        elif operation == "current_calendar":
+            await adapter.get_current_event(identifier, "synthetic-event")
+        else:
+            await adapter.get_current_event(CALENDAR_ID, identifier)
+    except PermanentProviderError as error:
+        error_code = error.error_code
+
+    requested_paths = tuple(call.request.url.path for call in collapsed_route.calls)
+    assert (
+        error_code,
+        collapsed_route.call_count,
+        requested_paths,
+    ) == (
+        "microsoft_calendar_invalid_response",
+        0,
+        (),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier", (".", ".."))
+@respx.mock
+async def test_provider_calendar_dot_segment_ids_fail_at_response_boundary(
+    identifier: str,
+) -> None:
+    """Graph 目录返回 dot-segment ID 时必须在投影或后续日历请求前失败。"""
+    payload = _fixture("calendars.json")
+    values = payload["value"]
+    assert isinstance(values, list) and isinstance(values[0], dict)
+    values[0]["id"] = identifier
+    source_route = respx.get(CALENDARS_URL).respond(200, json=payload)
+
+    error_code: str | None = None
+    try:
+        await _collect(_adapter().directory_pages())
+    except PermanentProviderError as error:
+        error_code = error.error_code
+
+    assert (error_code, source_route.call_count) == (
+        "microsoft_calendar_invalid_response",
+        1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field_name", "identifier"),
+    (
+        ("id", "."),
+        ("id", ".."),
+        ("seriesMasterId", "."),
+        ("seriesMasterId", ".."),
+    ),
+)
+@respx.mock
+async def test_provider_event_dot_segment_ids_fail_at_response_boundary(
+    field_name: str,
+    identifier: str,
+) -> None:
+    """Graph event 与 series master 的 dot-segment ID 不能成为本地事件事实。"""
+    event = _event_payload()
+    event[field_name] = identifier
+    payload = {"value": [event], "@odata.deltaLink": FINAL_DELTA_URL}
+    source_route = respx.get(
+        DELTA_URL,
+        params={
+            "startDateTime": "2030-01-08T00:00:00+08:00",
+            "endDateTime": "2030-02-08T00:00:00+08:00",
+        },
+    ).respond(200, json=payload)
+
+    error_code: str | None = None
+    try:
+        await _collect(_adapter().initial_pages(CALENDAR_ID))
+    except PermanentProviderError as error:
+        error_code = error.error_code
+
+    assert (error_code, source_route.call_count) == (
+        "microsoft_calendar_invalid_response",
+        1,
+    )
+
+
+@pytest.mark.parametrize("identifier", (".abc", "...", "a..b"))
+def test_non_segment_dots_remain_valid_in_opaque_ids(identifier: str) -> None:
+    """只拒绝精确 dot-segment，普通含点 opaque calendar/event/series ID 仍合法。"""
+    calendar_payload = _fixture("calendars.json")
+    values = calendar_payload["value"]
+    assert isinstance(values, list) and isinstance(values[0], dict)
+    values[0]["id"] = identifier
+    calendar = _adapter()._normalize_calendar(values[0])
+
+    event_payload = _event_payload()
+    event_payload["id"] = identifier
+    event_payload["seriesMasterId"] = identifier
+    event = _adapter()._normalize_event(event_payload, calendar_id=identifier)
+
+    assert calendar.calendar_id == identifier
+    assert event.event_id == identifier
+    assert event.calendar_id == identifier
+    assert event.recurring_event_id == identifier
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_delta_rejects_wrong_host_or_calendar_without_requesting_target() -> None:
     """next/delta URL 必须绑定 Graph 主机和精确 calendar path。"""

@@ -857,11 +857,12 @@ class MicrosoftCalendarAdapter(CalendarReader):
         *,
         max_length: int = MICROSOFT_CALENDAR_MAX_ID_LENGTH,
     ) -> None:
-        """验证 opaque ID，不在错误中回显实际值。"""
+        """验证 opaque ID，并拒绝会被 HTTP 客户端规范化的精确 dot-segment。"""
         del key
         if (
             not isinstance(value, str)
             or value == ""
+            or value in {".", ".."}
             or value.strip() != value
             or len(value) > max_length
             or any(

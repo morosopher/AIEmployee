@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import and_, delete, or_, select, update
@@ -279,7 +279,8 @@ class SqlAlchemyCalendarSyncRepository:
             该连接当前仍可见的全部日历 ID，供后续逐日历同步使用。
 
         Raises:
-            StateConflictError: 连接能力撤销、目录对象不安全或 CAS 竞争。
+            StateConflictError: 连接能力撤销、目录对象不安全或 revision 已无法继续推进。
+            TransientProviderError: provider cursor 或本地 revision 已被其他事务推进。
         """
         if next_cursor == "":
             raise StateConflictError(
@@ -339,6 +340,19 @@ class SqlAlchemyCalendarSyncRepository:
                 message="Calendar directory revision changed during provider read",
                 retry_after=1,
             )
+
+        committed_revision = completed_at
+        if expected_revision is not None and completed_at <= expected_revision:
+            # ``last_success_at`` 同时承载数据 freshness 与本地 CAS revision，因此成功提交
+            # 后必须严格大于本次观察值。等值或宿主时钟回拨时只把本地 revision 推进 1 微秒；
+            # 供应商事实、实际尝试时间和审计 cutoff 仍使用原始 ``completed_at``。
+            try:
+                committed_revision = expected_revision + timedelta(microseconds=1)
+            except OverflowError:
+                raise StateConflictError(
+                    error_code="calendar_directory_revision_exhausted",
+                    message="Calendar directory revision cannot advance",
+                ) from None
 
         # 必须在删除 tombstone 与 upsert 新目录行之前记录当前可见集合。cursor 行会跨目录
         # 删除保留，仅凭 cursor 是否存在无法区分持续可见与重新出现，正是空 delta 无法恢复
@@ -464,7 +478,7 @@ class SqlAlchemyCalendarSyncRepository:
                     cursor.last_success_at = None
 
         directory_cursor.cursor = next_cursor
-        directory_cursor.last_success_at = completed_at
+        directory_cursor.last_success_at = committed_revision
         directory_cursor.last_attempt_at = completed_at
         directory_cursor.last_error_code = None
         all_calendar_ids = tuple(
