@@ -900,13 +900,23 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    `description_aad_version`、`location_aad_version` 及两个字段各自“四列全空或全非空”的检查约束；
    数据变更仅将既有全非空 `ciphertext + nonce + key_version` 三元组标记为历史 `v1`，既有全空
    三元组继续保持 `aad_version=NULL`。若发现任一旧三元组部分为空，升级必须 fail closed，不能
-   猜测、补齐或删除该事件。迁移在任何 DDL/DML 前还必须推导每个受影响的精确
-   `(connection_id, calendar_id)` pair，并确认其非 `directory` Calendar 事件游标已存在；精确匹配
-   必须同时满足 `sync_cursors.connection_id = affected_connection_id`、
-   `sync_cursors.resource_kind = 'calendar'`、`sync_cursors.scope_key = affected_calendar_id` 和
-   `sync_cursors.scope_key <> 'directory'`。任一 pair 缺失该游标时，升级必须保持 revision
-   `20260809_0018` 和全部数据不变，也不得创建猜测 marker。迁移不得解密、重加密、删除、合并或
-   改写任何 CalendarEvent 内容。通过 preflight 后，只失效上述精确 pair 的游标：将 `cursor` 与
+   猜测、补齐或删除该事件。迁移在任何 DDL/DML 前还必须从历史完整三元组推导每个受影响的精确
+   `(connection_id, calendar_id)` pair 及其用户归属，并同时证明以下本地可恢复性事实：
+
+   - 精确非 `directory` Calendar 事件游标已存在；匹配必须同时满足
+     `sync_cursors.connection_id = affected_connection_id`、`resource_kind = 'calendar'`、
+     `scope_key = affected_calendar_id` 和 `scope_key <> 'directory'`。
+   - owning OAuth connection 存在、与事件/游标属于同一用户，且状态精确为 `connected`。
+   - 同用户、同连接的 `calendar.read` 能力行存在且状态精确为 `enabled`。
+   - 当前 Calendar Worker 凭据解析必需的本地 AEAD credential 行存在并属于同一用户/连接；至少
+     必须有 `access_token`，不得从其他连接借用、复制或伪造凭据。
+   - 同用户、同连接、同 `provider_calendar_id` 的精确 `ProviderCalendar` 目录行存在。
+
+   任一 pair 缺失上述事实，或连接已断开、能力为 disabled/revoked/其他非 enabled 状态时，升级都
+   必须保持 revision `20260809_0018` 和全部数据不变，也不得创建猜测 marker。迁移本身不执行供应商
+   网络 I/O；生产变更窗口还必须在备份、审计和 migration 前通过第 22 节定义的独立只读供应商
+   preflight。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。通过 preflight 后，
+   只失效上述精确 pair 的游标：将 `cursor` 与
    `last_success_at` 置空，并把 `last_error_code` 设为不含内容的
    `calendar_event_resync_required`；其他 connection 即使复用相同 `calendar_id` 也不得变化，
    `directory` 游标及其 freshness、revision 和错误状态必须原样保留。0019 是 forward-only；
@@ -1169,14 +1179,27 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   相关精确 `(connection_id, calendar_id)` 非 directory 事件 scope 的 cursor/freshness 置空且留下
   content-free `calendar_event_resync_required`。迁移测试必须包含两个 connection 复用同一
   `calendar_id`、但只有一个 connection 存在 v1 字段的场景，证明另一 connection 的游标完全不变；
-  还必须证明缺失任一精确 scope 游标会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且数据
-  原样保留。
+  还必须分别证明缺失任一精确 scope 游标、owning connection 已断开、`calendar.read` 为
+  disabled/revoked、缺失 Calendar Worker 必需 credential 或缺失精确 `ProviderCalendar` 时，都会在
+  任何 DDL/DML 前 fail closed，revision 仍为 0018 且全部数据原样保留。
+- `calendar-aad-preflight-0019` 只在 revision 0018 扫描历史完整 AEAD 三元组推导 affected pairs，逐
+  pair 复核相同本地可恢复性事实，并通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
+  Calendar adapter 完成精确 `initial_pages(scope_key)` 探测并取得最终 cursor。测试必须证明它不调用
+  `directory_pages()`、连接级 owner、其他 pair 或任何 Calendar 写适配器，不写 CalendarEvent、cursor
+  或 marker；若首次资源 401 触发既有 OAuth refresh，则只允许沿用现有 AEAD token rotation 边界，
+  不更新连接/能力状态或其他业务事实。refresh 拒绝、refresh 后仍为 401、403、权限缺失、无最终
+  cursor 或任何 pair 失败都必须返回非零并阻止 0019。
 - `0019` 恢复入口只扫描 `calendar_event_resync_required` marker，并以稳定任务种类
-  `calendar.aad_0019.resync` 为每个精确 pair 原子创建 `TaskRun + AuditEvent + Outbox`。集成测试必须
-  证明同一 pair 的重复/并发入口只产生一个任务和一条初始 Outbox、两个 connection 复用同一
-  `calendar_id` 时只读取被标记者、目录 reader 调用次数为零、普通 `sync_calendar` 队列事实保持
-  未处理、成功时只清除同一 marker 并恢复 cursor/freshness、失败时保留 marker，且整个流程不创建
-  ApprovalRequest、ToolExecution 或任何供应商写调用。
+  `calendar.aad_0019.resync` 为每个精确 pair 的每个正整数恢复 ordinal 原子创建一个
+  `TaskRun + AuditEvent + Outbox`。集成测试必须证明 planner 锁定精确 cursor 行后复用
+  `created/queued/running/retry_scheduled` 活动尝试；两个并发 planner 对同一 ordinal 只产生一个任务和
+  一条初始 Outbox；首次 `failed` 后修复条件并再次显式运行会创建 ordinal+1 并成功；`cancelled` 可在
+  后续调用创建新 ordinal；`succeeded` 与 marker 并存、多个活动尝试或该恢复种类出现
+  `waiting_approval/reconciling/needs_attention` 都 fail closed。旧终态 TaskRun 必须保持不变，单次 CLI
+  调用对每个 pair 最多创建一个新 ordinal，TaskRun 内部 `attempt_count` 仍只表示现有 runner 的有界
+  自动重试。两个 connection 复用同一 `calendar_id` 时只读取被标记者，目录 reader 调用次数为零，
+  普通 `sync_calendar` 队列事实保持未处理；成功只清除同一 marker 并恢复 cursor/freshness，失败保留
+  marker，且整个流程不创建 ApprovalRequest、ToolExecution 或任何供应商写调用。
 - 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
   v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
   且任何路径都不得回退尝试 v1 AAD。
@@ -1259,6 +1282,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
   cursor 与 freshness 后清除 `calendar_event_resync_required`。该入口和 `post-resync` 审计完成前，
   通用 Scheduler、普通 Taskiq Worker、API 与 Caddy 必须保持停止。
+- 恢复失败或取消不会复活、改写或重新认领旧终态 TaskRun。只有运维人员再次显式运行无参数 one-off
+  时，planner 才能在精确 cursor 锁下为仍带 marker 的 pair 分配下一个 recovery ordinal；每个新
+  TaskRun 仍受持久 `started_at` 总超时、单步超时、`max_transient_retries` 与 `attempt_count` 上限约束，
+  因此既不会无限自动重试，也不会用新 ordinal 绕过单次调用边界。
 
 ### 21.4 安全与隐私
 
@@ -1303,29 +1330,46 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 1. 保持外部写入默认关闭，关闭 Calendar 周期调度并停止新入口流量。
 2. 排空并停止所有 pre-0019 CalendarEvent reader/writer，包括 Caddy、API、Worker 与 Scheduler；确认
    没有旧 `sync_calendar` 任务、事件 upsert 事务或旧 reader 仍在运行，PostgreSQL 与 Redis 保持运行。
-3. 生成加密备份并执行迁移前只读审计；审计必须证明数据库位于 0018、没有部分 AEAD 三元组，且
-   每个受影响 `(connection_id, calendar_id)` 都有精确的非 directory 游标。
-4. 应用前向 `0019` 并执行迁移后只读审计，验证只新增版本列/约束、v1 标记和精确 pair 的事件 scope
+3. 运行 Task 27 提供的无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 只从
+   历史完整 AEAD 三元组推导 affected pairs，逐 pair 复核精确 cursor、connected owning connection、
+   enabled `calendar.read`、Calendar Worker 所需 AEAD credential 和精确 `ProviderCalendar`，再通过
+   供应商只读 Calendar adapter 调用与恢复路径一致的 `initial_pages(scope_key)` 并要求最终 cursor。
+   它不得调用 `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得
+   写 CalendarEvent、cursor 或 marker。资源 401 可以复用既有单次 OAuth refresh 与 AEAD token
+   rotation 维护边界，但不更新连接/能力状态或其他业务事实；除此之外供应商侧严格只读。preflight
+   使用与恢复相同的
+   `SHA-256(20260809_0019 + NUL + connection_id + NUL + calendar_id)` locally hashed pair digest 输出
+   content-free 结果。任一 refresh 拒绝、refresh 后仍为 401、403、权限缺失或无最终 cursor 都阻止
+   迁移；禁止 waiver、直接 SQL、伪造 credential 或迁移后清 marker。
+4. preflight 全部通过后，生成加密备份并执行迁移前只读审计；审计必须证明数据库仍位于 0018、没有
+   部分 AEAD 三元组，并重复记录每个 affected pair 的本地可恢复性事实和 locally hashed scope 结果。
+5. 应用前向 `0019` 并执行迁移后只读审计，验证只新增版本列/约束、v1 标记和精确 pair 的事件 scope
    游标失效，其他 connection 的同名 calendar、directory cursor/revision 与全部事件 AEAD 字节均未变化。
-5. 使只写 v2、正常读取拒绝 v1 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、
+6. 使只写 v2、正常读取拒绝 v1 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、
    普通 Worker 与 Scheduler 停止；0019 不支持旧新 Calendar reader/writer 混跑，任何旧组件都不得回流。
-6. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口只扫描
-   `calendar_event_resync_required` marker，通过用户隔离的应用用例与 Repository 为每个精确 pair
-   原子创建 `calendar.aad_0019.resync` TaskRun、审计和初始 Outbox；任务输入固定为
-   `connection_id`、`scope_key` 与 `recovery_revision=20260809_0019`，幂等键由 revision 与精确 pair
-   的稳定摘要生成。CLI 只精确分派并以内联 `DurableTaskRunner` 执行本次返回的恢复任务，不启动
-   Taskiq Worker、不扫描普通队列，也不发布或执行无关 `sync_calendar` 任务。
-7. 专用恢复任务步骤在供应商访问前重新验证 canonical task input、TaskRun 用户归属、现存非
-   `directory` 精确 cursor、marker、连接读取能力与目录中的同一 calendar；任一条件不满足都以无
+7. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口只扫描
+   `calendar_event_resync_required` marker，并对每个精确 cursor 行使用 `FOR UPDATE` 或等价 CAS
+   串行化 planner。逻辑 pair digest 是 revision、connection ID 与 calendar ID 的 SHA-256；首次 ordinal
+   为 1，稳定任务键固定为 `calendar-aad-0019:<pair_digest>:attempt:<ordinal>`，输入精确包含
+   `connection_id`、`scope_key`、`recovery_revision`、`pair_digest` 与
+   `recovery_attempt_ordinal`。`created/queued/running/retry_scheduled` 活动尝试必须复用；最新尝试为
+   `failed/cancelled` 且 marker 仍存在时，下一次显式 CLI 才能分配 `max_ordinal + 1`；多个活动尝试、
+   `succeeded` 与 marker 并存，或 `waiting_approval/reconciling/needs_attention` 都 fail closed。旧终态
+   TaskRun 不得复活或改写，单次 CLI 调用对每个 pair 最多创建一个新 ordinal，且 recovery ordinal 与
+   单个 TaskRun 的 `attempt_count` 完全分离。每个 ordinal 的 TaskRun、审计与初始 Outbox 原子提交。
+8. CLI 只精确分派并以内联 `DurableTaskRunner` 执行本次 planner 返回的任务 ID，不启动 Taskiq Worker、
+   不扫描普通队列，也不发布或执行无关 `sync_calendar` 任务。专用恢复任务步骤在供应商访问前重新
+   计算 pair digest，并核对 canonical task input、ordinal、幂等键、TaskRun 用户归属、现存非
+   `directory` 精确 cursor、marker、连接读取能力、必需 AEAD credential 与目录中的同一 calendar；任一条件不满足都以无
    供应商调用的幂等 no-op 或稳定失败结束。有效任务只调用单日历事件 scope 路径，不调用
    `directory_pages()`、连接级 owner 或其他 provider/calendar；完成提交必须以 marker 为 CAS 前提，
    失败保留 marker。该流程只读供应商并写本地同步事实，不创建审批、ToolExecution 或真实写操作。
-8. 执行 `post-resync` 只读审计，验证新密文均为 v2、每个精确 pair 的 cursor/freshness 恢复且 marker
+9. 执行 `post-resync` 只读审计，验证新密文均为 v2、每个精确 pair 的 cursor/freshness 恢复且 marker
    清除。任一 pair 失败时保持所有通用服务和真实写开关关闭，禁止改用直接 SQL、临时全量同步或
    connection-level directory sync。
-9. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy，运行
+10. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy，运行
    `just health`，并验证 M1 登录、普通同步、简报、审批假工具和任务恢复。
-10. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查；最后再打开正式环境
+11. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查；最后再打开正式环境
     供应商开关，每个连接仍需用户单独渐进授权。
 
 回滚应用镜像时，新表和列保留。一旦应用 `0019`，应用回滚下限就是理解 AAD 版本列、拒绝 v1
