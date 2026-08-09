@@ -496,10 +496,49 @@ async def test_directory_revision_strictly_advances_when_completion_clock_does_n
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored_revision",
+    (
+        pytest.param(datetime(2030, 1, 1, tzinfo=UTC), id="finite"),
+        pytest.param(datetime.max.replace(tzinfo=UTC), id="postgres-infinity"),
+    ),
+)
+async def test_directory_state_exposes_revision_as_aware_utc(
+    database_url: str,
+    stored_revision: datetime,
+) -> None:
+    """普通 timestamptz 与 asyncpg infinity 都必须以 UTC-aware revision 暴露给应用层。"""
+    sessions, _, user_id, connection_id = await _seed_microsoft_directory_connection(database_url)
+    async with sessions.begin() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert cursor is not None
+        cursor.last_success_at = stored_revision
+
+    async with sessions.begin() as session:
+        state = await SqlAlchemyCalendarSyncRepository(session).get_state(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key="directory",
+        )
+    await sessions.dispose()
+
+    assert state is not None
+    assert state.revision == stored_revision
+    assert state.revision is not None
+    assert state.revision.utcoffset() == timedelta(0)
+
+
+@pytest.mark.asyncio
 async def test_directory_revision_upper_bound_fails_closed_without_partial_facts(
     database_url: str,
 ) -> None:
-    """Python datetime 上界不能递增时返回固定冲突，且不得写入审计或部分目录事实。"""
+    """naive infinity revision 遇到真实 aware 完成时间时返回固定冲突且不写部分事实。"""
     sessions, _, user_id, connection_id = await _seed_microsoft_directory_connection(database_url)
     maximum_revision = datetime.max.replace(tzinfo=UTC)
     async with sessions.begin() as session:
@@ -513,8 +552,8 @@ async def test_directory_revision_upper_bound_fails_closed_without_partial_facts
         assert cursor is not None
         cursor.last_success_at = maximum_revision
 
-    # 从 ORM 重新读取上界，避免 asyncpg 对 PostgreSQL infinity/时区表示的驱动差异影响
-    # 测试本身；仓储随后必须在这个真实持久值上安全处理 ``+1 微秒`` 溢出。
+    # 从 get_state 取得真实 asyncpg infinity 形状；旧实现会返回 naive datetime，而真实
+    # use case 的完成时间始终是独立的 aware UTC，不能把 revision 伪装成 completed_at。
     async with sessions.begin() as session:
         state = await SqlAlchemyCalendarSyncRepository(session).get_state(
             user_id=user_id,
@@ -522,10 +561,20 @@ async def test_directory_revision_upper_bound_fails_closed_without_partial_facts
             scope_key="directory",
         )
     assert state is not None and state.revision is not None
-    maximum_revision = state.revision
+    observed_revision = state.revision
+    completed_at = datetime(2030, 1, 1, tzinfo=UTC)
 
-    error_code: str | None = None
-    try:
+    async with sessions() as session:
+        persisted_revision_before = await session.scalar(
+            select(SyncCursorModel.last_success_at).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+    assert persisted_revision_before is not None
+
+    with pytest.raises(StateConflictError) as raised:
         async with sessions.begin() as session:
             await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
                 user_id=user_id,
@@ -533,12 +582,10 @@ async def test_directory_revision_upper_bound_fails_closed_without_partial_facts
                 calendars=(ProviderCalendar("m-cal-1", "Unsafe", "UTC", True, "owner", True),),
                 full_snapshot=True,
                 expected_cursor=None,
-                expected_revision=maximum_revision,
+                expected_revision=observed_revision,
                 next_cursor=None,
-                completed_at=maximum_revision,
+                completed_at=completed_at,
             )
-    except StateConflictError as error:
-        error_code = error.error_code
 
     async with sessions() as session:
         persisted_revision = await session.scalar(
@@ -567,13 +614,83 @@ async def test_directory_revision_upper_bound_fails_closed_without_partial_facts
     await sessions.dispose()
 
     assert (
-        error_code,
+        raised.value.error_code,
         persisted_revision,
         calendar_ids,
         audit_ids,
     ) == (
         "calendar_directory_revision_exhausted",
-        maximum_revision,
+        persisted_revision_before,
+        (),
+        (),
+    )
+
+
+@pytest.mark.asyncio
+async def test_directory_rejects_naive_completed_at_without_partial_facts(
+    database_url: str,
+) -> None:
+    """调用方若传入 naive completed_at，仓储必须固定失败而不是泄露比较 TypeError。"""
+    sessions, _, user_id, connection_id = await _seed_microsoft_directory_connection(database_url)
+    observed_revision = datetime(2030, 1, 1, tzinfo=UTC)
+    async with sessions.begin() as session:
+        cursor = await session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        assert cursor is not None
+        cursor.last_success_at = observed_revision
+
+    with pytest.raises(StateConflictError) as raised:
+        async with sessions.begin() as session:
+            await SqlAlchemyCalendarSyncRepository(session).mark_directory_success(
+                user_id=user_id,
+                connection_id=connection_id,
+                calendars=(ProviderCalendar("m-cal-1", "Unsafe", "UTC", True, "owner", True),),
+                full_snapshot=True,
+                expected_cursor=None,
+                expected_revision=observed_revision,
+                next_cursor=None,
+                completed_at=datetime(2030, 1, 2),  # noqa: DTZ001 - 刻意验证 naive 边界。
+            )
+
+    async with sessions() as session:
+        persisted_revision = await session.scalar(
+            select(SyncCursorModel.last_success_at).where(
+                SyncCursorModel.connection_id == connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == "directory",
+            )
+        )
+        calendar_ids = tuple(
+            (
+                await session.scalars(
+                    select(ProviderCalendarModel.provider_calendar_id).where(
+                        ProviderCalendarModel.connection_id == connection_id
+                    )
+                )
+            ).all()
+        )
+        audit_ids = tuple(
+            (
+                await session.scalars(
+                    select(AuditEventModel.id).where(AuditEventModel.user_id == user_id)
+                )
+            ).all()
+        )
+    await sessions.dispose()
+
+    assert (
+        raised.value.error_code,
+        persisted_revision,
+        calendar_ids,
+        audit_ids,
+    ) == (
+        "calendar_directory_completed_at_invalid",
+        observed_revision,
         (),
         (),
     )

@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import and_, delete, or_, select, update
@@ -26,6 +26,47 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+
+
+def _normalize_directory_revision(value: datetime | None) -> datetime | None:
+    """把持久目录 revision 规范为 UTC-aware datetime。
+
+    PostgreSQL ``timestamptz`` 的普通有限值会由 asyncpg 返回 aware datetime，但正负
+    infinity 会映射为 naive ``datetime.max``/``datetime.min`` sentinel。该列的业务语义
+    固定为 UTC，因此 naive 值只在此数据库边界附加 UTC；已有 aware 值保持同一瞬间并
+    规范到 UTC，避免 CAS 与真实 use case 的 aware 完成时间发生裸 ``TypeError``。
+
+    Args:
+        value: 数据库当前值或调用方此前观察到的目录 revision。
+
+    Returns:
+        ``None``，或内容等价且带 UTC 时区的 revision。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _normalize_directory_completed_at(value: datetime) -> datetime:
+    """验证目录完成时间为 aware datetime，并返回同一瞬间的 UTC 值。
+
+    Args:
+        value: 应用 use case 注入的真实目录同步完成时间。
+
+    Returns:
+        与输入同一瞬间的 UTC-aware datetime，仅供 revision 比较和推进使用。
+
+    Raises:
+        StateConflictError: 调用方传入 offset-naive 时间，无法安全参与 CAS。
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise StateConflictError(
+            error_code="calendar_directory_completed_at_invalid",
+            message="Calendar directory completion time is invalid",
+        )
+    return value.astimezone(UTC)
 
 
 class SqlAlchemyCalendarSyncRepository:
@@ -125,7 +166,11 @@ class SqlAlchemyCalendarSyncRepository:
             provider=connection.provider,
             scope_key=scope_key,
             cursor=cursor.cursor,
-            revision=cursor.last_success_at if scope_key == "directory" else None,
+            revision=(
+                _normalize_directory_revision(cursor.last_success_at)
+                if scope_key == "directory"
+                else None
+            ),
         )
 
     async def upsert_event(
@@ -279,9 +324,11 @@ class SqlAlchemyCalendarSyncRepository:
             该连接当前仍可见的全部日历 ID，供后续逐日历同步使用。
 
         Raises:
-            StateConflictError: 连接能力撤销、目录对象不安全或 revision 已无法继续推进。
+            StateConflictError: 完成时间无时区、连接能力撤销、目录对象不安全或 revision
+                已无法继续推进。
             TransientProviderError: provider cursor 或本地 revision 已被其他事务推进。
         """
+        normalized_completed_at = _normalize_directory_completed_at(completed_at)
         if next_cursor == "":
             raise StateConflictError(
                 error_code="calendar_directory_cursor_invalid",
@@ -331,7 +378,9 @@ class SqlAlchemyCalendarSyncRepository:
                 message="Calendar directory cursor changed during provider read",
                 retry_after=1,
             )
-        if directory_cursor.last_success_at != expected_revision:
+        current_revision = _normalize_directory_revision(directory_cursor.last_success_at)
+        normalized_expected_revision = _normalize_directory_revision(expected_revision)
+        if current_revision != normalized_expected_revision:
             # Microsoft provider cursor 永远为 NULL；独立 revision CAS 防止两个从同一完整
             # 快照观察点出发的事务依次成功并让较旧目录覆盖较新事实。Google 同样复用该
             # 防线，避免 cursor 恰好相同或 410 清空 cursor 后失去本地并发检测。
@@ -341,13 +390,16 @@ class SqlAlchemyCalendarSyncRepository:
                 retry_after=1,
             )
 
-        committed_revision = completed_at
-        if expected_revision is not None and completed_at <= expected_revision:
+        committed_revision = normalized_completed_at
+        if (
+            normalized_expected_revision is not None
+            and normalized_completed_at <= normalized_expected_revision
+        ):
             # ``last_success_at`` 同时承载数据 freshness 与本地 CAS revision，因此成功提交
             # 后必须严格大于本次观察值。等值或宿主时钟回拨时只把本地 revision 推进 1 微秒；
             # 供应商事实、实际尝试时间和审计 cutoff 仍使用原始 ``completed_at``。
             try:
-                committed_revision = expected_revision + timedelta(microseconds=1)
+                committed_revision = normalized_expected_revision + timedelta(microseconds=1)
             except OverflowError:
                 raise StateConflictError(
                     error_code="calendar_directory_revision_exhausted",
