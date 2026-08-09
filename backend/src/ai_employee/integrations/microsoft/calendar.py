@@ -693,6 +693,9 @@ class MicrosoftCalendarAdapter(CalendarReader):
         name = address_value.get("name", "")
         if not isinstance(address, str) or address == "" or not isinstance(name, str):
             raise cls._invalid_response()
+        # 共享 mailbox normalizer 按邮件语法会消除水平 Tab 等 CFWS；Graph adapter 的契约
+        # 更严格，所有原始 C0/DEL/NUL 必须先在供应商边界拒绝，不能规范后伪装成可信地址。
+        cls._validate_bounded_string(address, MICROSOFT_CALENDAR_MAX_STRING_LENGTH)
         try:
             normalized_address = normalize_mailbox_address(address)
         except ValueError:

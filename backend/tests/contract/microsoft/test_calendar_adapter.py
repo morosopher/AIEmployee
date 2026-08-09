@@ -256,6 +256,63 @@ def test_organizer_address_uses_strict_mailbox_normalization(address: str) -> No
     assert raised.value.error_code == "microsoft_calendar_invalid_response"
 
 
+@pytest.mark.parametrize(
+    ("person_field", "address"),
+    (
+        ("organizer", "person\t@example.test"),
+        ("attendee", "person\t@example.test"),
+        ("organizer", "person\x01@example.test"),
+        ("attendee", "person\x7f@example.test"),
+    ),
+)
+def test_organizer_and_attendee_addresses_reject_controls_before_normalization(
+    person_field: str,
+    address: str,
+) -> None:
+    """原始人员地址的所有 C0/DEL 必须在共享 mailbox normalizer 前被拒绝。"""
+    payload = _single_event_payload()
+    if person_field == "organizer":
+        person = payload["organizer"]
+    else:
+        attendees = payload["attendees"]
+        assert isinstance(attendees, list) and isinstance(attendees[0], dict)
+        person = attendees[0]
+    assert isinstance(person, dict)
+    email_address = person["emailAddress"]
+    assert isinstance(email_address, dict)
+    email_address["address"] = address
+
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+    assert raised.value.error_code == "microsoft_calendar_invalid_response"
+    assert address not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "address",
+    (
+        "owner\t@example.test",
+        "owner\x01@example.test",
+        "owner\x7f@example.test",
+    ),
+)
+def test_calendar_owner_address_controls_fail_closed(address: str) -> None:
+    """owner 复用人员边界；非法控制字符不能被规范后投影为可信 owner。"""
+    payload = _fixture("calendars.json")
+    values = payload["value"]
+    assert isinstance(values, list) and isinstance(values[0], dict)
+    owner = values[0]["owner"]
+    assert isinstance(owner, dict)
+    email_address = owner["emailAddress"]
+    assert isinstance(email_address, dict)
+    email_address["address"] = address
+
+    calendar = _adapter()._normalize_calendar(values[0])
+
+    assert calendar.owner is None
+
+
 def test_mailbox_domain_is_canonicalized_without_changing_local_part() -> None:
     """有效 Graph 邮箱通过共享领域函数规范域名，同时保留 local-part 大小写。"""
     payload = _single_event_payload()
