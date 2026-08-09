@@ -177,6 +177,28 @@ def test_mailbox_masking_handles_escaped_quote_and_quoted_smtputf8_boundaries() 
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    (
+        ('"foo@example.com"@real.example', "[ADDRESS_REMOVED]"),
+        (
+            'Contact <"alpha@beta.example@inner.test"@real.example>, next.',
+            "Contact <[ADDRESS_REMOVED]>, next.",
+        ),
+        (
+            'Send to <"foo \\"alias@inside.example"@real.example>, please.',
+            "Send to <[ADDRESS_REMOVED]>, please.",
+        ),
+    ),
+)
+def test_mailbox_masking_redacts_whole_quoted_local_part_with_internal_at_signs(
+    text: str,
+    expected: str,
+) -> None:
+    """quoted local-part 内部 ``@``、点号与转义 quote 不得截断整段地址掩码。"""
+    assert _mask_mailbox_addresses(text) == expected
+
+
 def test_prompt_forbids_model_control_and_requires_uncertainty() -> None:
     """版本化 Prompt 明确限制模型只生成正文且不得臆造事实。"""
     prompt = load_mail_draft_prompt()

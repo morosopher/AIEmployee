@@ -596,6 +596,14 @@ def _mask_mailbox_addresses(text: str) -> str:
             index += 1
             continue
 
+        if quoted_start is not None:
+            # quoted local-part 在未遇到未转义闭合 quote 前是一个整体；其内部合法的 ``@``、
+            # 点号或空格都不能启动嵌套候选，否则会只掩码内部片段并泄漏真正的外层域。
+            closed_quoted_start = None
+            unquoted_start = None
+            index += 1
+            continue
+
         if character == "@":
             local_start = (
                 closed_quoted_start
