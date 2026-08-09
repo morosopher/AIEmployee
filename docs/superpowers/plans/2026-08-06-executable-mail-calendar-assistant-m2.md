@@ -2298,6 +2298,8 @@ git commit -m "feat: add calendar change proposals"
 
 All provider behavior in this task uses Fake readers, synthetic encrypted values, or checked-in contract fixtures. Do not configure or access a real Google or Microsoft account, and do not add approval, `ToolExecution`, or provider-write behavior from Task 18 or later.
 
+Task 16A only implements and verifies code plus migration behavior in synthetic environments. Because 0019 forbids old/new Calendar writer coexistence, passing its focused or repository gates is not authorization for a rolling deployment and does not prove a production rollout. This task must not stop production schedulers, drain production Workers, apply the production migration, or start a resync. The actual release is an operator-controlled Task 27/30 procedure following `docs/operations.md`: stop Calendar scheduling, drain every old `sync_calendar` Worker and upsert, apply 0019, deploy v2-only components, restore the new Worker and then scheduling, run bounded resync, then verify cursor/freshness recovery and error clearance before continuing.
+
 - [ ] **Step 1: Write failing lease and restore-input trust-boundary tests**
 
 In `backend/tests/integration/workers/test_outbox_dispatch.py`, extend the existing PostgreSQL lease cases with all of these assertions:
@@ -2628,6 +2630,8 @@ TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0
 
 Expected: PASS with fresh backend/frontend unit tests, lint, type checking, and no real-provider access. Then run `git diff --check` and inspect the complete diff for accidental Task 18 approval/ToolExecution/provider-write work, unbounded sensitive ORM loads, legacy AAD fallback, or any database URL other than the Task 13 synthetic test database.
 
+These results prove implementation readiness only. They may verify 0019 marking, fail-closed reads, and bounded-sync behavior with synthetic data, but they must not be recorded as completion of the non-rolling deployment or any production scope recovery.
+
 - [ ] **Step 13: Commit**
 
 ~~~bash
@@ -2677,7 +2681,7 @@ async def test_settings_accept_non_overlapping_weekly_hours(authenticated_api_cl
     assert response.json()["meeting_buffer_minutes"] == 15
 ~~~
 
-Cover all eight proposal routes, creation replay under the same `Idempotency-Key`, version conflicts, restore ownership, an exact historical `snapshot_id` in the restore request, restore idempotency, 201/202 semantics, no-store responses, recurrence/read-only/ETag errors, CSRF, cross-user 404, all-day date schemas, IANA timezone validation, and overlapping working-hours rejection.
+Cover all eight proposal routes, creation replay under the same `Idempotency-Key`, version conflicts, restore ownership, an exact historical `snapshot_id` in the restore request, restore idempotency, 201/202 semantics, no-store responses, recurrence/read-only/ETag errors, CSRF, cross-user 404, all-day date schemas, IANA timezone validation, and overlapping working-hours rejection. Restore tests must prove the route binds its path `event_id` and request `snapshot_id` to the current user, the same event, and a snapshot from a completed modification before enqueueing; cross-user, different-event, or incomplete/non-modification snapshots create no TaskRun.
 
 - [ ] **Step 2: Run tests and observe the expected failure**
 
@@ -2692,7 +2696,7 @@ Create discriminated `CreateProposalRequest` variants for `create` and `update`,
 The candidate response requires `attendee_availability_checked=false`; no route or provider adapter in
 M2 accepts attendee Free/Busy inputs.
 
-`suggest-times` performs database reads and deterministic CPU work without creating a TaskRun; it must not keep a database transaction open while calculating candidates. `POST /calendar/proposals`, `submit`, and `restore-proposal` require `Idempotency-Key`; proposal creation returns the same 201 representation on replay, while the long actions return HTTP 202 with persistent task IDs. The restore task input contains only event/snapshot identifiers and must prove the snapshot belongs to a completed modification of the same current-user event before any provider read.
+`suggest-times` performs database reads and deterministic CPU work without creating a TaskRun; it must not keep a database transaction open while calculating candidates. `POST /calendar/proposals`, `submit`, and `restore-proposal` require `Idempotency-Key`; proposal creation returns the same 201 representation on replay, while the long actions return HTTP 202 with persistent task IDs. For `POST /calendar/events/{event_id}/restore-proposal`, validate the path `event_id` and request `snapshot_id` before enqueueing: both must belong to the current user, the snapshot must describe the same event, and it must be the retained before-snapshot of a completed modification. Persisted `calendar.restore.prepare` input then has the exact key set `{"source_snapshot_id", "creation_idempotency_key"}`, with no key named `event_id` or `snapshot_id` and no extra key; the Worker retains Task 16A's exact-key validation and fail-closed ownership recheck before provider access.
 
 - [ ] **Step 4: Extend settings responses and validation**
 
@@ -3748,16 +3752,16 @@ git commit -m "feat: expose trusted action status"
 ### Task 27: Extend retention, privacy deletion, deployment, and incident runbooks for M2
 
 **Files:**
-- Modify: `backend/src/ai_employee/workers/retention.py`
+- Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
 - Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
-- Create: `backend/tests/integration/retention/test_m2_action_retention.py`
-- Modify: `docs/operations.md`
-- Modify: `docs/acceptance-checklist.md`
+- Create: `backend/tests/integration/retention/test_m2_action_retention.py` — M2 retention plus CalendarEvent four-column atomic-clear regressions.
+- Modify: `docs/operations.md` — non-rolling 0019 rollout, 0019-compatible rollback floor, and incident handling.
+- Modify: `docs/acceptance-checklist.md` — scope-by-scope 0019 resync recovery evidence and rollback-floor acceptance.
 - Modify: `scripts/test-deployment.sh`
 
 - [ ] **Step 1: Write failing retention and deletion-barrier tests**
@@ -3773,6 +3777,24 @@ async def test_mail_body_retention_clears_all_aead_material_but_keeps_hash() -> 
     assert approval.payload_hash == ORIGINAL_HASH
 
 
+async def test_calendar_event_retention_clears_each_field_four_column_group() -> None:
+    await retention.run(now=RETAIN_AFTER)
+
+    event = await load_calendar_event(EVENT_ID)
+    assert (
+        event.description_ciphertext,
+        event.description_nonce,
+        event.description_key_version,
+        event.description_aad_version,
+    ) == (None, None, None, None)
+    assert (
+        event.location_ciphertext,
+        event.location_nonce,
+        event.location_key_version,
+        event.location_aad_version,
+    ) == (None, None, None, None)
+
+
 async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_provider_ids() -> None:
     await deletion.execute(user_id=USER_ID, request_id=REQUEST_ID)
 
@@ -3783,17 +3805,21 @@ async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_pro
     assert await provider_resource_ids_for(USER_ID) == ()
 ~~~
 
-Cover 30-day mail body cleanup, 180-day mail metadata, event-end-plus-180-day calendar snapshots, 365-day action/audit history, unresolved reconciliation becoming `needs_attention` before command redaction, expired content blocking resubmission, source-cache deletion distinctions, unclaimed cancellation, claimed bounded reconciliation, user write barrier, unknown-result warning, provider-neutral Google/Microsoft token cleanup, deletion audit minimization, and retention-role permissions for every new table. Preserve M1's inactive anonymized user row because the append-only deletion audit has a non-null user foreign key; do not assert physical user-row deletion without a separate approved schema redesign.
+Cover 30-day mail body cleanup, 180-day mail metadata, event-end-plus-180-day calendar snapshots and CalendarEvent description/location fields, 365-day action/audit history, unresolved reconciliation becoming `needs_attention` before command redaction, expired content blocking resubmission, source-cache deletion distinctions, unclaimed cancellation, claimed bounded reconciliation, user write barrier, unknown-result warning, provider-neutral Google/Microsoft token cleanup, deletion audit minimization, and retention-role permissions for every new table. For each CalendarEvent field, assert `ciphertext`, `nonce`, `key_version`, and `aad_version` become `NULL` in one retention transaction; never accept an orphan version or a cleanup that clears only the legacy triple. Preserve M1's inactive anonymized user row because the append-only deletion audit has a non-null user foreign key; do not assert physical user-row deletion without a separate approved schema redesign.
 
 - [ ] **Step 2: Run tests and observe the expected failure**
 
 Run: `uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py -q`
 
-Expected: FAIL because M2 tables and encrypted command triples are not included in cleanup/deletion.
+Expected: FAIL because M2 tables and encrypted command groups are not included in cleanup/deletion, and CalendarEvent retention does not yet prove that each description/location AAD version is cleared atomically with its ciphertext, nonce, and key version.
 
 - [ ] **Step 3: Implement content-specific retention and source-cache cleanup**
 
-Clear each AEAD triple atomically. Before clearing an encrypted command still attached to a
+Clear each existing three-column AEAD group atomically. CalendarEvent description and location are
+independent four-column groups: for each field, clear `ciphertext`, `nonce`, `key_version`, and
+`aad_version` together in the same transaction. Never leave a version orphan, clear only the old
+triple, or temporarily violate the all-null/all-non-null field constraint. Apply the event-end-plus-180-day
+deadline to these CalendarEvent content fields as well as compensation snapshots. Before clearing an encrypted command still attached to a
 `reconciling` action, stop its automatic schedule and move it to `needs_attention` with
 `action_content_expired`; manual resolution and provider links remain available, but no adapter can be
 called without the authenticated command. A mail draft whose body expired becomes a content-free
@@ -3817,7 +3843,9 @@ endpoint records the token-free maintenance fact defined in Task 25; local delet
 
 - [ ] **Step 5: Update runbooks and deployment contracts**
 
-Document Google/Microsoft progressive authorization, Microsoft administrator consent, global/provider kill switches, dedicated test-account allowlist, unknown-result handling, calendar restore, duplicate/mis-send incident response, and the rule forbidding rollback to M1 while any `reconciling`/`needs_attention` task exists.
+Document Google/Microsoft progressive authorization, Microsoft administrator consent, global/provider kill switches, dedicated test-account allowlist, unknown-result handling, calendar restore, and duplicate/mis-send incident response. Once 0019 has been applied, define the application rollback floor as an 0019-compatible image that understands the version columns and writes only v2: pre-0019/M1, v1 readers, and old Calendar writers are forbidden even when every Task is terminal. Preserve the stricter task-state rule that an older but still 0019-compatible M2 image may be selected only after all Tasks are terminal; `reconciling` or `needs_attention` requires a forward-fix image with reconciliation support.
+
+The runbook and acceptance checklist must define the non-rolling production sequence exactly: keep write switches off; stop Calendar scheduling; drain and stop every old `sync_calendar` Worker and confirm no old upsert remains; back up and apply 0019; validate v1/NULL marking, precise non-directory cursor invalidation, unchanged directory state and unchanged event ciphertext; deploy v2-only API/Worker/Scheduler with no old Worker return; restore the new Worker and then scheduling; run bounded resync; then verify every affected scope has recovered cursor/freshness, cleared `calendar_event_resync_required`, and v2 synchronized field rows before continuing. Task 27 documents and tests this contract but does not execute production changes, and Task 16A test success must not be treated as rolling-deployment evidence.
 
 Extend `scripts/test-deployment.sh` to assert write switches default off, Microsoft secret-file mounts, no host publication of internal metrics ports, and no secret values in rendered Compose.
 
@@ -3825,11 +3853,13 @@ Extend `scripts/test-deployment.sh` to assert write switches default off, Micros
 
 Run: `uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_role_permissions.py -q`
 
-Expected: PASS.
+Expected: PASS, including CalendarEvent description/location four-column atomic cleanup.
 
 Run: `bash scripts/test-deployment.sh`
 
 Expected: PASS.
+
+Then run `git diff --check` and inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the exact non-rolling sequence and 0019-compatible rollback floor. This document review is required release-contract evidence, but it is not evidence that a production 0019 rollout has run.
 
 - [ ] **Step 7: Commit**
 
@@ -4079,9 +4109,13 @@ Expected: PASS with fresh output from `just ci`, all crash cases, deployment con
 
 After the automated gate passes, stop before enabling real writes and request the user's explicit authorization plus out-of-band dedicated Google/Microsoft test-account configuration. Run the manual matrix only in a separate environment with the global/provider switches and exact account allowlist enabled. If authorization is not supplied, leave Task 30 incomplete and do not create a blank release-evidence document or claim M2 release completion.
 
+If the target release environment has not yet applied 0019, the release operator must use the approved change window to execute the non-rolling `docs/operations.md` sequence before enabling real writes: stop scheduling, drain old Calendar Workers and upserts, back up, migrate, deploy v2-only components, restore the new Worker and then scheduling, perform bounded resync, and verify each affected scope. Neither `scripts/test-m2-release.sh` nor Task 16A may automate these production actions. Do not continue to the provider matrix while any affected scope lacks recovered cursor/freshness, retains `calendar_event_resync_required`, or has synchronized non-empty fields that are not v2.
+
 - [ ] **Step 7: Write the completed release-evidence record**
 
-Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision. Every row must contain evidence or an explicit failed result with disposition; the file must contain no blank field or future-action marker.
+Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision.
+
+The same record must contain the actual non-rolling 0019 rollout evidence: scheduler-stop and old-Worker-drain timestamps; confirmation that no legacy upsert remained; backup and migration identifiers without secrets; deployed v2-only image digest; and the exact affected `(connection_id, calendar_id)` scope set using internal connection UUIDs plus locally hashed provider calendar IDs. For every affected scope, record the migration-time cursor/`last_success_at` clearing and `calendar_event_resync_required` marker, followed by recovered cursor/freshness, cleared error, and evidence that newly synchronized non-empty description/location groups are v2. If there were zero affected scopes, record an explicit evidenced zero rather than omitting the section. Record the 0019-compatible rollback-floor image as well. Every row must contain evidence or an explicit failed result with disposition; the file must contain no blank field or future-action marker.
 
 - [ ] **Step 8: Commit**
 
@@ -4097,7 +4131,7 @@ git commit -m "test: freeze M2 release evidence"
 - Draft generation/editing, reply/reply-all rules, recipient limits, model minimization, empty fallback, and no provider draft: Tasks 2, 11, 14–15, 21, and 23.
 - Calendar directory, working hours, buffer, 15-minute grid, 14-day horizon, three candidates, completeness, create/update/restore, ETag, attendees, and notification policy: Tasks 4, 12–13, 16–17, 22, and 24.
 - Calendar proposal trust hardening, including time-valid Worker leases, independent freshness observation, fixed-query minimal projections, transaction-free merged-interval computation, expected-version CAS, exact restore input, explicit-confirmation invariants, and operation-specific readiness: Task 16A.
-- CalendarEvent field AAD v2, forward-only 0019 rotation, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A, with provider read foundations from Tasks 12–13 and later retention/operations coverage from Tasks 25–27.
+- CalendarEvent field AAD v2, forward-only 0019 rotation, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention and the non-rolling operations contract: Task 27; scope-by-scope rollout evidence and the 0019-compatible rollback floor: Task 30.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
 - Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, and 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.

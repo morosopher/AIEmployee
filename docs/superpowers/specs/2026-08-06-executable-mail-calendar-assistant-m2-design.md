@@ -1286,15 +1286,17 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
    cursor/revision 未变化；此时仍不得恢复旧 Worker。
 4. 部署只写 v2、正常读取拒绝 v1 的 API/Worker/Scheduler 组件。0019 不支持旧新 Calendar writer
    混跑，任何旧 Worker 都不得在迁移后回流。
-5. 重启新 Calendar Worker 与调度，对 `calendar_event_resync_required` scope 执行受限重同步；验证
+5. 先重启新 Calendar Worker，再恢复调度，对 `calendar_event_resync_required` scope 执行受限重同步；验证
    新密文均为 v2、对应 cursor/freshness 恢复且错误清除后，才继续发布验证。
 6. 验证 M1 登录、同步、简报、审批假工具和任务恢复。
 7. 只为允许列表中的专用测试账户启用供应商写入，完成人工 E2E 与审计检查。
 8. 打开正式环境供应商开关；每个连接仍需用户单独渐进授权。
 
-回滚应用镜像时，新表和列保留。旧 M1 版本不得读取 M2 加密命令或把新任务状态解释为普通
-失败；因此只有在所有 M2 任务均为终态时才允许回滚到 M1 代码。若仍有 `reconciling` 或
-`needs_attention`，应部署保留 M2 Schema 和核对能力的修复镜像，而不是直接回滚。
+回滚应用镜像时，新表和列保留。一旦应用 `0019`，应用回滚下限就是理解 AAD 版本列、拒绝 v1
+读取并且只写 v2 的 0019-compatible 镜像；无论 M2 任务是否均为终态，都不得回滚到
+pre-0019/M1、v1 reader 或旧 Calendar writer。切换到较旧但仍兼容 0019 的 M2 镜像前，仍必须
+确认所有 M2 任务均为终态；若存在 `reconciling` 或 `needs_attention`，应部署保留 M2 Schema、
+v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回滚。
 
 ## 23. 主要风险与控制
 
