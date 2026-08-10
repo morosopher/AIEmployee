@@ -2642,8 +2642,9 @@ In `backend/tests/integration/db/test_migrations.py`, first freeze the 0019 migr
   setting, or stale `current_setting` assumption leaves DDL/DML/version writes at zero. A new session must observe
   valid catalog settings through `current_setting(..., true)`. At the Task 16A boundary, the ordinary idle path
   requires gate reset and call authority absent because no restore executor exists yet; Task 27D later extends this
-  same admission helper so a prior completed tuple additionally requires matching `ai_employee.restore_completion`,
-  completed call authority, exactly one exact-metadata audit, and complete ACL facts;
+  same admission helper so completed idle is authorized by a valid `ai_employee.restore_completion`, gate reset, and
+  complete ACL facts; a matching completed call is only a consistency projection and the completion audit may already
+  have been removed by ordinary retention or all-data deletion;
 - every online migration path uses the fixed session-level
   `SCHEMA_LIFECYCLE_LOCK=(20260806, 143)`. Hold `pg_advisory_lock_shared(20260806, 143)` on an independent
   connection, start fresh/0018 ordinary upgrades, and prove the Alembic outer boundary cannot commit or release its
@@ -2762,7 +2763,7 @@ Create `infrastructure/db/database_maintenance.py` with the exact signed-bigint-
 bytes/boundaries, low/high-bit fixed synthetic digests, signed-big-endian lifecycle/target lock vectors, strict
 gate/call-authority grammar, direct `pg_db_role_setting`
 reads, role-override rejection, and typed lifecycle/owner admission entries; Task 27D later adds the completion-GUC
-grammar and matching completed proof to these same entries. Create
+grammar plus completed GUC/gate/ACL proof to these same entries without requiring a surviving audit row. Create
 `cli/database_maintenance.py` so ordinary migration and `db-reset` share one implementation. The lifecycle context
 opens a long-lived connection to management database `postgres`, acquires the target lifecycle key there, and
 returns an in-process typed lease tied to that exact live session; it is not serializable and cannot be supplied by
@@ -4325,11 +4326,12 @@ conversion lifecycle. It must not move retention/privacy behavior from Task 27E 
   the fixed container mount path, and require production to override it with an explicit dedicated absolute
   directory/volume satisfying owner/mode/no-symlink/non-overlap checks; no password or real Secret is stored here.
 - Modify: `backend/src/ai_employee/infrastructure/db/database_maintenance.py` — add strict matching restore claim,
-  `restore-call:v3` grammar/CAS, exact psql backend registration/reconcile and completion-GUC/audit/ACL checks, while preserving
+  `restore-call:v3` grammar/CAS, exact psql backend registration/reconcile, commit-time audit validation, and
+  completion-GUC/gate/ACL admission/ACK checks, while preserving
   Task 16A's management lifecycle lease and target vectors.
 - Modify: `backend/src/ai_employee/cli/database_maintenance.py` — extend Task 16A's lifecycle wrapper into the one
-  owner-session coordinator for gate establishment, catalog-authoritative call transitions/reconcile, fenced grants,
-  role-switched verifier callbacks, and completion-GUC atomic reopen.
+  owner-session coordinator for active-attempt completion RESET plus gate establishment, catalog-authoritative call
+  transitions/reconcile, fenced grants, role-switched verifier callbacks, and completion-GUC atomic reopen.
 - Create: `backend/src/ai_employee/infrastructure/db/postgres_restore_stream.py` — Python process/pipe executor that
   supervises the credential-bearing psql consumer and credential-free pg_restore SQL generator, registers exact
   backend PID/start, enforces SQL-byte-zero before started, and captures both exits without a shell pipeline.
@@ -4374,7 +4376,8 @@ conversion lifecycle. It must not move retention/privacy behavior from Task 27E 
 - Create: `backend/tests/integration/operations/test_postgres_backup_restore.py` — backup/migration/cleanup races,
   management/reset/target lock races, signed-system-ID vectors, gate/call/completion catalog facts,
   `.env.example`/state-v4, database-zero-write already-applied, psql backend registration plus streamed SQL rollback,
-  ordinal reconcile, completion-GUC/exact-metadata-audit/duplicate-count atomic reopen, and isolated legacy conversion.
+  ordinal reconcile, completion-GUC/gate/ACL-authoritative atomic reopen with exact completion-audit insertion, and
+  isolated legacy conversion.
 - Modify: `backend/tests/integration/operations/test_database_maintenance_gate.py` — matching restore kind/source
   claims, post-crash gate blocking, and all owner-entry zero-write coverage.
 - Modify: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py`
@@ -4406,7 +4409,8 @@ Before either backup serialization domain, every backup/restore/migration/reset 
 Task 16A `database_lifecycle_lock_key_v1` from management database `postgres`; restore holds it through the complete
 attempt/reconcile/reopen, and reset holds it through check→drop→create→migration. Freeze the global order as
 management lifecycle → target → schema. Simulate a restore holder crash and a reset from another host: after the
-lifecycle session lock becomes available, durable active/`needs_attention` gate/call/completion facts must still yield zero
+lifecycle session lock becomes available, durable active/`needs_attention` gate/call facts plus the required absence
+of completion GUC must still yield zero
 drop/create/migration calls. `justfiles/db.just` and `scripts/test-tooling.sh` must prove no direct `dropdb`/`createdb`
 or environment lease bypass reappears.
 
@@ -4480,32 +4484,39 @@ manifest digest. Tests prove a matching legacy gate+registry with no call author
 while generic/sealed gate-only and every authority-only mismatch fail closed. New sessions see all three catalog facts, and migration/reset/drop/create/
 role-bootstrap/init-db-roles/generic/sealed/legacy/owner one-off paths have zero lifecycle/write/call-authority/
 `pg_restore` activity under held locks, malformed authority, or a crashed holder's active/`needs_attention` state.
-Starting legacy after a validated completed generic/sealed tuple must atomically reset that old call authority while
-establishing the legacy gate; it may never clear active/`needs_attention` authority or leave a cross-attempt tuple.
+Starting every legacy attempt must first reset `ai_employee.restore_completion` in the same owner transaction that
+establishes the gate; after a validated completed generic/sealed idle it must also reset that old call authority. It
+may never clear active/`needs_attention` authority or leave an active gate with historical completion/call facts.
 
 Before a new generic/sealed request with no active gate establishes the gate or revokes CONNECT, the holder must use
 the manifest-selected read-only verifier under management lifecycle + target lock to compare current revision and
 the complete `restore_fingerprint_v1` with expected post. Exact equality returns evidenced
 `restore_already_applied`, leaves database writes, audit, gate/call/completion mutation, psql, and pg_restore all at
 zero, and preserves any prior completed authority. It publishes only deterministic local evidence at
-`${RESTORE_STATE_DIR}/<target_identity_digest_v1>/already-applied/<source_binding_digest_v1>.json` with schema
+`${RESTORE_STATE_DIR}/<target_identity_digest_v1>.<kind>.<source_binding_digest_v1>.already-applied.json` with schema
 `ai_employee.postgres_restore_already_applied.v1`, exact expected/observed revision and fingerprint, no timestamp or
-random ID, and same-directory mode-`0600` temp + file/directory fsync + atomic rename. Any missing/mismatched evidence
-continues to normal gate admission. A matching existing `gate_established` attempt may CAS directly to
+random ID, and target/kind/source canonical bytes matching the filename. Publication uses a same-directory mode-`0600`
+temp, file/directory fsync, and no-clobber create: an existing byte-identical file is idempotent, while an existing
+different file fails closed without overwrite. Generic and sealed evidence therefore cannot collide. Any missing/
+mismatched evidence continues to normal gate admission. A matching existing `gate_established` attempt may CAS directly to
 `restore_succeeded` only after the same exact post proof; it starts no psql/pg_restore and writes no separate
 already-applied audit, but still proceeds through grants, verifier, and the unified completion transaction.
 
 A new generic/sealed attempt treats absent/previous-completed authority as virtual `new`, freezing its new attempt
 UUID, `call_ordinal=0`, `reopen_ordinal=0`, and exact identity facts. One owner transaction CASes both the exact prior
-catalog value and proposed facts to `gate_established`, establishes the gate, appends a content-free audit, and
-revokes CONNECT for PUBLIC/app/retention. `needs_attention` cannot be overwritten. After commit it terminates existing
+catalog value and proposed facts, first RESETs `ai_employee.restore_completion`, then transitions to
+`gate_established`, establishes the gate, appends a content-free audit, and revokes CONNECT for PUBLIC/app/retention.
+`needs_attention` cannot be overwritten. After commit it terminates existing
 non-owner sessions and proves new app/retention denial. Both settings survive process/container crash. Different
 manifests/kinds serialize through lifecycle/target locks and catalog gate; filesystem, Compose, environment and
 process mutexes are never authority. Loss of control session makes the restore result unknown but does not prove the
 psql backend exited; later phases wait for a matching invocation to reacquire the locks and reconcile catalog plus
-the exact PID/backend-start/database/role/`PGAPPNAME` tuple recorded in authority. Starting phase without registered
-backend uses only the controller-pipe-owner-dead and SQL-byte-zero invariant; ready/started/unknown phases must prove
-the registered backend exited before fingerprint reads. `pg_stat_activity` alone is never authority.
+the exact PID/backend-start/database/role/`PGAPPNAME` tuple recorded in authority. In
+`restore_backend_starting`, only the original still-live local controller that proves ownership of the exact child/
+pipe identity and SQL-byte-zero may continue to backend registration. Any other controller/host or missing/corrupt/
+unverifiable local projection must CAS `needs_attention` (or persist only that disposition when CAS is unsafe), keep
+`pg_restore_calls == 0`, and must not infer not-applied or allocate another ordinal. Ready/started/unknown phases must
+prove the registered backend exited before fingerprint reads. `pg_stat_activity` alone is never authority.
 Generic/sealed also hold the exclusive schema lifecycle lock after target admission for the
 entire attempt/reconcile/reopen. Legacy remains isolated and uses its registry/scavenger lifecycle.
 
@@ -4536,18 +4547,27 @@ extra key. Gate version is integer `1`; `completed_at` is database-frozen six-mi
 canonical bytes are exactly
 `restore-completion-authority:v1|<attempt>|<kind>|<target>|<source>|<final_call_ordinal>|<final_reopen_ordinal>|<post_revision>|<post_fingerprint>|<maintenance_gate_version>`.
 The authority digest is `SHA-256(b"ai_employee.restore_completion_authority.v1\0" || canonical_bytes)`.
-One owner transaction then CASes call authority to `completed` including the exact digest, inserts one ordinary
-BigInteger-ID audit with the exact metadata, sets database-wide
+The final owner transaction first locks and reads the complete `users` table and requires exactly one administrator
+row; that row may be active or the inactive anonymized row retained by M1 all-data deletion, while zero or multiple
+rows fail closed. It then CASes call authority to `completed` including the exact digest and inserts one ordinary
+BigInteger-ID audit whose outer fields are exactly `user_id=<the sole users.id>`, `task_id=NULL`,
+`event_type=database.restore.completed`, `actor_type=system`, `actor_id=database_restore`, and database-generated
+`created_at`, with the exact versioned metadata and no extra key. The same transaction sets database-wide
 `ai_employee.restore_completion=restore_completion:v1:<digest>`, resets the gate, and restores only minimal
 app/retention CONNECT while PUBLIC stays revoked. AuditEvent ID is not part of canonical bytes, call authority, the
-completion GUC, or ACK predicates. Extra/missing metadata, value/digest mismatch, or a same-attempt/digest duplicate
-rolls back. If commit ACK is unknown, close the old session, reacquire lifecycle/target locks in a new owner session,
-and read completion GUC first, then matching call authority, exactly one exact event/schema/metadata audit, gate, and
-ACL. Expected GUC plus a complete matching tuple means no replay; exact `reopen_committing` + active gate + the GUC
-still absent or at its prior valid value + no new-digest audit + fully revoked ACL proves not applied and CASes to
+completion GUC, or ACK predicates. Extra/missing metadata, value/digest mismatch, a same-attempt/digest pre-existing
+audit, or an INSERT count other than one rolls back; this is commit-time atomic audit evidence, not admission/ACK
+authority. Ordinary retention and all-data deletion may later remove the audit without invalidating completion.
+If commit ACK is unknown, close the old session, reacquire lifecycle/target locks in a new owner session, and read
+completion GUC first. Expected GUC + gate reset + minimal app/retention CONNECT restored with PUBLIC still revoked
+proves committed and forbids replay; matching completed call/audit may aid diagnosis but are outside the predicate.
+Because every active attempt reset completion while establishing its gate, exact `reopen_committing` + absent
+completion GUC + active gate + fully revoked ACL proves not applied and CASes by exact old call value to
 `reopen_not_applied`. Only explicit operator approval may use a new `reopen_ordinal` to re-enter
-`reopen_committing`; malformed/conflicting GUC or mixed/missing/duplicate state is `needs_attention`. General services
-remain stopped until an operator observes completed and explicitly restarts them.
+`reopen_committing`; an expected GUC with active gate/revoked ACL, an absent GUC with reset gate/reopened ACL, a
+malformed/conflicting GUC, or any other mixed completion/gate/ACL shape is `needs_attention`. A prior valid completion
+value is never legal during an active attempt. General services remain stopped until an operator observes completed
+and explicitly restarts them.
 
 Freeze an independent absolute `RESTORE_STATE_DIR`; generic/sealed restore mounts backup and sealed artifacts
 read-only, mounts only this directory read-write, and rejects any state path equal to or nested under those trees.
@@ -4556,8 +4576,9 @@ Projection path is `${RESTORE_STATE_DIR}/<target_identity_digest_v1>/<attempt_uu
 stable result code through same-directory temp, mode check, file/directory `fsync`, and atomic rename, but is never a
 lock or transition/call/reopen authority. It is not uploaded and is outside backup retention/orphan cleanup. Another
 host with no file, or a corrupt/stale file, reconstructs it from gate/call/completion facts and, for completed state,
-the matching authority digest, exactly one exact event/schema/metadata audit, and ACL regardless of whether a call
-may have spawned; insufficient/mixed catalog facts return a `needs_attention` disposition, persisting that phase only
+the completion GUC, gate reset, and ACL regardless of whether the completion audit still exists; matching completed
+call is a projection consistency fact rather than an independent authority. Insufficient/mixed catalog facts return a
+`needs_attention` disposition, persisting that phase only
 when the frozen graph has the corresponding edge. Legacy does not use this projection.
 
 Freeze the complete phase graph exactly:
@@ -4565,7 +4586,7 @@ Freeze the complete phase graph exactly:
 ```text
 new → gate_established
 gate_established → restore_backend_starting | restore_succeeded  # 后者只允许 exact post evidence，零 psql/pg_restore
-restore_backend_starting → restore_backend_ready | restore_not_applied | needs_attention
+restore_backend_starting → restore_backend_ready | needs_attention
 restore_backend_ready → restore_started | restore_not_applied | needs_attention
 restore_started → restore_succeeded | restore_outcome_unknown | restore_not_applied | needs_attention
 restore_outcome_unknown → restore_succeeded | restore_not_applied | needs_attention
@@ -4601,13 +4622,21 @@ generator, stream its stdout to psql, and send the guard trailer only after clea
 before backend visibility closes the only pipe writer, so a late psql connection sees EOF and executes zero SQL;
 ready-before-feed crash also executes zero SQL, while mid-stream crash or either child failure lacks the trailer and
 rolls back. Before revision/fingerprint reconcile, `restore_backend_ready`/`restore_started`/unknown must prove the
-authority-bound PID+backend_start+database+role+application backend exited; starting without registered backend may
-converge only from pipe-owner-dead plus SQL-byte-zero proof. Exact post → `restore_succeeded`; exact pre →
-`restore_not_applied`; partial/inconsistent/indistinguishable → `needs_attention`. Only explicit operator approval
-plus a fresh exact-pre proof may allocate a new `call_ordinal`; no blind replay. Test spawn-before-visible crash,
+authority-bound PID+backend_start+database+role+application backend exited. A starting phase without registered
+backend may continue only under the original still-live local controller that proves the exact child/pipe identity and
+SQL-byte-zero, and then only to `restore_backend_ready`. Any second host/controller without that proof must CAS
+`needs_attention` (or persist only that disposition when CAS is unsafe), keep `pg_restore_calls == 0`, and may neither
+infer exact pre/not-applied nor allocate a new ordinal. Exact post → `restore_succeeded`; exact pre from the registered
+backend phases → `restore_not_applied`; partial/inconsistent/indistinguishable → `needs_attention`. Starting-phase
+manual handling requires operator verification/termination of any child/backend and an explicit forward-fix, not an
+automatic recovery claim. Only explicit operator approval plus a fresh exact-pre proof from legal
+`restore_not_applied` may allocate a new `call_ordinal`; no blind replay. Test spawn-before-visible crash,
 backend-ready-before-feed, SQL-byte-zero before started CAS+fsync, mid-stream crash/missing trailer rollback,
-generator/consumer failure, commit ACK unknown, two-host overlap, stale PID/backend_start, cross-host no projection,
-partial/inconsistent outcomes, CAS races, and ordinal reuse rejection.
+generator/consumer failure, commit ACK unknown, two-host overlap, stale PID/backend_start, cross-host no projection
+and no local child/pipe proof (`pg_restore_calls == 0`, `needs_attention`), the sole original-controller
+starting→ready path, partial/inconsistent outcomes, CAS races, and ordinal reuse rejection. Also test a second restore
+of an older backup resets the prior completion GUC atomically with gate establishment, and a host crash immediately
+after the restore commit reconciles as completed without reopening or replay.
 
 Pre-manifest backups must be rejected by production generic restore. Define the exact recipe
 `just restore-legacy-to-isolated file output_basename`, backed only by
@@ -4688,8 +4717,9 @@ the immutable image does not contain every operations entrypoint; lifecycle wrap
 management lock or catalog gate/call/completion facts, and direct drop/create can bypass a crashed restore. Generic restore
 has no `.env.example`/read-only-artifact/separate-state contract, database-authoritative CAS phase graph, one-time
 psql backend registration plus SQL-byte-zero/start fence, deferred completion-guard stream rollback, DB-zero-write
-already-applied evidence, completion-GUC proof schema, cross-host projection
-rebuild, ordinal-safe retry, `reopen_not_applied`, same-session verifier, or atomic reopen ACK reconciliation; legacy conversion lacks registry/labels/scavenging; sealed does not
+kind-aware no-clobber already-applied evidence, active-attempt completion RESET, completion-GUC/gate/ACL proof,
+cross-host projection rebuild and starting fail-closed, ordinal-safe retry, `reopen_not_applied`, same-session
+verifier, or atomic reopen ACK reconciliation; legacy conversion lacks registry/labels/scavenging; sealed does not
 reuse the shared primitive; audit tooling and the explicit release-wrapper call are absent.
 
 - [ ] **Step 3: Implement the generic manifest/restore boundary, sealed path, and audit tooling**
@@ -4722,9 +4752,9 @@ group, effective switches, all consumers, exact target and second production con
 read-only and a separately validated `RESTORE_STATE_DIR` read-write. The executor holds management lifecycle, target,
 then exclusive schema lifecycle lock, owns gate/CONNECT revocation, database-authoritative v4 projection, exact
 `PGAPPNAME` psql registration, `restore_backend_starting`/`restore_backend_ready`/`restore_started` CAS+fsync gates,
-credential-free pg_restore-to-psql streaming, same-session grants/verifier, and exact
-completion-authority/GUC/schema/key/value/digest/duplicate-count/gate/ACL final transaction. ACK loss uses a new
-owner session and the completed vs
+credential-free pg_restore-to-psql streaming, same-session grants/verifier, and exact completion-authority/GUC plus
+fixed outer/schema/key/value/digest audit insertion and gate/ACL final transaction. ACK loss uses a new owner session
+and only the completion-GUC/gate/ACL completed vs
 `reopen_not_applied` matrix.
 Update `.env.example` and Compose with the fixed development/test host default plus production-explicit
 `RESTORE_STATE_DIR` mount/permission contract; never persist a database credential in state or expose it to
@@ -4734,7 +4764,7 @@ must have all `PG*`/DSN/Secret material removed and only emit SQL to stdout. It 
 started CAS+projection fsync, roll back on missing completion trailer/controller crash/either-child failure, and prove
 the authority-bound backend exited before fingerprint or a new ordinal. It must also implement the no-gate
 `restore_already_applied` DB-zero-write local evidence, the `gate_established → restore_succeeded` evidenced edge,
-and the exact ordinary-ID completion audit plus completion-GUC/digest/duplicate-count contract below.
+and the exact ordinary-ID completion audit insertion plus completion-GUC/gate/ACL authority contract below.
 Make ordinary
 `scripts/init-db-roles.sh` acquire/check the same lifecycle/catalog-authority boundary and reject every active or
 `needs_attention` restore; expose restore grant logic
@@ -4811,17 +4841,17 @@ Cover every M2 encrypted content group, CalendarEvent four-column atomic clear, 
 barrier/final reconcile, user isolation, and the shared versioned result-union retention rules. Unresolved automatic
 fences survive cutoff; automatic-success, unsatisfied-recovery, and successful-recovery groups delete only when every
 member is older than cutoff; parser mismatches remain protected; cleanup never depends on later credential lineage.
-The `database.restore.completed` audit referenced by the strictly parsed current
-`ai_employee.restore_completion=restore_completion:v1:<digest>` must resolve to exactly one same-attempt row matching
-the event type, `ai_employee.database_restore_completed.v1` exact metadata and
-`completion_authority_digest_v1`; its ordinary BigInteger ID is not authority. That exact proof survives cutoff,
-while a legally superseded old proof becomes ordinarily eligible and malformed, missing, duplicate, or cross-attempt
-completion-GUC/audit tuples fail closed before completion-proof deletion.
+`database.restore.completed` follows ordinary 365-day audit retention and all-data deletion; it has no
+completion-GUC-based exemption. Tests must delete an old completion audit while preserving a valid
+`ai_employee.restore_completion=restore_completion:v1:<digest>`, then prove completed admission/ACK still uses only
+that GUC, gate reset, and ACL. All-data deletion must remove the user's completion audit while retaining the single
+inactive anonymized `users` row required by M1, and later restore completion must still be able to bind a new audit to
+that sole row. AuditEvent's ordinary BigInteger ID, row count, and metadata are not admission/ACK authority.
 Add documentation checks for the current-expiry effective deadline, four-entry access-log canary, frozen
 Task-16A/Task-27C migration boundary, Task 27D schema/backup locks plus manifest-bound publication, production
 management/target lifecycle locks, three catalog facts, `.env.example`/state-v4, DB-zero-write local already-applied
 evidence, psql backend registration plus deferred-guard pg_restore stream rollback/ordinal generic restore,
-completion-GUC exact proof and atomic reopen,
+active-attempt completion RESET and completion-GUC/gate/ACL-authoritative atomic reopen,
 registry-scavenged isolated
 legacy conversion, and artifact-distinct sealed restore on the same generic/sealed restore primitive,
 obsolete-0019 non-production
@@ -4838,16 +4868,16 @@ uv run --project backend pytest \
   backend/tests/integration/privacy/test_all_data_deletion.py -q
 ~~~
 
-Expected: FAIL because M2 content groups, fence-aware cleanup, current restore-completion-proof retention, deletion
-barrier, and the finalized operations/acceptance contract are incomplete.
+Expected: FAIL because M2 content groups, fence-aware cleanup, ordinary completion-audit retention/privacy deletion,
+deletion barrier, and the finalized operations/acceptance contract are incomplete.
 
 - [ ] **Step 3: Implement lifecycle cleanup and freeze operator-facing contracts**
 
 Implement the detailed retention/privacy rules below, update `docs/operations.md` and
 `docs/acceptance-checklist.md` as target contracts rather than claims that production 0019 already ran, and retain
-all security invariants delivered by 27A–27D. Reuse the exact restore authority parser and completion-audit matching
-predicate rather than introducing a retention-only interpretation. Do not move implementation back into this
-closeout task.
+all security invariants delivered by 27A–27D. Do not add a retention-only completion parser or protect completion
+audits through the GUC; restore completion authority remains wholly in the database-wide GUC while AuditEvent follows
+ordinary user-scoped cleanup/privacy behavior. Do not move implementation back into this closeout task.
 
 - [ ] **Step 4: Verify and commit Task 27E**
 
@@ -4869,7 +4899,7 @@ a staging list or a sixth combined task; the task-local `Files`, RED/GREEN gates
 authoritative.
 
 **Cross-task file inventory (reference only):**
-- Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups, replace generic AuditEvent deletion with user-scoped fence-aware cleanup for unresolved 0019 refresh attempts, and retain the completion audit referenced by the current database restore-call authority.
+- Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups, replace generic AuditEvent deletion with user-scoped fence-aware cleanup for unresolved 0019 refresh attempts, and keep `database.restore.completed` on the ordinary audit cutoff without a completion-GUC exemption.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
 - Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
 - Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral automatic-refresh claim plus explicit-recovery connection lease, committed two-channel state machine, `calendar_aad_preflight | provider_refresh` automatic source union, zero-call unknown/retry contract, and new-session read-only `OAuthRefreshResultV1` reconciliation after commit ACK loss. The versioned result union maps automatic started to confirmed/replacement and recovery started to unsatisfied/replacement, validates each result's identity-change relationship before closure, and keeps append-only closure independent from current readiness.
@@ -4929,8 +4959,9 @@ authoritative.
   unique staging, schema-revision shared-lock/CAS, local/remote cleanup races, management/target locks, database
   gate/`restore-call:v3`/completion-GUC authority, low/high system-ID vectors, `.env.example`/v4 projection,
   DB-zero-write local already-applied evidence, psql starting/ready/started registration, SQL-byte-zero and deferred
-  completion-guard stream rollback, authority-bound backend/ordinal reconcile, exact completion audit proof/atomic
-  reopen, session-role verifier, and registry-scavenged legacy conversion.
+  completion-guard stream rollback, cross-host starting fail-closed, authority-bound backend/ordinal reconcile,
+  fixed-outer-field completion audit insertion plus completion-GUC/gate/ACL-authoritative reopen, session-role
+  verifier, and registry-scavenged legacy conversion.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py` — current-expiry
   effective-deadline tightening, zero-state/image binding, and sealed owner-before-secret validation followed by the
   shared maintenance executor and same-session sealed verifier.
@@ -4946,7 +4977,8 @@ authoritative.
   rollout guard and image binding, non-rolling 0019 rollout, ordinal-aware recovery, sealed owner-before-secret
   exact-image restore, shared management/target/exclusive-schema locks, database gate/call/completion facts,
   state-v4 projection, DB-zero-write local already-applied evidence, psql backend registration plus credential-free
-  pg_restore SQL stream/deferred-guard rollback and ordinal reconcile, completion-GUC exact audit/atomic reopen,
+  pg_restore SQL stream/deferred-guard rollback and ordinal reconcile, completion-GUC/gate/ACL-authoritative reopen
+  with exact audit insertion,
   operation-specific
   same-session role-switched verifiers,
   rollback floor, and incident handling.
@@ -4958,14 +4990,15 @@ authoritative.
 - Modify: `backend/src/ai_employee/infrastructure/db/database_maintenance.py` — preserve exact digest/lifecycle
   vectors and add strict gate/call/completion catalog parsing/CAS, target-lock ownership, matching-attempt claims,
   exact PID/backend-start/database/role/`PGAPPNAME` discovery, DB-zero-write already-applied evidence,
-  completion-GUC proof parser/matcher, and new-session schema/key/value/digest/duplicate-count/gate/ACL reconciliation.
+  completion-GUC proof parser and new-session completion-GUC/gate/ACL reconciliation, with audit validation scoped to
+  the final transaction rather than admission/ACK.
 - Create: `backend/src/ai_employee/infrastructure/db/postgres_restore_stream.py` — controlled psql consumer and
   credential-free pg_restore generator orchestration, controller-owned anonymous pipe, deferred completion guard,
   bounded forwarding, two-child shutdown/status collection, and zero-SQL/rollback failure classification.
 - Modify: `backend/src/ai_employee/cli/database_maintenance.py` — extend Task 16A's lifecycle wrapper with shared
   holder-session gate/ACL setup, catalog-authoritative restore intent, starting/ready/started backend registration,
   authority-bound backend exit reconciliation, DB-zero-write already-applied handling, grant/verifier callbacks,
-  and completion-GUC exact-proof atomic reopen.
+  and active-attempt completion RESET plus completion-GUC/gate/ACL-authoritative atomic reopen.
 - Create: `backend/src/ai_employee/cli/postgres_restore.py` — typed image-internal generic/sealed restore entrypoint
   that composes the maintenance authority and stream executor without a shell pipeline.
 - Modify: `scripts/backup-postgres.sh` — hold fixed database backup lock plus `${BACKUP_DIR}` flock across unique-run
@@ -5072,13 +5105,14 @@ async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_pro
 ~~~
 
 Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `oauth.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching `oauth.refresh_confirmed` closes only its own automatic started. The cleanup path must reuse the exact versioned result-union parser used by reconcile: confirmed is legal only when missing/same means old == new plus `refresh_identity_changed=false`, or different means old != new plus changed=true; replacement is legal only with old != new plus changed=true. Reject every disposition/flag/equality mismatch. An exact `oauth.refresh_credential_replaced` may close an older unresolved fence only when it binds the original automatic attempt/started source/connection digest/F, both original pre-digests, old identity/fixed key version, the recovery OAuthAttempt and recovery-started event, valid F/S/T with `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, `refresh_identity_changed=true`, persisted expiry, stable result code, and strict event ordering. `oauth.refresh_recovery_unsatisfied` closes only its recovery attempt, so multiple unsatisfied pairs leave the original fence unresolved; its deletable group must match the versioned result schema, recovery event/OAuthAttempt, F/S/T, canonical requested capabilities, `capability_transition`, and stable error/result codes without requiring the current capability state to remain unchanged. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, automatic different-token rotation, and access-only rotation must not release it. Retention never compares current credential lineage. For every deletable group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer confirmed/unsatisfied/consumption remains. Race retention against confirmed/recovery-result/consumption CAS and preserve the anonymized M1 user row.
-Also seed current `ai_employee.restore_completion=restore_completion:v1:<digest>`: the completion digest must select
-exactly one same-attempt `database.restore.completed` row whose
-`ai_employee.database_restore_completed.v1` exact metadata and `completion_authority_digest_v1` match; it must survive beyond
-365 days while unrelated old audits delete. After a later
-legal completion atomically supersedes the completion GUC, the old completion audit becomes eligible on the next
-cleanup; malformed/cross-attempt GUC or audit must preserve the audit and fail closed rather than
-delete proof. AuditEvent BigInteger IDs are ordinary storage identity and never participate in authority.
+Also seed current `ai_employee.restore_completion=restore_completion:v1:<digest>` with a matching old
+`database.restore.completed` audit. The audit must be deleted by the ordinary 365-day cutoff while the completion GUC
+remains unchanged, and a fresh admission/ACK check must still classify completed solely from expected GUC + gate
+reset + ACL. All-data deletion must likewise remove the user's completion audit without clearing the database-wide
+GUC, preserve exactly one inactive anonymized `users` row, and allow a later final restore transaction to attach its
+new exact audit to that sole row. AuditEvent BigInteger IDs, row existence/count, event/schema/metadata, and malformed
+audit content never participate in admission/ACK authority; malformed completion GUC itself still fails closed at the
+restore boundary, not in retention cleanup.
 保留原有测试覆盖：邮件正文/元数据和日程内容 AEAD 清理、CalendarEvent 描述/地点四列原子清空、未决 reconciliation 在命令脱敏前转 `needs_attention`、过期内容禁止重新提交、source-cache 与独立草稿/提案的删除区别、未认领取消、已认领有界核对、用户写屏障、provider-neutral token 清理、删除审计最小化以及每张新增表的 retention-role 权限。还要证明普通过期 audit 不因 fence 例外被误保留，旧 started 与较新 confirmed/unsatisfied/replacement 不能提前删除，且清理不读取后续 credential lineage。
 追加的 coordinator RED tests 必须覆盖：automatic started 尚未提交前 provider call 为零；同一 connection 双 Worker/Taskiq duplicate delivery 只有一个 provider call；provider response 后 connection lease 丢失、CAS miss、`TransientProviderError`、网络未知或数据库明确 rollback 留下 unresolved fence，后续 delivery 的 provider call 为零。result commit ACK 丢失时，新数据库 session 按 user/connection/attempt 查询 versioned `ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1` union：confirmed/replacement actual commit 永久关闭 automatic attempt，unsatisfied/replacement actual commit 永久关闭 recovery attempt，只有 replacement 消费 original fence；各 actual rollback 分支不补写 result、不重放 provider/code。parser RED cases 必须拒绝 confirmed disposition、`refresh_identity_changed`、old/new identity equality 任一不一致，以及 replacement 非 old != new、changed=true 的 metadata。再覆盖 ACK 丢失后另一合法 refresh/reauth 先提交：历史 closing result 仍有效并按 current facts readiness；changed=false confirmed 后的 access-only refresh 与同 plaintext refresh-token re-encryption 即使完整物理 snapshot 变化也不冲突；changed=true confirmed/replacement 后 current identity 回到 old 的 A→B→A、缺行、AEAD/归属无效或其他不一致返回 `oauth_credential_state_conflict`且 provider calls 为零。preflight 与所有 Google/Microsoft mail/calendar automatic refresh 都经过同一 `OAuthRefreshCoordinator`，不会有适配器自有 retry 或第二个 upsert boundary。known-valid missing/same/different response 都写完整 confirmed，Google access-only 也 confirmed；missing/same 为 old == new、changed=false，different 为 old != new、changed=true，且 different token 不消费任何旧 fence。explicit recovery 取得同一 lease但不创建第二个 automatic started；denial/missing/same/known failure 在 current `T` 上把 requested capabilities 从 `authorizing` 收敛为 `action_required` 并保留 actual scopes/last-verified facts，stale `T` no-op；unsatisfied 无 credential post/expiry并保留原 fence，用户创建第二个 OAuthAttempt 后 different token 才以 old != new、changed=true proof 消费。Google/Microsoft 任意合法 error callback 一次性消费 state并统一执行脱敏/replay 不变量，但 Problem/error code 必须按安全分类矩阵断言：用户拒绝与未知名称为 `oauth_authorization_failed`，Microsoft consent evidence 为 `microsoft_admin_consent_required`，普通 `interaction_required` 为 `microsoft_reauthorization_required`；raw error 不记录也不作为持久 error code。shape 错误消费前拒绝，同一 state 未知-error replay 拒绝；targetless callback 命中 fenced existing identity 时在任何 local credential/scope/capability 保存前 fail closed。identity RED tests 先用独立标准库实现固定 HKDF/HMAC vector，再覆盖同一固定 APP root-key/version 的 API/Worker/CLI 构造一致性、same-plaintext re-encryption 保持 identity/changed=false 与 changed=true A→B→A rollback，以及解密/UTF-8 与边界验证/identity/started/lease/provider 的固定顺序；M2 只测试 immutable-key 行为，不测试多 key 生命周期，expected derived key/message/HMAC 不得由 production helper 生成，任何真实 token/HMAC key 都不得进入输出。
 
@@ -5086,7 +5120,7 @@ delete proof. AuditEvent BigInteger IDs are ordinary storage identity and never 
 
 Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py -q`
 
-Expected: FAIL because M2 tables and encrypted command groups are not included in cleanup/deletion, CalendarEvent retention does not yet prove that each description/location AAD version is cleared atomically with its ciphertext, nonce, and key version, and generic AuditEvent cleanup still deletes unresolved refresh fences or the current restore-completion proof after the normal cutoff.
+Expected: FAIL because M2 tables and encrypted command groups are not included in cleanup/deletion, CalendarEvent retention does not yet prove that each description/location AAD version is cleared atomically with its ciphertext, nonce, and key version, generic AuditEvent cleanup still deletes unresolved refresh fences incorrectly, or completion audits are still exempted from ordinary retention/privacy deletion.
 
 ##### Detailed 27E content-specific retention and source-cache implementation
 
@@ -5137,18 +5171,14 @@ result first and strand a false unresolved started. M2 uses one fixed APP root k
 historical identity-key retention branch. The exception must neither retain unrelated audit history nor cross user
 boundaries.
 
-Handle `database.restore.completed` outside the ordinary cutoff delete. Read the current database-wide
-`ai_employee.restore_completion` through the same strict catalog parser used by restore admission and ACK-loss
-reopen reconciliation. Reuse the `restore_completion:v1:<authority_digest>` parser,
-`database.restore.completed` event type, `ai_employee.database_restore_completed.v1` exact metadata,
-authority-digest, and same-attempt duplicate-count-equals-one predicate; do not add a retention-only matcher. A valid
-completion GUC protects only the exactly matching content-free completion audit even when that row is older than 365
-days, while unrelated old audit rows remain eligible. AuditEvent's ordinary BigInteger ID is not authority. Once a
-later legal completion atomically supersedes the GUC, the old completion audit has no special protection and becomes
-eligible on the next cleanup. If a present GUC is malformed, or its completion audit is missing, duplicated, or
-cross-attempt, fail closed before deleting any
-`database.restore.completed` row and preserve the possible proof; never infer safety from local state, a loose subset
-of metadata, or ordinary per-user cutoff selection.
+Keep `database.restore.completed` inside the ordinary user-scoped cutoff delete. Retention must not read
+`ai_employee.restore_completion`, invoke restore admission/ACK parsers, count matching audits, or preserve completion
+rows based on event/schema/metadata/digest. A valid, malformed, missing, or superseded completion GUC has no bearing
+on whether an old completion audit is eligible; catalog validation belongs exclusively to restore admission/ACK.
+All-data deletion must remove completion audits with the user's other AuditEvent rows and must not add a privacy
+exception. The database-wide GUC continues to authorize completed independently, while M1's single inactive
+anonymized `users` row remains available for a future final transaction's required `user_id`. AuditEvent's ordinary
+BigInteger ID and content never become restore authority.
 
 ##### Detailed 27E all-data write barrier and bounded final reconciliation
 
@@ -5488,8 +5518,8 @@ storage is involved. Cover all of these cases:
   phase, ordinal, backend fact, or completion fact fails;
 - different manifests and generic/sealed/legacy kinds for the same target serialize independently of state filename.
   All three share only the target-lock/database-gate admission boundary. For manifest-bound generic/sealed, the
-  holder establishes the exact gate plus PUBLIC/app/retention CONNECT revocation atomically, terminates old non-owner
-  sessions, rejects new app/retention connections, and keeps the lock-holding control session across the supervised
+  holder first resets completion GUC and establishes the exact gate plus PUBLIC/app/retention CONNECT revocation in
+  one transaction, terminates old non-owner sessions, rejects new app/retention connections, and keeps the lock-holding control session across the supervised
   restore, grants, verifier, and final transaction. Legacy instead uses its durable registry and disposable target;
 - generic/sealed backup/artifact mounts are read-only and a distinct `RESTORE_STATE_DIR` is the only writable mount.
   `.env.example` supplies only the safe development/test host default; production requires an explicit absolute
@@ -5499,7 +5529,7 @@ storage is involved. Cover all of these cases:
 - the exact frozen phase graph and all legal edges pass, while terminal overwrite, jump, regression, self-transition,
   stale attempt/phase/call CAS and reopen-ordinal CAS fail. Grant rollback remains `restore_succeeded`; verifier
   failure remains `grants_succeeded`; `reopen_not_applied` is retried only with a new explicit `reopen_ordinal`;
-- no-gate exact-post evidence produces only deterministic local evidence with database writes/audit/GUC/psql/
+- no-gate exact-post evidence produces only deterministic kind-aware no-clobber local evidence with database writes/audit/GUC/psql/
   pg_restore all zero. Matching-gate exact post takes the direct `restore_succeeded` edge without a separate audit,
   then still completes grants/verifier/reopen. Every real ordinal first proves exact pre-state, CASes
   `restore_backend_starting`, and starts a fixed-target credential-bearing psql consumer whose controller-owned pipe
@@ -5507,16 +5537,20 @@ storage is involved. Cover all of these cases:
   after started CAS plus v4 projection fsync sends the deferred guard and launches a credential-free pg_restore SQL
   generator. Cover spawn-before-visible crash, backend-ready-before-feed, SQL-byte-zero before started, mid-stream or
   missing-trailer rollback, generator/consumer failure, commit/rollback/partial results, stale PID/backend-start,
-  two-host overlap, cross-host no projection, and explicit new ordinal only;
+  two-host overlap, cross-host no projection where starting has no provable local child/pipe identity and therefore
+  CASes `needs_attention` with `pg_restore_calls == 0`, the original-controller-only starting→ready path, and explicit
+  new ordinal only from legal `restore_not_applied`;
 - generic/sealed role grants after restore do not reopen CONNECT. The holder session runs `SET ROLE ai_employee_app`,
   `BEGIN READ ONLY`, asserts current/session user, receives SQLSTATE `25006` for DML, and completes every failing
-  revision/fingerprint/data check before reopen. One final transaction writes an ordinary BigInteger-ID exact
-  schema/metadata/authority-digest completion audit, sets
-  `ai_employee.restore_completion=restore_completion:v1:<digest>`, proves same-attempt duplicate count one, CASes
+  revision/fingerprint/data check before reopen. One final transaction requires exactly one active-or-inactive
+  anonymized administrator row (zero/multiple rows fail closed), writes an ordinary BigInteger-ID completion audit with the fixed user/task/event/
+  actor/database-time outer fields and exact schema/metadata/authority digest, sets
+  `ai_employee.restore_completion=restore_completion:v1:<digest>`, CASes
   call authority to completed, resets the gate, and restores only app/retention CONNECT while PUBLIC stays revoked.
-  ACK-loss uses a new owner session to read completion GUC first, then matching call authority, exact
-  event/schema/metadata, same-attempt duplicate count, gate, and ACL: completed only rebuilds projection; definite
-  rollback CASes to `reopen_not_applied`; mixed facts enter `needs_attention`; no committed reopen repeats;
+  ACK-loss uses a new owner session to classify only expected completion GUC + gate + ACL: completed only rebuilds
+  projection, audit retention/privacy deletion does not invalidate it, definite absent-GUC active rollback CASes to
+  `reopen_not_applied`, and mixed facts enter `needs_attention`; no committed reopen repeats. Cover a second restore of
+  an older backup clearing the prior GUC in its gate transaction and a crash immediately after restore commit;
 - `just restore-legacy-to-isolated file output_basename` is rejected outside development/test. Valid input creates a
   fsynced registry before any resource, then a uniquely labeled Compose project, internal network, ephemeral volume,
   and `0600` registered Secret; restores only the isolated database; reads actual revision/health; and publishes the
@@ -5565,11 +5599,10 @@ process fakes where external storage is involved. Cover all of these cases:
 - sealed grants and the deterministic revision-0018/artifact verifier are callbacks on the same lock-holder owner
   session while CONNECT remains revoked. The verifier executes `SET ROLE ai_employee_app`, `BEGIN READ ONLY`, and
   proves SQLSTATE `25006` before comparing revision/pair/count/digest/cursor/ciphertext facts. All checks finish before
-  one final completion-authority/GUC/ordinary-audit-ID/schema/metadata/digest/duplicate-count/gate-reset/minimal-
-  CONNECT transaction. ACK loss uses that same exact new-session predicate including `reopen_not_applied`; no
-  standalone app-only verifier runs after
-  reopen. The original 0018-compatible immutable image
-  cannot start until the completed tuple is proven; and
+  one final completion-authority/GUC/fixed-outer-field ordinary-audit-ID/schema/metadata/digest/gate-reset/minimal-
+  CONNECT transaction. ACK loss uses the same completion-GUC/gate/ACL new-session predicate including
+  `reopen_not_applied`; no standalone app-only verifier runs after reopen. The original 0018-compatible immutable
+  image cannot start until the expected completion-GUC/gate-reset/ACL shape is proven; and
 - tests assert zero calls to Alembic downgrade, direct SQL marker clearing, directory/full-account sync, temporary
   OAuth-only services, or provider writes. The fixture explicitly proves the sealed window has no business writes,
   so whole-database restore discards only attempted 0019 migration/resync facts and preserves the refresh rotation
@@ -5601,7 +5634,7 @@ checksum plus the fixed psql-consumer and credential-free pg_restore-generator f
 target lock/database GUC establishment, PUBLIC/app/retention CONNECT revocation, existing-session termination,
 post-check new-connection denial, fsynced state-v4 starting/ready/started intent, psql backend registration,
 deferred-guard pg_restore SQL stream and unknown-outcome reconcile, holder-session grants/verifier, and
-completion-GUC plus ordinary-ID exact metadata/digest/duplicate-count/gate-reset/ACL atomic reopen with ACK-lost
+completion-GUC plus fixed-outer-field ordinary-ID exact metadata/digest/gate-reset/ACL atomic reopen with ACK-lost
 reconciliation; an ordinary revision-0019 backup
 restores successfully and `pg_restore_calls == 1` on the baseline path.
 
@@ -6378,10 +6411,12 @@ bootstrap/init-db-roles, generic/sealed/legacy restore/verifier, backup, and own
 
 For a new generic attempt, absent/previous-completed authority is virtual `new` with frozen new attempt UUID,
 zero call/reopen ordinals and exact identity facts; one holder transaction CASes those plus the exact prior catalog
-value to `gate_established`, writes the gate/audit, and revokes PUBLIC/app/retention CONNECT.
+value, first RESETs `ai_employee.restore_completion`, then transitions to `gate_established`, writes the gate/audit,
+and revokes PUBLIC/app/retention CONNECT.
 Before that mutation, a no-gate request read-only compares current full revision/fingerprint to manifest expected
 post; exact equality returns `restore_already_applied` with database writes/audit/GUC/psql/pg_restore all zero and
-publishes only deterministic canonical local evidence under the target/source digest path. A resumed matching
+publishes only deterministic canonical local evidence under the kind-aware
+`<target>.<kind>.<source>.already-applied.json` path with no-clobber, byte-identical-idempotent semantics. A resumed matching
 `gate_established` attempt may use the same exact-post evidence to transition directly to `restore_succeeded`
 without psql/pg_restore or a separate already-applied audit, then still runs grants/verifier/reopen.
 `needs_attention` is terminal. After commit it terminates existing non-owner sessions and proves denial. The control
@@ -6394,9 +6429,9 @@ The three database-wide catalog facts are the only cross-host restore facts. Per
 `${RESTORE_STATE_DIR}/<target_identity_digest_v1>/<attempt_uuid>.json`, mode `0600`, parent `0700`; the state directory must be
 outside read-only backup/artifact trees. It mirrors the complete content-free authority/result through same-directory
 temp, mode check, file/directory fsync and atomic rename, but never authorizes transition/spawn/reopen. Missing,
-corrupt or stale projection is rebuilt from gate/call/completion facts and, for completed state, the completion
-digest, matching call authority, exactly one exact event/schema/metadata audit, and ACL on any host; insufficient/
-mixed catalog facts are
+corrupt or stale projection is rebuilt from gate/call/completion facts and, for completed state, the completion GUC,
+gate reset, and ACL on any host; matching completed call is a projection consistency fact and completion audit may
+already be absent after retention/privacy deletion. Insufficient/mixed catalog facts are
 reported with a `needs_attention` disposition and only persisted when the frozen graph permits that edge; they are
 never treated as “not spawned”.
 
@@ -6405,7 +6440,7 @@ Freeze the exact phase graph:
 ```text
 new → gate_established
 gate_established → restore_backend_starting | restore_succeeded  # 后者只允许 exact post evidence，零 psql/pg_restore
-restore_backend_starting → restore_backend_ready | restore_not_applied | needs_attention
+restore_backend_starting → restore_backend_ready | needs_attention
 restore_backend_ready → restore_started | restore_not_applied | needs_attention
 restore_started → restore_succeeded | restore_outcome_unknown | restore_not_applied | needs_attention
 restore_outcome_unknown → restore_succeeded | restore_not_applied | needs_attention
@@ -6440,9 +6475,13 @@ logging. Send the guard trailer only after generator EOF and exit zero; controll
 child failure, or pipe error rolls back the psql transaction. Spawn-before-visible and ready-before-feed crashes
 execute zero SQL; mid-stream crash rolls back. Before fingerprint/not-applied/new ordinal,
 ready/started/unknown phases must prove the authority-bound PID/backend-start/database/role/application backend has
-exited; starting without a registered backend may converge only from pipe-owner-dead plus SQL-byte-zero proof. Exact
-post means success, exact pre means `restore_not_applied`, other means `needs_attention`; only operator-approved new
-ordinal plus fresh exact-pre proof can retry.
+exited. Starting without a registered backend may continue only when the original still-live local controller proves
+the exact child/pipe identity and SQL-byte-zero, and then only to ready. A different controller/host or missing/
+unverifiable local projection CASes `needs_attention` (or persists only that disposition when CAS is unsafe), keeps
+`pg_restore_calls == 0`, and cannot infer not-applied or allocate an ordinal. Exact post means success, exact pre from
+registered-backend phases means `restore_not_applied`, other means `needs_attention`; starting manual disposition
+requires operator process verification/termination plus explicit forward-fix. Only operator-approved new ordinal
+from legal `restore_not_applied` plus fresh exact-pre proof can retry.
 
 Only a proven successful restore invokes object/schema grants on the already-held session. A definite grant rollback
 keeps `restore_succeeded`; verifier failure keeps `grants_succeeded`, with bounded retry and no self-transition. The generic verifier
@@ -6450,15 +6489,20 @@ then performs `SET ROLE ai_employee_app`, `BEGIN READ ONLY`, session/current-use
 manifest-selected schema/revision/fingerprint/health/sample check before reopen. CAS `verified` to
 `reopen_committing` with a new reopen ordinal. Freeze the exact `database.restore.completed` event,
 `ai_employee.database_restore_completed.v1` key set, database UTC timestamp, canonical proof bytes,
-`completion_authority_digest_v1`, and ordinary BigInteger audit storage identity from the spec. One database
-transaction CASes authority to completed including the exact digest, inserts one exact metadata audit, sets
+`completion_authority_digest_v1`, and ordinary BigInteger audit storage identity from the spec. The final transaction
+first requires exactly one `users` row, active or M1-retained inactive anonymized, and fails closed on zero/multiple
+rows. It CASes authority to completed including the exact digest and inserts one audit with
+`user_id=<sole users.id>`, `task_id=NULL`, `event_type=database.restore.completed`, `actor_type=system`,
+`actor_id=database_restore`, database-generated `created_at`, and exact versioned metadata. It then sets
 `ai_employee.restore_completion=restore_completion:v1:<digest>`, resets gate, restores only app/retention CONNECT,
-and leaves PUBLIC revoked. Audit ID does not enter authority. Duplicate attempt/digest audit, extra/missing key, or
-digest/value mismatch rolls back. On ACK loss, close sessions, reacquire lifecycle/target locks, and read completion
-GUC first, then matching completed call authority, exactly one exact event/schema/metadata audit, gate, and ACL: the
-complete tuple is final; unchanged `reopen_committing` plus prior/absent completion GUC, active gate, no new-digest
-audit, and revoked ACL CASes to `reopen_not_applied`; only explicit new reopen ordinal may retry. Mixed facts are
-terminal `needs_attention`. General services remain stopped for operator restart.
+and leaves PUBLIC revoked. Audit ID does not enter authority. A pre-existing duplicate attempt/digest audit, an INSERT
+count other than one, extra/missing key, or digest/value mismatch rolls back at commit time; later ordinary retention
+or all-data deletion may remove the audit. On ACK loss, close sessions, reacquire lifecycle/target locks, and read
+completion GUC first: expected GUC + gate reset + reopened minimal ACL is final even if audit is gone; absent GUC +
+unchanged `reopen_committing` + active gate + revoked ACL CASes by exact old value to `reopen_not_applied`; only an
+explicit new reopen ordinal may retry. An active attempt can never retain a prior completion value. Mixed GUC/gate/
+ACL facts are terminal `needs_attention`. General services remain stopped for operator restart. Tests include a
+second restore of an older backup resetting prior completion and a crash immediately after final commit.
 
 Reject a pre-manifest backup in production. Implement only
 `just restore-legacy-to-isolated file output_basename` for `APP_ENV=development|test`, backed by dedicated
@@ -6484,9 +6528,9 @@ recipe/service. After the sealed restore and grants, the same target-lock holder
 `SET ROLE ai_employee_app`, `BEGIN READ ONLY`, SQLSTATE `25006` DML rejection, and compares affected/connection
 counts, hashed connection/pair sets, event/identity/cursor/ciphertext digests, credential-row presence, and
 ProviderCalendar ownership with the bound `pre-migration` artifact. Every difference fails before atomic reopen.
-Only a completion GUC whose digest matches completed call authority and exactly one same-attempt
-`database.restore.completed`/`ai_employee.database_restore_completed.v1` exact-metadata row, with reset gate and
-complete ACL, authorizes the operator to select the recorded original 0018-compatible image and run health checks.
+Only the expected completion GUC with reset gate and complete ACL authorizes the operator to select the recorded
+original 0018-compatible image and run health checks. Matching completed call/audit are diagnostic evidence outside
+the predicate, and ordinary retention or all-data deletion may remove the audit without invalidating completion.
 
 Add `just calendar-aad-restore-0018 <exact encrypted path>` with a distinct
 `calendar-aad-restore-0018` service in the operations profile; generic `just restore` is explicitly forbidden for
@@ -6631,9 +6675,9 @@ state-v4 projection, psql backend starting/ready/started registration, SQL-byte-
 credential-free pg_restore stream rollback, authority-bound backend-exit-before-fingerprint, complete phase/CAS/
 ordinal graph,
 pre/post/inconsistent reconciliation, holder-session grants and `SET ROLE ai_employee_app`/`BEGIN READ ONLY`/
-SQLSTATE `25006` verifier, completion GUC plus matching call authority and ordinary-ID exact metadata/digest,
-duplicate-count=1, gate-reset/minimal-CONNECT atomic reopen and ACK-lost
-`reopen_not_applied` reconciliation; same-workspace development/test rejection;
+SQLSTATE `25006` verifier, completion GUC plus fixed-outer-field ordinary-ID exact metadata/digest insertion,
+gate-reset/minimal-CONNECT atomic reopen and completion-GUC/gate/ACL ACK-lost `reopen_not_applied` reconciliation;
+same-workspace development/test rejection;
 durable-registry/labeled/scavenged legacy conversion without manifest fabrication; app-role restore denial;
 artifact-distinct sealed basename/dump/checksum/manifest/preflight/`pre-migration`/image/script mismatch with zero
 owner and `pg_restore` calls; exact `sha256:` image, no build/pull, `--pull never`, pre-Secret container guard; and
@@ -6648,10 +6692,10 @@ fence surviving the 365-day cutoff with next-invocation provider calls still zer
 cleanup, safe automatic-success/schema-and-capability-transition-bound unsatisfied-recovery/successful-recovery group
 cleanup through the same strict disposition/flag/equality result parser without later credential-lineage matching,
 maximum group `created_at < cutoff`, an old started plus newer result remaining protected,
-the current completion GUC's digest, exact event/schema/metadata/digest, and
-same-attempt-duplicate-count-one completion audit surviving cutoff while unrelated old audits delete, a later legal
-completion-GUC supersession making the old proof eligible, malformed/missing/duplicate/cross-attempt
-GUC/audit tuples preserving completion proofs and failing closed,
+ordinary-cutoff deletion of an old completion audit while the current completion GUC remains authoritative,
+completed admission/ACK succeeding after that deletion, all-data deletion removing the completion audit while
+retaining the sole inactive anonymized user row, and a later restore audit binding that row; malformed completion GUC
+still fails closed only at the restore boundary,
 access-only/automatic-different-token/physical-snapshot rotation remaining blocked, retention-versus-confirmed/
 recovery-result/consumption lock/CAS races, app-role DDL/restore denial,
 post-restore app/retention grants, and
@@ -6717,14 +6761,15 @@ git diff --check
 
 Expected: PASS with no real-provider access.
 
-Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, four-entry access-log shutdown/canary, revision-global session lease before artifact/provider access, required decryptable/usable refresh token, complete credential snapshot CAS, one proactive refresh per connection, original artifact deadline plus current-access-row effective-deadline tightening, deadline guards at every CLI/recipe critical boundary, Task 16A frozen migration guard with Task 27C injection-only ownership, pre-backup 0018 exact-pair provider probes and failure disposition, post-migration stopped-service interval, unconditional active-attempt reuse plus failed/cancelled-only ordinal allocation, exact marker-only task execution, three-phase artifact contract, post-resync-before-start gate, ordinary dump/checksum/versioned-manifest/fingerprint/script-digest publication, production generic stopped-write/second-confirmation boundaries, low/high-bit target vectors and management→target→schema lifecycle admission, reset holder-crash zero drop/create, manifest-bound generic/sealed gate/call/completion facts with `.env.example`/state-v4/read-only mounts/DB-zero-write local already-applied evidence/psql backend registration plus deferred-guard credential-free pg_restore stream/backend-exit ordinal reconcile/completion-GUC exact-proof atomic reopen, durable-registry legacy scavenging, sealed extra artifact/image/script guard on the same restore primitive, operation-specific same-session verification, explicit release-script audit invocation, obsolete-0019 non-production reset versus production stop, and the normal 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
+Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, four-entry access-log shutdown/canary, revision-global session lease before artifact/provider access, required decryptable/usable refresh token, complete credential snapshot CAS, one proactive refresh per connection, original artifact deadline plus current-access-row effective-deadline tightening, deadline guards at every CLI/recipe critical boundary, Task 16A frozen migration guard with Task 27C injection-only ownership, pre-backup 0018 exact-pair provider probes and failure disposition, post-migration stopped-service interval, unconditional active-attempt reuse plus failed/cancelled-only ordinal allocation, exact marker-only task execution, three-phase artifact contract, post-resync-before-start gate, ordinary dump/checksum/versioned-manifest/fingerprint/script-digest publication, production generic stopped-write/second-confirmation boundaries, low/high-bit target vectors and management→target→schema lifecycle admission, reset holder-crash zero drop/create, manifest-bound generic/sealed gate/call/completion facts with `.env.example`/state-v4/read-only mounts/kind-aware no-clobber DB-zero-write local already-applied evidence/psql backend registration plus deferred-guard credential-free pg_restore stream/backend-exit ordinal reconcile/active-attempt completion RESET/completion-GUC-gate-ACL atomic reopen, durable-registry legacy scavenging, sealed extra artifact/image/script guard on the same restore primitive, operation-specific same-session verification, explicit release-script audit invocation, obsolete-0019 non-production reset versus production stop, and the normal 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
 The backup/restore review must additionally show fixed global/local backup locks, unique run/remote staging,
 3600-second lock-held orphan rechecks, Task 16A schema-lifecycle exclusive versus backup shared lock with pre/post
 revision CAS, production management/target/exclusive-schema locks plus three catalog facts and CONNECT revocation/
 termination/new-connection denial, state-v4 projection and psql backend registration/deferred-guard SQL stream/
-backend-exit/ordinal restore reconcile, owner-session `SET ROLE ai_employee_app` verification, completion-GUC plus
-ordinary-ID exact metadata/digest/duplicate-count/gate-reset/ACL atomic reopen including `reopen_not_applied`,
-current-completion-GUC audit retention through the shared strict parser/matcher, and the
+backend-exit/ordinal restore reconcile, cross-host starting fail-closed without local child/pipe identity,
+owner-session `SET ROLE ai_employee_app` verification, active-attempt completion RESET, completion-GUC plus
+fixed-outer-field ordinary-ID exact metadata/digest/gate-reset/ACL atomic reopen including `reopen_not_applied`,
+ordinary retention/privacy deletion of completion audits without weakening completion-GUC authority, and the
 exact legacy registry/labels/scavenger contract. Sealed uses a verifier callback on the holder
 session; generic/sealed/legacy artifacts and preconditions cannot cross paths.
 The review must explicitly include existing-AuditEvent attempt-bound refresh started/confirmed fences,
@@ -6944,7 +6989,8 @@ git commit -m "feat: add trusted action editors"
   the fixed `refresh_token_identity_v1` HKDF/HMAC vector,
   automatic coordinator/result-union recovery, four-entry real-Uvicorn access-log canary, Task 16A migration
   zero-bootstrap/typed-guard/schema-lifecycle-lock paths, current-expiry effective-deadline tightening,
-  cross-cutoff OAuth fence and current restore-completion-proof retention, serialized manifest backup/revision CAS,
+  cross-cutoff OAuth fence plus ordinary completion-audit retention/privacy deletion with independent completion-GUC
+  authority, serialized manifest backup/revision CAS,
   immutable operations image, fixed low/high-bit target vectors,
   management→target→schema lifecycle/reset boundary, database gate/call/completion facts, generic/sealed
   state-v4 psql backend registration/deferred-guard pg_restore SQL stream/backend-exit/ordinal/completion-GUC
@@ -7092,8 +7138,8 @@ Shared full-row/generation CAS, repeated-recovery single-consumer arbitration, d
 blocking, post-consumption `action_required` reauthorization and generation changes without attempt revival,
 fixed-root-key same-plaintext re-encryption preserving identity/changed=false plus changed=true A→B→A conflict,
 result-union whole-group cutoff through the same strict parser with
-user-isolated ordinary audit cleanup, current-completion-GUC restore-proof retention and legal-supersession
-release through the shared strict restore parser/matcher, malformed/cross-attempt proof preservation, all fail-closed
+user-isolated ordinary audit cleanup, ordinary completion-audit cutoff/privacy deletion while completion GUC remains
+authoritative, completed admission after audit deletion, malformed completion GUC restore-boundary failure, all fail-closed
 provider/lease/CAS/rollback cases, Taskiq/
 `TransientProviderError` zero-call delivery, closing-result-before-artifact resume under independent current readiness,
 and no replay of original D0 all pass. The gate additionally covers the 0019 typed rollout guard
@@ -7113,16 +7159,19 @@ manifest-bound backup without rollout artifacts; app-role restore is denied; any
 general/owner consumer, missing production confirmation, manifest mismatch, lifecycle/target/authority conflict, or
 pre-gate failure has `pg_restore_calls == 0`. Fixed low/high-bit digest/key vectors and management→target→schema order are proven;
 reset after holder crash has zero drop/create/migration while active authority survives. Every owner entry shares
-the same gate/call/completion catalog facts; live/crashed nonmatching calls have zero writes. After gate establishment, CONNECT is
+the same gate/call/completion catalog facts; live/crashed nonmatching calls have zero writes. Gate establishment first
+RESETs completion in the same transaction; afterward CONNECT is
 revoked, existing writers terminate, and new writers are rejected. Backup/artifacts mount read-only; a separate
 state-v4 projection follows catalog CAS. The psql consumer registers exact PID/backend-start/database/role/
 `PGAPPNAME`; pg_restore is credential-free and emits SQL only after started CAS+projection fsync. Spawn-before-visible
 and ready-before-feed are SQL-byte-zero, while missing trailer/mid-stream/controller or child failure rolls back.
 Fingerprint/replay is blocked until the authority-bound backend exits; stale PID/backend-start and `pg_stat_activity`
 alone are insufficient. commit+crash, rollback+crash, cross-host missing projection and inconsistent results reconcile
-without blind replay. The full phase graph/CAS/ordinals pass. The holder performs grants and app-role read-only
-verification before one completion-authority/GUC/ordinary-audit-ID/exact-metadata/digest/duplicate-count/gate-reset/
-minimal-CONNECT transaction; ACK loss is reconciled from the same exact predicate in a new session, with not-applied reopen
+without blind replay. A cross-host `restore_backend_starting` invocation without local child/pipe identity must enter
+`needs_attention` with zero pg_restore calls. The full phase graph/CAS/ordinals pass. The holder performs grants and
+app-role read-only verification before one completion-authority/GUC/fixed-outer-field ordinary-audit-ID/exact-
+metadata/digest/gate-reset/minimal-CONNECT transaction; ACK loss is reconciled only from completion GUC, gate, and ACL
+in a new session, with not-applied reopen
 requiring `reopen_not_applied` and a new ordinal. The
 dedicated legacy recipe uses a durable registry/labels/scavenger and creates a new backup rather than fabricating a
 manifest. The sealed path adds owner-before-secret artifact/image/script validation with zero calls on mismatch,
@@ -7218,9 +7267,9 @@ claims `kind=sealed_0018` through the same management/target/exclusive-schema lo
 facts, read-only artifact plus separate state-v4 projection, psql backend registration, deferred-guard
 credential-free pg_restore SQL stream, and authority-bound backend-exit/ordinal reconcile executor as generic. The holder
 session runs grants and the sealed revision/artifact verifier under
-`SET ROLE ai_employee_app` + `BEGIN READ ONLY`/SQLSTATE `25006` before the final completion-GUC/matching-call-
-authority/exact-metadata-audit/gate-reset/minimal-CONNECT transaction; ACK unknown is resolved by new-session
-completion GUC, matching authority, exactly one exact event/schema/metadata audit, gate, and ACL inspection, with definite
+`SET ROLE ai_employee_app` + `BEGIN READ ONLY`/SQLSTATE `25006` before the final completion-GUC/fixed-outer-field-
+exact-metadata-audit/gate-reset/minimal-CONNECT transaction; ACK unknown is resolved by new-session expected
+completion GUC, gate, and ACL inspection, with audit absence after retention/privacy remaining valid and definite
 rollback entering `reopen_not_applied`. Start only the recorded
 original 0018-compatible image after that tuple and health pass. Record this as an aborted 0019 window, not a
 successful rollout. Alembic downgrade, direct SQL,
@@ -7349,15 +7398,14 @@ exchange. Include failure disposition for lock loss, network unknown, `invalid_g
 shrink, CAS failure, confirmed/unsatisfied/replacement rollback, and commit-result-unknown reconciliation, without
 recording token, raw scope, provider response, raw `calendar_id`, or correlatable credential timestamps.
 
-Include restore-completion retention evidence as well: the current strictly parsed
-`ai_employee.restore_completion=restore_completion:v1:<digest>` must select exactly one same-attempt
-`database.restore.completed`/`ai_employee.database_restore_completed.v1` exact-metadata row with matching
-`completion_authority_digest_v1` across the ordinary 365-day cutoff while unrelated old audits delete. AuditEvent's
-ordinary BigInteger ID is not authority. A later legal completion atomically superseding the GUC makes the old proof
-eligible on the next cleanup. Malformed completion GUC and missing/duplicate/cross-attempt audit tuples must retain
-every possible completion proof and fail closed before any
-`database.restore.completed` deletion, using the same restore admission/reopen parser and matching predicate rather
-than a retention-only interpretation.
+Include restore-completion retention/privacy evidence as well: an old
+`database.restore.completed`/`ai_employee.database_restore_completed.v1` row must be removed by the ordinary 365-day
+cutoff while `ai_employee.restore_completion=restore_completion:v1:<digest>` remains unchanged, and a fresh completed
+admission/ACK check must still succeed solely from expected GUC + gate reset + ACL. All-data deletion must remove that
+user's completion audit without a special exemption, preserve the sole inactive anonymized `users` row, and a later
+restore completion must attach its new fixed-outer-field audit to that row. AuditEvent's ordinary BigInteger ID,
+existence/count, event/schema/metadata, and digest are not authority. Malformed completion GUC fails closed at restore
+admission/ACK; retention does not parse the GUC or preserve completion audits.
 
 The normal release record must first include a generic disaster-restore drill for a supported backup revision,
 including an ordinary 0019 backup: versioned manifest schema, safe basename, UTC creation time, PostgreSQL/Alembic
@@ -7389,18 +7437,23 @@ and started CAS plus projection fsync before the first SQL byte or pg_restore ca
 receives the bootstrap owner credential, the pg_restore generator receives no `PG*`/DSN/Secret value, and the
 controller-owned pipe/deferred completion guard rolls back on controller crash, missing trailer, generator/consumer
 failure, or mid-stream EOF. Fingerprint/not-applied/replay remains blocked until the authority-bound backend exits;
-stale PID/backend-start or `pg_stat_activity` alone is insufficient. Record spawn-before-visible and
+stale PID/backend-start or `pg_stat_activity` alone is insufficient. Record that another host with no provable local
+child/pipe identity transitions starting to `needs_attention`, makes zero pg_restore calls, and cannot allocate an
+ordinal; only the original still-live controller may take starting→ready. Record spawn-before-visible and
 ready-before-feed SQL-byte-zero, exact-post/exact-pre/inconsistent, grant rollback staying `restore_succeeded`,
-verifier failure staying `grants_succeeded`, and explicit new ordinal retry only.
+verifier failure staying `grants_succeeded`, and explicit new ordinal retry only from legal `restore_not_applied`.
 
-Record holder-session grants and app-role read-only verification before one final transaction CASes authority to
-completed, appends one ordinary BigInteger-ID exact event/schema/metadata/digest audit, sets
-`ai_employee.restore_completion=restore_completion:v1:<digest>`, proves same-attempt duplicate count one, resets
+Record that a second restore of an older backup resets the prior completion GUC in the same owner transaction that
+establishes its gate/authority and revokes CONNECT. Record holder-session grants and app-role read-only verification
+before one final transaction requires exactly one active-or-inactive-anonymized administrator row, CASes authority to
+completed, appends one ordinary BigInteger-ID audit with fixed `user_id`/NULL task/event/system actor/database-time
+outer fields and exact metadata/digest, sets `ai_employee.restore_completion=restore_completion:v1:<digest>`, resets
 gate, restores only app/retention CONNECT, and leaves PUBLIC revoked. ACK-loss evidence from a new owner session must
-read the completion GUC first and distinguish completed from definite not-applied using this same predicate
-`reopen_committing → reopen_not_applied`; retry requires a new `reopen_ordinal`. Mixed tuples enter
-`needs_attention`. The local projection must never be presented as database authority. Explicitly prove no 0019
-rollout artifact was required.
+read the completion GUC first and distinguish completed from definite absent-GUC active not-applied using only GUC +
+gate + ACL; audit retention/privacy deletion does not invalidate completed. `reopen_committing → reopen_not_applied`
+retry requires a new `reopen_ordinal`; a prior completion value in an active attempt or other mixed tuple enters
+`needs_attention`. Record a host crash immediately after committed reopen and prove no replay. The local projection
+must never be presented as database authority. Explicitly prove no 0019 rollout artifact was required.
 
 Also record production rejection of pre-manifest input and the exact non-production
 `just restore-legacy-to-isolated file output_basename` conversion: checksum/name/conflict validation, unique Compose
@@ -7422,10 +7475,10 @@ pg_restore generator flags/results, read-only backup/artifact mounts plus separa
 `kind=sealed_0018` gate/call-authority/completion-GUC binding, with grants on the existing holder session without early
 CONNECT reopen. The sealed verifier evidence must show that same owner session executing
 `SET ROLE ai_employee_app`, `BEGIN READ ONLY`, current/session-user assertions, and same-connection DML rejection
-with SQLSTATE `25006` before the shared final completion-audit/gate-reset/minimal-CONNECT transaction. Prove there is
-no standalone post-reopen app-only verifier and no success-affecting verification after reopen; ACK unknown uses the
-same new-session completion GUC + matching authority/digest + exact event/schema/metadata + duplicate count + gate + ACL/
-`reopen_not_applied` reconciliation as generic. Also record restored revision 0018, deterministic
+with SQLSTATE `25006` before the shared final fixed-outer-field completion-audit/gate-reset/minimal-CONNECT
+transaction. Prove there is no standalone post-reopen app-only verifier and no success-affecting verification after
+reopen; ACK unknown uses the same new-session expected completion GUC + gate + ACL/`reopen_not_applied`
+reconciliation as generic, and audit absence after retention/privacy remains completed. Also record restored revision 0018, deterministic
 restored-audit digest comparison, original 0018 image digest and health result, and an explicit
 `0019 rollout aborted` decision;
 it must not present the v2 rollout or provider matrix
