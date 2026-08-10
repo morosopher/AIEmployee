@@ -644,12 +644,15 @@ parser 必须严格拒绝 malformed escape、小写 hex、对 unreserved 字符�
 - Token 响应没有新 refresh token 时保留仍有效的既有加密 refresh token，不能写空覆盖。
 - Microsoft 租户要求管理员同意时，界面显示稳定错误和管理员操作说明。
 
-Google 与 Microsoft callback 都必须要求 non-empty `state`，并且只接受互斥的 `code` 或 `error`。
-Google `error=access_denied` 必须复用现有 `callback_error`/失败收敛边界，一次性消费 state，把仍匹配
-target generation 的本次 requested capabilities 收敛为 `action_required`，并返回不含供应商正文的稳定
-Problem；缺少 state、同时出现 `code+error`、两者都缺失、未知 Google error 或重放 state 都 fail
-closed。Microsoft 现有 error callback 保持相同的一次性消费与脱敏语义。两家 callback 都不得让错误
-入口绕过下述 targetless fenced-identity 保存前阻断。
+Google 与 Microsoft callback 都必须要求 non-empty `state`，并且只接受互斥的 `code` 或 `error`。缺少
+state、同时出现 `code+error`、两者都缺失，或 error 为空/超出现有输入边界时，必须在消费 state 前拒绝。
+任何通过基本输入边界的 non-empty `error+state`——包括供应商返回但本地尚未识别的 error code——都必须
+先按 state 解析并一次性消费 OAuthAttempt；若它是 target-`T` recovery attempt，则在同一失败收敛路径提交
+matching `oauth.refresh_recovery_unsatisfied`，把仍匹配 `T` 的 requested capabilities 收敛为
+`action_required`，stale `T` 则明确 no-op。随后统一返回不含供应商 error、description 或正文的稳定脱敏
+Problem；raw error 不得持久化、写日志或进入 Trace。首次未知 error 不能因名称未知而跳过 state 消费；同一
+state 随后以相同或不同未知 error 重放都必须因 state 已消费而拒绝。Microsoft 保持完全相同的一次性消费、
+target-`T` 收敛与脱敏语义。两家 callback 都不得让错误入口绕过下述 targetless fenced-identity 保存前阻断。
 
 已有 `connected` connection 的渐进授权和重新同意继续使用现有 connection-bound start：start 事务锁定
 原 connection，读取 `source_generation=S`，按现有规则只递增一次到
@@ -666,7 +669,7 @@ unknown fence 只阻断使用旧 refresh token 的自动 OAuth refresh grant；�
 state/PKCE/OAuthAttempt 保护的 authorization-code exchange。每个 code 最多交换一次。missing/same refresh
 token、用户拒绝、管理员同意缺失或可安全确认的供应商/网络失败属于 unsatisfied recovery：connection
 保持 `connected`、authorization generation 保持 target `T`，仍匹配 `T` 的本次 requested capabilities
-在与 `oauth.refresh_recovery_authorization_unsatisfied` 相同的短事务中从 `authorizing` 收敛为
+在与 `oauth.refresh_recovery_unsatisfied` 相同的短事务中从 `authorizing` 收敛为
 `action_required` 并写稳定 `error_code`；实际 scopes、last-verified facts 和既有 credential 保持不变。
 若 `T` 已过时，能力更新为 no-op，只允许追加不会覆盖较新授权事实的安全审计。无论本地结果事务是否
 成功，同一 state/code 都不得重放；只有新的用户操作才能创建下一 OAuthAttempt。只有 callback 明确得到
@@ -1133,14 +1136,15 @@ CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时
 365 天工作区历史清理不得把 OAuth refresh 事件当作普通审计直接删除。generic AuditEvent delete 必须
 排除 `oauth.refresh_started`、`oauth.refresh_confirmed`、
 `oauth.refresh_recovery_authorization_started`、
-`oauth.refresh_recovery_authorization_unsatisfied` 与
+`oauth.refresh_recovery_unsatisfied` 与
 `oauth.refresh_credential_replaced`；专用 cleanup 只解析 content-free metadata，并显式按 `user_id`
 过滤。
 
 matching confirmed 只关闭它精确引用的 automatic started；matching unsatisfied 只关闭本次 recovery
-authorization started，不能关闭原 unresolved automatic fence；只有 matching
-`oauth.refresh_credential_replaced` 才消费原 fence。automatic success、unsatisfied recovery 和 successful
-recovery 分别按 17.3 定义的组原子清理，且组内每一行都必须早于 cutoff，等价于组内最大
+authorization started，不能关闭原 unresolved automatic fence；matching replacement 同时关闭它精确引用的
+recovery authorization started 和原 automatic fence，且只有 replacement 能消费原 fence。cleanup 必须使用
+17.3 的同一版本化 result union 匹配关闭事实；automatic success、unsatisfied recovery 和 successful recovery
+分别按完整组原子清理，且组内每一行都必须早于 cutoff，等价于组内最大
 `created_at < cutoff`。旧 started 加较新 confirmed/unsatisfied/consumption 不得提前删除，不能先删 result
 再留下伪 unresolved 事实。
 
@@ -1249,17 +1253,41 @@ network/response unknown、`invalid_grant`、malformed token/expiry/scope、scop
 CAS miss 都不能产生 confirmed；数据库明确证明 result 事务已 rollback 时，started 保持 unresolved。
 provider 一旦已经被调用，无论该 rollback 是否可证明，后续都不得再次调用 provider。
 
-coordinator/result 短事务在发出 commit 后若 ACK 丢失，或异常使调用方无法证明事务已 rollback，必须
-分类为 commit-result-unknown，而不是断言“必然未写 confirmed”。丢失原 connection/session/lease 不影响
-核对：实现使用新的数据库 session，以 `user_id + connection_id + attempt_id` 做只读 reconcile；automatic
-通道的 attempt 是 `refresh_attempt_id`，explicit recovery 的 attempt 是 `OAuthAttempt.id` 并同时核对其绑定
-的 original refresh attempt。只有 matching `oauth.refresh_confirmed` 或
-`oauth.refresh_credential_replaced`、required post snapshot/digest/identity/expiry 全部存在，且 current
-PostgreSQL facts 与该关闭 proof 一致时，才恢复为 confirmed/consumed；原 provider 调用数保持 1。若事件
-不存在、字段不完整或 current facts 不一致，禁止补写猜测 result，原 automatic started 保持 unresolved，
-进入稳定 `needs_attention`，以后 `provider_calls == 0`。Taskiq 重投、`TransientProviderError`、进程恢复和
-资源 401 重新进入都只读该事实。只有 started 尚未提交且 provider call 尚未开始的纯本地失败可以重新
-claim。
+ACK-lost 只读 reconcile 的返回类型必须是版本化、按 event type 判别的
+`OAuthRefreshResultV1 = ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1`：
+
+- automatic `oauth.refresh_started` 只接受 matching `oauth.refresh_confirmed` 或
+  `oauth.refresh_credential_replaced` 作为关闭 result；
+- explicit `oauth.refresh_recovery_authorization_started` 只接受 matching
+  `oauth.refresh_recovery_unsatisfied` 或同一个 `oauth.refresh_credential_replaced` consumption 作为关闭
+  result；replacement 同时关闭 recovery attempt 与它绑定的 original automatic fence，而 unsatisfied 只关闭
+  recovery attempt。
+
+每个 union member 都必须验证自己的 event type、result/proof schema version、精确 user/connection/attempt、
+source、必要的 original-attempt 关联和严格 `created_at` 顺序。只要 append-only matching result 合法存在，
+对应外部调用或 authorization attempt 就永久 closed；关闭证明不得要求 current credential、generation、
+capability 或 scope 仍等于历史 result 产生时的值，也不得因后续合法变化而让旧 attempt 复活。
+
+coordinator/result 短事务在发出 commit 后若 ACK 丢失，或异常使调用方无法证明事务已 rollback，必须分类为
+commit-result-unknown，而不是断言“必然未写 result”。丢失原 connection/session/lease 不影响核对：实现使用
+新的数据库 session，以 `user_id + connection_id + attempt_id` 查询上述 result union；automatic attempt 使用
+`refresh_attempt_id`，explicit recovery 使用 `OAuthAttempt.id` 并核对其 original refresh attempt。若允许的
+matching result 合法存在，事务按 actual commit 处理，attempt 永久 closed，reconcile 不增加 provider call；
+confirmed/replacement 保持原总调用数 1，error callback unsatisfied 可保持 0，完成 exchange 后的 unsatisfied
+可保持 1。若没有合法 matching result，才按 actual rollback/未决结果处理：禁止补写猜测 result，started
+保持 unresolved并进入稳定 `needs_attention`，且 provider/code 都不得重放。Taskiq 重投、
+`TransientProviderError`、进程恢复和资源 401 重新进入都只读该事实。只有 started 尚未提交且 provider call
+尚未开始的纯本地失败可以重新 claim。
+
+attempt 关闭与 current readiness 必须分两步核对。对已关闭的 confirmed/replacement：current credential
+精确等于 result post-state 时，可直接从持久 result 恢复成功；若另一次合法 refresh/reauthorization 已先提交，
+则按 current generation、credential、scope 与 capability 重新执行本地 preflight/readiness，不要求历史
+post-state 等于 current state，也不重开旧 attempt。若 current state 回到该关闭 proof 的 old identity、缺少
+必需 credential 行、AEAD/归属无效，或不能满足任何合法 current-state 不变量，则返回稳定
+`oauth_credential_state_conflict`/`needs_attention` 并阻断 rollout；旧 attempt 仍 closed，
+`provider_calls == 0`。unsatisfied 没有 credential post/expiry proof，关闭后同样只按 current capability facts
+检查 readiness。防重放不要求构造完整 credential lineage；append-only result 证明历史 attempt 已闭合，
+readiness 独立证明当前状态是否安全。
 
 显式 progressive recovery 直接映射现有 `OAuthAttempt + AuditEvent`，不新增 0018 schema：
 
@@ -1288,21 +1316,25 @@ claim。
    connection 仍为 `connected` 且 `authorization_generation == T` 时，callback 复用并扩展现有
    `mark_progressive_authorization_failed` 契约，在同一短事务中只把这些 requested capabilities 收敛为
    `action_required`、写稳定 `error_code`，同时追加
-   `oauth.refresh_recovery_authorization_unsatisfied`。该事务保留原 `actual_scopes`、`last_verified_at` 等
+   `oauth.refresh_recovery_unsatisfied`。该事务保留原 `actual_scopes`、`last_verified_at` 等
    last-verified facts，不保存新 credential、scope、provider account 或 supplier identity facts。若 `T`
    已过时或 connection 已由较新授权改变，capability 更新必须 no-op，只允许追加不会覆盖较新状态的安全
    audit；不得把旧失败重新写到新 generation。
 6. unsatisfied 使用关闭 metadata
-   `result_schema_version="oauth_refresh_recovery_authorization_unsatisfied.v1"`，精确绑定 matching
+   `result_schema_version="oauth_refresh_recovery_unsatisfied.v1"`，精确绑定 matching
    recovery-started event/OAuthAttempt IDs、原 `refresh_attempt_id`/`started_source`/`connection_digest`、
    F/S/T、两个 frozen pre-digest、old identity/固定 key version、规范排序的 requested capabilities、
    `capability_transition="action_required"|"stale_target_noop"`、稳定 `error_code` 与 `result_code`；其
    `created_at` 必须严格晚于 matching recovery started。它只关闭本次 authorization attempt，不关闭原
-   automatic fence。lease loss、CAS miss、明确 rollback 或 commit-result-unknown 按上文安全核对规则处理，
-   不得重放 provider/code 或补写猜测 result；用户只能显式创建新的 progressive OAuthAttempt。
+   automatic fence。该 schema 不得包含 credential post snapshot/digest、new identity、persisted expiry 或
+   deadline 字段；current-`T` 的 result 必须证明 `action_required` 与原 `actual_scopes`/last-verified facts 保留，
+   stale-`T` 的 result 必须证明 capability no-op。lease loss、CAS miss、明确 rollback 或
+   commit-result-unknown 按上文 result union 核对，不得重放 provider/code 或补写猜测 result；用户只能显式
+   创建新的 progressive OAuthAttempt。
 
-`oauth.refresh_credential_replaced` 是唯一能够关闭 unresolved automatic fence 的 append-only
-consumption。其关闭 metadata
+`oauth.refresh_credential_replaced` 是 result union 中同时关闭 matching recovery authorization started 与
+unresolved original automatic fence 的 append-only consumption，也是唯一能够关闭 original fence 的
+result。其关闭 metadata
 `proof_schema_version="oauth_refresh_credential_replaced.v1"` 精确包含：
 
 - `source="progressive_recovery"`、原 `started_source`、`connection_digest`、原
@@ -1357,7 +1389,8 @@ ciphertext/nonce 使用原始 bytes；两行的 `credential_kind` 必须分别�
 才产生的 token、expiry、deadline 或 provider response。
 
 confirmed 只关闭自己的 automatic started；recovery unsatisfied 只关闭 matching recovery authorization
-started；credential replacement consumption 只关闭它精确引用的原 unresolved automatic started。365 天
+started；credential replacement consumption 同时关闭 matching recovery authorization started，并消费它精确
+引用的原 unresolved automatic started。365 天
 清理的 generic AuditEvent delete 必须排除上述五种事件，专用 user-scoped cleanup 按以下组处理：
 
 - automatic success 组为 started + confirmed；
@@ -1373,7 +1406,7 @@ lineage，也不能先删 result 留下伪 unresolved 事实。
 replacement consumption 首次有效后永久关闭原 fence。后续 generation、scope/capability、access 或
 refresh credential 正常变化不使它复活；current guard 使用同一固定 root key/version 重算 current
 identity。current identity 等于 consumed old identity 时，即使 physical digest 已变化（包括 A→B→A 或同
-token 重加密），仍以 `oauth_refresh_identity_rollback` fail closed。disconnect 会删除 old credential，
+token 重加密），仍以 `oauth_credential_state_conflict` fail closed。disconnect 会删除 old credential，
 因此不能用于补造 consumption；新 connection 映射、direct SQL、marker waiver 或 physical digest/
 generation 变化都不能解除 fence。
 
@@ -1454,7 +1487,7 @@ expected lowercase `refresh_token_identity_v1` 为
 | `oauth_refresh_claim_locked` | 409/任务非重试失败，同 connection 已有 coordinator lease |
 | `oauth_refresh_result_unknown` | 任务进入 `needs_attention`，禁止 Taskiq/TransientProviderError 重放 |
 | `oauth_refresh_claim_lost` | 任务进入 `needs_attention`，provider 后 session lease 已丢失 |
-| `oauth_refresh_identity_rollback` | 409/任务失败，current identity 回到 consumed old identity |
+| `oauth_credential_state_conflict` | 409/任务失败，closed result 后 current credential 回到 old identity、必需行缺失或状态不一致 |
 | `draft_version_conflict` | 409，重新加载草稿 |
 | `proposal_version_conflict` | 409，重新加载提案 |
 | `approval_invalidated_by_edit` | 409，提交新版本 |
@@ -1529,12 +1562,16 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   可消费旧 fence。多次 recovery、F/S/T、target-`T` anti-replay、strict `created_at` 顺序和完整 metadata 都
   必须独立测试。unsatisfied 单元测试覆盖 requested capabilities 从 `authorizing` 收敛为
   `action_required`、稳定 error code、保留 actual scopes/last-verified facts、stale-`T` no-op 和创建新
-  OAuthAttempt 重试。
+  OAuthAttempt 重试。另测试版本化 `OAuthRefreshResultV1` 的判别：automatic started 只接受
+  confirmed/replacement，recovery authorization started 只接受 unsatisfied/replacement；合法 append-only
+  result 永久关闭对应 attempt，current readiness 变化不得重开它。
 - `OAuthRefreshCoordinator` 的 automatic 状态机：session advisory lease → committed started → network →
   atomic confirmed；started 未提交前 provider call 为零，started 后的 lock loss/network unknown/CAS miss/
   已确认 rollback 都留下 unresolved fence。commit ACK 丢失必须用新 session 做只读 result reconcile，而非
-  假定 rollback；Taskiq/`TransientProviderError` delivery 重新进入时只读 fence，provider call 为零；显式
-  progressive authorization-code exchange 取得 lease 但不追加第二个 started。
+  假定 rollback；result closure 与 current readiness 分开测试，包括 ACK 丢失后另一合法 refresh/reauth 先
+  提交仍不复活旧 attempt，以及 current identity 回到 old identity/缺行时稳定
+  `oauth_credential_state_conflict` 且 provider call 为零。Taskiq/`TransientProviderError` delivery 重新进入时
+  只读 fence/result，显式 progressive authorization-code exchange 取得 lease 但不追加第二个 started。
 - ProviderWriteOutcome 与重试安全判断。
 - 模型输入裁剪、签名清洗和输出 Schema。
 
@@ -1579,11 +1616,13 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   different 更新两行但不追加 replacement consumption。network unknown、`invalid_grant`、malformed、
   scope shrink、任一 lease loss、CAS miss 或明确 rollback 不产生 confirmed，并让后续 Taskiq/
   `TransientProviderError` delivery provider call 为零。result commit ACK 丢失必须另测两种数据库事实：
-  事务实际 commit 时，用新 session 按 `user_id + connection_id + attempt_id` 读到完整 matching
-  confirmed/post snapshot/digest/expiry，恢复 confirmed 且 `provider_calls == 1`；事务实际 rollback 时，
-  reconcile 不补写 result，started 保持 unresolved，进入 `needs_attention`，后续
-  `provider_calls == 0`。原 coordinator connection 或 lease 丢失不得阻止该 PostgreSQL 只读核对。
-  confirmed 后 artifact 前崩溃只从持久 post-state 恢复。
+  事务实际 commit 时，用新 session 按 `user_id + connection_id + attempt_id` 读到合法 versioned confirmed
+  union member 即永久关闭 started，`provider_calls == 1`；事务实际 rollback 时，reconcile 不补写 result，
+  started 保持 unresolved，进入 `needs_attention`，后续 `provider_calls == 0`。原 coordinator connection 或
+  lease 丢失不得阻止该 PostgreSQL 只读核对。再覆盖 ACK 丢失后另一合法 refresh/reauthorization 先提交：
+  historical post 与 current 不同仍保持旧 attempt closed，并按 current facts 继续 readiness；current identity
+  回到 old identity、缺行或 current facts 无法自洽时返回 `oauth_credential_state_conflict`、阻断 artifact，
+  但 provider call 仍为零。confirmed 后 artifact 前崩溃只从持久 result 和 current readiness 恢复。
 - Google/Microsoft progressive recovery 测试必须直接使用现有 target-bound OAuthAttempt。start 事务在
   `S >= F` 且 current identity 等于 unresolved fence old identity 时，原子执行唯一
   `S→T=S+1`、创建 OAuthAttempt，并追加
@@ -1600,16 +1639,20 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   mismatch 都不写 credential/scope/account facts；在 target `T` 仍匹配时，同一短事务复用
   `mark_progressive_authorization_failed` 把本次 requested capabilities 置为 `action_required`、写稳定
   `error_code`、保留原 actual scopes/last-verified facts，并写完整
-  `oauth_refresh_recovery_authorization_unsatisfied.v1` result。`T` 已过时则 capability mutation 为 no-op，
+  `oauth_refresh_recovery_unsatisfied.v1` result。该 result 不含 credential post/expiry 字段；`T` 已过时则
+  capability mutation 为 no-op，
   safe audit 标记 `stale_target_noop` 且不得覆盖较新状态。测试分别覆盖 denial、missing、same、stale `T`
   和创建新 attempt 重试；第一次 unsatisfied 后原 fence 仍阻断 automatic refresh，第二次 different token
-  才消费原 fence，同一 code 永不重放。replacement result commit ACK 丢失也必须覆盖“实际 commit → 新
-  session reconcile consumed、`provider_calls == 1`”与“实际 rollback → original fence unresolved、后续
-  `provider_calls == 0`”，禁止 fabricated consumption。
-- Google callback API 集成测试必须证明 `code+state` 与 `error=access_denied+state` 互斥且 state 一次性
-  消费；`access_denied` 走上述 callback-error/unsatisfied capability 收敛并返回稳定脱敏 Problem。缺 state、
-  同时 `code+error`、两者都缺失、未知 error 和重放均 fail closed。Microsoft 现有 error callback 语义
-  保持对等，且两家 targetless fenced identity 仍在任何保存前阻断。
+  才消费原 fence，同一 code 永不重放。unsatisfied 与 replacement 两种 result 的 commit ACK 丢失都必须
+  覆盖 actual commit/actual rollback：actual commit 通过对应 union member 永久关闭 recovery attempt，且只有
+  replacement 消费 original fence；actual rollback 不补写 result、不重放 code/provider。测试还覆盖 ACK
+  丢失后另一合法 reauthorization 已改变 generation/capability 的竞态，历史 attempt 仍 closed并独立核对
+  current readiness。
+- Google callback API 集成测试必须证明 `code+state` 与任意合法 non-empty `error+state` 互斥且 state 一次性
+  消费；`access_denied` 和未知但输入合法的 error 都先走 callback-error/target-`T` unsatisfied 收敛，再返回
+  相同稳定脱敏 Problem，raw error/description 不持久化、不记录日志。缺 state、同时 `code+error`、两者都
+  缺失或 malformed error 必须在消费前拒绝；首次未知 error 已消费后，以同一 state 重放相同或不同未知
+  error 必须拒绝。Microsoft 语义保持对等，且两家 targetless fenced identity 仍在任何保存前阻断。
 - 无 target 的 Google/Microsoft `/provider/start` 继续覆盖新连接与无 fence identity merge。若一次性
   exchange 后规范化 identity 命中已有 connected connection 且存在 unresolved fence，callback 必须在任何
   credential/scope/capability 写入前返回
@@ -1619,12 +1662,13 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   connection 只有一个 automatic provider call；每次 successful automatic call 只关闭自己的 started；
   Google access-only/missing-refresh response 写完整 confirmed、更新 access、逐字节保留 refresh；different
   refresh 写 confirmed 但不消费旧 fence；存在 earlier unresolved fence 时 provider call 为零。另覆盖
-  response-after-lock-loss、network unknown、CAS miss、result commit ACK-loss reconcile、confirmed rollback、Taskiq 和
+  response-after-lock-loss、network unknown、CAS miss、result-union commit ACK-loss reconcile、confirmed rollback、Taskiq 和
   `TransientProviderError` zero-call re-entry、固定 lock order、stale generation/row CAS，以及所有
-  confirmed/unsatisfied/consumption 的 required metadata 与严格 created_at ordering。
-- retention 集成测试必须覆盖 confirmed 关闭自己的 started、unsatisfied 只关闭 recovery attempt、
-  replacement consumption 关闭 original fence、多次 explicit recovery、targetless blocked audit 不关闭
-  fence，以及 automatic-success、unsatisfied-recovery、successful-recovery 各组只有
+  confirmed/unsatisfied/consumption 的 required metadata 与严格 created_at ordering；另覆盖 closing result 后
+  current credential/generation 合法变化不复活旧 attempt，以及 old-identity rollback conflict 的零调用阻断。
+- retention 集成测试必须使用同一 result union 覆盖 confirmed 关闭自己的 started、unsatisfied 只关闭
+  recovery attempt、replacement 同时关闭 recovery attempt 并消费 original fence、多次 explicit recovery、
+  targetless blocked audit 不关闭 fence，以及 automatic-success、unsatisfied-recovery、successful-recovery 各组只有
   `max(created_at) < cutoff` 才原子删除；未消费 original started 跨 cutoff 保留且不影响其他用户/普通
   audit cleanup。
 - preflight 使用刷新后 access token，通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
@@ -1774,9 +1818,12 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   response 以 G/G/G CAS 和完整 `oauth.refresh_confirmed` 关闭本次 started；missing/same refresh 也必须
   confirmed 并逐字节保留 refresh row。unknown、lease loss、CAS miss、已确认 rollback 或既有 unresolved
   fence 时，Taskiq/`TransientProviderError` 重入 provider call 为零；result commit ACK 丢失时不得假定
-  rollback，而要用新数据库 session 按 user/connection/attempt 做只读 reconcile。matching confirmed 或
-  replacement 及 required post facts 完整且 current facts 一致时恢复 confirmed/consumed，provider 调用数
-  仍为 1；否则原 started unresolved、进入 `needs_attention`，后续调用数为零且不补写 result。带
+  rollback，而要用新数据库 session 按 user/connection/attempt 查询版本化 result union。合法 matching
+  confirmed/replacement 永久关闭 automatic started；合法 unsatisfied/replacement 永久关闭 recovery started，
+  其中 unsatisfied 不消费 original fence。关闭后再独立检查 current readiness：历史 post 精确匹配可直接
+  恢复，后续合法 credential/generation 变化按 current facts 继续，old-identity rollback、缺行或不一致则返回
+  `oauth_credential_state_conflict` 并阻断，但都不能复活旧 attempt或增加 provider call。没有合法 result 才
+  保持 started unresolved、进入 `needs_attention` 且不补写 result。带
   connection ID 的显式 progressive authorization-code recovery 取得相同 lease但不创建第二个 started；
   只有 target-`T` callback 的 different refresh 可写 replacement consumption。无 target callback 命中带
   unresolved fence 的既有 connection 时，保存前 fail closed，不能承担恢复。
@@ -1809,16 +1856,23 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   S→T、OAuthAttempt target T，并追加关联原 fence 的 recovery authorization event；requested capabilities
   同时进入 `authorizing`，callback code 只交换一次。denial、missing/same 或已知 provider/network failure
   的 unsatisfied result 在 target `T` 仍匹配时，把本次 requested capabilities 与 audit 同事务收敛为
-  `action_required`，写稳定 error code，保留 actual scopes/last-verified facts；stale `T` 只允许 capability
-  no-op 和安全审计。原 fence 始终保留，用户可创建新 attempt。different token 才把
-  credential/scopes/capabilities 与完整 replacement proof 原子提交。Google callback 只接受互斥的
-  `code+state` 或 `error+state`，`access_denied` 走同一 unsatisfied 路径；歧义、未知 error、缺 state 和重放
-  fail closed。targetless identity merge 遇到 fence 保存前失败。confirmed、unsatisfied 和 consumption
-  分别关闭自己的精确 started，retention 只有在对应组全部早于 cutoff 时删除。
-- consumption 后 current state 独立校验，正常 generation/scope/credential 变化不使 fence 复活；固定
-  APP root key/version 重算的 current identity 回到 consumed old identity 时按 rollback fail closed。M2
-  不轮换 root key，也不引入 identity keyring。confirmed 后、artifact 前崩溃必须从持久 token/expiry 恢复，
-  不能再次 refresh；disconnect/reconnect、unconditional upsert 或 physical digest 变化不能成为恢复路径。
+  `action_required`，写稳定 error code，保留 actual scopes/last-verified facts，且不含 credential post/expiry
+  字段；stale `T` 只允许 capability no-op 和安全审计。原 fence 始终保留，用户可创建新 attempt。different
+  token 才把 credential/scopes/capabilities 与完整 replacement proof 原子提交。Google 与 Microsoft callback
+  只接受互斥的 `code+state` 或 bounded non-empty `error+state`；任意通过输入边界的 error（包括未知名称与
+  `access_denied`）都先一次性消费 state，并在 target `T` 上提交 unsatisfied/no-op 后返回相同脱敏 Problem。
+  缺 state、code/error 歧义、两者都缺失或 malformed error 在消费前拒绝；raw error 不持久化、不写日志或
+  Trace，已消费 state 的相同或不同 error 重放都 fail closed。targetless identity merge 遇到 fence 保存前
+  失败。versioned result union 按 automatic started→confirmed/replacement、recovery started→unsatisfied/
+  replacement 精确关闭；replacement 同时消费 original fence。retention 复用同一 union，且只有完整组全部
+  早于 cutoff 时删除。
+- closing result 后 current state 独立校验，正常 generation/scope/credential 变化不使旧 attempt 复活；固定
+  APP root key/version 重算的 current identity 回到 closed result 的 old identity、必需 credential 行缺失或
+  状态不一致时返回 `oauth_credential_state_conflict` 并 fail closed，但 provider call 为零。M2 不轮换 root
+  key，也不引入 identity keyring。closing result 已提交但 artifact 尚未发布时，精确 post-state 从持久
+  token/expiry 恢复；若另一合法 refresh/reauth 已先提交，则通过独立 current readiness 使用 current
+  token/expiry，均不能再次调用旧 attempt。disconnect/reconnect、unconditional upsert 或 physical digest
+  变化不能成为恢复路径。
 - whole-database restore 只能由 operations profile 的专用 owner-role one-off 执行。该服务不继承会自动
   migration 的 backend common 配置，只依赖 healthy PostgreSQL。宿主必须在任何 owner Secret/connection/
   `pg_restore` 前验证 basename、dump/checksum、preflight/`pre-migration` artifacts 和 image binding；服务
@@ -1912,18 +1966,22 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    access/refresh snapshot；随后在受控内存按精确 AAD 解密 refresh token，验证 non-empty、UTF-8 和现有
    长度边界，才按 M2 固定 APP root key/version 计算 current `refresh_token_identity_v1`。这些事实作为可能
    新 automatic attempt 的 `fence_generation=F`、两个 pre-digest、old identity 与 key version，再检查既有
-   refresh fence：同一 rollout 已有 `oauth.refresh_confirmed` 且 current
-   credential 匹配 post-snapshot、persisted expiry/deadline candidate 时，从持久 token/expiry 恢复后续
-   probe，不再次 refresh；存在 unresolved `oauth.refresh_started` 时，相同或不同 basename 都先保持零
-   provider call。只有用户显式 progressive recovery 产生的 `oauth.refresh_credential_replaced` 精确绑定原
+   refresh fence：同一 rollout 已有合法 matching `oauth.refresh_confirmed` 时，该 automatic attempt 已永久
+   closed；current credential 精确匹配 post-snapshot 时从持久 token/expiry 恢复后续 probe，另一次合法
+   refresh/reauthorization 已先改变 current facts 时则按 current readiness 继续，均不再次调用旧 attempt。
+   存在没有合法 result-union member 的 unresolved `oauth.refresh_started` 时，相同或不同 basename 都先保持
+   零 provider call。只有用户显式 progressive recovery 产生的 `oauth.refresh_credential_replaced` 精确绑定原
    automatic attempt、`started_source`、`fence_generation=F`、两个原 pre-digest、old identity/key version、
    recovery OAuthAttempt/event、F/S/T、两个 required post-digest、different-token new identity/version、
-   persisted expiry 与严格晚于两个 matching started 的 `created_at`，才永久关闭旧 fence。automatic
+   persisted expiry 与严格晚于两个 matching started 的 `created_at`，才永久关闭旧 fence与 matching recovery
+   attempt。automatic
    `provider_refresh`、targetless callback、generation/physical digest/access-only 变化都不能消费它。
    preflight 随后独立验证 current connection 仍 connected、`calendar.read` enabled、scopes 完整、credential
-   存在/归属/AEAD 可解密，并以固定 key version 重算 current plaintext identity；若 current identity 回到
-   consumed old identity，即使 physical digest 不同，也以 credential rollback fail closed。没有 matching
-   replacement consumption 时不得建立新 automatic attempt。
+   存在/归属/AEAD 可解密，并以固定 key version 重算 current plaintext identity；合法的后续
+   generation/credential 变化无需等于历史 post snapshot，也不要求构造完整 credential lineage。若 current
+   identity 回到 closed result 的 old identity、必需行缺失或 current facts 无法满足合法状态不变量，则返回
+   `oauth_credential_state_conflict` 并 fail closed；该冲突只阻断 rollout，不重开旧 attempt且 provider call
+   为零。没有 matching replacement consumption 时不得把 unsatisfied 当作 original-fence consumption。
 
    上述 current 前置条件通过后，preflight 必须重检本轮冻结的 current generation/snapshot，并在紧邻
    provider 调用的短事务中向既有 append-only `audit_events` 提交 content-free
@@ -1949,11 +2007,14 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    started。禁止现有无条件 upsert。网络未知、调用后任一 lease 丢失、scope shrink、CAS miss 或数据库
    明确 rollback 均不产生 confirmed、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。
    result commit ACK 丢失或异常导致 rollback 不可证明时，丢弃旧 session/lease，用新数据库 session 按
-   user/connection/attempt 只读核对 PostgreSQL：matching confirmed/replacement、required post
-   snapshot/digest/expiry 完整且 current facts 一致时恢复 confirmed/consumed，provider 调用数仍为 1；否则
-   started unresolved、进入 `needs_attention`，后续 provider call 为零，禁止补写猜测 result。后续 Taskiq
-   delivery 或 `TransientProviderError` 路径只读取该持久事实。confirmed 已提交但 artifact 发布前崩溃时，
-   同一 rollout 从持久 credential/expiry 继续。全部
+   user/connection/attempt 查询 versioned result union。matching confirmed/replacement 的 event schema、
+   attempt/source 与时序合法即永久关闭本次 automatic attempt，provider 调用数仍为 1；没有合法 result 才
+   保持 started unresolved、进入 `needs_attention`，后续 provider call 为零，禁止补写猜测 result。关闭后
+   独立执行 current readiness：精确 post-state 可恢复 persisted expiry；ACK 丢失期间另一合法 refresh/reauth
+   已提交则使用 current credential/expiry；old identity rollback、缺行或不一致返回
+   `oauth_credential_state_conflict` 并阻断 artifact，但不重开 attempt。后续 Taskiq delivery 或
+   `TransientProviderError` 路径只读取该关闭事实与 current readiness。confirmed 已提交但 artifact 发布前崩溃
+   时，同一 rollout按上述规则继续。全部
    connection confirmed 后重新
    读取持久化 expiry 并计算 deadline，再通过供应商只读 Calendar adapter 调用与恢复路径一致的
    `initial_pages(scope_key)` 并要求最终 cursor；全部 probe 成功且最终 rollout guard 通过后才原子提交
@@ -1969,13 +2030,15 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    或迁移后清 marker。
 
    若 unresolved fence 通过带 connection ID 的 explicit progressive OAuthAttempt 恢复，start 已把 requested
-   capabilities 置为 `authorizing` 并固定 target `T`。Google `access_denied`、Microsoft 对等拒绝、
+   capabilities 置为 `authorizing` 并固定 target `T`。Google/Microsoft 任何输入合法的 provider error、
    missing/same refresh 或已知 provider/network failure 在 `T` 仍匹配时，必须复用
    `mark_progressive_authorization_failed`，把这些能力与 unsatisfied audit 同事务收敛为
    `action_required`，保留 actual scopes/last-verified facts且不写新 credential/scope/account facts；stale
-   `T` 只做 capability no-op 与安全审计。它们只关闭本次 OAuthAttempt，不能消费 original fence；只有
-   different non-empty refresh 的完整 replacement proof 能消费。Google callback 缺 state、同时 code/error、
-   未知 error 或 state replay 均 fail closed，targetless fenced identity 仍在任何保存前阻断。
+   `T` 只做 capability no-op 与安全审计。matching `oauth.refresh_recovery_unsatisfied` 只关闭本次
+   OAuthAttempt，不能消费 original fence；只有 different non-empty refresh 的完整 replacement proof 能消费。
+   Google/Microsoft callback 缺 state、同时 code/error、两者都缺失或 malformed error 在消费前拒绝；任何
+   合法 error（包括未知名称）先消费 state/收敛 attempt，再返回统一脱敏 Problem且不记录 raw error，随后
+   replay fail closed。targetless fenced identity 仍在任何保存前阻断。
 4. preflight 全部通过后，生成加密备份并执行迁移前只读审计；backup/audit 在启动和 artifact 原子提交前
    校验同一 rollout guard：非空集合要求 `now < deadline`，零分支要求重新证明 affected set 仍为空。
    审计必须证明数据库仍位于 0018、没有部分 AEAD 三元组，并重复记录每个
@@ -2052,13 +2115,13 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
 | 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
-| 双 Worker、Taskiq 重投或 `TransientProviderError` 导致同一 connection 重复 refresh/exchange | 所有 writer 共用 `OAuthRefreshCoordinator` 与 connection-scoped session lease；provider 前提交 attempt-bound started，网络外无业务事务，响应后同事务 CAS/result；网络未知、响应后 lock loss、CAS miss 或已确认 rollback 后续 delivery 只读 fence且 provider call 为零；commit ACK 丢失用新 session 按 user/connection/attempt 只读 reconcile，完整 matching result 恢复且总调用数仍为 1，否则 unresolved/`needs_attention` 且不补写 result |
+| 双 Worker、Taskiq 重投或 `TransientProviderError` 导致同一 connection 重复 refresh/exchange | 所有 writer 共用 `OAuthRefreshCoordinator` 与 connection-scoped session lease；provider 前提交 attempt-bound started，网络外无业务事务，响应后同事务 CAS/result；网络未知、响应后 lock loss、CAS miss 或已确认 rollback 后续 delivery 只读 fence且 provider call 为零；commit ACK 丢失用新 session 按 user/connection/attempt 查询版本化 confirmed/unsatisfied/replacement result union，合法 matching event 永久关闭对应 attempt，再独立核对 current readiness；后续合法状态变化不复活，old-identity/缺行冲突返回 `oauth_credential_state_conflict` 且零调用，无 result 才 unresolved且绝不补写 |
 | explicit recovery 拒绝或 missing/same token 后 capability 长期停在 `authorizing` | start 的 S→T 与 requested capability `authorizing` 原子提交；可安全确认的 unsatisfied 在同一短事务复用 `mark_progressive_authorization_failed` 收敛为 `action_required`、写稳定 error code并保留 actual scopes/last-verified facts；stale T 只做 no-op 与安全审计，用户可创建新 attempt，原 automatic fence 不被消费 |
-| Google callback 的歧义或 error 重放绕过一次性授权状态 | Google 与 Microsoft 都要求 state 且仅接受互斥 code/error；Google `access_denied` 走 callback-error/unsatisfied 路径并一次性消费 state；缺 state、code+error、未知 error 和 replay fail closed，targetless fenced identity 仍在保存前阻断 |
+| Google callback 的歧义或 error 重放绕过一次性授权状态 | Google 与 Microsoft 都要求 state 且仅接受互斥 code/error；缺 state、code+error、两者都缺失或 malformed error 在消费前拒绝；任何合法 error（含未知名称）都先一次性消费 state并在 target T 写 unsatisfied/no-op，再返回相同脱敏 Problem，raw error 不入库/日志，后续 replay fail closed；targetless fenced identity 仍在保存前阻断 |
 | targetless callback 命中带 unresolved fence 的既有 identity，却覆盖 credential 或创建重复 connection | callback 在保存任何 credential、scope 或 capability 前返回 `oauth_refresh_recovery_requires_connection_start`；可追加 content-free blocked audit，但不得创建 candidate snapshot、消费 fence、调用 `ensure_connection`/无条件 upsert或创建第二个 connection |
-| refresh token A→B→A 或同 token 重加密绕过 rollback guard | M2 从固定 `APP_MASTER_KEY_FILE` root key 与固定 `AeadCipher.key_version` 经 HKDF-SHA256/HMAC-SHA256 生成 `refresh_token_identity_v1`；started/consumption 持久化 old identity/version，current guard 按同一固定版本重算，identity 回到 consumed old identity即 fail closed；M2 不更换 root key/version，也不引入 multi-key lookup |
+| refresh token A→B→A 或同 token 重加密绕过 rollback guard | M2 从固定 `APP_MASTER_KEY_FILE` root key 与固定 `AeadCipher.key_version` 经 HKDF-SHA256/HMAC-SHA256 生成 `refresh_token_identity_v1`；started/result 持久化 old identity/version，current guard 按同一固定版本重算，identity 回到 closed result 的 old identity 时返回 `oauth_credential_state_conflict` 且不重开旧 attempt；M2 不更换 root key/version，也不引入 multi-key lookup |
 | 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；generic started/confirmed 精确绑定 attempt UUID、source、`rollout_digest_v1`、G/G/G、full/refresh pre/post 摘要、old/new identity/version、persisted expiry与 deadline candidate；mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序。未确认 fence 跨 basename 阻断；automatic missing/same/different refresh 都只 confirmed 自己的 started，只有带 connection ID 的 explicit progressive recovery 返回 different non-empty refresh token并原子提交完整 F/S/T replacement proof 才消费旧 fence |
-| 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention；未匹配 confirmed 或 explicit progressive replacement 的 automatic started 跨 cutoff 保留，统一锁序下重查 automatic-success、unsatisfied-recovery、successful-recovery 完整组；组内每个事件都必须早于 cutoff且不依赖后续 current credential lineage，unsatisfied、automatic different-token、access-only、generation 或物理摘要变化不解锁，跨 365 天回归要求后续 provider call 为零 |
+| 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention并复用同一 result union；confirmed 关闭 automatic started，unsatisfied 只关闭 recovery started，replacement 同时关闭 recovery started并消费 original fence。未匹配 union result 的 automatic started 跨 cutoff 保留；各完整事件组只有全部早于 cutoff 才删，且关闭不依赖后续 current credential lineage，跨 365 天回归要求后续 provider call 为零 |
 | restore 镜像/工件被替换，app-role 无法完整恢复，或 `pg_restore` 中途失败留下部分状态 | owner 前宿主 artifact/image guard；精确 `sha256:` restore image、无 build/pull、`--pull never`，容器读取 Secret 前复核；专用 owner-role 单事务 restore，成功后重授最小权限；app-only verifier 由 `PGOPTIONS` 与 `BEGIN READ ONLY` 双重强制只读 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |

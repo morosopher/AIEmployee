@@ -3807,8 +3807,8 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups, and replace generic AuditEvent deletion with user-scoped fence-aware cleanup for unresolved 0019 refresh attempts.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
 - Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
-- Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral automatic-refresh claim plus explicit-recovery connection lease, committed started/confirmed state machine, `calendar_aad_preflight | provider_refresh` automatic source union, zero-call unknown/retry contract, and new-session read-only result reconciliation after commit ACK loss.
-- Create: `backend/src/ai_employee/application/ports/credential_rotation.py` — typed connection-generation plus access/refresh physical snapshots and fixed identity version, with separate automatic confirmed and explicit progressive-recovery replacement-result contracts plus complete-post-proof reconciliation.
+- Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral automatic-refresh claim plus explicit-recovery connection lease, committed two-channel state machine, `calendar_aad_preflight | provider_refresh` automatic source union, zero-call unknown/retry contract, and new-session read-only `OAuthRefreshResultV1` reconciliation after commit ACK loss. The versioned result union maps automatic started to confirmed/replacement and recovery started to unsatisfied/replacement, with append-only closure independent from current readiness.
+- Create: `backend/src/ai_employee/application/ports/credential_rotation.py` — typed connection-generation plus access/refresh physical snapshots and fixed identity version, versioned confirmed/unsatisfied/replacement result contracts, and a separate current-readiness result including stable `oauth_credential_state_conflict`; unsatisfied has no credential post/expiry fields.
 - Modify: `backend/src/ai_employee/application/use_cases/connections.py` — extend connection-bound progressive authorization with the F/S/T unresolved-fence protocol; create `OAuthAttempt` plus `oauth.refresh_recovery_authorization_started` in the start transaction, keep the one-time code exchange outside the transaction, compare old/new refresh plaintext in controlled memory, reuse/extend `mark_progressive_authorization_failed` so safely known denial/missing/same/provider failures converge requested capabilities from `authorizing` to `action_required` at target `T` while stale `T` is a no-op, persist the matching unsatisfied result without closing the original fence, and atomically append replacement consumption only for a genuinely different non-empty token. A targetless callback that resolves to a fenced connection must fail before local credential/scope/capability persistence.
 - Create: `backend/src/ai_employee/application/use_cases/calendar_aad_preflight.py` — 0018 affected-pair discovery, revision-global plus connection-scoped coordinator leases, append-only durable refresh fence with identity/key-version metadata, per-connection OAuth refresh through the shared snapshot-CAS/confirmed rotation port, local recoverability proof, and provider-resource-read-only probe orchestration.
 - Create: `backend/src/ai_employee/application/calendar_aad_digests.py` — pure versioned field framing plus `credential_snapshot_digest_v1`, `refresh_credential_snapshot_digest_v1`, and `rollout_digest_v1` helpers shared by fence creation, replacement proof, replay lookup, retention, rollout guards, and evidence.
@@ -3817,8 +3817,8 @@ git commit -m "feat: expose trusted action status"
 - Create: `backend/src/ai_employee/application/use_cases/calendar_aad_recovery.py` — marker-only recovery planning, pair-digest/recovery-ordinal state protocol, and exact-task execution orchestration.
 - Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py` — add a marker-gated exact-event-scope entry that never invokes directory discovery.
 - Modify: `backend/src/ai_employee/application/use_cases/sync_mail.py` — route ordinary mail refresh through the shared coordinator and preserve access-only/same-token semantics without a second retry writer.
-- Create: `backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py` — session-bound shared snapshot loader/CAS helper with connection → access row → refresh row → matching started audit locks, automatic `oauth.refresh_confirmed`, progressive replacement proof, target-`T` capability convergence plus unsatisfied recovery result, strict event ordering, byte-preserving missing/same refresh handling, and a separate read-only complete-post-proof lookup used after commit ACK loss.
-- Create: `backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py` — connection-scoped PostgreSQL session-advisory lease, automatic committed-started claim lookup, explicit recovery lease, lease-loss/unknown classification, exactly-once automatic provider-call admission used by preflight and mail/calendar writers, and new-session `user_id + connection_id + attempt_id` result reconciliation that never requires the lost lease.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py` — session-bound shared snapshot loader/CAS helper with connection → access row → refresh row → matching started audit locks, automatic `oauth.refresh_confirmed`, progressive replacement proof, target-`T` capability convergence plus versioned `oauth.refresh_recovery_unsatisfied`, strict event ordering, byte-preserving missing/same refresh handling, and a read-only discriminated-result lookup followed by independent current-readiness validation.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py` — connection-scoped PostgreSQL session-advisory lease, automatic committed-started claim lookup, explicit recovery lease, lease-loss/unknown classification, exactly-once automatic provider-call admission used by preflight and mail/calendar writers, and new-session `user_id + connection_id + attempt_id` result-union reconciliation that never requires the lost lease or historical post-state equality.
 - Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_preflight.py` — 0018 historical-triple scan, dedicated PostgreSQL session advisory lease, existing AuditEvent-backed automatic started/confirmed plus progressive replacement-consumption lookup and local recoverability projections without Calendar fact mutation; all credential commits delegate to the shared rotation repository.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/connections.py` — at progressive start validate the unique unresolved fence/current refresh snapshot before the existing `S→T=S+1` increment, create the target-`T` OAuthAttempt and recovery-started event in the same transaction, resolve callback recovery linkage by `OAuthAttempt.id`, and compose the shared session-bound rotation helper so credentials/scopes/capabilities and `source="progressive_recovery"` replacement proof commit atomically while generation stays `T`; extend `mark_progressive_authorization_failed` so matching-`T` unsatisfied results atomically set only requested capabilities to `action_required` with a stable error while preserving actual scopes/last-verified facts, and stale `T` is a capability no-op plus safe audit.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/email.py` — replace the unconditional `rotate_access_token` upsert boundary with snapshot loading/delegation to the shared credential-rotation repository; preserve existing mail-sync repository responsibilities without retaining a second credential writer.
@@ -3827,7 +3827,7 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
 - Modify: `backend/src/ai_employee/api/deps.py` — construct `AeadCipher` and `refresh_token_identity_v1` service from the same `APP_MASTER_KEY_FILE` bytes and fixed key version used by every Worker/CLI composition root.
-- Modify: `backend/src/ai_employee/api/routers/connections.py` — make Google callback accept exactly one of `code+state` or `error+state`; route `error=access_denied` through the existing one-time `callback_error`/unsatisfied boundary and a stable sanitized Problem, reject missing state, code/error ambiguity and unknown errors, preserve Microsoft parity, and keep targetless fenced-identity blocking before persistence.
+- Modify: `backend/src/ai_employee/api/routers/connections.py` — make Google callback accept exactly one of `code+state` or any bounded non-empty `error+state`; reject missing state, code/error ambiguity, neither value and malformed error before state consumption. Every valid error, including an unknown name, consumes state once and routes target-bound recovery through the unsatisfied boundary before returning one stable sanitized Problem; raw error/description never persists or logs, replay is rejected, Microsoft parity remains, and targetless fenced-identity blocking stays before persistence.
 - Modify: `backend/src/ai_employee/workers/sync_mail.py` — carry the read generation and complete access/refresh snapshots through Google/Microsoft automatic refresh and commit every known-valid missing/same/different response through the shared confirmed path; missing/same preserves the refresh row byte-for-byte and different never consumes an older fence.
 - Modify: `backend/src/ai_employee/workers/sync_calendar.py` — use the same fixed-key identity service, coordinator and automatic confirmed rotation path for Google/Microsoft refresh, then validate/execute the dedicated ordinal-aware `calendar.aad_0019.resync` task kind without the legacy directory default.
 - Modify: `backend/src/ai_employee/workers/execute_task.py` — route the dedicated recovery kind to the marker-gated Calendar step.
@@ -3842,19 +3842,19 @@ git commit -m "feat: expose trusted action status"
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py` — M2 retention, CalendarEvent four-column atomic-clear regressions, and cross-cutoff/user-isolated 0019 refresh-fence cleanup races.
 - Create: `backend/tests/unit/application/test_calendar_aad_digests.py` — independent fixed canonical-byte/base64/SHA-256 vectors for all three v1 digest protocols; expected constants must not call production helpers.
 - Create: `backend/tests/unit/application/test_oauth_refresh_identity.py` — independent HKDF/HMAC implementation of the fixed synthetic vector, fixed APP root-key/version construction parity, same-token re-encryption, A→B→A rollback, and missing/changed-key fail-closed cases.
-- Create: `backend/tests/unit/application/test_oauth_refresh_coordinator.py` — two-channel state-machine RED/GREEN tests for automatic claim ordering/committed-started admission, explicit recovery lease without a second started, lock loss, unknown/CAS/definite-rollback handling, commit-ACK-loss read-only reconciliation, and Taskiq/`TransientProviderError` zero-call delivery.
-- Create: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py` — PostgreSQL session-lease, dual-Worker single-call/confirmed arbitration, response-after-lock-loss, CAS-miss, cross-basename fence, explicit-recovery lease, and actual-commit-versus-actual-rollback result reconciliation tests.
+- Create: `backend/tests/unit/application/test_oauth_refresh_coordinator.py` — two-channel state-machine RED/GREEN tests for automatic claim ordering/committed-started admission, explicit recovery lease without a second started, the versioned confirmed/unsatisfied/replacement result union, lock loss, unknown/CAS/definite-rollback handling, commit-ACK-loss read-only reconciliation, closure/readiness separation, and Taskiq/`TransientProviderError` zero-call delivery.
+- Create: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py` — PostgreSQL session-lease, dual-Worker single-call/confirmed arbitration, response-after-lock-loss, CAS-miss, cross-basename fence, explicit-recovery lease, confirmed/unsatisfied/replacement actual-commit-versus-actual-rollback reconciliation, ACK-lost-then-later-valid-refresh/reauth races, and current rollback-conflict zero-call tests.
 - Modify: `backend/tests/unit/application/test_connection_capability_use_cases.py` — controlled-memory `secrets.compare_digest`, `F=S`/`S>F` start/target derivation, repeated explicit recovery attempts, no-token/empty/same-plaintext/access-only/disconnected negatives, denial/missing/same capability convergence, stale-`T` no-op, new-attempt retry, and different-token replacement orchestration.
-- Modify: `backend/tests/integration/m2/test_connection_capability_repository.py` — unique-fence/current-refresh start CAS, OAuthAttempt plus recovery-started atomic creation, target-generation anti-replay, first unsatisfied attempt atomically setting only requested capabilities to `action_required` while preserving actual scopes/last-verified facts and the original fence, stale-`T` no-op, later different-token credential/scope/capability/replacement atomic commit, stale/concurrent callback rejection, commit-ACK-loss result reconciliation, and injected definite rollback points without a callback generation increment.
-- Create: `backend/tests/integration/m2/test_credential_rotation_repository.py` — complete-row/generation CAS, fixed lock order, automatic confirmed missing/same/different handling, access-only byte preservation, progressive replacement proof, rollback detection, strict timestamps, commit-ACK-loss complete-post-proof reconciliation, and callback/Worker arbitration without Worker consumption of an old fence.
-- Modify: `backend/tests/integration/api/test_connections.py` — Google callback query-shape regressions for required state, mutually exclusive code/error, `access_denied`, unknown error, stable sanitized Problem, and replay rejection while preserving Microsoft behavior.
-- Modify: `backend/tests/integration/google/test_oauth_flow.py` — Google F/S/T multiple explicit recovery attempts, `access_denied` callback-error state consumption, denial/missing/same capability convergence, stale-`T` no-op, first unsatisfied/second different-token success, targetless fenced-identity pre-save blocking, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-result reconciliation.
-- Modify: `backend/tests/integration/microsoft/test_oauth_flow.py` — Microsoft parity for repeated explicit recovery, denial/missing/same capability convergence, stale-`T` no-op, targetless pre-save blocking, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-result reconciliation while preserving existing error-callback semantics.
+- Modify: `backend/tests/integration/m2/test_connection_capability_repository.py` — unique-fence/current-refresh start CAS, OAuthAttempt plus recovery-started atomic creation, target-generation anti-replay, versioned unsatisfied result with no credential post/expiry, current-`T` `action_required` preserving actual scopes/last-verified facts, stale-`T` no-op, later different-token replacement atomic commit, result-union ACK-loss actual commit/rollback, later-reauth race closure, and injected definite rollback points without a callback generation increment.
+- Create: `backend/tests/integration/m2/test_credential_rotation_repository.py` — complete-row/generation CAS, fixed lock order, automatic confirmed missing/same/different handling, access-only byte preservation, progressive replacement proof, rollback detection, strict timestamps, result-union ACK-loss reconciliation, closure independent of later valid credential changes, `oauth_credential_state_conflict` for old-identity/missing-row current state, and callback/Worker arbitration without Worker consumption of an old fence.
+- Modify: `backend/tests/integration/api/test_connections.py` — Google and Microsoft callback query-shape regressions for required state, mutually exclusive code/error, pre-consumption shape rejection, `access_denied` plus unknown-but-valid error consumption, identical sanitized Problem, raw-error redaction, and same-state unknown-error replay rejection.
+- Modify: `backend/tests/integration/google/test_oauth_flow.py` — Google F/S/T multiple explicit recovery attempts, any valid error callback state consumption, denial/missing/same capability convergence, stale-`T` no-op, first unsatisfied/second different-token success, unsatisfied/replacement ACK-loss actual commit/rollback, later-reauth closure race, targetless fenced-identity pre-save blocking, stale/concurrent target rejection, and transaction-result reconciliation.
+- Modify: `backend/tests/integration/microsoft/test_oauth_flow.py` — Microsoft parity for generic valid-error state consumption/redaction/replay rejection, repeated explicit recovery, denial/missing/same capability convergence, stale-`T` no-op, targetless pre-save blocking, stale/concurrent target rejection, and result-union reconciliation.
 - Modify: `backend/tests/integration/google/test_gmail_sync.py` — Google automatic `provider_refresh` claim, access-only confirmed with byte-preserved refresh row, different-token confirmed while any older unresolved fence remains closed to automatic entry, stale CAS, lock loss, unknown/Taskiq zero-call delivery, and no replay of the original unknown preflight attempt.
 - Modify: `backend/tests/integration/google/test_calendar_sync.py` — Google calendar automatic coordinator parity for shared snapshot-CAS confirmed rotation and zero-call unresolved-fence blocking.
 - Modify: `backend/tests/integration/microsoft/test_mail_sync.py` — Microsoft automatic refresh missing/same/different confirmed behavior through the shared coordinator, lock/unknown handling, and no old-fence consumption.
 - Modify: `backend/tests/integration/microsoft/test_calendar_sync.py` — Microsoft calendar automatic coordinator parity, multi-refresh single-call behavior, same-token/access-only preservation, different-token confirmed, and unresolved-fence zero-call blocking.
-- Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py` — 0018 local proof, attempt/dual-digest-bound generic automatic started/confirmed fence, commit-ACK-loss actual-commit versus actual-rollback reconciliation, explicit progressive capability-converging replacement gate, repeated recovery, Google callback-error parity, targetless pre-save blocking, rollback detection, crash recovery, proactive OAuth refresh/scope/deadline boundary, Fake/HTTP-mocked real-adapter probes, and no-Calendar-mutation coverage.
+- Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py` — 0018 local proof, attempt/dual-digest-bound generic automatic started/confirmed fence, versioned result-union commit-ACK-loss actual-commit versus actual-rollback reconciliation, closure/readiness separation with later valid refresh/reauth and rollback-conflict zero-call cases, explicit progressive capability-converging replacement gate, repeated recovery, generic Google/Microsoft callback-error parity, targetless pre-save blocking, crash recovery, proactive OAuth refresh/scope/deadline boundary, Fake/HTTP-mocked real-adapter probes, and no-Calendar-mutation coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py` — marker isolation, ordinal-aware atomic task creation, exact provider reads, explicit retry, concurrency, and CLI lifecycle coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py` — fixed deadline crossing, zero-state and immutable-image binding at every rollout boundary, owner-before-secret restore image/artifact guard, exact-image no-pull restore, and database-enforced read-only restored-0018 verification.
 - Modify: `compose.yaml` — add an operations-profile owner-role restore one-off that depends only on healthy PostgreSQL, never inherits `backend-common`/automatic migration, and uses only an internally injected exact `sha256:` image with no tag/build/pull.
@@ -3925,9 +3925,9 @@ async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_pro
     assert await provider_resource_ids_for(USER_ID) == ()
 ~~~
 
-Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `oauth.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching `oauth.refresh_confirmed` closes only its own automatic started. An exact `oauth.refresh_credential_replaced` may close an older unresolved fence only when it binds the original automatic attempt/started source/connection digest/F, both original pre-digests, old identity/fixed key version, the recovery OAuthAttempt and recovery-started event, valid F/S/T with `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, persisted expiry, stable result code, and strict event ordering. `oauth.refresh_recovery_authorization_unsatisfied` closes only its recovery attempt, so multiple unsatisfied pairs leave the original fence unresolved; its deletable group must match the versioned result schema, recovery event/OAuthAttempt, F/S/T, canonical requested capabilities, `capability_transition`, and stable error/result codes without requiring the current capability state to remain unchanged. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, changed key material, automatic different-token rotation, and access-only rotation must not release it. For every deletable group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer confirmed/unsatisfied/consumption remains. Race retention against confirmed/recovery-result/consumption CAS and preserve the anonymized M1 user row.
+Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `oauth.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching `oauth.refresh_confirmed` closes only its own automatic started. An exact `oauth.refresh_credential_replaced` may close an older unresolved fence only when it binds the original automatic attempt/started source/connection digest/F, both original pre-digests, old identity/fixed key version, the recovery OAuthAttempt and recovery-started event, valid F/S/T with `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, persisted expiry, stable result code, and strict event ordering. `oauth.refresh_recovery_unsatisfied` closes only its recovery attempt, so multiple unsatisfied pairs leave the original fence unresolved; its deletable group must match the versioned result schema, recovery event/OAuthAttempt, F/S/T, canonical requested capabilities, `capability_transition`, and stable error/result codes without requiring the current capability state to remain unchanged. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, changed key material, automatic different-token rotation, and access-only rotation must not release it. For every deletable group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer confirmed/unsatisfied/consumption remains. Race retention against confirmed/recovery-result/consumption CAS and preserve the anonymized M1 user row.
 保留原有测试覆盖：邮件正文/元数据和日程内容 AEAD 清理、CalendarEvent 描述/地点四列原子清空、未决 reconciliation 在命令脱敏前转 `needs_attention`、过期内容禁止重新提交、source-cache 与独立草稿/提案的删除区别、未认领取消、已认领有界核对、用户写屏障、provider-neutral token 清理、删除审计最小化以及每张新增表的 retention-role 权限。还要证明普通过期 audit 不因 fence 例外被误保留，旧 started 与较新 confirmed/unsatisfied/replacement 不能提前删除，且清理不读取后续 credential lineage。
-追加的 coordinator RED tests 必须覆盖：automatic started 尚未提交前 provider call 为零；同一 connection 双 Worker/Taskiq duplicate delivery 只有一个 provider call；provider response 后 connection lease 丢失、CAS miss、`TransientProviderError`、网络未知或数据库明确 rollback 留下 unresolved fence，后续 delivery 的 provider call 为零；result commit ACK 丢失时，新数据库 session 按 user/connection/attempt 只读核对，事务实际 commit 恢复 complete matching confirmed/consumed 且总 provider call 为 1，事务实际 rollback 不补写 result、started unresolved且后续调用为零。preflight 与所有 Google/Microsoft mail/calendar automatic refresh 都经过同一 `OAuthRefreshCoordinator`，不会有适配器自有 retry 或第二个 upsert boundary。known-valid missing/same/different response 都写完整 confirmed，Google access-only 也 confirmed；different token 不消费任何旧 fence。explicit recovery 取得同一 lease但不创建第二个 automatic started；denial/missing/same/known failure 在 current `T` 上把 requested capabilities 从 `authorizing` 收敛为 `action_required` 并保留 actual scopes/last-verified facts，stale `T` no-op；第一次 unsatisfied 保留原 fence，用户创建第二个 OAuthAttempt 后 different token 才消费。Google `access_denied` callback 一次性消费 state，歧义/未知/replay fail closed；targetless callback 命中 fenced existing identity 时在任何 local credential/scope/capability 保存前 fail closed。identity RED tests 先用独立标准库实现固定 HKDF/HMAC vector，再覆盖同一固定 APP root-key/version 的 API/Worker/CLI 构造一致性、same-token re-encryption 与 A→B→A rollback，以及解密/UTF-8 与边界验证/identity/started/lease/provider 的固定顺序；M2 只测试 immutable-key 行为，不测试多 key 生命周期，expected derived key/message/HMAC 不得由 production helper 生成，任何真实 token/HMAC key 都不得进入输出。
+追加的 coordinator RED tests 必须覆盖：automatic started 尚未提交前 provider call 为零；同一 connection 双 Worker/Taskiq duplicate delivery 只有一个 provider call；provider response 后 connection lease 丢失、CAS miss、`TransientProviderError`、网络未知或数据库明确 rollback 留下 unresolved fence，后续 delivery 的 provider call 为零。result commit ACK 丢失时，新数据库 session 按 user/connection/attempt 查询 versioned `ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1` union：confirmed/replacement actual commit 永久关闭 automatic attempt，unsatisfied/replacement actual commit 永久关闭 recovery attempt，只有 replacement 消费 original fence；各 actual rollback 分支不补写 result、不重放 provider/code。再覆盖 ACK 丢失后另一合法 refresh/reauth 先提交：历史 closing result 仍有效并按 current facts readiness；current old-identity rollback、缺行或不一致返回 `oauth_credential_state_conflict`且 provider calls 为零。preflight 与所有 Google/Microsoft mail/calendar automatic refresh 都经过同一 `OAuthRefreshCoordinator`，不会有适配器自有 retry 或第二个 upsert boundary。known-valid missing/same/different response 都写完整 confirmed，Google access-only 也 confirmed；different token 不消费任何旧 fence。explicit recovery 取得同一 lease但不创建第二个 automatic started；denial/missing/same/known failure 在 current `T` 上把 requested capabilities 从 `authorizing` 收敛为 `action_required` 并保留 actual scopes/last-verified facts，stale `T` no-op；unsatisfied 无 credential post/expiry并保留原 fence，用户创建第二个 OAuthAttempt 后 different token 才消费。Google/Microsoft 任意合法 error callback 一次性消费 state、统一脱敏且 raw error 不记录；shape 错误消费前拒绝，同一 state 未知-error replay 拒绝；targetless callback 命中 fenced existing identity 时在任何 local credential/scope/capability 保存前 fail closed。identity RED tests 先用独立标准库实现固定 HKDF/HMAC vector，再覆盖同一固定 APP root-key/version 的 API/Worker/CLI 构造一致性、same-token re-encryption 与 A→B→A rollback，以及解密/UTF-8 与边界验证/identity/started/lease/provider 的固定顺序；M2 只测试 immutable-key 行为，不测试多 key 生命周期，expected derived key/message/HMAC 不得由 production helper 生成，任何真实 token/HMAC key 都不得进入输出。
 
 - [ ] **Step 2: Run tests and observe the expected failure**
 
@@ -3953,16 +3953,19 @@ created drafts remain.
 Replace the final generic bounded delete for `AuditEventModel` with a dedicated user-scoped cleanup query. It may
 delete ordinary non-fence audit rows by cutoff, but the generic path must exclude exactly
 `oauth.refresh_started`, `oauth.refresh_confirmed`, `oauth.refresh_recovery_authorization_started`,
-`oauth.refresh_recovery_authorization_unsatisfied`, and `oauth.refresh_credential_replaced`. The dedicated path
-classifies only these closed, content-free metadata schemas and protects every unresolved automatic started attempt.
+`oauth.refresh_recovery_unsatisfied`, and `oauth.refresh_credential_replaced`. The dedicated path uses the same
+versioned result union to classify only these closed, content-free metadata schemas and protects every unresolved
+automatic started attempt.
 For each candidate, explicitly filter `user_id`; lock owning connection, access credential row, refresh credential
 row, and matching started audit in that order—confirmed, recovery-result, and replacement transactions use the same
 order—then requery the exact event group. An automatic success group is started + confirmed. An unsuccessful
 recovery group is recovery-started + unsatisfied and never closes the original automatic fence. The unsatisfied
-event must match the recovery event/OAuthAttempt IDs, original attempt/started source/connection digest, F/S/T, both
-frozen pre-digests, old identity/fixed key version, stable result code, and `created_at` strictly later than the
-recovery-started event. A successful recovery group is the original automatic started + matching recovery-started +
-replacement consumption; the replacement is valid only when it binds original attempt/started source/connection
+event must use `oauth_refresh_recovery_unsatisfied.v1` and match the recovery event/`OAuthAttempt.id`, original
+attempt/started source/connection digest, F/S/T, both frozen pre-digests, old identity/fixed key version, canonical
+requested capabilities, stable error/result codes, target-`T` `action_required`-with-actual-scope-preservation or
+stale-`T` no-op transition, and `created_at` strictly later than the recovery-started event; it has no credential
+post/expiry fields. A successful recovery group is the original automatic started + matching recovery-started +
+replacement consumption; the replacement closes both the recovery attempt and original fence and is valid only when it binds original attempt/started source/connection
 digest/F, both original pre-digests, old identity
 and fixed key version, recovery OAuthAttempt/event IDs, valid `F <= S` and `T=S+1` with
 `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, persisted
@@ -4020,12 +4023,15 @@ all of these contracts:
   Workers/deliveries against one connection and assert exactly one provider call. Inject response-after-lease-loss,
   network unknown, CAS miss and a database-confirmed rollback; each leaves a stable unresolved fence/needs-attention
   result, and the next Taskiq/`TransientProviderError` delivery performs zero provider calls. Separately inject a
-  lost commit ACK after the provider response: if the result transaction actually committed, a new database session
-  keyed by `user_id + connection_id + attempt_id` must read the complete matching confirmed/replacement plus required
-  post snapshot/digest/identity/expiry, recover confirmed/consumed, and keep `provider_calls == 1`; if the transaction
-  actually rolled back, the read-only reconcile must not synthesize a result, the original started remains unresolved,
-  and all later `provider_calls == 0`. Loss of the original connection/session lease cannot block this PostgreSQL
-  reconcile. Explicit progressive recovery
+  lost commit ACK for each result-union member. A new database session keyed by
+  `user_id + connection_id + attempt_id` must discriminate `ConfirmedV1 | RecoveryUnsatisfiedV1 |
+  CredentialReplacedV1`: actual commit permanently closes the member's allowed automatic/recovery started, while
+  actual rollback leaves that started unresolved and never synthesizes a result. Unsatisfied closes only recovery;
+  replacement also consumes original automatic. Reconcile never adds a provider/code call. Loss of the original
+  connection/session lease cannot block this PostgreSQL reconcile. After an actual commit, race a later legitimate
+  refresh/reauthorization before reconcile and prove the old attempt remains closed while current readiness uses the
+  new facts; old-identity rollback, missing credential rows, or an inconsistent current state returns
+  `oauth_credential_state_conflict`, blocks rollout, and keeps later `provider_calls == 0`. Explicit progressive recovery
   obtains the same connection lease through a distinct one-time authorization-code path and does not create a
   second automatic started. No adapter-owned retry, `ensure_connection`, unconditional upsert, or second credential
   writer is reachable;
@@ -4039,7 +4045,10 @@ all of these contracts:
   already have passed; access-only, missing, mismatched, or undecryptable refresh credentials produce neither
   started nor provider call. Assert provider calls remain zero until the started transaction commits and that no
   0018 migration or new table is introduced for the fence;
-- fence lookup is durable across process restarts and independent of basename. An unresolved
+- fence/result lookup is durable across process restarts and independent of basename. The read-only boundary returns
+  a versioned discriminated union: automatic started accepts only confirmed/replacement, recovery authorization
+  started accepts only unsatisfied/replacement. A legal append-only member closes its matching attempt permanently
+  based on schema/attempt/source/time ordering, without comparing mutable current rows. An unresolved
   `oauth.refresh_started` blocks the same and different basename and all automatic Worker refresh before provider
 access. `oauth.refresh_confirmed` must match the same attempt/source/started source and connection digest,
 revision/rollout tuple, G/G/G, both
@@ -4050,9 +4059,12 @@ only when it binds the original attempt/started source/connection digest/F, both
 identity/version,
   recovery OAuthAttempt/event IDs, `F <= S`, `T=S+1`, `pre_generation=post_generation=T`, both required
   post-digests, different-token new identity/version, persisted expiry, stable result code, and `created_at`
-  strictly later than both started events. Preflight validates that proof independently from later readiness and
-  recomputes current plaintext identity using the fixed APP root key/version; identity equal to the consumed old
-  identity is rollback even when its physical digest differs. Basename, generation, either physical digest,
+  strictly later than both started events. It closes both the recovery started and original fence. Preflight validates
+  closure independently from later readiness and recomputes current plaintext identity using the fixed APP root
+  key/version; an exact historical post-state resumes directly, while a later legal refresh/reauth uses current facts.
+  Identity equal to the closed result's old identity, missing required rows, or inconsistent current facts yields
+  `oauth_credential_state_conflict` even when physical digest differs, but never reopens or recalls the old attempt.
+  Basename, generation, either physical digest,
   ciphertext/nonce/`updated_at`, access-only rotation, automatic different-token rotation, or an operator waiver
   cannot bypass the fence;
 - Google and Microsoft progressive recovery start only on the original connection while it remains `connected`.
@@ -4070,11 +4082,12 @@ identity/version,
   or capability. It may append only the optional content-free blocked audit; it creates no candidate snapshot,
   target generation, replacement consumption, or second connection, and never reaches `ensure_connection` or an
   unconditional upsert;
-- Google API tests require the callback to accept exactly `code+state` or `error+state`. `error=access_denied`
-  consumes state once through `callback_error`, enters the same unsatisfied path, and returns a stable sanitized
-  Problem; missing state, code/error together, neither value, unknown error, and replay all fail closed. Microsoft's
-  existing error callback remains behaviorally unchanged, and neither provider may bypass targetless pre-save
-  blocking through its error branch;
+- Google and Microsoft API tests require the callback to accept exactly `code+state` or bounded non-empty
+  `error+state`. Missing state, code/error together, neither value, or malformed error rejects before state
+  consumption. Every valid error, including an unknown name, consumes state once through `callback_error`; a
+  target-bound attempt appends the versioned unsatisfied result/transition before both providers return the same stable
+  sanitized Problem. Raw error/description never persists or logs. Replaying that state with the same or another
+  unknown error fails because state was consumed, and neither provider may bypass targetless pre-save blocking;
 - authorization-code exchange remains outside the database transaction. The callback consumes the state/code once,
   resolves recovery linkage by `OAuthAttempt.id`, enforces
   `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`, obtains the same
@@ -4089,15 +4102,18 @@ identity/version,
   `connection.authorization_generation == T`, reuse/extend `mark_progressive_authorization_failed` so one short
   transaction changes only this attempt's requested capabilities from `authorizing` to `action_required`, records a
   stable error code, preserves existing actual scopes and last-verified facts, and appends
-  `oauth.refresh_recovery_authorization_unsatisfied` with
-  `result_schema_version="oauth_refresh_recovery_authorization_unsatisfied.v1"`, the matching recovery
+  `oauth.refresh_recovery_unsatisfied` with
+  `result_schema_version="oauth_refresh_recovery_unsatisfied.v1"`, the matching recovery
   event/OAuthAttempt IDs, original attempt/started source/fence, F/S/T, both frozen pre-digests, old identity/fixed
   key version, canonical requested capabilities, `capability_transition="action_required"`, stable error/result
-  codes, and `created_at` strictly later than recovery started. If `T` is stale, capability mutation is a no-op and
+  codes, and `created_at` strictly later than recovery started; it contains no credential post snapshot/digest,
+  new identity, persisted expiry, or deadline. If `T` is stale, capability mutation is a no-op and
   the safe audit uses `capability_transition="stale_target_noop"`; it cannot overwrite newer authorization state.
-  Both results close only that OAuthAttempt and preserve the original automatic fence. Cover denial, missing, same,
+  Unsatisfied closes only that OAuthAttempt and preserves the original automatic fence; replacement closes that
+  OAuthAttempt and consumes the original fence. Cover denial, missing, same,
   stale `T`, and creation of a new OAuthAttempt for the next attempt; the old code is never replayed. Lease loss,
-  CAS miss, definite rollback and commit-ACK-loss follow the no-replay/result-reconciliation contract above. Inject
+  CAS miss, definite rollback and commit-ACK-loss follow the no-replay/result-union contract above. Test actual commit
+  and rollback for both unsatisfied and replacement, including a later reauthorization winning before reconcile. Inject
   failure after every credential/scope/capability/event mutation and during commit;
 - `application/ports/oauth_refresh.py` is the sole automatic provider-call admission and explicit recovery lease
   boundary, while `application/ports/credential_rotation.py` is the sole typed CAS/result boundary. API deps,
@@ -4109,9 +4125,11 @@ identity/version,
   but never consumes an older fence. An unresolved predecessor prevents the automatic call entirely. Race mail
   versus calendar and duplicate Worker delivery; exactly one provider call/confirmed result may win. Race an
   explicit recovery callback against automatic entry and prove the unresolved fence keeps automatic calls at zero
-  while at most one different-token recovery consumes it. After consumption, later capability/generation/scope/
-  credential changes do not revive the fence, while current identity equal to the consumed old identity fails as
-  rollback. In every case, the original D0 unknown preflight refresh call count remains unchanged.
+  while at most one different-token recovery consumes it. After any closing result, later legal
+  capability/generation/scope/credential changes do not revive the matching attempt; current readiness is evaluated
+  separately. Current identity equal to the closed result's old identity, missing rows, or invalid current facts returns
+  `oauth_credential_state_conflict` with zero provider calls. In every case, the original D0 unknown preflight refresh
+  call count remains unchanged.
 - each pair must have the exact same-user cursor, owning connection in `connected`, `calendar.read` in `enabled`,
   both access and refresh AEAD credentials, and exact `ProviderCalendar`; disconnected, missing/mismatched,
   disabled, revoked, degraded, action-required, access-only, missing refresh, or refresh AEAD decryption failure
@@ -4142,14 +4160,17 @@ identity/version,
   transaction rollback cannot overwrite a concurrently refreshed token, prevents every later pair probe/artifact
   publication, leaves Alembic at 0018, and leaves a durable unresolved fence that blocks every later basename from
   calling the provider. A commit ACK loss is not equivalent to rollback: create a fresh session and read only the
-  exact user/connection/attempt result. If credential/result actually committed, complete matching post proof recovers
-  confirmed/consumed with total provider calls still 1; if it actually rolled back, no result is backfilled and every
-  later provider call remains zero. Inject network unknown result, `invalid_grant`, malformed response, scope shrink,
-  lock loss, a competing explicit recovery/Worker entry, CAS failure, actual commit with lost ACK, and actual rollback;
-  assert no path guesses a result or invokes provider again;
+  exact user/connection/attempt versioned result. If a legal matching result actually committed, it permanently closes
+  its allowed attempt and no call is added; if it actually rolled back, no result is backfilled and every later
+  provider/code call remains zero. Inject confirmed, unsatisfied, and replacement actual commit/rollback, network
+  unknown result, `invalid_grant`, malformed response, scope shrink, lock loss, a competing explicit recovery/Worker
+  entry, and CAS failure. Then inject a later valid refresh/reauth before ACK reconcile and a current old-identity/
+  missing-row conflict; assert closure never depends on historical-post/current equality, conflict is
+  `oauth_credential_state_conflict`, and no path guesses a result or invokes provider again;
 - if credential CAS plus `oauth.refresh_confirmed` commits and the process crashes before rollout artifact publication,
-  rerunning the same rollout recognizes the current credential as the confirmed post-snapshot, resumes deadline/
-  pair probes from persisted token and expiry, publishes the artifact when valid, and does not call refresh again;
+  rerunning the same rollout recognizes the closing result. Exact post-state resumes from persisted token/expiry;
+  later valid credential state resumes from current token/expiry after independent readiness. Both publish only when
+  valid and never call the closed refresh attempt again;
 - the digest unit tests independently decode the three fixed base64 canonical-byte vectors from design section
   17.3, assert the production canonicalizer returns those exact `497`-, `265`-, and `222`-byte values, and compare
   production digests with fixed lowercase SHA-256 constants
@@ -4347,9 +4368,10 @@ bash scripts/test-deployment.sh
 ~~~
 
 Expected: FAIL because the versioned digest helpers and independent fixed vectors, fixed-root-key HKDF/HMAC identity,
-two-channel coordinator state machine and zero-call unknown/retry contracts, commit-ACK-loss read-only result
-reconciliation versus definite rollback, automatic started/confirmed handling, explicit progressive recovery
-started/capability-converging unsatisfied/replacement plus atomic rollback boundary, Google error-callback parity,
+two-channel coordinator state machine and zero-call unknown/retry contracts, commit-ACK-loss versioned result-union
+reconciliation versus definite rollback, closure/current-readiness separation, automatic started/confirmed handling,
+explicit progressive recovery started/capability-converging unsatisfied/replacement plus atomic rollback boundary,
+generic sanitized Google/Microsoft error-callback parity,
 targetless pre-save block,
 shared full-row/generation/identity credential snapshot CAS, 0018 revision-global advisory lease,
 existing-AuditEvent durable refresh fence, atomic confirmed event, fence-aware retention,
@@ -4423,10 +4445,15 @@ business transactions during I/O, and requires the same lease plus complete snap
 `oauth.refresh_confirmed`. A started attempt, response-after-lock-loss, network unknown, CAS miss, or definite
 rollback becomes stable non-retryable `oauth_refresh_result_unknown`/`needs_attention`; Taskiq and
 `TransientProviderError` re-entry reads the fence and performs zero provider calls. If commit ACK is lost, the
-coordinator must use a new database session for read-only user/connection/attempt reconciliation: an actual commit
-with complete matching post proof recovers confirmed/consumed with total provider calls still 1, while an actual
-rollback leaves the fence unresolved and every later provider call at zero. It never backfills a guessed result and
-does not require the lost lease/session. Explicit progressive recovery
+coordinator must use a new database session for read-only user/connection/attempt reconciliation returning
+`OAuthRefreshResultV1 = ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1`. Automatic started accepts
+confirmed/replacement; recovery started accepts unsatisfied/replacement. A schema/attempt/source/time-valid
+append-only member permanently closes the attempt or attempts allowed by that mapping without comparing current
+mutable facts; replacement closes the matching recovery attempt and original automatic fence, while unsatisfied closes
+only the recovery attempt. Actual rollback has no member and remains unresolved. Reconcile never backfills a guessed
+result, adds a provider/code call, or requires the lost lease/session. It then separately validates current readiness:
+exact post resumes directly, later legal refresh/reauth uses current facts, and old identity/missing rows/inconsistent
+state yields `oauth_credential_state_conflict` without reopening the attempt. Explicit progressive recovery
 uses the same connection lease around its one-time code exchange but never creates another automatic started.
 Integration tests run two Workers against one connection and prove exactly one provider call, plus response-after-
 lock-loss/CAS-miss cases with no replay. New connection bootstrap is the only no-old-credential exception; existing
@@ -4468,7 +4495,8 @@ old/new `refresh_token_identity_v1` with fixed key versions, actual persisted ex
 `F <= S`, `T=S+1`, exact old snapshot/fence and generation CAS, and `created_at` strictly later than both original
 automatic started and matching recovery-started event. It never persists token plaintext, a plaintext hash, raw
 scope, or provider response. Failure injection after any credential, scope, capability, or event mutation and during
-commit must roll back the full callback transaction; a network response alone is never evidence.
+commit must roll back the full callback transaction; a network response alone is never evidence. A valid replacement
+event permanently closes both the matching recovery started and original automatic fence.
 
 Missing/empty/same refresh, user denial, missing administrator consent, safely known provider/network failure, or
 identity mismatch does not save credential/scope/account facts and does not consume the original fence. The start
@@ -4476,13 +4504,15 @@ transaction already changed this attempt's requested capabilities to `authorizin
 `mark_progressive_authorization_failed` contract so, while the connection is still `connected` at generation `T`, one
 short transaction changes only those requested capabilities to `action_required`, writes the stable error code,
 preserves their existing `actual_scopes` and last-verified facts, and appends
-`oauth.refresh_recovery_authorization_unsatisfied`. Its closed metadata uses
-`result_schema_version="oauth_refresh_recovery_authorization_unsatisfied.v1"` and binds the matching
+`oauth.refresh_recovery_unsatisfied`. Its closed metadata uses
+`result_schema_version="oauth_refresh_recovery_unsatisfied.v1"` and binds the matching
 recovery-started event/OAuthAttempt, original fence, F/S/T, both frozen pre-digests, old identity/fixed key version,
 canonical requested capabilities, `capability_transition="action_required"`, stable error/result codes, and a
-`created_at` strictly later than recovery started. If target `T` is stale, the capability update is an idempotent
+`created_at` strictly later than recovery started. It contains no credential post snapshot/digest, new identity,
+persisted expiry, or deadline field. If target `T` is stale, the capability update is an idempotent
 no-op and an otherwise-safe audit may use `capability_transition="stale_target_noop"`; it must not overwrite newer
-authorization state. Either result closes only that OAuthAttempt and leaves the original automatic fence unresolved.
+authorization state. Unsatisfied closes only that OAuthAttempt and leaves the original automatic fence unresolved;
+replacement closes the OAuthAttempt and consumes the original fence.
 The user may explicitly create another progressive OAuthAttempt, but neither the prior state/code nor an exchange with
 unknown result may be replayed. Lease loss, CAS miss, definite rollback and commit-result-unknown use the coordinator
 reconciliation contract rather than fabricating an unsatisfied or replacement result.
@@ -4497,12 +4527,13 @@ only an optional content-free blocked audit. Do not add candidate snapshot field
 consumption, a second connection, or an unconditional upsert; the user must begin a new connection-bound progressive
 OAuthAttempt instead.
 
-Update `api/routers/connections.py` so the Google callback has the same closed response-shape discipline as Microsoft:
-require non-empty `state` and accept exactly one of `code` or `error`. `error=access_denied` must invoke
-`ConnectionsUseCase.callback_error(provider=GOOGLE, state=...)`, consume the state once, and then raise a stable
-sanitized Problem without provider description text. Missing state, both code and error, neither value, unknown error,
-or replay must fail closed. Preserve Microsoft's existing classifications and one-time consumption. The Google error
-branch must not reach credential persistence or weaken the targetless fenced-identity check.
+Update `api/routers/connections.py` so Google and Microsoft callbacks share one closed response-shape discipline:
+require non-empty `state` and accept exactly one of `code` or bounded non-empty `error`. Missing state, both values,
+neither value, or malformed error rejects before state consumption. Every valid error—including an unknown provider
+name—must invoke `ConnectionsUseCase.callback_error(...)`, consume state once, and for target-bound recovery persist
+the matching unsatisfied result/transition before raising the same stable sanitized Problem. Raw error/description is
+never stored or logged. A later same-state callback using the same or another unknown error is rejected as replay.
+Neither provider error branch may reach credential persistence or weaken targetless fenced-identity blocking.
 
 Before the CLI reads/checks a rollout artifact or invokes any provider, create a dedicated database connection and
 execute `SELECT pg_try_advisory_lock(20260809, 19)`. These fixed session-lock keys are the complete global domain
@@ -4520,18 +4551,21 @@ coordinator's connection-scoped session lease, freeze the current generation and
 decrypt the refresh token under its exact credential AAD in controlled memory. Validate non-empty canonical UTF-8 and
 the existing token boundaries, then compute current `refresh_token_identity_v1` with the fixed APP root key/version.
 Inspect
-existing content-free fence events before provider access. An `oauth.refresh_started` without matching
-`oauth.refresh_confirmed` or valid explicit progressive replacement consumption blocks provider access for every
+existing content-free fence events before provider access. An `oauth.refresh_started` without matching versioned
+confirmed or valid explicit progressive replacement consumption blocks provider access for every
 basename. Confirmed lookup requires the exact canonical attempt/source, revision/rollout tuple, G/G/G, both
 pre-digests, both required post-digests, old/new identity/version, persisted expiry, disposition, deadline candidate
-and strict timestamp; if those fields and current credentials match, the rollout resumes from persisted token/expiry
-without another provider call. Only `oauth.refresh_credential_replaced` from explicit progressive recovery can
+and strict timestamp; those append-only fields permanently close the attempt. If current credentials match historical
+post, the rollout resumes from persisted token/expiry; if a later valid refresh/reauth changed them, current readiness
+uses the current token/expiry, both without another old-attempt call. Only `oauth.refresh_credential_replaced` from explicit progressive recovery can
 close an older fence, and only when original attempt/started source/F, both original pre-digests, old
 identity/version, recovery OAuthAttempt/event IDs, F/S/T, both post-digests, different-token new identity/version,
-persisted expiry and strict timestamps are valid. Later generation/capability/scope/access/refresh changes do not
-reactivate a validly consumed fence. Preflight independently validates current readiness and freezes current
-generation/snapshots for any new automatic attempt. Current identity equal to consumed old identity is rollback even
-when physical digest differs. Basename changes, automatic different-token refresh, access-only rotation,
+persisted expiry and strict timestamps are valid; it closes recovery and original automatic attempts. Later
+generation/capability/scope/access/refresh changes do not reactivate a validly closed attempt. Preflight independently
+validates current readiness and freezes current generation/snapshots for any new automatic attempt. Current identity
+equal to the closed result's old identity, missing rows, or inconsistent current facts yields
+`oauth_credential_state_conflict` even when physical digest differs, blocks rollout, and never recalls provider.
+Basename changes, automatic different-token refresh, access-only rotation,
 generation/physical-digest changes, same-plaintext re-encryption, direct SQL, or an operator waiver cannot reset the
 fence.
 
@@ -4540,7 +4574,8 @@ session-bound repositories as the only existing-connection credential writer bou
 source, generation, complete access/refresh snapshots and old identity/fixed key version; the implementation locks
 connection → access row → refresh row → matching started audit, rechecks every field, and atomically appends
 `oauth.refresh_confirmed`. Explicit progressive recovery uses the same snapshot/CAS helper inside the callback
-transaction so credentials/scopes/capabilities and either replacement proof or unsatisfied result remain atomic.
+transaction so credentials/scopes/capabilities and either replacement proof or unsatisfied result remain atomic. The
+read-only side exposes only the versioned discriminated result union, followed by a separate current-readiness check;
 `sync_mail.py`, `sync_calendar.py`, mail/calendar Workers and preflight call the automatic ports directly;
 `connections.py` calls the explicit-recovery lease/result path. Remove unconditional mutation semantics from
 `email.py` instead of leaving a second writer. Unknown, lock-loss, CAS-miss and database-confirmed rollback paths leave
@@ -4605,19 +4640,22 @@ overwrites a newer token, never runs pair probes, never publishes the artifact, 
 started fence unresolved so all later basenames make zero provider calls until exact explicit progressive replacement
 proof exists and current preconditions independently pass. If commit was issued but its ACK is lost or an exception
 cannot prove rollback, never call the provider again and never reuse the lost session/lease as evidence. Open a new
-database session and read only by `user_id + connection_id + attempt_id`. A complete matching
-`oauth.refresh_confirmed` or `oauth.refresh_credential_replaced`, including required post snapshot/digests,
-old/new identity versions and persisted expiry, plus consistent current PostgreSQL facts, recovers
-confirmed/consumed with `provider_calls == 1`. Missing, incomplete, or inconsistent proof leaves the original started
-unresolved, enters `needs_attention`, and keeps every subsequent `provider_calls == 0`; do not backfill or guess a
-result. Invalid/unknown automatic outcomes do not create a separate terminal event. Fence lookup, confirmed-crash
-recovery, unknown-result blocking, explicit recovery and retention all call the same digest/identity helpers and match
-the same closed metadata tuples. Provider calls remain outside database transactions.
+database session and read only by `user_id + connection_id + attempt_id`, returning the versioned
+confirmed/unsatisfied/replacement result union. A legal matching member permanently closes only its allowed started;
+replacement also consumes original automatic, unsatisfied does not. Missing or invalid proof leaves that started
+unresolved and enters `needs_attention`; do not backfill or guess a result. The closure query does not compare current
+mutable rows. A second readiness step accepts exact post-state, accepts a later legitimate refresh/reauth by using
+current facts, or returns `oauth_credential_state_conflict` for old identity, missing rows, invalid AEAD/ownership, or
+otherwise inconsistent current state. Every branch keeps subsequent `provider_calls == 0` for the closed/unknown
+attempt. Invalid/unknown automatic outcomes do not create a separate terminal event. Fence lookup, crash recovery,
+unknown-result blocking, explicit recovery and retention share the same versioned metadata matching; current readiness
+does not require full credential lineage. Provider calls remain outside database transactions.
 
 If the atomic credential/confirmed transaction commits and the process crashes before artifact publication, a
-later invocation of the same rollout must recognize the confirmed post-snapshot, reuse persisted token/expiry, and
-continue without refresh. After every distinct connection is confirmed, verify each event's required deadline
-candidate against its persisted expiry and compute with an injected UTC clock and fixed constant
+later invocation must recognize the closing result. Exact current post-state reuses that persisted token/expiry;
+another legitimate refresh/reauth uses current token/expiry after readiness, without replaying the closed attempt.
+After every distinct connection has a closed result and current-ready token, verify the applicable persisted/current
+expiry and compute with an injected UTC clock and fixed constant
 `CALENDAR_AAD_ROLLOUT_SAFETY_MARGIN_SECONDS = 900`:
 
 ~~~python
@@ -4757,8 +4795,9 @@ ToolExecution, Task 18 command, or legacy v1 decrypt path.
 Document Google/Microsoft progressive recovery and targetless fenced-identity pre-save blocking, the shared
 `OAuthRefreshCoordinator` two-channel protocol, fixed APP root-key/version and A→B→A rollback, Microsoft
 administrator consent, global/provider kill switches, dedicated
-test-account allowlist, commit-ACK-loss read-only reconciliation versus definite rollback, Google error-callback
-parity, unsatisfied capability convergence, calendar restore, and duplicate/mis-send incident response.
+test-account allowlist, commit-ACK-loss versioned result-union reconciliation versus definite rollback,
+closure/current-readiness separation with `oauth_credential_state_conflict`, generic Google/Microsoft error-callback
+parity and raw-error redaction, unsatisfied capability convergence, calendar restore, and duplicate/mis-send incident response.
 Once 0019's post-resync audit has passed, any general service has started, or any business write has occurred, define
 the application rollback floor as an 0019-compatible image that understands the version columns and writes only v2:
 pre-0019/M1, v1 readers, and old Calendar writers are forbidden even when every Task is terminal. Preserve the
@@ -4780,16 +4819,21 @@ old/new identity/version, persisted expiry, disposition, deadline candidate, sta
 older fence. An unresolved fence blocks every basename and all automatic Worker refresh until explicit progressive
 recovery appends `oauth.refresh_credential_replaced` with original attempt/started source/F, both original
 pre-digests, old identity/version, recovery OAuthAttempt/event IDs, F/S/T, both post-digests, different-token new
-identity/version, persisted expiry and strict timestamps. The consumption remains valid through later
-generation/capability/scope/credential changes; preflight independently checks current readiness and recomputes
-current identity with the fixed APP root key/version, treating identity equal to consumed old identity as rollback.
+identity/version, persisted expiry and strict timestamps. The consumption permanently closes both matching recovery
+and original automatic attempts. Every legal append-only confirmed/unsatisfied/replacement result permanently closes
+its allowed attempt through the versioned result union; unsatisfied never consumes original fence. Closure remains
+valid through later generation/capability/scope/credential changes; preflight independently checks current readiness
+and recomputes current identity with the fixed APP root key/version, treating identity equal to a closed result's old
+identity, missing rows, or inconsistent facts as `oauth_credential_state_conflict` without reopening the attempt.
 Credential handling follows decrypt → non-empty/UTF-8/bound validation → identity → committed started/lease checks →
-provider access. A result commit ACK loss always opens a fresh read-only database session: complete matching
-confirmed/replacement post proof plus consistent current facts recovers confirmed/consumed with the original single
-provider call; absent/incomplete/inconsistent proof leaves started unresolved and every later call at zero. Confirmed
-crash resumes from persisted credential/expiry without another refresh. Retention preserves unresolved
-automatic fences, treats unsatisfied recovery pairs separately, and deletes automatic-success, unsuccessful-
-recovery, or successful-recovery groups only when every event is older than cutoff, without later credential lineage.
+provider access. A result commit ACK loss always opens a fresh read-only database session and queries the versioned
+confirmed/unsatisfied/replacement union. Legal matching result actual commit permanently closes the corresponding
+attempt; actual rollback has no result and remains unresolved. Reconcile adds no provider/code call. It then performs
+current readiness separately: exact post resumes from persisted credential/expiry, another legal refresh/reauth uses
+current facts, and rollback/missing-row conflict blocks with `oauth_credential_state_conflict` at zero calls. Retention
+uses the same union, preserves unresolved automatic fences, treats unsatisfied recovery pairs separately, and deletes
+automatic-success, unsuccessful-recovery, or successful-recovery groups only when every event is older than cutoff,
+without later credential lineage.
 
 If provider preflight fails, do not back up for the rollout, audit as ready, or apply 0019. Missing/undecryptable/
 revoked refresh, access-only credentials, returned scope shrink, malformed token/expiry, insufficient 900-second
@@ -4803,16 +4847,17 @@ new user-initiated, connection-bound
 progressive OAuthAttempt: start records `oauth.refresh_recovery_authorization_started` in the OAuthAttempt
 transaction and sets requested capabilities to `authorizing`; callback exchanges that code once without a second
 automatic started. Denial, missing/same or safely known provider/network failure at current target `T` must append
-the versioned unsatisfied result and atomically set only those requested capabilities to `action_required` with a
-stable error while preserving actual scopes/last-verified facts; stale `T` is a capability no-op plus safe audit. The
+the versioned `oauth.refresh_recovery_unsatisfied` result and atomically set only those requested capabilities to
+`action_required` with a stable error while preserving actual scopes/last-verified facts; stale `T` is a capability
+no-op plus safe audit. Unsatisfied has no credential post/expiry fields and closes only the recovery attempt. The
 original fence remains and the user may create another OAuthAttempt. Only a different non-empty refresh token may
 atomically commit credential/scopes/
 capabilities plus complete F/S/T `source="progressive_recovery"` replacement proof. Targetless callback must fail
 before any local credential/scope/capability save, and automatic Worker refresh cannot consume the fence. Do not
 trigger an extra provider call or temporary OAuth-only service merely to consume it. A generation/physical-digest/
 access-only/automatic-different-token change or operator disposition cannot waive replay safety. If confirmed
-committed before a crash, rerun the
-same rollout from persisted token/expiry instead of reauthorizing or refreshing again. Keep the database at 0018,
+committed before a crash, rerun from its closing result; use persisted post token/expiry if still current or a later
+valid current token/expiry after readiness, never reauthorizing or refreshing the closed attempt. Keep the database at 0018,
 restore the original 0018-compatible services while write switches remain off. An unknown fence requires the
 explicit progressive recovery flow above before a new full change window; an
 independent local-directory failure instead requires restoration of that exact fact and does not waive any fence. If an
@@ -4830,10 +4875,12 @@ if that flow does not apply, stop and request a newly approved design. Fabricate
 forbidden. A targetless callback resolving to a fenced identity must be blocked before persistence and prohibit
 `ensure_connection`; an explicit recovery response-after-lock-loss, CAS miss, exchange unknown or same-code replay
 must preserve the existing row and enter `needs_attention`. Operators inspect only content-free automatic/recovery
-attempt, source, lease, CAS, result-reconcile and capability-transition facts. Google callback accepts only
-`code+state` or `error=access_denied+state`; missing state, code/error ambiguity, unknown error and replay fail closed,
-while Microsoft keeps equivalent one-time error semantics. M2 fixes the APP root key/version and has no multi-key lookup; current
-identity equal to consumed old identity, including A→B→A or same-token re-encryption, fails closed. Release evidence
+attempt, source, lease, CAS, result-union, current-readiness and capability-transition facts. Google/Microsoft callback
+accepts only `code+state` or bounded non-empty `error+state`; shape errors reject before consumption, every valid error
+including unknown names consumes state once and returns the same sanitized Problem after target-T unsatisfied/no-op,
+raw error is not stored/logged, and replay fails closed. M2 fixes the APP root key/version and has no multi-key lookup;
+current identity equal to a closed result's old identity, including A→B→A or same-token re-encryption, or missing/
+inconsistent credential state produces `oauth_credential_state_conflict` without reopening the attempt. Release evidence
 records only fixed synthetic HMAC-vector pass/fail, never real token, identity, root key or derived key material.
 
 Implement `just calendar-aad-preflight-0019` with no pair/user argument. Before starting its one-off container,
@@ -5007,17 +5054,21 @@ uv run --project backend pytest \
 Expected: PASS with independent fixed canonical-byte/base64/hash vectors for
 `credential_snapshot_digest_v1`/`refresh_credential_snapshot_digest_v1`/`rollout_digest_v1` plus the fixed
 HKDF/HMAC `refresh_token_identity_v1` vector; coordinator claim ordering, dual-Worker single-call,
-response-after-lock-loss/CAS-miss and Taskiq/`TransientProviderError` zero-call cases; actual result commit with lost
-ACK reconciled through a fresh session with `provider_calls == 1`, actual rollback left unresolved with every later
-call at zero, and no guessed result; automatic
+response-after-lock-loss/CAS-miss and Taskiq/`TransientProviderError` zero-call cases; versioned
+confirmed/unsatisfied/replacement result-union ACK reconciliation with actual commit permanently closing only the
+allowed attempts, actual rollback unresolved, unsatisfied preserving original fence and replacement consuming it,
+and no guessed result or extra provider/code call; later valid refresh/reauth before reconcile leaves historical
+attempt closed and uses current readiness, while old-identity/missing-row conflict returns
+`oauth_credential_state_conflict` at zero calls; automatic
 missing/same/different confirmed handling with complete G/G/G proof, Google access-only confirmed and byte-preserved
 refresh row, different-token Worker rotation without old-fence consumption, and stale-CAS rejection; explicit
 progressive recovery start transaction with OAuthAttempt + recovery-started event, repeated attempts where the first
 denial/missing/same/known-failure unsatisfied result atomically converges only requested capabilities from
-`authorizing` to `action_required`, preserves actual scopes/last-verified facts and the original fence, stale `T` is a
-capability no-op, and a later new-attempt different-token callback atomically commits credential/scope/capability plus
-complete F/S/T replacement proof while target generation stays `T`; Google `access_denied+state` one-time callback,
-code/error mutual exclusion, missing/unknown/replay rejection, Microsoft parity, and targetless fenced-identity
+`authorizing` to `action_required`, preserves actual scopes/last-verified facts and the original fence, contains no
+credential post/expiry fields, stale `T` is a capability no-op, and a later new-attempt different-token callback
+atomically commits credential/scope/capability plus complete F/S/T replacement proof while target generation stays
+`T`; Google/Microsoft any-valid-error one-time callback, code/error mutual exclusion, pre-consumption shape rejection,
+unknown-error consumption then replay rejection, stable sanitized Problem/raw-error redaction, and targetless fenced-identity
 pre-save blocking; `F=S`/`S>F`, stale/concurrent target, missing/empty/same refresh, disconnected/old-plaintext-
 unavailable, provider/network/lease/CAS failure negatives, complete proof fields and strict timestamps; post-
 consumption `action_required` reauthorization and later-generation monotonicity; fixed-root-key identity rollback
@@ -5029,9 +5080,9 @@ attempt-bound dual-digest generic started/confirmed atomicity with required iden
 persisted-expiry/deadline-candidate fields; unresolved cross-basename blocking; repeated explicit recovery with
 started/unsatisfied/replacement facts, targetless blocked audit that does not close the fence, and
 missing/empty/same-plaintext/access-only negatives;
-confirmed-before-artifact crash recovery with no second refresh; lock contention/loss,
+closing-result-before-artifact crash recovery with exact-post or later-current readiness and no second refresh; lock contention/loss,
 network unknown, `invalid_grant`, malformed response, scope shrink, credential snapshot CAS, definite rollback and
-commit-ACK-loss reconciliation with zero duplicate provider calls; access-only/undecryptable refresh rejection;
+commit-ACK-loss result-union reconciliation with zero duplicate provider calls; access-only/undecryptable refresh rejection;
 fixed earliest-expiry-minus-900-seconds deadline; Fake and HTTP-mocked real-adapter exact-scope probes; CAS-only
 AEAD rotation;
 zero Calendar fact mutation;
@@ -5076,7 +5127,7 @@ typed rollout checks, host-resolved immutable-image binding, revision-global plu
 leases and shared CAS boundary, durable generic automatic started/confirmed fence, repeated explicit recovery
 started/unsatisfied/replacement gate, targetless pre-save blocking, automatic access-only confirmed and different-
 token no-old-consumption cases, two-Worker single-call and unknown/Taskiq zero-call cases,
-confirmed-crash resume, exact active-refresh preflight/guarded migration/three-phase audit/resync/restored-0018
+closing-result/current-readiness crash resume, exact active-refresh preflight/guarded migration/three-phase audit/resync/restored-0018
 recipes, revision/stopped-service gates for every no-argument one-off, the
 owner-before-secret/image-guarded exact-image restore service plus existing production confirmations, app-role
 verifier with server/transaction read-only enforcement, zero Calendar mutation during preflight, and no
@@ -5098,15 +5149,18 @@ Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` di
 The review must explicitly include existing-AuditEvent attempt-bound refresh started/confirmed fences,
 `rollout_digest_v1` plus full and refresh credential snapshot digests and the independent HKDF/HMAC identity vector,
 shared `OAuthRefreshCoordinator` claims, cross-basename unresolved blocking,
-required confirmed post-digests/persisted-expiry/deadline-candidate fields, fresh-session commit-result reconcile
-versus definite rollback with the 1/0 provider-call assertions, callback `compare_digest` plus atomic F/S/T
-`progressive_recovery`, requested-capability `authorizing→action_required` unsatisfied convergence, stale-`T` no-op,
-new-attempt retry, Google access-denied/error-shape/replay handling, targetless fenced-identity pre-save block, and automatic
+required confirmed post-digests/persisted-expiry/deadline-candidate fields, fresh-session versioned result-union
+reconcile versus definite rollback for confirmed/unsatisfied/replacement, exact automatic/recovery closure and original-
+fence consumption, later-valid-refresh/reauth current-readiness races, `oauth_credential_state_conflict` zero-call
+blocking, callback `compare_digest` plus atomic F/S/T `progressive_recovery`, requested-capability
+`authorizing→action_required` unsatisfied convergence without credential post/expiry, stale-`T` no-op, new-attempt
+retry, generic Google/Microsoft error consumption/redaction/replay handling, targetless fenced-identity pre-save block, and automatic
 G/G/G missing/same/different confirmed handling without old-fence consumption, shared full-row/generation/identity
 CAS, single-consumer recovery races, target generation preserved, stale/concurrent callback and disconnect-without-
 consumption negatives, post-consumption capability/generation changes, fixed-root-key A→B→A/same-token identity
 rollback rejection, cross-cutoff fence
-retention without later credential lineage and with whole-group cutoff, confirmed-crash resume, host
+retention through the same result union without later credential lineage and with whole-group cutoff, closing-result/
+current-readiness crash resume, host
 owner-before-secret artifact/image guard, exact
 `sha256:`/`--pull never` restore, and verifier `PGOPTIONS` + first-action
 `BEGIN READ ONLY` + SQLSTATE `25006` evidence.
@@ -5301,10 +5355,10 @@ git commit -m "feat: add trusted action editors"
 - Modify: `backend/src/ai_employee/infrastructure/testing/scenarios.py`
 - Modify: `backend/src/ai_employee/infrastructure/testing/test_support.py`
 - Modify: `backend/src/ai_employee/api/routers/test_support.py`
-- Create: `scripts/test-m2-release.sh` — full CI plus three fixed v1 digest vectors and the fixed `refresh_token_identity_v1` HKDF/HMAC vector, fixed APP root-key construction parity and decrypt/validate/identity ordering, automatic coordinator started/confirmed state machine, commit-ACK-loss actual-commit reconciliation versus actual rollback, repeated explicit progressive recovery with capability-converging started/unsatisfied/replacement facts, Google error-callback parity, targetless pre-save blocking, shared generation/full-row CAS, 0019 revision-global lease, cross-cutoff fence retention, identity rollback detection, deadline, owner-before-secret exact-image restore/grant, and database-enforced app-role verifier contract gate; it never performs production migration or restore.
+- Create: `scripts/test-m2-release.sh` — full CI plus three fixed v1 digest vectors and the fixed `refresh_token_identity_v1` HKDF/HMAC vector, fixed APP root-key construction parity and decrypt/validate/identity ordering, automatic coordinator state machine, versioned confirmed/unsatisfied/replacement ACK-loss actual-commit/rollback reconciliation, closure/current-readiness separation with later-valid-state and `oauth_credential_state_conflict` cases, repeated explicit recovery, generic sanitized Google/Microsoft error-callback parity, targetless pre-save blocking, shared generation/full-row CAS, 0019 leases, cross-cutoff result-union retention, deadline, owner-before-secret exact-image restore/grant, and database-enforced app-role verifier gate; it never performs production migration or restore.
 - Create: `scripts/verify-m2-sensitive-output.py`
-- Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free 0019 digest/HKDF-HMAC vectors, automatic started/confirmed, commit-result reconciliation/rollback call counts, repeated capability-converging progressive recovery, Google callback-error parity, targetless block, shared coordinator CAS/lease, whole-group retention, identity rollback, deadline, ordinal, and exact-image owner-restore evidence.
-- Modify: `docs/acceptance-checklist.md` — require three fixed v1 digest vectors, automatic confirmed plus progressive replacement atomicity, actual-commit-ACK-loss versus actual-rollback reconciliation, repeated unsatisfied capability convergence/stale-target/new-attempt recovery, Google callback error-shape/replay and targetless-block evidence, shared snapshot-CAS, durable refresh fence and whole-group cross-cutoff retention evidence plus exact deadline completion or evidenced owner-before-secret exact-image atomic restore/grant/database-read-only app verification before release acceptance.
+- Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free 0019 digest/HKDF-HMAC vectors, automatic/recovery started plus versioned result union, commit-result reconciliation/rollback call counts, closure/current-readiness races/conflicts, repeated capability-converging recovery, generic callback-error/redaction parity, targetless block, shared coordinator CAS/lease, whole-group retention, deadline, ordinal, and exact-image owner-restore evidence.
+- Modify: `docs/acceptance-checklist.md` — require three fixed v1 digest vectors, versioned confirmed/unsatisfied/replacement closure, actual-commit-ACK-loss versus actual-rollback reconciliation, closure/readiness separation, repeated unsatisfied capability convergence/stale-target/new-attempt recovery, generic Google/Microsoft callback error-consumption/redaction/replay and targetless-block evidence, shared snapshot-CAS, durable refresh fence and whole-group result-union retention evidence plus exact deadline completion or evidenced owner-before-secret exact-image atomic restore/grant/database-read-only app verification before release acceptance.
 - Modify: `README.md`
 
 - [ ] **Step 1: Write the failing crash matrix and Playwright flows**
@@ -5360,35 +5414,36 @@ It must also verify that the working tree has no `.env`, secret, dump, Playwrigh
 Run: `bash scripts/test-m2-release.sh`
 
 Expected: PASS with fresh output from `just ci`, all crash cases, three independent fixed v1 digest vectors plus the
-independent HKDF/HMAC `refresh_token_identity_v1` vector and decrypt/validate/identity/started/lease/provider ordering,
-coordinator claim ordering, two-Worker single-call and response-after-lock-loss/CAS-miss zero-call cases, actual
-result commit plus lost ACK recovered by a fresh read-only session with `provider_calls == 1`, actual rollback left
-unresolved with every later `provider_calls == 0`, no guessed result, revision-global plus connection-scoped leases across
-same/different basenames, provider-before-`oauth.refresh_started` ordering, attempt/source/rollout/G/G/G/pre-post
-full-and-refresh credential digest/old-new identity binding, unresolved cross-basename zero-call blocking, and
-required confirmed persisted-expiry/disposition/deadline-candidate/strict-timestamp fields. Known-valid
-missing/same/different automatic responses all confirmed; Google access-only preserves the refresh row byte-for-byte,
-automatic different-token rotation does not consume an old fence. Explicit recovery covers `F=S`/`S>F`, atomic
-OAuthAttempt + recovery-started creation and requested-capability `authorizing` state; denial, missing, same and known
-provider failure atomically converge only those capabilities to `action_required` with stable error while preserving
-actual scopes/last-verified facts and the original fence; stale `T` is a capability no-op; a later new-attempt different-
-token callback has target-generation-preserving F/S/T replacement proof; stale-target/concurrent-reauthorization
-rejection and full credential/scope/capability/event rollback remain covered. Google callback proves mutually exclusive
-`code+state`/`access_denied+state`, one-time state consumption, stable sanitized Problem, and missing/unknown/replay
-rejection with Microsoft parity. Targetless fenced identity is blocked before local
-persistence with no duplicate connection. Shared full-row/generation CAS, repeated-recovery single-consumer
-arbitration, disconnected/old-plaintext-unavailable blocking, post-consumption `action_required` reauthorization and
-generation changes without fence revival, fixed-root-key identity rollback including A→B→A and same-token
-re-encryption, cross-cutoff unresolved-fence
-preservation with user-isolated ordinary audit cleanup and whole-group maximum-time cutoff without current-lineage
-matching, lock-loss/network-unknown/invalid-grant/malformed/scope-shrink/credential-CAS/definite-database-rollback
-fail-closed cases, fresh-session commit-ACK-loss reconciliation for actual commit versus actual rollback, and
-Taskiq/`TransientProviderError` zero-call delivery without guessed results,
-confirmed-before-artifact crash resume without another refresh and no replay of original D0, 0019 typed
-rollout guard, app-role restore denial, owner-before-secret artifact/image mismatch with zero owner/`pg_restore`
-calls, exact `sha256:` no-pull atomic owner restore/error rollback, role regrant, app-only verifier
-`PGOPTIONS`/`BEGIN READ ONLY`/SQLSTATE `25006`, deployment/tooling contracts, sensitive-output scan, and
-`git diff --check`.
+independent HKDF/HMAC `refresh_token_identity_v1` vector, and decrypt/validate/identity/started/lease/provider ordering.
+The gate proves coordinator claim ordering, two-Worker single-call and response-after-lock-loss/CAS-miss zero-call
+cases, versioned confirmed/unsatisfied/replacement actual-commit versus actual-rollback reconciliation through a fresh
+session, exact automatic/recovery closure and replacement-only original-fence consumption, no guessed result or added
+provider/code call, ACK-lost-then-later-valid-refresh/reauth closure, and `oauth_credential_state_conflict` zero-call
+blocking. It also proves revision-global plus connection-scoped leases across same/different basenames, provider-before-
+started ordering, attempt/source/rollout/G/G/G/pre-post full-and-refresh digest/identity binding, unresolved cross-
+basename zero-call blocking, and required confirmed persisted-expiry/disposition/deadline-candidate/strict-timestamp
+fields. Known-valid missing/same/different automatic responses all confirm; Google access-only preserves the refresh row
+byte-for-byte, and automatic different-token rotation does not consume an old fence.
+
+Explicit recovery covers `F=S`/`S>F`, atomic OAuthAttempt + recovery-started creation, and requested-capability
+`authorizing` state. Denial, missing, same, and known provider failure converge only those capabilities to
+`action_required` with stable error while preserving actual scopes/last-verified facts and the original fence; the
+unsatisfied result has no credential post/expiry, stale `T` is a capability no-op, and a later new-attempt different-
+token callback has target-generation-preserving F/S/T replacement proof. Stale-target/concurrent-reauthorization
+rejection and full credential/scope/capability/event rollback remain covered. Google/Microsoft callbacks prove
+mutually exclusive `code+state`/any-valid-`error+state`, pre-consumption shape rejection, unknown-error state
+consumption, a stable common sanitized Problem, raw-error redaction, and replay rejection. Targetless fenced identity is
+blocked before local persistence with no duplicate connection.
+
+Shared full-row/generation CAS, repeated-recovery single-consumer arbitration, disconnected/old-plaintext-unavailable
+blocking, post-consumption `action_required` reauthorization and generation changes without attempt revival,
+fixed-root-key current-state conflict including A→B→A and same-token re-encryption, result-union whole-group cutoff with
+user-isolated ordinary audit cleanup, all fail-closed provider/lease/CAS/rollback cases, Taskiq/
+`TransientProviderError` zero-call delivery, closing-result-before-artifact resume under independent current readiness,
+and no replay of original D0 all pass. The gate additionally covers the 0019 typed rollout guard, app-role restore
+denial, owner-before-secret artifact/image mismatch with zero owner/`pg_restore` calls, exact `sha256:` no-pull atomic
+owner restore/error rollback, role regrant, app-only verifier `PGOPTIONS`/`BEGIN READ ONLY`/SQLSTATE `25006`,
+deployment/tooling contracts, sensitive-output scan, and `git diff --check`.
 
 - [ ] **Step 6: Pause for explicitly authorized provider-account E2E**
 
@@ -5413,28 +5468,34 @@ and strict timestamp; and freezes
 is affected. Known-valid missing/same/different automatic responses all confirmed; missing/same preserves the refresh
 row, while different updates it without consuming any older fence. An unresolved fence blocks every basename and all
 Taskiq/`TransientProviderError` re-entry must make zero provider calls. If a result commit ACK is lost, a fresh
-database session must reconcile by user/connection/attempt: an actual commit with complete matching post proof
-recovers confirmed/consumed with total calls still 1, while an actual rollback leaves the started unresolved and all
-later calls at zero; no guessed result is permitted. Recovery requires a user-created,
+database session must reconcile by user/connection/attempt using the versioned confirmed/unsatisfied/replacement union:
+an actual commit permanently closes its allowed automatic/recovery attempt without adding calls, while an actual
+rollback has no result and leaves that started unresolved; unsatisfied does not consume original fence, replacement
+does. Closure is independent from current readiness: a later valid refresh/reauth uses current facts, while old identity,
+missing rows or inconsistent state returns `oauth_credential_state_conflict` and blocks rollout at zero calls. No
+guessed result is permitted. Recovery requires a user-created,
 connection-bound progressive OAuthAttempt whose start transaction appends
 `oauth.refresh_recovery_authorization_started` and sets requested capabilities to `authorizing`; callback exchanges
 that code once without a second automatic started. Denial, missing/same or safely known provider/network failure at
 current `T` appends the versioned unsatisfied result and atomically changes only those requested capabilities to
-`action_required` with a stable error while preserving actual scopes/last-verified facts; stale `T` is a capability
+`action_required` with a stable error while preserving actual scopes/last-verified facts and without credential
+post/expiry fields; stale `T` is a capability
 no-op plus safe audit. The original fence remains and the user may create another OAuthAttempt. Only a different
 non-empty refresh token may atomically commit credential/scopes/capabilities plus
 matching `oauth.refresh_credential_replaced` with complete F/S/T `source="progressive_recovery"` proof and strict
 timestamps. Targetless fenced-identity callback must fail before local credential/scope/capability persistence;
-Google callback must accept only `code+state` or `error=access_denied+state`, consume state once, and reject missing/
-ambiguous/unknown/replayed input with a stable sanitized Problem; Microsoft parity remains. Normal Google/Microsoft
+Google/Microsoft callbacks must accept only `code+state` or bounded non-empty `error+state`; missing/ambiguous/neither/
+malformed shape rejects before consumption, any valid error including an unknown name consumes state once and returns
+the same sanitized Problem after target-T unsatisfied/no-op, raw error is not recorded, and replay rejects. Normal Google/Microsoft
 mail/calendar automatic refresh cannot consume the fence. Once valid, replacement proof
-permanently closes the old fence while current readiness is checked independently; current identity equal to consumed
-old identity under the fixed APP root key/version (including A→B→A or same-token re-encryption) is rollback even when
-physical digest differs. Disconnect/reconnect, a new connection mapping, missing/same refresh token, or unavailable
+permanently closes both matching recovery and old automatic attempts while current readiness is checked independently;
+current identity equal to a closed result's old identity under the fixed APP root key/version (including A→B→A or
+same-token re-encryption), missing rows, or inconsistent state is `oauth_credential_state_conflict` even when physical
+digest differs, but never reopens/calls the old attempt. Disconnect/reconnect, a new connection mapping, missing/same refresh token, or unavailable
 old plaintext cannot produce consumption. If the affected scope remains, use only an existing explicitly user-
 authorized data-disposition flow; otherwise stop and request a newly approved design.
-Confirmed state surviving a pre-artifact crash resumes from persisted
-token/expiry without another refresh. Then back up and
+Closing result surviving a pre-artifact crash resumes from persisted post token/expiry when exact, or later valid
+current token/expiry after readiness, without another old-attempt refresh. Then back up and
 capture the pre-migration audit artifact; migrate only through `just calendar-aad-migrate-0019` and capture the
 post-migration artifact; make the v2-only immutable image available while all general services remain stopped; run
 only the ordinal-aware `just calendar-aad-resync-0019`; capture and pass the post-resync artifact under the same
@@ -5466,7 +5527,7 @@ OAuth-only service, or continuing provider E2E after restore verification failur
 
 Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision.
 
-The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; the recorded original 0018-compatible image; confirmation that no legacy reader/upsert or business write remained; proof that no general service was running during `calendar-aad-preflight-0019`; its start/finish result before backup; successful acquisition of the fixed revision-global PostgreSQL session lease before artifact/provider access and a connection-scoped coordinator lease for every connection, plus the disposition of any `calendar_aad_rollout_locked`, `oauth_refresh_claim_locked`, or lock-loss result; the accepted `rollout_digest_v1` and proof that all three fixed credential/rollout vectors plus the independent `refresh_token_identity_v1` HKDF/HMAC vector passed; distinct affected-connection count and hashed IDs; proof each connection followed exact-AAD decrypt → non-empty/UTF-8/bound validation → identity calculation → started/lease checks → provider access, recorded the identity key version, and made exactly one proactive refresh; returned-scope validation result and access/optional-refresh AEAD rotation fact without token/scope material; proof that every credential commit used complete old access/refresh snapshot/generation/identity CAS and that no CAS miss published an artifact; content-free evidence for both commit-result cases—actual commit with lost ACK reconciled through a fresh session and `provider_calls == 1`, actual rollback with no matching result, unresolved started and all later `provider_calls == 0`—with no fabricated result; the content-free minimum of all persisted refreshed `token_expires_at` values; the fixed 900-second margin and exact UTC `rollout_deadline`; each pair's locally hashed digest/result; and the disposition of every failed preflight window. Record backup/preflight-state/migration identifiers and checksums without secrets; the host-resolved backend image content ID and proof it matched every guarded one-off; deployed v2-only image digest; every one-off `calendar-aad-resync-0019` invocation and proof that no ordinary Worker/Scheduler/API/Caddy was running during recovery; evidence active `created/queued/running/retry_scheduled` ordinals were reused and only prior `failed/cancelled` allocated the next ordinal; each start/pre-commit rollout guard result; the post-resync artifact commit time preceding both deadline and general service startup; and references plus checksums for the preflight, `pre-migration`, `post-migration`, and `post-resync` artifacts. Record the exact affected `(connection_id, calendar_id)` set using locally hashed connection IDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and every recovery ordinal: stable pair digest, immutable prior TaskRun terminal state, reused/new TaskRun ID/status, bounded runner result, and final marker result. If there were zero affected scopes, record an explicit evidenced zero/no-deadline branch rather than omitting the section. Record the immutable 0019-compatible normal rollback-floor image as well. Evidence may state snapshot field names and CAS/result-reconcile codes but must never contain credential bytes, token timestamps beyond the approved content-free earliest expiry, identity fingerprints, or `updated_at` values that enable correlating a secret rotation.
+The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; the recorded original 0018-compatible image; confirmation that no legacy reader/upsert or business write remained; proof that no general service was running during `calendar-aad-preflight-0019`; its start/finish result before backup; successful acquisition of the fixed revision-global PostgreSQL session lease before artifact/provider access and a connection-scoped coordinator lease for every connection, plus the disposition of any `calendar_aad_rollout_locked`, `oauth_refresh_claim_locked`, or lock-loss result; the accepted `rollout_digest_v1` and proof that all three fixed credential/rollout vectors plus the independent `refresh_token_identity_v1` HKDF/HMAC vector passed; distinct affected-connection count and hashed IDs; proof each connection followed exact-AAD decrypt → non-empty/UTF-8/bound validation → identity calculation → started/lease checks → provider access, recorded the identity key version, and made exactly one proactive refresh; returned-scope validation result and access/optional-refresh AEAD rotation fact without token/scope material; proof that every credential commit used complete old access/refresh snapshot/generation/identity CAS and that no CAS miss published an artifact; content-free evidence for confirmed/unsatisfied/replacement result-union actual commit and actual rollback, exact automatic/recovery closure and original-fence consumption, no fabricated result or extra call, later-valid-refresh/reauth closure, and `oauth_credential_state_conflict` zero-call rollout blocking; the content-free minimum of all current-ready persisted `token_expires_at` values; the fixed 900-second margin and exact UTC `rollout_deadline`; each pair's locally hashed digest/result; and the disposition of every failed preflight window. Record backup/preflight-state/migration identifiers and checksums without secrets; the host-resolved backend image content ID and proof it matched every guarded one-off; deployed v2-only image digest; every one-off `calendar-aad-resync-0019` invocation and proof that no ordinary Worker/Scheduler/API/Caddy was running during recovery; evidence active `created/queued/running/retry_scheduled` ordinals were reused and only prior `failed/cancelled` allocated the next ordinal; each start/pre-commit rollout guard result; the post-resync artifact commit time preceding both deadline and general service startup; and references plus checksums for the preflight, `pre-migration`, `post-migration`, and `post-resync` artifacts. Record the exact affected `(connection_id, calendar_id)` set using locally hashed connection IDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and every recovery ordinal: stable pair digest, immutable prior TaskRun terminal state, reused/new TaskRun ID/status, bounded runner result, and final marker result. If there were zero affected scopes, record an explicit evidenced zero/no-deadline branch rather than omitting the section. Record the immutable 0019-compatible normal rollback-floor image as well. Evidence may state snapshot field names and CAS/result-reconcile/current-readiness codes but must never contain credential bytes, token timestamps beyond the approved content-free earliest expiry, identity fingerprints, raw provider errors, or `updated_at` values that enable correlating a secret rotation.
 
 The release record must additionally prove API deps, mail Worker, calendar Worker and the preflight CLI constructed
 `AeadCipher` plus `refresh_token_identity_v1` from the same fixed `APP_MASTER_KEY_FILE` bytes and key version. M2
@@ -5478,27 +5539,41 @@ For each affected connection, the record must identify content-free `oauth.refre
 old/new identity-field presence/match with the fixed key versions but no fingerprint values, persisted-expiry/
 deadline-candidate field presence/match while emitting only the approved global earliest expiry/deadline,
 missing/same/different disposition, and strict `created_at` ordering. Evidence both leases and started committed
-before the provider call, and credential CAS plus
-confirmed committed in one transaction. Record automatic access-only confirmed and different-token confirmed cases;
-the latter must show no old-fence consumption. Record every unresolved fence and demonstrate all later same/different-
-basename and Taskiq/`TransientProviderError` automatic entries made zero provider calls. Record both injected result-
-transaction outcomes: actual commit with lost ACK must be recognized by a fresh-session user/connection/attempt
-read-only reconcile and retain exactly one provider call; actual rollback must have no matching result, keep the
-original started unresolved/`needs_attention`, and retain zero later provider calls. Loss of the original lease/session
-must not prevent either check, and evidence must show no guessed result was appended. For each explicit recovery,
+before the provider call, and credential CAS plus confirmed committed in one transaction. Record automatic access-only
+confirmed and different-token confirmed cases; the latter must show no old-fence consumption. Record every unresolved
+fence and demonstrate all later same/different-basename and Taskiq/`TransientProviderError` automatic entries made zero
+provider calls.
+
+The record must separately cover injected actual commit and actual rollback for every
+`OAuthRefreshResultV1 = ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1` member. A fresh-session
+user/connection/attempt read-only reconcile must prove that confirmed/replacement are the only allowed closers for a
+matching automatic attempt, unsatisfied/replacement are the only allowed closers for a matching recovery attempt, and
+replacement closes both while only it consumes the original automatic fence. Every actual commit must preserve the
+already-observed provider/code call count without adding a call: confirmed/replacement retain one total provider call,
+an error-callback unsatisfied may retain zero, and an unsatisfied after exchange may retain one;
+every actual rollback must have no matching result, leave the corresponding started unresolved/`needs_attention`, and
+make every later provider/code call zero. Loss of the original lease/session must not prevent either check, and no
+guessed result may be appended. Closure evidence must then be followed by independent current-readiness evidence:
+exact confirmed/replacement post-state may resume directly; a later valid refresh/reauth keeps the historical attempt
+closed and proceeds from current facts; old identity, missing credential rows, invalid AEAD/ownership, or inconsistent
+current state returns `oauth_credential_state_conflict`, blocks rollout, and keeps `provider_calls == 0`. Unsatisfied
+has no credential post/expiry proof and is checked only against current capability facts.
+
+For each explicit recovery,
 record `oauth.refresh_recovery_authorization_started` schema/source, OAuthAttempt and event IDs, connection digest,
 original attempt/started source, F/S/T, both frozen pre-digest field presence/match, old identity-field match/key
 version, stable result code, and strict timestamp after the original automatic started, without recording any
 digest or fingerprint value. For every unsatisfied result, record
-`result_schema_version="oauth_refresh_recovery_authorization_unsatisfied.v1"`, its matching recovery event/OAuthAttempt IDs,
+`result_schema_version="oauth_refresh_recovery_unsatisfied.v1"`, its matching recovery event/OAuthAttempt IDs,
 original attempt/started source/connection
 digest, F/S/T, both frozen pre-digest field presence/match, old identity-field match/key version, canonical requested
 capabilities, stable error/result codes, `capability_transition`, and strict timestamp after the recovery-started
 event. Demonstrate denial, missing, same and safely known provider failure at current target `T` each atomically
 changing only requested capabilities from `authorizing` to `action_required` while preserving actual scopes and
-last-verified facts; demonstrate stale `T` as `stale_target_noop` without overwriting newer authorization state. Each
-unsatisfied attempt closes only itself and leaves the original fence, followed by a new OAuthAttempt whose different-
-token callback atomically commits
+last-verified facts; prove the unsatisfied schema contains no credential post snapshot/digest, new identity,
+persisted-expiry or deadline field. Demonstrate stale `T` as `stale_target_noop` without overwriting newer authorization
+state. Each unsatisfied attempt closes only itself and leaves the original fence, followed by a new OAuthAttempt whose
+different-token callback atomically commits
 `oauth.refresh_credential_replaced` with `source="progressive_recovery"`, original
 attempt/started source/connection digest, recovery OAuthAttempt/event IDs, complete F/S/T with
 `pre_generation=post_generation=T`, original pre-digest and required post-digest field presence/match without digest
@@ -5509,23 +5584,27 @@ generation remains `T`. Record the
 one-call proof, response-after-lock-loss/CAS-miss/unknown/Taskiq zero-call evidence, commit-ACK-loss reconcile evidence,
 and injected atomic rollback
 without token or plaintext hash. Targetless fenced-identity callback must show local credential/scope/capability
-writes and duplicate-connection creation were zero. Google API evidence must show mutually exclusive
-`code+state`/`access_denied+state`, one-time state consumption, stable sanitized Problem, and missing-state/
-code-error-ambiguity/unknown-error/replay rejection while Microsoft error semantics remain unchanged. No-token/empty/same-plaintext/access-only/re-encryption, stale
-CAS, unknown-result, disconnected/old-plaintext-unavailable, and unsatisfied-recovery paths must show no consumption
-and continued blocking; disconnect/reconnect or new-connection mapping must never be presented as recovery evidence.
-Automated evidence must also show consumption surviving later capability `action_required` plus reauthorization,
-later generation/scope/credential changes, fixed-root-key current-identity rollback rejection including A→B→A, and
-no replay of the original D0 preflight refresh. Include cutoff evidence that an unresolved started older than the
+writes and duplicate-connection creation were zero. Google and Microsoft API evidence must show mutually exclusive
+`code+state`/bounded non-empty `error+state`; missing state, code/error ambiguity, neither field, and malformed error
+must reject before state consumption. Any valid error, including an unknown name and `access_denied`, must consume state
+once, perform target-`T` unsatisfied/no-op convergence, return the same stable sanitized Problem, and keep raw error/
+description out of persistence, logs, and Trace; replay of the consumed state with the same or a different unknown error
+must reject. No-token/empty/same-plaintext/access-only/re-encryption, stale CAS, unknown-result, disconnected/old-
+plaintext-unavailable, and unsatisfied-recovery paths must show no original-fence consumption and continued blocking;
+disconnect/reconnect or new-connection mapping must never be presented as recovery evidence. Automated evidence must
+also show every legal result closure surviving later capability `action_required` plus reauthorization and later
+generation/scope/credential changes; replacement consumption remains valid, while fixed-root-key current identity
+returning to old identity, including A→B→A or same-token re-encryption, is
+`oauth_credential_state_conflict` without reopening or recalling the old attempt. Prove no replay of the original D0
+preflight refresh. Include cutoff evidence that an unresolved started older than the
 ordinary audit retention period remains, still blocks with zero provider calls, and does not prevent another user's
 or ordinary audit cleanup. Also prove automatic-success, unsuccessful-recovery and successful-recovery groups are
-deleted only when every event is older than cutoff without comparing later credential lineage, so an old started plus
-newer result remains. If a
-confirmed-before-artifact crash occurred,
-record that the next invocation reused persisted token/expiry with zero additional refresh. Include failure
-disposition for lock loss, network unknown, `invalid_grant`, malformed response, scope shrink, CAS failure, confirmed
-rollback, and commit-result-unknown reconciliation, without recording token, raw scope, provider response, raw `calendar_id`, or correlatable
-credential timestamps.
+deleted through the same result union only when every event is older than cutoff, without comparing later credential
+lineage, so an old started plus newer result remains. If a closing-result-before-artifact/reconcile crash occurred,
+record that exact post-state or later-valid current readiness resumed without another old-attempt refresh or code
+exchange. Include failure disposition for lock loss, network unknown, `invalid_grant`, malformed response, scope
+shrink, CAS failure, confirmed/unsatisfied/replacement rollback, and commit-result-unknown reconciliation, without
+recording token, raw scope, provider response, raw `calendar_id`, or correlatable credential timestamps.
 
 If the window instead used sealed restore, the same record must contain the exact failure/expiry guard, proof that no
 general service or business write occurred after backup, encrypted backup/checksum identity, production restore
@@ -5557,7 +5636,26 @@ git commit -m "test: freeze M2 release evidence"
 - Draft generation/editing, reply/reply-all rules, recipient limits, model minimization, empty fallback, and no provider draft: Tasks 2, 11, 14–15, 21, and 23.
 - Calendar directory, working hours, buffer, 15-minute grid, 14-day horizon, three candidates, completeness, create/update/restore, ETag, attendees, and notification policy: Tasks 4, 12–13, 16–17, 22, and 24.
 - Calendar proposal trust hardening, including time-valid Worker leases, independent freshness observation, fixed-query minimal projections, transaction-free merged-interval computation, expected-version CAS, exact restore input, explicit-confirmation invariants, and operation-specific readiness: Task 16A.
-- CalendarEvent field AAD v2, forward-only 0019 rotation, local access/refresh credential preconditions, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention, revision-global plus connection-scoped PostgreSQL leases, shared two-channel `OAuthRefreshCoordinator`, fixed digest vectors plus fixed-APP-root-key HKDF/HMAC `refresh_token_identity_v1` with decrypt/validate/identity ordering, automatic `oauth.refresh_started`/`oauth.refresh_confirmed` for missing/same/different responses, fresh-session commit-ACK-loss reconciliation versus definite rollback, repeated connection-bound progressive recovery with recovery-started/capability-converging unsatisfied/replacement facts and target generation preserved, Google error-callback parity, targetless fenced-identity pre-save blocking, Google/Microsoft mail/calendar different-token confirmed without old-fence consumption, shared complete credential/generation/identity CAS, dual-Worker single-call/unknown zero-call arbitration, replacement state monotonicity and identity rollback rejection, complete proof metadata with strict timestamps, whole-group cross-cutoff unresolved-fence retention without later credential lineage, confirmed-crash resume, fixed earliest-expiry-minus-900-second rollout deadline, deadline-bound pre-backup 0018 exact-scope probes/migration/audits, unconditional active-attempt reuse with failed/cancelled-only ordinal allocation, exact-scope one-off execution, post-resync-before-start, owner-before-secret artifact/image guard, exact-image no-pull atomic owner restore, post-restore grants, and database-enforced app-role verifier contracts: Task 27; digest/recovery/fence/CAS/result-reconcile/retention/refresh/rollback/deadline/per-ordinal evidence, aborted-window exact-image owner-restore/read-only-verifier evidence, and the normal 0019-compatible rollback floor: Task 30.
+- CalendarEvent field AAD v2, forward-only 0019 rotation, local access/refresh credential preconditions, scoped resync,
+  cross-calendar ciphertext isolation, fail-closed v1/unknown/tampered reads, and atomic four-column retention: Task 16A.
+  Revision-global plus connection-scoped leases, fixed digest vectors, fixed earliest-expiry-minus-900-second deadline,
+  deadline-bound pre-backup 0018 exact-scope probes/migration/audits, unconditional active-attempt reuse with
+  failed/cancelled-only ordinal allocation, exact-scope one-off execution, post-resync-before-start, owner-before-secret
+  artifact/image guard, exact-image no-pull atomic owner restore, post-restore grants, and database-enforced app-role
+  verifier contracts: Task 27. Digest/deadline/per-ordinal evidence, aborted-window restore/read-only-verifier evidence,
+  and the normal 0019-compatible rollback floor: Task 30.
+- OAuth refresh trust hardening, including the shared two-channel `OAuthRefreshCoordinator`, fixed-APP-root-key
+  HKDF/HMAC `refresh_token_identity_v1` with decrypt/validate/identity ordering, automatic started/confirmed
+  missing/same/different handling, and Google/Microsoft mail/calendar different-token confirmed without old-fence
+  consumption: Task 27. The same task owns the versioned
+  `OAuthRefreshResultV1 = ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1` closure mapping, fresh-session
+  actual-commit/actual-rollback reconciliation, closure/current-readiness separation with later valid refresh/reauth and
+  `oauth_credential_state_conflict` zero-call blocking, repeated recovery whose unsatisfied result has no credential
+  post/expiry, generic Google/Microsoft error consumption/redaction/replay parity, targetless pre-save blocking, shared
+  complete credential/generation/identity CAS, dual-Worker single-call/unknown zero-call arbitration, A→B→A/same-token
+  current-state conflict, strict proof metadata, result-union whole-group retention without later credential lineage,
+  and closing-result/current-readiness crash resume. Task 30 records the corresponding content-free
+  result-reconcile/recovery/fence/CAS/retention/refresh/rollback evidence.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
 - Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, Task 27's coordinator/zero-call tests, and Task 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.
@@ -5569,6 +5667,30 @@ git commit -m "test: freeze M2 release evidence"
 2. Tasks 7–13 generalize reads and add Microsoft/Google parity. Checkpoint: both providers pass OAuth plus incremental mail/calendar contract tests with real writes still disabled.
 3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14 → Task 16 → Task 16A → Task 18 → Task 15 → Task 17 → Tasks 19–20. Task 16A must close calendar lease, freshness, bounded-query, transaction, confirmation, restore-input, and CalendarEvent AAD v2/0019 trust gaps before any proposal version can be frozen. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
 4. Tasks 21–24 add one high-risk provider write path per task and commit. Checkpoint: each adapter independently passes success, rejection, timeout, unknown-result, reconciliation, and duplicate-delivery contracts before starting the next adapter.
-5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, retention-role, three digest vectors plus the fixed HKDF/HMAC identity vector, API/Worker/CLI fixed-key construction parity and exact decrypt → validate → identity → durable started/lease recheck → provider ordering, automatic coordinator claim/lease/started/confirmed state machine, two-Worker one-call and unknown/Taskiq zero-call cases, missing/same/different confirmed with access-only byte preservation and no old-fence consumption, fresh-session commit-ACK-loss reconciliation proving actual commit with one total provider call or actual rollback with an unresolved fence and every later provider call at zero, repeated explicit recovery with atomic OAuthAttempt + recovery-started creation and requested capabilities at `authorizing`, current-`T` denial/missing/same/known-failure convergence to `action_required` while preserving actual scopes and last-verified facts, stale-`T` capability no-op plus safe audit, a later new OAuthAttempt with different-token F/S/T replacement and target generation preserved, Google mutually exclusive code/error callback parity, and atomic credential/scope/capability/event rollback, targetless fenced-identity pre-save blocking, shared complete-row/generation/identity snapshot CAS, stale-CAS/recovery single-consumer races, `F=S`/`S>F`, stale/concurrent/disconnected negative cases, post-consumption `action_required` reauthorization and later-generation monotonicity, A→B→A/same-token identity rollback rejection, stopped-service 0018 active-refresh provider preflight with revision-global plus connection-scoped session leases, complete generic automatic started/confirmed proof with persisted-expiry/disposition/deadline-candidate and strict timestamps, cross-basename unknown-result blocking with no original D0 replay, whole-group cross-cutoff unresolved-fence preservation/user isolation without later credential lineage and confirmed-crash resume, fixed deadline artifact and start/pre-commit guards, unconditional active-ordinal reuse, failed/cancelled-only new ordinal, marker-only exact-pair recovery, guarded migration/audits, app-role restore denial, owner-before-secret artifact/image mismatch zero-call guard, exact-image no-pull atomic owner restore/error rollback, app/retention regrant, app-only restored-0018 verifier with server/transaction read-only enforcement, and post-resync-before-start suites pass.
+5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint:
+   kill-switch, deletion-barrier, sensitive-event, retention-role, three digest vectors plus the fixed HKDF/HMAC identity
+   vector, and API/Worker/CLI fixed-key construction parity all pass. OAuth tests prove exact decrypt → validate →
+   identity → durable started/lease recheck → provider ordering; automatic coordinator claim/lease/started/confirmed;
+   two-Worker one-call and unknown/Taskiq zero-call behavior; missing/same/different confirmed with access-only byte
+   preservation and no old-fence consumption; and the versioned
+   `OAuthRefreshResultV1 = ConfirmedV1 | RecoveryUnsatisfiedV1 | CredentialReplacedV1` mapping. Fresh-session ACK-loss
+   tests cover actual commit and actual rollback for every union member, automatic/recovery closure, replacement-only
+   original-fence consumption, no guessed result or extra provider/code call, later-valid-refresh/reauth current-readiness
+   races, and `oauth_credential_state_conflict` zero-call blocking. Repeated explicit recovery proves atomic OAuthAttempt +
+   recovery-started creation, requested capabilities at `authorizing`, current-`T` denial/missing/same/known-failure
+   convergence to `action_required` while preserving actual scopes/last-verified facts and omitting credential post/
+   expiry, stale-`T` capability no-op, and a later new-attempt different-token F/S/T replacement with target generation
+   preserved. Google/Microsoft callbacks prove code/error mutual exclusion, pre-consumption malformed-shape rejection,
+   any-valid-error state consumption including unknown names, common sanitized Problem/raw-error redaction, and replay
+   rejection; targetless fenced identity is blocked before local persistence. Shared complete-row/generation/identity
+   snapshot CAS, stale-CAS/recovery single-consumer races, `F=S`/`S>F`, stale/concurrent/disconnected negatives,
+   post-consumption reauthorization/later-generation monotonicity, A→B→A/same-token current-state conflict, strict
+   proof metadata, result-union whole-group cross-cutoff retention with user isolation, and closing-result/current-
+   readiness crash resume also pass. The stopped-service 0018 active-refresh preflight then proves revision-global plus
+   connection-scoped leases, persisted-expiry/disposition/deadline-candidate fields, cross-basename unresolved blocking
+   with no original D0 replay, fixed deadline/start/pre-commit guards, active-ordinal reuse, failed/cancelled-only new
+   ordinals, marker-only exact-pair recovery, guarded migration/audits, app-role restore denial, owner-before-secret
+   artifact/image mismatch zero-call guard, exact-image no-pull atomic owner restore/error rollback, app/retention regrant,
+   app-only restored-0018 server/transaction read-only verification, and post-resync-before-start.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.
 7. Task 30 runs the full automated gate, pauses for explicit provider-account authorization, performs the dedicated Google/Microsoft matrix, and writes a fully evidenced final release record. Without that authorization, Task 30 remains incomplete.
