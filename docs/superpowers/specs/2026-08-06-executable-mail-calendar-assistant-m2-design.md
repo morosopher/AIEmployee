@@ -968,7 +968,8 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    发布。Compose migration、`just db-upgrade`、integration fixture、E2E bootstrap 与专用 0019 migration
    one-off 都必须经过这一外层边界，不能各自实现可漂移的锁协议。该锁只绑定 dump 与 schema revision，
    不改变本 revision 已冻结的 typed guard 分支，也不替代 `(20260809, 19)` rollout lease 或恢复时的
-   `CONNECT` fence。普通 `upgrade head` 仍是 fresh database、CI/E2E、Compose migration
+   target-scoped maintenance lock、database-wide maintenance gate 与 CONNECT revocation。普通
+   `upgrade head` 仍是 fresh database、CI/E2E、Compose migration
    service 和常规运维的唯一入口，因此 guard 必须有两个封闭分支：
 
    - fresh/new database，或在 0019 mutation 前以同一查询严格证明 affected set 为空时，使用内建
@@ -1861,35 +1862,41 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   snapshot，但 shared/exclusive lock 加 pre/post CAS 都是强制条件。
 - 通用备份/灾备恢复测试必须冻结 versioned manifest 三件套：安全 basename、UTC `created_at`、
   PostgreSQL/Alembic revision、dump SHA-256/size、checksum filename、immutable backend image 与
-  content-free metadata 完整且权限为 `0600`，DSN/Token/内容字段零出现；checksum 同时绑定 dump 与最终
-  manifest，manifest 反向绑定 checksum 和 dump digest/size。测试必须覆盖 manifest-last/no-clobber 原子
-  发布、任一成员失败/冲突不发布、rclone 三件套复制以及上述整组保留/孤儿协议。
+  content-free metadata、`restore_fingerprint_v1` 与镜像内 executable digest map 完整且权限为 `0600`，
+  DSN/Token/内容字段零出现；checksum 同时绑定 dump 与最终 manifest，manifest 反向绑定 checksum 和 dump
+  digest/size。测试必须实际从 repository-root context 构建 `backend/Dockerfile`，证明全部运行入口已 COPY
+  进镜像且没有 executable bind mount，并覆盖 manifest-last/no-clobber 原子发布、任一成员失败/冲突不发布、
+  rclone 三件套复制以及上述整组保留/孤儿协议。
 - 通用 `just restore file` 不要求 0019 preflight 或 `pre-migration` artifact，可恢复任意受支持 Alembic
   revision（包括普通 0019 备份），但必须在任一 owner Secret/connection/`pg_restore` 前验证完整
   manifest-bound 组。生产测试必须分别让任一写开关开启、Caddy/API/Worker/Scheduler/migration/
-  role-bootstrap/general/owner consumer 运行或二次确认缺失，并断言 `pg_restore_calls == 0`。最后一次
-  host/container 检查后，owner maintenance session 必须执行最小 database fence：对 `PUBLIC`、
-  `ai_employee_app`、`ai_employee_retention` 执行 `REVOKE CONNECT`，保留 owner 连接，终止全部既有非 owner
-  业务/retention session并验证零 writer；随后新 app/retention 连接必须由 PostgreSQL 拒绝，既有连接必须
-  已终止，才允许唯一一次 owner-role、`--exit-on-error --single-transaction` `pg_restore`。advisory lock
-  不能替代该持续 `CONNECT` fence。
-- fence 必须覆盖 restore、fence-aware role grants 与 verifier 全过程；grant 阶段不得提前恢复 database
-  `CONNECT`。通用 verifier 复用已建立的 owner maintenance session，第一条 verifier SQL 为
-  `SET ROLE ai_employee_app`，随后 `BEGIN READ ONLY`，断言
-  `session_user='ai_employee_owner'` 与 `current_user='ai_employee_app'`，并要求同一 connection 的 DML
-  由 PostgreSQL 以 SQLSTATE `25006` 拒绝。全部检查成功后，才在一个 owner 事务中只
-  为 `ai_employee_app`/`ai_employee_retention` 恢复所需 `CONNECT`；`PUBLIC` 保持最小权限。restore、grant、
-  verifier 或 CONNECT reopening 失败都保持 fence 与通用服务停止，写入 `0600`、content-free、
-  manifest-digest-bound phase state；同一 manifest 续跑只能从已证明 phase 恢复，未知 restore outcome
-  先只读核对，禁止盲目第二次 `pg_restore`。测试要求成功路径 `pg_restore_calls == 1`、失败不提前开闸。
+  role-bootstrap/general/owner consumer 运行或二次确认缺失，并断言 `pg_restore_calls == 0`。
+- database-maintenance integration 必须用两个 manifest、generic/sealed 两种 kind 和并发 session 证明同一
+  target 只有 `maintenance_target_lock_key_v1` 的 holder 能建立/继续 attempt；state filename 不参与互斥。
+  gate commit 后启动 migration、role-bootstrap、init-db-roles 或任意 owner one-off 时，仍活跃 holder 导致
+  try-lock 拒绝，holder crash 后则由 durable `ai_employee.maintenance_gate` 拒绝；两种情况 DDL/DML/audit/
+  grant/CONNECT writes、目标 state mutation 与 `pg_restore` calls 都为零。测试还必须验证 exact GUC
+  grammar、database-wide-only catalog row、新
+  session `current_setting` 可见性、target/source digest binding 与非 matching attempt 拒绝。
+- restore 测试必须在 spawn 前读取 pre revision/fingerprint 和 manifest expected post facts，原子 fsync
+  `restore_started` 后才增加 call intent。利用 `--single-transaction --exit-on-error` 注入 spawn 后
+  commit+crash、rollback+crash、partial/inconsistent 三支：post 精确匹配继续，pre 精确匹配只允许运维显式
+  新 attempt，其他状态进入 `needs_attention`；未知分支绝不盲目增加 `pg_restore_calls`。state v2 路径与
+  mode、attempt/call count、phase/gate 一致性也必须核验。
+- grants 与 generic/sealed-specific verifier 必须复用 holder owner session，在 gate active、app/retention
+  CONNECT revoked 时完成 `SET ROLE ai_employee_app`、`BEGIN READ ONLY`、session/current-user 与 SQLSTATE
+  `25006`。最终事务同时写 matching completed audit/phase、RESET database gate 与只恢复 app/retention
+  CONNECT，PUBLIC 保持 revoked。commit/rollback ACK-lost 测试分别证明新 session 读取 gate+audit+ACL 后
+  只完成本地 projection 或继续 closed；grant 后不得再运行可能失败的数据 verifier，commit 后 host crash
+  也不得被误报为 reopen failure。
 - legacy pre-manifest 备份在 production 必须拒绝。`just restore-legacy-to-isolated file output_basename`
   只允许 `APP_ENV=development|test`，由专用 `scripts/convert-legacy-backup.sh` 与 Compose isolated
   PostgreSQL/conversion services 创建唯一 project、internal network、ephemeral volume 和 `0600` 临时
-  Secret；校验旧 dump/checksum后只恢复临时数据库，实读 revision/健康，再通过普通锁定备份路径向受控
-  `${BACKUP_DIR}` 发布新的无冲突三件套。成功或失败的 trap 都必须删除 project、volume、network 与
-  temp Secret，且不得连接/修改 workspace 或 production 数据库、伪造 manifest、stamp 或 repair revision。
-  tooling 与 PostgreSQL integration 测试必须覆盖安全 output basename、冲突拒绝、未知 revision、清理与
-  禁止敏感输出。generic、sealed 与 legacy recipe/service/script/fixture/test 互不调用或混用前置条件。
+  Secret；所有资源先进入 fsynced registry并带统一 attempt/kind/created-at labels。测试必须 SIGKILL
+  converter、模拟 Docker daemon crash，随后由固定 3600 秒 grace、per-attempt lock 与 active-container
+  recheck 的 `legacy-backup-scavenge` 只删除超时孤儿，保留另一 active run，并清理 volume/network/temp
+  Secret/registry且零敏感输出。legacy target 也使用同一 maintenance gate primitive，但不混用 generic/
+  sealed artifact 或 validator。
 - `scripts/test-m2-release.sh` 必须在启动任何子命令前固定并导出合成 Task 13 测试数据库：若外部已提供
   `TEST_DATABASE_URL`，只有精确等于
   `postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test`
@@ -1897,23 +1904,14 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   audit shell 或 integration child process。之后所有 pytest、`just ci`、audit shell、部署/tooling shell
   和 integration 子进程只继承这一环境，不得仅给单条命令加前缀或在后续覆盖；测试必须同时覆盖缺失环境的
   确定性 Task13 选择、外部精确值保留和其他 DSN 拒绝。
-- sealed 0018 恢复测试必须从本窗口 refresh 后且 0019 前创建的加密整库备份，通过独立
-  `just calendar-aad-restore-0018 file` 执行真实 PostgreSQL restore。宿主在读取
-  任一 owner Secret、建立 owner connection 或调用 `pg_restore` 前，必须独立验证安全 basename、完整
-  dump/checksum/versioned-manifest 绑定、preflight/`pre-migration` artifacts 及其 immutable image
-  binding；移动 tag、缺失/错误 image、manifest/checksum 或 artifact mismatch 都以 owner connection 与
-  `pg_restore` 调用数为零失败。guard
-  通过后，restore service 的 `image:` 只能使用内部注入且与 artifact 匹配的精确 `sha256:...` 内容 ID，
-  不得使用 tag/`build:`/pull，并固定以 `--pull never` 启动。容器入口必须在读取 owner Secret 前再次
-  校验 artifact/image 环境，随后才允许以 `ai_employee_owner`、`postgres_bootstrap_password` 和固定
-  `--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction` 执行 `pg_restore`；
-  中途错误不得留下部分状态，成功后才重跑既有 app/retention role bootstrap/grants。
-- restored-0018 verifier 只能挂载 app-role Secret，不得获得 owner Secret；recipe 固定
-  `PGOPTIONS=-c default_transaction_read_only=on`，CLI 的首个数据库动作必须显式执行
-  `BEGIN READ ONLY` 且不得关闭只读模式。同一 verifier connection 上的 DML 测试必须由 PostgreSQL 以
-  read-only transaction（SQLSTATE `25006`）拒绝；随后才可证明 revision 回到 0018 且恢复后确定性本地
-  audit 与原 `pre-migration` artifact digest 一致。任何路径都不得给普通应用服务 DDL 权限，也不得调用
-  Alembic downgrade、直接 SQL、跳过 marker 或启动 OAuth-only 临时服务。
+- sealed 0018 恢复测试必须先独立验证本窗口 manifest/preflight/`pre-migration`/revision/exact image，
+  再以 `kind=sealed_0018` 调用与 generic 完全相同的 target lock、database gate、durable attempt/reconcile、
+  same-session role verifier 与 atomic reopen primitive；只有 artifact/image/revision verifier 不同。generic、
+  sealed、不同 manifest 或第二个 sealed attempt 并发同 target 都必须拒绝。镜像测试必须从 built immutable
+  image 内读取 restore/audit/guard script digest并匹配 content ID，禁止 host bind-mounted executable。
+  artifact mismatch、image-internal script mismatch、maintenance gate mismatch 或任一 ACK-lost 分支均不得
+  绕过 gate、提前 CONNECT 或启动服务。任何路径都不得调用 Alembic downgrade、直接 SQL、跳过 marker
+  或启动 OAuth-only 临时服务。
 - release tooling 测试必须证明 `scripts/test-m2-release.sh` 在任何 child process 前把缺失或精确匹配的
   外部值统一导出为固定 Task13 `TEST_DATABASE_URL`，拒绝其他/production-like DSN，并显式执行
   `bash scripts/test-calendar-aad-0019-audit.sh`；audit、pytest 与其他 shell child 都必须继承同一值，不能
@@ -2091,23 +2089,21 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - 通用 `just restore file` 保持灾备入口语义：它只接受 manifest-bound 组，可恢复备份自身支持的
   revision，包括普通 0019 备份；它不依赖 0019 preflight/`pre-migration` artifact。production 在任何
   owner action 前必须证明三层写开关关闭、Caddy/API/Worker/Scheduler/migration/role-bootstrap、所有
-  general consumer 和 owner maintenance/general consumer 停止，并完成二次确认。owner maintenance
-  session 随后对 `PUBLIC`、`ai_employee_app`、`ai_employee_retention` 撤销 database `CONNECT`，终止全部
-  既有非 owner 业务/retention session并验证零 writer；最后检查后的新 app/retention connection 必须由
-  PostgreSQL 拒绝，才能调用一次 owner-role、单事务且遇错退出的 `pg_restore`。advisory lock 不是 writer
-  admission fence。
-- `CONNECT` fence 覆盖 restore、不会恢复 CONNECT 的 role grants 与 read-only verifier。通用 verifier
-  复用 owner maintenance session，立即 `SET ROLE ai_employee_app`、`BEGIN READ ONLY`，验证
-  `session_user='ai_employee_owner'`、`current_user='ai_employee_app'` 与 SQLSTATE `25006` DML 拒绝；只有
-  restore/grants/verifier 全部成功后才以 owner 事务为
-  app/retention 恢复所需 CONNECT，`PUBLIC` 保持最小权限。任一步失败都保持服务停止与 fence，写入
-  `0600` content-free phase state，并只允许同 manifest、按已证明 phase 续跑；未知 restore outcome 不得
-  盲目重放。development/test 同 workspace writer 仍运行时也必须拒绝或改用隔离目标。
+  general consumer 和 owner maintenance/general consumer 停止，并完成二次确认。随后必须持
+  target-derived session advisory lock，事务性设置 database-wide `ai_employee.maintenance_gate`、写 gate
+  audit并撤销 PUBLIC/app/retention CONNECT；进程 crash 只释放 lock，不清除 gate。所有 migration、role
+  bootstrap、restore/verifier 与 owner one-off 都在任何写前检查同一 lock+gate，非 matching attempt 零写入。
+- v2 restore state 在 `pg_restore` spawn 前 fsync `restore_started` 及 attempt/call/pre/expected-post facts；
+  unknown outcome 只以 manifest-bound fingerprint 区分 exact post、exact pre 和 inconsistent 三支。grants
+  与 role-switched verifier 复用 lock-holder connection；最终单一事务同时写 completed audit/phase、RESET
+  gate 与恢复 app/retention CONNECT，PUBLIC 保持 revoked。ACK unknown 从新 session 读取 gate+audit+ACL
+  核对，服务始终由 operator 之后显式启动。
 - pre-manifest legacy backup 只能通过
   `just restore-legacy-to-isolated file output_basename` 在 development/test 转换：专用脚本与隔离 Compose
-  services 使用唯一 project/internal network/ephemeral volume/临时 `0600` Secret，实读 revision/健康后
-  调用普通锁定备份路径生成新三件套，并由 trap 始终删除隔离资源。它不能直接用于 production、伪造
-  manifest、连接 workspace 数据库或执行 revision repair。generic、sealed、legacy 三条路径完全分离。
+  services 使用唯一 project/internal network/ephemeral volume/临时 `0600` Secret，资源先登记 registry/
+  labels并使用同一 admission primitive；实读 revision/健康后调用普通锁定备份路径生成新三件套。
+  trap 与 `legacy-backup-scavenge` 分别覆盖正常退出和 SIGKILL/daemon-crash 孤儿。它不能直接用于
+  production、伪造 manifest、连接 workspace 数据库或执行 revision repair。
 - sealed-window 的 0018 整库恢复只能由独立
   `just calendar-aad-restore-0018 file` 与 operations-profile owner-role one-off 执行。该服务不继承会
   自动 migration 的 backend common 配置，只依赖 healthy PostgreSQL。宿主必须在任何 owner
@@ -2115,11 +2111,11 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   preflight/`pre-migration` artifacts 和 image binding；服务只能使用内部注入的精确 `sha256:...` image，无 tag/`build:`/pull，并以
   `--pull never` 启动。容器入口在读取 bootstrap Secret 前重复 artifact/image guard，随后才取得
   `ai_employee_owner` 密码并执行单事务、遇错退出的 `pg_restore`；移动 tag、缺失/错误 image 或
-  artifact mismatch 必须保持 owner connection 与 `pg_restore` 调用为零。restore 成功后才重授
-  app/retention 最小权限，普通 app 服务不获得 DDL。最终 sealed verifier 只有 app Secret，无 owner
-  Secret，固定 server-default read-only 并以首个数据库动作 `BEGIN READ ONLY` 建立事务；同一
-  connection 的 DML 必须被 PostgreSQL 拒绝。两条 restore 路径的 recipe、service、script 与测试必须
-  分离，grant 或 verifier 失败时保持所有通用服务停止。
+  artifact mismatch 必须保持 owner connection 与 `pg_restore` 调用为零。通过前置 guard 后，sealed 只以
+  `kind=sealed_0018` 复用 generic 的 target lock、durable database gate、restore state/reconcile、持锁
+  owner-session verifier 与 atomic reopen；generic/sealed/legacy 的 validator/artifact/recipe 仍分离。
+  `backend/Dockerfile` 必须把全部所需脚本/CLI COPY 进 immutable image，sealed 不得 bind mount host
+  executable，并验证镜像内 digest。
 
 ### 21.4 安全与隐私
 
@@ -2159,11 +2155,13 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 4. 一个专用 Microsoft 测试账户完成同等流程；另一账户类型至少通过完整 OAuth、同步和写入
    契约 fixture，且个人与工作/学校账户都必须包含在自动化契约矩阵中。
 5. 审计证明每项真实测试写入都绑定有效审批和唯一 ToolExecution。
-6. 完成一次部署、manifest-bound 通用加密备份恢复、backup/migration/cleanup 竞态、生产持续
-   `CONNECT` fence 与并发写零 `pg_restore` 门禁、legacy isolated conversion、sealed 0018 恢复边界和
-   Worker 调用后崩溃演练；证据必须包含三件套 digest/size/revision/image metadata、shared/exclusive
-   schema lifecycle lock、恢复 phase state、owner session `SET ROLE ai_employee_app` read-only verifier、
-   CONNECT reopening 与重授权限结果，且不能把 generic、sealed、legacy 三条路径合并。
+6. 完成一次部署、manifest-bound 通用加密备份恢复、backup/migration/cleanup 竞态、target lock 与
+   crash-surviving database gate 的 owner-entry 零写门禁、legacy isolated conversion/scavenger、sealed
+   0018 共享恢复 primitive 和 Worker 调用后崩溃演练；证据必须包含三件套
+   digest/size/revision/fingerprint/image/script metadata、shared/exclusive schema lifecycle lock、v2 restore
+   state、`restore_started` fsync、pre/post/inconsistent unknown-outcome 核对、owner session
+   `SET ROLE ai_employee_app` read-only verifier，以及 completion audit + gate reset + 最小 CONNECT 的 atomic
+   reopen/ACK-lost 新 session 核对，且不能混用 generic、sealed、legacy 的 validator 或 artifact。
 
 不执行持续试用会降低发现供应商偶发行为和长期 Token 问题的概率，这是明确接受的 M2 发布
 风险；自动化重复投递和崩溃测试仍不可省略。
@@ -2185,10 +2183,13 @@ Task 27D 必须把每个新普通 PostgreSQL 备份发布为不可拆分的三�
 `ai_employee.postgres_backup_manifest.v1`，至少包含安全 dump basename、严格 UTC RFC 3339
 `created_at`、PostgreSQL server version、Alembic revision、加密 dump 的小写 SHA-256 与字节数、精确
 checksum filename，以及实际解析得到的 immutable backend image `sha256:` content ID 与允许列表内的
-content-free build/release metadata；不得包含 DSN、主机凭据、Token、Cookie、正文、日程内容或其他
-个人数据。三件套权限均为 `0600`。checksum 只使用安全相对 basename，并同时校验加密 dump 与最终
-manifest；manifest 反向绑定精确 checksum filename并重复 dump digest/size。验证器必须重算并交叉比较
-全部这些事实，拒绝额外条目、绝对路径、符号链接、大小/digest/revision/image metadata 不一致或任一缺件。
+content-free build/release metadata、备份时计算的 `restore_fingerprint_v1`，以及镜像内 generic/sealed/
+legacy/audit/maintenance-guard 可执行脚本与 CLI 的 allowlisted digest map；不得包含 DSN、主机凭据、
+Token、Cookie、正文、日程内容或其他个人数据。`restore_fingerprint_v1` 是规范化 Schema、Alembic
+revision、约束与 content-free 健康/抽样事实的确定性摘要，不包含业务明文。三件套权限均为 `0600`。
+checksum 只使用安全相对 basename，并同时校验加密 dump 与最终 manifest；manifest 反向绑定精确
+checksum filename并重复 dump digest/size。验证器必须重算并交叉比较全部这些事实，拒绝额外条目、
+绝对路径、符号链接、大小/digest/revision/image/script metadata 不一致或任一缺件。
 
 备份、remote publication、retention 与 orphan cleanup 使用两层固定互斥。每个 run 先取得同一目标数据库
 共享的 session-level `BACKUP_LIFECYCLE_LOCK=(20260806, 274)`，即执行
@@ -2215,72 +2216,133 @@ remote manifest，远端整组完成前命令不得成功。local/remote orphan 
 并在 remote conflict、manifest 前崩溃或 cleanup race 中绝不删除另一 run。日/周保留与冲突处理同样只能
 按完整 basename 组执行。
 
-通用 `just restore file` 只接受上述已发布 manifest-bound 备份。在读取 owner Secret、启动 owner-role
-restore service、建立 owner connection 或调用 `pg_restore` 前，宿主必须验证安全路径、三件套完整性、
-manifest schema、digest/size、checksum filename、备份 revision 与 content-free image metadata。manifest
-记录的镜像事实用于兼容性与审计，不把通用恢复变成 sealed 0018 的 exact-image/preflight artifact 路径。
-生产恢复还必须先证明 `EXTERNAL_WRITES_ENABLED`、`GOOGLE_WRITES_ENABLED` 和
-`MICROSOFT_WRITES_ENABLED` 的有效值全部为 `false`，Caddy、API、普通 Worker、Scheduler、migration、
-role bootstrap、任何通用消费者、backup/retention one-off，以及所有 owner maintenance/general consumer
-均已停止；只允许 PostgreSQL 与必要的非业务写基础设施继续运行。宿主完成 Compose/host/container 最后
-检查和生产专用二次精确确认后，owner maintenance session 对目标数据库执行最小 admission fence：
-`REVOKE CONNECT` 至少覆盖 `PUBLIC`、`ai_employee_app`、`ai_employee_retention`，owner 保持可连接；随后
-终止全部既有非 owner 业务/retention session并验证零 writer。最后检查之后的新 app/retention connection
-必须由 PostgreSQL 在数据库边界拒绝，既有 writer 必须已终止；advisory lock、单事务或进程状态检查均
-不能替代该持续 `CONNECT` fence。任一服务、开关、session、确认或 fence 检查不满足都要求
-`pg_restore_calls == 0`。
+Task 27D 必须修改 `backend/Dockerfile`，使用 repository root build context 将
+`backup-postgres.sh`、`restore-postgres.sh`、`restore-calendar-aad-0018.sh`、`init-db-roles.sh`、
+`convert-legacy-backup.sh`、`scavenge-legacy-backups.sh`、`audit-calendar-aad-0019.sh`，以及 generic/sealed
+verifier 与 maintenance-gate Python CLI 实际 COPY 到 immutable backend image 的固定只读路径。Compose/recipe 只能执行镜像内文件；backup
+volume、artifact 与 Secret 可以只读 mount，但禁止用 host bind mount 覆盖脚本/CLI。sealed host guard 与
+容器内 guard 都要比较实际 image content ID 和镜像内 allowlisted script digest；moved image、missing
+script、digest mismatch 或 host-mounted executable 必须在 owner Secret/connection/`pg_restore` 前失败。
 
-通用恢复固定使用 owner role 与
-`--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`，且成功路径精确调用
-一次 `pg_restore`。fence 从 restore 前持续覆盖 restore、fence-aware role bootstrap/grants 与 verifier；
-grant 阶段可以恢复 object/schema 最小权限，但不得提前恢复 database `CONNECT`；实施计划固定以
-`AI_EMPLOYEE_RESTORE_CONNECT_FENCE=1` 进入该收紧模式，unset 仅用于普通启动，其他非空值 fail closed。
-通用 manifest verifier
-不得再新建 app-role connection；它复用已建立的 owner maintenance session，第一条 verifier SQL 必须是
-`SET ROLE ai_employee_app`，随后 `BEGIN READ ONLY`，断言 `session_user='ai_employee_owner'` 与
-`current_user='ai_employee_app'`，并要求同一 connection 的 DML 被 PostgreSQL 以 SQLSTATE `25006`
-拒绝，再按 manifest revision 执行 Schema、健康与抽样业务事实核验。verifier 事务结束前不得
-`RESET ROLE`；只有全部检查成功并结束只读事务后，同一
-maintenance session 才可 `RESET ROLE` 回 owner，且只用于 reopening。只有 restore、grants、verifier
-全部成功后，owner 才在一个事务中仅为
-`ai_employee_app` 与 `ai_employee_retention` 恢复所需 CONNECT；`PUBLIC` 保持最小权限。全部完成前不得
-重启通用服务。
+所有 repository-owned owner 写入口统一使用数据库维护 admission primitive；目标 state 文件、manifest
+basename、Compose project name 或进程 mutex 都不能充当互斥。`target_identity_digest_v1` 仍按
+`ai_employee.restore_target.v1`、PostgreSQL system identifier、`current_database()` 的 NUL framing 计算。
+`maintenance_target_lock_key_v1` 固定为
+`SHA-256("ai_employee.database_maintenance_lock.v1\0" || target_identity_digest_v1)` 前 8 bytes 的 signed
+big-endian bigint；每个 owner 写入口在任何 DDL/DML、grant、restore 或 audit phase 写入前必须用同一目标
+session 执行 `pg_try_advisory_lock(maintenance_target_lock_key_v1)` 并保持到该入口 commit/rollback。Task
+16A 的所有 migration entry、`role-bootstrap`/`scripts/init-db-roles.sh`、generic/sealed/legacy restore、
+generic/sealed/legacy verifier 和任何其他持 owner 凭据的 one-off 都必须调用同一 typed helper。未取得锁
+时 fail closed；锁取得后必须直接读取目标 database 的 `pg_db_role_setting` 并验证 database-wide custom
+setting，不能只信任进程环境或缓存的 `current_setting`。空闲态要求该 key 没有任何 database/role row；
+活动态要求当前 database、`setrole=0` 恰有一个 setting。任何 role-specific override、重复 key/row、
+malformed array 或 session-local override 都 fail closed；新 owner session 的
+`current_setting('ai_employee.maintenance_gate', true)` 只用于证明 catalog 值可见，不能替代 catalog 读取。
 
-任一 restore、grant、verifier 或 CONNECT reopening 失败都保持 admission fence 和通用服务停止，并在
-`${BACKUP_DIR}/.restore-state/` 写入 mode `0600`、content-free、同 manifest digest/target identity digest
-绑定的 `ai_employee.postgres_restore_state.v1` phase state。文件名固定为
-`<manifest_sha256>.<target_identity_digest_v1>.json`；target digest 以
-`ai_employee.restore_target.v1` domain、PostgreSQL system identifier 与 current database 的 NUL framing
-计算，不包含 DSN。state 记录稳定 phase/result code、fence 状态与
-`pg_restore_calls`；phase 只允许
-`fence_established | restore_rolled_back | restore_outcome_unknown | restore_succeeded | grants_succeeded | verified | connect_reopened`。不得写 DSN、Secret 或业务内容。该目录 mode `0700`，不属于 backup group、不上传
-remote，并从 retention/orphan cleanup 明确排除。在 `pg_restore` 前原子发布 `fence_established`；每个
-phase 以 current-run temp file、`fsync`、mode 复核和 atomic rename 更新，state 持久化失败保持 fence/服务
-停止。同一 manifest 的再次调用必须重新验证 host/container 停机与 fence，并按 phase 续跑：已证明
-restore 未开始或事务已回滚才可调用 `pg_restore`；restore 已成功
-则只续跑 grants/verifier；grants 已成功则只续跑 verifier/reopening。若 restore outcome unknown，先在
-fence 内做 owner-only 只读核对，只有证明未应用才允许重放，证明已完整应用则继续下一 phase，无法判定
-时进入人工处置，禁止盲目第二次 restore。development/test 同 workspace writer 仍运行时也必须拒绝；
-若不能停止，只能使用明确隔离目标。
+crash-surviving gate 固定为 database 自定义 setting `ai_employee.maintenance_gate`。空闲状态只能是
+`ALTER DATABASE <target> RESET ai_employee.maintenance_gate`；活动值必须逐字节匹配
+`restore:v1:<attempt_uuid>:<kind>:<target_identity_digest_v1>:<source_binding_digest_v1>`，其中 UUID 为规范
+小写文本，`kind` 闭集为 `generic | sealed_0018 | legacy_conversion`，两个 digest 都是 64 位小写十六
+进制。generic/sealed 的 `source_binding_digest_v1` 必须等于 manifest SHA-256；legacy 使用经 checksum
+验证的旧 dump/basename canonical binding digest，不能伪造 manifest。建立 gate 必须在持 target lock 的
+owner 事务中执行 `ALTER DATABASE ... SET ai_employee.maintenance_gate = <exact value>`、写 content-free
+gate-established audit、对 `PUBLIC`/app/retention 撤销 CONNECT；commit 后终止既有非 owner session并
+验证新 app/retention connection 被拒绝。测试还必须证明新 owner session 的
+`current_setting('ai_employee.maintenance_gate', true)` 可读取同一值，且 role-specific override、malformed
+value 或多个 setting row 都 fail closed。restore 进程崩溃会释放 advisory lock，但 database setting 继续
+阻断所有 owner 入口；非 matching attempt 在重新取得 lock 后看到非空 gate 仍必须零写入。不同 manifest、
+generic 与 sealed、或两个 legacy attempt 对同一 target 都由同一 target lock/gate 串行，state filename
+不得影响该结果。
+
+matching restore 只有持锁 session 本身可以继续；不能靠 `AI_EMPLOYEE_RESTORE_CONNECT_FENCE`、attempt
+环境变量或第二条 owner connection 冒充 lock owner。正常 role bootstrap 在 gate 非空时绝不 grant
+CONNECT 或其他权限；restore 所需 object/schema grants 与 verifier functions 必须由持锁 owner
+maintenance executor 在同一 connection 上调用。migration wrapper、role bootstrap 或任意 owner one-off
+若在 active gate 建立后启动，无论原 restore 仍活跃还是已经 crash，都必须在第一笔写前拒绝，测试要求 migration/
+grant/audit writes、CONNECT grants、`pg_restore` 与目标 state mutation 全为零。restore executor 的 control
+session 只用于 manifest-bound generic/sealed，并从建立 gate 前一直持有 target lock，覆盖受监督的 `pg_restore` 子进程、grants、verifier 与最终
+reopen；control session/lock 丢失后不得继续任何写阶段，必须尽力终止仍受控的子进程并把结果视为 unknown。
+新的 matching invocation 只有重新取得同一 target lock 后才能只读 reconcile。
+
+每次 restore attempt 使用 `${BACKUP_DIR}/.restore-state/<target_identity_digest_v1>/<attempt_uuid>.json`
+保存 mode `0600` 的 `ai_employee.postgres_restore_state.v2`；父目录均为 `0700`。state 不是锁、不上传
+remote，并从 backup retention/orphan cleanup 排除。它记录 exact gate、kind、
+`target_identity_digest_v1`、`source_binding_digest_v1` 与 `manifest_digest_v1`；generic/sealed 的后两个
+digest 必须逐字节等于同一 manifest SHA-256。本 state-v2
+只属于 manifest-bound generic/sealed executor；legacy conversion 使用独立 durable registry 与
+checksum-verified canonical source digest，不得填充或伪造 manifest digest。state 还记录 `attempt_number`、
+单调 `call_count`、稳定 result code、pre-restore Alembic revision 与
+`restore_fingerprint_v1`、manifest 预期 post revision/fingerprint，以及闭集 phase
+`gate_established | restore_started | restore_outcome_unknown | restore_not_applied | restore_succeeded | grants_succeeded | verified | reopen_committing | completed | needs_attention`，不含 DSN、Secret 或业务内容。
+每个 transition 都通过 current-run temp、mode check、file/directory `fsync` 与 atomic rename 发布。
+
+每次进入必须先执行 gate/state 一致性矩阵。active gate 与 state 必须逐字段绑定同一 attempt/kind/source/
+target；gate active 但 state 缺失时，只有 exact kind/source invocation 能在 matching gate-established audit、
+CONNECT ACL 与 current fingerprint 共同证明 restore 尚未开始后，按 gate 中 UUID 重建
+`gate_established`。state/gate 冲突、损坏、多个 candidate，或已可能 spawn 却缺失 call/pre facts，都必须
+进入 `needs_attention`。gate 已 reset 时，只有 matching completion audit 与 app/retention/PUBLIC ACL 全部
+一致才可把本地投影标记为 `completed`；state 文件从不授权或证明数据库写入。
+
+在 spawn `pg_restore` 前必须先原子发布 `restore_started`，并把本次 `attempt_number`/`call_count` 与 pre/
+expected-post facts 写全，且 `call_count` 在 spawn 前单调递增；任何没有先持久化 intent 的
+`pg_restore` 调用都禁止。若 pre fingerprint 已等于
+manifest expected post fingerprint，入口不得制造无法判定的写调用，而是以只读核对证明 already-applied
+后继续。否则固定使用
+`--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`。spawn 后进程/ACK
+丢失一律先写或恢复为 `restore_outcome_unknown`；即使崩溃只留下 `restore_started`，也必须按 unknown
+而不是“尚未调用”处理。下次在同一 database gate 下只读 reconcile：current
+revision/fingerprint 完整等于 expected post 时标记 `restore_succeeded`；精确等于记录的 pre-state 时标记
+`restore_not_applied`，只有运维显式创建下一 `attempt_number` 并先发布新的 `restore_started` 才可再调用；
+两者都不匹配或两者无法区分时进入 `needs_attention`，`call_count`/`pg_restore_calls` 不增加。利用单事务
+语义，测试必须覆盖 spawn 后 commit+crash、rollback+crash 与 partial/inconsistent 三支，禁止盲目 replay。
+
+restore 后的 object/schema grants、generic 或 sealed 专用 verifier 都在 gate active、app/retention
+CONNECT revoked 且同一 target lock/session 持有时完成；所有可能失败的 Schema/revision/artifact/image/
+抽样事实与 `SET ROLE ai_employee_app`、`BEGIN READ ONLY`、session/current-user、SQLSTATE `25006` 检查都必须
+先完成。最终只允许一个 owner transaction 同时追加 content-free `database.restore.completed` audit/phase、
+`ALTER DATABASE ... RESET ai_employee.maintenance_gate`，并只为 app/retention 恢复最小 CONNECT；`PUBLIC`
+保持 revoked。该 audit metadata 固定 `phase=completed`；本地 state 不属于数据库事务。事务前先持久化
+`reopen_committing`。commit ACK unknown 必须关闭旧 session，用新 owner session 重新取得 target lock并
+读取 database setting、completion audit 与 ACL：gate 仍精确 active且 PUBLIC/app/retention CONNECT revoked
+表示事务未提交并继续 closed；gate 已 reset、唯一 matching completion audit 存在且 app/retention 最小
+CONNECT/PUBLIC revoked ACL 完整表示已完成，只把本地投影更新为 `completed`，不得重做 reopen；缺失或
+重复 audit、ACL 不完整及任何混合状态进入 `needs_attention`。commit 后 host
+crash 不是 reopen failure，服务仍由 operator 之后显式启动。
+
+通用 `just restore file` 只接受已发布 manifest-bound 组；sealed `just calendar-aad-restore-0018 file` 在
+读取 owner Secret 前额外验证 preflight/`pre-migration`/exact-image/revision；legacy 只对 disposable
+isolated target 使用经验证的旧 source binding。三者的 recipe、validator、artifact 与 output 不能互调或
+混用；三者只共用上述 target lock/database gate admission helper。manifest-bound generic/sealed 才共用
+state-v2、unknown-outcome reconcile、holder-session verifier 与 atomic reopen executor；legacy 必须使用独立
+durable registry、disposable target 和 cleanup/scavenger lifecycle，不得调用该 restore executor。
+development/test 同 workspace writer 仍运行时仍必须拒绝；若不能停止，只能使用明确隔离目标。
 
 Task 27D 以前产生且没有 manifest 的 legacy backup 禁止直接恢复 production，也禁止为既有加密字节
 伪造 manifest。唯一转换入口固定为
 `just restore-legacy-to-isolated file output_basename`，且只允许
 `APP_ENV=development|test`。专用 `scripts/convert-legacy-backup.sh` 必须先验证 input 是受控路径下的普通
-文件、旧 checksum 与安全无冲突 output basename，再创建
+文件、旧 checksum 与安全无冲突 output basename。创建任何 Compose/temp 资源前，先在
+`${BACKUP_DIR}/.legacy-conversion-registry/` 通过 temp+fsync+atomic rename 发布 mode `0600` registry
+record，记录 attempt UUID、严格 UTC `created_at`、kind、project/resource names、统一 labels、受控临时
+Secret path 与 source binding；目录 mode `0700` 且不上传/不参与 backup cleanup。随后才创建
 `aiemployee-legacy-<32-lowercase-hex-uuid>` Compose project，只启动 profile `legacy-conversion` 下的
 `legacy-conversion-postgres`/`legacy-backup-converter`，使用 project-private `internal: true` network、
-ephemeral PostgreSQL volume 与 `mktemp -d` 中 mode `0600` 临时 Secret；Secret 不得输出。isolated
-services 不连接或修改 workspace/production network、volume 或数据库。
+ephemeral PostgreSQL volume 与登记路径中的 mode `0600` 临时 Secret；project、container、network、
+volume 都必须带 `com.ai-employee.maintenance.attempt`、`.kind`、`.created_at` labels。Secret 不得输出。
+isolated services 不连接或修改 workspace/production network、volume 或数据库。
 
 脚本只把 legacy dump 恢复到该临时 PostgreSQL，以 app-compatible 只读路径实读 Alembic revision 和健康
 事实；未知或不受支持 revision 立即失败。通过后，针对隔离数据库调用同一普通 backup 锁/manifest 路径，
 向受控 `${BACKUP_DIR}` 以 `output_basename` no-clobber 发布新的 dump/checksum/manifest 三件套。成功只
-输出 content-free 新组路径/结果码；失败输出稳定错误与清理结果，不得输出 Secret、DSN 或内容。trap 在
-成功和任一失败/signal 上都执行 profile-scoped `down --volumes --remove-orphans`、删除 temp
-directory/Secret并确认 project network/volume 已清理。该流程不是 revision
+输出 content-free 新组路径/结果码；失败输出稳定错误与清理结果，不得输出 Secret、DSN 或内容。每次
+conversion 开始前先运行 `just legacy-backup-scavenge`。正常 trap 仍在成功和可捕获失败/signal 上执行
+profile-scoped `down --volumes --remove-orphans`、删除 temp Secret/registry并确认 project resources 已清理；
+另由 `scripts/scavenge-legacy-backups.sh` 扫描 registry 与精确 labels，固定 grace 3600 秒，只在 record 超时、
+per-attempt nonblocking lock 可取得且无 active labeled container 时删除对应 container/network/volume、
+临时 Secret 与 registry。Docker daemon 不可用、label/record 不匹配、仍有 lock/container 或尚在 grace
+内都不删除。测试必须覆盖 SIGKILL、daemon crash 后遗留回收，以及另一 active run 不受影响。该流程不是 revision
 repair、stamp、downgrade 或 sealed 0018 restore；generic/sealed/legacy recipe、service、script、fixture 与
-tests 互不调用，也不可混用 artifact 或前置条件。
+tests 互不调用，也不可混用 artifact 或前置条件；共享的只有 admission primitive。
 
 0019 使用一个固定、不可由运维覆盖的安全余量 `CALENDAR_AAD_ROLLOUT_SAFETY_MARGIN_SECONDS = 900`，
 与当前 durable task 总超时默认值对齐，但不随运行时配置漂移。preflight 为每个 distinct affected
@@ -2447,23 +2509,25 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `just calendar-aad-restore-0018 file` 使用本窗口 refresh 后/0019 前指定的加密整库备份恢复到
    revision 0018。该入口与通用 `just restore file` 完全分离；后者仍用于不要求 0019 artifacts 的普通
    灾备恢复。sealed 宿主必须先在任何 owner Secret、owner connection 或 `pg_restore` 前独立验证
-   basename、dump/checksum/versioned-manifest、preflight/原 `pre-migration` artifacts 和 immutable image binding；移动 tag、
-   缺失/错误 image 或 artifact mismatch 必须保持 owner/`pg_restore` 调用为零。通过后才向 operations
-   profile 中不继承 `backend-common` 的专用 restore service 内部注入与 artifact 匹配的精确
-   `CALENDAR_AAD_RESTORE_IMAGE_ID=sha256:...`；service 的 `image:` 直接引用该 ID，无 tag、`build:` 或
-   pull，并固定
-   `docker compose --profile operations run --rm --pull never ... calendar-aad-restore-0018`。该服务只依赖
-   healthy PostgreSQL，
-   容器入口在读取任何 owner Secret 前再次校验 artifact/image 环境，随后才固定
-   `PGUSER=ai_employee_owner`、从 `postgres_bootstrap_password` 取得密码，并以
-   `--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction` 执行 `pg_restore`。
-   任一 restore 错误整体回滚，成功后才执行既有 role bootstrap/grant。
+   basename、dump/checksum/versioned-manifest、preflight/原 `pre-migration` artifacts、immutable image
+   content ID 与镜像内 allowlisted executable digests；移动 tag、缺失/错误 image/script、executable bind
+   mount 或 artifact mismatch 必须保持 owner/`pg_restore` 调用为零。通过后才向 operations profile 中不
+   继承 `backend-common` 的专用 restore service 注入 artifact 匹配的精确
+   `CALENDAR_AAD_RESTORE_IMAGE_ID=sha256:...`；service 的 `image:` 直接引用该 ID，无 tag、`build:` 或 pull，
+   并固定 `docker compose --profile operations run --rm --pull never ... calendar-aad-restore-0018`。该服务只
+   依赖 healthy PostgreSQL，且只能执行 immutable image 内的 sealed validator/executor。
 
-   随后由只挂载 app Secret 的专用 verifier 核验 backup dump/checksum/manifest、revision 0018 和原始/恢复后
-   deterministic `pre-migration` artifact digest。recipe 固定
-   `PGOPTIONS=-c default_transaction_read_only=on`，CLI 的首个数据库动作是 `BEGIN READ ONLY` 且不得关闭；
-   同一 connection 上的 DML 必须由 PostgreSQL 以 SQLSTATE `25006` 拒绝。验证通过后再检查原
-   0018-compatible image 健康。zero state 漂移或镜像/basename 不匹配必须先人工调查，只有仍能独立
+   容器内 guard 在读取任何 owner Secret 前重复验证 manifest/artifact/revision/image/script binding；通过
+   后以 `kind=sealed_0018` 调用与 generic 完全相同的 target lock、database-wide maintenance gate、v2
+   restore state、`restore_started` fsync、pre/post/inconsistent unknown-outcome reconcile 与 atomic reopen
+   primitive。受监督的 `pg_restore` 固定使用
+   `--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`；grants 和
+   sealed-specific revision/artifact verifier 都在 gate active、CONNECT revoked且同一 lock-holder owner
+   session 上完成，verifier 必须 `SET ROLE ai_employee_app`、`BEGIN READ ONLY` 并证明 DML 被 SQLSTATE
+   `25006` 拒绝。所有会失败的 digest/revision/data checks 必须先于最终单一事务；该事务原子写 completion
+   audit、RESET gate并只恢复 app/retention 最小 CONNECT，PUBLIC 保持 revoked。ACK unknown 必须关闭旧
+   session并由新 owner session读取 gate+audit+ACL 核对，绝不重做 reopen。只有该核对证明 completed 后，
+   才检查并启动原 0018-compatible image。zero state 漂移或镜像/basename 不匹配必须先人工调查，只有仍能独立
    证明没有业务写入时才可能使用同一恢复例外。禁止 Alembic downgrade、直接 SQL、给 app 服务临时
    DDL、临时全量同步、connection-level directory sync、跳过 marker 或 OAuth-only 临时服务。
 10. 只有 `post-resync` 审计通过后，才启动 v2-only API、普通 Worker、Scheduler 与 Caddy，运行
@@ -2499,7 +2563,7 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；generic started/confirmed 精确绑定 attempt UUID、source、`rollout_digest_v1`、G/G/G、full/refresh pre/post 摘要、old/new identity/version、`refresh_identity_changed`、persisted expiry与 deadline candidate；mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序。未确认 fence 跨 basename 阻断；automatic missing/same/different refresh 都只 confirmed 自己的 started并满足 flag/equality 矩阵，只有带 connection ID 的 explicit progressive recovery 返回 different non-empty refresh token并原子提交 old != new、changed=true 的完整 F/S/T replacement proof 才消费旧 fence |
 | 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention并复用同一 result union；confirmed 关闭 automatic started，unsatisfied 只关闭 recovery started，replacement 同时关闭 recovery started并消费 original fence。未匹配 union result 的 automatic started 跨 cutoff 保留；各完整事件组只有全部早于 cutoff 才删，且关闭不依赖后续 current credential lineage，跨 365 天回归要求后续 provider call 为零 |
 | 并发 backup/migration/cleanup 使 manifest revision 错绑、覆盖或误删另一 run | 固定 `BACKUP_LIFECYCLE_LOCK=(20260806, 274)` 跨主机串行同一数据库，`${BACKUP_DIR}` `flock` 串行本地目录；每 run 唯一 `.partial.<uuid>`、no-clobber/manifest-last、本地与 remote 3600 秒 grace 加锁内 mtime/manifest 重查；schema-lifecycle shared/exclusive lock与 pre/post revision CAS 绑定 dump，backup 期间 migration 不得提交 |
-| 通用灾备 restore 与 0019 sealed restore 混淆，或最后检查后新 writer 进入/失败时提前开闸 | `just restore` 在 owner 前验证 manifest和停服，并持续撤销 PUBLIC/app/retention CONNECT、终止既有非 owner writer；advisory lock/单事务不能替代 admission fence。restore、fence-aware grants、owner session `SET ROLE ai_employee_app` + `BEGIN READ ONLY` verifier 全部成功后才恢复 app/retention CONNECT，PUBLIC 保持最小权限；失败保留 `0600` manifest-bound phase state并只按已证明 phase续跑。legacy 只走专用非生产隔离 Compose 转换；`calendar-aad-restore-0018` 独立执行 artifact/image guard、精确 `sha256:` 无 pull restore 与 app-only sealed verifier；generic/sealed/legacy recipe/service/script/fixture/test 不复用语义 |
+| 通用灾备 restore 与 0019 sealed restore 混淆，或 crash/ACK 丢失后盲目重放/提前开闸 | generic、sealed 与 legacy validator/artifact/recipe 分离，三者只共用 target advisory lock 与 crash-surviving database gate admission；所有 owner 写入口在写前检查 catalog gate，非 matching attempt 零写入。manifest-bound generic/sealed 另外共用 v2 attempt state、`restore_started` fsync、pre/post/inconsistent reconcile、holder-session verifier 与 atomic reopen：最终单一事务写 completion audit、RESET gate并恢复最小 app/retention CONNECT，PUBLIC 保持 revoked，ACK unknown 用新 session 核对 gate+audit+ACL。sealed 额外执行 exact-image/artifact/script guard；legacy 使用独立 durable registry/labels/disposable target/scavenger，不调用 restore executor，也不混用 source artifact。 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
