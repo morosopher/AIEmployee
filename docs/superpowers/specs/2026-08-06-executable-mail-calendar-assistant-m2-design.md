@@ -2340,10 +2340,12 @@ revision 为 1–128 个 ASCII alphanumeric/underscore。ordinal 是无前导零
 
 `previous_completion_digest_or_dash` 在 pristine 新 attempt 为 `-`；从 `completed_idle` 开始下一 attempt 时
 必须等于被替换 completion pair 的 digest，并在该 attempt 全阶段保持不变。`gate_established_at` 在建立
-active pair 的事务内冻结；真实 call 进入 `restore_backend_starting` 时设置 `call_started_at`，direct
-exact-post edge 保持 `-`。`restore_backend_starting` 的 backend 两字段为 `-`；
+active pair 的事务内冻结；每次分配新的 real-call ordinal 并进入 `restore_backend_starting` 时，都用本次
+数据库时间写入新的 `call_started_at`，同一 ordinal 的后继 phase 必须保留该值；direct exact-post edge
+保持 `-`。`restore_backend_starting` 的 backend 两字段为 `-`；
 `restore_backend_ready`、`restore_started` 与其结果分支保留 exact PID/start。pre revision/fingerprint 在
-`gate_established` 可为 `-`，首次真实 call 前必须填充。expected revision/fingerprint 从 admission 起不可变；
+`gate_established` 可为 `-`；每个 real-call ordinal 建立时都必须从 holder 本次刚验证的 exact current
+revision/fingerprint 重新冻结，且在同一 ordinal 内不可变。expected revision/fingerprint 从 admission 起不可变；
 observed revision/fingerprint 在 exact-post 成功判定时填充，并从 `restore_succeeded` 到 `completed` 不可变。
 非 `completed` phase 的 `completed_at` 与 completion digest 都必须为 `-`；`completed` 必须含 observed facts、
 数据库冻结的 `completed_at` 和合法 digest。phase、字段 presence/absence 与下述状态图不匹配即 malformed。
@@ -2353,7 +2355,14 @@ parser 的 phase-shape 闭集进一步冻结为：`gate_established` 的 call-st
 `restore_succeeded` 及其全部后继（含 `reopen_not_applied`）可采用 direct exact-post shape（ordinal 0 且 call-start/backend/pre 全
 为 `-`）或 real-call shape（ordinal 至少 1 且这些字段按前述已填充），两者都必须有 observed pair；
 `completed` 还要求 reopen ordinal 至少为 1、completed_at 与 digest。所有 revision/fingerprint、PID/start、
-call-start 和 observed 字段都必须成对为 `-` 或成对有值，已填字段不得在后继 phase 被清空。
+call-start 和 observed 字段都必须成对为 `-` 或成对有值。字段单调性以同一 `call_ordinal` 为边界：starting
+建立的 call-start/pre 必须全程保留；`starting → ready` 只允许首次填入 backend pair，ready/started/outcome
+及其后继必须保留该 pair；exact-post 判定只允许首次填入 observed pair，后继必须保留。任何同一 ordinal
+内已经填充的事实都不得清空或改写。唯一受控的 ordinal-boundary 例外是合法
+`gate_established|restore_not_applied → restore_backend_starting` CAS：新 ordinal 必须递增且从不复用，写入
+本次新的 `call_started_at`，把 backend PID/start 重置为 `-`，从本次 exact current 重新冻结 pre pair，并令
+observed/completed 字段符合 starting shape；不得沿用上一 ordinal 的 backend facts。direct exact-post 仍是
+ordinal 0、call-start/backend/pre 全为 `-` 的独立 shape，不进入该 real-call ordinal 重置规则。
 `needs_attention` 只接受从 graph 合法入边继承而来的上述 predecessor shape，不得凭该终态新增、清除或
 改写事实。任何其他组合即使 delimiter/字符合法也按 malformed fail closed。
 
@@ -2475,9 +2484,15 @@ matching `gate_established` attempt 恢复时若 exact read-only verifier 已证
 CAS `gate_established → restore_succeeded`；不得启动 psql/pg_restore，也不写单独 already-applied audit。
 该 attempt 随后仍经过 grants、verifier 与统一 completion transaction。其他情况只能走真实 call。
 
-每个真实 call 在分配新 ordinal 前，holder 必须证明 current 完整等于冻结 pre-state。随后 CAS
-`gate_established|restore_not_applied → restore_backend_starting`、递增从不复用的 `call_ordinal` 并清空 backend
-facts。受控 Python executor 读取长期 bootstrap owner Secret，只用它启动一个固定 target database、固定
+每个真实 call 在分配新 ordinal 前，holder 必须证明 current 完整等于冻结 pre-state。随后在同一 owner
+transaction 中以 exact old authority CAS
+`gate_established|restore_not_applied → restore_backend_starting`：`call_ordinal` 必须恰好递增 1 且从不复用，
+`reopen_ordinal` 保持不变，写入本次新的数据库 `call_started_at`，把 backend PID/start 重置为 `-`，从本次
+刚验证的 exact current 重新冻结 pre revision/fingerprint，并把 observed/completed 字段置为 starting shape
+要求的 `-`。从 `restore_not_applied` 重试时不得复制上一 ordinal 的 backend facts；这是后继字段可被清空的
+唯一受控 ordinal-boundary 例外，同一 ordinal 的 ready/started/outcome 必须继续保留本次 call-start、pre 与
+backend facts。direct exact-post 的 ordinal-0 shape 不受该规则影响。受控 Python executor 读取长期
+bootstrap owner Secret，只用它启动一个固定 target database、固定
 `ai_employee_owner`、固定 `PGAPPNAME=ai_employee_restore:<attempt_uuid>:<call_ordinal>` 的
 `psql --set=ON_ERROR_STOP=1 --single-transaction` child。psql stdin 是 controller 独占 write end 的匿名
 pipe；child 建立连接后等待 stdin，尚未收到 SQL。controller 从持锁 control session 查询
@@ -2506,7 +2521,10 @@ not-applied，也不得分配新 ordinal，而必须 CAS `needs_attention`（CAS
 pre-state 转 `restore_not_applied`，partial/inconsistent/不可区分转 `needs_attention`。starting 的人工处置必须
 先由 operator 核对并终止可能存在的 child/backend，再通过显式 forward-fix 处置；不得声称自动恢复。只有
 operator 显式授权并再次证明 exact pre-state，才可从合法 `restore_not_applied` 为同一 attempt 分配新
-ordinal；禁止盲目 replay。测试覆盖 spawn-before-visible crash、backend-ready-before-feed、mid-stream crash、
+ordinal；禁止盲目 replay。测试还必须覆盖合法 `restore_not_applied → restore_backend_starting` 新 ordinal
+写入新的 call-start、重新冻结 exact-current pre pair、清空旧 backend pair，并将 observed/completed 设为
+starting shape；拒绝 ordinal 复用、旧 PID/start 继承以及同一 ordinal 内清空 call-start/pre/backend facts。测试覆盖
+spawn-before-visible crash、backend-ready-before-feed、mid-stream crash、
 generator/consumer failure、commit ACK unknown、两 host overlap、stale PID/backend_start、跨主机无 projection
 且无 local child/pipe identity 时 `pg_restore_calls=0`/`needs_attention`，以及原 controller 仍持有 identity 的
 唯一 starting→ready 成功路径。

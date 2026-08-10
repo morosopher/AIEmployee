@@ -441,12 +441,22 @@ parser 只接受 ASCII、恰好 21 个 `|`、总长不超过 1133 bytes、上述
 数据库 UTC RFC3339 六位微秒 `Z`。source 与 manifest digest 必须相同。
 
 pristine 来源 attempt 的 previous completion digest 为 `-`；从 completed idle 开始时必须等于被验证旧 pair
-的 digest并全程不变。`gate_established_at` 在 gate transaction 内冻结，真实 call 开始时填写
-`call_started_at`；exact-post direct edge 为 `-`。`restore_backend_starting` 的 backend 两字段为 `-`；
+的 digest并全程不变。`gate_established_at` 在 gate transaction 内冻结；每个新的 real-call ordinal 都填写
+本次数据库 `call_started_at`，同一 ordinal 后继保持不变；exact-post direct edge 为 `-`。
+`restore_backend_starting` 的 backend 两字段为 `-`；
 `restore_backend_ready`、`restore_started` 与其结果分支保存经 `pg_stat_activity` 验证的 PID/start。pre facts
-在 gate-established 可为 `-`，真实 call 前必填；expected facts 从 admission 起冻结，observed facts 在 exact-post
-判定后必填并保持到 completed。非 completed phase 的 completed_at/digest 为 `-`；completed call 必须包含
+在 gate-established 可为 `-`，每个 real-call ordinal 都从本次 exact current 重新冻结；expected facts 从
+admission 起冻结，observed facts 在 exact-post 判定后必填并保持到 completed。非 completed phase 的
+completed_at/digest 为 `-`；completed call 必须包含
 observed facts、completed_at 和合法 digest。
+
+字段单调性只约束同一 `call_ordinal`：starting 建立的 call-start/pre 全程保留；starting→ready 只允许首次
+填入 backend pair，ready/started/outcome 及其后继必须保留；exact-post 只允许首次填入 observed pair，后继
+必须保留。任何已填事实都不得在同一 ordinal 内清空或改写。唯一允许跨 ordinal 清除已填字段的边界是合法
+`gate_established|restore_not_applied → restore_backend_starting` CAS；它必须递增且不复用 ordinal，写入新的
+call-start，把 backend PID/start 清为 `-`，从刚验证的 exact current 重新冻结 pre pair，并让
+observed/completed 字段回到 starting shape，禁止继承上一 ordinal 的 backend facts。direct exact-post 保持
+ordinal 0 的独立 shape，不执行该重置。
 
 `ai_employee.restore_completion` 只接受
 恰好 86 ASCII bytes 的 `restore_completion:v1:<completion_authority_digest_v1>`。writer 只能在持锁 owner
@@ -550,10 +560,14 @@ post，则直接 CAS `gate_established → restore_succeeded`；不得启动 psq
 already-applied audit。该 attempt 随后仍必须经过 grants、verifier 与统一 completion transaction。无 exact
 evidence 时只能继续正常 call；不存在“人工标记已应用”分支。
 
-每个真实 call 必须先在 holder transaction 证明 current 完整等于冻结 pre-state，再 CAS
-`gate_established|restore_not_applied → restore_backend_starting`、递增从不复用的 `call_ordinal` 并把 backend
-facts 清为 `-`；retry 在该 pre-state 证明前不得分配新 ordinal。受控 Python executor 随后读取长期 bootstrap
-owner Secret，只用它启动一个固定目标数据库、固定 `ai_employee_owner`、固定
+每个真实 call 必须先在 holder transaction 证明 current 完整等于冻结 pre-state，再以 exact old authority
+CAS `gate_established|restore_not_applied → restore_backend_starting`。该 transaction 必须把
+`call_ordinal` 恰好递增 1 且从不复用，保持 `reopen_ordinal`，写入本次新的数据库 `call_started_at`，把
+backend PID/start 清为 `-`，从刚验证的 exact current 重新冻结 pre revision/fingerprint，并把
+observed/completed 字段置为 starting shape 的 `-`；从 `restore_not_applied` 重试不得沿用上一 ordinal 的
+backend facts。同一 ordinal 后续 ready/started/outcome 必须保留本次 call-start/pre/backend facts，direct
+exact-post ordinal-0 shape 不受此规则影响；retry 在 exact-pre 证明前不得分配新 ordinal。受控 Python executor
+随后读取长期 bootstrap owner Secret，只用它启动一个固定目标数据库、固定 `ai_employee_owner`、固定
 `PGAPPNAME=ai_employee_restore:<attempt_uuid>:<call_ordinal>` 的 `psql --set=ON_ERROR_STOP=1
 --single-transaction` child。psql 的 stdin 是 controller 独占 write end 的匿名 pipe；child 连接后等待
 stdin，尚未收到任何 SQL。controller 从独立持锁 session 查询 `pg_stat_activity`，要求 exact database、role、
@@ -581,8 +595,11 @@ pipe-owner-dead/SQL-byte-zero 猜测 not-applied，不得分配新 ordinal；必
 只持久化同 disposition）并保持 `pg_restore_calls=0`。ready/started/unknown 在 backend 退出后，exact post
 转 `restore_succeeded`，exact pre 转 `restore_not_applied`，其他/不可区分转 `needs_attention`。starting 的
 人工处置必须先核对并终止可能存在的 child/backend，再显式 forward-fix，不能声称自动恢复。只有 operator
-明确授权且再次证明 exact pre，才可从合法 `restore_not_applied` 为相同 attempt 分配新 ordinal；禁止盲目
-replay。故障演练覆盖 spawn-before-visible crash、backend-ready-before-feed、mid-stream crash、generator/
+明确授权且再次证明 exact pre，才可从合法 `restore_not_applied` 为相同 attempt 分配新 ordinal；新 ordinal
+必须记录新的 call-start、重新冻结 exact-current pre pair、清除旧 PID/backend-start，并让
+observed/completed 符合 starting shape；演练同时拒绝旧 backend facts 继承、ordinal 复用及同一 ordinal 内
+清空 call-start/pre/backend facts；禁止盲目 replay。故障演练覆盖 spawn-before-visible crash、
+backend-ready-before-feed、mid-stream crash、generator/
 consumer 任一失败、commit ACK unknown、两 host overlap、stale PID/backend_start、跨主机无 local projection
 时 `pg_restore_calls=0`/`needs_attention`，以及原 controller 持有 local identity 的 starting→ready 路径。
 

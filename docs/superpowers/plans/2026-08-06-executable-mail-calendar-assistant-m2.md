@@ -4492,6 +4492,17 @@ current-database/`setrole=0` occurrence for each present key; duplicate key/row,
 unknown version/encoding, or last-write-wins interpretation fails closed. Writers use only lock-held
 `ALTER DATABASE SET/RESET` and re-read the catalog result.
 
+Freeze field monotonicity within one `call_ordinal`, not across real-call ordinal boundaries. Call-start and pre
+facts frozen at starting persist throughout that ordinal; starting→ready may fill the backend pair once, after which
+ready/started/outcome and successors preserve it; exact-post may fill the observed pair once, after which successors
+preserve it. No populated fact may be cleared or rewritten within the ordinal.
+The sole controlled boundary exception is a legal
+`gate_established|restore_not_applied → restore_backend_starting` CAS: increment and never reuse the ordinal, write
+a fresh database `call_started_at`, reset backend PID/start to `-`, re-freeze pre revision/fingerprint from the exact
+current state just proven by the holder, and set observed/completed fields to the starting shape. Never inherit an
+older ordinal's backend facts. Keep the direct exact-post ordinal-0 shape independent with call-start/backend/pre
+all `-`.
+
 Freeze the complete admission matrix and test every row and every off-matrix tuple:
 
 | State | Gate | Call | Completion | ACL | Allowed caller |
@@ -4649,9 +4660,14 @@ call and does not change the current phase, wrap or reuse an ordinal. The six-di
 application name within 63 bytes. A grant rollback remains `restore_succeeded`; verifier failure remains
 `grants_succeeded`; each has bounded retry without a fake phase update.
 
-For a real call, first prove current revision/fingerprint exactly equal the frozen pre-state. CAS
-`gate_established|restore_not_applied → restore_backend_starting`, increment the never-reused ordinal, and clear
-backend facts. The Python controller reads the long-lived bootstrap owner Secret only for the fixed-target
+For a real call, first prove current revision/fingerprint exactly equal the frozen pre-state. In the same owner
+transaction, CAS exact old authority from `gate_established|restore_not_applied` to `restore_backend_starting`,
+increment the never-reused ordinal by exactly one, retain `reopen_ordinal`, write this ordinal's fresh database
+`call_started_at`, reset backend PID/start to `-`, re-freeze pre revision/fingerprint from that exact current read,
+and reset observed/completed fields to the starting shape. A retry from `restore_not_applied` must not copy the prior
+ordinal's backend facts; this is the sole controlled ordinal-boundary clearing exception. Within the new ordinal,
+ready/started/outcome retain its call-start, pre and backend facts. The direct exact-post ordinal-0 shape is unchanged.
+The Python controller reads the long-lived bootstrap owner Secret only for the fixed-target
 credential-bearing psql consumer. Spawn psql with exact database, role `ai_employee_owner`,
 `PGAPPNAME=ai_employee_restore:<attempt_uuid>:<call_ordinal>`, `--set=ON_ERROR_STOP=1`, and
 `--single-transaction`; the controller retains the sole pipe write end, so psql receives no SQL while connecting.
@@ -4764,7 +4780,8 @@ has no `.env.example`/read-only-artifact/separate-state contract, database-autho
 psql backend registration plus SQL-byte-zero/start fence, deferred completion-guard stream rollback, DB-zero-write
 kind-aware no-clobber already-applied evidence, active-attempt completion RESET, completed-call/completion-GUC/gate/ACL proof,
 required completed-call pairing, closed admission matrix, prior-pair archive, and zero pre-restore gate audits,
-cross-host projection rebuild and starting fail-closed, ordinal-safe retry, `reopen_not_applied`, same-session
+cross-host projection rebuild and starting fail-closed, ordinal-safe retry with a fresh call-start/pre freeze and
+controlled old-backend reset, `reopen_not_applied`, same-session
 verifier, or atomic reopen ACK reconciliation; legacy conversion lacks registry/labels/scavenging; sealed does not
 reuse the shared primitive; audit tooling and the explicit release-wrapper call are absent.
 
@@ -4793,7 +4810,10 @@ CAS transitions, exact psql backend identity registration, state-v4 projection, 
 evidence, ordinal reopen, the frozen `restore-call:v4` parser/length rules, required completed-call/completion-GUC
 pair verification, prior-pair archive, and post-restore-only completion audit timeline. Add
 `infrastructure/db/postgres_restore_stream.py` for the controller-owned anonymous pipe, deferred completion guard,
-credential-free pg_restore generator, bounded forwarding, child shutdown, and exact status classification; add
+credential-free pg_restore generator, bounded forwarding, child shutdown, and exact status classification. The
+parser/transition validator must enforce same-ordinal fact preservation plus the sole legal new-ordinal starting
+reset: fresh call-start, exact-current pre re-freeze, backend clearing, observed/completed starting-shape enforcement,
+and no prior PID/start inheritance. Add
 `cli/postgres_restore.py` as the typed image-internal entrypoint. Before owner startup, `just restore` validates manifest
 group, effective switches, all consumers, exact target and second production confirmation. It mounts backup/artifact
 read-only and a separately validated `RESTORE_STATE_DIR` read-write. The executor holds management lifecycle, target,
@@ -5572,7 +5592,10 @@ storage is involved. Cover all of these cases:
   audit/grant/CONNECT/authority/psql/`pg_restore` calls for nonmatching callers; role-specific/duplicate/malformed
   phase, ordinal, backend/timeline/expected-observed fact, or completion fact fails. Freeze `restore-call:v4` as
   ASCII-only, exactly 21 delimiters and at most 1133 bytes, completion as exactly 86 ASCII bytes, and reject every
-  malformed phase-dependent dash/value combination;
+  malformed phase-dependent dash/value combination. Within one call ordinal reject clearing or rewriting frozen
+  call-start/pre/backend/observed facts; across the legal new-ordinal starting edge require ordinal+1, fresh
+  call-start, exact-current pre re-freeze, backend PID/start reset, observed/completed starting shape, and rejection
+  of prior backend inheritance or ordinal reuse. Preserve the direct exact-post ordinal-0 shape;
 - test the complete `pristine_idle → active → completed_idle → next active` matrix plus every off-matrix tuple.
   Pristine all-absent + baseline ACL permits migration/role-bootstrap. For manifest-bound generic/sealed, the holder
   validates/archives any prior completed pair, resets completion, atomically replaces it with the exact active call +
@@ -5593,14 +5616,16 @@ storage is involved. Cover all of these cases:
 - no-gate exact-post evidence produces only deterministic kind-aware no-clobber local evidence with database writes/audit/GUC/psql/
   pg_restore all zero. Matching-gate exact post takes the direct `restore_succeeded` edge without a separate audit,
   then still completes grants/verifier/reopen. Every real ordinal first proves exact pre-state, CASes
-  `restore_backend_starting`, and starts a fixed-target credential-bearing psql consumer whose controller-owned pipe
+  `restore_backend_starting` with ordinal+1, a fresh call-start, exact-current pre re-freeze, backend PID/start reset
+  and observed/completed starting shape, and starts a fixed-target credential-bearing psql consumer whose controller-owned pipe
   contains zero SQL. The holder registers exact PID/backend-start/database/role/`PGAPPNAME`, CASes ready, and only
   after started CAS plus v4 projection fsync sends the deferred guard and launches a credential-free pg_restore SQL
   generator. Cover spawn-before-visible crash, backend-ready-before-feed, SQL-byte-zero before started, mid-stream or
   missing-trailer rollback, generator/consumer failure, commit/rollback/partial results, stale PID/backend-start,
   two-host overlap, cross-host no projection where starting has no provable local child/pipe identity and therefore
   CASes `needs_attention` with `pg_restore_calls == 0`, the original-controller-only starting→ready path, and explicit
-  new ordinal only from legal `restore_not_applied`;
+  new ordinal only from legal `restore_not_applied`; prove that this retry cannot inherit the prior PID/start and
+  that the same ordinal's ready/started/outcome shapes cannot clear call-start/pre/backend facts;
 - generic/sealed role grants after restore do not reopen CONNECT. The holder session runs `SET ROLE ai_employee_app`,
   `BEGIN READ ONLY`, asserts current/session user, receives SQLSTATE `25006` for DML, and completes every failing
   revision/fingerprint/data check before reopen. One final transaction requires exactly one active-or-inactive
@@ -6530,11 +6555,22 @@ CASes independent `reopen_ordinal`. Terminals, jumps, regressions and self-trans
 uses the exact ASCII-only, 21-delimiter, maximum-1133-byte `restore-call:v4` grammar from the spec and persists prior
 completion digest, gate/call timeline, exact psql backend identity, expected/observed facts, completed_at, and the
 completion authority digest. Completion GUC is exactly 86 ASCII bytes. Duplicate/role-specific/malformed catalog
-settings and invalid phase-dependent dash/value combinations fail closed.
+settings and invalid phase-dependent dash/value combinations fail closed. Field monotonicity applies within one
+`call_ordinal`: call-start/pre frozen at starting persist; starting→ready may fill backend once and later phases
+preserve it; exact-post may fill observed once and successors preserve it. No populated fact may be cleared or
+rewritten within the ordinal. The only controlled cross-ordinal clearing is the legal new-ordinal starting CAS,
+which requires ordinal+1, a fresh database
+call-start, exact-current pre re-freeze, backend PID/start reset and observed/completed starting shape; prior ordinal
+backend facts cannot be inherited. The direct exact-post ordinal-0 shape remains separate.
 
-For every real ordinal, first prove current full revision/fingerprint exactly equals the frozen pre-state. CAS
-`gate_established|restore_not_applied → restore_backend_starting`, increment the never-reused ordinal, and clear
-backend facts. The controlled Python executor reads the long-lived bootstrap owner Secret only to spawn a fixed
+For every real ordinal, first prove current full revision/fingerprint exactly equals the frozen pre-state. In one
+owner transaction CAS exact old authority
+`gate_established|restore_not_applied → restore_backend_starting`, increment the never-reused ordinal by exactly one,
+retain `reopen_ordinal`, write a fresh database `call_started_at`, reset backend PID/start, re-freeze pre facts from
+that exact current read, and reset observed/completed fields to the starting shape. A `restore_not_applied` retry
+must not copy prior backend facts; within the new ordinal, ready/started/outcome preserve its call-start/pre/backend
+facts. The direct exact-post ordinal-0 shape is unchanged. The controlled Python executor reads the long-lived
+bootstrap owner Secret only to spawn a fixed
 target-database, role `ai_employee_owner`, exact
 `PGAPPNAME=ai_employee_restore:<attempt_uuid>:<call_ordinal>`
 `psql --set=ON_ERROR_STOP=1 --single-transaction` consumer. The controller alone holds the anonymous-pipe write end;
@@ -7077,7 +7113,8 @@ git commit -m "feat: add trusted action editors"
   authority, serialized manifest backup/revision CAS,
   immutable operations image, fixed low/high-bit target vectors,
   management→target→schema lifecycle/reset boundary, database gate/call/completion facts, generic/sealed
-  state-v4 psql backend registration/deferred-guard pg_restore SQL stream/backend-exit/ordinal/completion-GUC
+  state-v4 psql backend registration/deferred-guard pg_restore SQL stream/backend-exit/same-ordinal fact preservation/
+  controlled new-ordinal fresh-call-start/exact-current-pre/backend-reset/completion-GUC
   atomic-reopen restore, registry-scavenged legacy
   conversion, plus artifact-distinct sealed exact-image restore on the same restore primitive; it never
   performs production migration or restore.
@@ -7094,13 +7131,17 @@ git commit -m "feat: add trusted action editors"
   canary; current-expiry effective-deadline tightening; ordinal recovery; fixed Task13 release-test environment;
   backup global/local/schema locks and orphan races; immutable operations image; generic manifest management/target
   locks, gate/call/completion facts, state-v4 psql backend registration/deferred-guard SQL stream/backend-exit/ordinal
-  reconcile plus completion-GUC atomic reopen; registry-scavenged legacy
+  reconcile, same-ordinal fact preservation and controlled new-ordinal fresh-call-start/exact-current-pre/backend
+  reset, plus
+  completion-GUC atomic reopen; registry-scavenged legacy
   conversion; and sealed exact-image shared-restore-primitive evidence.
 - Modify: `docs/acceptance-checklist.md` — require strict result-union/CAS/recovery evidence, frozen migration
   guard paths, sanitized callback and real access-log canary, durable fence retention, current-expiry deadline
   tightening, fixed release-test database inheritance, explicit audit invocation, manifest-bound generic restore
   with management/target locks, gate/call/completion facts, read-only artifact plus separate state-v4 projection,
-  psql backend registration/deferred-guard SQL stream/backend-exit/ordinal reconcile/completion-GUC atomic reopen and owner-session role-switched
+  psql backend registration/deferred-guard SQL stream/backend-exit/ordinal reconcile, same-ordinal fact preservation,
+  controlled new-ordinal fresh-call-start/exact-current-pre/backend reset, completion-GUC atomic reopen and
+  owner-session role-switched
   verification, plus sealed owner-before-secret exact-image/script guard on the same generic/sealed restore primitive
   before release acceptance.
 - Modify: `README.md`
@@ -7255,7 +7296,10 @@ and ready-before-feed are SQL-byte-zero, while missing trailer/mid-stream/contro
 Fingerprint/replay is blocked until the authority-bound backend exits; stale PID/backend-start and `pg_stat_activity`
 alone are insufficient. commit+crash, rollback+crash, cross-host missing projection and inconsistent results reconcile
 without blind replay. A cross-host `restore_backend_starting` invocation without local child/pipe identity must enter
-`needs_attention` with zero pg_restore calls. The full phase graph/CAS/ordinals pass. The holder performs grants and
+`needs_attention` with zero pg_restore calls. The full phase graph/CAS/ordinals pass, including same-ordinal
+call-start/pre/backend preservation and the sole legal `restore_not_applied` retry boundary with ordinal+1, fresh
+call-start, exact-current pre re-freeze, old backend reset, starting-shape observed/completed fields, and no PID/start
+inheritance. The holder performs grants and
 app-role read-only verification before one completion-authority/GUC/fixed-outer-field ordinary-audit-ID/exact-
 metadata/timeline/digest/gate-reset/minimal-CONNECT transaction; ACK loss is reconciled from the required completed
 call + completion GUC, gate, and ACL
@@ -7526,7 +7570,10 @@ projection and a second-host reconstruction with no local file. The database aut
 kind/target/source/manifest, previous completion digest, pre/expected/observed facts, `call_ordinal`, independent
 `reopen_ordinal`, phase, gate/call/completed timeline, completion digest, and last psql PID/backend-start. Record exact
 ASCII lengths/delimiter counts, duplicate/malformed parser rejection, every legal frozen phase edge, and rejection of
-jumps/self-transitions/stale CAS. Record
+jumps/self-transitions/stale CAS. Record same-ordinal preservation of call-start/pre/backend/observed facts and the
+sole controlled real-call ordinal boundary: only after exact-pre proof may the holder CAS to starting with ordinal+1,
+a new database call-start, exact-current pre re-freeze, backend PID/start reset and observed/completed starting shape;
+the previous ordinal's backend facts cannot carry forward, while direct exact-post remains the ordinal-0 shape. Record
 `restore_backend_starting` before spawn, exact PID/backend-start/database/role/`PGAPPNAME` registration before ready,
 and started CAS plus projection fsync before the first SQL byte or pg_restore call. Prove only the psql consumer
 receives the bootstrap owner credential, the pg_restore generator receives no `PG*`/DSN/Secret value, and the
