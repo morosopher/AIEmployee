@@ -644,19 +644,29 @@ parser 必须严格拒绝 malformed escape、小写 hex、对 unreserved 字符�
 - Token 响应没有新 refresh token 时保留仍有效的既有加密 refresh token，不能写空覆盖。
 - Microsoft 租户要求管理员同意时，界面显示稳定错误和管理员操作说明。
 
-已有 `connected` connection 的渐进授权和重新同意必须先通过 `OAuthRefreshCoordinator` claim。若 OAuth
-state 解析出一个现有 connected identity，start 事务先锁定该 connection、冻结当前 generation 与
-credential snapshot，并把候选 connection 写入 `OAuthAttempt`；callback 在 token exchange 前重新取得同一
-connection claim。该路径使用 `source="progressive_callback"` 或
-`source="targetless_callback"`，不得无条件调用 `ensure_connection` 或 refresh upsert。只有没有现有
-connection、没有旧 refresh credential/fence 的全新连接 bootstrap 才可以在创建首个 connection 前交换
-授权码；它不是对既有 credential 的 refresh rotation，仍必须受一次性 OAuthAttempt/state 约束。
+已有 `connected` connection 的渐进授权和重新同意继续使用现有 connection-bound start：start 事务锁定
+原 connection，读取 `source_generation=S`，按现有规则只递增一次到
+`target_generation=T=S+1`，并把 connection ID 与 target `T` 写入 `OAuthAttempt`。若该 connection 恰有一个
+未解决的自动 refresh fence，且 current `refresh_token_identity_v1` 等于 fence 的 old identity，则同一
+事务允许用户显式发起恢复，并追加 content-free
+`oauth.refresh_recovery_authorization_started`。该事件精确绑定 recovery schema/source、
+`OAuthAttempt.id`、connection digest、原 fence 的 `refresh_attempt_id`/started source、`F/S/T`、两个
+frozen pre-digest、old identity/固定 identity key version 与稳定 result code；其 `created_at` 严格晚于原
+automatic started。它不是第二个 `oauth.refresh_started`。callback 通过 `OAuthAttempt.id` 查询该关联，在
+交换授权码前取得同一 connection 的 coordinator lease，并继续使用现有 target-`T` anti-replay/CAS。
 
-`targetless_callback` 适用于 provider 返回的规范化身份命中一个仍为 `connected` 的既有 connection、但
-没有 target generation 的回调。它在 coordinator 下保持 `source_generation=pre_generation=post_generation=G`
-且不递增 generation；旧 fence 的 generation 记为 `F`，有效 replacement 必须满足 `F <= G`。同一 provider
-identity 的并发 callback 只能复用该 connection，不能创建第二行；身份不匹配、connection 已断开或
-snapshot/claim 竞争失败都 fail closed。
+unknown fence 只阻断使用旧 refresh token 的自动 OAuth refresh grant；它不阻断用户明确发起、由一次性
+state/PKCE/OAuthAttempt 保护的 authorization-code exchange。每个 code 最多交换一次：missing/same refresh
+token、用户拒绝、管理员同意缺失、供应商/网络失败或本地 CAS/commit 失败都关闭本次 OAuthAttempt，禁止
+重放同一 code；只有新的用户操作才能创建下一 OAuthAttempt。只有 callback 明确得到 non-empty、与旧
+plaintext 不同的新 refresh token，并把 credential、实际 scopes、capabilities 与
+`oauth.refresh_credential_replaced` 在同一 CAS 事务提交时，才消费原 automatic fence。
+
+无 connection target 的 `/provider/start` 保持普通首次连接/身份合并语义，不承担 fence 恢复。callback
+完成一次性 exchange 并规范化身份后，若命中已有 `connected` connection 且发现 unresolved refresh fence，
+必须在保存任何 credential、scope 或 capability 前返回稳定阻断结果；不得消费 fence、创建第二个
+connection 或调用无条件 upsert。恢复该 connection 只能由带 `connection_id` 的显式渐进授权 start 发起，
+无需给 targetless OAuthAttempt 增加 candidate snapshot、迁移或 API 参数。
 
 Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作集合更粗的供应商
 权限，技术上可能允许删除事件。应用层端口、类型化命令联合和审批 Schema 不暴露删除动作；
@@ -789,13 +799,12 @@ action + task_id + approval_id + approval_version + operation_id
 `ProviderWriteOutcome`，明确区分 `confirmed_applied`、`confirmed_not_applied` 和 `unknown`；
 应用层不得根据普通异常字符串猜测。
 
-OAuth refresh/exchange 是单独的未知结果边界，不能套用“普通 retry”。每个既有 connection 的 refresh
-或授权码 exchange 都必须先由 `OAuthRefreshCoordinator` 取得按 `connection_id` 的 PostgreSQL session
-advisory lease，并在短事务中提交 `refresh_started` 后才进入网络调用；业务事务不得跨网络。Taskiq、
-`TransientProviderError`、连接中断、响应后锁丢失或 CAS/commit 未知都必须转换为稳定的
-`needs_attention`/non-retryable unknown，后续 delivery 即使再次进入 Worker 也只能读取未决 fence，
-`provider_calls == 0`，不得盲目重放。只有 provider call 尚未开始且 coordinator claim/started 尚未提交的
-本地失败才可按普通安全重试规则处理。
+OAuth automatic refresh grant 是单独的未知结果边界，不能套用“普通 retry”。每个既有 connection 的
+automatic refresh 必须先由 `OAuthRefreshCoordinator` 取得 connection lease，并在网络前提交自己的
+`oauth.refresh_started`；unknown、锁丢失或 CAS/commit 未知后，Taskiq/`TransientProviderError` 重入只读
+unresolved fence，`provider_calls == 0`。用户显式发起的 progressive authorization-code exchange 使用同一
+connection lease 和一次性 OAuthAttempt/state，但不创建第二个 refresh started，也不受 automatic fence 的
+provider-call 阻断；同一 code 仍只能交换一次，失败后只能由用户创建新的 OAuthAttempt。
 
 ### 13.3 核对
 
@@ -1110,43 +1119,38 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时清空其 `ciphertext`、`nonce`、
 `key_version` 和 `aad_version`，不得留下只有版本或部分 AEAD 列非空的记录。
 
-365 天工作区历史清理不得把 0019 refresh fence 当作普通审计直接删除。retention 必须按用户显式
-过滤候选，只解析 content-free metadata，并为 `calendar.aad_0019.refresh_started` 使用 fence-aware
-清理：没有 matching `refresh_confirmed`、可证明安全关闭的 known-terminal，或有效
-`oauth.refresh_credential_replaced` terminal consumption 时，started 必须跨 cutoff 保留。consumption
-必须精确绑定原 attempt、`fence_generation=F`、old refresh physical digest、
-`old_refresh_token_identity_v1` 与 identity key version，并满足其关闭
-source-tagged union 的代际不变量；它首次成功后不可逆，不要求清理时或后续任意时刻的 current
-generation/refresh digest 仍等于消费事务的提交后值。后续 generation、scope/capability、access 或
-refresh credential 的正常变化不会让旧 fence 复活。连接进入可独立证明的永久断开/数据处置终态也可
-作为安全 terminal；known-terminal 若没有独立持久的不可调用状态作为重放防线，仍按未决 fence 处理。
-任意 physical digest、`updated_at`、ciphertext、nonce、key version 或 generation 变化本身都不能替代
-matching terminal consumption；access-only rotation、generation-only、相同明文重加密和缺失/相同
-refresh token 的 callback/Worker 均不得解除保护。retention 不能为了清理提前删除仍被 started、consumption
-或 rollback guard 引用的 fingerprint key version；key 不可用时保留整组并 fail closed。
+365 天工作区历史清理不得把 OAuth refresh 事件当作普通审计直接删除。generic AuditEvent delete 必须
+排除 `oauth.refresh_started`、`oauth.refresh_confirmed`、
+`oauth.refresh_recovery_authorization_started`、
+`oauth.refresh_recovery_authorization_unsatisfied` 与
+`oauth.refresh_credential_replaced`；专用 cleanup 只解析 content-free metadata，并显式按 `user_id`
+过滤。
 
-清理锁序与所有 credential CAS 统一为 owning connection、access credential、refresh credential、
-started audit；锁住 started 后重查 matching result/consumption，确保清理与并发 terminal writer 串行，
-但不得用后续 current credential lineage 作为保留或删除条件；只校验事件自身 attempt/source/
-generation/old identity/key-version 不变量。通用审计 delete 必须排除
-started/confirmed/terminal 与 `oauth.refresh_credential_replaced`；只有专用清理可在同一事务按 attempt
-成组删除已证明安全的 started 及其 matching terminal result。整组每个待删事件都必须早于 cutoff，
-等价要求组内最大 `created_at < cutoff`；旧 started 匹配新 confirmed/terminal/consumption 时不得提前
-删除。不能先删结果再把 started 误判为未决。其他用户的审计和同一用户的普通过期审计仍按既有周期
-清理，不得因 fence 例外被误保留；消费后无需保留后续 credential lineage。
+matching confirmed 只关闭它精确引用的 automatic started；matching unsatisfied 只关闭本次 recovery
+authorization started，不能关闭原 unresolved automatic fence；只有 matching
+`oauth.refresh_credential_replaced` 才消费原 fence。automatic success、unsatisfied recovery 和 successful
+recovery 分别按 17.3 定义的组原子清理，且组内每一行都必须早于 cutoff，等价于组内最大
+`created_at < cutoff`。旧 started 加较新 confirmed/unsatisfied/consumption 不得提前删除，不能先删 result
+再留下伪 unresolved 事实。
 
-### 17.3 0019 refresh fence 摘要协议
+未 confirmed、未被 replacement consumption 消费的 automatic started 必须跨 cutoff 保留，并继续让
+automatic provider call 为零；多次显式 recovery 的 closed unsatisfied pair 不改变该事实。cleanup 与所有
+credential CAS 使用统一锁序，锁后重查 matching event、F/S/T、old identity/version 与严格
+`created_at` 顺序，但不读取或约束后续 current credential lineage。M2 root key/version 固定且不得轮换，
+因此 retention 不引入 historical identity key 保存或删除逻辑；root key 缺失/变化一律 fail closed。
 
-0019 还必须为 refresh plaintext 定义不持久化明文的
-`refresh_token_identity_v1`。它不是 AEAD 物理快照摘要，而是用于判断同一 refresh token 是否回归的
-密钥化 fingerprint：应用主密钥只由 Secret 文件注入并按整数 `master_key_version` 管理；对活动版本
-`v`，固定使用 HKDF-SHA256
+### 17.3 OAuth refresh fence 与显式恢复协议
+
+M2 只定义一个固定的 `refresh_token_identity_v1`。它不是 AEAD 物理快照摘要，而是使用现有
+`APP_MASTER_KEY_FILE` 内容计算的密钥化 fingerprint；API、Worker、CLI composition root 必须从同一
+Secret bytes 和同一个 `AeadCipher.key_version=v` 同时实例化 AEAD cipher 与 identity service，不新增
+identity Secret、multi-key lookup 或独立轮换配置。固定算法为 HKDF-SHA256：
 
 ```text
 K_fp(v) = HKDF-Expand(
     HKDF-Extract(
         salt=b"AIEMPLOYEE/oauth/refresh-token-identity/hkdf-salt/v1\x00",
-        IKM=application_master_key_v,
+        IKM=application_master_key,
     ),
     info=b"AIEMPLOYEE/oauth/refresh-token-identity/fingerprint-key/v1\x00"
          || frame(ASCII(decimal(v))),
@@ -1159,65 +1163,145 @@ refresh_token_identity_v1 = HMAC-SHA256(
 )
 ```
 
-其中 `frame` 仍是 `NULL => 0x00`、非 NULL `=> 0x01 || uint32_be(length) || raw_bytes`；refresh
-plaintext 必须为 non-empty bytes，输出为小写十六进制。`refresh_started`、confirmed/terminal 和
-replacement consumption 必须记录 `refresh_token_identity_v1` 及其
-`refresh_token_identity_key_version=v`；current guard 在受控内存中按事件记录的 key version 重新计算
-当前 refresh identity。活动 fingerprint key 可以轮换，但每个事件的 key version 不得静默改写；所有
-仍被 unresolved started、consumption、rollback guard 或 retention 组引用的旧版本必须至少保留到该组
-生命周期结束并完成 retention cutoff，旧 key 不可用时必须 fail closed。算法、HKDF label、domain、framing
-或 key-version 语义变化必须定义 `refresh_token_identity_v2`，不得把 v1 重新解释。identity 只作
-恒定时间的 durable guard；当 old/new plaintext 同时可得时，仍必须在受控内存使用
-`secrets.compare_digest`，不能把 HMAC 碰撞假设当作唯一 replacement 证明。identity、token plaintext
-和 HMAC key 不得进入日志、Trace、SSE、API 响应或 release evidence；AuditEvent 只允许保存关闭 schema
-规定的 identity fingerprint 与 key version，不保存原 token 或派生 key。
+其中 `frame` 仍是 `NULL => 0x00`、非 NULL
+`=> 0x01 || uint32_be(length) || raw_bytes`；refresh plaintext 必须为 non-empty bytes，输出为小写
+十六进制。M2 期间 `APP_MASTER_KEY_FILE` 的 root key 与 key version 不得更换；存在 unresolved refresh
+fence 时更严禁更换。未来 root-key rotation 必须先通过新的 ADR/里程碑设计 ciphertext 重加密、identity
+重算和 fence 迁移，不能在 M2 内加入隐式 keyring。identity 只作恒定时间 durable guard；old/new plaintext
+同时可得时仍必须在受控内存使用 `secrets.compare_digest`。identity、token plaintext、root key 和派生
+HMAC key 不得进入日志、Trace、SSE、API 或 release evidence。
 
-所有现有 connection 的 OAuth refresh/exchange writer 必须共享同一个供应商中立
-`OAuthRefreshCoordinator` application port（实现位于 `infrastructure/db/repositories/oauth_refresh_coordinator.py`），
-不得由 preflight、mail Worker、calendar Worker、渐进 callback 或 targetless callback 各自维护 claim。
-coordinator 的 source union 固定为 `calendar_aad_preflight`、`provider_refresh`、
-`progressive_callback`、`targetless_callback`；每个 source 都先以 `connection_id` 获取 domain-separated
-PostgreSQL session advisory lock（使用稳定 `hashtextextended` 64-bit key，碰撞只会保守串行），再在短事务
-锁定 connection → access row → refresh row → matching started audit、冻结完整旧 snapshot 与
-`refresh_token_identity_v1`，并提交 content-free `refresh_started`。该事务必须在网络调用前提交，网络阶段
-只保留 session lease，不持有业务事务；provider call/exchange 前、响应后、CAS 前和结果提交前都用同一
-session 验证 lease 仍由本进程持有，锁丢失或连接断开立即 fail closed。
+OAuth refresh 只有两条状态通道：
 
-`refresh_started` 的关闭 metadata 至少包含 `source`、canonical lowercase `refresh_attempt_id`、
-`connection_digest`、`fence_generation`、old `credential_snapshot_digest_v1`、old
-`refresh_credential_snapshot_digest_v1`、old `refresh_token_identity_v1`、
-`refresh_token_identity_key_version`、适用时的 `rollout_digest_v1`/source-target revision 和稳定
-`result_code`。claim 事务还必须检查同一 connection 是否已有未消费 started/unknown fence：若存在且 current
-refresh identity 仍等于该 fence old identity，任何 source、Taskiq delivery 或 `TransientProviderError`
-retry 都不得调用供应商；只能返回稳定 non-retryable unknown/`needs_attention`。若 current identity 已不同，
-coordinator 只能在不调用供应商的情况下走已有 rotation-consumption CAS，不能借此重新 refresh；若无法
-形成完整、对应 started 的 terminal fact，仍 fail closed。
+1. **Automatic refresh grant**：0019 preflight 与 Google/Microsoft mail/calendar Worker 使用旧 refresh
+   token 调用 provider。它们共享 `OAuthRefreshCoordinator`，每次获准调用都创建自己的
+   `oauth.refresh_started`；已存在 unresolved automatic fence 时 provider call 为零。
+2. **Explicit progressive recovery**：用户通过带 `connection_id` 的现有渐进授权 start 创建一次性
+   `OAuthAttempt`，随后用 authorization code 恢复旧 fence。该通道取得同一 connection lease，但不创建
+   第二个 `oauth.refresh_started`。无 target 的 `/provider/start` 不属于恢复通道。
 
-provider 返回后，coordinator 在另一短事务中重新验证 session lease、connection generation、两行旧 row
-identity/`updated_at`/AEAD/expiry、old refresh identity 和 claim attempt；credential CAS、access/optional
-refresh 写入及 matching `refresh_confirmed`/`calendar.aad_0019.refresh_terminal`/
-`oauth.refresh_credential_replaced` 必须同一事务提交。响应未知、lock loss、CAS miss 或 commit failure
-不得覆盖并发 credential，必须留下 durable fence 并禁止后续 provider call。没有新 refresh token 或返回
-相同 plaintext 时，只确认 access rotation、逐字节保留 refresh row 和 identity，不消费 fence；只有明确不同
-non-empty token 且 CAS 成功才可追加 replacement consumption。普通 resolver 的 Taskiq retry 读取该状态后
-必须保持 zero provider calls；coordinator 是唯一允许把 unknown 转为稳定 `needs_attention` 的边界。
+`OAuthRefreshCoordinator` 的 automatic source union 仅为 `calendar_aad_preflight` 与
+`provider_refresh`。automatic claim 先按 `connection_id` 取得 domain-separated PostgreSQL session
+advisory lease，再以固定 connection → access row → refresh row → matching started audit 锁序冻结
+connection generation `G`、两行完整物理 snapshot、old `refresh_token_identity_v1` 与固定 key
+version。claim 事务必须先确认不存在 unresolved `oauth.refresh_started`，然后追加新的 started 并提交；
+网络阶段只保留 session lease，不持有业务事务。provider 前、响应后、CAS 前和结果提交前都由同一 session
+证明 lease 仍在。
+
+`oauth.refresh_started` 使用关闭 metadata
+`fence_schema_version="oauth_refresh_fence.v1"`，精确包含：
+
+- `source`、canonical lowercase `refresh_attempt_id`、`connection_digest`；
+- 适用时的 `source_revision`、`target_revision`、`rollout_digest_v1`；普通 provider refresh 对这些
+  字段使用规范 NULL；
+- `fence_generation=G`、`pre_credential_snapshot_digest_v1`、
+  `pre_refresh_credential_snapshot_digest_v1`；
+- `old_refresh_token_identity_v1`、`refresh_token_identity_key_version` 与稳定 `result_code`。
+
+AuditEvent 的 `created_at` 是 provider call 前已提交的时序事实。任何 token、raw scope、provider
+response、正文、raw `calendar_id`、ciphertext 或 credential `updated_at` 都不得进入 metadata。
+
+provider 返回的 token response 只有通过非空 access token、正数 expiry、canonical scope 覆盖等完整验证
+后才是 known-valid。coordinator 随后在另一短事务重检 lease、connection/capability/generation、两行旧
+snapshot 与 old identity；credential CAS 与 matching `oauth.refresh_confirmed` 必须原子提交。valid
+response 无论省略 refresh token、返回相同 plaintext 或返回不同 plaintext，都关闭**本次** started：
+
+- missing/same refresh 只更新 access row，逐字节保留 refresh row 与 identity；
+- different non-empty refresh 更新两行，但只确认自己的 started，不生成
+  `oauth.refresh_credential_replaced`，也不能消费任何更早 unknown fence；
+- 实际上若存在更早 unresolved fence，automatic claim 必须在 provider 前阻断，因此不得出现“靠下一次
+  automatic rotation 自动修复旧 fence”的路径。
+
+`oauth.refresh_confirmed` 使用关闭 metadata
+`result_schema_version="oauth_refresh_confirmed.v1"`，精确包含
+`source`、`started_source`、matching `refresh_attempt_id`、`connection_digest`、适用的
+revision/rollout 字段、`fence_generation=source_generation=pre_generation=post_generation=G`、两个
+pre-digest、两个 required post-digest、old/new `refresh_token_identity_v1` 与各自固定 key version、
+实际持久化 `token_expires_at`、`refresh_token_disposition="missing"|"same"|"different"` 和稳定
+`result_code`。0019 preflight 还必须包含
+`rollout_deadline_candidate = token_expires_at - 900 seconds`；普通 provider refresh 对该字段使用规范
+NULL。confirmed 的 `created_at` 必须严格晚于 matching started。confirmed crash 后只从持久 credential、
+expiry 和 post-digest 恢复，不再次调用 provider。
+
+network/response unknown、`invalid_grant`、malformed token/expiry/scope、scope shrink、响应后 lease loss、
+CAS miss 或 commit unknown 都不得写 confirmed。其 started 保持 unresolved，并阻断后续所有使用 refresh
+token 的 automatic grant；Taskiq 重投、`TransientProviderError`、进程恢复和资源 401 重新进入都只读
+该 fence，返回稳定 non-retryable `needs_attention`，`provider_calls == 0`。只有 started 尚未提交且
+provider call 尚未开始的纯本地失败可以重新 claim。
+
+显式 progressive recovery 直接映射现有 `OAuthAttempt + AuditEvent`，不新增 0018 schema：
+
+1. start 事务锁定仍为 `connected` 的原 connection，读取 `source_generation=S`、current credential
+   snapshot/identity 和恰好一个 unresolved automatic fence。只有 current identity 等于 fence old identity
+   且 `S >= F` 才允许继续；现有 `set_capabilities_authorizing` 仍只递增一次到
+   `target_generation=T=S+1`，`OAuthAttempt` 仍只保存 target connection 与 target `T`。
+2. 同一事务创建 OAuthAttempt 后追加
+   `oauth.refresh_recovery_authorization_started`，其关闭 metadata 精确包含
+   `recovery_schema_version="oauth_refresh_recovery_authorization.v1"`、
+   `source="progressive_recovery"`、`oauth_attempt_id`、`connection_digest`、原
+   `refresh_attempt_id`、`started_source`、`fence_generation=F`、`source_generation=S`、
+   `target_generation=T`、两个 frozen pre-digest、old identity/key version 和稳定 `result_code`。
+   该事件的 `created_at` 必须严格晚于原 automatic started；它不是 refresh grant started。
+3. callback 一次性消费 state/code，按 `OAuthAttempt.id` 查询上述关联，取得同一 connection lease并在
+   exchange 前重检 target `T`、原 unresolved fence 与 frozen identity/snapshot。authorization-code
+   exchange 保持在业务事务外；unknown fence 不阻断这次用户显式 exchange，但同一 code 永远不得重放。
+4. 只有供应商明确返回 non-empty、且
+   `secrets.compare_digest(old_refresh_plaintext, new_refresh_plaintext) == false`，并通过 normalized
+   account identity、scope 与 expiry 验证时，callback 才可在一个短事务用 target-`T` generation、两行
+   snapshot 和 old identity CAS 写入 access/refresh credential、实际 scopes/capabilities，并追加
+   `oauth.refresh_credential_replaced`。callback 保持
+   `pre_generation=post_generation=T`，不得再次递增 generation。
+5. missing/empty/same refresh、用户拒绝、管理员同意缺失、供应商/网络失败、identity mismatch、lease
+   loss、CAS miss 或 commit failure 都不消费原 fence。能够安全提交本地结果时追加
+   `oauth.refresh_recovery_authorization_unsatisfied`，精确绑定 matching recovery-started event/OAuthAttempt
+   IDs、原 `refresh_attempt_id`/`started_source`/`connection_digest`、F/S/T、两个 frozen pre-digest、old
+   identity/固定 key version 与稳定 `result_code`；其 `created_at` 必须严格晚于 matching recovery started。
+   它只关闭本次 authorization attempt，不关闭原 automatic fence，也不保存任何
+   credential/scope/capability。无论该 result event 是否因 commit unknown 无法证明，同一
+   OAuthAttempt/code 都保持已消费；用户可以显式创建新的 progressive OAuthAttempt。
+
+`oauth.refresh_credential_replaced` 是唯一能够关闭 unresolved automatic fence 的 append-only
+consumption。其关闭 metadata
+`proof_schema_version="oauth_refresh_credential_replaced.v1"` 精确包含：
+
+- `source="progressive_recovery"`、原 `started_source`、`connection_digest`、原
+  `refresh_attempt_id`；
+- `recovery_oauth_attempt_id` 与
+  `recovery_authorization_started_event_id`；
+- `fence_generation=F`、`source_generation=S`、`target_generation=T`、
+  `pre_generation=post_generation=T`，并满足 `F <= S`、`T=S+1`；
+- 原 started/recovery 绑定的两个 pre-digest、credential CAS 后的两个 required post-digest；
+- old/new `refresh_token_identity_v1` 与各自固定 key version、实际持久化
+  `token_expires_at` 和稳定 `result_code`。
+
+consumption 的 `created_at` 必须严格晚于原 automatic started 与 matching recovery authorization
+started。repository 必须锁住并重查两者仍匹配、OAuthAttempt target `T` 未过时且原 fence 尚未消费，
+再把 credential/scopes/capabilities 与 consumption 同事务提交。多个显式 recovery attempt 可以先后
+产生各自 started/unsatisfied pair，但最多一个不同-token callback 能消费原 fence。
+
+无 target 的 `/provider/start` 继续执行普通一次性 exchange、账户创建或无 fence 的 identity merge。
+若规范化 provider identity 命中已有 connected connection 且该 connection 有 unresolved automatic
+fence，callback 在保存任何 credential、scope 或 capability 前返回稳定
+`oauth_refresh_recovery_requires_connection_start`；可追加 content-free blocked audit，但该事实不关闭
+fence。禁止 candidate snapshot、targetless consumption、第二 connection 或无条件 upsert。
 
 0019 refresh fence 使用两个职责明确的物理快照摘要：`credential_snapshot_digest_v1` 绑定 access 与
 refresh 两行的完整 CAS 身份；`refresh_credential_snapshot_digest_v1` 只绑定 refresh row，供 fence
-配对、refresh-row CAS 与 terminal consumption 使用。两者都只证明数据库物理快照，不证明 refresh token
-明文已经替换；ciphertext、nonce、`updated_at` 或其他物理字段变化可能只是同一明文重加密。
+配对与 refresh-row CAS 使用。两者都只证明数据库物理快照，不证明 refresh token plaintext 已经替换；
+ciphertext、nonce、`updated_at` 或其他物理字段变化可能只是同一 plaintext 重加密。
 
 `credential_snapshot_digest_v1` 使用 SHA-256 并输出小写十六进制。规范字节以固定 domain
 `b"AIEMPLOYEE/calendar-aad/credential-snapshot/v1\x00"` 开头，随后每个字段使用同一 framing：
-`NULL` 编码为单字节 `0x00`；非 NULL 编码为 `0x01 || uint32_be(length) || raw_bytes`。空 bytes 是长度为
-零的非 NULL 值，与 NULL 不同。顶层字段顺序固定为 access-token credential row、refresh-token
-credential row；`authorization_generation` 不进入该摘要，而是 fence/consumption 的独立字段。
+`NULL` 编码为单字节 `0x00`；非 NULL 编码为
+`0x01 || uint32_be(length) || raw_bytes`。空 bytes 是长度为零的非 NULL 值，与 NULL 不同。顶层字段
+顺序固定为 access-token credential row、refresh-token credential row；`authorization_generation` 不进入
+该摘要，而是事件的独立字段。
 
-每行字段顺序固定为 `credential_kind`、row `id`、`user_id`、`connection_id`、`ciphertext`、`nonce`、
-`key_version`、`token_expires_at`、`updated_at`。UUID 使用小写 canonical ASCII；整数使用无 `+`、无
-多余前导零的十进制 ASCII；时间使用 UTC RFC3339、固定六位 microseconds 和 `Z`；ciphertext/nonce
-使用原始 bytes；两行的 `credential_kind` 必须分别是 ASCII `access_token` 与 `refresh_token`。协议不
-包含 token plaintext、raw scope 或 raw `calendar_id`。字段、顺序、domain 或
+每行字段顺序固定为 `credential_kind`、row `id`、`user_id`、`connection_id`、`ciphertext`、
+`nonce`、`key_version`、`token_expires_at`、`updated_at`。UUID 使用小写 canonical ASCII；整数
+使用无 `+`、无多余前导零的十进制 ASCII；时间使用 UTC RFC3339、固定六位 microseconds 和 `Z`；
+ciphertext/nonce 使用原始 bytes；两行的 `credential_kind` 必须分别是 ASCII `access_token` 与
+`refresh_token`。协议不包含 token plaintext、raw scope 或 raw `calendar_id`。字段、顺序、domain 或
 编码发生任何变化都必须新增 digest version，禁止静默修改 v1。
 
 `refresh_credential_snapshot_digest_v1` 使用相同 framing、SHA-256 和小写十六进制，固定 domain 为
@@ -1231,101 +1315,26 @@ credential row；`authorization_generation` 不进入该摘要，而是 fence/co
 `sha256:...` immutable image content ID、`safety_margin_seconds=900`。它绑定发布身份，不包含运行后
 才产生的 token、expiry、deadline 或 provider response。
 
-`refresh_started` metadata 是关闭的 content-free schema，精确包含
-`fence_schema_version="calendar_aad_0019_refresh_fence.v1"`、`source`、
-`refresh_attempt_id=<canonical lowercase UUID>`、`connection_digest=<hashed connection>`、适用时的
-`source_revision`、`target_revision`、`rollout_digest_v1`、`fence_generation=F`、
-`pre_credential_snapshot_digest_v1`、`pre_refresh_credential_snapshot_digest_v1`、
-`old_refresh_token_identity_v1`、`refresh_token_identity_key_version` 与 `result_code`。普通 mail/calendar
-refresh 的 rollout/revision 字段使用规范 `NULL`，0019 preflight 必须绑定实际 rollout/revision；事件的
-数据库 `created_at` 是 provider call/exchange 前提交的时序事实。matching `refresh_confirmed` 或
-`calendar.aad_0019.refresh_terminal` 必须绑定同一 attempt UUID、`source`、
-`rollout_digest_v1`/revision（如适用）、`fence_generation=F` 和两个 pre-digest；confirmed 还必须包含
-`post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、从同一事务实际
-持久化 credential 读取的规范 UTC `token_expires_at`，以及确定性
-`rollout_deadline_candidate = token_expires_at - 900 seconds`。这些 confirmed 字段全部必填，不得按实现
-方便省略。attempt UUID 不得按 basename、connection 或时间重新推导；每次获准的新尝试生成一次并由
-全部结果事件复用。结果事件必须在 provider response 已返回、且仍持有 coordinator lease 的同一短事务中
-提交；任何 token、raw scope、provider response、正文、raw `calendar_id` 或 credential `updated_at` 都
-不得进入 fence metadata，confirmed 中上述明确允许的 persisted expiry/deadline 除外。
+confirmed 只关闭自己的 automatic started；recovery unsatisfied 只关闭 matching recovery authorization
+started；credential replacement consumption 只关闭它精确引用的原 unresolved automatic started。365 天
+清理的 generic AuditEvent delete 必须排除上述五种事件，专用 user-scoped cleanup 按以下组处理：
 
-`oauth.refresh_credential_replaced` 是某个 matching unresolved `refresh_started` 的 append-only、不可逆
-terminal consumption fact，而不是要求其 post-state 永远等于 current 的 credential lineage marker。事件
-metadata 是关闭的 source-tagged union，共同精确包含
-`proof_schema_version="oauth_refresh_credential_replaced.v1"`、消费方 `source`、被消费 started 的
-`started_source`、`connection_digest`、原 fence 的 `refresh_attempt_id`、`fence_generation=F`、
-`old_refresh_credential_snapshot_digest_v1`、`new_refresh_credential_snapshot_digest_v1`、
-`old_refresh_token_identity_v1`、`new_refresh_token_identity_v1`、对应 identity key versions、
-`source_generation`、`pre_generation`、`post_generation` 与稳定 `result_code`；用户由 AuditEvent 的非空
-`user_id` 绑定。repository 必须按原 attempt 精确读取并验证 matching started 的 source、pre-digests、
-old identity、generation、created-at-before-call 时序，不能接受孤立 proof。不得保存 token、plaintext hash、
-raw scope 或 provider response。
+- automatic success 组为 started + confirmed；
+- unsuccessful recovery 组为 recovery authorization started + unsatisfied；
+- successful recovery 组为原 unresolved started + matching recovery authorization started + replacement
+  consumption；同一原 fence 的更早 unsatisfied pair 仍按各自关闭组处理。
 
-`source="progressive_callback"` 保留首次未知 fence 的 F/S/T 恢复协议：
+只有组内每一行 `created_at < cutoff`，等价于组内最大 `created_at < cutoff`，才可在同一事务删除该组。
+未消费的 original started 必须跨 cutoff 保留；unsatisfied 不能释放它。cleanup 固定按 connection →
+access row → refresh row → original started → recovery started 锁序重查关联与时序，不读取后续 credential
+lineage，也不能先删 result 留下伪 unresolved 事实。
 
-1. `refresh_started` 提交时把当前连接代际冻结为 `fence_generation=F`，同时冻结 full 与 refresh pre-digest。
-2. 渐进重授权/重新同意只能针对仍为 `connected` 的原 connection。发起事务在连接锁下读取
-   `source_generation=S`、当前 refresh snapshot/identity 和恰好一个 matching unresolved fence；必须满足
-   `S >= F` 且当前 refresh identity 精确等于该 fence old identity。随后既有
-   `set_capabilities_authorizing` 只递增一次到
-   `target_generation=T=S+1`；`OAuthAttempt` 继续只持久化现有 target `T`。
-3. coordinator 在 token exchange 前已经提交 started 并持有 connection session lease；token exchange 保持
-   在业务事务外。callback 按既有 anti-replay 规则证明
-   `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`，加载旧 refresh
-   credential/identity 与唯一 unresolved fence，并保持 `pre_generation=post_generation=T`。只有供应商明确返回
-   non-empty refresh token，且受控内存中的 `secrets.compare_digest(old, new)` 为 false，才可在同一短事务
-   以旧 row/fence 与 generation `T` 的精确 CAS 保存 access/refresh credential、实际 scopes、能力状态和
-   consumption。该来源必须满足 `F <= S`、`T=S+1`、`source_generation=S`、
-   `pre_generation=post_generation=T`，callback 绝不能再次递增 generation。缺失/相同 refresh 时，共享
-   boundary 仍可原子保存 access、实际 scopes 和能力状态，但必须逐字节保留 refresh row 且不追加
-   consumption；若 claim 已被判定为 unknown/needs_attention，则 callback 不得再次进入 exchange。
-
-`source="targetless_callback"` 适用于 token exchange 返回的规范化 provider identity 命中一个仍为
-`connected` 的既有 connection、但 OAuthAttempt 没有 target generation 的回调。start 先锁定该 candidate
-connection 并冻结 current snapshot；callback 在 coordinator claim 后才交换 code，source tuple 保持
-`source_generation=pre_generation=post_generation=G` 且不递增 generation。若存在 unresolved fence，只有
-明确返回 non-empty refresh token、受控内存 `compare_digest(old, new) == false`、且 CAS 成功时才可保存
-scope/capability/credential 并追加 replacement；该 consumption 必须满足 `F <= G`，其 old/new identity
-和 physical snapshot 与 matching started 精确绑定。缺失/空/相同 refresh、identity/connection mismatch、
-断开或 CAS miss 都 fail closed 且逐字节保留旧 refresh row；若没有旧 fence，已有 connected connection
-可完成普通 access/scope 更新而不追加 consumption。并发同 identity callback 只能复用一个 connection，
-不能先 `ensure_connection` 再覆盖旧 token。
-
-`source="provider_refresh"` 适用于普通 Google/Microsoft mail/calendar refresh writer。writer 在 provider
-调用前冻结 connection generation `G` 与 access/refresh 两行完整 snapshot，并由 coordinator 提交
-`refresh_started`；若响应明确包含 non-empty、且与旧 plaintext 不同的新 refresh token，则共享短事务保持
-`source_generation=pre_generation=post_generation=G`，以 generation 与两行 snapshot CAS 更新 credential，
-并在恰有一个 old identity matching unresolved started 时原子追加 consumption；该 started attempt UUID、
-`started_source`、old identity、pre-digests 和 created-at-before-call 必须被 proof 精确引用。该来源不递增
-generation；没有 matching unresolved fence 时仍可完成普通 credential rotation，但不追加 consumption。
-若有 unresolved fence，provider call 前必须先按 current identity/old identity 规则阻断或走无网络
-rotation-consumption CAS，不能盲目刷新。0019 preflight 对自己刚提交的 `refresh_started` 只追加 matching
-`refresh_confirmed`；不能把同一 attempt 同时标记为 `provider_refresh` consumption 或其他 terminal fact。
-
-渐进 callback、targetless callback、Google/Microsoft mail Worker、Google/Microsoft calendar Worker 和 0019
-主动 preflight 必须复用同一个 `OAuthRefreshCoordinator` 与 application credential-rotation port/
-repository snapshot-CAS boundary。每个 snapshot 均
-携带 row ID、`user_id`、`connection_id`、kind、`updated_at`、ciphertext、nonce、key version 与 expiry，
-session lease 固定按 connection → access row → refresh row → matching started audit 的顺序锁定和重检。CAS miss
-不得覆盖任何 credential，也不得消费 fence。provider 省略 refresh token 或返回相同 plaintext 时，只能
-更新 access row 并逐字节保留 refresh row 与 old identity；access-only rotation 只追加/确认 access result，
-不生成 consumption。锁住 started 后必须再次确认它仍未被消费，两个竞争 consumer 最多一个成功；任何
-Taskiq/TransientProviderError retry 都必须先读取该 coordinator 状态，未知 fence 保持 zero provider calls。
-
-首次有效 consumption 永久关闭该 fence。之后 generation、scope/capability、access 或 refresh credential
-的正常变化都不会使它复活；若某个 scope 后来进入 `action_required`，后续授权走普通 existing-connection
-代际协议，不再加载、绑定或重新消费旧 fence。preflight 只校验 matching event 的 schema、attempt、原
-fence generation/old physical digest/old identity/key version 与对应来源代际不变量，再独立验证 current
-connection、能力、scopes 和 credential。若要建立新 attempt，必须从通过校验的 current generation 与两行
-current snapshot 重新冻结新的 `F`、两个 pre-digest 和 current identity，不得沿用已消费 fence 的旧
-pre-state。current guard 必须按 consumption 记录的 old identity key version 计算当前 plaintext identity；
-若 current identity 等于已消费 old identity，即使物理 digest 不同（包括 A→B→A 或同 token 重加密），也
-视为 credential rollback 并 fail closed。网络未知、响应缺失/相同 refresh
-token、旧 plaintext 不可得、CAS/事务失败或 connection 已 `disconnected` 均不消费 fence。disconnect
-会先删除旧 credential，因此之后无法完成 old/new plaintext 比较；重连、新建 connection 或映射新 token
-不能补造 consumption。若断开后 affected scope 仍存在，只能走既有明确用户授权的数据处置/删除历史
-敏感字段流程；若该流程也不适用，必须停止并请求新的已批准设计。禁止 fabricated consumption、新连接
-映射、marker skip 或根据 physical digest/generation 变化推测解锁。
+replacement consumption 首次有效后永久关闭原 fence。后续 generation、scope/capability、access 或
+refresh credential 正常变化不使它复活；current guard 使用同一固定 root key/version 重算 current
+identity。current identity 等于 consumed old identity 时，即使 physical digest 已变化（包括 A→B→A 或同
+token 重加密），仍以 `oauth_refresh_identity_rollback` fail closed。disconnect 会删除 old credential，
+因此不能用于补造 consumption；新 connection 映射、direct SQL、marker waiver 或 physical digest/
+generation 变化都不能解除 fence。
 
 以下四个合成向量是协议常量。测试必须把 expected canonical bytes/base64、digest/HMAC 写成固定常量，
 不得调用生产 helper 生成 expected 值。
@@ -1468,18 +1477,19 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - `credential_snapshot_digest_v1`、`refresh_credential_snapshot_digest_v1` 与 `rollout_digest_v1` 的字段
   framing、NULL/空 bytes 区分、UUID/整数/UTC 时间规范化、固定字段顺序和上述完整合成向量；expected
   bytes/base64/hash 必须是独立固定常量，不得由生产 helper 反向生成。
-- `refresh_token_identity_v1` 的标准 HKDF-SHA256/HMAC-SHA256、domain/framing、固定 synthetic vector、
-  identity key-version lookup/retention 和缺 key fail-closed；expected derived key/message/HMAC 必须由独立
-  标准库路径验证，不能调用生产 helper。A→B→A、同 token 重加密与 active key rotation 都必须用事件
-  key version 识别旧 identity，不能只比较 AEAD physical digest。
-- callback 与普通 provider refresh 的 replacement 判定：仅 non-empty 且
-  `secrets.compare_digest(old, new)` 为 false 才可能生成 terminal consumption；缺失/空值、同 plaintext、
-  同 plaintext 重加密和 access-only 均拒绝。progressive callback 使用 F/S/T source tuple，targetless
-  callback 使用满足 `F <= G` 的 G/G/G tuple，普通 mail/calendar Worker 使用 G/G/G source tuple，并共同
-  依赖 coordinator claim、identity 与完整 snapshot/generation CAS。
-- `OAuthRefreshCoordinator` 的状态机：session advisory lease → committed started → network → atomic result；
-  started 未提交前 provider call 为零，started 后的 lock loss/network unknown/CAS miss/commit failure 都变为
-  non-retryable unknown。Taskiq/`TransientProviderError` delivery 重新进入时只读 fence，provider call 为零。
+- `refresh_token_identity_v1` 的标准 HKDF-SHA256/HMAC-SHA256、domain/framing、固定 synthetic vector，以及
+  API/Worker/CLI 从同一 `APP_MASTER_KEY_FILE` 和 key version 构造 AEAD/identity service。M2 不实现 keyring
+  或 rotation；root key/version 变化必须 fail closed。A→B→A 与同 token 重加密必须由 identity 识别，不能
+  只比较 AEAD physical digest。
+- 两通道状态机：automatic refresh 的 started → confirmed/unknown，以及 explicit progressive recovery 的
+  authorization-started → unsatisfied/credential-replaced。普通 automatic valid response 的 missing/same/
+  different refresh 都只写 matching confirmed；只有 progressive callback 的 non-empty different plaintext
+  可消费旧 fence。多次 recovery、F/S/T、target-`T` anti-replay、strict `created_at` 顺序和完整 metadata 都
+  必须独立测试。
+- `OAuthRefreshCoordinator` 的 automatic 状态机：session advisory lease → committed started → network →
+  atomic confirmed；started 未提交前 provider call 为零，started 后的 lock loss/network unknown/CAS miss/
+  commit failure 都留下 unresolved fence。Taskiq/`TransientProviderError` delivery 重新进入时只读 fence，
+  provider call 为零；显式 progressive authorization-code exchange 取得 lease 但不追加第二个 started。
 - ProviderWriteOutcome 与重试安全判断。
 - 模型输入裁剪、签名清洗和输出 Schema。
 
@@ -1511,88 +1521,56 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   供应商网络 I/O 期间不得持有业务事务；每次供应商调用、credential commit 和 artifact publish 前都要
   通过同一 session 核验连接与锁仍存在，连接断开或锁丢失立即 fail closed。进程退出或连接关闭依赖
   PostgreSQL 自动释放 session lock，不能用进程内 mutex 代替跨进程互斥。
-- 每个 affected connection 在任何事件 scope probe 前必须冻结 access/refresh 两行 credential snapshot
-  和当前 `fence_generation=F`，并在受控内存计算 old `refresh_token_identity_v1`；每行 snapshot 包含
-  `id`、`user_id`、`connection_id`、
-  `credential_kind`、完整 AEAD 三列、`token_expires_at` 与 `updated_at`。本地 credential 存在性、归属和
-  AEAD 可解密性校验成功后，preflight 必须先取得 connection-scoped `OAuthRefreshCoordinator` session
-  lease，再在调用 provider 前用短事务向既有 append-only `audit_events` 提交 content-free
-  `calendar.aad_0019.refresh_started`，不得为此新增 0018 Schema。该事件使用 `task_id=NULL`、
-  `actor_type=system`，metadata 使用 `calendar_aad_0019_refresh_fence.v1`，只绑定 source、canonical
-  lowercase `refresh_attempt_id`、source/target revision、`rollout_digest_v1`、`connection_digest`、
-  `fence_generation=F`、`pre_credential_snapshot_digest_v1`、
-  `pre_refresh_credential_snapshot_digest_v1`、old refresh identity/key version 和稳定结果码，不含 token、
-  raw scope、provider response、正文或 raw `calendar_id`。存在 started-without-confirmed 或
-  needs-attention 结果时，相同或不同 basename 的后续 invocation 都必须在 provider 前失败。只有 matching
-  `oauth.refresh_credential_replaced` consumption 的原 attempt、started source、原 fence generation、old
-  refresh digest/identity/key version 精确匹配 started，并满足 `progressive_callback`、
-  `targetless_callback` 或 `provider_refresh` 的 source generation 不变量，才永久关闭
-  该 fence；不要求该 event 提交后的 generation/refresh digest 在后续保持不变。preflight 必须另行验证
-  current connection/capability/scopes/credential；若建立新 attempt，必须从 current generation/snapshot
-  重新冻结新的 `F`、两个 pre-digest 和 current identity。current identity 回到 consumed old identity 时，
-  包括 A→B→A 或物理密文变化后的同 token，均以 credential rollback fail closed。未带 matching
-  consumption 的 physical snapshot/generation 变化、普通 access-only rotation 和人工处置都不得成为
-  replay waiver。
-- 只有没有未决 fence 且本地 credential 校验成功的 connection 才能使用已解密的 refresh credential，
-  在 committed started 后确定性串行调用现有 Google/Microsoft OAuth adapter 的 refresh；同一 connection
-  多个 pair 只调用一次且不并行。返回值必须包含规范化 access token、正整数 expiry 和实际
-  `granted_scopes`，scope 覆盖连接保存的 canonical
-  scopes 与 `calendar.read` 所需 provider scope。provider 返回后只能由共享 `OAuthRefreshCoordinator`/
-  credential-rotation repository 在一个短事务内重检 session lease、owning connection、
-  `authorization_generation` 与 `calendar.read` 能力，以完整旧
-  snapshot 对两行 credential 执行 CAS，写入新 access/可选 refresh credential 和精确 expiry，并同时追加
-  content-free
-  `calendar.aad_0019.refresh_confirmed`。confirmed 必须复用 started 的 attempt UUID、
-  `rollout_digest_v1`、`fence_generation=F` 与两个 pre-digest，并强制绑定
-  `post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、实际持久化
-  `token_expires_at` 和 `rollout_deadline_candidate = token_expires_at - 900 seconds`；响应没有新 refresh
-  token 或返回相同 plaintext 时，只更新 access row，仍校验旧 refresh row snapshot 并逐字节保留。只有
-  该事务成功提交才算 refresh 完成，现有无条件 credential upsert 不能复用。网络未知、
-  provider 调用后 revision-global 或 connection-scoped lease 丢失、`invalid_grant`、malformed
-  token/expiry/scope、scope shrink、CAS miss 或 commit failure 都必须留下 started-without-confirmed 或稳定
-  needs-attention 结果，保持 revision 0018、不 probe、不发布 artifact，且不得对同 snapshot 再次调用
-  provider。Taskiq/TransientProviderError retry 必须返回 stable non-retryable unknown 且 provider call 为零。
-  若 confirmed 已提交但 artifact
-  发布前崩溃，同一 rollout 必须从持久的新 credential/expiry 恢复后续 probe，refresh 调用数不得增加。
-- Google/Microsoft 渐进授权 callback 必须覆盖 `source="progressive_callback"` 的 F/S/T consumption
-  原子性。测试至少包含 `F=S` 与 `S>F`，并证明发起时原 connection 仍为 `connected`、恰有一个 matching
-  unresolved fence、current refresh identity 按 started 记录的 key version 计算后等于 fence old identity，
-  同时 refresh physical digest 只用于 snapshot CAS；既有 `set_capabilities_authorizing` 只把
-  `source_generation=S` 递增一次到 `T=S+1`，`OAuthAttempt` 只保存 target `T`。token exchange 在事务外；
-  callback 以 target `T` 做 anti-replay，在 `T` 锁下加载旧 refresh 与唯一 fence，并在受控内存对明确返回的
-  non-empty 新值使用 `secrets.compare_digest`。只有 plaintext 不同才在同一事务保存新 access/refresh
-  credential、实际 scopes、能力状态与绑定 attempt/F/old-new digest、`source_generation=S`、
-  `pre_generation=post_generation=T` 的 `oauth.refresh_credential_replaced`；generation 保持 `T`，不得再次
-  递增。注入 credential、scope、能力或 consumption 写入后及 commit 时崩溃，全部事实必须回滚。测试还
-  必须覆盖 stale target、并发重授权导致的 target mismatch、多个或零 matching fence、发起前/回调时
-  refresh snapshot CAS miss、无 refresh token、空 token、同 plaintext、仅 access 更新、同明文重加密、
-  connection 已断开和旧 plaintext 不可得；这些路径都不得消费 fence。disconnect 后重连、新 connection
-  映射或 generation-only 变化不能替代 consumption；若 affected scope 仍存在，只能转入既有明确用户授权
-  的数据处置流程，否则停止并请求新的已批准设计。
-- Google/Microsoft OAuth 集成测试还必须覆盖 `source="targetless_callback"`：start 识别 candidate existing
-  connection 并保存 snapshot，callback 在 exchange 前取得 connection lease；规范化 provider identity 必须
-  命中同一 connected row，tuple 为满足 `F <= G` 的 G/G/G 且无 target `T`。同 identity merge 不能创建第二
-  connection；旧 fence 加 missing/empty/same refresh 必须 fail closed、旧 refresh row/scopes/capabilities
-  不变；不同 non-empty refresh 只有在 identity/plaintext 比较和 snapshot/generation CAS 成功后才原子保存并
-  追加 replacement。覆盖 callback 并发、identity mismatch、disconnected、新 connection bootstrap、result
-  rollback 和 current identity 回到 consumed old identity。
-- 共享 `OAuthRefreshCoordinator` 与 credential-rotation application port/repository 必须覆盖渐进 callback、
-  targetless callback、0019 主动 preflight，以及 Google/Microsoft mail 与 calendar Worker。四组同步集成测试
-  都要证明 coordinator 在 provider call 前按 connection 取得 PostgreSQL session advisory lease、提交
-  source/attempt/old digests/old identity/generation 的 started，且 snapshot 携带读取时 generation 和
-  access/refresh 两行完整物理字段，repository 使用 connection → access row → refresh row → matching
-  started audit 锁序，并拒绝 stale generation、任一 row CAS miss 或多个 matching unresolved fence 而不
-  覆盖 credential、不追加 consumption。provider 明确把本地 D1 refresh plaintext 轮换为不同 D2 时，普通
-  Worker 原子更新两行并以 `source="provider_refresh"`、
-  `source_generation=pre_generation=post_generation=G` 消费其 proof 精确绑定的 matching started attempt，
-  并验证 `F <= G`；缺失/空/相同 refresh token
-  只更新 access row，refresh row 必须逐字节不变。callback 与 Worker、两个 Worker 或重复投递竞争同一
-  connection 时最多一个进入 provider call、最多一个 consumer 成功。测试必须覆盖双 Worker 同时 refresh
-  只有一个 provider call、provider response 后 lease loss、network unknown 后 Taskiq retry provider call 为
-  零、`TransientProviderError` 不重放和 CAS miss 不覆盖。消费后 capability 进入 `action_required` 再完成普通重授权、消费后
-  generation 继续变化、scope/capability 正常变化都不得使原 fence 复活；preflight 在 current 状态重新满足
-  前置条件后继续，但若 current identity 回到 consumed old identity 必须 fail closed。上述
-  每个场景都必须证明原 D0 未知 preflight refresh 不会被再次调用。
+- 每个 affected connection 在任何事件 scope probe 前必须冻结 access/refresh 两行完整 snapshot、
+  connection generation `G` 与 fixed-key `refresh_token_identity_v1`。本地 credential 校验成功后，
+  preflight 取得 connection-scoped coordinator lease；若已有 unresolved `oauth.refresh_started`，相同或
+  不同 basename 都在 provider 前以 `provider_calls == 0` 失败。否则短事务追加
+  `source="calendar_aad_preflight"` 的 `oauth.refresh_started`，并证明 started.created_at 早于 provider
+  call。事件使用 `oauth_refresh_fence.v1` 的完整关闭字段，不新增 0018 schema。
+- preflight 的 known-valid response 无论 missing/same/different refresh，都必须通过 shared CAS repository
+  原子写 credential 与 matching `oauth.refresh_confirmed`。confirmed 包含 started/source、G/G/G、两个
+  pre/post digest、old/new identity/version、persisted expiry、refresh disposition、rollout digest 和
+  deadline candidate，且 `confirmed.created_at > started.created_at`。missing/same 逐字节保留 refresh row；
+  different 更新两行但不追加 replacement consumption。network unknown、`invalid_grant`、malformed、
+  scope shrink、任一 lease loss、CAS miss 或 commit unknown 不写 confirmed，并让后续 Taskiq/
+  `TransientProviderError` delivery provider call 为零。confirmed 后 artifact 前崩溃只从持久 post-state
+  恢复。
+- Google/Microsoft progressive recovery 测试必须直接使用现有 target-bound OAuthAttempt。start 事务在
+  `S >= F` 且 current identity 等于 unresolved fence old identity 时，原子执行唯一
+  `S→T=S+1`、创建 OAuthAttempt，并追加
+  `oauth.refresh_recovery_authorization_started`；它绑定 recovery schema/source、OAuthAttempt.id、connection
+  digest、原 refresh attempt/started source、F/S/T、两个 pre-digest、old identity/version、稳定 result
+  code 与严格晚于 original started 的 `created_at`，且不创建第二个 refresh started。callback 按
+  OAuthAttempt.id 查询关联、取得 lease、一次性交换 code，并保持 target-`T` anti-replay。
+- progressive callback 只有得到 non-empty different refresh plaintext 才能把 credential、scopes、
+  capabilities 和完整 `oauth.refresh_credential_replaced` proof 同事务提交。proof 必须包含
+  started_source、original/recovery attempt IDs、F/S/T、pre/post digests、old/new identity/key versions、
+  persisted expiry 与稳定 result，满足 `F <= S`、`T=S+1`、
+  `pre_generation=post_generation=T`，且 created_at 严格晚于 original started 与 recovery started。
+  missing/empty/same refresh、用户拒绝、管理员同意缺失、provider/network failure、identity mismatch、
+  lease loss、CAS/commit failure 都不写 credential；可证明的本地结果写
+  `oauth.refresh_recovery_authorization_unsatisfied`；它必须匹配 recovery event/OAuthAttempt IDs、原
+  attempt/started source/connection digest、F/S/T、两个 frozen pre-digest、old identity/version、稳定
+  result code，且 `created_at` 严格晚于 matching recovery started。它只关闭本次
+  OAuthAttempt/recovery event。测试连续发起至少两次 explicit recovery：第一次 unsatisfied 后原 fence 仍
+  阻断 automatic refresh，第二次 different token 才消费原 fence；同一 code 永不重放。
+- 无 target 的 Google/Microsoft `/provider/start` 继续覆盖新连接与无 fence identity merge。若一次性
+  exchange 后规范化 identity 命中已有 connected connection 且存在 unresolved fence，callback 必须在任何
+  credential/scope/capability 写入前返回
+  `oauth_refresh_recovery_requires_connection_start`；不得消费 fence、创建第二 connection、要求
+  candidate snapshot/新 API 参数或调用无条件 upsert。
+- 共享 coordinator/rotation repository 的 Google/Microsoft mail/calendar 测试必须覆盖：两个 Worker 对同一
+  connection 只有一个 automatic provider call；每次 successful automatic call 只关闭自己的 started；
+  Google access-only/missing-refresh response 写完整 confirmed、更新 access、逐字节保留 refresh；different
+  refresh 写 confirmed 但不消费旧 fence；存在 earlier unresolved fence 时 provider call 为零。另覆盖
+  response-after-lock-loss、network unknown、CAS miss、commit unknown、Taskiq 和
+  `TransientProviderError` zero-call re-entry、固定 lock order、stale generation/row CAS，以及所有
+  confirmed/unsatisfied/consumption 的 required metadata 与严格 created_at ordering。
+- retention 集成测试必须覆盖 confirmed 关闭自己的 started、unsatisfied 只关闭 recovery attempt、
+  replacement consumption 关闭 original fence、多次 explicit recovery、targetless blocked audit 不关闭
+  fence，以及 automatic-success、unsatisfied-recovery、successful-recovery 各组只有
+  `max(created_at) < cutoff` 才原子删除；未消费 original started 跨 cutoff 保留且不影响其他用户/普通
+  audit cleanup。
 - preflight 使用刷新后 access token，通过 Fake reader 或 HTTP mock 下的真实 Google/Microsoft 只读
   Calendar adapter 完成每个精确 `initial_pages(scope_key)` 探测并取得最终 cursor。它不等待资源 401，
   主动刷新后的 401 必须直接失败且 OAuth refresh 调用次数不增加。测试还必须证明它不调用
@@ -1625,17 +1603,19 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   lease 只允许一个调用进入供应商；并覆盖 provider 前 started 提交、调用后锁丢失、网络未知、
   `invalid_grant`、malformed response、scope shrink、credential CAS/commit failure、confirmed 后 artifact
   发布前崩溃和下一次 invocation。started 未 confirmed/needs-attention 时，同一或不同 basename 的
-  provider 调用数必须为零；只有精确匹配原 attempt/F/old digest 且满足来源代际不变量的
+  provider 调用数必须为零；只有 explicit progressive recovery 精确匹配原 attempt/started source/F、
+  两个原 pre-digest、old identity/version、recovery OAuthAttempt/event、F/S/T、两个 post-digest、
+  different-token new identity/version、persisted expiry 与严格时序的
   `oauth.refresh_credential_replaced` consumption 才能永久关闭旧 fence，current 状态随后独立校验；
   confirmed crash recovery 必须复用持久 token/expiry，Fake refresh 调用数保持不变。
-- retention 跨越 365 天 cutoff 时，未匹配 confirmed/安全 known-terminal/有效 consumption 的 started fence
-  必须仍存在，
-  且下一次同/异 basename invocation 的 `provider_calls == 0`。测试必须同时证明普通审计与另一用户的
-  审计仍按各自 cutoff 处理；matching confirmed/安全 terminal、有效 terminal consumption 以及可独立
-  证明的永久断开/数据处置终态允许清理旧 fence，不要求 current credential/generation 保持消费后的
-  lineage；所有待删 started/result 的最大 `created_at` 必须早于 cutoff，旧 started 加新 result 不得提前
-  清理。仅 physical digest/generation/access-only 变化不允许清理或解锁。并发测试按
-  connection → access row → refresh row → started audit 的统一锁序制造 retention 与 confirmed/consumption
+- retention 跨越 365 天 cutoff 时，未匹配 confirmed 或有效 progressive replacement consumption 的
+  automatic started fence 必须仍存在，且下一次同/异 basename invocation 的 `provider_calls == 0`。测试
+  必须同时证明普通审计与另一用户的审计仍按各自 cutoff 处理；automatic started + confirmed、recovery
+  started + unsatisfied、original automatic started + successful recovery started + replacement consumption
+  三类完整组只有在组内每一事件都早于 cutoff 时才允许删除，不要求 current credential/generation 保持
+  consumption 后的 lineage。旧 started 加新 result 不得提前清理；unsatisfied、automatic different-token、
+  physical digest/generation/access-only 变化不允许清理 original fence 或解锁。并发测试按
+  connection → access row → refresh row → started audit 的统一锁序制造 retention 与 confirmed/recovery-result/consumption
   CAS 竞争，
   锁后重查 matching result/consumption，证明不会误删或死锁，且不读取后续 current credential lineage。
 - 测试必须从本窗口 refresh 后且 0019 前创建的加密整库备份执行真实 PostgreSQL restore。宿主在读取
@@ -1731,15 +1711,14 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - 同步游标失效能够受限回退，不扩大数据读取窗口。
 - Microsoft 完整日历目录不伪造 provider cursor；并发快照通过独立 revision CAS 拒绝陈旧提交，
   只有已声明完整的快照才执行缺席删除。
-- 现有 connection 的渐进 callback、targetless callback、Google/Microsoft mail/calendar Worker 与 0019
-  主动 preflight 必须共用供应商中立的 `OAuthRefreshCoordinator`。每次 refresh/exchange 在任何 provider
-  call 前取得 connection-scoped PostgreSQL session advisory lease，并先提交 attempt-bound
-  `refresh_started`；网络阶段不持有业务事务，provider 响应后的 credential CAS、结果事件和可选
-  replacement consumption 在同一短事务完成。两个 Worker 竞争同一 connection 时最多一个进入 provider；
-  响应未知、网络断开、响应后 lease 丢失、CAS miss、commit unknown 或已存在 unresolved fence 时，Taskiq
-  重投和 `TransientProviderError` 路径只能读取持久状态并返回稳定 non-retryable unknown/
-  `needs_attention`，后续 `provider_calls == 0`。targetless callback 命中既有 identity 时保持满足
-  `F <= G` 的 G/G/G tuple、不得递增 generation 或创建第二个 connection。
+- Google/Microsoft mail/calendar Worker 与 0019 preflight 的 automatic refresh 共用
+  `OAuthRefreshCoordinator`：provider 前取得 connection lease 并提交自己的 `oauth.refresh_started`，valid
+  response 以 G/G/G CAS 和完整 `oauth.refresh_confirmed` 关闭本次 started；missing/same refresh 也必须
+  confirmed 并逐字节保留 refresh row。unknown、lease loss、CAS miss、commit unknown 或既有 unresolved
+  fence 时，Taskiq/`TransientProviderError` 重入 provider call 为零。带 connection ID 的显式 progressive
+  authorization-code recovery 取得相同 lease但不创建第二个 started；只有 target-`T` callback 的 different
+  refresh 可写 replacement consumption。无 target callback 命中带 unresolved fence 的既有 connection 时，
+  保存前 fail closed，不能承担恢复。
 - `0019` 不改变或删除 CalendarEvent 业务行和 directory revision；受影响事件 scope 会失去旧
   cursor/freshness。恢复只能由 v2-only one-off 入口执行：它从 marker 推导精确
   `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
@@ -1759,28 +1738,21 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   内，从指定的 refresh 后/迁移前加密整库备份恢复到 0018，再核验 checksum、原/恢复后 audit、revision
   和原 0018 image 健康；禁止 downgrade、直接 SQL、marker waiver 或 OAuth-only 临时服务。
 - 每次 0019 preflight 都必须先持有 revision-global PostgreSQL session advisory lease；同一数据库内不论
-  backup basename 是否相同，都只能有一个 preflight 进入 artifact 检查、OAuth refresh 或 provider
-  probe。lease 使用独立连接贯穿全部网络阶段，业务短事务不得跨网络；锁连接或锁本身丢失时，下一次
-  provider call、credential CAS 或 artifact publish 必须失败。lease 只解决并发；每次 refresh 还必须在
-  provider 前提交既有 append-only AuditEvent 的 content-free `refresh_started` fence，并把完整旧
-  access/refresh snapshot CAS、新 credential/expiry 与含必填 post digest、persisted expiry/deadline candidate
-  的 `refresh_confirmed` 放在 provider 后的同一短事务。started 未 confirmed/needs-attention 会跨 basename
-  阻断后续 preflight provider 调用，直到 matching `oauth.refresh_credential_replaced` 作为不可逆 terminal
-  consumption 精确绑定原 attempt/F/old refresh physical digest、old `refresh_token_identity_v1` 与 identity
-  key version，并满足 `source="progressive_callback"` 的 `source_generation=S`、
-  `pre_generation=post_generation=T=S+1`，或 `source="targetless_callback"`/`source="provider_refresh"`
-  满足 `F <= G` 的 `source_generation=pre_generation=post_generation=G`。progressive 来源保持 OAuthAttempt
-  target `T`，G/G/G 来源不递增 generation；所有来源都必须由确定的 non-empty 不同 refresh plaintext、
-  完整 snapshot/generation CAS 与同事务 event append 支撑。渐进 callback、targetless callback、
-  Google/Microsoft mail/calendar Worker 和主动 preflight 共享同一 `OAuthRefreshCoordinator`、完整 row
-  snapshot 与固定锁序；access-only、缺失/相同 refresh、unknown result 或 stale CAS 不消费 fence。
-  consumption 后 current credential/generation 独立校验，正常变化不使旧 fence 复活；current guard 必须按
-  consumption 记录的 identity key version 重新计算 plaintext identity，current identity 回到 consumed old
-  identity 时按 rollback fail closed，即使 physical digest 已变化。
-  disconnect/reconnect 不能产生或替代 consumption。365 天审计清理不得删除仍未解决的 started fence，
-  也不得在 matching terminal result 尚未超过 cutoff 时提前清理旧 started；安全组清理不依赖后续
-  credential lineage。confirmed 后、artifact 前崩溃必须从持久 token/expiry 恢复，不能再次 refresh，也
-  不能复用无条件 upsert 覆盖并发 callback/Worker 已写入的新凭据。
+  basename 都只能有一个 preflight 进入 artifact/provider 边界。每个 distinct connection 还取得 shared
+  coordinator lease，并在 provider 前提交完整 `oauth.refresh_started`。known-valid missing/same/different
+  response 都以 credential CAS + `oauth.refresh_confirmed` 原子提交，confirmed 必须有 full/refresh
+  post-digests、old/new identity/version、persisted expiry、deadline candidate、G/G/G 与严格 created_at
+  顺序。unknown 或本地不确定结果不写 confirmed并阻断所有 automatic retry。
+- unresolved automatic fence 只能由用户显式 progressive recovery 消费。start 在同一事务保留现有
+  S→T、OAuthAttempt target T，并追加关联原 fence 的 recovery authorization event；callback code 只交换一次。
+  missing/same/provider failure 写 unsatisfied（若可安全提交）但原 fence 保持；different token 才把
+  credential/scopes/capabilities 与完整 replacement proof 原子提交。targetless identity merge 遇到 fence
+  保存前失败。confirmed、unsatisfied 和 consumption 分别关闭自己的精确 started，retention 只有在对应组
+  全部早于 cutoff 时删除。
+- consumption 后 current state 独立校验，正常 generation/scope/credential 变化不使 fence 复活；固定
+  APP root key/version 重算的 current identity 回到 consumed old identity 时按 rollback fail closed。M2
+  不轮换 root key，也不引入 identity keyring。confirmed 后、artifact 前崩溃必须从持久 token/expiry 恢复，
+  不能再次 refresh；disconnect/reconnect、unconditional upsert 或 physical digest 变化不能成为恢复路径。
 - whole-database restore 只能由 operations profile 的专用 owner-role one-off 执行。该服务不继承会自动
   migration 的 backend common 配置，只依赖 healthy PostgreSQL。宿主必须在任何 owner Secret/connection/
   `pg_restore` 前验证 basename、dump/checksum、preflight/`pre-migration` artifacts 和 image binding；服务
@@ -1799,19 +1771,18 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - Token、真实命令、正文和日程敏感字段按规格加密。
 - 所有新同步的 CalendarEvent 描述和地点都标记为 v2 并绑定完整日历身份；跨日历同 event ID
   密文互换、v2 篡改、v1/未知版本读取均 fail closed，且没有 legacy fallback。
-- 0019 refresh fence 只使用既有 append-only AuditEvent，并以 attempt UUID、`rollout_digest_v1`、
-  `credential_snapshot_digest_v1`、`refresh_credential_snapshot_digest_v1`、`fence_generation=F`、持久化
-  expiry/由其导出的 deadline candidate、old `refresh_token_identity_v1`、identity key version 和稳定结果码
-  绑定精确尝试；plaintext replacement 只能由 `progressive_callback`、`targetless_callback` 或普通
-  Google/Microsoft mail/calendar `provider_refresh` 在共享 snapshot-CAS boundary 中生成的 content-free
-  `oauth.refresh_credential_replaced` terminal consumption 证明。identity key 必须按版本化应用主密钥通过
-  固定 HKDF-SHA256 label 派生，再以 domain-separated framed plaintext 做 HMAC-SHA256；旧 key version 必须
-  保留到所有引用它的 unresolved fence、consumption、rollback guard 和 retention 组生命周期结束。不得输出
-  或保存 refresh token、应用主密钥、派生 HMAC key、raw scope、provider response、正文或 raw
-  `calendar_id`；日志、Trace、SSE、API 与 release evidence 也不得包含这些值。AuditEvent 只保存关闭 schema
-  允许的 identity fingerprint 与 key version。不得为该 fence 新增 0018 Schema、OAuth-only 服务或新的
-  真实写动作。未决 started 受 retention 例外保护，不能因普通历史 cutoff 失去重放防线；已消费组的清理
-  必须匹配事件自身的 old identity/key version，且不依赖后续 credential lineage。
+- OAuth refresh fence 只使用现有 OAuthAttempt 与 append-only AuditEvent，不新增 0018 Schema。
+  automatic started/confirmed、progressive recovery started/unsatisfied 和 replacement consumption 都使用
+  17.3 的关闭 metadata，按各自 schema 精确绑定适用的 matching attempt/source/started_source、F/S/T 或
+  G/G/G、pre-digests、old identity/key version 与严格 `created_at` 时序；confirmed/replacement 另包含各自
+  required post-digests、new identity/version 与 persisted expiry。只有 explicit progressive recovery 的
+  different refresh consumption 能关闭 old unknown fence；automatic confirmed 只关闭自己的 started，
+  unsatisfied 只关闭本次 OAuthAttempt。targetless callback 不能消费 fence。
+- `refresh_token_identity_v1` 只从现有 `APP_MASTER_KEY_FILE` 与固定 `AeadCipher.key_version` 按固定
+  HKDF/HMAC 派生。API、Worker、CLI 必须从同一 Secret 构造 AEAD 与 identity service；M2 禁止更换 root
+  key/version，不存在 multi-key lookup。不得输出 token、root key、派生 key、identity fingerprint、
+  raw scope、provider response、正文或 raw `calendar_id`。未决 started 受 retention 例外保护；只有
+  matching event 组全部超过 cutoff 才能专用清理。
 - 日志、Trace、指标、SSE 和 fixture 不包含敏感内容。
 - 所有修改 API 通过会话、CSRF、用户隔离和版本验证。
 - 保留和删除任务覆盖 M2 新实体、既有密文三元组及 CalendarEvent 四列密文原子组。
@@ -1872,44 +1843,47 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    必须通过共享 `OAuthRefreshCoordinator` 取得该 `connection_id` 的 session advisory lease；revision-global
    lease 与 connection-scoped lease 必须同时保持有效，任一获取失败或响应后丢失都不得进入下一次 provider
    call、credential CAS 或 artifact publish。每个 connection 先冻结本轮 current generation、完整
-   access/refresh snapshot 和按活动 identity key version 计算的 current `refresh_token_identity_v1`，作为可能
-   新 attempt 的 `fence_generation=F`、两个 pre-digest、old identity 与 key version，再检查既有
-   refresh fence：同一 rollout 已 confirmed 且 current credential 匹配 post-snapshot、persisted
-   expiry/deadline candidate 时，从持久 token/expiry 恢复后续 probe，不再次 refresh；存在
-   started-without-confirmed 或 needs-attention 时，相同或不同 basename 都先保持零 provider call。只有
-   `oauth.refresh_credential_replaced` consumption 的原 attempt、原 started 自身的 fence generation 与 old
-   refresh physical digest、old identity 与 identity key version 精确匹配，并满足 `progressive_callback`、
-   `targetless_callback` 或 `provider_refresh` 的来源代际不变量，才永久关闭旧 fence；不要求消费事务提交后
-   的 generation/refresh digest 在后续保持不变。preflight 随后独立
-   验证 current connection 仍 connected、`calendar.read` enabled、scopes 完整、credential
-   存在/归属/AEAD 可解密，并按 consumption 记录的 old identity key version 重新计算 current plaintext
-   identity；若 current identity 回到 consumed old identity，即使 physical digest 不同，也以 credential
-   rollback fail closed。没有 matching
-   consumption、只发生 full/refresh physical digest、generation 或 access-only 变化时都不得建立新尝试。
+   access/refresh snapshot 和按 M2 固定 APP root key/version 计算的 current
+   `refresh_token_identity_v1`，作为可能新 automatic attempt 的 `fence_generation=F`、两个 pre-digest、old
+   identity 与 key version，再检查既有 refresh fence：同一 rollout 已有 `oauth.refresh_confirmed` 且 current
+   credential 匹配 post-snapshot、persisted expiry/deadline candidate 时，从持久 token/expiry 恢复后续
+   probe，不再次 refresh；存在 unresolved `oauth.refresh_started` 时，相同或不同 basename 都先保持零
+   provider call。只有用户显式 progressive recovery 产生的 `oauth.refresh_credential_replaced` 精确绑定原
+   automatic attempt、`started_source`、`fence_generation=F`、两个原 pre-digest、old identity/key version、
+   recovery OAuthAttempt/event、F/S/T、两个 required post-digest、different-token new identity/version、
+   persisted expiry 与严格晚于两个 matching started 的 `created_at`，才永久关闭旧 fence。automatic
+   `provider_refresh`、targetless callback、generation/physical digest/access-only 变化都不能消费它。
+   preflight 随后独立验证 current connection 仍 connected、`calendar.read` enabled、scopes 完整、credential
+   存在/归属/AEAD 可解密，并以固定 key version 重算 current plaintext identity；若 current identity 回到
+   consumed old identity，即使 physical digest 不同，也以 credential rollback fail closed。没有 matching
+   replacement consumption 时不得建立新 automatic attempt。
+
    上述 current 前置条件通过后，preflight 必须重检本轮冻结的 current generation/snapshot，并在紧邻
    provider 调用的短事务中向既有 append-only `audit_events` 提交 content-free
-   `calendar.aad_0019.refresh_started`。事件使用新生成的 canonical lowercase attempt UUID，并绑定
-   `calendar_aad_0019_refresh_fence.v1`、`source="calendar_aad_preflight"`、source/target revision、
+   `oauth.refresh_started`。事件使用新生成的 canonical lowercase attempt UUID，并绑定
+   `fence_schema_version="oauth_refresh_fence.v1"`、`source="calendar_aad_preflight"`、source/target revision、
    `rollout_digest_v1`、`fence_generation=F`、`pre_credential_snapshot_digest_v1`、
-   `pre_refresh_credential_snapshot_digest_v1`、old `refresh_token_identity_v1` 与 identity key version，再使用已解密
-   refresh token 主动调用现有 Google/Microsoft OAuth refresh。access-only 或 AEAD 解密失败在
-   started/provider 前 fail closed；`invalid_grant`、返回
-   token/expiry/scope malformed 或实际 scope 未覆盖连接保存的 canonical scopes/`calendar.read`
-   provider scope 则留下 durable fence 并 fail closed。
+   `pre_refresh_credential_snapshot_digest_v1`、old `refresh_token_identity_v1`、固定 identity key version 与
+   stable result code，再使用已解密 refresh token 主动调用现有 Google/Microsoft OAuth refresh。access-only
+   或 AEAD 解密失败在 started/provider 前 fail closed；`invalid_grant`、返回 token/expiry/scope malformed 或
+   实际 scope 未覆盖连接保存的 canonical scopes/`calendar.read` provider scope 则留下 durable unresolved
+   fence 并 fail closed。
 
    provider 返回后只允许共享 credential-rotation repository 的短事务按固定锁序重检连接、能力与
-   generation，以完整旧 snapshot CAS 两行 credential，并把新 access/可选 refresh AEAD、精确
-   `token_expires_at` 与 content-free
-   `calendar.aad_0019.refresh_confirmed` 原子提交；confirmed 复用同一 attempt UUID、
-   `rollout_digest_v1`、`fence_generation=F` 与两个 pre-digest，并强制增加
+   generation，以完整旧 snapshot CAS credential，并把新 access/可选 refresh AEAD、精确
+   `token_expires_at` 与 content-free `oauth.refresh_confirmed` 原子提交。known-valid response 无论 missing、
+   same 或 different refresh token 都必须 confirmed：missing/same 只更新 access row 并逐字节保留旧 refresh
+   row；different non-empty refresh 更新两行，但只关闭本次 automatic started，不追加
+   `oauth.refresh_credential_replaced`，也不能消费任何旧 fence。confirmed 复用同一 attempt UUID、source、
+   `rollout_digest_v1`、G/G/G、两个 pre-digest、old/new identity/version，并强制增加
    `post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、实际持久化
-   `token_expires_at` 和 `rollout_deadline_candidate = token_expires_at - 900 seconds`。没有新 refresh token
-   或返回相同 plaintext 时，只更新 access row 并逐字节保留旧 refresh row；禁止现有无条件 upsert。
-   网络未知、调用后任一 lease 丢失、scope shrink、CAS/commit failure 均不得覆盖
-   更新后的 token、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。后续 Taskiq delivery
-   或 `TransientProviderError` 路径必须读取未决 fence，返回稳定 non-retryable unknown 且 provider call 为零。
-   confirmed 已提交但
-   artifact 发布前崩溃时，同一 rollout 从持久 credential/expiry 继续。全部 connection confirmed 后重新
+   `token_expires_at`、`refresh_token_disposition` 和
+   `rollout_deadline_candidate = token_expires_at - 900 seconds`；其 `created_at` 必须严格晚于 matching
+   started。禁止现有无条件 upsert。网络未知、调用后任一 lease 丢失、scope shrink、CAS/commit failure
+   均不得写 confirmed、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。后续 Taskiq
+   delivery 或 `TransientProviderError` 路径必须读取未决 fence，返回稳定 non-retryable unknown 且 provider
+   call 为零。confirmed 已提交但 artifact 发布前崩溃时，同一 rollout 从持久 credential/expiry 继续。全部
+   connection confirmed 后重新
    读取持久化 expiry 并计算 deadline，再通过供应商只读 Calendar adapter 调用与恢复路径一致的
    `initial_pages(scope_key)` 并要求最终 cursor；全部 probe 成功且最终 rollout guard 通过后才原子提交
    content-free rollout artifact。它不等待资源 401；主动刷新后的 401 直接失败且不得第二次 refresh。
@@ -1999,10 +1973,10 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
 | 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
 | 双 Worker、Taskiq 重投或 `TransientProviderError` 导致同一 connection 重复 refresh/exchange | 所有 writer 共用 `OAuthRefreshCoordinator` 与 connection-scoped session lease；provider 前提交 attempt-bound started，网络外无业务事务，响应后同事务 CAS/result；未知结果、响应后 lock loss、CAS miss 或 commit unknown 后续 delivery 只读 fence且 provider call 为零 |
-| targetless callback 命中既有 identity 却创建重复 connection 或覆盖较新 credential | start 冻结 candidate existing connection，callback exchange 前取得同一 coordinator claim；规范化 identity 必须命中同一 connected row，保持满足 `F <= G` 的 G/G/G tuple并禁止 `ensure_connection`/无条件 upsert；identity mismatch、断开或 CAS miss 全部 fail closed |
-| refresh token A→B→A 或同 token 重加密绕过 rollback guard | 版本化主密钥经固定 HKDF-SHA256/HMAC-SHA256 生成 `refresh_token_identity_v1`；started/consumption 持久化 old identity 与 key version，current guard 按该版本重算 plaintext identity；physical digest 仅作 snapshot CAS，identity 回到 consumed old identity即 fail closed，旧 key 保留到 fence/consumption/retention 生命周期结束 |
-| 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；started/confirmed 精确绑定 attempt UUID、`rollout_digest_v1`、`fence_generation=F`、full/refresh 两个物理摘要、old identity/key version与必填 persisted expiry/deadline candidate；callback、mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序；未确认 fence 跨 basename 阻断，只有 `progressive_callback`、`targetless_callback` 或 `provider_refresh` 对确定不同的 non-empty refresh plaintext 原子提交 matching terminal consumption 才永久关闭，access-only/unknown/stale CAS 不消费，current identity 回到 consumed old identity按 rollback fail closed，confirmed crash 从持久结果恢复 |
-| 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention；未匹配 terminal result 的 started 跨 cutoff 保留，统一锁序下重查 matching consumption/result；安全组中每个事件都必须早于 cutoff且不依赖后续 current credential lineage，普通 access-only rotation、generation 或物理摘要变化不解锁，跨 365 天回归要求后续 provider call 为零 |
+| targetless callback 命中带 unresolved fence 的既有 identity，却覆盖 credential 或创建重复 connection | callback 在保存任何 credential、scope 或 capability 前返回 `oauth_refresh_recovery_requires_connection_start`；可追加 content-free blocked audit，但不得创建 candidate snapshot、消费 fence、调用 `ensure_connection`/无条件 upsert或创建第二个 connection |
+| refresh token A→B→A 或同 token 重加密绕过 rollback guard | M2 从固定 `APP_MASTER_KEY_FILE` root key 与固定 `AeadCipher.key_version` 经 HKDF-SHA256/HMAC-SHA256 生成 `refresh_token_identity_v1`；started/consumption 持久化 old identity/version，current guard 按同一固定版本重算，identity 回到 consumed old identity即 fail closed；M2 不更换 root key/version，也不引入 multi-key lookup |
+| 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；generic started/confirmed 精确绑定 attempt UUID、source、`rollout_digest_v1`、G/G/G、full/refresh pre/post 摘要、old/new identity/version、persisted expiry与 deadline candidate；mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序。未确认 fence 跨 basename 阻断；automatic missing/same/different refresh 都只 confirmed 自己的 started，只有带 connection ID 的 explicit progressive recovery 返回 different non-empty refresh token并原子提交完整 F/S/T replacement proof 才消费旧 fence |
+| 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention；未匹配 confirmed 或 explicit progressive replacement 的 automatic started 跨 cutoff 保留，统一锁序下重查 automatic-success、unsatisfied-recovery、successful-recovery 完整组；组内每个事件都必须早于 cutoff且不依赖后续 current credential lineage，unsatisfied、automatic different-token、access-only、generation 或物理摘要变化不解锁，跨 365 天回归要求后续 provider call 为零 |
 | restore 镜像/工件被替换，app-role 无法完整恢复，或 `pg_restore` 中途失败留下部分状态 | owner 前宿主 artifact/image guard；精确 `sha256:` restore image、无 build/pull、`--pull never`，容器读取 Secret 前复核；专用 owner-role 单事务 restore，成功后重授最小权限；app-only verifier 由 `PGOPTIONS` 与 `BEGIN READ ONLY` 双重强制只读 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |

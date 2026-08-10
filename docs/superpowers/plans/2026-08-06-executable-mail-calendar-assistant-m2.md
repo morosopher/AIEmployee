@@ -3807,29 +3807,30 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups, and replace generic AuditEvent deletion with user-scoped fence-aware cleanup for unresolved 0019 refresh attempts.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
 - Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
-- Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral coordinator claim, connection-scoped session lease, committed-started/network/result state machine, source union, and zero-call unknown/retry contract shared by every existing-connection refresh/exchange writer.
-- Create: `backend/src/ai_employee/application/ports/credential_rotation.py` — typed connection-generation plus access/refresh physical snapshots and identity/key versions, provider refresh outcome, caller terminal fact, and closed `progressive_callback`/`targetless_callback`/`provider_refresh` consumption contracts shared by every existing-connection credential writer.
-- Modify: `backend/src/ai_employee/application/use_cases/connections.py` — extend progressive authorization with the F/S/T unresolved-fence protocol and targetless existing-identity merge with `F <= G` G/G/G, keep token exchange outside the transaction, claim through the shared coordinator, compare old/new refresh plaintext in controlled memory, and route callback persistence through the shared rotation port so credentials/scopes/capabilities remain atomic while terminal consumption is appended only for a genuinely different non-empty token.
+- Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral automatic-refresh claim plus explicit-recovery connection lease, committed started/confirmed state machine, `calendar_aad_preflight | provider_refresh` automatic source union, and zero-call unknown/retry contract.
+- Create: `backend/src/ai_employee/application/ports/credential_rotation.py` — typed connection-generation plus access/refresh physical snapshots and fixed identity version, with separate automatic confirmed and explicit progressive-recovery replacement-result contracts.
+- Modify: `backend/src/ai_employee/application/use_cases/connections.py` — extend connection-bound progressive authorization with the F/S/T unresolved-fence protocol; create `OAuthAttempt` plus `oauth.refresh_recovery_authorization_started` in the start transaction, keep the one-time code exchange outside the transaction, compare old/new refresh plaintext in controlled memory, persist unsatisfied attempts without closing the original fence, and atomically append replacement consumption only for a genuinely different non-empty token. A targetless callback that resolves to a fenced connection must fail before local credential/scope/capability persistence.
 - Create: `backend/src/ai_employee/application/use_cases/calendar_aad_preflight.py` — 0018 affected-pair discovery, revision-global plus connection-scoped coordinator leases, append-only durable refresh fence with identity/key-version metadata, per-connection OAuth refresh through the shared snapshot-CAS/confirmed rotation port, local recoverability proof, and provider-resource-read-only probe orchestration.
-- Create: `backend/src/ai_employee/application/calendar_aad_digests.py` — pure versioned field framing plus `credential_snapshot_digest_v1`, `refresh_credential_snapshot_digest_v1`, and `rollout_digest_v1` helpers shared by fence creation, terminal consumption, replay lookup, retention, rollout guards, and evidence.
-- Create: `backend/src/ai_employee/application/oauth_refresh_identity.py` — versioned application-master-key lookup plus the fixed HKDF-SHA256/HMAC-SHA256 `refresh_token_identity_v1` derivation; missing historical keys fail closed and plaintext/key material never leaves controlled memory.
+- Create: `backend/src/ai_employee/application/calendar_aad_digests.py` — pure versioned field framing plus `credential_snapshot_digest_v1`, `refresh_credential_snapshot_digest_v1`, and `rollout_digest_v1` helpers shared by fence creation, replacement proof, replay lookup, retention, rollout guards, and evidence.
+- Create: `backend/src/ai_employee/application/oauth_refresh_identity.py` — fixed `APP_MASTER_KEY_FILE` plus `AeadCipher.key_version` HKDF-SHA256/HMAC-SHA256 `refresh_token_identity_v1` derivation; M2 has no independent identity Secret, keyring, or root-key rotation, and plaintext/key material never leaves controlled memory.
 - Create: `backend/src/ai_employee/application/use_cases/calendar_aad_rollout.py` — fixed 900-second deadline derivation, typed zero/no-deadline state, immutable-image binding, content-free rollout-state validation, and reusable start/pre-commit guards.
 - Create: `backend/src/ai_employee/application/use_cases/calendar_aad_recovery.py` — marker-only recovery planning, pair-digest/recovery-ordinal state protocol, and exact-task execution orchestration.
 - Modify: `backend/src/ai_employee/application/use_cases/sync_calendar.py` — add a marker-gated exact-event-scope entry that never invokes directory discovery.
 - Modify: `backend/src/ai_employee/application/use_cases/sync_mail.py` — route ordinary mail refresh through the shared coordinator and preserve access-only/same-token semantics without a second retry writer.
-- Create: `backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py` — session-bound shared snapshot loader/CAS helper and repository implementation with connection → access row → refresh row → matching started audit locks, caller-specific confirmed/consumption append, single-consumer arbitration, and byte-preserving refresh-row handling for missing/same plaintext.
-- Create: `backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py` — connection-scoped PostgreSQL session-advisory lease, committed-started claim lookup, lease-loss/unknown classification, and exactly-once provider-call admission used by callback, preflight, mail, and calendar writers.
-- Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_preflight.py` — 0018 historical-triple scan, dedicated PostgreSQL session advisory lease, existing AuditEvent-backed started/confirmed/terminal/consumption lookup plus fence append, and local recoverability projections without Calendar fact mutation; all credential commits delegate to the shared rotation repository.
-- Modify: `backend/src/ai_employee/infrastructure/db/repositories/connections.py` — at progressive start validate the unique unresolved fence/current refresh snapshot before the existing `S→T=S+1` increment, then compose the shared session-bound rotation helper into the target-`T` callback transaction so credentials/scopes/capabilities and `source="progressive_callback"` consumption commit atomically while generation stays `T`.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py` — session-bound shared snapshot loader/CAS helper with connection → access row → refresh row → matching started audit locks, automatic `oauth.refresh_confirmed`, progressive replacement proof, unsatisfied recovery result, strict event ordering, and byte-preserving missing/same refresh handling.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py` — connection-scoped PostgreSQL session-advisory lease, automatic committed-started claim lookup, explicit recovery lease, lease-loss/unknown classification, and exactly-once automatic provider-call admission used by preflight and mail/calendar writers.
+- Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_preflight.py` — 0018 historical-triple scan, dedicated PostgreSQL session advisory lease, existing AuditEvent-backed automatic started/confirmed plus progressive replacement-consumption lookup and local recoverability projections without Calendar fact mutation; all credential commits delegate to the shared rotation repository.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/connections.py` — at progressive start validate the unique unresolved fence/current refresh snapshot before the existing `S→T=S+1` increment, create the target-`T` OAuthAttempt and recovery-started event in the same transaction, resolve callback recovery linkage by `OAuthAttempt.id`, and compose the shared session-bound rotation helper so credentials/scopes/capabilities and `source="progressive_recovery"` replacement proof commit atomically while generation stays `T`; unsatisfied attempts close only their recovery event.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/email.py` — replace the unconditional `rotate_access_token` upsert boundary with snapshot loading/delegation to the shared credential-rotation repository; preserve existing mail-sync repository responsibilities without retaining a second credential writer.
 - Create: `backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_recovery.py` — user-owned marker scan, exact cursor locking, ordinal allocation, and atomic TaskRun/AuditEvent/Outbox creation.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/calendar.py` — require an existing exact marker cursor and clear it only through final marker-aware CAS.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
-- Modify: `backend/src/ai_employee/workers/sync_mail.py` — carry the read generation and complete access/refresh snapshots through Google/Microsoft refresh, compare old/new plaintext, and commit through the shared rotation port so a definite different token may append `source="provider_refresh"` consumption while access-only refresh preserves the refresh row byte-for-byte.
-- Modify: `backend/src/ai_employee/workers/sync_calendar.py` — use the same credential-safe resolver and shared rotation port for Google/Microsoft refresh, then validate/execute the dedicated ordinal-aware `calendar.aad_0019.resync` task kind without the legacy directory default.
+- Modify: `backend/src/ai_employee/api/deps.py` — construct `AeadCipher` and `refresh_token_identity_v1` service from the same `APP_MASTER_KEY_FILE` bytes and fixed key version used by every Worker/CLI composition root.
+- Modify: `backend/src/ai_employee/workers/sync_mail.py` — carry the read generation and complete access/refresh snapshots through Google/Microsoft automatic refresh and commit every known-valid missing/same/different response through the shared confirmed path; missing/same preserves the refresh row byte-for-byte and different never consumes an older fence.
+- Modify: `backend/src/ai_employee/workers/sync_calendar.py` — use the same fixed-key identity service, coordinator and automatic confirmed rotation path for Google/Microsoft refresh, then validate/execute the dedicated ordinal-aware `calendar.aad_0019.resync` task kind without the legacy directory default.
 - Modify: `backend/src/ai_employee/workers/execute_task.py` — route the dedicated recovery kind to the marker-gated Calendar step.
-- Create: `backend/src/ai_employee/cli/calendar_aad_preflight_0019.py` — no-argument, 0018-compatible active-refresh plus provider-resource-read-only preflight with content-free rollout state.
+- Create: `backend/src/ai_employee/cli/calendar_aad_preflight_0019.py` — no-argument, 0018-compatible active-refresh plus provider-resource-read-only preflight with content-free rollout state, constructing AEAD and identity services from the same fixed `APP_MASTER_KEY_FILE` bytes/key version as API and Workers.
 - Create: `backend/src/ai_employee/cli/calendar_aad_migrate_0019.py` — no-argument, rollout-state/typed-guard-bound exact 0018-to-0019 migration wrapper.
 - Create: `backend/src/ai_employee/cli/calendar_aad_0019.py` — content-free one-off recovery CLI using the existing durable runner and an exact-task in-process dispatch boundary.
 - Create: `backend/src/ai_employee/cli/calendar_aad_verify_restored_0018.py` — stopped-service app-role comparison of restored revision 0018 against the bound backup and pre-migration audit, with server-default read-only plus a first-action `BEGIN READ ONLY` transaction.
@@ -3839,24 +3840,24 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py` — M2 retention, CalendarEvent four-column atomic-clear regressions, and cross-cutoff/user-isolated 0019 refresh-fence cleanup races.
 - Create: `backend/tests/unit/application/test_calendar_aad_digests.py` — independent fixed canonical-byte/base64/SHA-256 vectors for all three v1 digest protocols; expected constants must not call production helpers.
-- Create: `backend/tests/unit/application/test_oauth_refresh_identity.py` — independent HKDF/HMAC implementation of the fixed synthetic vector, key-version retention/rotation, same-token re-encryption, A→B→A rollback, and missing-key fail-closed cases.
-- Create: `backend/tests/unit/application/test_oauth_refresh_coordinator.py` — coordinator state-machine RED/GREEN tests for claim ordering, committed-started admission, lock loss, unknown/CAS/commit failure, Taskiq/`TransientProviderError` zero-call delivery, and targetless G/G/G rules.
-- Create: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py` — PostgreSQL session-lease, dual-Worker single-call, response-after-lock-loss, CAS-miss, cross-basename fence, and single-consumer arbitration tests.
-- Modify: `backend/tests/unit/application/test_connection_capability_use_cases.py` — controlled-memory `secrets.compare_digest`, `F=S`/`S>F` start/target derivation, no-token/empty/same-plaintext/access-only/disconnected negatives, and callback terminal-consumption orchestration.
-- Modify: `backend/tests/integration/m2/test_connection_capability_repository.py` — unique-fence/current-refresh start CAS, target-generation anti-replay, credential/scope/capability/consumption atomic commit, stale/concurrent callback rejection, and injected rollback points without a callback generation increment.
-- Create: `backend/tests/integration/m2/test_credential_rotation_repository.py` — complete-row/generation CAS, fixed lock order, access-only byte preservation, `provider_refresh` terminal consumption, rollback detection, and two-consumer arbitration across callback/Worker writers.
-- Modify: `backend/tests/integration/google/test_oauth_flow.py` — Google F/S/T and targetless callback claim/identity/CAS behavior, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-failure recovery.
-- Modify: `backend/tests/integration/microsoft/test_oauth_flow.py` — Microsoft F/S/T and targetless callback parity, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-failure recovery.
-- Modify: `backend/tests/integration/google/test_gmail_sync.py` — Google mail `provider_refresh` D1→D2 consumption, coordinator claim, access-only preservation, stale CAS, lock loss, unknown/Taskiq zero-call delivery, and no replay of the original unknown preflight attempt.
-- Modify: `backend/tests/integration/google/test_calendar_sync.py` — Google calendar coordinator parity for shared snapshot-CAS rotation, targetless/worker G/G/G rules, and terminal consumption.
-- Modify: `backend/tests/integration/microsoft/test_mail_sync.py` — Microsoft mail `provider_refresh` rotation/omission behavior through the shared coordinator, lock/unknown handling, and monotonic fence consumption.
-- Modify: `backend/tests/integration/microsoft/test_calendar_sync.py` — Microsoft calendar coordinator parity, multi-refresh single-call behavior, same-token/access-only preservation, and consumption that survives later generation/capability changes.
-- Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py` — 0018 local proof, attempt/dual-digest-bound durable refresh started/confirmed/terminal/needs-attention fence, source-tagged terminal-consumption gate, rollback detection, crash recovery, proactive OAuth refresh/scope/deadline boundary, Fake/HTTP-mocked real-adapter probes, and no-Calendar-mutation coverage.
+- Create: `backend/tests/unit/application/test_oauth_refresh_identity.py` — independent HKDF/HMAC implementation of the fixed synthetic vector, fixed APP root-key/version construction parity, same-token re-encryption, A→B→A rollback, and missing/changed-key fail-closed cases.
+- Create: `backend/tests/unit/application/test_oauth_refresh_coordinator.py` — two-channel state-machine RED/GREEN tests for automatic claim ordering/committed-started admission, explicit recovery lease without a second started, lock loss, unknown/CAS/commit failure, and Taskiq/`TransientProviderError` zero-call delivery.
+- Create: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py` — PostgreSQL session-lease, dual-Worker single-call/confirmed arbitration, response-after-lock-loss, CAS-miss, cross-basename fence, and explicit-recovery lease tests.
+- Modify: `backend/tests/unit/application/test_connection_capability_use_cases.py` — controlled-memory `secrets.compare_digest`, `F=S`/`S>F` start/target derivation, repeated explicit recovery attempts, no-token/empty/same-plaintext/access-only/disconnected negatives, unsatisfied-result handling, and different-token replacement orchestration.
+- Modify: `backend/tests/integration/m2/test_connection_capability_repository.py` — unique-fence/current-refresh start CAS, OAuthAttempt plus recovery-started atomic creation, target-generation anti-replay, first unsatisfied attempt preserving the original fence, later different-token credential/scope/capability/replacement atomic commit, stale/concurrent callback rejection, and injected rollback points without a callback generation increment.
+- Create: `backend/tests/integration/m2/test_credential_rotation_repository.py` — complete-row/generation CAS, fixed lock order, automatic confirmed missing/same/different handling, access-only byte preservation, progressive replacement proof, rollback detection, strict timestamps, and callback/Worker arbitration without Worker consumption of an old fence.
+- Modify: `backend/tests/integration/google/test_oauth_flow.py` — Google F/S/T multiple explicit recovery attempts, first unsatisfied/second different-token success, targetless fenced-identity pre-save blocking, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-failure recovery.
+- Modify: `backend/tests/integration/microsoft/test_oauth_flow.py` — Microsoft parity for repeated explicit recovery, targetless pre-save blocking, same-token/no-token/disconnected behavior, stale/concurrent target rejection, and transaction-failure recovery.
+- Modify: `backend/tests/integration/google/test_gmail_sync.py` — Google automatic `provider_refresh` claim, access-only confirmed with byte-preserved refresh row, different-token confirmed while any older unresolved fence remains closed to automatic entry, stale CAS, lock loss, unknown/Taskiq zero-call delivery, and no replay of the original unknown preflight attempt.
+- Modify: `backend/tests/integration/google/test_calendar_sync.py` — Google calendar automatic coordinator parity for shared snapshot-CAS confirmed rotation and zero-call unresolved-fence blocking.
+- Modify: `backend/tests/integration/microsoft/test_mail_sync.py` — Microsoft automatic refresh missing/same/different confirmed behavior through the shared coordinator, lock/unknown handling, and no old-fence consumption.
+- Modify: `backend/tests/integration/microsoft/test_calendar_sync.py` — Microsoft calendar automatic coordinator parity, multi-refresh single-call behavior, same-token/access-only preservation, different-token confirmed, and unresolved-fence zero-call blocking.
+- Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py` — 0018 local proof, attempt/dual-digest-bound generic automatic started/confirmed fence, explicit progressive replacement gate, repeated recovery, targetless pre-save blocking, rollback detection, crash recovery, proactive OAuth refresh/scope/deadline boundary, Fake/HTTP-mocked real-adapter probes, and no-Calendar-mutation coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py` — marker isolation, ordinal-aware atomic task creation, exact provider reads, explicit retry, concurrency, and CLI lifecycle coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py` — fixed deadline crossing, zero-state and immutable-image binding at every rollout boundary, owner-before-secret restore image/artifact guard, exact-image no-pull restore, and database-enforced read-only restored-0018 verification.
 - Modify: `compose.yaml` — add an operations-profile owner-role restore one-off that depends only on healthy PostgreSQL, never inherits `backend-common`/automatic migration, and uses only an internally injected exact `sha256:` image with no tag/build/pull.
-- Modify: `docs/operations.md` — revision-global lease, dual credential-digest/attempt protocol, source-tagged monotonic refresh replacement consumption, shared credential snapshot CAS/confirmed commit, AuditEvent-backed durable refresh fence, whole-group cross-cutoff fence retention without current-lineage dependence, typed rollout guard and image binding, non-rolling 0019 rollout, ordinal-aware recovery, owner-before-secret restore guard, exact-image atomic owner restore, database-enforced app-role verifier, normal rollback floor, and incident handling.
-- Modify: `docs/acceptance-checklist.md` — three fixed digest vectors, callback/Worker terminal-consumption atomicity, shared snapshot-CAS and whole-group cross-cutoff durable refresh-fence evidence, image/artifact guard with zero owner calls on mismatch, per-ordinal scope recovery, exact-image owner restore/grant/database-read-only app verification, and normal rollback-floor acceptance.
+- Modify: `docs/operations.md` — revision-global lease, automatic started/confirmed, repeated explicit progressive recovery with started/unsatisfied/replacement facts, targetless pre-save blocking, fixed-root identity, shared snapshot CAS, whole-group cross-cutoff fence retention, typed rollout guard and image binding, non-rolling 0019 rollout, ordinal-aware recovery, owner-before-secret restore guard, exact-image atomic owner restore, database-enforced app-role verifier, rollback floor, and incident handling.
+- Modify: `docs/acceptance-checklist.md` — three fixed digest vectors, automatic confirmed plus progressive replacement atomicity, repeated recovery/targetless-block evidence, shared snapshot-CAS and whole-group cross-cutoff durable refresh-fence evidence, image/artifact guard with zero owner calls on mismatch, per-ordinal scope recovery, exact-image owner restore/grant/database-read-only app verification, and normal rollback-floor acceptance.
 - Create: `scripts/audit-calendar-aad-0019.sh` — content-free, read-only three-phase 0019 local-proof and data-integrity audit.
 - Create: `scripts/test-calendar-aad-0019-audit.sh` — Task 13 synthetic-database contract test for local recoverability failures, audit phases, and artifact redaction.
 - Modify: `scripts/backup-postgres.sh` — accept a validated explicit 0019 artifact basename, require/check the typed rollout and actual-image binding at start and before artifact publication, reject paths/collisions, and preserve encryption, retention, and remote-copy guarantees.
@@ -3922,9 +3923,9 @@ async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_pro
     assert await provider_resource_ids_for(USER_ID) == ()
 ~~~
 
-Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `calendar.aad_0019.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching confirmed or independently safe known-terminal results, or an exact `oauth.refresh_credential_replaced` terminal consumption whose attempt/`fence_generation=F`/old refresh physical digest, old `refresh_token_identity_v1` and identity key version match started and whose `progressive_callback`, `targetless_callback`, or `provider_refresh` generation tuple is valid, may release the old fence. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, identity-key mismatch, and especially access-only rotation must not release it. For every deletable started/result group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer result remains. Race retention against confirmed/consumption CAS and preserve the anonymized M1 user row.
-保留原有测试覆盖：邮件正文/元数据和日程内容 AEAD 清理、CalendarEvent 描述/地点四列原子清空、未决 reconciliation 在命令脱敏前转 `needs_attention`、过期内容禁止重新提交、source-cache 与独立草稿/提案的删除区别、未认领取消、已认领有界核对、用户写屏障、provider-neutral token 清理、删除审计最小化以及每张新增表的 retention-role 权限。还要证明普通过期 audit 不因 fence 例外被误保留，旧 started 与较新 terminal/result 不能提前删除，且清理不读取后续 credential lineage。
-追加的 coordinator RED tests 必须覆盖：started 尚未提交前 provider call 为零；同一 connection 双 Worker/Taskiq duplicate delivery 只有一个 provider call；provider response 后 connection lease 丢失、CAS miss、commit unknown、`TransientProviderError` 和网络未知均写入稳定 non-retryable unknown/`needs_attention`，后续 delivery 的 provider call 为零；所有 writer 都经过同一 `OAuthRefreshCoordinator`，不会有适配器自有 retry 或第二个 upsert boundary。targetless callback 必须先 claim/freeze candidate existing connection，命中同一 normalized identity 时保持 `F <= G`、G/G/G、无 target `T`，不创建第二行；identity mismatch、断开、并发竞争和 stale CAS 全部 fail closed。identity RED tests 先用独立标准库实现固定 HKDF/HMAC vector，再覆盖 key rotation、same-token re-encryption 与 A→B→A rollback；expected derived key/message/HMAC 不得由 production helper 生成，任何真实 token/HMAC key 都不得进入输出。
+Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `oauth.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching `oauth.refresh_confirmed` closes only its own automatic started. An exact `oauth.refresh_credential_replaced` may close an older unresolved fence only when it binds the original automatic attempt/started source/connection digest/F, both original pre-digests, old identity/fixed key version, the recovery OAuthAttempt and recovery-started event, valid F/S/T with `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, persisted expiry, stable result code, and strict event ordering. `oauth.refresh_recovery_authorization_unsatisfied` closes only its recovery attempt, so multiple unsatisfied pairs leave the original fence unresolved. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, changed key material, automatic different-token rotation, and access-only rotation must not release it. For every deletable group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer confirmed/unsatisfied/consumption remains. Race retention against confirmed/recovery-result/consumption CAS and preserve the anonymized M1 user row.
+保留原有测试覆盖：邮件正文/元数据和日程内容 AEAD 清理、CalendarEvent 描述/地点四列原子清空、未决 reconciliation 在命令脱敏前转 `needs_attention`、过期内容禁止重新提交、source-cache 与独立草稿/提案的删除区别、未认领取消、已认领有界核对、用户写屏障、provider-neutral token 清理、删除审计最小化以及每张新增表的 retention-role 权限。还要证明普通过期 audit 不因 fence 例外被误保留，旧 started 与较新 confirmed/unsatisfied/replacement 不能提前删除，且清理不读取后续 credential lineage。
+追加的 coordinator RED tests 必须覆盖：automatic started 尚未提交前 provider call 为零；同一 connection 双 Worker/Taskiq duplicate delivery 只有一个 provider call；provider response 后 connection lease 丢失、CAS miss、commit unknown、`TransientProviderError` 和网络未知留下 unresolved fence，后续 delivery 的 provider call 为零；preflight 与所有 Google/Microsoft mail/calendar automatic refresh 都经过同一 `OAuthRefreshCoordinator`，不会有适配器自有 retry 或第二个 upsert boundary。known-valid missing/same/different response 都写完整 confirmed，Google access-only 也 confirmed；different token 不消费任何旧 fence。explicit recovery 取得同一 lease但不创建第二个 automatic started，第一次 unsatisfied 保留原 fence，用户创建第二个 OAuthAttempt 后 different token 才消费。targetless callback 命中 fenced existing identity 时在任何 local credential/scope/capability 保存前 fail closed。identity RED tests 先用独立标准库实现固定 HKDF/HMAC vector，再覆盖同一固定 APP root-key/version 的 API/Worker/CLI 构造一致性、same-token re-encryption 与 A→B→A rollback；M2 只测试 immutable-key 行为，不测试多 key 生命周期，expected derived key/message/HMAC 不得由 production helper 生成，任何真实 token/HMAC key 都不得进入输出。
 
 - [ ] **Step 2: Run tests and observe the expected failure**
 
@@ -3948,26 +3949,31 @@ connection/thread only; source-calendar deletion does the same for proposals/sna
 created drafts remain.
 
 Replace the final generic bounded delete for `AuditEventModel` with a dedicated user-scoped cleanup query. It may
-delete ordinary non-fence audit rows by cutoff, but the generic path must exclude started/confirmed/terminal and
-`oauth.refresh_credential_replaced` event types. The dedicated path classifies only the closed, content-free 0019
-fence/consumption metadata and protects every unresolved started attempt. For each candidate, explicitly filter
-`user_id`; lock owning connection, access credential row, refresh credential row, and started audit in that order—
-confirmed and every credential-consumption transaction must use the same order—then requery a matching
-confirmed/known-terminal result or terminal consumption before deletion. A known-terminal permits cleanup only
-when an independent persistent state makes provider invocation impossible; otherwise preserve the started event.
-Release protection for an `oauth.refresh_credential_replaced` only when attempt/F/old refresh physical digest, old
-`refresh_token_identity_v1`, identity key version, and `started_source` exactly match started and the closed source
-tuple is valid: `progressive_callback` requires `source_generation=S`, `pre_generation=post_generation=T=S+1` and
-`F <= S`; `targetless_callback` requires `F <= G` and G/G/G with no target; `provider_refresh` requires
-`source_generation=pre_generation=post_generation=G`. Once valid, do not compare later connection generation or
-refresh snapshot, and do not retain later credential lineage merely for cleanup. A permanent disconnected or
-data-disposition terminal is also allowed when independently persisted. Any physical snapshot or generation change
-without a matching terminal result preserves the fence. Candidate parsing must never decrypt or load token/content
-fields. When cleanup is safe, delete the started plus the matching terminal result as one transaction, and only when
-every row in that group is older than cutoff, equivalently `max(created_at) < cutoff`; never delete a newer result
-because its started is old, and never delete the result first and strand a false unresolved started. Identity key
-versions referenced by the group remain available through cleanup. The exception must neither retain unrelated audit
-history nor cross user boundaries.
+delete ordinary non-fence audit rows by cutoff, but the generic path must exclude exactly
+`oauth.refresh_started`, `oauth.refresh_confirmed`, `oauth.refresh_recovery_authorization_started`,
+`oauth.refresh_recovery_authorization_unsatisfied`, and `oauth.refresh_credential_replaced`. The dedicated path
+classifies only these closed, content-free metadata schemas and protects every unresolved automatic started attempt.
+For each candidate, explicitly filter `user_id`; lock owning connection, access credential row, refresh credential
+row, and matching started audit in that order—confirmed, recovery-result, and replacement transactions use the same
+order—then requery the exact event group. An automatic success group is started + confirmed. An unsuccessful
+recovery group is recovery-started + unsatisfied and never closes the original automatic fence. The unsatisfied
+event must match the recovery event/OAuthAttempt IDs, original attempt/started source/connection digest, F/S/T, both
+frozen pre-digests, old identity/fixed key version, stable result code, and `created_at` strictly later than the
+recovery-started event. A successful recovery group is the original automatic started + matching recovery-started +
+replacement consumption; the replacement is valid only when it binds original attempt/started source/connection
+digest/F, both original pre-digests, old identity
+and fixed key version, recovery OAuthAttempt/event IDs, valid `F <= S` and `T=S+1` with
+`pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, persisted
+expiry, stable result code, and `created_at` strictly later than both matching started events. Automatic
+`provider_refresh`, targetless
+callback, physical snapshot/generation changes, same-token re-encryption, access-only changes, or an unsatisfied
+recovery never release the original fence. Once replacement proof is valid, do not compare later connection
+generation or refresh snapshot and do not retain later credential lineage merely for cleanup. Candidate parsing must
+never decrypt or load token/content fields. Delete only a complete group whose every event is older than cutoff,
+equivalently `max(created_at) < cutoff`; never delete a newer result because its started is old, and never delete a
+result first and strand a false unresolved started. M2 uses one fixed APP root key/version, so cleanup has no
+historical identity-key retention branch. The exception must neither retain unrelated audit history nor cross user
+boundaries.
 
 - [ ] **Step 4: Implement the all-data write barrier and bounded final reconciliation**
 
@@ -4006,93 +4012,84 @@ all of these contracts:
   credential commit, and artifact publish, the same session must prove connection liveness and ownership of the
   fixed advisory lock without reentrant reacquisition. Inject connection drop and explicit lock loss at each next
   boundary and assert fail-closed behavior; process/connection exit relies on PostgreSQL automatic release;
-- every existing-connection caller first uses the shared `OAuthRefreshCoordinator` to acquire a connection-scoped
-  session advisory lease. The preflight holds both revision-global and connection leases before provider access;
-  connections/progressive/targetless callbacks and Google/Microsoft mail/calendar Workers use the same application
-  port. Run two Workers/deliveries against one connection and assert exactly one provider call. Inject response-after-
-  lease-loss, network unknown, CAS miss and commit unknown; each creates a stable non-retryable fence/needs-attention
-  result, and the next Taskiq/`TransientProviderError` delivery performs zero provider calls. No adapter-owned retry,
-  `ensure_connection`, unconditional upsert, or second credential writer is reachable;
-- before any provider refresh, a short transaction commits an existing append-only `AuditEvent` with
-  `event_type="calendar.aad_0019.refresh_started"`, `task_id=NULL`, and `actor_type="system"`. Its metadata contains
-  only `fence_schema_version="calendar_aad_0019_refresh_fence.v1"`,
-  `refresh_attempt_id=<new canonical lowercase UUID>`, `source`, `rollout_digest_v1`, `connection_digest`,
-  `fence_generation=F`, `pre_credential_snapshot_digest_v1`, `pre_refresh_credential_snapshot_digest_v1`,
-  old `refresh_token_identity_v1`, `refresh_token_identity_key_version`, and a stable result code—never
-  token, raw scope, provider response, body, raw `calendar_id`, or credential timestamps. Local credential
-  existence/ownership/AEAD-decryption checks must already have passed; access-only,
-  missing, mismatched, or undecryptable refresh credentials produce neither started nor provider call. Assert
-  provider calls remain zero until the started transaction commits and that no 0018 migration or new table is
-  introduced for the fence;
-- fence lookup is durable across process restarts and independent of basename. A started-without-confirmed or
-  content-free needs-attention outcome blocks the same and different basename before provider access. Every
-  confirmed/`calendar.aad_0019.refresh_terminal` lookup matches the same attempt UUID, `rollout_digest_v1`,
-  `fence_generation=F`, full pre-digest, and refresh pre-digest. A confirmed event additionally requires both post
-  digests, the actual persisted `token_expires_at`, and
-  `rollout_deadline_candidate = token_expires_at - 900 seconds`; none is optional. A matching
-  `oauth.refresh_credential_replaced` event permanently consumes the old fence only when it binds the original
-  attempt/F/old refresh physical digest/old identity/key version and validates one closed source tuple:
-  `progressive_callback` has `source_generation=S`, `pre_generation=post_generation=T=S+1`, `F <= S`;
-  `targetless_callback` has `F <= G` and G/G/G with no target; `provider_refresh` has
-  `source_generation=pre_generation=post_generation=G`. Preflight validates that terminal fact independently from
-  the later connection/capability/scope/credential preconditions and recomputes current plaintext identity with the
-  event's key version; identity equal to the consumed old identity is credential rollback even when its physical
-  digest differs. Basename, generation, either physical digest,
-  ciphertext/nonce/`updated_at`, access-only rotation, or an operator waiver cannot bypass the fence without the
-  matching consumption;
-- the Google and Microsoft progressive recovery starts only on the original connection while it remains `connected`.
-  Under the connection/coordinator lock it loads `source_generation=S`, the current refresh snapshot/identity, and
-  exactly one matching unresolved fence; it requires `S >= fence_generation=F` and current identity (using the
-  fence key version) equal to the fence old identity, while physical digest is used only for old-snapshot CAS. The
-  existing `set_capabilities_authorizing` then performs the only generation increment to
-  `target_generation=T=S+1`, while `OAuthAttempt` persists only its existing target `T`. Cover both `F=S` and
-  `S>F`; zero/multiple matching fences or a start-time identity mismatch fail closed. Changes between `F` and
-  `S` do not themselves release the fence;
-- targetless callback tests start by freezing a candidate existing connected row and its complete credential snapshot
-  without a target generation. Before exchange the coordinator must claim that same connection; normalized provider
-  identity must resolve to that row, and callback persistence uses `source_generation=pre_generation=post_generation=G`
-  with `F <= G`, no generation increment, and no second connection. Identity mismatch, candidate disconnect,
-  concurrent callback, missing/empty/same refresh, response-after-lock-loss, or CAS miss keeps the old row unchanged
-  and produces no consumption; a started/unknown attempt is never re-exchanged on Taskiq or transient delivery.
-- token exchange remains outside the database transaction. The callback uses the existing anti-replay check
-  `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`, derives `S=T-1`,
-  and under the target-`T` lock loads the old refresh credential plus the unique unresolved fence. It decrypts the
-  old refresh token only in controlled memory and uses `secrets.compare_digest` on canonical bytes. The exchange is
-  admitted by `OAuthRefreshCoordinator` after a committed started fence; a callback/network response is never a
-  license for an adapter-local retry. Only an
-  explicitly returned non-empty refresh token whose plaintext differs may, in one transaction, CAS the exact old
-  refresh snapshot/fence, persist new access/refresh credentials, actual scopes and capability states, and append
-  `oauth.refresh_credential_replaced`; callback completion keeps generation `T` and never increments again. The
-  consumption binds `proof_schema_version="oauth_refresh_credential_replaced.v1"`,
-  `source="progressive_callback"`, `connection_digest`, original `refresh_attempt_id`, `fence_generation=F`,
-  `old_refresh_credential_snapshot_digest_v1`, `new_refresh_credential_snapshot_digest_v1`,
-  `old_refresh_token_identity_v1`, `new_refresh_token_identity_v1`, both identity key versions,
-  `source_generation=S`, `pre_generation=post_generation=T`, and a stable result code; the non-null AuditEvent
-  `user_id` binds ownership. No token, plaintext hash, raw scope, or provider response is persisted. Inject stale
-  target and concurrent reauthorization callbacks plus failure after each credential, scope, capability, or
-  consumption mutation and during commit; every point rolls back all callback persistence together, including a
-  crash after provider response but before the local transaction commits. Missing/empty refresh token, identical
-  plaintext, access-only update, same-plaintext re-encryption, a disconnected connection, or unavailable old
-  plaintext does not consume the fence. Disconnect/reconnect, a new connection mapping, fabricated consumption,
-  and generation-only change are forbidden recovery substitutes;
-- `application/ports/oauth_refresh.py` is the sole admission/claim boundary and
-  `application/ports/credential_rotation.py` is the sole typed CAS/result boundary for existing-connection
-  credential writes. Callback, targetless callback, preflight, and Google/Microsoft mail/calendar Worker tests must
-  carry the read connection generation plus both rows' `id`, `user_id`, `connection_id`, kind, ciphertext, nonce, key
-  version, expiry, and `updated_at`, and the old refresh identity/key version; the shared repository locks connection
-  → access row → refresh row → matching started audit and rechecks every field. Started must be committed before
-  network and every Taskiq/`TransientProviderError` re-entry after started proves zero provider calls.
-  A definite ordinary Worker rotation from local refresh plaintext D1 to different D2 commits access/refresh plus
-  `source="provider_refresh"`, `source_generation=pre_generation=post_generation=G` consumption when exactly one
-  unresolved fence matches D1. Missing/empty/same refresh updates access only and preserves the refresh row
-  byte-for-byte. With no matching unresolved fence, a valid rotation commits normally without a consumption event;
-  multiple matching fences fail closed. Stale generation/row CAS, unknown result, or transaction failure changes no
-  credential and consumes no fence. Race callback versus Worker, mail versus calendar, and duplicate Worker delivery;
-  exactly one terminal consumer may win. After consumption, exercise capability `action_required` followed by the
-  ordinary reauthorization path, later generation changes, and later scope/access/refresh rotations; the old fence
-  stays consumed, while a current plaintext identity equal to the consumed old identity (computed with its recorded
-  key version) fails as rollback even if physical ciphertext/digest changed; physical digests remain only CAS/fence
-  bindings. In every case, the original D0 unknown preflight refresh call count remains unchanged.
+- every automatic existing-connection caller first uses the shared `OAuthRefreshCoordinator` to acquire a
+  connection-scoped session advisory lease. The preflight holds both revision-global and connection leases before
+  provider access; Google/Microsoft mail/calendar Workers use the same automatic application port. Run two
+  Workers/deliveries against one connection and assert exactly one provider call. Inject response-after-lease-loss,
+  network unknown, CAS miss and commit unknown; each leaves a stable unresolved fence/needs-attention result, and
+  the next Taskiq/`TransientProviderError` delivery performs zero provider calls. Explicit progressive recovery
+  obtains the same connection lease through a distinct one-time authorization-code path and does not create a
+  second automatic started. No adapter-owned retry, `ensure_connection`, unconditional upsert, or second credential
+  writer is reachable;
+- before any automatic provider refresh, a short transaction commits an existing append-only `AuditEvent` with
+  `event_type="oauth.refresh_started"`, `task_id=NULL`, and `actor_type="system"`. Its metadata contains exactly
+  `fence_schema_version="oauth_refresh_fence.v1"`, canonical `refresh_attempt_id`, `source`, applicable
+  source/target revision and `rollout_digest_v1` (canonical NULL for ordinary Worker refresh),
+  `connection_digest`, `fence_generation=G`, both pre-digests, old `refresh_token_identity_v1`, the fixed
+  `refresh_token_identity_key_version`, and a stable result code—never token, raw scope, provider response, body,
+  raw `calendar_id`, or credential timestamps. Local credential existence/ownership/AEAD-decryption checks must
+  already have passed; access-only, missing, mismatched, or undecryptable refresh credentials produce neither
+  started nor provider call. Assert provider calls remain zero until the started transaction commits and that no
+  0018 migration or new table is introduced for the fence;
+- fence lookup is durable across process restarts and independent of basename. An unresolved
+  `oauth.refresh_started` blocks the same and different basename and all automatic Worker refresh before provider
+access. `oauth.refresh_confirmed` must match the same attempt/source/started source and connection digest,
+revision/rollout tuple, G/G/G, both
+pre-digests, both required post-digests, old/new identity and fixed key version, persisted expiry,
+  missing/same/different disposition, stable result code, and the 0019 deadline candidate; its `created_at` is
+  strictly later than started. A matching `oauth.refresh_credential_replaced` permanently consumes an older fence
+only when it binds the original attempt/started source/connection digest/F, both original pre-digests, old
+identity/version,
+  recovery OAuthAttempt/event IDs, `F <= S`, `T=S+1`, `pre_generation=post_generation=T`, both required
+  post-digests, different-token new identity/version, persisted expiry, stable result code, and `created_at`
+  strictly later than both started events. Preflight validates that proof independently from later readiness and
+  recomputes current plaintext identity using the fixed APP root key/version; identity equal to the consumed old
+  identity is rollback even when its physical digest differs. Basename, generation, either physical digest,
+  ciphertext/nonce/`updated_at`, access-only rotation, automatic different-token rotation, or an operator waiver
+  cannot bypass the fence;
+- Google and Microsoft progressive recovery start only on the original connection while it remains `connected`.
+  Under the connection lock it loads `source_generation=S`, current refresh snapshot/identity, and exactly one
+  unresolved automatic fence; it requires `S >= F` and current identity equal to the fence old identity. The
+  existing `set_capabilities_authorizing` performs the only increment to `target_generation=T=S+1`. In the same
+  transaction create the existing target-`T` `OAuthAttempt` and append
+  `oauth.refresh_recovery_authorization_started` with exact recovery schema/source, OAuthAttempt ID, connection
+  digest, original refresh attempt/started source, F/S/T, both frozen pre-digests, old identity/fixed key version,
+  stable result code, and `created_at` strictly later than the original automatic started. Cover `F=S`, `S>F`,
+  zero/multiple fences, start-time identity mismatch, and atomic rollback of the generation/OAuthAttempt/event;
+- targetless callback tests require that a normalized identity resolving to an existing connected row with an
+  unresolved fence returns `oauth_refresh_recovery_requires_connection_start` before saving any credential, scope,
+  or capability. It may append only the optional content-free blocked audit; it creates no candidate snapshot,
+  target generation, replacement consumption, or second connection, and never reaches `ensure_connection` or an
+  unconditional upsert;
+- authorization-code exchange remains outside the database transaction. The callback consumes the state/code once,
+  resolves recovery linkage by `OAuthAttempt.id`, enforces
+  `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`, obtains the same
+  connection lease, and rechecks the original fence plus frozen snapshot/identity before exchange. It decrypts old
+  refresh plaintext only in controlled memory and uses `secrets.compare_digest`. Only an explicitly returned
+  non-empty different refresh token may, in one transaction, CAS the exact target-`T` state, persist access/refresh
+  credentials, actual scopes and capability states, and append `oauth.refresh_credential_replaced`; generation
+  remains `T`. The proof metadata is the complete closed set defined above, including both original pre-digests,
+  both required post-digests, recovery OAuthAttempt/event IDs, old/new identity versions, persisted expiry and
+  strict timestamps. Missing/empty/same refresh, user denial, admin-consent failure, provider/network/identity/lease/
+  CAS/commit failure does not persist credential/scope/capability or consume the original fence; when the local
+  result is safely committable, append `oauth.refresh_recovery_authorization_unsatisfied` bound to the same recovery
+  event/OAuthAttempt IDs, original attempt/started source/fence, F/S/T, both frozen pre-digests, old identity/fixed
+  key version, stable result code, and `created_at` strictly later than recovery started. It closes only that
+  OAuthAttempt. The user may create a new OAuthAttempt for another explicit attempt, but the old code is never
+  replayed. Inject failure after every credential/scope/capability/event mutation and during commit;
+- `application/ports/oauth_refresh.py` is the sole automatic provider-call admission and explicit recovery lease
+  boundary, while `application/ports/credential_rotation.py` is the sole typed CAS/result boundary. API deps,
+  mail Worker, calendar Worker, and preflight CLI construct AEAD and identity services from the same
+  `APP_MASTER_KEY_FILE` bytes and fixed key version. All automatic callers carry generation plus both complete row
+  snapshots and old identity/version; the shared repository locks connection → access row → refresh row → matching
+  started audit and rechecks every field. Known-valid missing/same/different Worker responses all commit
+  `oauth.refresh_confirmed`; missing/same preserves the refresh row byte-for-byte, while different updates both rows
+  but never consumes an older fence. An unresolved predecessor prevents the automatic call entirely. Race mail
+  versus calendar and duplicate Worker delivery; exactly one provider call/confirmed result may win. Race an
+  explicit recovery callback against automatic entry and prove the unresolved fence keeps automatic calls at zero
+  while at most one different-token recovery consumes it. After consumption, later capability/generation/scope/
+  credential changes do not revive the fence, while current identity equal to the consumed old identity fails as
+  rollback. In every case, the original D0 unknown preflight refresh call count remains unchanged.
 - each pair must have the exact same-user cursor, owning connection in `connected`, `calendar.read` in `enabled`,
   both access and refresh AEAD credentials, and exact `ProviderCalendar`; disconnected, missing/mismatched,
   disabled, revoked, degraded, action-required, access-only, missing refresh, or refresh AEAD decryption failure
@@ -4110,22 +4107,23 @@ all of these contracts:
   After validation, the shared credential-rotation repository opens one short transaction, rechecks the owning
   connection, exact `authorization_generation`, and `calendar.read` capability; conditionally matches both old
   snapshots; writes access-token AEAD/expiry and optional rotated refresh-token AEAD; and appends
-  `calendar.aad_0019.refresh_confirmed` with the same attempt UUID, `rollout_digest_v1`, `fence_generation=F`, both
-  pre-digests, required `post_credential_snapshot_digest_v1`, required
-  `post_refresh_credential_snapshot_digest_v1`, the exact persisted `token_expires_at`, required
-  `rollout_deadline_candidate = token_expires_at - 900 seconds`, and a stable result code. Credential mutation without
-  the confirmed event, or confirmed without the credential mutation, must be impossible. When the provider omits a
-  new refresh token or returns the same plaintext, prove the old refresh credential row is
-  unchanged and preserve it byte-for-byte. Existing unconditional credential upsert/`rotate_access_token()`
-  semantics are removed rather than retained as a second writer;
+  `oauth.refresh_confirmed` with the same attempt/source, revision/rollout tuple, G/G/G, both pre-digests, required
+  `post_credential_snapshot_digest_v1`, required `post_refresh_credential_snapshot_digest_v1`, old/new identity and
+  fixed key version, exact persisted `token_expires_at`, missing/same/different disposition, required
+  `rollout_deadline_candidate = token_expires_at - 900 seconds`, a stable result code, and `created_at` strictly later
+  than started. Credential mutation without confirmed, or confirmed without credential mutation, must be impossible.
+  When the provider omits a new refresh token or returns the same plaintext, prove the old refresh row is unchanged
+  byte-for-byte; when it returns a different non-empty token, prove both rows change under CAS but no
+  `oauth.refresh_credential_replaced` is appended. Existing unconditional credential upsert/
+  `rotate_access_token()` semantics are removed rather than retained as a second writer;
 - a credential CAS miss, connection/generation/capability change, post-provider lease loss, or transaction commit
   failure rolls back both credential rows and confirmed event, cannot overwrite a concurrently refreshed token,
   prevents every later pair probe/artifact publication, leaves Alembic at 0018, and leaves a durable unresolved
   fence that blocks every later basename from calling the provider. Inject network unknown result,
-  `invalid_grant`, malformed response, scope shrink, lock loss, a competing OAuth callback/Worker rotation, CAS
-  failure, and commit failure; assert the next invocation has `provider_calls == 0` unless an exact matching terminal
-  consumption exists and the independently checked current preconditions pass;
-- if credential CAS plus `refresh_confirmed` commits and the process crashes before rollout artifact publication,
+  `invalid_grant`, malformed response, scope shrink, lock loss, a competing explicit recovery/Worker entry, CAS
+  failure, and commit failure; assert the next invocation has `provider_calls == 0` unless an exact matching
+  progressive replacement proof exists and the independently checked current preconditions pass;
+- if credential CAS plus `oauth.refresh_confirmed` commits and the process crashes before rollout artifact publication,
   rerunning the same rollout recognizes the current credential as the confirmed post-snapshot, resumes deadline/
   pair probes from persisted token and expiry, publishes the artifact when valid, and does not call refresh again;
 - the digest unit tests independently decode the three fixed base64 canonical-byte vectors from design section
@@ -4138,8 +4136,10 @@ all of these contracts:
   non-canonical UUID, integer, UTC timestamp, image ID, field order, or silent v1 schema changes;
 - the identity unit test independently derives the fixed HKDF-SHA256 fingerprint key and 73-byte framed HMAC message,
   then compares the fixed `refresh_token_identity_v1` constant from design section 17.3 without calling production
-  helpers. It covers active-key rotation while old event versions remain readable, missing-old-key fail closed,
-  same-token re-encryption and A→B→A rollback, and proves no plaintext/master-key/derived-key output;
+  helpers. It proves API deps, mail Worker, calendar Worker and preflight CLI construct the helper from the same fixed
+  `APP_MASTER_KEY_FILE` bytes and `AeadCipher.key_version`; missing or changed root key/version fails closed. It also
+  covers same-token re-encryption and A→B→A rollback, and proves no plaintext/root-key/derived-key output. M2 has no
+  alternate-key lifecycle case;
 - each valid pair calls only `initial_pages(scope_key)` and must obtain a final cursor; `directory_pages()`, a
   connection-level owner, every other pair, and all provider write adapters receive zero calls;
 - the probe consumes the same bounded event-scope page contract as post-migration recovery but persists no
@@ -4320,11 +4320,12 @@ bash scripts/test-tooling.sh
 bash scripts/test-deployment.sh
 ~~~
 
-Expected: FAIL because the versioned digest helpers and independent fixed vectors, versioned HKDF/HMAC identity,
-coordinator claim/lease state machine and zero-call unknown/retry contracts, callback/Worker source-tagged
-terminal consumption plus atomic rollback boundary, shared full-row/generation/identity credential snapshot CAS, 0018
-revision-global advisory lease, existing-AuditEvent durable refresh fence, atomic confirmed event, fence-aware
-retention, active-refresh/typed-rollout preflight, ordinal-aware marker-only task planner, dedicated task kind,
+Expected: FAIL because the versioned digest helpers and independent fixed vectors, fixed-root-key HKDF/HMAC identity,
+two-channel coordinator state machine and zero-call unknown/retry contracts, automatic started/confirmed handling,
+explicit progressive recovery started/unsatisfied/replacement plus atomic rollback boundary, targetless pre-save block,
+shared full-row/generation/identity credential snapshot CAS, 0018 revision-global advisory lease,
+existing-AuditEvent durable refresh fence, atomic confirmed event, fence-aware retention,
+active-refresh/typed-rollout preflight, ordinal-aware marker-only task planner, dedicated task kind,
 owner-before-secret artifact/image guard, exact-image no-pull atomic restore,
 database-enforced app-role verifier, marker-aware exact-scope path, one-off CLIs, and stopped-service/rollout-guard
 recipes do not exist.
@@ -4369,78 +4370,91 @@ base64 vectors in design section 17.3, verifies exact lengths `497`, `265`, and 
 `0746bb13c476b6009e8b73e5647daa6bbe8bc1a75f0f717a7632b36915c509e5`, never the production helper for expected
 values.
 
-Implement `oauth_refresh_identity.py` as the only canonical `refresh_token_identity_v1` helper. Derive the
-fingerprint key from the versioned application master key with the fixed HKDF-SHA256 salt/info labels in design
-section 17.3, then HMAC-SHA256 the domain-separated framed non-empty plaintext; return lowercase hex plus the key
-version only to controlled application memory/closed fence metadata. The independent unit test must hard-code the
+Implement `oauth_refresh_identity.py` as the only canonical `refresh_token_identity_v1` helper. API deps, mail
+Worker, calendar Worker and the preflight CLI composition root all read the same `APP_MASTER_KEY_FILE` bytes and use
+the same fixed `AeadCipher.key_version` to construct both AEAD and identity services. Derive the fingerprint key with
+the fixed HKDF-SHA256 salt/info labels in design section 17.3, then HMAC-SHA256 the domain-separated framed non-empty
+plaintext; return lowercase hex plus the fixed key version only to controlled application memory/closed fence
+metadata. Do not add an independent identity Secret, multi-key lookup, or mutable-root setting. The
+independent unit test must hard-code the
 synthetic master-key vector (identity key version `7`), derived fingerprint key
 `47119abdcf6b97afcdd6416bf5a8b7771b314a630c53c1553aa1789cc02f95c1`, 73-byte message base64
 `QUlFTVBMT1lFRS9vYXV0aC9yZWZyZXNoLXRva2VuLWlkZW50aXR5L3YxAAEAAAAZc3ludGhldGljLXJlZnJlc2gtdG9rZW4tQQ==`, and
 expected identity `9de29ff352c78092c4b7dae5e0e3093fee49815a3473d75c3876e3b316222564`; expected key/message/HMAC must
-come from an independent standard-library path, never the production helper. Key rotation keeps old versions until
-all unresolved/consumption/rollback/retention references expire; missing old key fails closed. A→B→A and
-same-token re-encryption must fail rollback based on identity even when physical digests differ, and no test/log/release
-output may print plaintext, master key, derived key, or real identity.
+come from an independent standard-library path, never the production helper. M2 fixes the APP root key/version;
+missing or changed key material fails closed and requires a future ADR/里程碑 rather than an implicit keyring.
+A→B→A and same-token re-encryption must fail rollback based on identity even when physical digests differ, and no
+test/log/release output may print plaintext, root key, derived key, or real identity.
 
 Implement `application/ports/oauth_refresh.py` and `infrastructure/db/repositories/oauth_refresh_coordinator.py` as
-the shared coordinator used by `connections.py`, `calendar_aad_preflight.py`, `sync_mail.py`, `sync_calendar.py`,
-and both provider families. The coordinator claims a connection-scoped session advisory lease, freezes generation,
-complete snapshots, identity and key version, commits `refresh_started` before network, releases business
-transactions during I/O, and requires the same lease plus complete snapshot/generation CAS for the atomic result. Its
-source union is `calendar_aad_preflight`, `progressive_callback`, `targetless_callback`, and `provider_refresh`. A
-started attempt, response-after-lock-loss, network unknown, CAS miss, or commit unknown becomes stable
-non-retryable `oauth_refresh_result_unknown`/`needs_attention`; Taskiq and `TransientProviderError` re-entry reads
-the fence and must perform zero provider calls. Integration tests run two Workers against one connection and prove
-exactly one provider call, plus response-after-lock-loss/CAS-miss cases with no replay. New connection bootstrap is
-the only no-old-credential exception; all existing connections use the coordinator and never `ensure_connection` or
-an unconditional upsert.
+the automatic coordinator used by `calendar_aad_preflight.py`, `sync_mail.py`, `sync_calendar.py`, and both provider
+families, plus the explicit-recovery connection lease used by `connections.py`. Automatic source union is exactly
+`calendar_aad_preflight | provider_refresh`. An automatic claim freezes generation, complete snapshots, identity and
+fixed key version, rejects any unresolved predecessor, commits `oauth.refresh_started` before network, releases
+business transactions during I/O, and requires the same lease plus complete snapshot/generation CAS for atomic
+`oauth.refresh_confirmed`. A started attempt, response-after-lock-loss, network unknown, CAS miss, or commit unknown
+becomes stable non-retryable `oauth_refresh_result_unknown`/`needs_attention`; Taskiq and
+`TransientProviderError` re-entry reads the fence and performs zero provider calls. Explicit progressive recovery
+uses the same connection lease around its one-time code exchange but never creates another automatic started.
+Integration tests run two Workers against one connection and prove exactly one provider call, plus response-after-
+lock-loss/CAS-miss cases with no replay. New connection bootstrap is the only no-old-credential exception; existing
+connections never use `ensure_connection` or an unconditional upsert to bypass the protocol.
 
 Extend the existing Google/Microsoft progressive-authorization start/callback use case rather than introducing an
-OAuth-only service. The unresolved-fence callback source has three explicit generations. `refresh_started` records
-`fence_generation=F`. When the original connection is still `connected`, the progressive reauthorization start
+OAuth-only service. The original automatic `oauth.refresh_started` records `fence_generation=F`. When the original
+connection is still `connected`, the progressive reauthorization start
 locks it, reads `source_generation=S`, the current refresh snapshot, and exactly one matching unresolved fence, and
-requires `S >= F` plus current identity recomputed with the fence key version equal to the fence old identity;
+requires `S >= F` plus current identity recomputed with the fixed key version equal to the fence old identity;
 physical digest is only an old-snapshot CAS input. Only then may the existing
 `set_capabilities_authorizing` perform its existing single increment to `target_generation=T=S+1`; the existing
-`OAuthAttempt.target_authorization_generation` persists only `T`. Do not add a second persisted generation field.
-Other generation changes between `F` and `S` never release the fence by themselves.
+`OAuthAttempt.target_authorization_generation` persists only `T`. In that same transaction create the OAuthAttempt
+and append `oauth.refresh_recovery_authorization_started` with exactly the recovery schema/source, OAuthAttempt ID,
+connection digest, original refresh attempt/started source, F/S/T, both frozen pre-digests, old identity/fixed key
+version and stable result code. Its `created_at` must be strictly later than the original automatic started. Do not
+add a second persisted generation field or a 0018 migration. Other generation changes between `F` and `S` never
+release the fence by themselves.
 
 Keep provider token exchange outside the database transaction. During callback persistence, lock the target
 connection and enforce the existing anti-replay equality
 `connection.authorization_generation == OAuthAttempt.target_authorization_generation == T`; derive `S=T-1`, load
 the old refresh credential and the unique matching unresolved fence under that target-`T` lock, and recheck
 `F <= S` plus the exact old snapshot/identity. A stale callback or concurrent later reauthorization fails closed on
-the target mismatch. Decrypt old refresh plaintext only in controlled memory. Callback persistence always uses one
-short transaction for access credential, connection scopes, requested capability states, and any refresh-row change.
-A provider response is eligible for terminal consumption only when it explicitly contains a non-empty new refresh
-token and `secrets.compare_digest(old_bytes, new_bytes)` is false; that transaction then also updates the refresh row
-and appends an `AuditEvent` with `event_type="oauth.refresh_credential_replaced"`. Missing/same refresh preserves the
-refresh row byte-for-byte and appends no consumption. Generation remains `T` and must not increment again.
+the target mismatch. Resolve the recovery association by `OAuthAttempt.id`, obtain the same connection lease, and
+consume state/code exactly once before exchange. Decrypt old refresh plaintext only in controlled memory and compare
+canonical bytes with `secrets.compare_digest`. A provider response is eligible to consume the original fence only
+when it explicitly contains a non-empty different refresh token and normalized identity/scope/expiry validation
+passes. One short transaction then CASes target `T`, writes access/refresh credentials, actual scopes and requested
+capability states, and appends `oauth.refresh_credential_replaced`; generation remains `T` and never increments
+again.
 
-The consumption has non-null `user_id` and closed metadata containing only
-`proof_schema_version="oauth_refresh_credential_replaced.v1"`, `source="progressive_callback"`,
-`connection_digest`, original `refresh_attempt_id`, `fence_generation=F`,
-`old_refresh_credential_snapshot_digest_v1`, `new_refresh_credential_snapshot_digest_v1`,
-`source_generation=S`, `pre_generation=post_generation=T`, and a stable result code. It never persists token
-plaintext, a plaintext hash, raw scope, or provider response. Enforce `F <= S`, `T=S+1`, exact old snapshot/fence
-and generation CAS, then append credential and consumption in one transaction. Missing/empty/same refresh,
-access-only update, same-plaintext re-encryption, disconnected connection, or unavailable old plaintext does not
-consume a fence. Disconnect deletes the old credential, so reconnecting or mapping a new connection cannot
-reconstruct or fabricate consumption. If the affected scope remains, only an existing explicitly user-authorized
-data-disposition flow may remove it; if that flow does not apply, stop and request a newly approved design. Failure
-injection after any credential, scope, capability, or consumption mutation and during commit must roll back the full
-callback transaction; a network response alone is never evidence.
+The replacement event has non-null `user_id` and closed metadata containing exactly
+`proof_schema_version="oauth_refresh_credential_replaced.v1"`, `source="progressive_recovery"`, original
+`started_source`, `connection_digest`, original `refresh_attempt_id`, `recovery_oauth_attempt_id`,
+`recovery_authorization_started_event_id`, `fence_generation=F`, `source_generation=S`,
+`target_generation=T`, `pre_generation=post_generation=T`, both original pre-digests, both required post-digests,
+old/new `refresh_token_identity_v1` with fixed key versions, actual persisted expiry, and stable result code. Enforce
+`F <= S`, `T=S+1`, exact old snapshot/fence and generation CAS, and `created_at` strictly later than both original
+automatic started and matching recovery-started event. It never persists token plaintext, a plaintext hash, raw
+scope, or provider response. Failure injection after any credential, scope, capability, or event mutation and during
+commit must roll back the full callback transaction; a network response alone is never evidence.
 
-Add the targetless callback branch to the same use case, not to a second connection factory. Start locks and freezes
-the normalized candidate existing connection, current generation `G`, complete access/refresh snapshots and current
-identity; the callback claims that connection before exchange and then requires provider identity to normalize back to
-the same connected row. With a matching unresolved fence, only a non-empty refresh plaintext that differs under
-`secrets.compare_digest` may commit `source="targetless_callback"` with `F <= G` and
-`source_generation=pre_generation=post_generation=G`; no target `T` is stored and generation never increments.
-Identity mismatch, candidate disconnect, duplicate identity rows, missing/empty/same refresh, stale snapshot, lease
-loss, or CAS/commit failure leaves the old row unchanged and appends no consumption. A targetless attempt that is
-already started/unknown is not re-exchanged on callback/task retry; recovery uses the durable fence or a new explicit
-user-authorized attempt under the coordinator.
+Missing/empty/same refresh, user denial, missing administrator consent, provider/network failure, identity mismatch,
+lease loss, stale target, CAS miss or commit failure does not save credential/scope/capability and does not consume
+the original fence. When the local failure result can be safely committed, append
+`oauth.refresh_recovery_authorization_unsatisfied` bound to the same recovery-started event/OAuthAttempt, original
+fence, F/S/T, both frozen pre-digests, old identity/fixed key version and stable result code; its `created_at` is
+strictly later than recovery started. It closes only that OAuthAttempt. The user may explicitly create another
+progressive OAuthAttempt, but neither the prior state/code nor an exchange with unknown result may be replayed.
+Disconnect deletes the old credential, so reconnecting or mapping a new connection cannot reconstruct or fabricate
+replacement proof. If the affected scope remains, only an existing explicitly user-authorized data-disposition flow
+may remove it; otherwise stop and request a newly approved design.
+
+Keep the ordinary targetless OAuth path only for bootstrap or unfenced identity merge. If its normalized provider
+identity resolves to an existing connected row with an unresolved automatic fence, return
+`oauth_refresh_recovery_requires_connection_start` before saving any credential, scope, or capability. It may append
+only an optional content-free blocked audit. Do not add candidate snapshot fields, a migration, targetless
+consumption, a second connection, or an unconditional upsert; the user must begin a new connection-bound progressive
+OAuthAttempt instead.
 
 Before the CLI reads/checks a rollout artifact or invokes any provider, create a dedicated database connection and
 execute `SELECT pg_try_advisory_lock(20260809, 19)`. These fixed session-lock keys are the complete global domain
@@ -4455,63 +4469,52 @@ in-process mutex or basename lock is insufficient.
 The revision-global advisory lease is not the unknown-result protection. For each connection, first obtain the shared
 coordinator's connection-scoped session lease, freeze the current generation and both credential rows, derive
 `credential_snapshot_digest_v1` from the rows and `refresh_credential_snapshot_digest_v1` from the refresh row, and
-compute current `refresh_token_identity_v1` with the active/event key version before decrypting a token. Inspect
-existing content-free fence events before provider access. A `calendar.aad_0019.refresh_started` without a matching
-confirmed event, or a stable needs-attention result for that
-hashed connection, blocks provider access for every basename. Matching confirmed/terminal events require the exact
-canonical attempt UUID, `rollout_digest_v1`, `fence_generation=F`, full pre-digest, and refresh pre-digest. A
-confirmed event also requires both post-digests, the actual persisted `token_expires_at`, and deterministic
-`rollout_deadline_candidate = token_expires_at - 900 seconds`; if those fields and current credentials match, refresh
-already completed and the rollout resumes deadline/probe/artifact work from persisted token and expiry without
-another provider call. Otherwise, a matching `oauth.refresh_credential_replaced` terminal consumption closes the
-old fence only when the original attempt, that started event's fence generation/old digest, and the closed
-  `progressive_callback`, `targetless_callback`, or `provider_refresh` generation tuple are valid. That fact is monotonic: later generation,
-capability/scope, access, or refresh changes do not reactivate the fence and need not equal its commit-time
-post-state. A later `action_required` scope follows the ordinary existing-connection authorization-generation
-protocol and never rebinds the consumed fence. Preflight then independently validates the current connected
-connection, enabled capability, scopes, and decryptable credential. Before it creates a new attempt, it must recheck
-and freeze the current generation and both current row snapshots as that new event's `F` and pre-digests; it never
-carries forward the consumed fence's old pre-state. Recompute current plaintext identity with the consumed event's key
-version; identity equal to the consumed old identity is credential rollback and fails closed even when physical digest
-differs. Basename changes, access-only rotation, generation-only or physical-digest changes, same-plaintext
-re-encryption, direct SQL, or an operator waiver
-cannot reset the fence.
+compute current `refresh_token_identity_v1` with the fixed APP root key/version before decrypting a token. Inspect
+existing content-free fence events before provider access. An `oauth.refresh_started` without matching
+`oauth.refresh_confirmed` or valid explicit progressive replacement consumption blocks provider access for every
+basename. Confirmed lookup requires the exact canonical attempt/source, revision/rollout tuple, G/G/G, both
+pre-digests, both required post-digests, old/new identity/version, persisted expiry, disposition, deadline candidate
+and strict timestamp; if those fields and current credentials match, the rollout resumes from persisted token/expiry
+without another provider call. Only `oauth.refresh_credential_replaced` from explicit progressive recovery can
+close an older fence, and only when original attempt/started source/F, both original pre-digests, old
+identity/version, recovery OAuthAttempt/event IDs, F/S/T, both post-digests, different-token new identity/version,
+persisted expiry and strict timestamps are valid. Later generation/capability/scope/access/refresh changes do not
+reactivate a validly consumed fence. Preflight independently validates current readiness and freezes current
+generation/snapshots for any new automatic attempt. Current identity equal to consumed old identity is rollback even
+when physical digest differs. Basename changes, automatic different-token refresh, access-only rotation,
+generation/physical-digest changes, same-plaintext re-encryption, direct SQL, or an operator waiver cannot reset the
+fence.
 
 Implement `application/ports/oauth_refresh.py` plus `application/ports/credential_rotation.py` and their
-session-bound repositories as the only existing-connection credential writer boundary. The coordinator request
-first claims the connection lease and records the source; the typed rotation request then carries connection
-generation and complete access/refresh row snapshots, old identity/key version, and caller terminal fact. The
-implementation locks connection → access row → refresh row → matching started audit, rechecks all snapshot/identity
-columns, and exposes caller-specific atomic terminal facts: 0019 preflight appends its matching `refresh_confirmed`,
-while progressive/targetless callback or ordinary Worker may append `oauth.refresh_credential_replaced` consumption.
-`connections.py` composes the same session-bound helper so scopes/capabilities remain in the callback transaction;
-`sync_mail.py`, `sync_calendar.py`, mail/calendar Workers and preflight call the coordinator/repository ports
-directly. Remove unconditional mutation semantics from `email.py` instead of leaving a second writer. Unknown,
-lock-loss, CAS-miss and commit-failure paths persist a durable fence/needs-attention result; duplicate delivery
-reads it and makes zero provider calls.
+session-bound repositories as the only existing-connection credential writer boundary. Automatic requests carry
+source, generation, complete access/refresh snapshots and old identity/fixed key version; the implementation locks
+connection → access row → refresh row → matching started audit, rechecks every field, and atomically appends
+`oauth.refresh_confirmed`. Explicit progressive recovery uses the same snapshot/CAS helper inside the callback
+transaction so credentials/scopes/capabilities and either replacement proof or unsatisfied result remain atomic.
+`sync_mail.py`, `sync_calendar.py`, mail/calendar Workers and preflight call the automatic ports directly;
+`connections.py` calls the explicit-recovery lease/result path. Remove unconditional mutation semantics from
+`email.py` instead of leaving a second writer. Unknown, lock-loss, CAS-miss and commit-failure paths leave the
+automatic fence unresolved; duplicate delivery reads it and makes zero provider calls.
 
 Compare old/new refresh plaintext in controlled memory before persistence. A provider response with no refresh token
-or the same plaintext CAS-updates access only and preserves every refresh-row byte. For an ordinary Worker caller, a
-definite different token may update both rows; with exactly one matching unresolved fence it also appends
-`source="provider_refresh"` and `source_generation=pre_generation=post_generation=G`, while with no matching fence it
-performs an ordinary rotation without a consumption event. A targetless callback may consume only after the candidate
-existing row and normalized provider identity match, using G/G/G and `F <= G` with no target. A preflight caller
-appends `refresh_confirmed` for its own started attempt and never labels that same attempt as `provider_refresh`
-consumption. Multiple matching fences, stale generation/identity, any row CAS miss, lock loss, unknown result, or
-commit failure changes nothing. Lock and recheck the started row immediately before append so progressive callback,
-targetless callback, mail Worker, calendar Worker, and duplicate deliveries racing for one fence produce exactly one
-terminal consumer; Taskiq/`TransientProviderError` re-entry after started is a zero-call lookup.
+or the same plaintext CAS-updates access only and preserves every refresh-row byte; a different non-empty token
+updates both rows. Every known-valid automatic response—missing, same, or different—appends matching
+`oauth.refresh_confirmed` with `refresh_token_disposition`; none appends replacement consumption. An unresolved
+predecessor prevents automatic provider access, so a Worker can never repair it by rotation. Multiple unresolved
+fences, stale generation/identity, any row CAS miss, lock loss, unknown result, or commit failure changes nothing.
+Lock and recheck the started row immediately before confirmed append so mail/calendar duplicate deliveries produce
+exactly one provider call/result; Taskiq/`TransientProviderError` re-entry after started is a zero-call lookup.
 
 After all local credential existence/ownership/decryption checks succeed and immediately before the first permitted
 provider call, verify both the revision-global lease and the connection coordinator lease, then use a short
 application transaction to append
-`calendar.aad_0019.refresh_started` with `task_id=NULL` and `actor_type=system`, and commit it before entering the
+`oauth.refresh_started` with `task_id=NULL` and `actor_type=system`, and commit it before entering the
 adapter. Generate one random UUID for the newly permitted attempt, serialize it as canonical lowercase text, and
 reuse it for every result event. Metadata is a closed content-free schema containing only
-`fence_schema_version="calendar_aad_0019_refresh_fence.v1"`, `source="calendar_aad_preflight"`,
+`fence_schema_version="oauth_refresh_fence.v1"`, `source="calendar_aad_preflight"`,
 `refresh_attempt_id`, source/target revision, `rollout_digest_v1`, `connection_digest`, `fence_generation=F`,
 `pre_credential_snapshot_digest_v1`, `pre_refresh_credential_snapshot_digest_v1`, old
-`refresh_token_identity_v1`, `refresh_token_identity_key_version`, and `result_code`. It must
+`refresh_token_identity_v1`, the fixed `refresh_token_identity_key_version`, and `result_code`. It must
 not contain token bytes, raw scopes, provider response, body, raw `calendar_id`, or credential timestamps beyond
 the explicitly approved expiry on a confirmed result. Network I/O never occurs inside this transaction.
 
@@ -4535,24 +4538,24 @@ OAuth save/upsert or retain Calendar Worker `rotate_access_token()` as another b
 recheck the owning connection, exact `authorization_generation`, and enabled `calendar.read`; conditionally match
 both access and refresh rows against every frozen snapshot column; update access-token AEAD and exact
 `token_expires_at`; update refresh-token AEAD only for a different returned plaintext, otherwise preserve the proven
-old row byte-for-byte; and append `calendar.aad_0019.refresh_confirmed` with the same attempt UUID,
-`rollout_digest_v1`, hashed connection, `fence_generation=F`, `pre_credential_snapshot_digest_v1`, and
-`pre_refresh_credential_snapshot_digest_v1`, plus required `post_credential_snapshot_digest_v1`, required
-`post_refresh_credential_snapshot_digest_v1`, the actual persisted `token_expires_at`, required
-`rollout_deadline_candidate = token_expires_at - 900 seconds`, and a stable result code.
+old row byte-for-byte; and append `oauth.refresh_confirmed` with
+`result_schema_version="oauth_refresh_confirmed.v1"`, the same source/started source and attempt UUID,
+source/target revision, `rollout_digest_v1`, hashed connection,
+`fence_generation=source_generation=pre_generation=post_generation=F`, both pre-digests, both required
+post-digests, old/new identity with fixed key versions, actual persisted `token_expires_at`,
+`refresh_token_disposition="missing"|"same"|"different"`, required
+`rollout_deadline_candidate = token_expires_at - 900 seconds`, and a stable result code. Its `created_at` is strictly
+later than started. All three known-valid dispositions use this path; different updates the refresh row but does not
+append `oauth.refresh_credential_replaced`.
 Credential mutation and confirmed event are one atomic commit.
 Both row-count/snapshot predicates must succeed or the transaction rolls back and raises a stable needs-attention
 credential-conflict result. CAS miss, lease loss after provider response, or commit failure never overwrites a
 newer token, never runs pair probes, never publishes the artifact, leaves revision 0018, and leaves the started
-fence unresolved so all later basenames make zero provider calls until exact terminal consumption exists and current
-preconditions independently pass. Provider calls remain outside database transactions.
-
-Any content-free needs-attention or `calendar.aad_0019.refresh_terminal` event reuses the exact started attempt UUID,
-`rollout_digest_v1`, `fence_generation=F`, full pre-digest, and refresh pre-digest. A terminal result never acts as a
-same-snapshot replay waiver. Emit one only when the outcome is definitive and an independently persisted
-connection/data-disposition state prevents later provider
-invocation; otherwise leave the started attempt unresolved. Fence lookup, confirmed-crash recovery, unknown-result
-blocking, and retention all call the same two digest helpers and match the same closed metadata tuple.
+fence unresolved so all later basenames make zero provider calls until exact explicit progressive replacement proof
+exists and current preconditions independently pass. Invalid/unknown automatic outcomes do not create a separate
+terminal event; they leave the original started unresolved. Fence lookup, confirmed-crash recovery, unknown-result
+blocking, explicit recovery and retention all call the same digest/identity helpers and match the same closed
+metadata tuples. Provider calls remain outside database transactions.
 
 If the atomic credential/confirmed transaction commits and the process crashes before artifact publication, a
 later invocation of the same rollout must recognize the confirmed post-snapshot, reuse persisted token/expiry, and
@@ -4694,8 +4697,9 @@ ToolExecution, Task 18 command, or legacy v1 decrypt path.
 
 - [ ] **Step 8: Update runbooks, audit tooling, and deployment contracts**
 
-Document Google/Microsoft progressive and targetless authorization, the shared `OAuthRefreshCoordinator` protocol,
-identity-key rotation/A→B→A rollback, Microsoft administrator consent, global/provider kill switches, dedicated
+Document Google/Microsoft progressive recovery and targetless fenced-identity pre-save blocking, the shared
+`OAuthRefreshCoordinator` two-channel protocol, fixed APP root-key/version and A→B→A rollback, Microsoft
+administrator consent, global/provider kill switches, dedicated
 test-account allowlist, unknown-result zero-call handling, calendar restore, and duplicate/mis-send incident response.
 Once 0019's post-resync audit has passed, any general service has started, or any business write has occurred, define
 the application rollback floor as an 0019-compatible image that understands the version columns and writes only v2:
@@ -4709,21 +4713,21 @@ refresh-after/pre-migration encrypted backup and verify revision 0018 before sta
 
 The runbook and acceptance checklist must define the non-rolling production sequence exactly: keep write switches off; record the original 0018-compatible immutable image; disable Calendar scheduling and stop new ingress; gracefully drain and stop every pre-0019 CalendarEvent reader/writer—Caddy, API, Worker, and Scheduler—while PostgreSQL and Redis remain running; confirm no old `sync_calendar`, event read, or upsert remains; run only `just calendar-aad-preflight-0019`, which first obtains the fixed revision-global PostgreSQL session lease, then obtains the shared coordinator lease for each distinct affected connection, commits started before provider access, and commits credentials only through complete old-snapshot/generation/identity CAS before creating the bound fixed-deadline or exact zero/no-deadline artifact; only after every pair passes and the typed rollout guard succeeds, back up and run the pre-migration audit; use only `just calendar-aad-migrate-0019`; run the post-migration audit; make the v2-only immutable image available while all four general services remain stopped; run only `just calendar-aad-resync-0019`; run and commit the post-resync audit before the non-empty deadline or under the still-empty zero branch; only after it passes start API/Worker/Scheduler/Caddy; and then require `just health`. Every recipe/CLI checks the artifact, actual image content ID, and typed rollout guard at start and immediately before critical DB/artifact commits. Cursor mutation and all evidence must use the exact `(connection_id, calendar_id)` pair, never `calendar_id` alone. Task 27 documents and tests this contract but does not execute production changes, and Task 16A test success must not be treated as rolling-deployment evidence.
 
-The preflight portion additionally commits a content-free append-only `refresh_started` before each provider call
-and atomically commits complete old-snapshot CAS, new credential/expiry, and `refresh_confirmed` afterward. The
-events bind one canonical attempt UUID, `rollout_digest_v1`, `fence_generation=F`, pre/post
-`credential_snapshot_digest_v1` plus `refresh_credential_snapshot_digest_v1`; confirmed also requires actual
-persisted expiry and its `-900 seconds` deadline candidate. An unresolved or needs-attention fence blocks every
-basename until `oauth.refresh_credential_replaced` terminal consumption matches original attempt/F/old refresh
-digest/identity/key version and satisfies either `progressive_callback` F/S/T, `targetless_callback` G/G/G with
-`F <= G`, or `provider_refresh` G/G/G generation invariants. The consumption remains valid through later
+The preflight portion additionally commits content-free append-only `oauth.refresh_started` before each provider
+call and atomically commits complete old-snapshot CAS, new credential/expiry, and `oauth.refresh_confirmed`
+afterward. Started binds canonical attempt/source, revision/rollout, G, both pre-digests and old identity/fixed key
+version. Every known-valid missing/same/different response must be confirmed with G/G/G, both pre/post digests,
+old/new identity/version, persisted expiry, disposition, deadline candidate, stable result code and strict
+`created_at`; missing/same preserves the refresh row byte-for-byte, while different updates it without consuming an
+older fence. An unresolved fence blocks every basename and all automatic Worker refresh until explicit progressive
+recovery appends `oauth.refresh_credential_replaced` with original attempt/started source/F, both original
+pre-digests, old identity/version, recovery OAuthAttempt/event IDs, F/S/T, both post-digests, different-token new
+identity/version, persisted expiry and strict timestamps. The consumption remains valid through later
 generation/capability/scope/credential changes; preflight independently checks current readiness and recomputes
-current plaintext identity with the event key version, treating identity equal to the consumed old identity as
-rollback even when the physical digest differs. A
-confirmed crash resumes from persisted credential/expiry without another refresh. Normal audit retention must
-preserve an unresolved started fence across cutoff, use the same terminal matching protocol, and delete a safe
-started/result group only when its maximum `created_at` is older than cutoff, without requiring later credential
-lineage.
+current identity with the fixed APP root key/version, treating identity equal to consumed old identity as rollback.
+Confirmed crash resumes from persisted credential/expiry without another refresh. Retention preserves unresolved
+automatic fences, treats unsatisfied recovery pairs separately, and deletes automatic-success, unsuccessful-
+recovery, or successful-recovery groups only when every event is older than cutoff, without later credential lineage.
 
 If provider preflight fails, do not back up for the rollout, audit as ready, or apply 0019. Missing/undecryptable/
 revoked refresh, access-only credentials, returned scope shrink, malformed token/expiry, insufficient 900-second
@@ -4731,35 +4735,37 @@ margin, active-refresh resource 401, revision-global or connection-coordinator l
 failure are all hard failures. A network unknown result, provider-call-after lock loss, `invalid_grant`, malformed
 response, scope shrink, CAS/commit failure, or started-without-confirmed result must leave a durable content-free
 fence. Every later invocation, including one with another basename, and every Taskiq/`TransientProviderError`
-delivery for the same attempt must make zero provider calls until a new valid recovery source receives a genuinely
-different non-empty refresh plaintext and atomically commits matching `oauth.refresh_credential_replaced`
-consumption through the shared coordinator/snapshot-CAS boundary. Progressive callback uses
-`source="progressive_callback"` and remains at OAuthAttempt target `T`; targetless callback may use `F <= G` G/G/G
-only when normalized identity matches the frozen existing row and must not create a second connection; Worker uses
-`source="provider_refresh"` and preserves generation `G`. Do not trigger an extra provider call or
-temporary OAuth-only service merely to consume the fence. A generation/physical-digest/access-only change or
-operator disposition cannot waive replay safety. If confirmed committed before a crash, rerun the
+delivery for the same attempt must make zero provider calls. Recovery requires a new user-initiated, connection-bound
+progressive OAuthAttempt: start records `oauth.refresh_recovery_authorization_started` in the OAuthAttempt
+transaction; callback exchanges that code once without a second automatic started. Missing/same/provider/network/
+CAS failures may append `oauth.refresh_recovery_authorization_unsatisfied` but leave the original fence; the user may
+create another OAuthAttempt. Only a different non-empty refresh token may atomically commit credential/scopes/
+capabilities plus complete F/S/T `source="progressive_recovery"` replacement proof. Targetless callback must fail
+before any local credential/scope/capability save, and automatic Worker refresh cannot consume the fence. Do not
+trigger an extra provider call or temporary OAuth-only service merely to consume it. A generation/physical-digest/
+access-only/automatic-different-token change or operator disposition cannot waive replay safety. If confirmed
+committed before a crash, rerun the
 same rollout from persisted token/expiry instead of reauthorizing or refreshing again. Keep the database at 0018,
-restore the original 0018-compatible services while write switches remain off. An unknown fence requires a new
-explicitly authorized coordinator flow or normal Worker rotation that produces terminal consumption before a new
-full change window; an
+restore the original 0018-compatible services while write switches remain off. An unknown fence requires the
+explicit progressive recovery flow above before a new full change window; an
 independent local-directory failure instead requires restoration of that exact fact and does not waive any fence. If an
 affected scope can only be removed through an existing explicit user-authorized data-disposition workflow,
 complete that workflow and recompute the affected set. A waiver, direct SQL, fabricated credential/ProviderCalendar
 row, full-account probe, or post-migration marker clear is forbidden.
 
 The runbook must warn operators not to disconnect a connection that has an unknown refresh fence. Disconnect deletes
-the old credential before any later callback/Worker can compare plaintext, so disconnect/reconnect, a new connection,
-or a new-token mapping can never create terminal consumption. If the provider omits refresh token, returns the same
-token, the connection is already disconnected, or old plaintext is unavailable, the 0019 scope stays blocked. When
+the old credential before a later explicit recovery callback can compare plaintext, so disconnect/reconnect, a new
+connection, or a new-token mapping can never create replacement consumption. If the recovery exchange omits refresh
+token, returns the same token, the connection is already disconnected, or old plaintext is unavailable, the 0019
+scope stays blocked. When
 the affected scope still exists, only an existing explicitly user-authorized data-disposition flow may remove it;
 if that flow does not apply, stop and request a newly approved design. Fabricated consumption and marker skip are
-forbidden. Targetless identity mismatch, duplicate-row attempt, response-after-lock-loss, CAS miss, or exchange
-unknown must preserve the existing row, prohibit `ensure_connection`/same-code replay, and enter `needs_attention`;
-operators inspect only content-free attempt/source/lease/CAS facts. The runbook must also retain every historical
-identity key version referenced by a fence/consumption/rollback/retention group and fail closed when current identity
-recomputed under that version equals consumed old identity, including A→B→A or same-token re-encryption. It may
-record only the fixed synthetic HMAC-vector pass/fail, never real token, identity, master key, or derived key material.
+forbidden. A targetless callback resolving to a fenced identity must be blocked before persistence and prohibit
+`ensure_connection`; an explicit recovery response-after-lock-loss, CAS miss, exchange unknown or same-code replay
+must preserve the existing row and enter `needs_attention`. Operators inspect only content-free automatic/recovery
+attempt, source, lease and CAS facts. M2 fixes the APP root key/version and has no multi-key lookup; current
+identity equal to consumed old identity, including A→B→A or same-token re-encryption, fails closed. Release evidence
+records only fixed synthetic HMAC-vector pass/fail, never real token, identity, root key or derived key material.
 
 Implement `just calendar-aad-preflight-0019` with no pair/user argument. Before starting its one-off container,
 the host recipe must inspect Compose state and fail when `caddy`, `api`, `worker`, or `scheduler` is running; it
@@ -4931,20 +4937,22 @@ uv run --project backend pytest \
 Expected: PASS with independent fixed canonical-byte/base64/hash vectors for
 `credential_snapshot_digest_v1`/`refresh_credential_snapshot_digest_v1`/`rollout_digest_v1` plus the fixed
 HKDF/HMAC `refresh_token_identity_v1` vector; coordinator claim ordering, dual-Worker single-call,
-response-after-lock-loss/CAS-miss and Taskiq/`TransientProviderError` zero-call cases; callback
-`compare_digest` replacement decisions, F/S/T `progressive_callback` terminal consumption, target generation
-preserved, and credential/scope/capability/consumption atomic rollback; `F=S`/`S>F`, stale/concurrent target,
-missing/empty/same refresh, and disconnected/old-plaintext-unavailable negatives; shared generation/full-row
-snapshot CAS across Google/Microsoft mail/calendar Workers; definite D1→D2 `provider_refresh` consumption,
-access-only byte preservation, stale-CAS rejection, two-consumer single-winner arbitration, post-consumption
-`action_required` reauthorization and later-generation monotonicity, identity-based consumed-old rollback including
-A→B→A/same-token re-encryption, and zero replay
+response-after-lock-loss/CAS-miss and Taskiq/`TransientProviderError` zero-call cases; automatic
+missing/same/different confirmed handling with complete G/G/G proof, Google access-only confirmed and byte-preserved
+refresh row, different-token Worker rotation without old-fence consumption, and stale-CAS rejection; explicit
+progressive recovery start transaction with OAuthAttempt + recovery-started event, repeated attempts where the first
+unsatisfied result leaves the original fence and a later different-token callback atomically commits credential/
+scope/capability plus complete F/S/T replacement proof while target generation stays `T`; targetless fenced-identity
+pre-save blocking; `F=S`/`S>F`, stale/concurrent target, missing/empty/same refresh, disconnected/old-plaintext-
+unavailable, provider/network/lease/CAS failure negatives, complete proof fields and strict timestamps; post-
+consumption `action_required` reauthorization and later-generation monotonicity; fixed-root-key identity rollback
+including A→B→A/same-token re-encryption; and zero replay
 of the original D0 preflight refresh; 0018
 local/provider recoverability proof; revision-global lease across same/different basenames;
 provider-before-started-call count zero; exactly one proactive refresh per newly fenced affected connection;
-attempt-bound dual-digest started/confirmed atomicity with required post-digest/persisted-expiry/deadline-candidate
-fields; unresolved/needs-attention cross-basename blocking;
-matching source-tagged terminal-consumption gate with progressive F/S/T, targetless `F <= G` G/G/G/no-target merge,
+attempt-bound dual-digest generic started/confirmed atomicity with required identity/disposition/post-digest/
+persisted-expiry/deadline-candidate fields; unresolved cross-basename blocking; repeated explicit recovery with
+started/unsatisfied/replacement facts, targetless blocked audit that does not close the fence, and
 missing/empty/same-plaintext/access-only negatives;
 confirmed-before-artifact crash recovery with no second refresh; lock contention/loss,
 network unknown, `invalid_grant`, malformed response, scope shrink, credential snapshot CAS and commit failure with
@@ -4966,9 +4974,10 @@ Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password
 
 Expected: PASS, including CalendarEvent description/location four-column atomic cleanup, an unresolved started
 fence surviving the 365-day cutoff with next-invocation provider calls still zero, user-isolated ordinary audit
-cleanup, safe confirmed/terminal/consumption/disposition cleanup without later credential-lineage matching, maximum
-group `created_at < cutoff`, an old started plus newer result remaining protected, access-only or physical-snapshot
-rotation remaining blocked, retention-versus-confirmed/consumption lock/CAS races, app-role DDL/restore denial,
+cleanup, safe automatic-success/unsatisfied-recovery/successful-recovery group cleanup without later credential-
+lineage matching, maximum group `created_at < cutoff`, an old started plus newer result remaining protected,
+access-only/automatic-different-token/physical-snapshot rotation remaining blocked, retention-versus-confirmed/
+recovery-result/consumption lock/CAS races, app-role DDL/restore denial,
 post-restore app/retention grants, and
 Secret-file-only role bootstrap.
 
@@ -4989,8 +4998,9 @@ Run: `bash scripts/test-tooling.sh`
 
 Expected: PASS, including safe explicit backup basename/state handling, collision/path rejection, start/pre-commit
 typed rollout checks, host-resolved immutable-image binding, revision-global plus connection-scoped coordinator
-leases and shared CAS boundary, durable dual-digest/identity refresh started/confirmed/needs-attention fence,
-callback/targetless/Worker source-tagged consumption gate, two-Worker single-call and unknown/Taskiq zero-call cases,
+leases and shared CAS boundary, durable generic automatic started/confirmed fence, repeated explicit recovery
+started/unsatisfied/replacement gate, targetless pre-save blocking, automatic access-only confirmed and different-
+token no-old-consumption cases, two-Worker single-call and unknown/Taskiq zero-call cases,
 confirmed-crash resume, exact active-refresh preflight/guarded migration/three-phase audit/resync/restored-0018
 recipes, revision/stopped-service gates for every no-argument one-off, the
 owner-before-secret/image-guarded exact-image restore service plus existing production confirmations, app-role
@@ -5014,10 +5024,11 @@ The review must explicitly include existing-AuditEvent attempt-bound refresh sta
 `rollout_digest_v1` plus full and refresh credential snapshot digests and the independent HKDF/HMAC identity vector,
 shared `OAuthRefreshCoordinator` claims, cross-basename unresolved blocking,
 required confirmed post-digests/persisted-expiry/deadline-candidate fields, callback `compare_digest` plus atomic
-F/S/T `progressive_callback`, targetless `F <= G` G/G/G/no-target merge, and G/G/G Worker `provider_refresh`
-consumption, shared full-row/generation/identity CAS,
-single-consumer races, target generation preserved, stale/concurrent callback and disconnect-without-consumption
-negatives, post-consumption capability/generation changes, A→B→A/same-token identity rollback rejection, cross-cutoff fence
+F/S/T `progressive_recovery`, repeated unsatisfied attempts, targetless fenced-identity pre-save block, and automatic
+G/G/G missing/same/different confirmed handling without old-fence consumption, shared full-row/generation/identity
+CAS, single-consumer recovery races, target generation preserved, stale/concurrent callback and disconnect-without-
+consumption negatives, post-consumption capability/generation changes, fixed-root-key A→B→A/same-token identity
+rollback rejection, cross-cutoff fence
 retention without later credential lineage and with whole-group cutoff, confirmed-crash resume, host
 owner-before-secret artifact/image guard, exact
 `sha256:`/`--pull never` restore, and verifier `PGOPTIONS` + first-action
@@ -5026,6 +5037,7 @@ owner-before-secret artifact/image guard, exact
 - [ ] **Step 10: Commit**
 
 ~~~bash
+git add backend/src/ai_employee/api/deps.py
 git add compose.yaml backend/migrations/env.py backend/migrations/versions/20260809_0019_calendar_event_field_aad_v2.py backend/src/ai_employee/workers/retention.py backend/src/ai_employee/workers/privacy.py backend/src/ai_employee/application/use_cases/privacy.py backend/src/ai_employee/application/use_cases/connections.py backend/src/ai_employee/application/use_cases/sync_mail.py backend/src/ai_employee/application/ports/oauth_refresh.py backend/src/ai_employee/application/ports/credential_rotation.py backend/src/ai_employee/application/oauth_refresh_identity.py backend/src/ai_employee/application/calendar_aad_digests.py backend/src/ai_employee/application/use_cases/calendar_aad_preflight.py backend/src/ai_employee/application/use_cases/calendar_aad_rollout.py backend/src/ai_employee/application/use_cases/calendar_aad_recovery.py backend/src/ai_employee/application/use_cases/sync_calendar.py backend/src/ai_employee/infrastructure/db/repositories/connections.py backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py backend/src/ai_employee/infrastructure/db/repositories/email.py backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_preflight.py backend/src/ai_employee/infrastructure/db/repositories/calendar_aad_recovery.py backend/src/ai_employee/infrastructure/db/repositories/calendar.py backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py backend/src/ai_employee/integrations/registry.py backend/src/ai_employee/workers/sync_mail.py backend/src/ai_employee/workers/sync_calendar.py backend/src/ai_employee/workers/execute_task.py backend/src/ai_employee/cli/calendar_aad_preflight_0019.py backend/src/ai_employee/cli/calendar_aad_migrate_0019.py backend/src/ai_employee/cli/calendar_aad_0019.py backend/src/ai_employee/cli/calendar_aad_verify_restored_0018.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/retention/test_role_permissions.py backend/tests/unit/application/test_calendar_aad_digests.py backend/tests/unit/application/test_oauth_refresh_identity.py backend/tests/unit/application/test_oauth_refresh_coordinator.py backend/tests/unit/application/test_connection_capability_use_cases.py backend/tests/integration/m2/test_connection_capability_repository.py backend/tests/integration/m2/test_credential_rotation_repository.py backend/tests/integration/m2/test_oauth_refresh_coordinator.py backend/tests/integration/google/test_oauth_flow.py backend/tests/integration/google/test_gmail_sync.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_oauth_flow.py backend/tests/integration/microsoft/test_mail_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/unit/test_init_db_roles_script.py backend/tests/integration/operations/test_calendar_aad_0019_preflight.py backend/tests/integration/operations/test_calendar_aad_0019_recovery.py backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py docs/operations.md docs/acceptance-checklist.md scripts/audit-calendar-aad-0019.sh scripts/test-calendar-aad-0019-audit.sh scripts/backup-postgres.sh scripts/restore-postgres.sh justfiles/ops.just scripts/test-tooling.sh scripts/test-deployment.sh
 git commit -m "feat: protect M2 action lifecycle data"
 ~~~
@@ -5212,10 +5224,10 @@ git commit -m "feat: add trusted action editors"
 - Modify: `backend/src/ai_employee/infrastructure/testing/scenarios.py`
 - Modify: `backend/src/ai_employee/infrastructure/testing/test_support.py`
 - Modify: `backend/src/ai_employee/api/routers/test_support.py`
-- Create: `scripts/test-m2-release.sh` — full CI plus three fixed v1 digest vectors and the fixed `refresh_token_identity_v1` HKDF/HMAC vector, shared coordinator claim/lease state machine, callback/Worker source-tagged refresh-replacement consumption, shared generation/full-row CAS, 0019 revision-global lease, attempt-bound durable refresh fence/CAS-confirmed recovery, cross-cutoff fence retention, identity rollback detection, deadline, owner-before-secret exact-image restore/grant, and database-enforced app-role verifier contract gate; it never performs production migration or restore.
+- Create: `scripts/test-m2-release.sh` — full CI plus three fixed v1 digest vectors and the fixed `refresh_token_identity_v1` HKDF/HMAC vector, fixed APP root-key construction parity, automatic coordinator started/confirmed state machine, repeated explicit progressive recovery with started/unsatisfied/replacement facts, targetless pre-save blocking, shared generation/full-row CAS, 0019 revision-global lease, cross-cutoff fence retention, identity rollback detection, deadline, owner-before-secret exact-image restore/grant, and database-enforced app-role verifier contract gate; it never performs production migration or restore.
 - Create: `scripts/verify-m2-sensitive-output.py`
-- Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free 0019 digest-vector/HKDF-HMAC-vector/source-tagged-consumption/shared-coordinator-CAS/lease/durable-refresh-fence/CAS-confirmed/cross-cutoff-retention/identity-rollback/deadline/ordinal/exact-image-owner-restore evidence.
-- Modify: `docs/acceptance-checklist.md` — require three fixed v1 digest vectors, callback/Worker consumption atomicity, shared snapshot-CAS, attempt-bound durable refresh fence/CAS-confirmed and whole-group cross-cutoff retention evidence plus exact deadline completion or evidenced owner-before-secret exact-image atomic restore/grant/database-read-only app verification before release acceptance.
+- Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free 0019 digest/HKDF-HMAC vectors, automatic started/confirmed, repeated progressive recovery, targetless block, shared coordinator CAS/lease, whole-group retention, identity rollback, deadline, ordinal, and exact-image owner-restore evidence.
+- Modify: `docs/acceptance-checklist.md` — require three fixed v1 digest vectors, automatic confirmed plus progressive replacement atomicity, repeated unsatisfied recovery and targetless-block evidence, shared snapshot-CAS, durable refresh fence and whole-group cross-cutoff retention evidence plus exact deadline completion or evidenced owner-before-secret exact-image atomic restore/grant/database-read-only app verification before release acceptance.
 - Modify: `README.md`
 
 - [ ] **Step 1: Write the failing crash matrix and Playwright flows**
@@ -5273,16 +5285,18 @@ Run: `bash scripts/test-m2-release.sh`
 Expected: PASS with fresh output from `just ci`, all crash cases, three independent fixed v1 digest vectors plus the
 independent HKDF/HMAC `refresh_token_identity_v1` vector, coordinator claim ordering, two-Worker single-call and
 response-after-lock-loss/CAS-miss zero-call cases, revision-global plus connection-scoped leases across
-same/different basenames, provider-before-started ordering, attempt/
-`rollout_digest_v1`/pre-post full-and-refresh credential digest binding, unresolved/needs-attention cross-basename
-zero-call blocking, required confirmed persisted-expiry/deadline-candidate fields, callback `compare_digest`,
-`F=S`/`S>F`, stale-target/concurrent-reauthorization rejection, target-generation-preserving atomic
-`progressive_callback` consumption, targetless identity merge with `F <= G` G/G/G and no duplicate connection,
-Google/Microsoft mail/calendar `provider_refresh` D1→D2 consumption,
-shared full-row/generation CAS, access-only byte preservation, stale-CAS and two-consumer arbitration,
-same/missing refresh and disconnected-without-consumption blocking, post-consumption `action_required` reauthorization
-and generation changes without fence revival, identity-based consumed-old rollback detection including A→B→A and
-same-token re-encryption, cross-cutoff unresolved-fence
+same/different basenames, provider-before-`oauth.refresh_started` ordering, attempt/source/rollout/G/G/G/pre-post
+full-and-refresh credential digest/old-new identity binding, unresolved cross-basename zero-call blocking, and
+required confirmed persisted-expiry/disposition/deadline-candidate/strict-timestamp fields. Known-valid
+missing/same/different automatic responses all confirmed; Google access-only preserves the refresh row byte-for-byte,
+automatic different-token rotation does not consume an old fence. Explicit recovery covers `F=S`/`S>F`, atomic
+OAuthAttempt + recovery-started creation, first unsatisfied attempt preserving the original fence, a later different-
+token callback with target-generation-preserving F/S/T replacement proof, stale-target/concurrent-reauthorization
+rejection, and full credential/scope/capability/event rollback. Targetless fenced identity is blocked before local
+persistence with no duplicate connection. Shared full-row/generation CAS, repeated-recovery single-consumer
+arbitration, disconnected/old-plaintext-unavailable blocking, post-consumption `action_required` reauthorization and
+generation changes without fence revival, fixed-root-key identity rollback including A→B→A and same-token
+re-encryption, cross-cutoff unresolved-fence
 preservation with user-isolated ordinary audit cleanup and whole-group maximum-time cutoff without current-lineage
 matching, lock-loss/network-unknown/invalid-grant/malformed/scope-shrink/credential-CAS/commit fail-closed cases and
 Taskiq/`TransientProviderError` zero-call delivery,
@@ -5302,26 +5316,31 @@ window to execute the non-rolling `docs/operations.md` sequence before enabling 
 Caddy/API/Worker/Scheduler CalendarEvent readers/writers while PostgreSQL/Redis remain running; run and pass only
 the no-argument `just calendar-aad-preflight-0019`, which first acquires the fixed revision-global PostgreSQL
 session lease before artifact/provider access and then obtains each connection's shared coordinator lease, proves a
-decryptable/usable refresh token and versioned `refresh_token_identity_v1`, commits a content-free append-only
-`refresh_started` before each first permitted provider call with canonical attempt UUID, source,
+decryptable/usable refresh token and fixed-root-key `refresh_token_identity_v1`, commits a content-free append-only
+`oauth.refresh_started` before each first permitted provider call with canonical attempt UUID, source,
 `rollout_digest_v1`, `fence_generation=F`, `pre_credential_snapshot_digest_v1`,
 `pre_refresh_credential_snapshot_digest_v1`, old identity and key version; proactively refreshes each newly fenced
 distinct connection once; validates returned scopes; atomically commits complete old-snapshot CAS plus new
-credential/expiry and an attempt-matching `refresh_confirmed` with required full/refresh post-digests, actual
-persisted expiry, and its derived deadline candidate; and freezes
+credential/expiry and an attempt-matching `oauth.refresh_confirmed` with G/G/G, required full/refresh post-digests,
+old/new identity/version, actual persisted expiry, missing/same/different disposition, its derived deadline candidate,
+and strict timestamp; and freezes
 `rollout_deadline = min(token_expires_at) - 900 seconds`, or produces the exact zero/no-deadline state when no pair
-is affected. An unresolved/needs-attention fence blocks every basename and all Taskiq/`TransientProviderError`
-re-entry must make zero provider calls; only a progressive-authorization callback, targetless callback whose
-normalized provider identity returns to the frozen existing row, or normal Google/Microsoft mail/calendar Worker that
-receives a genuinely different non-empty refresh plaintext and commits through the shared full-row/generation CAS
-may append matching `oauth.refresh_credential_replaced` terminal consumption. Callback records
-`source="progressive_callback"` and preserves OAuthAttempt target `T`; targetless records `F <= G` G/G/G with no
-target; Worker records `source="provider_refresh"` and preserves generation `G`. Once valid, the event permanently
-closes the old fence while current readiness is checked independently; a current identity equal to the consumed old
-identity (including A→B→A or same-token re-encryption) is rollback even when physical digest differs. Disconnect/reconnect, a new
-connection mapping, missing/same refresh token, or unavailable old plaintext cannot produce consumption. If the
-affected scope remains, use only an existing explicitly user-authorized data-disposition flow; otherwise stop and
-request a newly approved design.
+is affected. Known-valid missing/same/different automatic responses all confirmed; missing/same preserves the refresh
+row, while different updates it without consuming any older fence. An unresolved fence blocks every basename and all
+Taskiq/`TransientProviderError` re-entry must make zero provider calls. Recovery requires a user-created,
+connection-bound progressive OAuthAttempt whose start transaction appends
+`oauth.refresh_recovery_authorization_started`; callback exchanges that code once without a second automatic
+started. Missing/same/provider/network/CAS failure may append
+`oauth.refresh_recovery_authorization_unsatisfied` but leaves the original fence, and the user may create another
+OAuthAttempt. Only a different non-empty refresh token may atomically commit credential/scopes/capabilities plus
+matching `oauth.refresh_credential_replaced` with complete F/S/T `source="progressive_recovery"` proof and strict
+timestamps. Targetless fenced-identity callback must fail before local credential/scope/capability persistence;
+normal Google/Microsoft mail/calendar automatic refresh cannot consume the fence. Once valid, replacement proof
+permanently closes the old fence while current readiness is checked independently; current identity equal to consumed
+old identity under the fixed APP root key/version (including A→B→A or same-token re-encryption) is rollback even when
+physical digest differs. Disconnect/reconnect, a new connection mapping, missing/same refresh token, or unavailable
+old plaintext cannot produce consumption. If the affected scope remains, use only an existing explicitly user-
+authorized data-disposition flow; otherwise stop and request a newly approved design.
 Confirmed state surviving a pre-artifact crash resumes from persisted
 token/expiry without another refresh. Then back up and
 capture the pre-migration audit artifact; migrate only through `just calendar-aad-migrate-0019` and capture the
@@ -5355,31 +5374,49 @@ OAuth-only service, or continuing provider E2E after restore verification failur
 
 Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision.
 
-The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; the recorded original 0018-compatible image; confirmation that no legacy reader/upsert or business write remained; proof that no general service was running during `calendar-aad-preflight-0019`; its start/finish result before backup; successful acquisition of the fixed revision-global PostgreSQL session lease before artifact/provider access and a connection-scoped coordinator lease for every connection, plus the disposition of any `calendar_aad_rollout_locked`, `oauth_refresh_claim_locked`, or lock-loss result; the accepted `rollout_digest_v1` and proof that all three fixed credential/rollout vectors plus the independent `refresh_token_identity_v1` HKDF/HMAC vector passed; distinct affected-connection count and hashed IDs; proof each connection had a decryptable refresh token, recorded identity key version, and exactly one proactive refresh; returned-scope validation result and access/optional-refresh AEAD rotation fact without token/scope material; proof that every credential commit used complete old access/refresh snapshot/generation/identity CAS and that no CAS miss published an artifact; the content-free minimum of all persisted refreshed `token_expires_at` values; the fixed 900-second margin and exact UTC `rollout_deadline`; each pair's locally hashed digest/result; and the disposition of every failed preflight window. Record backup/preflight-state/migration identifiers and checksums without secrets; the host-resolved backend image content ID and proof it matched every guarded one-off; deployed v2-only image digest; every one-off `calendar-aad-resync-0019` invocation and proof that no ordinary Worker/Scheduler/API/Caddy was running during recovery; evidence active `created/queued/running/retry_scheduled` ordinals were reused and only prior `failed/cancelled` allocated the next ordinal; each start/pre-commit rollout guard result; the post-resync artifact commit time preceding both deadline and general service startup; and references plus checksums for the preflight, `pre-migration`, `post-migration`, and `post-resync` artifacts. Record the exact affected `(connection_id, calendar_id)` set using internal connection UUIDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and every recovery ordinal: stable pair digest, immutable prior TaskRun terminal state, reused/new TaskRun ID/status, bounded runner result, and final marker result. If there were zero affected scopes, record an explicit evidenced zero/no-deadline branch rather than omitting the section. Record the immutable 0019-compatible normal rollback-floor image as well. Evidence may state snapshot field names and CAS result codes but must never contain credential bytes, token timestamps beyond the approved content-free earliest expiry, identity fingerprints, or `updated_at` values that enable correlating a secret rotation.
+The same record must contain the actual non-rolling 0019 rollout evidence: ingress/scheduler-stop and Caddy/API/Worker/Scheduler drain timestamps; the recorded original 0018-compatible image; confirmation that no legacy reader/upsert or business write remained; proof that no general service was running during `calendar-aad-preflight-0019`; its start/finish result before backup; successful acquisition of the fixed revision-global PostgreSQL session lease before artifact/provider access and a connection-scoped coordinator lease for every connection, plus the disposition of any `calendar_aad_rollout_locked`, `oauth_refresh_claim_locked`, or lock-loss result; the accepted `rollout_digest_v1` and proof that all three fixed credential/rollout vectors plus the independent `refresh_token_identity_v1` HKDF/HMAC vector passed; distinct affected-connection count and hashed IDs; proof each connection had a decryptable refresh token, recorded identity key version, and exactly one proactive refresh; returned-scope validation result and access/optional-refresh AEAD rotation fact without token/scope material; proof that every credential commit used complete old access/refresh snapshot/generation/identity CAS and that no CAS miss published an artifact; the content-free minimum of all persisted refreshed `token_expires_at` values; the fixed 900-second margin and exact UTC `rollout_deadline`; each pair's locally hashed digest/result; and the disposition of every failed preflight window. Record backup/preflight-state/migration identifiers and checksums without secrets; the host-resolved backend image content ID and proof it matched every guarded one-off; deployed v2-only image digest; every one-off `calendar-aad-resync-0019` invocation and proof that no ordinary Worker/Scheduler/API/Caddy was running during recovery; evidence active `created/queued/running/retry_scheduled` ordinals were reused and only prior `failed/cancelled` allocated the next ordinal; each start/pre-commit rollout guard result; the post-resync artifact commit time preceding both deadline and general service startup; and references plus checksums for the preflight, `pre-migration`, `post-migration`, and `post-resync` artifacts. Record the exact affected `(connection_id, calendar_id)` set using locally hashed connection IDs plus locally hashed provider calendar IDs. For every pair, link its scope/hash evidence and record the cursor/freshness/error transition across all three phases, evidence that newly synchronized non-empty description/location groups are v2, and every recovery ordinal: stable pair digest, immutable prior TaskRun terminal state, reused/new TaskRun ID/status, bounded runner result, and final marker result. If there were zero affected scopes, record an explicit evidenced zero/no-deadline branch rather than omitting the section. Record the immutable 0019-compatible normal rollback-floor image as well. Evidence may state snapshot field names and CAS result codes but must never contain credential bytes, token timestamps beyond the approved content-free earliest expiry, identity fingerprints, or `updated_at` values that enable correlating a secret rotation.
 
-For each affected connection, the record must also identify the content-free `refresh_started` and
-`refresh_confirmed` result codes; their fence schema, source, canonical attempt UUID, `rollout_digest_v1`,
-hashed-connection, `fence_generation=F`, pre/post full/refresh credential digest bindings, old/new identity and key
-versions, actual persisted expiry, and derived deadline candidate; evidence both leases and started committed before
-the provider call; and evidence credential CAS plus confirmed committed in one transaction. Record every unresolved
-or needs-attention fence and demonstrate that all later same/different-basename invocations made zero preflight
-provider calls until a callback or normal Google/Microsoft mail/calendar Worker atomically committed
-`oauth.refresh_credential_replaced` terminal consumption with original attempt/F/old physical digest/identity/key
-version matching started. Record the event schema, `source`, `started_source`, old/new digest/identity,
-`source_generation`, `pre_generation`, and `post_generation`: `progressive_callback` must show F/S/T with callback
-generation remaining target `T`; `targetless_callback` must show `F <= G` G/G/G, no target, and no duplicate
-connection; `provider_refresh` must show G/G/G without a generation increment. Record the `compare_digest` decision
-class, complete row/generation/identity CAS result, single-consumer arbitration, two-Worker one-call proof, response-
-after-lock-loss/CAS-miss/unknown/Taskiq/`TransientProviderError` zero-call evidence, and injected atomic rollback
-without token or plaintext hash. No-token/empty/same-plaintext/access-only/re-encryption, stale CAS, unknown-result,
-and disconnected/old-plaintext-unavailable paths must show no consumption and continued blocking; disconnect/reconnect
-or new-connection mapping must never be presented as recovery evidence. Automated evidence must also show consumption
-surviving later capability `action_required` plus reauthorization, later generation/scope/credential changes,
-current-identity rollback rejection including A→B→A, and no replay of the original D0 preflight refresh. Include
-cutoff evidence that an unresolved started older than the ordinary audit retention period remains, still blocks with
-zero provider calls, and does not prevent another user's or ordinary audit cleanup. Also prove a safe started/result
-group is deleted only when its maximum `created_at` is older than cutoff without comparing later credential lineage,
-so an old started plus newer result remains. If a
+The release record must additionally prove API deps, mail Worker, calendar Worker and the preflight CLI constructed
+`AeadCipher` plus `refresh_token_identity_v1` from the same fixed `APP_MASTER_KEY_FILE` bytes and key version. M2
+must not claim a mutable root, multi-key lookup coverage, or a second identity Secret.
+
+For each affected connection, the record must identify content-free `oauth.refresh_started` and
+`oauth.refresh_confirmed` result codes; their schema, source/started source, canonical attempt UUID,
+`rollout_digest_v1`, hashed connection, G/G/G, pre/post full/refresh digest-field presence/match without digest values,
+old/new identity-field presence/match with the fixed key versions but no fingerprint values, persisted-expiry/
+deadline-candidate field presence/match while emitting only the approved global earliest expiry/deadline,
+missing/same/different disposition, and strict `created_at` ordering. Evidence both leases and started committed
+before the provider call, and credential CAS plus
+confirmed committed in one transaction. Record automatic access-only confirmed and different-token confirmed cases;
+the latter must show no old-fence consumption. Record every unresolved fence and demonstrate all later same/different-
+basename and Taskiq/`TransientProviderError` automatic entries made zero provider calls. For each explicit recovery,
+record `oauth.refresh_recovery_authorization_started` schema/source, OAuthAttempt and event IDs, connection digest,
+original attempt/started source, F/S/T, both frozen pre-digest field presence/match, old identity-field match/key
+version, stable result code, and strict timestamp after the original automatic started, without recording any
+digest or fingerprint value. For every unsatisfied result, record its matching recovery event/OAuthAttempt IDs,
+original attempt/started source/connection
+digest, F/S/T, both frozen pre-digest field presence/match, old identity-field match/key version, stable result code,
+and strict timestamp after the recovery-started event. Demonstrate at least one first unsatisfied attempt that
+closes only itself, followed by a new OAuthAttempt whose different-token callback atomically commits
+`oauth.refresh_credential_replaced` with `source="progressive_recovery"`, original
+attempt/started source/connection digest, recovery OAuthAttempt/event IDs, complete F/S/T with
+`pre_generation=post_generation=T`, original pre-digest and required post-digest field presence/match without digest
+values, old/new identity-field match and key versions without fingerprint values, persisted-expiry field match
+without a per-attempt timestamp, stable result code, and timestamps strictly later than both started events while
+generation remains `T`. Record the
+`compare_digest` decision class, complete row/generation/identity CAS result, single-consumer arbitration, two-Worker
+one-call proof, response-after-lock-loss/CAS-miss/unknown/Taskiq zero-call evidence, and injected atomic rollback
+without token or plaintext hash. Targetless fenced-identity callback must show local credential/scope/capability
+writes and duplicate-connection creation were zero. No-token/empty/same-plaintext/access-only/re-encryption, stale
+CAS, unknown-result, disconnected/old-plaintext-unavailable, and unsatisfied-recovery paths must show no consumption
+and continued blocking; disconnect/reconnect or new-connection mapping must never be presented as recovery evidence.
+Automated evidence must also show consumption surviving later capability `action_required` plus reauthorization,
+later generation/scope/credential changes, fixed-root-key current-identity rollback rejection including A→B→A, and
+no replay of the original D0 preflight refresh. Include cutoff evidence that an unresolved started older than the
+ordinary audit retention period remains, still blocks with zero provider calls, and does not prevent another user's
+or ordinary audit cleanup. Also prove automatic-success, unsuccessful-recovery and successful-recovery groups are
+deleted only when every event is older than cutoff without comparing later credential lineage, so an old started plus
+newer result remains. If a
 confirmed-before-artifact crash occurred,
 record that the next invocation reused persisted token/expiry with zero additional refresh. Include failure
 disposition for lock loss, network unknown, `invalid_grant`, malformed response, scope shrink, CAS failure, and
@@ -5416,7 +5453,7 @@ git commit -m "test: freeze M2 release evidence"
 - Draft generation/editing, reply/reply-all rules, recipient limits, model minimization, empty fallback, and no provider draft: Tasks 2, 11, 14–15, 21, and 23.
 - Calendar directory, working hours, buffer, 15-minute grid, 14-day horizon, three candidates, completeness, create/update/restore, ETag, attendees, and notification policy: Tasks 4, 12–13, 16–17, 22, and 24.
 - Calendar proposal trust hardening, including time-valid Worker leases, independent freshness observation, fixed-query minimal projections, transaction-free merged-interval computation, expected-version CAS, exact restore input, explicit-confirmation invariants, and operation-specific readiness: Task 16A.
-- CalendarEvent field AAD v2, forward-only 0019 rotation, local access/refresh credential preconditions, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention, revision-global plus connection-scoped PostgreSQL leases, shared `OAuthRefreshCoordinator` claim state machine, fixed digest vectors plus versioned HKDF/HMAC `refresh_token_identity_v1`, target-generation-preserving F/S/T `progressive_callback`, targetless `F <= G` G/G/G identity merge, and generation-preserving G/G/G mail/calendar Worker `provider_refresh` terminal consumption, shared complete credential/generation/identity CAS, dual-Worker single-call/unknown zero-call arbitration, post-consumption state monotonicity and identity rollback rejection, attempt-bound existing-AuditEvent refresh started/confirmed fence with required post-digest/persisted-expiry/deadline-candidate fields, whole-group cross-cutoff unresolved-fence retention without later credential lineage, confirmed-crash resume, fixed earliest-expiry-minus-900-second rollout deadline, deadline-bound pre-backup 0018 exact-scope probes/migration/audits, unconditional active-attempt reuse with failed/cancelled-only ordinal allocation, exact-scope one-off execution, post-resync-before-start, owner-before-secret artifact/image guard, exact-image no-pull atomic owner restore, post-restore grants, and database-enforced app-role verifier contracts: Task 27; digest/consumption/fence/CAS/retention/refresh/rollback/deadline/per-ordinal evidence, aborted-window exact-image owner-restore/read-only-verifier evidence, and the normal 0019-compatible rollback floor: Task 30.
+- CalendarEvent field AAD v2, forward-only 0019 rotation, local access/refresh credential preconditions, scoped resync, cross-calendar ciphertext isolation, and fail-closed v1/unknown/tampered reads without legacy fallback: Task 16A; atomic four-column retention, revision-global plus connection-scoped PostgreSQL leases, shared two-channel `OAuthRefreshCoordinator`, fixed digest vectors plus fixed-APP-root-key HKDF/HMAC `refresh_token_identity_v1`, automatic `oauth.refresh_started`/`oauth.refresh_confirmed` for missing/same/different responses, repeated connection-bound progressive recovery with recovery-started/unsatisfied/replacement facts and target generation preserved, targetless fenced-identity pre-save blocking, Google/Microsoft mail/calendar different-token confirmed without old-fence consumption, shared complete credential/generation/identity CAS, dual-Worker single-call/unknown zero-call arbitration, replacement state monotonicity and identity rollback rejection, complete proof metadata with strict timestamps, whole-group cross-cutoff unresolved-fence retention without later credential lineage, confirmed-crash resume, fixed earliest-expiry-minus-900-second rollout deadline, deadline-bound pre-backup 0018 exact-scope probes/migration/audits, unconditional active-attempt reuse with failed/cancelled-only ordinal allocation, exact-scope one-off execution, post-resync-before-start, owner-before-secret artifact/image guard, exact-image no-pull atomic owner restore, post-restore grants, and database-enforced app-role verifier contracts: Task 27; digest/recovery/fence/CAS/retention/refresh/rollback/deadline/per-ordinal evidence, aborted-window exact-image owner-restore/read-only-verifier evidence, and the normal 0019-compatible rollback floor: Task 30.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
 - Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution, compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, Task 27's coordinator/zero-call tests, and Task 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.
@@ -5428,6 +5465,6 @@ git commit -m "test: freeze M2 release evidence"
 2. Tasks 7–13 generalize reads and add Microsoft/Google parity. Checkpoint: both providers pass OAuth plus incremental mail/calendar contract tests with real writes still disabled.
 3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14 → Task 16 → Task 16A → Task 18 → Task 15 → Task 17 → Tasks 19–20. Task 16A must close calendar lease, freshness, bounded-query, transaction, confirmation, restore-input, and CalendarEvent AAD v2/0019 trust gaps before any proposal version can be frozen. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
 4. Tasks 21–24 add one high-risk provider write path per task and commit. Checkpoint: each adapter independently passes success, rejection, timeout, unknown-result, reconciliation, and duplicate-delivery contracts before starting the next adapter.
-5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, retention-role, three digest vectors plus the fixed HKDF/HMAC identity vector, coordinator claim/lease state machine, two-Worker one-call and unknown/Taskiq zero-call cases, callback `compare_digest` F/S/T `progressive_callback` consumption with target generation preserved and atomic credential/scope/capability/event rollback, targetless `F <= G` G/G/G/no-target identity merge, Google/Microsoft mail/calendar G/G/G `provider_refresh` D1→D2 consumption, shared complete-row/generation/identity snapshot CAS, access-only byte preservation, stale-CAS/two-consumer races, `F=S`/`S>F`, stale/concurrent/disconnected negative cases, post-consumption `action_required` reauthorization and later-generation monotonicity, A→B→A/same-token identity rollback rejection, stopped-service 0018 active-refresh provider preflight with revision-global plus connection-scoped session leases, attempt-bound durable dual-digest/identity started/confirmed fence with required persisted-expiry/deadline-candidate fields, cross-basename unknown-result blocking with no original D0 replay, whole-group cross-cutoff unresolved-fence preservation/user isolation without later credential lineage and confirmed-crash resume, fixed deadline artifact and start/pre-commit guards, unconditional active-ordinal reuse, failed/cancelled-only new ordinal, marker-only exact-pair recovery, guarded migration/audits, app-role restore denial, owner-before-secret artifact/image mismatch zero-call guard, exact-image no-pull atomic owner restore/error rollback, app/retention regrant, app-only restored-0018 verifier with server/transaction read-only enforcement, and post-resync-before-start suites pass.
+5. Tasks 25–27 close revocation, API/SSE, observability, privacy, retention, deployment, and operations gaps. Checkpoint: kill-switch, deletion-barrier, sensitive-event, retention-role, three digest vectors plus the fixed HKDF/HMAC identity vector, API/Worker/CLI fixed-key construction parity, automatic coordinator claim/lease/started/confirmed state machine, two-Worker one-call and unknown/Taskiq zero-call cases, missing/same/different confirmed with access-only byte preservation and no old-fence consumption, repeated explicit recovery with atomic OAuthAttempt + recovery-started creation, first unsatisfied attempt preserving the original fence, later different-token F/S/T replacement with target generation preserved and atomic credential/scope/capability/event rollback, targetless fenced-identity pre-save blocking, shared complete-row/generation/identity snapshot CAS, stale-CAS/recovery single-consumer races, `F=S`/`S>F`, stale/concurrent/disconnected negative cases, post-consumption `action_required` reauthorization and later-generation monotonicity, A→B→A/same-token identity rollback rejection, stopped-service 0018 active-refresh provider preflight with revision-global plus connection-scoped session leases, complete generic automatic started/confirmed proof with persisted-expiry/disposition/deadline-candidate and strict timestamps, cross-basename unknown-result blocking with no original D0 replay, whole-group cross-cutoff unresolved-fence preservation/user isolation without later credential lineage and confirmed-crash resume, fixed deadline artifact and start/pre-commit guards, unconditional active-ordinal reuse, failed/cancelled-only new ordinal, marker-only exact-pair recovery, guarded migration/audits, app-role restore denial, owner-before-secret artifact/image mismatch zero-call guard, exact-image no-pull atomic owner restore/error rollback, app/retention regrant, app-only restored-0018 verifier with server/transaction read-only enforcement, and post-resync-before-start suites pass.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.
 7. Task 30 runs the full automated gate, pauses for explicit provider-account authorization, performs the dedicated Google/Microsoft matrix, and writes a fully evidenced final release record. Without that authorization, Task 30 remains incomplete.
