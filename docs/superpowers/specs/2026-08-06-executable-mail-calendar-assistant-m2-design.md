@@ -1212,8 +1212,9 @@ credential CAS 使用统一锁序，锁后重查 matching event、F/S/T、old/ne
 因此 retention 不引入 historical identity key 保存或删除逻辑；root key 缺失/变化一律 fail closed。
 
 `database.restore.completed` 不获得 retention 或隐私删除豁免。database-wide
-`ai_employee.restore_completion` 本身是 completed admission 与 ACK reconcile 的唯一持久 authority；它不依赖
-AuditEvent 存续。generic AuditEvent cleanup 按普通 365 天 cutoff 处理 completion audit，全数据删除也必须像
+completed `ai_employee.restore_call_authority` + matching `ai_employee.restore_completion` zero-slot pair 是
+completed admission 与 ACK reconcile 的持久 catalog authority；它不依赖 AuditEvent 存续，且 completed
+call 不可缺失。generic AuditEvent cleanup 按普通 365 天 cutoff 处理 completion audit，全数据删除也必须像
 其他该用户 audit 一样删除它，不能为了 restore proof 绕过用户隐私删除。后续 audit retention、全数据删除或
 审计分区维护使该行缺失，不得让已提交 restore 失效，也不得阻止下一次合法 restore。AuditEvent 的普通
 BigInteger ID、event 数量与 metadata matcher 都不参与 admission/ACK authority；exact completion audit 只在
@@ -1912,20 +1913,26 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   `ai_employee.database_restore_completed.v1` exact metadata audit、设置
   `ai_employee.restore_completion=restore_completion:v1:<authority_digest>`、RESET gate 与只恢复 app/retention
   CONNECT，PUBLIC 保持 revoked。每个新 active attempt 的 gate transaction 必须先 RESET completion GUC；
-  commit ACK-lost 只以 expected completion GUC、gate 与 ACL 区分 completed、not-applied 或 mixed，再重建
+  gate transaction 不写会被 `pg_restore` 覆盖的 AuditEvent，而把 gate/call timeline 保存在 catalog call 与
+  state-v4；最终 completion audit 才在恢复后数据库追加。commit ACK-lost 必须同时读取不可缺失的 completed
+  call、expected completion GUC、gate 与 ACL，区分 completed、not-applied 或 mixed，再重建
   projection，或 CAS
   `reopen_committing →
   reopen_not_applied`；后者只有显式新 `reopen_ordinal` 才可重试。commit 后 host crash 不得误报为 reopen
-  failure。测试还必须覆盖第二次恢复较旧 backup 时 active gate 内不存在历史 completion GUC，以及最终
-  restore commit 成功后 controller/host crash 仍只按 completion GUC、gate 与 ACL 收敛而不重放 reopen。
+  failure。测试还必须覆盖完整 `pristine → active → completed → next active` 矩阵，以及第二次恢复较旧
+  backup 时先验证/归档旧 completed pair、再原子替换为 active call并确保 active gate 内不存在历史
+  completion GUC；最终
+  restore commit 成功后 controller/host crash 仍按 completed call + completion GUC + gate + ACL 收敛而不重放
+  reopen。
 - legacy pre-manifest 备份在 production 必须拒绝。`just restore-legacy-to-isolated file output_basename`
   只允许 `APP_ENV=development|test`，由专用 `scripts/convert-legacy-backup.sh` 与 Compose isolated
   PostgreSQL/conversion services 创建唯一 project、internal network、ephemeral volume 和 `0600` 临时
   Secret；所有资源先进入 fsynced registry并带统一 attempt/kind/created-at labels。测试必须 SIGKILL
   converter、模拟 Docker daemon crash，随后由固定 3600 秒 grace、per-attempt lock 与 active-container
   recheck 的 `legacy-backup-scavenge` 只删除超时孤儿，保留另一 active run，并清理 volume/network/temp
-  Secret/registry且零敏感输出。legacy target 也使用同一 maintenance gate primitive，但不混用 generic/
-  sealed artifact 或 validator。
+  Secret/registry且零敏感输出。legacy conversion 只操作 disposable target 与自己的 registry/scavenger，不写
+  workspace/production target 的 maintenance gate/call/completion facts，也不混用 generic/sealed artifact 或
+  validator。
 - `scripts/test-m2-release.sh` 必须在启动任何子命令前固定并导出合成 Task 13 测试数据库：若外部已提供
   `TEST_DATABASE_URL`，只有精确等于
   `postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test`
@@ -2119,9 +2126,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   revision，包括普通 0019 备份；它不依赖 0019 preflight/`pre-migration` artifact。production 在任何
   owner action 前必须证明三层写开关关闭、Caddy/API/Worker/Scheduler/migration/role-bootstrap、所有
   general consumer 和 owner maintenance/general consumer 停止，并完成二次确认。随后必须持
-  管理库 lifecycle lock，再持 target-derived advisory lock 与 exclusive schema lifecycle lock，在同一 owner
-  transaction 先 RESET completion GUC，再设置 database-wide maintenance gate/call authority、写 gate audit并
-  撤销 PUBLIC/app/retention CONNECT；进程 crash 只释放 lock，不清除 catalog
+  管理库 lifecycle lock，再持 target-derived advisory lock 与 exclusive schema lifecycle lock；先验证并
+  fsync prior completed pair archive（若有），再在同一 owner transaction 重检该 pair、RESET completion GUC、设置 database-wide
+  maintenance gate/active call authority并撤销 PUBLIC/app/retention CONNECT；该阶段不写 AuditEvent，只在
+  commit 后 fsync state-v4。进程 crash 只释放 lock，不清除 catalog
   authority。所有 migration、reset/drop/create、role bootstrap、restore/verifier 与 owner one-off 都在任何写
   前检查同一 primitive，非 matching attempt 零写入。
 - generic/sealed restore 先支持 no-gate database-zero-write local-evidence no-op 与 matching-gate direct edge；
@@ -2132,13 +2140,13 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   single transaction。reconcile 在 ready/started 后先证明 exact backend 退出，再读 fingerprint。grants 与
   role-switched verifier 复用 lock-holder connection；每个新 active attempt 在建立 gate 的同一事务先 RESET
   completion GUC；最终单一事务把 authority CAS 为 completed、写普通 BigInteger-ID exact metadata audit、
-  设置 completion GUC、RESET gate 与恢复 app/retention CONNECT。ACK unknown 从新 session 只以 expected
-  completion GUC、gate 与 ACL 判定；audit 后续缺失不影响 completed。not-applied reopen 进入
+  设置 completion GUC、RESET gate 与恢复 app/retention CONNECT。ACK unknown 从新 session 同时校验 exact
+  completed call、expected completion GUC、gate 与 ACL；audit 后续缺失不影响 completed pair。not-applied reopen 进入
   `reopen_not_applied` 并要求新 `reopen_ordinal`，服务始终由 operator 之后显式启动。
 - pre-manifest legacy backup 只能通过
   `just restore-legacy-to-isolated file output_basename` 在 development/test 转换：专用脚本与隔离 Compose
   services 使用唯一 project/internal network/ephemeral volume/临时 `0600` Secret，资源先登记 registry/
-  labels并使用同一 admission primitive；实读 revision/健康后调用普通锁定备份路径生成新三件套。
+  labels但不使用 workspace/production restore catalog admission；实读 revision/健康后调用普通锁定备份路径生成新三件套。
   trap 与 `legacy-backup-scavenge` 分别覆盖正常退出和 SIGKILL/daemon-crash 孤儿。它不能直接用于
   production、伪造 manifest、连接 workspace 数据库或执行 revision repair。
 - sealed-window 的 0018 整库恢复只能由独立
@@ -2205,8 +2213,8 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
    credential-free pg_restore generator、database-zero-write already-applied no-op、pre/post/inconsistent
    unknown-outcome 核对、owner session
    `SET ROLE ai_employee_app` read-only verifier，以及带 `reopen_not_applied`/新 `reopen_ordinal` 的
-   active-attempt completion RESET + completion-GUC authority + 固定外层 exact metadata audit insertion + gate
-   reset + 最小 CONNECT atomic reopen，以及只按 completion GUC/gate/ACL 的 ACK-lost 新 session 核对，且不能混用 generic、sealed、
+   active-attempt completion RESET + completed-call/completion-GUC pair authority + 固定外层 exact metadata audit insertion + gate
+   reset + 最小 CONNECT atomic reopen，以及按 completed call/completion GUC/gate/ACL 的 ACK-lost 新 session 核对，且不能混用 generic、sealed、
    legacy 的 validator 或 artifact。
 
 不执行持续试用会降低发现供应商偶发行为和长期 Token 问题的概率，这是明确接受的 M2 发布
@@ -2307,7 +2315,9 @@ big-endian bigint；上述 vector 分别为 `-9116408252019116299` 与 `59710018
 target lock 必须由同一目标 owner session nonblocking 取得；普通入口持有到该入口 commit/rollback，
 manifest-bound restore 按下文跨事务持有到终态。Task 16A 的
 migration entry、`db-reset`/drop/create wrapper、`role-bootstrap`/`scripts/init-db-roles.sh`，以及 Task 27D 的
-generic/sealed/legacy restore/verifier 与 owner one-off 都调用同一 typed helper。取得 target lock 后必须直接
+generic/sealed restore/verifier 与 owner one-off 都调用同一 typed helper。legacy conversion 只在独立 disposable
+target 上使用自己的 durable registry/scavenger 与普通 backup lifecycle lock，不写 workspace/production target
+的 restore catalog facts。取得 target lock 后必须直接
 读取 `pg_db_role_setting` 中三个 database-wide catalog fact：`ai_employee.maintenance_gate`、
 `ai_employee.restore_call_authority` 与 `ai_employee.restore_completion`。三者都只接受当前 database、`setrole=0` 的唯一 row/key；role-specific
 override、重复 key/row、malformed array、session-local override 或只信任 `current_setting`/缓存均 fail
@@ -2315,45 +2325,59 @@ closed。新 owner session 的 `current_setting(..., true)` 只证明 catalog �
 
 crash-surviving gate 固定为 database 自定义 setting `ai_employee.maintenance_gate`。空闲状态只能是
 `ALTER DATABASE <target> RESET ai_employee.maintenance_gate`；活动值必须逐字节匹配
-`restore:v1:<attempt_uuid>:<kind>:<target_identity_digest_v1>:<source_binding_digest_v1>`，其中 UUID 为规范
-小写文本，`kind` 闭集为 `generic | sealed_0018 | legacy_conversion`，两个 digest 都是 64 位小写十六
-进制。generic/sealed 的 `source_binding_digest_v1` 必须等于 manifest SHA-256；legacy 使用经 checksum
-验证的旧 dump/basename canonical binding digest，不能伪造 manifest。manifest-bound generic/sealed 还必须
-持久化第二个 database-wide authority `ai_employee.restore_call_authority`，规范值逐字节为
-`restore-call:v3|<attempt_uuid>|<generic|sealed_0018>|<target_digest>|<source_digest>|<manifest_digest>|<call_ordinal>|<reopen_ordinal>|<phase>|<backend_pid_or_dash>|<backend_start_or_dash>|<pre_revision_or_dash>|<pre_fingerprint_or_dash>|<expected_revision>|<expected_fingerprint>|<completion_authority_digest_or_dash>`。
-UUID 为规范小写，digest 与 expected fingerprint 为 64 位小写十六进制；pre revision/fingerprint 在
-`gate_established` 可为单一 `-`，首次 `restore_backend_starting` 前必须替换为真实值。ordinal 为无前导零的
-非负十进制且固定 `0..999999`，保证 exact `PGAPPNAME` 最长 63 bytes、不被 PostgreSQL 截断；非空
-revision 为 1–128 个 ASCII alphanumeric/underscore，backend PID 为正十进制，backend start 为数据库 UTC
-RFC3339 六位微秒 `Z`。source/manifest digest 必须逐字节等于同一 manifest SHA-256。
-`restore_backend_starting` 的 backend 字段为 `-`；`restore_backend_ready`、`restore_started` 与其结果分支
-保留 exact PID/start，direct already-applied edge 可保持 `-`。非 `completed` phase 的 completion digest
-必须为 `-`，`completed` 时必填。它持久化 attempt UUID、kind、target/source/manifest digest、从不复用的
-`call_ordinal`、独立 `reopen_ordinal`、phase、last psql backend identity、pre/expected revision/fingerprint 与
-completion digest。legacy 只使用 lifecycle lock 与 maintenance gate，不创建 call authority，也不进入
-generic/sealed state/reconcile/reopen executor。
+`restore:v1:<attempt_uuid>:<generic|sealed_0018>:<target_identity_digest_v1>:<source_binding_digest_v1>`。它只允许
+ASCII，generic 值恰好 185 bytes、sealed 值恰好 189 bytes；UUID 必须是规范小写文本，两个 digest 都是
+64 位小写十六进制，source digest 必须等于 manifest SHA-256。legacy conversion 不设置该 gate。
 
-第三个 database-wide fact `ai_employee.restore_completion` 只接受
-`restore_completion:v1:<completion_authority_digest_v1>`，是 completed admission 与 ACK reconcile 的唯一
-持久 authority。AuditEvent 的 BigInteger ID、matching event 是否仍存在、local state、call-completed
-projection 与 Compose/proc identity 都不能替代它；普通 retention 或全数据删除移除 completion audit 不影响
-该 authority。
+第二个 database-wide authority `ai_employee.restore_call_authority` 的规范值升级并逐字节冻结为
+`restore-call:v4|<attempt_uuid>|<generic|sealed_0018>|<target_digest>|<source_digest>|<manifest_digest>|<previous_completion_digest_or_dash>|<call_ordinal>|<reopen_ordinal>|<phase>|<gate_established_at>|<call_started_at_or_dash>|<backend_pid_or_dash>|<backend_start_or_dash>|<pre_revision_or_dash>|<pre_fingerprint_or_dash>|<expected_revision>|<expected_fingerprint>|<observed_revision_or_dash>|<observed_fingerprint_or_dash>|<completed_at_or_dash>|<completion_authority_digest_or_dash>`。
+parser 只接受 ASCII、恰好 21 个 `|`、总长不超过 1133 bytes 和上述字段顺序；禁止 NUL、CR/LF、空字段、
+未知版本、额外字段或 delimiter escaping。UUID 为规范小写，所有 digest/fingerprint 为 64 位小写十六进制；
+revision 为 1–128 个 ASCII alphanumeric/underscore。ordinal 是无前导零的非负十进制且固定
+`0..999999`，保证 exact `PGAPPNAME` 最长 63 bytes、不被 PostgreSQL 截断；backend PID 是正 int32
+十进制。所有时间都由数据库生成，使用 UTC RFC3339、恰好六位微秒和 `Z`。source/manifest digest 必须
+逐字节等于同一 manifest SHA-256。
 
-catalog admission matrix 只接受四类组合：pristine idle 的 gate/call/completion 三者均不存在；
-`kind=legacy_conversion` 的 active gate、call/completion 均不存在且 registry/source binding 完整；
-generic/sealed active gate 与同一 attempt 合法非终态 call authority，且 completion GUC 必须不存在；或 gate
-已 reset、completion GUC 合法且 app/retention 最小 CONNECT 已恢复、PUBLIC 仍 revoked 的 completed idle。
-completed call authority 若存在只能是与 completion digest 一致的 `completed` projection，audit 可以存在或已被
-retention/privacy 删除；二者都不是 completed admission authority。第一与第四类允许 ordinary owner lifecycle，
-第二类只允许 matching legacy executor，第三类只允许 matching generic/sealed executor。active gate + 任意
-completion GUC、gate reset + revoked app/retention ACL、completion GUC absent + reopened ACL、gate-only、非终态
-authority-only、`needs_attention` 或 cross-attempt/conflicting call projection 都一律 fail closed。
+`previous_completion_digest_or_dash` 在 pristine 新 attempt 为 `-`；从 `completed_idle` 开始下一 attempt 时
+必须等于被替换 completion pair 的 digest，并在该 attempt 全阶段保持不变。`gate_established_at` 在建立
+active pair 的事务内冻结；真实 call 进入 `restore_backend_starting` 时设置 `call_started_at`，direct
+exact-post edge 保持 `-`。`restore_backend_starting` 的 backend 两字段为 `-`；
+`restore_backend_ready`、`restore_started` 与其结果分支保留 exact PID/start。pre revision/fingerprint 在
+`gate_established` 可为 `-`，首次真实 call 前必须填充。expected revision/fingerprint 从 admission 起不可变；
+observed revision/fingerprint 在 exact-post 成功判定时填充，并从 `restore_succeeded` 到 `completed` 不可变。
+非 `completed` phase 的 `completed_at` 与 completion digest 都必须为 `-`；`completed` 必须含 observed facts、
+数据库冻结的 `completed_at` 和合法 digest。phase、字段 presence/absence 与下述状态图不匹配即 malformed。
+parser 的 phase-shape 闭集进一步冻结为：`gate_established` 的 call-start/backend/pre/observed/completed 字段
+全为 `-`；`restore_backend_starting` 必须有 call-start 与 pre pair、ordinal 至少为 1，但 backend/observed 为
+`-`；ready/started/outcome-unknown/not-applied 必须保留 call-start、pre 与 backend pair，observed 为 `-`；
+`restore_succeeded` 及其全部后继（含 `reopen_not_applied`）可采用 direct exact-post shape（ordinal 0 且 call-start/backend/pre 全
+为 `-`）或 real-call shape（ordinal 至少 1 且这些字段按前述已填充），两者都必须有 observed pair；
+`completed` 还要求 reopen ordinal 至少为 1、completed_at 与 digest。所有 revision/fingerprint、PID/start、
+call-start 和 observed 字段都必须成对为 `-` 或成对有值，已填字段不得在后继 phase 被清空。
+`needs_attention` 只接受从 graph 合法入边继承而来的上述 predecessor shape，不得凭该终态新增、清除或
+改写事实。任何其他组合即使 delimiter/字符合法也按 malformed fail closed。
 
-每个新 legacy attempt 必须在建立 legacy gate 的同一 owner transaction 中先
-`RESET ai_employee.restore_completion`；若从 completed generic/sealed idle 开始，还必须 RESET 旧 call
-authority，然后才设置新 gate、写 gate audit并撤销 CONNECT。从 pristine idle 开始则保持 call authority
-不存在。不得清除 active/`needs_attention` authority，也不得留下 active legacy gate + 历史 completion GUC
-或旧 completed call authority。
+第三个 database-wide fact `ai_employee.restore_completion` 只接受恰好 86 个 ASCII bytes 的
+`restore_completion:v1:<completion_authority_digest_v1>`。writer 只能在持有 lifecycle/target locks 的 owner
+transaction 内使用 `ALTER DATABASE SET/RESET`，随后直接重读 `pg_db_role_setting`；每个 present key 必须在
+当前 database、`setrole=0` 的 `setconfig` 中恰好出现一次。重复 key、role-specific row、malformed array、
+非 canonical encoding、未知 schema 或依赖 last-write-wins 的解析都 fail closed，不能由 writer/parser
+“修复”成合法状态。
+
+baseline ACL 固定为 `PUBLIC` 无 CONNECT、`ai_employee_app` 与 `ai_employee_retention` 只有各自最小 CONNECT；
+active ACL 固定为三者 CONNECT 全部 revoked。catalog admission 是三态闭集：
+
+| 状态 | maintenance gate | call authority | completion GUC | ACL | 允许入口 |
+|---|---|---|---|---|---|
+| `pristine_idle` | absent | absent | absent | baseline | ordinary migration/role-bootstrap/owner lifecycle，或新 generic/sealed admission |
+| `active` | present | 同 attempt、合法且 phase 非 `completed` | absent | active/revoked | 仅 matching generic/sealed executor/reconcile |
+| `completed_idle` | absent | 合法 `completed` | present，且与 completed call 双向 digest 绑定 | baseline | ordinary lifecycle，或验证并归档旧 pair 后的新 admission |
+
+除此之外的任何组合都 fail closed，包括 gate-only、call-only、completion-only、active gate + completion、
+completed call 缺失、completed call/completion digest 不匹配、cross-attempt pair、gate reset + revoked ACL、
+或 active gate + baseline ACL。不得再用“completion absent + baseline ACL”单独判非法，因为它正是
+`pristine_idle`；首次安装、migration 与 role-bootstrap 必须能在该状态运行。`needs_attention` 是 active call
+的合法终态 phase，但只允许事故处置，不允许被 ordinary lifecycle 或新 attempt 覆盖。
 
 无 active gate 的新 generic/sealed 请求在 management lifecycle + target lock 下、建立 gate 与撤销 CONNECT
 之前，必须先通过只读 verifier 证明 current revision 和完整 `restore_fingerprint_v1` 逐字节等于 manifest
@@ -2367,15 +2391,27 @@ sealed 绝不互相覆盖。文件不含时间戳或随机 ID，以 same-directo
 no-clobber publication 发布；目标不存在时原子创建，已存在且 canonical bytes 完全相同才视为幂等成功，
 已存在但任一 byte 不同必须 fail closed，禁止 overwrite。没有逐字段 evidence 不得跳过正常 restore。
 
-新 generic/sealed attempt 把“call authority 不存在或上一 attempt 为 `completed`”视作虚拟 `new`；proposed state 已冻结
-新 attempt UUID、`call_ordinal=0`、`reopen_ordinal=0` 与 exact kind/target/source/manifest。建立 gate 必须在
-持锁 owner transaction 中同时 CAS exact previous catalog value 和 proposed facts，并按固定顺序先
-`RESET ai_employee.restore_completion`，再设置 maintenance gate、把 call authority写为
-`gate_established`、写 content-free gate-established audit、撤销 `PUBLIC`/app/retention CONNECT；commit
-后终止既有非 owner session并验证新 app/retention connection 被拒绝。`needs_attention` 不能被新 attempt
-覆盖。restore 进程崩溃会释放 advisory lock，但 gate/call database setting 继续阻断 owner entry/reset；非
-matching attempt 在重新取得 lock 后仍必须零写入。不同 manifest、generic/sealed 或 legacy attempt 对同一
-target 都由同一 lifecycle/target lock 与 gate 串行，state filename 不影响结果。
+新 generic/sealed attempt 只能从 `pristine_idle` 或 `completed_idle` 进入虚拟 `new`，并冻结新 attempt UUID、
+`call_ordinal=0`、`reopen_ordinal=0`、database `gate_established_at` 与 exact kind/target/source/manifest。
+`pristine_idle` 的 `previous_completion_digest` 为 `-`。从 `completed_idle` 开始时，holder 必须先重算并验证
+旧 completed call 的 zero-slot canonical digest、matching completion GUC、gate absent 与 baseline ACL，再把
+exact old call + completion pair 重建/写入旧 attempt 的 mode-`0600` final state-v4 文件；该文件必须
+file/directory fsync、no-clobber，已存在时只接受 canonical bytes 完全相同。这个 archive 只是不可变诊断
+projection；新 call 的 `previous_completion_digest` 才把已验证旧 pair 的 digest 带入下一条 catalog chain。
+
+随后一个持锁 owner transaction 必须再次比较 exact old three-fact tuple 与 archive digest：从 pristine
+要求三者 absent；从 completed 要求旧 call/completion 仍互绑。事务按固定顺序 RESET completion（pristine
+为 canonical no-op）、用新 `gate_established` active call 原子替换 absent/旧 completed call、设置 maintenance
+gate并撤销 `PUBLIC`/app/retention CONNECT。gate 建立阶段不向 `audit_events` 写任何行；只持久化 catalog
+gate/call，并在 commit 后 fsync 外部 state-v4 projection。若在 projection 前 crash，另一主机必须仅凭
+active gate + active call 重建。commit 后终止既有非 owner session并验证新 app/retention connection 被拒绝。
+archive 完成但 catalog CAS 前 crash 只留下无害 archive，数据库仍是原 `completed_idle`；catalog commit 则
+必须把旧 completion RESET、新 active call 替换与 gate/ACL 变更作为一个原子结果，绝不能暴露 gate-only、
+call missing 或 completion 已清除但 active call 尚未建立的中间状态。
+`needs_attention` 不能被新 attempt 覆盖。restore 进程崩溃会释放 advisory lock，但 gate/call database
+setting 继续阻断 owner entry/reset；非 matching attempt 在重新取得 lock 后仍必须零写入。不同 manifest
+与 generic/sealed kind 由同一 lifecycle/target lock 与三态 catalog 串行；legacy conversion 只使用其独立
+disposable target/registry，不占用或改写这组三个 catalog facts。
 
 matching restore 只有持锁 session 本身可以继续；不能靠 `AI_EMPLOYEE_RESTORE_CONNECT_FENCE`、attempt
 环境变量或第二条 owner connection 冒充 lock owner。正常 role bootstrap 在 gate 非空时绝不 grant
@@ -2402,9 +2438,11 @@ attempt projection 路径固定为
 `ai_employee.postgres_restore_state.v4`，父目录 `0700`、文件 `0600`，不上传、不参与 backup retention/orphan
 cleanup。projection 记录 gate/call/completion catalog facts 的完整 content-free 镜像和稳定 result code，通过同目录 current-run
 temp、mode check、file/directory `fsync` 与 atomic rename 发布，但不能授权 transition、spawn、retry 或
-reopen。另一主机没有 local state，或 state 丢失/损坏/滞后时，必须直接从 gate/call authority 与 completion
-GUC 重建；completed 状态只由合法 completion GUC、gate reset 与 ACL 判定，matching completed call 可用于
-重建 catalog projection，completion audit 可以存在或已按 retention/privacy 删除。authority
+reopen。completed projection 包含 exact completed call 与 matching completion GUC，完成后转为 immutable
+no-clobber archive；下一 attempt 只能在校验/归档该 pair 后替换 catalog call。另一主机没有 local state，或
+state 丢失/损坏/滞后时，必须直接从 gate/call authority 与 completion GUC 重建；`completed_idle` 必须同时
+读取不可缺失的 completed call、matching completion GUC、gate absent 与 baseline ACL，任何一项缺失都不是
+completed。completion audit 可以存在或已按 retention/privacy 删除，但不能补足 catalog pair。authority
 信息不足、malformed 或互相矛盾时返回 `needs_attention`
 disposition并停止。只有当前
 phase 在下述 graph 中存在到 `needs_attention` 的边才持久化该 phase，否则保持 authority 不变等待事故
@@ -2479,15 +2517,28 @@ CONNECT revoked 且同一 target lock/session 持有时完成；所有可能失�
 先完成。随后以 expected `verified`、attempt、call/reopen ordinal CAS 为 `reopen_committing` 并把独立
 `reopen_ordinal` 增加 1。completion event type 固定为 `database.restore.completed`，metadata schema 固定为
 `ai_employee.database_restore_completed.v1`；exact metadata keys 且禁止额外 key：`schema`、`attempt_id`、
-`kind`、`target_identity_digest_v1`、`source_binding_digest_v1`、`manifest_sha256`、`final_call_ordinal`、
-`final_reopen_ordinal`、`post_revision`、`post_restore_fingerprint_v1`、`maintenance_gate_version`（整数 `1`）、
-`maintenance_gate_value`、`completed_at`、`completion_authority_digest_v1`。`completed_at` 由最终 database
-transaction 冻结为 UTC RFC3339、恰好六位微秒和 `Z`。
+`kind`、`target_identity_digest_v1`、`source_binding_digest_v1`、`manifest_sha256`、
+`previous_completion_authority_digest_v1`（pristine 来源为 JSON `null`）、`final_call_ordinal`、
+`final_reopen_ordinal`、`gate_established_at`、`final_call_started_at`（direct exact-post 为 JSON `null`）、
+`final_backend_start`（未启动 psql 为 JSON `null`）、`expected_post_revision`、
+`expected_post_restore_fingerprint_v1`、`observed_post_revision`、
+`observed_post_restore_fingerprint_v1`、`maintenance_gate_version`（整数 `1`）、`maintenance_gate_value`、
+`completed_at`、`completion_authority_digest_v1`。这些 timeline/fingerprint 字段都来自 active call 与最终
+同 session verifier，只含安全 metadata；`completed_at` 由最终 database transaction 冻结为 UTC RFC3339、
+恰好六位微秒和 `Z`。gate 建立、call 开始、failure 或 `needs_attention` 不预写 AuditEvent；恢复完成前的
+持久事实只有 catalog call/gate 与 state-v4。事故稳定后 operator 可另行追加 content-free incident audit，
+但它不反写 completion metadata 或 catalog authority。
 
-completion authority canonical bytes 固定为
-`restore-completion-authority:v1|<attempt>|<kind>|<target>|<source>|<final_call_ordinal>|<final_reopen_ordinal>|<post_revision>|<post_fingerprint>|<maintenance_gate_version>`；
-authority digest 为
-`SHA-256(b"ai_employee.restore_completion_authority.v1\0" || canonical_bytes)`。最终事务必须先锁定并读取
+completion digest 必须覆盖完整 completed-call schema，不能只哈希部分字段。最终事务先构造 exact
+`restore-call:v4` completed value，其中 phase=`completed`、observed facts 与最终 verifier 相同、
+`completed_at` 已冻结，最后一个 digest 槽位暂时使用恰好 64 个 ASCII `0`。该完整 1133-byte-bound
+zero-slot authority value 是 `canonical_completed_call_bytes`；authority digest 固定为
+`SHA-256(b"ai_employee.restore_completion_authority.v1\0" || canonical_completed_call_bytes)`。随后只把末尾
+zero slot 替换为所得 64 位小写 digest，其他 byte 不得变化。验证者必须把 stored completed call 的末尾
+digest 重新归零后重算，并同时要求 call 内 digest、completion GUC digest 与重算值三者相等；这种固定
+zero-slot 规则消除自引用歧义并绑定 completed call 的每个事实字段。
+
+最终事务必须先锁定并读取
 `users`，要求全表恰好一行；该唯一管理员可以是 active，也可以是 M1 全数据删除后保留的 inactive anonymized
 row，零行或多行都 fail closed。最终只允许一个 owner transaction 同时把 call authority CAS 为带该 digest
 的 `completed`、插入一条普通 BigInteger-ID audit、
@@ -2498,25 +2549,27 @@ row 的 ID，`task_id=NULL`，`event_type=database.restore.completed`，`actor_t
 `actor_id=database_restore`，`created_at` 使用数据库时间；metadata 使用上述 exact versioned key set，禁止
 额外 key。最终事务当刻发现同 attempt/digest 已有 audit、INSERT 数量不是一、schema/key set/value/digest
 不匹配都 rollback；这只是提交原子性与审计证据校验，不使 audit 成为 admission/ACK authority。该 audit
-后续被普通 retention 或全数据删除移除不影响 completion GUC。
+后续被普通 retention 或全数据删除移除不影响 completed call + completion GUC pair。
 
 commit ACK unknown 必须关闭旧 session，用新 owner session重新取得 lifecycle/target lock并先读取
-`ai_employee.restore_completion`。只有 expected GUC + gate reset + app/retention 最小 CONNECT 已恢复且 PUBLIC
-仍 revoked 表示已提交，只重建 projection；matching completed call 与 completion audit 可作为当刻/后续诊断
-证据，但不进入 ACK predicate，audit 已被 retention/privacy 删除也不得使 completed 失效。由于每个 active
-attempt 建 gate 时已 RESET completion，只有 exact authority `reopen_committing` + completion GUC absent +
-active gate + PUBLIC/app/retention CONNECT 全 revoked 表示事务未应用，并以 exact old call value CAS 到
-`reopen_not_applied`。只有 operator 显式授权才以新且从不复用的 `reopen_ordinal` 再 CAS 到
-`reopen_committing`；任何 malformed/conflicting GUC、expected GUC 与 active gate/revoked ACL、absent GUC 与
-gate reset/reopened ACL 等 mixed combination 都进入 `needs_attention`。不得接受“先前合法 completion
-value”作为 active attempt 的 not-applied 形状。本地 projection 不是数据库事务或 authority。commit 后 host
-crash 不是 reopen failure，服务仍由 operator 之后显式启动。
+`ai_employee.restore_call_authority` 与 `ai_employee.restore_completion`。只有 gate absent、baseline ACL、
+合法 completed call、expected completion GUC，且 zero-slot 重算证明二者互绑，才是 `completed_idle` 并禁止
+replay；audit 和 local projection 都可缺失，缺失时从 catalog pair 重建 projection。completed call 本身
+不可缺失，也不能降级成“diagnostic projection”。由于每个 active attempt 建 gate 时已 RESET completion，
+只有 exact active authority `reopen_committing` + completion GUC absent + matching gate + active ACL 才证明
+final transaction 未应用，并以 exact old call value CAS 到 `reopen_not_applied`。只有 operator 显式授权才
+以新且从不复用的 `reopen_ordinal` 再 CAS 到 `reopen_committing`。任何 malformed/conflicting GUC、completed
+call 缺失、digest mismatch、completion + active gate、absent completion + completed call、或其他不属于
+三态矩阵的组合都进入 `needs_attention`。`pristine_idle` 的 completion absent + baseline ACL 明确合法，
+不得误判 mixed。本地 projection 不是数据库事务或 authority。commit 后 host crash 不是 reopen failure，
+服务仍由 operator 之后显式启动。
 
 通用 `just restore file` 只接受已发布 manifest-bound 组；sealed `just calendar-aad-restore-0018 file` 在
 读取 owner Secret 前额外验证 preflight/`pre-migration`/exact-image/revision；legacy 只对 disposable
 isolated target 使用经验证的旧 source binding。三者的 recipe、validator、artifact 与 output 不能互调或
-混用；三者只共用上述 lifecycle/target lock 与 database-gate admission helper。manifest-bound
-generic/sealed 才共用 catalog call authority、state-v4 projection、Python psql/pg_restore stream reconcile、
+混用；legacy 只在 disposable target 上复用普通 backup lifecycle，不能进入 workspace/production 的
+三态 restore admission。manifest-bound generic/sealed 才共用 lifecycle/target/schema locks、catalog gate/call/
+completion authority、state-v4 projection、Python psql/pg_restore stream reconcile、
 holder-session verifier 与 completion-GUC atomic reopen executor；legacy 必须使用独立
 durable registry、disposable target 和 cleanup/scavenger lifecycle，不得调用该 restore executor。
 development/test 同 workspace writer 仍运行时仍必须拒绝；若不能停止，只能使用明确隔离目标。
@@ -2735,8 +2788,9 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `25006` 拒绝。所有会失败的 digest/revision/data checks 必须先于最终单一事务；该事务原子写 completion
    ordinary BigInteger-ID exact metadata audit、把 call authority CAS 为 completed、设置 completion GUC、
    RESET gate并只恢复 app/retention 最小 CONNECT，PUBLIC 保持 revoked。新 sealed attempt 建 gate 的同一
-   owner transaction 必须先 RESET completion GUC。ACK unknown 必须关闭旧 session并由新 owner session只按
-   expected completion GUC、gate 与 ACL 判定；completion audit 后续缺失不影响 completed。明确
+   owner transaction 必须先 RESET completion GUC。ACK unknown 必须关闭旧 session并由新 owner session同时
+   校验 exact completed call、expected completion GUC、gate 与 ACL；completion audit 后续缺失不影响
+   completed pair。明确
    not-applied 先进入 `reopen_not_applied`，只有新 `reopen_ordinal` 的显式 operator retry 才能再提交。只有该
    核对证明 completed 后，
    才检查并启动原 0018-compatible image。zero state 漂移或镜像/basename 不匹配必须先人工调查，只有仍能独立
@@ -2775,7 +2829,7 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；generic started/confirmed 精确绑定 attempt UUID、source、`rollout_digest_v1`、G/G/G、full/refresh pre/post 摘要、old/new identity/version、`refresh_identity_changed`、persisted expiry与 deadline candidate；mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序。未确认 fence 跨 basename 阻断；automatic missing/same/different refresh 都只 confirmed 自己的 started并满足 flag/equality 矩阵，只有带 connection ID 的 explicit progressive recovery 返回 different non-empty refresh token并原子提交 old != new、changed=true 的完整 F/S/T replacement proof 才消费旧 fence |
 | 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention并复用同一 result union；confirmed 关闭 automatic started，unsatisfied 只关闭 recovery started，replacement 同时关闭 recovery started并消费 original fence。未匹配 union result 的 automatic started 跨 cutoff 保留；各完整事件组只有全部早于 cutoff 才删，且关闭不依赖后续 current credential lineage，跨 365 天回归要求后续 provider call 为零 |
 | 并发 backup/migration/reset/cleanup 使目标被替换、manifest revision 错绑、覆盖或误删另一 run | 固定管理库 target lifecycle lock 先串行 target create/drop/reset 与所有 lifecycle wrapper；backup 另用 `BACKUP_LIFECYCLE_LOCK=(20260806, 274)` 跨主机串行同一数据库，`${BACKUP_DIR}` `flock` 串行本地目录。每 run 唯一 `.partial.<uuid>`、no-clobber/manifest-last、本地与 remote 3600 秒 grace 加锁内 mtime/manifest 重查；schema-lifecycle shared/exclusive lock与 pre/post revision CAS 绑定 dump，backup 期间 migration 不得提交，active restore authority 下 reset 必须零 drop/create。 |
-| 通用灾备 restore 与 0019 sealed restore 混淆，或 crash/ACK 丢失后盲目重放/提前开闸 | generic、sealed 与 legacy validator/artifact/recipe 分离，三者只共用 management lifecycle/target admission；manifest-bound generic/sealed 还持 exclusive schema lock，并以 `restore-call:v3` 和逐 transition CAS 为唯一跨主机调用事实。本地 `RESTORE_STATE_DIR` v4 文件仅是 projection，backup/artifact mount 只读。Python controller 先登记 credential-bearing psql backend，持久化 ready 后再 CAS+fsync started；credential-free pg_restore 只生成 SQL并由 controller 逐块转发，completion guard 保证 controller crash/EOF/mid-stream failure 回滚。跨主机无法证明本地 child/pipe identity 的 `restore_backend_starting` 必须进入 `needs_attention`，不得自动判 not-applied。no-gate exact post 使用 kind-aware、no-clobber 的 DB-zero-write local evidence，matching gate direct edge仍走统一 completion。每个 active attempt 建 gate 时先 RESET completion；最终事务写带固定外层字段的普通 BigInteger-ID exact metadata audit、设置 `restore_completion:v1:<digest>`、CAS completed、RESET gate并恢复最小 app/retention CONNECT；ACK unknown 只按 completion GUC、gate 与 ACL 判定，audit retention/privacy 删除不影响 authority。sealed 额外执行 exact-image/artifact/script guard；legacy 使用独立 registry/labels/disposable target/scavenger，不调用 restore executor。 |
+| 通用灾备 restore 与 0019 sealed restore 混淆，或 crash/ACK 丢失后盲目重放/提前开闸 | generic、sealed 与 legacy validator/artifact/recipe 分离；legacy 只用 registry/labels/disposable target/scavenger，不写 workspace restore catalog。manifest-bound generic/sealed 持 management/target/exclusive-schema locks，并以 `restore-call:v4` 和逐 transition CAS 为唯一跨主机调用事实。本地 `RESTORE_STATE_DIR` v4 文件仅是 projection/archive，backup/artifact mount 只读。Python controller 先登记 credential-bearing psql backend，持久化 ready 后再 CAS+fsync started；credential-free pg_restore 只生成 SQL并由 controller 逐块转发，completion guard 保证 controller crash/EOF/mid-stream failure 回滚。跨主机无法证明本地 child/pipe identity 的 `restore_backend_starting` 必须进入 `needs_attention`，不得自动判 not-applied。no-gate exact post 使用 kind-aware、no-clobber 的 DB-zero-write local evidence，matching gate direct edge仍走统一 completion。每个 active attempt 原子验证/归档 prior completed pair、RESET completion 并建立 gate/active call，且不写 pre-restore gate audit；最终事务写恢复后普通 BigInteger-ID exact metadata audit、设置 `restore_completion:v1:<digest>`、保留 completed call、RESET gate并恢复 baseline ACL。ACK unknown 必须验证 completed call + completion GUC 的 zero-slot digest 互绑、gate absent 与 baseline ACL；audit retention/privacy 删除不影响该 pair authority。sealed 额外执行 exact-image/artifact/script guard。 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
