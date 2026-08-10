@@ -2311,8 +2311,9 @@ git commit -m "feat: add calendar change proposals"
 - Modify: `scripts/run-e2e-backend.sh` — keep E2E bootstrap on ordinary `upgrade head`.
 - Modify: `scripts/test-run-e2e-backend.sh` — assert fresh E2E upgrade succeeds without a rollout artifact and
   does not bypass a non-empty affected database.
-- Modify: `scripts/test-tooling.sh` — cover ordinary DB recipe compatibility and the absence of implicit guard
-  waivers.
+- Modify: `scripts/test-tooling.sh` — cover ordinary DB recipe compatibility, the absence of implicit guard waivers
+  or invented obsolete-0019 repair/stamp/downgrade recipes, and preservation of the existing non-production-only,
+  exact-target-confirmed `just db-reset` rebuild boundary.
 - Modify: `scripts/test-deployment.sh` — cover Compose migration-service compatibility with zero-bootstrap.
 - Modify: `backend/tests/integration/google/test_calendar_sync.py` — Google v2 AAD write/decrypt and same-event-ID calendar isolation.
 - Modify: `backend/tests/integration/microsoft/test_calendar_sync.py` — Microsoft v2 AAD write/decrypt and same-event-ID calendar isolation.
@@ -2336,14 +2337,22 @@ production services, apply the production migration, or start a resync. The actu
 Task 27A–27E/30 procedure following `docs/operations.md`: keep PostgreSQL/Redis running, stop new ingress and
 Calendar scheduling, drain every pre-0019 Caddy/API/Worker/Scheduler reader or writer, run the 0018-compatible
 preflight that actively refreshes each distinct affected connection and binds an original deadline or exact
-zero/no-deadline state, recompute a current-expiry effective deadline at every later guard, back up and audit only
-after the typed rollout guard passes, apply 0019, make the v2-only image available without starting general services,
-run the dedicated ordinal-aware exact-pair one-off recovery and `post-resync` audit under the same guard, and only
-then start API/Worker/Scheduler/Caddy and continue release verification. If a non-empty sealed window cannot clear
-markers before the effective deadline, Task 27D owns the independent
-`calendar-aad-restore-0018` path to the recorded pre-migration 0018 backup; Task 16A must not alter generic restore
-or invent a downgrade path. A previously affected dev/test database that already applied an obsolete 0019 must use
-the later explicit safe rebuild/repair recipe, never a rewritten revision or silent stamp.
+zero/no-deadline state, recompute a current-expiry effective deadline at every later guard, back up the complete
+manifest/checksum/dump group and audit only after the typed rollout guard passes, apply 0019, make the v2-only image
+available without starting general services, run the dedicated ordinal-aware exact-pair one-off recovery and
+`post-resync` audit under the same guard, and only then start API/Worker/Scheduler/Caddy and continue release
+verification. If a non-empty sealed window cannot clear markers before the effective deadline, Task 27D owns the
+independent `calendar-aad-restore-0018` path to the recorded pre-migration 0018 backup; Task 16A must not alter
+generic restore or invent a downgrade path.
+
+Task 16A is the first repository task that creates/publishes `20260809_0019`; before it, no 0019 revision is a
+released contract. A development/test database that already contains a hand-applied, unknown or incomplete 0019 is
+an obsolete experimental target: first take a forensic backup, then use only the existing protected `just db-reset`
+against the precisely confirmed non-production target so it drops/recreates that target and runs the ordinary
+`upgrade head`. Do not add a future repair recipe, rewrite an applied revision, silently stamp, or fake a downgrade.
+If production reports an unknown or obsolete 0019, stop immediately and keep all services/writes disabled; never run
+`db-reset`, stamp/revision surgery, direct SQL repair, or downgrade without a newly approved incident/data-disposition
+plan.
 
 - [ ] **Step 1: Write failing lease and restore-input trust-boundary tests**
 
@@ -2590,6 +2599,13 @@ Exercise the real entrypoints through `backend/tests/integration/conftest.py`,
 `scripts/test-run-e2e-backend.sh`, `scripts/test-tooling.sh`, and `scripts/test-deployment.sh`: fresh
 CI/E2E/Compose/`just db-upgrade` must remain green without rollout artifacts, while no entrypoint may set an
 implicit allow flag for a non-empty affected database.
+
+Freeze the obsolete-database operator boundary in `scripts/test-tooling.sh`: no `repair-0019`, stamp, downgrade, or
+revision-rewrite recipe may appear. The already existing `just db-reset` must remain restricted to explicit
+`development|test`, localhost/exact database identity and exact typed confirmation, and must continue by running
+ordinary `just db-upgrade`. A production-like environment or target must fail before any drop/create/migration call.
+This test documents the only permitted rebuild of a hand-applied pre-Task-16A experimental 0019; it does not create
+a migration branch for that obsolete database.
 
 Then upgrade a synthetic database to `20260809_0018`, inject the typed Fake guard, seed all of these facts, and
 upgrade to `20260809_0019`:
@@ -4121,7 +4137,8 @@ git commit -m "feat: add oauth refresh recovery"
 - Modify: `backend/src/ai_employee/workers/sync_calendar.py`
 - Modify: `backend/src/ai_employee/workers/execute_task.py`
 - Modify: `justfiles/ops.just`
-- Modify: `scripts/backup-postgres.sh`
+- Modify: `scripts/backup-postgres.sh` — add only the Task 27C rollout-guard/basename hook used by the sealed change
+  window; Task 27D owns the generic versioned manifest, group publication, remote/retention, and restore tooling.
 - Modify: `scripts/test-tooling.sh`
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py`
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py`
@@ -4181,18 +4198,26 @@ git add backend/src/ai_employee/application/use_cases/calendar_aad_preflight.py 
 git commit -m "feat: add guarded calendar aad rollout"
 ~~~
 
-### Task 27D: Separate generic restore, sealed 0018 restore, and audit tooling
+### Task 27D: Publish generic backup manifests; separate generic restore, sealed 0018 restore, and audit tooling
 
-**Depends on:** Task 27C. This task must preserve two independent restore contracts.
+**Depends on:** Task 27C. This task owns generic backup-manifest/restore/audit tooling and must preserve two
+independent restore contracts. It must not move retention/privacy behavior from Task 27E into this task.
 
 **Files:**
-- Modify: `compose.yaml`
-- Modify: `scripts/restore-postgres.sh` — generic owner-role disaster restore only.
+- Modify: `compose.yaml` — add independent operations-profile generic owner restore and app-only verifier boundaries;
+  keep the sealed 0018 service separate from both.
+- Modify: `scripts/backup-postgres.sh` — publish and retain/copy an atomic manifest-bound three-file backup group.
+- Modify: `scripts/restore-postgres.sh` — generic manifest-bound owner-role disaster restore only, including repeated
+  no-business-writer checks; no 0019 sealed artifact logic.
+- Create: `backend/src/ai_employee/cli/verify_restored_backup.py` — generic app-role, database-enforced read-only
+  verifier selected by the backup manifest revision.
 - Create: `scripts/restore-calendar-aad-0018.sh` — sealed-window artifact/image-bound restore only.
 - Create: `backend/src/ai_employee/cli/calendar_aad_verify_restored_0018.py`
 - Create: `scripts/audit-calendar-aad-0019.sh`
 - Create: `scripts/test-calendar-aad-0019-audit.sh`
-- Modify: `justfiles/ops.just`
+- Modify: `justfiles/ops.just` — resolve immutable backup image metadata, enforce group conflicts and production
+  stopped-write confirmations, orchestrate generic restore/verifier, and expose the non-production isolated legacy
+  conversion flow without weakening `just restore`.
 - Create: `scripts/test-m2-release.sh` — initial release wrapper with an explicit audit invocation; Task 30 expands
   the remaining release matrix.
 - Modify: `scripts/test-tooling.sh`
@@ -4200,19 +4225,56 @@ git commit -m "feat: add guarded calendar aad rollout"
 - Modify: `backend/tests/unit/test_init_db_roles_script.py`
 - Modify: `backend/tests/integration/retention/test_role_permissions.py`
 - Modify: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py`
+- Modify: `docs/operations.md` — generic manifest/restore and sealed restore target contracts, without claiming the
+  not-yet-executed production procedures are already available or completed.
 
-- [ ] **Step 1: Write failing generic/sealed separation and explicit-audit release tests**
+- [ ] **Step 1: Write failing manifest, generic/sealed separation, stopped-write, and explicit-audit tests**
 
-For generic `just restore file`, require checksum, owner role,
-`--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`, restored grants, and an
-app-role read-only verifier selected by the backup's own revision/manifest. It must restore ordinary 0019 backups
-without preflight or `pre-migration` artifacts.
+Freeze every new ordinary backup as adjacent `${dump}`, `${dump}.sha256`, and `${dump}.manifest.json`. The versioned
+manifest schema is `ai_employee.postgres_backup_manifest.v1` and contains only a safe dump basename, strict UTC
+`created_at`, PostgreSQL server version, Alembic revision, encrypted dump lowercase SHA-256/size, exact checksum
+filename, the resolved immutable backend image `sha256:` content ID, and allowlisted content-free build/release
+metadata. Assert all three files are `0600` and contain no DSN, credential, token, body, calendar content, or personal
+data. The checksum must cover the encrypted dump and finalized manifest by safe relative basename; the manifest must
+bind the exact checksum filename and repeat dump digest/size. Any extra checksum line, symlink, absolute/unsafe name,
+digest/size/revision/image mismatch, partial file, or collision fails closed.
+
+Test same-directory staging and manifest-last atomic publication: any dump/manifest/checksum generation or rename
+failure leaves no published group, and a final manifest is the only publication marker. rclone must copy all three
+members and publish the remote manifest last; backup success is withheld if the configured remote group is partial.
+Daily/weekly retention, conflict detection, orphan handling, and deletion must treat the three members as one
+indivisible basename group.
+
+For generic `just restore file`, require the complete manifest-bound group to pass pure-file/schema/digest/size/
+revision/image-metadata verification before any owner Secret, owner service, owner connection, or `pg_restore`.
+Production must additionally resolve all three write switches to `false`, prove Caddy/API/Worker/Scheduler,
+migration/role-bootstrap and every general consumer or write-credential one-off are stopped, and obtain an in-recipe
+production-only second exact confirmation after the Compose-state check. The owner one-off must recheck that there is
+no active business-writer database session immediately before restore. Parameterize every running-service, active
+writer, enabled-switch, missing-confirmation, manifest mismatch, and check-to-restore race case and assert
+`pg_restore_calls == 0`. A single PostgreSQL transaction is required for atomicity but is never accepted as a
+substitute for stopped writes. Development/test must reject a write-capable service in the same workspace unless the
+target is a separately proven isolated PostgreSQL instance.
+
+The generic owner restore uses
+`--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`, re-runs the existing role
+bootstrap only after restore success, and then launches the independent app-only `verify_restored_backup` service
+with database-enforced read-only behavior. It must restore ordinary 0019 backups without preflight or
+`pre-migration` artifacts. No Caddy/API/Worker/Scheduler/migration/general consumer may restart until both restore and
+generic verifier succeed.
+
+Pre-manifest backups must be rejected by production generic restore. Define and test the Task 27D
+`restore-legacy-to-isolated` non-production conversion flow: verify the old checksum, restore only into a disposable
+isolated PostgreSQL target with no shared business network/volume/write service, read the actual revision and health,
+then run a fresh normal backup from that isolated database to create a new manifest-bound group. It must never attach
+a fabricated manifest to the old encrypted dump, repair/stamp a revision, target the workspace/production database,
+or accept an unknown/unsupported revision.
 
 For `just calendar-aad-restore-0018 file`, require the stopped-service sealed window, preflight plus exact
 `pre-migration` artifact, exact local image content ID, owner-before-secret zero-call mismatch behavior,
 `--pull never`, the independent sealed script/service, revision 0018, deterministic artifact comparison, and
-`PGOPTIONS` plus first-action `BEGIN READ ONLY`/SQLSTATE `25006`. Assert neither recipe/service/script invokes
-the other.
+`PGOPTIONS` plus first-action `BEGIN READ ONLY`/SQLSTATE `25006`. Assert the generic and sealed
+recipe/service/script/verifier/fixture paths never invoke each other or transfer exact-image/preflight requirements.
 
 Before implementing audit tooling, add a release-wrapper contract that fails because
 `scripts/test-m2-release.sh` does not yet explicitly execute:
@@ -4221,9 +4283,10 @@ Before implementing audit tooling, add a release-wrapper contract that fails bec
 TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test bash scripts/test-calendar-aad-0019-audit.sh
 ~~~
 
-The contract must inspect/execute that direct call; `just ci` is not accepted as indirect evidence.
+The contract must inspect/execute that direct call; `just ci` is not accepted as indirect evidence. Task 30 later
+moves the fixed database value to a script-wide validated export while preserving this direct audit subprocess.
 
-- [ ] **Step 2: Run the restore/audit RED gate**
+- [ ] **Step 2: Run the backup/restore/audit RED gate**
 
 ~~~bash
 TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
@@ -4235,26 +4298,44 @@ TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0
 bash scripts/test-calendar-aad-0019-audit.sh
 bash scripts/test-tooling.sh
 bash scripts/test-deployment.sh
+git diff --check
 ~~~
 
-Expected: FAIL because generic restore is app-role/non-atomic, the sealed path is not independent, audit tooling and
-the explicit release-wrapper call are absent, and the restored verifier is not database-enforced read-only.
+Expected: FAIL because backup publication has no versioned manifest/group semantics, generic restore is
+app-role/non-atomic and has no stopped-write or revision-aware verifier boundary, legacy backups are not isolated,
+the sealed path is not independent, audit tooling and the explicit release-wrapper call are absent, and the restored
+verifiers are not database-enforced read-only.
 
-- [ ] **Step 3: Implement both restore paths and the audit boundary**
+- [ ] **Step 3: Implement the generic manifest/restore boundary, sealed path, and audit tooling**
 
-Keep `scripts/restore-postgres.sh` free of 0019 artifact logic. Add the separate sealed script/service/recipe and
-verifier, preserving the full owner-before-secret, exact-image, atomic restore, grant, and read-only rules below.
-Implement all three audit phases and make the initial `scripts/test-m2-release.sh` call the audit test explicitly
-with `TEST_DATABASE_URL`; Task 30 may add tests around it but may not remove or hide this direct invocation.
+In `scripts/backup-postgres.sh`, create all group members under temporary names, finalize the manifest before writing
+the checksum that covers dump plus manifest, verify the complete binding, set `0600`, and rename the manifest last.
+Treat an existing final member as an all-group conflict; make rclone publication and daily/weekly cleanup group-aware.
+Resolve the immutable backend image content ID in the host recipe and pass it as data, never as an operator-entered
+authority. A partial local or remote group is not a successful backup.
+
+Keep `scripts/restore-postgres.sh` free of 0019 preflight/`pre-migration` logic. Add independent operations-profile
+generic owner restore and app-only verifier services that do not inherit `backend-common` or auto-run migration.
+Before starting the owner service, `just restore` validates the manifest group, effective write-switch values,
+Compose service state, exact target and the second production confirmation; the owner script rechecks active writer
+sessions immediately before `pg_restore`. Restore, grants, and the generic manifest verifier must all succeed while
+general services remain stopped. Implement `restore-legacy-to-isolated` only as a non-production disposable-target
+conversion that produces a new backup; it is not an obsolete-0019 repair recipe and cannot manufacture a manifest.
+
+Add the separate sealed script/service/recipe and verifier, preserving its full owner-before-secret, exact-image,
+atomic restore, grant, and read-only rules below. Implement all three audit phases and make the initial
+`scripts/test-m2-release.sh` call the audit test explicitly with `TEST_DATABASE_URL`; Task 30 may add tests around it
+and move the value to a validated script-wide export, but may not remove or hide the direct audit execution. Update
+`docs/operations.md` as a target contract with explicit implementation-status warnings.
 
 - [ ] **Step 4: Verify and commit Task 27D**
 
-Re-run Step 2, then:
+Re-run Step 2, inspect the full backup/restore/operations diff, then:
 
 ~~~bash
 git diff --check
-git add compose.yaml scripts/restore-postgres.sh scripts/restore-calendar-aad-0018.sh backend/src/ai_employee/cli/calendar_aad_verify_restored_0018.py scripts/audit-calendar-aad-0019.sh scripts/test-calendar-aad-0019-audit.sh justfiles/ops.just scripts/test-m2-release.sh scripts/test-tooling.sh scripts/test-deployment.sh backend/tests/unit/test_init_db_roles_script.py backend/tests/integration/retention/test_role_permissions.py backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py
-git commit -m "fix: separate calendar aad restore paths"
+git add compose.yaml scripts/backup-postgres.sh scripts/restore-postgres.sh backend/src/ai_employee/cli/verify_restored_backup.py scripts/restore-calendar-aad-0018.sh backend/src/ai_employee/cli/calendar_aad_verify_restored_0018.py scripts/audit-calendar-aad-0019.sh scripts/test-calendar-aad-0019-audit.sh justfiles/ops.just scripts/test-m2-release.sh scripts/test-tooling.sh scripts/test-deployment.sh backend/tests/unit/test_init_db_roles_script.py backend/tests/integration/retention/test_role_permissions.py backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py docs/operations.md
+git commit -m "fix: bind and separate database restores"
 ~~~
 
 ### Task 27E: Integrate retention, privacy deletion, operations, and acceptance
@@ -4270,7 +4351,8 @@ migration branches, or restore services.
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py`
-- Modify: `docs/operations.md`
+- Modify: `docs/operations.md` — extend, without replacing, Task 27D's manifest/restore sections with the final
+  retention/privacy/operator integration.
 - Modify: `docs/acceptance-checklist.md`
 
 - [ ] **Step 1: Write failing retention, deletion-barrier, and operations-consistency tests**
@@ -4280,7 +4362,9 @@ barrier/final reconcile, user isolation, and the shared versioned result-union r
 fences survive cutoff; automatic-success, unsatisfied-recovery, and successful-recovery groups delete only when every
 member is older than cutoff; parser mismatches remain protected; cleanup never depends on later credential lineage.
 Add documentation checks for the current-expiry effective deadline, four-entry access-log canary, frozen
-Task-16A/Task-27C migration boundary, generic versus sealed restore commands, and explicit release audit gate.
+Task-16A/Task-27C migration boundary, Task 27D manifest-bound generic backup/production stopped-write restore versus
+sealed restore commands, obsolete-0019 non-production reset/production-stop disposition, and explicit release audit
+gate. This closeout may integrate those operator-facing facts but must not re-own their tooling implementation.
 
 - [ ] **Step 2: Run the retention/privacy RED gate**
 
@@ -4376,23 +4460,41 @@ authoritative.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_preflight.py` — 0018 local proof, attempt/dual-digest-bound generic automatic started/confirmed fence, strict identity-change result parsing, versioned result-union commit-ACK-loss actual-commit versus actual-rollback reconciliation, closure/readiness separation with later valid refresh/reauth, changed=false non-conflict and changed=true rollback-conflict zero-call cases, explicit progressive capability-converging replacement gate, repeated recovery, classified Google/Microsoft callback-error parity, targetless pre-save blocking, crash recovery, proactive OAuth refresh/scope/deadline boundary, Fake/HTTP-mocked real-adapter probes, and no-Calendar-mutation coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_recovery.py` — marker isolation, ordinal-aware atomic task creation, exact provider reads, explicit retry, concurrency, and CLI lifecycle coverage.
 - Create: `backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py` — current-expiry
-  effective-deadline tightening, zero-state/image binding, generic restore, independent sealed owner-before-secret
-  restore, and database-enforced restored-0018 verification.
-- Modify: `compose.yaml` — add separate generic owner-role disaster-restore and sealed
+  effective-deadline tightening, zero-state/image binding, manifest-bound generic backup/restore with stopped-write
+  and legacy-isolation gates, independent sealed owner-before-secret restore, and both database-enforced verifiers.
+- Modify: `compose.yaml` — add separate generic owner-role disaster-restore, generic app-only verifier, and sealed
   `calendar-aad-restore-0018` services; only the sealed service uses the artifact-bound exact image contract.
-- Modify: `docs/operations.md` — revision-global lease, automatic started/confirmed, commit-ACK-loss versus definite-rollback reconciliation, repeated explicit progressive recovery with capability-converging started/unsatisfied/replacement facts, Google error-callback parity, targetless pre-save blocking, fixed-root identity ordering, shared snapshot CAS, whole-group cross-cutoff fence retention, typed rollout guard and image binding, non-rolling 0019 rollout, ordinal-aware recovery, owner-before-secret restore guard, exact-image atomic owner restore, database-enforced app-role verifier, rollback floor, and incident handling.
+- Modify: `docs/operations.md` — generic backup three-file manifest publication, remote/retention grouping,
+  production stopped-write restore and legacy isolation; revision-global lease, automatic started/confirmed,
+  commit-ACK-loss versus definite-rollback reconciliation, repeated explicit progressive recovery with
+  capability-converging started/unsatisfied/replacement facts, Google error-callback parity, targetless pre-save
+  blocking, fixed-root identity ordering, shared snapshot CAS, whole-group cross-cutoff fence retention, typed
+  rollout guard and image binding, non-rolling 0019 rollout, ordinal-aware recovery, sealed owner-before-secret
+  exact-image restore, both database-enforced app-role verifiers, rollback floor, and incident handling.
 - Modify: `docs/acceptance-checklist.md` — three fixed digest vectors, automatic confirmed plus progressive replacement atomicity, commit-result actual-commit/rollback reconciliation, repeated capability-converging recovery, Google callback-error and targetless-block evidence, shared snapshot-CAS and whole-group cross-cutoff durable refresh-fence evidence, image/artifact guard with zero owner calls on mismatch, per-ordinal scope recovery, exact-image owner restore/grant/database-read-only app verification, and normal rollback-floor acceptance.
 - Create: `scripts/audit-calendar-aad-0019.sh` — content-free, read-only three-phase 0019 local-proof and data-integrity audit.
 - Create: `scripts/test-calendar-aad-0019-audit.sh` — Task 13 synthetic-database contract test for local recoverability failures, audit phases, and artifact redaction.
-- Modify: `scripts/backup-postgres.sh` — accept a validated explicit 0019 artifact basename, require/check the typed rollout and actual-image binding at start and before artifact publication, reject paths/collisions, and preserve encryption, retention, and remote-copy guarantees.
-- Modify: `scripts/restore-postgres.sh` — generic owner-role disaster restore with checksum and atomic restore
-  flags; it does not parse 0019 rollout artifacts.
+- Modify: `scripts/backup-postgres.sh` — publish each ordinary or explicit-0019 backup as a `0600`
+  dump/checksum/versioned-manifest group with cross-binding and manifest-last local/remote publication; accept a
+  validated explicit 0019 artifact basename, require/check the typed rollout and actual-image binding at start and
+  before publication, reject paths/group collisions, and make retention/remote copy group-atomic.
+- Modify: `scripts/restore-postgres.sh` — generic manifest-bound owner-role disaster restore with stopped-writer
+  recheck, atomic restore flags, and no 0019 rollout-artifact parsing.
+- Create: `backend/src/ai_employee/cli/verify_restored_backup.py` — manifest-revision-selected, database-enforced
+  app-role read-only generic verifier with no owner Secret.
 - Create: `scripts/restore-calendar-aad-0018.sh` — sealed owner-before-secret artifact/image guard and exact
   revision-0018 restore.
-- Modify: `justfiles/ops.just` — keep generic `just restore file` independent while adding no-argument
-  preflight/migration/resync/audit/verifier recipes and `just calendar-aad-restore-0018 file`.
-- Modify: `scripts/test-tooling.sh` — backup-basename/versioned-rollout-digest/image validation, durable refresh lease/fence/CAS preflight, guarded migration/audit/resync commands, stopped-service gates, zero-owner-call restore image guard, exact production confirmation, and database-enforced read-only restored-0018 verifier regressions.
-- Modify: `scripts/test-deployment.sh` — statically prove restore profile, dependency, role, Secret, volume, exact `sha256:` image/no-build/no-pull, pre-Secret entry guard, fixed flags, and no-`backend-common`/migration inheritance contracts.
+- Modify: `justfiles/ops.just` — resolve generic backup image metadata; keep manifest-bound `just restore file`
+  independent with pre-owner Compose/write-switch checks, second production confirmation, app verifier, and the
+  non-production isolated legacy conversion; add no-argument preflight/migration/resync/audit/sealed-verifier recipes
+  and `just calendar-aad-restore-0018 file`.
+- Modify: `scripts/test-tooling.sh` — generic three-file publication/rclone/retention/group-conflict validation,
+  stopped-write/active-writer/legacy-isolation generic restore gates, backup-basename/versioned-rollout-digest/image
+  validation, durable refresh lease/fence/CAS preflight, guarded migration/audit/resync commands, zero-owner-call
+  sealed image guard, exact production confirmations, and both database-enforced read-only verifier regressions.
+- Modify: `scripts/test-deployment.sh` — statically prove distinct generic owner/app-verifier and sealed restore
+  profiles, dependencies, roles, Secrets, volumes, fixed atomic flags, no-`backend-common`/migration inheritance,
+  plus the sealed exact `sha256:` image/no-build/no-pull and pre-Secret entry guard contracts.
 - Modify: `backend/tests/unit/test_init_db_roles_script.py` — grant bootstrap runs only after successful owner restore and remains Secret-file-only.
 - Modify: `backend/tests/integration/retention/test_role_permissions.py` — app-role restore/DDL denial, restored app/retention grants, verifier without owner Secret, and same-connection DML rejection under `PGOPTIONS` plus `BEGIN READ ONLY`.
 
@@ -4822,16 +4924,26 @@ process fakes where external storage is involved. Cover all of these cases:
   content ID mismatch fails closed;
 - crossing the current-row `effective_deadline` never starts a general service, creates a later ordinal, publishes a partial artifact, or
   mutates a marker through a bypass path;
-- generic `just restore file` accepts a checksum-valid backup at any supported manifest revision, including 0019,
-  without preflight/`pre-migration` artifacts; it uses the generic owner service, atomic restore flags, restored
-  grants, and revision-aware app-role read-only verification;
+- ordinary backup publication creates a `0600` dump/checksum/versioned-manifest group whose checksum binds dump plus
+  final manifest and whose manifest binds checksum filename plus dump digest/size/revision/image metadata; generation,
+  rename, collision, rclone and retention failures never publish or split a group;
+- generic `just restore file` accepts a fully verified manifest-bound backup at any supported revision, including
+  0019, without preflight/`pre-migration` artifacts. Before owner access it rejects any enabled write switch,
+  Caddy/API/Worker/Scheduler/migration/general consumer, missing second production confirmation, active business
+  writer, unsafe/partial/mismatched manifest group or pre-manifest production input with `pg_restore_calls == 0`;
+  development/test also rejects same-workspace writers unless the target is isolated. It then uses the generic owner
+  service, atomic restore flags, restored grants, and revision-aware app-role database-read-only verification, with
+  no general-service restart before verification;
+- `restore-legacy-to-isolated` validates the old checksum, restores only to a disposable isolated database, reads
+  actual revision/health and creates a new normal backup group; it never fabricates a manifest, repairs/stamps a
+  revision, or targets the workspace/production database;
 - a failed/cancelled attempt with time remaining does not force sealed restore and can allocate the next ordinal only on a
   later explicit CLI invocation; once the current-row `effective_deadline` is reached with a marker still present or timely artifact
   completion can no longer be proven, the exact encrypted dump created after active refresh and before migration
   restores the whole database only through `just calendar-aad-restore-0018` and the operations-profile
   `calendar-aad-restore-0018` service. Before any owner Secret read,
-  owner database connection, decryption, or `pg_restore`, the host guard validates the safe basename, encrypted
-  dump and adjacent checksum, preflight and original `pre-migration` artifacts, their rollout/pair digests, and the
+  owner database connection, decryption, or `pg_restore`, the host guard independently validates the safe basename,
+  encrypted dump, adjacent checksum and versioned manifest, preflight and original `pre-migration` artifacts, their rollout/pair digests, and the
   bound local immutable image. A moved tag, missing/wrong image, checksum failure, or artifact/image mismatch fails
   with `owner_connection_calls == 0` and `pg_restore_calls == 0`;
 - only after that guard succeeds may the recipe inject the matching exact `sha256:...` as internal
@@ -4882,7 +4994,7 @@ checksum plus all six atomic `pg_restore` flags, and does not inspect 0019 artif
 manifest/revision, so an ordinary revision-0019 backup restores successfully.
 
 `just calendar-aad-restore-0018` invokes a different service/script. Its host stub proves
-basename/dump/checksum/preflight/`pre-migration`/image validation all happen before any owner Secret or database
+basename/dump/checksum/manifest/preflight/`pre-migration`/image validation all happen before any owner Secret or database
 use, and moved tag, missing/wrong image, or artifact mismatch yields zero owner connection, zero `pg_restore`, zero
 pull, and zero build calls. Rendered Compose proves the sealed service has only
 `postgres: service_healthy`, no `backend-common`/`migration`/Redis dependency, an exact internally injected
@@ -5553,7 +5665,23 @@ docker compose run --rm --no-deps \
 
 Implement `just calendar-aad-audit phase artifact` with exactly three accepted phases: `pre-migration`, `post-migration`, and `post-resync`. Treat `artifact` as the same validated backup path prefix, require the bound preflight state, and write a distinct `${artifact}.calendar-aad-${phase}.json` file for each phase. The script is read-only, obtains database access from the existing Compose secret boundary, validates `rollout_digest_v1`, the actual image content ID, and the typed rollout guard before DB reads and immediately before atomic artifact rename, creates phase artifacts with mode `0600`, and never prints or stores a DSN, event body, description/location plaintext, token, scope string, provider response, or raw `calendar_id`. Artifacts contain only schema/revision, `rollout_digest_v1`, earliest deadline, image/basename binding, row/ciphertext digests, locally hashed connection/scope identifiers, affected/connection count, and the content-free checks needed for comparison.
 
-For the change-window backup, `BACKUP_ARTIFACT_BASENAME` is an optional basename only: reject an empty value, path separators, traversal, unsupported characters, or an already existing artifact/checksum; append the normal encrypted-dump/checksum suffixes inside `/backups`; and keep timestamp naming as the default for ordinary backups. When this variable is set, `scripts/backup-postgres.sh` requires the exact adjacent preflight state, validates the actual image content ID and typed rollout guard before `pg_dump` and before atomically publishing encrypted artifact/checksum, and fails without a partial final artifact on expiry or zero-state drift. `justfiles/ops.just` passes only the validated basename/state path and host-resolved image ID explicitly to the backup container without exposing Secret values.
+Every backup, including a change-window backup, uses the generic three-member publication contract. The manifest
+schema is `ai_employee.postgres_backup_manifest.v1` and stores safe dump basename, UTC `created_at`, PostgreSQL server
+version, Alembic revision, encrypted dump lowercase SHA-256/size, exact checksum filename, resolved immutable backend
+image `sha256:` content ID, and allowlisted content-free build/release metadata. It contains no DSN, credential,
+token, content, raw provider identifier, or personal data. Dump, checksum and manifest are `0600`; the checksum covers
+the finalized dump and manifest by safe relative name, while the manifest repeats dump digest/size and binds the
+checksum filename. Generate all three under temporary names, cross-verify them, rename the manifest last as the
+publication marker, and treat any existing member as an all-group collision. rclone publishes all members with the
+manifest last, and retention/orphan cleanup deletes or preserves complete basename groups only.
+
+For the change-window backup, `BACKUP_ARTIFACT_BASENAME` is an optional basename only: reject an empty value, path
+separators, traversal, unsupported characters, or any already existing group member; append the normal encrypted-
+dump/checksum/manifest suffixes inside `/backups`; and keep timestamp naming as the default for ordinary backups.
+When this variable is set, `scripts/backup-postgres.sh` requires the exact adjacent preflight state, validates the
+actual image content ID and typed rollout guard before `pg_dump` and before manifest-last publication, and fails
+without a published group on expiry or zero-state drift. `justfiles/ops.just` passes only the validated basename/state
+path and host-resolved image ID explicitly to the backup container without exposing Secret values.
 
 The phase contract is fixed:
 
@@ -5561,15 +5689,34 @@ The phase contract is fixed:
 - `post-migration` requires revision 0019, proves event identity/non-AAD business-row summaries and ciphertext/nonce/key-version digests are unchanged, verifies the expected v1/NULL version marking, confirms directory state is unchanged, and shows that only the exact affected pair's cursor/freshness/error marker changed.
 - `post-resync` proves all affected markers are cleared, cursor/freshness is restored, every non-empty field newly written during this recovery is v2, and reports the remaining historical v1 count without attempting to decrypt v1 content.
 
-Keep generic `just restore <exact encrypted path>` as the disaster-recovery entry. Replace its current app-role
-`backup` service reuse with a generic owner-role restore service, preserve checksum/path/production confirmations,
-add `--exit-on-error --single-transaction`, rerun role grants only after success, and verify through the backup's
-own Alembic revision/manifest using an app-role read-only connection. It must not require, parse, or mount 0019
-preflight/`pre-migration` artifacts, and an ordinary revision-0019 backup must restore successfully.
+Keep generic `just restore <exact encrypted path>` as the disaster-recovery entry, but accept only a published
+manifest-bound group. Before any owner Secret/service/connection or `pg_restore`, the host validates safe path and
+basename, all three members, schema, digest/size, checksum filename, backup revision and content-free image metadata.
+In production it then resolves `EXTERNAL_WRITES_ENABLED`, `GOOGLE_WRITES_ENABLED` and
+`MICROSOFT_WRITES_ENABLED` to exact `false`; rejects any running Caddy/API/Worker/Scheduler/migration/role-bootstrap,
+general consumer or write-credential one-off; proves no business-writer database session; and requires a second
+production-only exact confirmation after that state check. Development/test rejects a writer in the same workspace
+unless an isolated target is explicitly proven. Parameterized race tests start a service or writer after the host
+check and require the container's immediate pre-restore recheck to leave `pg_restore_calls == 0`.
+
+Replace the current app-role `backup` service reuse with separate generic owner-role restore and app-only verifier
+services; neither inherits `backend-common` or auto-runs migration. The owner script rechecks active writers, uses
+`--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction`, and reruns role grants only
+after success. The verifier has no owner Secret, selects supported checks from the manifest Alembic revision, and
+uses database-enforced read-only mode for Schema, health and sampled business-fact checks. All general services stay
+stopped until both stages pass. The path must not require, parse, or mount 0019 preflight/`pre-migration` artifacts,
+and an ordinary revision-0019 backup must restore successfully; manifest image metadata is compatibility/audit
+evidence, not the sealed path's exact-image authority. A single transaction never substitutes for stopped writes.
+
+Reject a pre-manifest backup in production. The non-production `restore-legacy-to-isolated` flow validates its old
+checksum, restores only into a disposable isolated PostgreSQL with no shared business network/volume/write service,
+reads the actual revision and health, then invokes the normal backup path against that isolated database to create a
+new manifest-bound group. It never appends a fabricated manifest to old bytes, changes/stamps a revision, or targets
+the workspace/production database; unknown or unsupported revisions stop for investigation.
 
 Implement `just calendar-aad-verify-restored-0018` as a separate no-argument, read-only path for the expired/aborted
 sealed window; it must not reuse a flag that disables the normal audit deadline guard. The host gate requires all
-general services stopped, the same safe basename, the encrypted dump and checksum, original preflight state, and
+general services stopped, the same safe basename, the encrypted dump/checksum/versioned-manifest group, original preflight state, and
 original `pre-migration` artifact, and the same host-resolved image content ID bound by preflight. The CLI requires database revision exactly 0018 and compares a fresh
 deterministic local proof with the original artifact: affected/connection counts, hashed connection/pair sets,
 event/identity/cursor/ciphertext digests, credential-row presence, and ProviderCalendar ownership must match. It
@@ -5586,8 +5733,8 @@ Add `just calendar-aad-restore-0018 <exact encrypted path>` with a distinct
 this sealed-window path. In production the sealed recipe still requires `APP_ENV=production`,
 `ALLOW_PRODUCTION_RESTORE=yes`, the configured `BACKUP_DIR` volume, `[confirm]`, and the second exact-path
 confirmation. Before Compose can read any owner Secret, open an owner database connection, decrypt the dump, or
-invoke `pg_restore`, the host recipe performs a pure file/local-image guard: validate the safe basename and exact
-path, encrypted dump plus adjacent checksum, original preflight and `pre-migration` artifacts, their canonical
+invoke `pg_restore`, the host recipe performs a pure file/local-image guard: independently validate the safe basename and exact
+path, encrypted dump plus adjacent checksum and versioned manifest, original preflight and `pre-migration` artifacts, their canonical
 schema/digests/basename, and immutable image binding; then resolve the Compose-selected local image to its actual
 content ID. A missing/wrong image, moved tag, checksum failure, or artifact/image mismatch exits with zero owner
 Secret reads, zero owner connections, zero `pg_restore`, zero pull, and zero build calls.
@@ -5616,15 +5763,17 @@ write switches remain stopped from preflight through verification, and the backu
 rotation but before 0019, the whole-database restore loses no business write and preserves the current refresh
 credential.
 
-`scripts/test-calendar-aad-0019-audit.sh` must use only the Task 13 synthetic PostgreSQL database and cover two connections sharing one `calendar_id`, a single affected connection, exact-pair marker isolation, missing cursor/disconnected connection/non-enabled capability/missing access or refresh credential/missing ProviderCalendar failures, all three typed-rollout-guarded phases, restored-0018 deterministic comparison under fixed `PGOPTIONS` plus first-action `BEGIN READ ONLY`, same-connection DML rejection, `0600` permissions, and forbidden-output scans. `scripts/test-m2-release.sh` must invoke this script explicitly with `TEST_DATABASE_URL`; `just ci` is not a substitute. Tasks 27C/27D are not complete until the provider-preflight integration test, recovery integration test, deadline/dual-restore integration, audit test, and tooling test prove all exact one-off entries above; they must not invent a direct SQL mutation, use a directory/full-account sync, start the ordinary Scheduler/Worker, contact a live provider, or describe an unimplemented command as already available.
+`scripts/test-calendar-aad-0019-audit.sh` must use only the Task 13 synthetic PostgreSQL database and cover two connections sharing one `calendar_id`, a single affected connection, exact-pair marker isolation, missing cursor/disconnected connection/non-enabled capability/missing access or refresh credential/missing ProviderCalendar failures, all three typed-rollout-guarded phases, restored-0018 deterministic comparison under fixed `PGOPTIONS` plus first-action `BEGIN READ ONLY`, same-connection DML rejection, `0600` permissions, and forbidden-output scans. `scripts/test-m2-release.sh` must invoke this script as an explicit subprocess; Task 27D initially supplies the exact Task13 `TEST_DATABASE_URL` on that call, while Task 30 validates and exports the same value once at script start so the audit and every other child inherit it. `just ci` is not a substitute. Tasks 27C/27D are not complete until the provider-preflight integration test, recovery integration test, deadline/dual-restore integration, audit test, and tooling test prove all exact one-off entries above; they must not invent a direct SQL mutation, use a directory/full-account sync, start the ordinary Scheduler/Worker, contact a live provider, or describe an unimplemented command as already available.
 
 Extend `scripts/test-deployment.sh` to assert write switches default off, Microsoft secret-file mounts, no host
-publication of internal metrics ports, no secret values in rendered Compose, generic owner restore without 0019
-artifact dependencies, and the full sealed restore service contract: operations profile, no `backend-common`,
-PostgreSQL-only healthy dependency, fixed owner role, bootstrap/app/retention/backup Secret mounts, bound
-artifact/read-only backup volumes, internally injected exact `sha256:` `image:`, no `build:`, fixed
-`--pull never`, container pre-Secret artifact/image guard, fixed wrapper order, all atomic `pg_restore` flags,
-and an app-only verifier with no owner Secret. Assert the generic and sealed services/scripts/recipes are distinct.
+publication of internal metrics ports, no secret values in rendered Compose, distinct generic owner restore and
+app-only verifier services without 0019 artifact dependencies, no migration/general-service inheritance, and the
+full sealed restore service contract: operations profile, no `backend-common`, PostgreSQL-only healthy dependency,
+fixed owner role, bootstrap/app/retention/backup Secret mounts, bound artifact/read-only backup volumes, internally
+injected exact `sha256:` `image:`, no `build:`, fixed `--pull never`, container pre-Secret artifact/image guard,
+fixed wrapper order, all atomic `pg_restore` flags, and an app-only verifier with no owner Secret. Assert generic
+manifest metadata does not force the sealed exact-image contract and all generic/sealed services/scripts/recipes/
+verifiers are distinct.
 
 ##### Combined verification reference
 
@@ -5698,9 +5847,12 @@ AEAD rotation;
 zero Calendar fact mutation;
 ordinal-aware marker-only task creation; unconditional active-attempt reuse; one TaskRun/Outbox per new ordinal
 under replay/concurrency; explicit failed/cancelled retry; immutable old terminal tasks; deadline fail-closed at
-every critical boundary; exact zero/no-deadline rechecks and immutable-image mismatch rejection; generic owner
-restore of ordinary 0019 backups without rollout artifacts; app-role restore denial; independent sealed
-basename/dump/checksum/preflight/`pre-migration`/image mismatch with zero owner and `pg_restore` calls; exact
+every critical boundary; exact zero/no-deadline rechecks and immutable-image mismatch rejection; generic
+dump/checksum/versioned-manifest `0600` cross-binding, manifest-last local/remote publication, whole-group
+conflict/retention, owner restore of ordinary 0019 backups without rollout artifacts, production write-switch/
+service/session/second-confirmation zero-`pg_restore` gates, same-workspace development/test rejection, isolated
+legacy conversion without manifest fabrication, and app-role restore denial; independent sealed
+basename/dump/checksum/manifest/preflight/`pre-migration`/image mismatch with zero owner and `pg_restore` calls; exact
 `sha256:` image, no build/pull, `--pull never`, pre-Secret container guard; atomic sealed owner whole-database
 restore, injected-error rollback, restored grants; and app-only verifier with fixed `PGOPTIONS`, first-action
 `BEGIN READ ONLY`, same-connection SQLSTATE `25006` DML rejection, and revision-0018 verification; zero
@@ -5724,15 +5876,16 @@ Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password
 Expected: PASS for the three typed-rollout-guarded audit phases, exact-pair isolation, all local recoverability
 failures, zero-state drift rejection, restored-0018 comparison, image binding, artifact mode/content, and
 sensitive-output scan using only synthetic data. `scripts/test-m2-release.sh` must execute this audit command
-directly with `TEST_DATABASE_URL`.
+directly; Task 27D passes the exact Task13 value on the call, and Task 30 replaces per-command prefixes with a
+validated script-wide export inherited by this subprocess and every other release child.
 
 Run: `bash scripts/test-deployment.sh`
 
-Expected: PASS, including a generic owner restore with no 0019 artifact dependency plus the sealed
-operations-profile service's PostgreSQL-only dependency, fixed owner role, Secret/volume boundary, exact internally
-injected `sha256:` image, no tag/`build:`/pull, fixed `--pull never`, pre-Secret artifact/image guard, no
-`backend-common`/migration inheritance, wrapper ordering, six fixed restore flags, and strict separation between
-the two services/scripts.
+Expected: PASS, including distinct generic owner restore and app-only verifier services with no 0019 artifact
+dependency, no `backend-common`/migration inheritance, fixed owner/app Secret boundaries and atomic restore flags;
+plus the sealed operations-profile service's PostgreSQL-only dependency, fixed owner role, Secret/volume boundary,
+exact internally injected `sha256:` image, no tag/`build:`/pull, fixed `--pull never`, pre-Secret artifact/image
+guard, wrapper ordering, and strict separation between generic and sealed services/scripts/verifiers.
 
 Run: `bash scripts/test-tooling.sh`
 
@@ -5744,7 +5897,9 @@ access-only changed=false confirmed and different-token changed=true/no-old-cons
 and unknown/Taskiq zero-call cases,
 closing-result/current-readiness crash resume, exact active-refresh preflight/guarded migration/three-phase audit/resync/restored-0018
 recipes, revision/stopped-service gates for every no-argument one-off, the
-generic `just restore` plus independent owner-before-secret/image-guarded
+generic manifest-bound `just backup`/`just restore` group publication, remote/retention behavior, production
+write-switch/service/session/second-confirmation gates, isolated legacy conversion and app-only verifier, plus the
+independent owner-before-secret/image-guarded
 `calendar-aad-restore-0018` service, explicit release-script audit invocation, app-role verifier with
 server/transaction read-only enforcement, four-entry real-Uvicorn OAuth-query canary, zero Calendar mutation during preflight, and no
 Taskiq/general queue/OAuth-only/migration service startup.
@@ -5761,7 +5916,7 @@ git diff --check
 
 Expected: PASS with no real-provider access.
 
-Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, four-entry access-log shutdown/canary, revision-global session lease before artifact/provider access, required decryptable/usable refresh token, complete credential snapshot CAS, one proactive refresh per connection, original artifact deadline plus current-access-row effective-deadline tightening, deadline guards at every CLI/recipe critical boundary, Task 16A frozen migration guard with Task 27C injection-only ownership, pre-backup 0018 exact-pair provider probes and failure disposition, post-migration stopped-service interval, unconditional active-attempt reuse plus failed/cancelled-only ordinal allocation, exact marker-only task execution, three-phase artifact contract, post-resync-before-start gate, independent generic and sealed owner-role restore paths, restored grants, app-role read-only verifier, explicit release-script audit invocation, and the normal 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
+Inspect the complete `docs/operations.md` plus `docs/acceptance-checklist.md` diff for the full Caddy/API/Worker/Scheduler drain, four-entry access-log shutdown/canary, revision-global session lease before artifact/provider access, required decryptable/usable refresh token, complete credential snapshot CAS, one proactive refresh per connection, original artifact deadline plus current-access-row effective-deadline tightening, deadline guards at every CLI/recipe critical boundary, Task 16A frozen migration guard with Task 27C injection-only ownership, pre-backup 0018 exact-pair provider probes and failure disposition, post-migration stopped-service interval, unconditional active-attempt reuse plus failed/cancelled-only ordinal allocation, exact marker-only task execution, three-phase artifact contract, post-resync-before-start gate, ordinary dump/checksum/versioned-manifest publication and group handling, production generic stopped-write/second-confirmation/legacy-isolation boundaries, independent generic and sealed owner-role restore paths, restored grants, both app-role read-only verifiers, explicit release-script audit invocation, obsolete-0019 non-production reset versus production stop, and the normal 0019-compatible rollback floor. This document and synthetic-script review is required release-contract evidence, but neither it nor an unexecuted production recipe is evidence that a production 0019 rollout has run.
 The review must explicitly include existing-AuditEvent attempt-bound refresh started/confirmed fences,
 `rollout_digest_v1` plus full and refresh credential snapshot digests and the independent HKDF/HMAC identity vector,
 shared `OAuthRefreshCoordinator` claims, cross-basename unresolved blocking,
@@ -5778,8 +5933,8 @@ consumption negatives, post-consumption capability/generation changes, safe call
 `microsoft_admin_consent_required`/`microsoft_reauthorization_required` with `oauth_authorization_failed` fallback,
 fixed-root-key same-plaintext changed=false identity plus changed=true A→B→A rollback rejection, cross-cutoff fence
 retention through the same result union without later credential lineage and with whole-group cutoff, closing-result/
-current-readiness crash resume, host
-owner-before-secret artifact/image guard, exact
+current-readiness crash resume, generic manifest-before-owner and stopped-write evidence, legacy isolation without
+manifest fabrication, sealed host owner-before-secret artifact/image guard, exact
 `sha256:`/`--pull never` restore, and verifier `PGOPTIONS` + first-action
 `BEGIN READ ONLY` + SQLSTATE `25006` evidence.
 
@@ -5970,28 +6125,35 @@ git commit -m "feat: add trusted action editors"
 - Modify: `backend/src/ai_employee/infrastructure/testing/scenarios.py`
 - Modify: `backend/src/ai_employee/infrastructure/testing/test_support.py`
 - Modify: `backend/src/ai_employee/api/routers/test_support.py`
-- Modify: `scripts/test-m2-release.sh` — expand Task 27D's explicit calendar-AAD audit wrapper into the full
-  release gate while retaining the direct
-  `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test bash scripts/test-calendar-aad-0019-audit.sh`
-  invocation. Add three fixed v1 digest vectors and the fixed `refresh_token_identity_v1` HKDF/HMAC vector,
+- Modify: `scripts/test-m2-release.sh` — at the start, before any subprocess, accept an externally supplied
+  `TEST_DATABASE_URL` only when it exactly matches
+  `postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test`, otherwise
+  fail closed; when absent, set that same constant, then export it once for every child command. Expand Task 27D's
+  explicit calendar-AAD audit wrapper into the full release gate while retaining a direct
+  `bash scripts/test-calendar-aad-0019-audit.sh` subprocess after the export. Add three fixed v1 digest vectors and
+  the fixed `refresh_token_identity_v1` HKDF/HMAC vector,
   automatic coordinator/result-union recovery, four-entry real-Uvicorn access-log canary, Task 16A migration
   zero-bootstrap/typed-guard paths, current-expiry effective-deadline tightening, cross-cutoff retention, generic
-  restore plus independent sealed exact-image restore/grant/read-only verifier; it never performs production
-  migration or restore.
+  manifest/stopped-write restore plus independent sealed exact-image restore/grant/read-only verifier; it never
+  performs production migration or restore.
 - Modify: `backend/tests/integration/db/test_migrations.py` — release evidence for fresh/zero/missing/Fake/final
   0019 guard paths.
 - Modify: `backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py` — release canary for all
   four launch entries and persisted sanitized audit.
-- Modify: `scripts/test-tooling.sh` — release-wrapper command/order assertions, including the explicit audit call.
+- Modify: `scripts/test-tooling.sh` — release-wrapper command/order/environment assertions, including deterministic
+  Task13 selection when the environment is absent, exact-match-only external override, rejection of other and
+  production-like DSNs before any child call, and inheritance by the explicit audit plus every pytest/shell command.
 - Create: `scripts/verify-m2-sensitive-output.py`
 - Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free 0019
   digest/HKDF-HMAC vectors; migration zero/guard paths; automatic/recovery result union; four-entry access-log
-  canary; current-expiry effective-deadline tightening; ordinal recovery; generic restore; and independent sealed
-  exact-image owner-restore evidence.
+  canary; current-expiry effective-deadline tightening; ordinal recovery; fixed Task13 release-test environment;
+  generic manifest/stopped-write restore plus isolated legacy conversion; and independent sealed exact-image
+  owner-restore evidence.
 - Modify: `docs/acceptance-checklist.md` — require strict result-union/CAS/recovery evidence, frozen migration
   guard paths, sanitized callback and real access-log canary, durable fence retention, current-expiry deadline
-  tightening, explicit audit invocation, generic restore, and sealed owner-before-secret exact-image atomic
-  restore/grant/database-read-only verification before release acceptance.
+  tightening, fixed release-test database inheritance, explicit audit invocation, manifest/stopped-write generic
+  restore, and sealed owner-before-secret exact-image atomic restore/grant/database-read-only verification before
+  release acceptance.
 - Modify: `README.md`
 
 - [ ] **Step 1: Write the failing crash matrix and Playwright flows**
@@ -6003,7 +6165,11 @@ Playwright must cover Google and Microsoft Fake connections, new/reply/reply-all
 Extend `scripts/test-tooling.sh` first so it requires the release wrapper to contain, in executable order, the
 direct calendar-AAD audit command, migration fresh/zero/guard tests, real-Uvicorn canary, current-expiry deadline
 tightening test, and generic/sealed restore separation test. The assertion must fail when audit is present only
-inside `just ci`.
+inside `just ci`. The same test must run the wrapper with `TEST_DATABASE_URL` absent and prove every fake `just`,
+pytest, audit and shell child sees the exact Task13 URL; run it again with the same external value and prove it is
+accepted/exported; then use a different synthetic DSN and a production-like synthetic DSN and prove the wrapper
+fails before the first child command. Per-command prefixes, a late export, or an audit/integration subprocess that
+does not inherit the fixed value must fail the contract.
 
 - [ ] **Step 2: Run focused fault/E2E tests and observe expected failures**
 
@@ -6034,13 +6200,27 @@ captured logs, JUnit/Playwright output, metrics text, and structured traces. Run
 only in the test-input declaration and explicit encrypted-byte assertions; any appearance in an
 observable output fails the gate.
 
-`scripts/test-m2-release.sh` must run, in order:
+`scripts/test-m2-release.sh` must begin with this fail-closed environment boundary before any subprocess:
+
+~~~bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly required_test_database_url='postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test'
+if [[ -v TEST_DATABASE_URL && "${TEST_DATABASE_URL}" != "${required_test_database_url}" ]]; then
+  printf 'M2 release test refused: TEST_DATABASE_URL must match the fixed Task13 database\n' >&2
+  exit 1
+fi
+export TEST_DATABASE_URL="${required_test_database_url}"
+~~~
+
+After that single export, it must run in order, with every command inheriting the same environment:
 
 ~~~bash
 just ci
-TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test bash scripts/test-calendar-aad-0019-audit.sh
+bash scripts/test-calendar-aad-0019-audit.sh
 uv run --project backend pytest backend/tests/integration/faults/test_m2_write_recovery.py -q
-TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/db/test_migrations.py backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py -q
+uv run --project backend pytest backend/tests/integration/db/test_migrations.py backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py -q
 uv run --project backend pytest backend/tests/unit/application/test_calendar_aad_digests.py backend/tests/unit/application/test_oauth_refresh_identity.py backend/tests/unit/application/test_oauth_refresh_coordinator.py backend/tests/unit/application/test_connection_capability_use_cases.py -q
 uv run --project backend pytest backend/tests/integration/m2/test_connection_capability_repository.py backend/tests/integration/m2/test_credential_rotation_repository.py backend/tests/integration/m2/test_oauth_refresh_coordinator.py backend/tests/integration/api/test_connections.py backend/tests/integration/google/test_oauth_flow.py backend/tests/integration/google/test_gmail_sync.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_oauth_flow.py backend/tests/integration/microsoft/test_mail_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/operations/test_calendar_aad_0019_preflight.py -q
 uv run --project backend pytest backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py -q
@@ -6052,8 +6232,9 @@ git diff --check
 ~~~
 
 It must also verify that the working tree has no `.env`, secret, dump, Playwright report, coverage, or generated release artifact staged for commit.
-The release script test must fail if the explicit audit command is removed, reordered behind a possible early
-success exit, or replaced with `just ci`; indirect coverage is not evidence.
+The release script test must fail if the fixed export is absent/late, a different or production-like DSN is accepted,
+any child loses or overrides the exported value, or the explicit audit command is removed, reordered behind a
+possible early success exit, or replaced with `just ci`; per-command prefixes and indirect coverage are not evidence.
 
 - [ ] **Step 5: Run the complete automated release gate**
 
@@ -6094,13 +6275,20 @@ user-isolated ordinary audit cleanup, all fail-closed provider/lease/CAS/rollbac
 `TransientProviderError` zero-call delivery, closing-result-before-artifact resume under independent current readiness,
 and no replay of original D0 all pass. The gate additionally covers the 0019 typed rollout guard, app-role restore
 zero-bootstrap/affected-without-guard/Fake/final-commit paths, and proves Task 27C did not rewrite the frozen revision
-or Alembic environment. It directly executes the calendar-AAD audit script, runs the four-entry real-Uvicorn OAuth
-query canary with persisted sanitized audit, and proves ACK-lost/later-reauth current access rows can only tighten
-the original deadline. Generic owner restore succeeds for ordinary 0019 backups without rollout artifacts;
-app-role restore is denied; the independent sealed path covers owner-before-secret artifact/image mismatch with zero
-owner/`pg_restore` calls, exact `sha256:` no-pull atomic owner restore/error rollback, role regrant, and app-only
-verifier `PGOPTIONS`/`BEGIN READ ONLY`/SQLSTATE `25006`. Deployment/tooling contracts, sensitive-output scan,
-and `git diff --check` also pass.
+or Alembic environment. Before any child command, the wrapper deterministically exports the exact Task13
+`TEST_DATABASE_URL`; absent input selects it, an exact external value is accepted, every pytest/audit/shell child
+inherits it, and any other or production-like DSN yields zero child calls. It directly executes the calendar-AAD
+audit script, runs the four-entry real-Uvicorn OAuth query canary with persisted sanitized audit, and proves
+ACK-lost/later-reauth current access rows can only tighten the original deadline. Generic backup tests prove
+dump/checksum/versioned-manifest digest/size/revision/image binding, `0600`, manifest-last local/remote publication,
+and whole-group conflict/retention behavior. Generic owner restore succeeds for an ordinary 0019 manifest-bound
+backup without rollout artifacts; app-role restore is denied; any enabled write switch, running general service,
+active business writer, missing production confirmation, pre-manifest input or verifier failure has
+`pg_restore_calls == 0` or keeps every general service stopped as applicable. The isolated legacy conversion creates
+a new backup rather than fabricating a manifest. The independent sealed path covers owner-before-secret
+artifact/image mismatch with zero owner/`pg_restore` calls, exact `sha256:` no-pull atomic owner restore/error
+rollback, role regrant, and app-only verifier `PGOPTIONS`/`BEGIN READ ONLY`/SQLSTATE `25006`.
+Deployment/tooling contracts, sensitive-output scan, and `git diff --check` also pass.
 
 - [ ] **Step 6: Pause for explicitly authorized provider-account E2E**
 
@@ -6182,7 +6370,7 @@ must remain paused. While the same maintenance window is still sealed and no gen
 occurred, use only that window's active-refresh-after/pre-migration encrypted whole-database backup with the
 guarded production `just calendar-aad-restore-0018` confirmations through the dedicated PostgreSQL-only sealed
 owner-role operations service. Generic `just restore` is not valid for this exception. Before owner
-Secret/connection/`pg_restore`, the host must validate basename, dump/checksum,
+Secret/connection/`pg_restore`, the host must independently validate basename, dump/checksum/manifest,
 preflight/`pre-migration` artifacts, and image binding; mismatch must have zero owner and `pg_restore` calls. The
 service must use only the internally injected matching `sha256:` image with no tag/build/pull and fixed
 `--pull never`; its entrypoint repeats the artifact/image check before reading the owner Secret. The restore then
@@ -6317,13 +6505,21 @@ shrink, CAS failure, confirmed/unsatisfied/replacement rollback, and commit-resu
 recording token, raw scope, provider response, raw `calendar_id`, or correlatable credential timestamps.
 
 The normal release record must first include a generic disaster-restore drill for a supported backup revision,
-including an ordinary 0019 backup: checksum, owner-role atomic restore, restored grants, backup-revision/manifest
-app-role read-only verification, and explicit proof that no 0019 rollout artifact was required.
+including an ordinary 0019 backup: versioned manifest schema, safe basename, UTC creation time, PostgreSQL/Alembic
+revision, encrypted dump digest/size, checksum filename, immutable backend image/content-free metadata, `0600`,
+dump/checksum/manifest cross-binding, manifest-last local/remote publication, and whole-group retention/conflict
+behavior. Record all three write switches off, Caddy/API/Worker/Scheduler/migration/general consumers stopped, no
+business-writer session, the post-state-check production confirmation, and a concurrent-writer/running-service case
+with `pg_restore_calls == 0`; a single transaction alone is not accepted as stop-write evidence. Then record the
+owner-role atomic restore, restored grants, backup-revision manifest app-role read-only verification, no restart
+before verifier completion, and explicit proof that no 0019 rollout artifact was required. Also record production
+rejection of pre-manifest input and a non-production `restore-legacy-to-isolated` conversion that reads actual
+revision/health and creates a new backup without fabricating a manifest.
 
 If the window instead used sealed restore, the same record must contain the exact failure/effective-deadline guard, proof that no
-general service or business write occurred after backup, encrypted backup/checksum identity, production restore
+general service or business write occurred after backup, encrypted backup/checksum/manifest identity, production restore
 confirmations for `just calendar-aad-restore-0018`, dedicated sealed restore service/image identity, proof it depended only on PostgreSQL and used
-`ai_employee_owner` solely through the bootstrap Secret, proof the host validated basename/dump/checksum/preflight/
+`ai_employee_owner` solely through the bootstrap Secret, proof the host validated basename/dump/checksum/manifest/preflight/
 `pre-migration`/image binding before any owner action, and zero owner/`pg_restore` calls for every moved-tag,
 missing/wrong-image, or artifact-mismatch case. Record the exact internally injected `sha256:` restore image, no
 tag/build/pull and `--pull never` facts, the container pre-Secret guard, fixed atomic `pg_restore` flags/result,
@@ -6354,8 +6550,9 @@ git commit -m "test: freeze M2 release evidence"
   isolation, fail-closed reads, and the frozen mutation/final-commit typed migration guard with fresh/strict-zero
   ordinary `upgrade head`: Task 16A. Revision-global lease, artifact-backed injection without revision rewrites,
   exact-scope probes, current-access-row effective-deadline tightening, ordinal recovery, and post-resync-before-
-  start: Task 27C. Generic disaster restore, independent sealed 0018 restore, three-phase audit, and explicit
-  release audit wrapper: Task 27D. Four-column retention and operator-facing integration: Task 27E. Final
+  start: Task 27C. Generic backup manifest/group publication, production stopped-write disaster restore,
+  non-production legacy conversion, independent sealed 0018 restore, three-phase audit, and explicit release audit
+  wrapper: Task 27D. Four-column retention and operator-facing integration: Task 27E. Final
   migration/deadline/restore/audit evidence: Task 30.
 - OAuth refresh trust hardening is split by ownership: Task 27A owns the fixed-root identity, shared automatic
   coordinator, full-row/generation CAS, strict confirmed/result parser, zero-call replay behavior, and four-entry
@@ -6391,12 +6588,15 @@ git commit -m "test: freeze M2 release evidence"
    rollback reconcile; F/S/T progressive recovery and callback classification; current-readiness separation;
    current-access-row effective-deadline tightening where shorter expiry tightens and longer expiry does not extend;
    revision-global plus connection leases; exact-pair probes and ordinal recovery; Task 16A fresh/zero/missing/Fake/
-   final migration-guard paths; generic owner disaster restore of ordinary 0019 backups without rollout artifacts;
+   final migration-guard paths; manifest-bound generic backup publication, group retention/remote copy,
+   stopped-write owner disaster restore of ordinary 0019 backups without rollout artifacts, app-only verifier and
+   isolated legacy conversion;
    independent sealed `calendar-aad-restore-0018` owner-before-secret/exact-image/read-only verification; explicit
    release-script execution of `scripts/test-calendar-aad-0019-audit.sh`; whole-group fence retention; privacy
    deletion barrier; and post-resync-before-start. No Task 27A–27E commit may combine another subtask's file list.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.
-7. Task 30 runs the full automated gate, including the direct calendar-AAD audit call, migration guard matrix,
-   access-log subprocess canary, current-expiry deadline tightening, and generic/sealed restore separation; then it
+7. Task 30 runs the full automated gate from one exact exported Task13 `TEST_DATABASE_URL`, including the direct
+   calendar-AAD audit call, migration guard matrix, access-log subprocess canary, current-expiry deadline tightening,
+   manifest/stopped-write generic restore and sealed restore separation; then it
    pauses for explicit provider-account authorization, performs the dedicated Google/Microsoft matrix, and writes a
    fully evidenced final release record. Without that authorization, Task 30 remains incomplete.
