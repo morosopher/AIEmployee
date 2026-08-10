@@ -956,7 +956,21 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    upsert 事务后应用迁移；再部署引用新三元约束的 API/Worker/Scheduler，最后恢复 Worker 与调度。
    迁移后禁止旧 Worker 回流。若 downgrade 前已产生跨日历同 ID，旧二元约束无法无损恢复，必须
    fail closed 并先由人工制定数据保留方案，迁移不得删除任一事件来强行回退。
-3. `0019` 是紧随 CalendarEvent 身份迁移的前向 AAD 轮换 revision。Schema 变更只增加
+3. `0019` 是紧随 CalendarEvent 身份迁移的前向 AAD 轮换 revision。Task 16A 首次创建该 revision
+   时就必须同时冻结最终 typed rollout guard 协议与 helper，并让 migration 在任何 DDL/DML 前调用；
+   `backend/migrations/env.py` 还必须通过 Alembic `on_version_apply` 在版本表更新后、外层迁移事务
+   最终提交前再次调用同一 guard。普通 `upgrade head` 仍是 fresh database、CI/E2E、Compose migration
+   service 和常规运维的唯一入口，因此 guard 必须有两个封闭分支：
+
+   - fresh/new database，或在 0019 mutation 前以同一查询严格证明 affected set 为空时，使用内建
+     zero-bootstrap 分支，不要求生产 rollout artifact，但必须在 mutation 前和最终提交前重复空集合证明；
+   - 数据库当前精确位于 0018 且存在历史完整 AEAD 三元组时，必须注入 schema-valid typed rollout
+     guard；缺失、错误类型、artifact/image/affected-set/deadline 不匹配都在任何 DDL/DML 前 fail closed。
+
+   Task 27C 只能实现真实 artifact guard 并通过 Task 16A 冻结的 composition boundary 注入；不得再修改
+   0019 revision、`migrations/env.py` 或同 revision 的分支语义。已经在旧开发/测试数据库应用过不完整
+   0019 逻辑时，必须使用后续专用安全 recipe 或明确重建该非生产数据库，不能重写已应用 revision、
+   静默 stamp 或用普通 upgrade 绕过。Schema 变更只增加
    `description_aad_version`、`location_aad_version` 及两个字段各自“四列全空或全非空”的检查约束；
    数据变更仅将既有全非空 `ciphertext + nonce + key_version` 三元组标记为历史 `v1`，既有全空
    三元组继续保持 `aad_version=NULL`。若发现任一旧三元组部分为空，升级必须 fail closed，不能
@@ -1111,6 +1125,8 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 - 审批不使用密码二次验证，因此会话 Cookie、CSRF、会话撤销、Secure、HttpOnly 和 SameSite
   属性是强制边界。
 - Provider Token 继续使用带版本 AEAD；明文只存在于受控内存。
+- `AeadCipher` port 与实现必须公开只读 `key_version` 属性，composition root 只能通过该冻结接口让
+  AEAD 与 refresh-token identity service 使用同一版本；不得读取私有实现字段或在 Tasks 27A–27C 另造版本来源。
 - M2 命令、邮件正文、日程描述、地点和补偿快照使用字段或记录级 AEAD。
 - CalendarEvent 描述和地点分别验证自己的四列原子组。四列全空时字段读取为空字符串；四列非空
   且版本为 v2 时，必须使用
@@ -1124,6 +1140,10 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
   `Exception`。任何路径都不能尝试 v1 AAD、去掉 `calendar_id`、忽略认证或返回部分明文。密文、
   nonce、key version、AAD version 任一被篡改，都不得触发 legacy fallback。
 - 地址、主题和参会人不得进入日志、指标 label、Trace attribute 或 URL query。
+- 所有真实 API 启动入口必须关闭 Uvicorn 默认 access logger；应用结构化日志 schema 禁止保存 raw
+  URL、query string 或 request target。OAuth callback query 即使包含 `code`、`state` 或
+  `error_description`，也只能由应用边界消费并写入脱敏的稳定审计结果，不能落入 stdout、stderr 或
+  JSON 日志。
 - 正式与开发默认不允许真实写入；显式运行开关和连接能力缺一不可。
 
 ### 17.2 保留
@@ -1263,8 +1283,10 @@ pre-digest、两个 required post-digest、old/new `refresh_token_identity_v1` �
 identity equality 不一致的 metadata：missing/same 只能是 old == new 且 changed=false，different 只能是
 old != new 且 changed=true。0019 preflight 还必须包含
 `rollout_deadline_candidate = token_expires_at - 900 seconds`；普通 provider refresh 对该字段使用规范
-NULL。confirmed 的 `created_at` 必须严格晚于 matching started。confirmed crash 后只从持久 credential、
-expiry 和 post-digest 恢复，不再次调用 provider。
+NULL。该 candidate 只证明历史 confirmed result schema 与当时 persisted expiry 自洽，绝不能作为
+ACK-lost 恢复后或任一后续 guard 的当前 deadline 输入。confirmed 的 `created_at` 必须严格晚于
+matching started。confirmed crash 后只从持久 credential、expiry 和 post-digest 恢复，不再次调用
+provider。
 
 network/response unknown、`invalid_grant`、malformed token/expiry/scope、scope shrink、响应后 lease loss 或
 CAS miss 都不能产生 confirmed；数据库明确证明 result 事务已 rollback 时，started 保持 unresolved。
@@ -1311,6 +1333,17 @@ identity，则返回稳定 `oauth_credential_state_conflict`/`needs_attention` �
 unsatisfied 没有 credential post/expiry proof，关闭后同样只按 current capability facts 检查 readiness。防重放
 不要求构造完整 credential lineage；append-only result 证明历史 attempt 已闭合，readiness 独立证明当前状态
 是否安全。
+
+每次 ACK-lost closure 与 current readiness 都通过后，以及 backup、audit、migration、resync、restore
+eligibility 和 post-resync 的每个后续 guard，都必须重新读取每个 affected connection 当前持久化
+`access_token` credential 行的 `token_expires_at`，计算
+`current_deadline = min(current_token_expires_at) - 900 seconds`。非空 rollout 的
+`effective_deadline` 只能收紧：
+`min(original_artifact_deadline, current_deadline)`。后续合法 refresh/reauth 得到更短 expiry 时必须
+立即收紧；得到更长 expiry 也不得延长原 artifact 窗口。历史
+`oauth.refresh_confirmed.rollout_deadline_candidate` 仅参与 result schema 校验，不能替代上述 current
+row 读取。任一 current access credential 缺失、expiry 无效或 `now >= effective_deadline` 都 fail closed；
+零 affected set 仍只允许经过实时空集合证明的规范 no-deadline 分支。
 
 显式 progressive recovery 直接映射现有 `OAuthAttempt + AuditEvent`，不新增 0018 schema：
 
@@ -1566,6 +1599,13 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
 - 日程恢复和冲突处理。
 - 疑似误发、重复发送或未审批写入的事故响应。
 
+API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根目录开发 recipe 与 E2E backend
+脚本）必须显式使用 `--no-access-log` 或等价 `access_log=False`。静态测试扫描所有入口，防止后来
+新增未受控启动方式；真实子进程 canary 必须向 OAuth callback 发送带 synthetic `code`、`state` 和
+`error_description` 的 query，扫描 stdout、stderr 与 JSON logs，证明三个值均为零泄露，同时查询
+持久审计证明正常 callback-error 状态消费与脱敏审计仍然成立。仅有 router/filter 单元测试不构成该边界
+的证据。
+
 ## 20. 测试策略
 
 ### 20.1 单元测试
@@ -1631,6 +1671,11 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   还必须分别证明缺失任一精确 scope 游标、owning connection 已断开、`calendar.read` 为
   disabled/revoked、缺失 access credential、缺失 refresh credential、仅 access-token 可用或缺失精确
   `ProviderCalendar` 时，都会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且全部数据原样保留。
+- 0019 migration 测试必须覆盖 Task 16A 冻结的同一 typed guard 在 mutation 前与
+  `on_version_apply` 最终提交前各执行一次：fresh database 和严格空 affected set 的普通
+  `upgrade head` 走 zero-bootstrap 并正常服务 CI/E2E/Compose；revision 0018 且 affected set 非空时，
+  缺失/错误 guard 必须在任何 DDL/DML 前失败。Fake guard 要证明两次调用使用同一 protocol；Task 27C
+  的真实 artifact composition 只能注入该接口，不能通过改写 0019 或 `migrations/env.py` 改变结果。
 - `calendar-aad-preflight-0019` 只在 revision 0018 扫描历史完整 AEAD 三元组推导 affected pairs，并按
   connection UUID 去重、确定性串行处理。preflight 在检查 rollout artifact 是否存在或调用任何供应商
   之前，必须通过独立、非业务事务 PostgreSQL 连接执行 session-level
@@ -1699,6 +1744,10 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   不能成为持久 error code。缺 state、同时 `code+error`、两者都缺失或 malformed error 必须在消费前拒绝；
   首次未知 error 已消费后，以同一 state 重放相同或不同未知 error 必须拒绝。两家 targetless fenced identity
   仍在任何保存前阻断。
+- 日志集成测试必须静态检查全部四个 Uvicorn API 启动入口均关闭 access log，并启动真实 Uvicorn
+  子进程执行 OAuth callback canary。synthetic `code`、`state`、`error_description` 在 stdout、
+  stderr、应用 JSON log 中都必须零命中；应用日志 schema 还必须拒绝 raw URL/query/request target，
+  而 PostgreSQL 中仍能查询到对应的脱敏 callback-error 审计与一次性 state 消费事实。
 - 无 target 的 Google/Microsoft `/provider/start` 继续覆盖新连接与无 fence identity merge。若一次性
   exchange 后规范化 identity 命中已有 connected connection 且存在 unresolved fence，callback 必须在任何
   credential/scope/capability 写入前返回
@@ -1725,10 +1774,15 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   主动刷新后的 401 必须直接失败且 OAuth refresh 调用次数不增加。测试还必须证明它不调用
   `directory_pages()`、连接级 owner、其他 pair 或任何 Calendar 写适配器，不写 CalendarEvent、cursor
   或 marker；403、权限缺失、malformed page、无最终 cursor 或任何 pair 失败都返回非零并阻止 0019。
-- 对每个已轮换 access token 使用同一注入 UTC clock 持久化 `token_expires_at`，并固定计算
-  `rollout_deadline = min(token_expires_at) - 900 seconds`；900 秒不是配置项或运维估计。测试必须覆盖
-  expiry 不足 900 秒、preflight probe/rollout artifact 提交时越过 deadline、多个 connection 取最早
-  expiry，以及零 affected pair 的显式 no-op。preflight artifact 只允许 schema/revision、
+- 对每个已轮换 access token 使用同一注入 UTC clock 持久化 `token_expires_at`，首次 artifact 固定计算
+  `rollout_deadline = min(token_expires_at) - 900 seconds`；900 秒不是配置项或运维估计。ACK-lost closure
+  与 current readiness 后，以及每个后续 guard，都要从当前持久化 access credential 行重读 expiry，
+  计算 `current_deadline`，并使用
+  `effective_deadline = min(original_artifact_deadline, current_deadline)`。测试必须覆盖历史
+  `rollout_deadline_candidate` 不能替代 current-row 读取、ACK-lost 后较短 expiry 立即收紧、较长 expiry
+  不延长原窗口、expiry 不足 900 秒、preflight probe/rollout artifact 提交时越过当次重算的
+  `effective_deadline`、多个
+  connection 取最早 expiry，以及零 affected pair 的显式 no-op。preflight artifact 只允许 schema/revision、
   `rollout_digest_v1`、安全 backup basename、宿主机从 Compose 选定 backend image 解析的 immutable image content ID、earliest expiry/
   deadline、固定 margin、affected/connection count、hashed connection IDs、pair digests 和稳定结果码，
   权限为 `0600`；不得包含 token、scope 原文、正文、描述/地点、供应商响应或 raw `calendar_id`。镜像
@@ -1745,7 +1799,8 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   普通 `sync_calendar` 队列事实保持未处理；成功只清除同一 marker 并恢复 cursor/freshness，失败保留
   marker，且整个流程不创建 ApprovalRequest、ToolExecution 或任何供应商写调用。
 - deadline 集成测试必须让 backup、`pre-migration`/`post-migration` audit、0019 migration、recovery
-  planner/Worker final CAS 与 `post-resync` artifact 分别在启动或关键提交前跨过同一 deadline，并证明
+  planner/Worker final CAS 与 `post-resync` artifact 分别在启动或关键提交前跨过各自从当前 access rows
+  重算的 `effective_deadline`，并证明
   全部 fail closed、通用服务不启动、未创建额外 ordinal；还必须证明零 affected-pair state 只能在每个
   边界重新得到空集合时走规范 no-deadline 分支，任何伪造零值、集合漂移或镜像 content ID 不匹配都
   fail closed。测试还必须覆盖相同 basename 和不同 basename 的并发 preflight，证明 revision-global
@@ -1770,7 +1825,12 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   CAS 竞争，
   锁后重查 matching result/consumption，证明不会误删或死锁，且不读取后续 current credential lineage；
   schema mismatch 测试证明 retention 与 reconcile 复用同一 disposition/flag/equality parser。
-- 测试必须从本窗口 refresh 后且 0019 前创建的加密整库备份执行真实 PostgreSQL restore。宿主在读取
+- 通用灾备恢复测试必须保留 `just restore file` 的独立用途：它不要求 0019 preflight 或
+  `pre-migration` artifact，可恢复任意受支持 Alembic revision（包括已经处于 0019 的普通备份），使用
+  owner role、checksum、`--exit-on-error --single-transaction`，成功后按备份自身 revision/manifest
+  运行 app-role 只读核验。它不得调用 sealed-window verifier，也不能因缺少 0019 artifact 拒绝普通恢复。
+- sealed 0018 恢复测试必须从本窗口 refresh 后且 0019 前创建的加密整库备份，通过独立
+  `just calendar-aad-restore-0018 file` 执行真实 PostgreSQL restore。宿主在读取
   任一 owner Secret、建立 owner connection 或调用 `pg_restore` 前，必须验证安全 basename、dump 与
   checksum、preflight/`pre-migration` artifacts 及其 immutable image binding；移动 tag、缺失或错误
   image、checksum 或 artifact mismatch 都以 owner connection 与 `pg_restore` 调用数为零失败。guard
@@ -1785,6 +1845,9 @@ Problem Details 不返回供应商原始响应、完整地址或正文。未知�
   read-only transaction（SQLSTATE `25006`）拒绝；随后才可证明 revision 回到 0018 且恢复后确定性本地
   audit 与原 `pre-migration` artifact digest 一致。任何路径都不得给普通应用服务 DDL 权限，也不得调用
   Alembic downgrade、直接 SQL、跳过 marker 或启动 OAuth-only 临时服务。
+- release tooling 测试必须证明 `scripts/test-m2-release.sh` 显式执行
+  `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test bash scripts/test-calendar-aad-0019-audit.sh`；不能以 `just ci` 可能间接包含
+  该脚本作为发布证据。
 - 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
   v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
   且任何路径都不得回退尝试 v1 AAD。
@@ -1886,6 +1949,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
   cursor 与 freshness 后清除 `calendar_event_resync_required`。该入口和 `post-resync` 审计完成前，
   通用 Scheduler、普通 Taskiq Worker、API 与 Caddy 必须保持停止。
+- 0019 revision 在 Task 16A 创建时已经包含最终 typed guard：fresh/严格空集合的普通
+  `upgrade head` 可通过 zero-bootstrap；revision 0018 且 affected set 非空时，缺少注入 guard 必须在
+  mutation 前失败，并在 `on_version_apply` 最终提交前再次核验。Task 27C 只提供真实 artifact guard
+  composition，不改写 revision 或 Alembic 环境语义。
 - 恢复 planner 遇到 `created/queued/running/retry_scheduled` 时必须始终复用该活动 ordinal，绝不分配
   新 ordinal；多个活动尝试是 fail-closed 不变量错误。只有上一尝试已经 `failed` 或 `cancelled`、marker
   仍存在且运维人员再次显式运行无参数 one-off 时，才能在精确 cursor 锁下分配下一个 ordinal。旧终态
@@ -1893,10 +1960,13 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   `max_transient_retries` 与 `attempt_count` 上限约束，因此既不会无限自动重试，也不会用新 ordinal
   绕过单次调用边界。
 - 0019 rollout 的所有 provider probes 和本地提交都受同一个 content-free rollout artifact 约束：非空
-  affected set 固定使用 `rollout_deadline = min(token_expires_at) - 900 seconds`；零 affected pair 只允许
+  affected set 的原始 artifact deadline 固定为 `min(token_expires_at) - 900 seconds`；ACK-lost closure
+  与 current readiness 后以及每个后续 guard 都从当前持久化 access credential 重读 expiry，并只使用
+  `effective_deadline = min(original_artifact_deadline, current_deadline)`。更短 expiry 必须收紧，更长
+  expiry 不得延长窗口；历史 confirmed deadline candidate 不能替代 current-row 读取。零 affected pair 只允许
   使用规范 null deadline 且在每个边界重新证明集合仍为空。backup、migration、resync 与
   `post-resync` audit 必须通过对应 guard；任何启动或关键提交 guard 失败都保持通用服务停止。若 0019
-  已提交且无法在 deadline 前清完 marker，只允许在尚未重开服务、没有业务写入的同一 sealed window
+  已提交且无法在当前重算的 `effective_deadline` 前清完 marker，只允许在尚未重开服务、没有业务写入的同一 sealed window
   内，从指定的 refresh 后/迁移前加密整库备份恢复到 0018，再核验 checksum、原/恢复后 audit、revision
   和原 0018 image 健康；禁止 downgrade、直接 SQL、marker waiver 或 OAuth-only 临时服务。
 - 每次 0019 preflight 都必须先持有 revision-global PostgreSQL session advisory lease；同一数据库内不论
@@ -1933,16 +2003,21 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   token/expiry 恢复；若另一合法 refresh/reauth 已先提交，则通过独立 current readiness 使用 current
   token/expiry，均不能再次调用旧 attempt。disconnect/reconnect、unconditional upsert 或 physical digest
   变化不能成为恢复路径。
-- whole-database restore 只能由 operations profile 的专用 owner-role one-off 执行。该服务不继承会自动
-  migration 的 backend common 配置，只依赖 healthy PostgreSQL。宿主必须在任何 owner Secret/connection/
-  `pg_restore` 前验证 basename、dump/checksum、preflight/`pre-migration` artifacts 和 image binding；服务
-  只能使用内部注入的精确 `sha256:...` image，无 tag/`build:`/pull，并以 `--pull never` 启动。容器入口在
-  读取 bootstrap Secret 前重复 artifact/image guard，随后才取得 `ai_employee_owner` 密码并执行单事务、
-  遇错退出的 `pg_restore`；移动 tag、缺失/错误 image 或 artifact mismatch 必须保持 owner connection 与
-  `pg_restore` 调用为零。restore 成功后才重授 app/retention 最小权限，普通 app 服务不获得 DDL。
-  最终 verifier 只有 app Secret，无 owner Secret，固定 server-default read-only 并以首个数据库动作
-  `BEGIN READ ONLY` 建立事务；同一 connection 的 DML 必须被 PostgreSQL 拒绝。grant 或 verifier 失败时
-  保持所有通用服务停止。
+- 通用 `just restore file` 保持灾备入口语义：owner-role、checksum、单事务且遇错退出，可恢复备份自身
+  支持的 revision，包括普通 0019 备份；它不依赖 0019 preflight/`pre-migration` artifact，并在成功后按
+  backup revision/manifest 运行 app-role 只读核验。
+- sealed-window 的 0018 整库恢复只能由独立
+  `just calendar-aad-restore-0018 file` 与 operations-profile owner-role one-off 执行。该服务不继承会
+  自动 migration 的 backend common 配置，只依赖 healthy PostgreSQL。宿主必须在任何 owner
+  Secret/connection/`pg_restore` 前验证 basename、dump/checksum、preflight/`pre-migration` artifacts 和
+  image binding；服务只能使用内部注入的精确 `sha256:...` image，无 tag/`build:`/pull，并以
+  `--pull never` 启动。容器入口在读取 bootstrap Secret 前重复 artifact/image guard，随后才取得
+  `ai_employee_owner` 密码并执行单事务、遇错退出的 `pg_restore`；移动 tag、缺失/错误 image 或
+  artifact mismatch 必须保持 owner connection 与 `pg_restore` 调用为零。restore 成功后才重授
+  app/retention 最小权限，普通 app 服务不获得 DDL。最终 sealed verifier 只有 app Secret，无 owner
+  Secret，固定 server-default read-only 并以首个数据库动作 `BEGIN READ ONLY` 建立事务；同一
+  connection 的 DML 必须被 PostgreSQL 拒绝。两条 restore 路径的 recipe、service、script 与测试必须
+  分离，grant 或 verifier 失败时保持所有通用服务停止。
 
 ### 21.4 安全与隐私
 
@@ -1965,6 +2040,8 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   raw scope、provider response、正文或 raw `calendar_id`。未决 started 受 retention 例外保护；只有
   matching event 组全部超过 cutoff 才能专用清理。
 - 日志、Trace、指标、SSE 和 fixture 不包含敏感内容。
+- 四个 Uvicorn 启动入口关闭默认 access log，应用日志 schema 不含 raw URL/query/request target；真实
+  callback 子进程 canary 证明 synthetic OAuth query 零泄露且脱敏审计仍被持久化。
 - 所有修改 API 通过会话、CSRF、用户隔离和版本验证。
 - 保留和删除任务覆盖 M2 新实体、既有密文三元组及 CalendarEvent 四列密文原子组。
 
@@ -1973,12 +2050,14 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 
 1. `just ci` 全部通过并保存本轮完整输出摘要。
-2. 安全 scope 审核、日志脱敏扫描和迁移验证通过。
+2. 安全 scope 审核、四入口 access-log 静态扫描与真实子进程 canary、0019 zero-bootstrap/typed-guard
+   迁移验证、current-expiry deadline 收紧测试、通用与 sealed restore 隔离测试，以及显式
+   `scripts/test-calendar-aad-0019-audit.sh` release gate 全部通过。
 3. 专用 Google 测试账户完成新邮件、回复、全部回复、日程创建、修改和恢复。
 4. 一个专用 Microsoft 测试账户完成同等流程；另一账户类型至少通过完整 OAuth、同步和写入
    契约 fixture，且个人与工作/学校账户都必须包含在自动化契约矩阵中。
 5. 审计证明每项真实测试写入都绑定有效审批和唯一 ToolExecution。
-6. 完成一次部署、加密备份恢复和 Worker 调用后崩溃演练。
+6. 完成一次部署、通用加密备份恢复、sealed 0018 恢复边界和 Worker 调用后崩溃演练。
 
 不执行持续试用会降低发现供应商偶发行为和长期 Token 问题的概率，这是明确接受的 M2 发布
 风险；自动化重复投递和崩溃测试仍不可省略。
@@ -2000,10 +2079,14 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 connection 先提交 durable refresh fence，再主动 refresh，并只通过 callback、mail/calendar Worker 与
 preflight 共用的 snapshot-CAS credential rotation boundary，把 credential 与 confirmed 事件原子提交；
 随后以数据库中这些已 confirmed 新 token 的最早
-`token_expires_at` 计算 `rollout_deadline = min(token_expires_at) - 900 seconds`。所有时间使用 UTC；
-禁止“token 足够新鲜”“窗口预计够用”等主观判断。零 affected pair 必须形成显式、可核验的 no-op
+`token_expires_at` 计算原始
+`rollout_deadline = min(token_expires_at) - 900 seconds`。ACK-lost closure/current readiness 后和每个
+后续 guard 都重新读取 affected connections 当前持久化 access credential expiry，计算
+`current_deadline`，并以 `min(original_artifact_deadline, current_deadline)` 作为 effective deadline；
+窗口只能收紧，不能因后续更长 expiry 延长。所有时间使用 UTC；禁止“token 足够新鲜”“窗口预计够用”
+等主观判断，也禁止把历史 confirmed deadline candidate 当作 current deadline。零 affected pair 必须形成显式、可核验的 no-op
 artifact；所有后续 guard 都必须重新证明 affected set 仍为空才可接受其 null deadline。其他情况若
-preflight 完成时 `now >= rollout_deadline`，必须在备份前失败。宿主机 recipe 还必须从 Compose 实际
+preflight 完成时 `now >= effective_deadline`，必须在备份前失败。宿主机 recipe 还必须从 Compose 实际
 选中的 backend image 解析内容 ID 并内部传入，artifact 绑定该 ID；运维人员不得手填 image ID，后续
 backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与 artifact 不一致。
 
@@ -2012,7 +2095,7 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
 1. 保持外部写入默认关闭，关闭 Calendar 周期调度并停止新入口流量。
 2. 排空并停止所有 pre-0019 CalendarEvent reader/writer，包括 Caddy、API、Worker 与 Scheduler；确认
    没有旧 `sync_calendar` 任务、事件 upsert 事务或旧 reader 仍在运行，PostgreSQL 与 Redis 保持运行。
-3. 运行 Task 27 提供的无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 首先通过
+3. 运行 Task 27C 提供的无参数 `just calendar-aad-preflight-0019`。该 0018-compatible one-off 首先通过
    独立 PostgreSQL session 执行固定 `pg_try_advisory_lock(20260809, 19)`，并在取得 revision-global
    lease 前禁止检查 artifact、调用供应商或写凭据；获取失败以 `calendar_aad_rollout_locked` 返回，零
    refresh、零持久写入。同一 lease 覆盖整个网络阶段和 artifact 发布，每次 provider call、credential
@@ -2068,7 +2151,8 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `rollout_digest_v1`、G/G/G、两个 pre-digest、old/new identity/version，并强制增加
    `post_credential_snapshot_digest_v1`、`post_refresh_credential_snapshot_digest_v1`、实际持久化
    `token_expires_at`、`refresh_token_disposition`、`refresh_identity_changed` 和
-   `rollout_deadline_candidate = token_expires_at - 900 seconds`；其 `created_at` 必须严格晚于 matching
+   `rollout_deadline_candidate = token_expires_at - 900 seconds`（仅作历史 result schema proof，不作后续
+   current deadline 输入）；其 `created_at` 必须严格晚于 matching
    started。missing/same 必须 old == new、changed=false，different 必须 old != new、changed=true；不一致
    metadata 不能作为合法 result。禁止现有无条件 upsert。网络未知、调用后任一 lease 丢失、scope shrink、CAS miss 或数据库
    明确 rollback 均不产生 confirmed、执行 probe 或发布 artifact，也不得对同 snapshot 重放 provider。
@@ -2082,8 +2166,9 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `oauth_credential_state_conflict` 并阻断 artifact，但不重开 attempt。后续 Taskiq delivery 或
    `TransientProviderError` 路径只读取该关闭事实与 current readiness。confirmed 已提交但 artifact 发布前崩溃
    时，同一 rollout按上述规则继续。全部
-   connection confirmed 后重新
-   读取持久化 expiry 并计算 deadline，再通过供应商只读 Calendar adapter 调用与恢复路径一致的
+   connection confirmed 后，以及 ACK-lost closure/current readiness 的每次恢复路径，都重新读取每个
+   affected connection 当前持久化 access credential 的 expiry，计算只能收紧的 effective deadline，再通过
+   供应商只读 Calendar adapter 调用与恢复路径一致的
    `initial_pages(scope_key)` 并要求最终 cursor；全部 probe 成功且最终 rollout guard 通过后才原子提交
    content-free rollout artifact。它不等待资源 401；主动刷新后的 401 直接失败且不得第二次 refresh。
    它不得调用 `directory_pages()`、连接级/full-account sync、其他 pair 或 Calendar 写适配器，也不得写
@@ -2110,17 +2195,21 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `microsoft_reauthorization_required`。raw error 不记录且不能成为持久错误码，随后 replay fail closed。
    targetless fenced identity 仍在任何保存前阻断。
 4. preflight 全部通过后，生成加密备份并执行迁移前只读审计；backup/audit 在启动和 artifact 原子提交前
-   校验同一 rollout guard：非空集合要求 `now < deadline`，零分支要求重新证明 affected set 仍为空。
+   校验同一 rollout guard：非空集合从当前 access rows 重算并要求 `now < effective_deadline`，零分支要求
+   重新证明 affected set 仍为空。
    审计必须证明数据库仍位于 0018、没有部分 AEAD 三元组，并重复记录每个
    affected pair 的本地可恢复性事实、必需 access/refresh credential 和完全一致的 locally hashed set。
-5. 通过受限 `calendar-aad-migrate-0019` one-off 应用前向 `0019`，在任何 DDL/DML 前和事务最终提交前
-   校验 preflight artifact、实际镜像内容 ID、精确 affected set、本地可恢复性和 rollout guard；再执行
+5. 通过受限 `calendar-aad-migrate-0019` one-off 应用前向 `0019`。0019 revision 与
+   `migrations/env.py` 的 mutation 前/`on_version_apply` 最终 guard 已由 Task 16A 冻结；该 one-off
+   只能注入 Task 27C 的真实 artifact guard，在任何 DDL/DML 前和事务最终提交前校验 preflight artifact、
+   实际镜像内容 ID、精确 affected set、本地可恢复性和 effective deadline。fresh/严格空集合的普通
+   `upgrade head` 仍走内建 zero-bootstrap，非空 0018 数据库缺 guard 则 mutation 前失败；再执行
    迁移后只读审计。验证
    只新增版本列/约束、v1 标记和精确 pair 的事件 scope 游标失效，其他 connection 的同名 calendar、
    directory cursor/revision 与全部事件 AEAD 字节均未变化。
 6. 使只写 v2、正常读取拒绝 v1 的不可变镜像可供 one-off 恢复命令使用，但继续保持 Caddy、API、
    普通 Worker 与 Scheduler 停止；0019 不支持旧新 Calendar reader/writer 混跑，任何旧组件都不得回流。
-7. 运行 Task 27 提供的 `just calendar-aad-resync-0019`。该无参数入口在启动和每个任务最终本地提交前
+7. 运行 Task 27C 提供的 `just calendar-aad-resync-0019`。该无参数入口在启动和每个任务最终本地提交前
    校验同一 rollout guard，只扫描
    `calendar_event_resync_required` marker，并对每个精确 cursor 行使用 `FOR UPDATE` 或等价 CAS
    串行化 planner。逻辑 pair digest 是 revision、connection ID 与 calendar ID 的 SHA-256；首次 ordinal
@@ -2140,16 +2229,21 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
    `directory_pages()`、连接级 owner 或其他 provider/calendar；完成提交必须以 marker 为 CAS 前提，
    失败保留 marker。该流程只读供应商并写本地同步事实，不创建审批、ToolExecution 或真实写操作。
 9. 执行 `post-resync` 只读审计，在读取前和 artifact 原子提交前检查同一 rollout guard，验证新密文均为
-   v2、每个精确 pair 的 cursor/freshness 恢复且 marker 清除。任一 pair 失败、非空集合 deadline 已到
-   或 zero state 漂移时保持所有通用服务和真实写开关关闭。deadline 尚未到且精确失败条件可修复时，
-   只能由后续显式 CLI 按既定 ordinal 规则重试；deadline 已到或已不能证明会及时提交 artifact，且仍在
-   sealed maintenance window、没有任何业务写入时，才使用本窗口 refresh 后/0019 前指定的加密整库
-   备份恢复到 revision 0018。宿主必须先在任何 owner Secret、owner connection 或 `pg_restore` 前验证
+   v2、每个精确 pair 的 cursor/freshness 恢复且 marker 清除。任一 pair 失败、非空集合当前重算的
+   `effective_deadline` 已到或 zero state 漂移时保持所有通用服务和真实写开关关闭。该
+   `effective_deadline` 尚未到且精确失败条件可修复时，只能由后续显式 CLI 按既定 ordinal 规则重试；
+   `effective_deadline` 已到或已不能证明会及时提交 artifact，且仍在
+   sealed maintenance window、没有任何业务写入时，才通过独立
+   `just calendar-aad-restore-0018 file` 使用本窗口 refresh 后/0019 前指定的加密整库备份恢复到
+   revision 0018。该入口与通用 `just restore file` 完全分离；后者仍用于不要求 0019 artifacts 的普通
+   灾备恢复。sealed 宿主必须先在任何 owner Secret、owner connection 或 `pg_restore` 前验证
    basename、dump/checksum、preflight/原 `pre-migration` artifacts 和 immutable image binding；移动 tag、
    缺失/错误 image 或 artifact mismatch 必须保持 owner/`pg_restore` 调用为零。通过后才向 operations
    profile 中不继承 `backend-common` 的专用 restore service 内部注入与 artifact 匹配的精确
    `CALENDAR_AAD_RESTORE_IMAGE_ID=sha256:...`；service 的 `image:` 直接引用该 ID，无 tag、`build:` 或
-   pull，并固定 `docker compose ... run --rm --pull never ... restore`。该服务只依赖 healthy PostgreSQL，
+   pull，并固定
+   `docker compose --profile operations run --rm --pull never ... calendar-aad-restore-0018`。该服务只依赖
+   healthy PostgreSQL，
    容器入口在读取任何 owner Secret 前再次校验 artifact/image 环境，随后才固定
    `PGUSER=ai_employee_owner`、从 `postgres_bootstrap_password` 取得密码，并以
    `--clean --if-exists --no-owner --no-privileges --exit-on-error --single-transaction` 执行 `pg_restore`。
@@ -2184,7 +2278,9 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 多账户选择错误 | 回复绑定原连接、新建使用可切换默认值、审批展示精确账户 |
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
 | CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
-| 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；固定 `min(token_expires_at)-900s` deadline；超时仅允许 sealed-window 整库恢复到 0018 |
+| 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；artifact deadline 固定，后续从 current access rows 重算并只允许收紧；超时仅允许 sealed-window 整库恢复到 0018 |
+| 历史 OAuth callback query 被 Uvicorn access logger 输出 | 四个真实启动入口全部关闭 access log；应用日志 schema 禁止 raw URL/query/request target；真实子进程 canary 同时证明 query 零泄露与脱敏审计正常 |
+| 0019 guard 只在专用 rollout CLI 存在，破坏 fresh DB 或普通 `upgrade head` | Task 16A 在 revision 内冻结 mutation 前与 `on_version_apply` 最终 guard；fresh/严格空集合走 zero-bootstrap，0018 非空无 typed guard 在 mutation 前失败；Task 27C 只注入，不重写 revision |
 | 双 Worker、Taskiq 重投或 `TransientProviderError` 导致同一 connection 重复 refresh/exchange | 所有 writer 共用 `OAuthRefreshCoordinator` 与 connection-scoped session lease；provider 前提交 attempt-bound started，网络外无业务事务，响应后同事务 CAS/result；网络未知、响应后 lock loss、CAS miss 或已确认 rollback 后续 delivery 只读 fence且 provider call 为零；commit ACK 丢失用新 session 按 user/connection/attempt 查询版本化 confirmed/unsatisfied/replacement result union，合法 matching event 永久关闭对应 attempt，再独立核对 current readiness；后续合法状态变化不复活，只有 changed=true 的 old-identity rollback 或缺行/AEAD/归属/状态冲突返回 `oauth_credential_state_conflict` 且零调用，无 result 才 unresolved且绝不补写 |
 | explicit recovery 拒绝或 missing/same token 后 capability 长期停在 `authorizing` | start 的 S→T 与 requested capability `authorizing` 原子提交；可安全确认的 unsatisfied 在同一短事务复用 `mark_progressive_authorization_failed` 收敛为 `action_required`、写稳定 error code并保留 actual scopes/last-verified facts；stale T 只做 no-op 与安全审计，用户可创建新 attempt，原 automatic fence 不被消费 |
 | Google callback 的歧义、错误分类被抹平或 error 重放绕过一次性授权状态 | Google 与 Microsoft 都要求 state 且仅接受互斥 code/error；缺 state、code+error、两者都缺失或 malformed error 在消费前拒绝；任何合法 error（含未知名称）都先一次性消费 state并在 target T 写 unsatisfied/no-op，raw error 不入库/日志且 replay fail closed；公开 Problem 与持久 error code 使用安全分类矩阵，保留 `microsoft_admin_consent_required`/`microsoft_reauthorization_required`，用户拒绝与未知名称回退 `oauth_authorization_failed`；targetless fenced identity 仍在保存前阻断 |
@@ -2192,7 +2288,7 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | refresh token A→B→A 绕过 rollback guard，或同 plaintext 重加密被误判为 rollback | M2 从固定 `APP_MASTER_KEY_FILE` root key 与固定 `AeadCipher.key_version` 经 HKDF-SHA256/HMAC-SHA256 生成 `refresh_token_identity_v1`；confirmed/replacement 以 `refresh_identity_changed` 区分 plaintext 是否变化，parser 强制 disposition/flag/equality 一致。changed=false 的同 plaintext 重加密保持 old == new、不是 rollback；只有 changed=true 的 A→B proof 后 current identity 回到 A 才返回 `oauth_credential_state_conflict`，且不重开旧 attempt；M2 不更换 root key/version，也不引入 multi-key lookup |
 | 并发或未知结果 preflight 重复 refresh，或陈旧 writer 覆盖新 token | revision-global lease 互斥全部 basename，且每个 connection 同时持有共享 coordinator lease；generic started/confirmed 精确绑定 attempt UUID、source、`rollout_digest_v1`、G/G/G、full/refresh pre/post 摘要、old/new identity/version、`refresh_identity_changed`、persisted expiry与 deadline candidate；mail/calendar Worker 与 preflight 共享完整 snapshot/generation CAS 和固定锁序。未确认 fence 跨 basename 阻断；automatic missing/same/different refresh 都只 confirmed 自己的 started并满足 flag/equality 矩阵，只有带 connection ID 的 explicit progressive recovery 返回 different non-empty refresh token并原子提交 old != new、changed=true 的完整 F/S/T replacement proof 才消费旧 fence |
 | 历史清理删除未决 refresh fence 后触发迟到重放 | AuditEvent 使用 user-scoped fence-aware retention并复用同一 result union；confirmed 关闭 automatic started，unsatisfied 只关闭 recovery started，replacement 同时关闭 recovery started并消费 original fence。未匹配 union result 的 automatic started 跨 cutoff 保留；各完整事件组只有全部早于 cutoff 才删，且关闭不依赖后续 current credential lineage，跨 365 天回归要求后续 provider call 为零 |
-| restore 镜像/工件被替换，app-role 无法完整恢复，或 `pg_restore` 中途失败留下部分状态 | owner 前宿主 artifact/image guard；精确 `sha256:` restore image、无 build/pull、`--pull never`，容器读取 Secret 前复核；专用 owner-role 单事务 restore，成功后重授最小权限；app-only verifier 由 `PGOPTIONS` 与 `BEGIN READ ONLY` 双重强制只读 |
+| 通用灾备 restore 与 0019 sealed restore 混淆，或 restore 中途留下部分状态 | `just restore` 保持按备份 revision/manifest 的通用 owner-role 单事务恢复，不要求 0019 artifacts；`calendar-aad-restore-0018` 独立执行 owner 前 artifact/image guard、精确 `sha256:` 无 pull restore 与 app-only verifier；两条 recipe/service/script/test 不复用语义 |
 | 日程通知行为不一致 | 通知策略进入冻结载荷、适配器无损映射，不支持即审批前拒绝 |
 | Microsoft 个人与企业授权差异 | `common` 类委托授权、delegated `User.Read` 的 Graph `/me` 身份读取、tenant/account 规范身份、管理员同意状态 |
 | 通用抽象扩大到 M5 | 命令联合只允许四个 M2 动作，不提供动态工具注册或 Planner |
