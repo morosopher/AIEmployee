@@ -1028,7 +1028,10 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    `calendar_event_resync_required`；其他 connection 即使复用相同 `calendar_id` 也不得变化，
    `directory` 游标及其 freshness、revision 和错误状态必须原样保留。0019 是 forward-only；
    downgrade 必须拒绝移除版本列、约束或恢复 legacy AAD 读取，不能通过破坏性回退重新引入
-   跨日历替换风险。
+   跨日历替换风险。同一 0019 revision 还必须按 17.2.3～17.2.4 以无 autocommit 的显式 policy delta
+   收紧 retention 对象权限，并把 revision DDL/DML、Alembic version 行、grant/revoke、destination
+   inventory verification 与最终 typed guard 保持在同一个外层事务；不得让 role-bootstrap 在迁移前
+   预先修复或提前授予 0019 权限。
 4. 除本节明确批准且已先建立替代事实的约束 contract 外，迁移只增加新表、新列、新索引和新状态
    值；任何迁移都不得删除业务行，也不得依赖破坏性 downgrade。
 5. 为现有 Google 连接根据已保存 scope 回填读取能力，写能力统一为 disabled。
@@ -1244,11 +1247,161 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 | Task、状态与不含内容的审计 | 365 天 | 按现有工作区历史清理 |
 | OAuth 凭据 | 连接期间 | 断开时删除本地密文并尽力撤销 |
 
+#### 17.2.1 内容到期与可信操作收敛
+
 未发送草稿按最后编辑时间应用邮件正文周期。正文到期后，草稿不可再次提交，但可以保留一个
 不含内容的历史占位。
 
 CalendarEvent 描述或地点到期清理必须按字段在同一事务中同时清空其 `ciphertext`、`nonce`、
 `key_version` 和 `aad_version`，不得留下只有版本或部分 AEAD 列非空的记录。
+
+清理可能被审批或执行引用的邮件正文、日程快照或加密命令时，必须按固定顺序取得同一用户范围内的
+行锁：`TaskRun → ApprovalRequest → ToolExecution（若存在）→ MailDraft/CalendarChangeProposal →
+MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期时间、审批版本、命令哈希和执行
+状态；过期扫描先前观察到的状态不能直接作为写入依据。
+
+- 尚未创建 `ToolExecution` 时，审批转为失效，TaskRun 与草稿/提案动作转为取消，稳定错误码为
+  `action_content_expired`；同时清空 `scheduled_for`、`retry_recovery_at`、
+  `approval_checkpoint_recovery_at`、lease owner/expiry 与其他可重新进入执行的调度字段。该动作不得
+  重新提交，用户只能基于仍可用的非敏感元数据创建新版本。
+- 已存在非终态 `ToolExecution` 时，草稿/提案动作、ToolExecution 与 TaskRun 一并收敛为
+  `needs_attention`，错误码为 `action_content_expired`。必须保留供应商资源 ID、请求/关联 ID、检查链接、
+  只读核对计数与人工结果入口，禁止把未知外部副作用伪装为取消或未执行。
+- 已存在终态 `ToolExecution` 时，只清除到期内容，不改写已经确定的执行结论。
+
+邮件版本正文三元组与引用它的审批 payload 三元组必须在同一事务内一起清空；日程 snapshot 内容
+三元组与引用它的审批 payload 三元组也必须在同一事务内一起清空。任一组部分失败都必须整体回滚，
+不能留下仍可解密的一侧或只剩 nonce/key version 的半组。
+
+#### 17.2.2 来源缓存与全数据删除
+
+来源缓存删除必须根据冻结的领域绑定决定是否删除本地动作，不能以供应商显示字段、当前目录状态或
+级联副作用推断归属：
+
+- 邮件动作仅在 `source_thread_id IS NOT NULL OR source_message_id IS NOT NULL` 时属于来源绑定动作；
+  两者都为空的独立新邮件草稿保留。
+- 日历动作仅在 `target_event_id IS NOT NULL` 时属于来源绑定动作；没有目标事件的
+  `calendar.create` 提案保留。
+- 尚未认领的来源绑定动作先按 17.2.1 失效其审批与任务，再按显式子到父顺序删除版本/快照、审批及
+  动作聚合。删除器不得依赖 ORM 或数据库 cascade 证明清理完整性。
+- 已认领动作不删除最小 ToolExecution/TaskRun 核对事实；先按 17.2.1 清除敏感内容并收敛状态，再删除
+  可重新同步的来源缓存。来源删除绝不能制造新的供应商写请求。
+
+删除全部数据采用可恢复的分阶段协议：
+
+1. 独立短事务对目标用户执行 `is_active=true → false` 的 CAS 写屏障；CAS 后的新 TaskRun claim、
+   ToolExecution claim 和 provider request-start 都必须锁后重检用户仍 active，否则在任何供应商调用前
+   拒绝。
+2. 在屏障之后失效所有未认领动作；对每个已认领动作至多执行一次有界、只读 reconcile，禁止借删除
+   请求重放写命令。结果仍未知时也继续本地删除，但必须先向用户说明外部副作用可能已经发生。
+3. 每个连接至多解密并在受控内存中保留一个用于 revoke 的 token；不得同时保留 access/refresh token，
+   不得把 token 写入日志、审计、异常或中间表。读取与删除连接/credential/fence 时复用 17.3 的
+   `connection → access credential → refresh credential → matching started audit` 锁序，锁后重查归属与
+   当前 credential 行，不能从后续 connection 借 token。
+4. 先在本地事务中显式删除该连接的 credential 行并提交，再使用内存中的单个 token best-effort 调用
+   对应供应商 revoke。网络失败、供应商拒绝或 token 已失效均不得回滚或阻断已经提交的本地删除。
+5. 所有业务表按外键拓扑显式子到父、有界批次删除；不得把 cascade 当作覆盖证明，也不得跨用户读取
+   或删除。最后匿名化但保留 M1 用户根行，并追加唯一、无正文/地址/标题/provider ID 的
+   `privacy.deletion_completed` 审计事实。
+
+最终用户行必须保持 `is_active=false`，把 email/display name 替换为确定性、不可投递且不含原值的匿名
+表示，清空 `password_hash` 和三个默认连接/日历字段，并把所有设置恢复为冻结默认值：`timezone=UTC`、
+`locale=zh-CN`、`brief_time=08:00`、retention `30/180/365` 天、周一至周五 `09:00–18:00` 且周末为空、
+`meeting_buffer_minutes=10`。该最终事务同时更新 `updated_at`；`users` 行不得被 retention 角色删除。
+
+#### 17.2.3 retention 角色的精确对象权限
+
+`ai_employee_retention` 只执行已批准的保留与隐私 Worker，不通过 `SECURITY DEFINER`、角色继承或
+effective-permission 探测扩大权限。所有 policy delta 必须使用逐表、逐列的显式直接 SQL；禁止
+`GRANT ... ON ALL TABLES`、`GRANT ... ON ALL SEQUENCES` 或把 cascade 当作权限/清理证明。revision
+`20260809_0019` 完成后，下表是新增或扩展对象的完整
+retention policy；表级权限未列出即不存在，列级 UPDATE 只允许列出的列：
+
+| 对象 | 表级权限 | 允许 UPDATE 的列 |
+|---|---|---|
+| `connection_capabilities` | `SELECT, DELETE` | — |
+| `provider_calendars` | `SELECT, DELETE` | — |
+| `mail_drafts` | `SELECT, DELETE` | `status, updated_at` |
+| `mail_draft_versions` | `SELECT, DELETE` | `body_ciphertext, body_nonce, body_key_version` |
+| `calendar_change_proposals` | `SELECT, DELETE` | `status, updated_at` |
+| `calendar_change_snapshots` | `SELECT, DELETE` | `content_ciphertext, content_nonce, content_key_version` |
+| `oauth_attempts` | `SELECT, DELETE` | — |
+| `oauth_connections` | `SELECT, DELETE` | — |
+| `sync_cursors` | `SELECT, DELETE` | `cursor, last_success_at, last_attempt_at, last_error_code` |
+| `email_messages` | `SELECT, DELETE` | `body_ciphertext, body_nonce, body_key_version, updated_at` |
+| `calendar_events` | `SELECT, DELETE` | `description_ciphertext, description_nonce, description_key_version, description_aad_version, location_ciphertext, location_nonce, location_key_version, location_aad_version, updated_at` |
+| `approval_requests` | `SELECT, DELETE` | `status, payload_ciphertext, payload_nonce, payload_key_version` |
+| `tool_executions` | `SELECT, DELETE` | `status, error_code` |
+| `task_runs` | `SELECT, DELETE` | `status, error_code, scheduled_for, retry_recovery_at, approval_checkpoint_recovery_at, lease_owner, lease_expires_at, finished_at, updated_at` |
+| `users` | `SELECT`，明确无 `DELETE` | `email, display_name, password_hash, is_active, timezone, locale, brief_time, email_body_retention_days, source_metadata_retention_days, workspace_history_retention_days, default_mail_connection_id, default_calendar_connection_id, default_calendar_id, working_hours, meeting_buffer_minutes, updated_at` |
+| `audit_events` | `SELECT, INSERT, DELETE` | 明确无任何 `UPDATE` |
+
+现有 M1 删除对象 `messages`、`conversations`、`daily_brief_items`、`daily_briefs`、
+`llm_invocations`、`task_steps`、`outbox_events`、`user_sessions`、`email_analyses`、`email_threads` 与
+`encrypted_credentials` 继续只有 `SELECT, DELETE`；不得为完成 M2 删除流程增加 INSERT 或 UPDATE。
+revision `0018` 及更早版本必须保持当时已冻结的精确 inventory，不能在迁移前先“修复”为 0019 policy。
+
+列级授权不是业务值授权：Worker 只能在用户条件、CAS 与状态守卫下把 `users` 写成上述匿名化/默认值，
+不得把 `is_active` 从 `false` 改回 `true`，也不得借 `status`/错误列伪造执行结果。权限测试必须同时验证
+SQL 列边界和这些领域状态不变量。
+
+retention 角色在 `public` schema 只获得 `USAGE`，不获得 `CREATE`。它只对
+`audit_events_id_seq` 获得 `USAGE`，必须撤销历史脚本留下的 `USAGE ON ALL SEQUENCES`；所有 sequence
+的 `SELECT/UPDATE` 均禁止。任何对象上的 `TRUNCATE`、`REFERENCES`、`TRIGGER`、`MAINTAIN`、grant
+option，以及 schema CREATE 都不属于 M2 权限。普通应用角色继续不能 UPDATE/DELETE `audit_events`。
+
+schema/table/sequence/column 权限必须由一个共享 canonical catalog reader 读取并比较完整 multiset：
+
+```text
+(object_kind, schema_name, object_name, column_name|null,
+ grantee, grantor, privilege_type, is_grantable)
+```
+
+reader 对 schema 使用 `COALESCE(nspacl, acldefault('n', nspowner))`，对普通 table 使用
+`COALESCE(relacl, acldefault('r', relowner))`，对 sequence 使用
+`COALESCE(relacl, acldefault('s', relowner))`，对 column 使用
+`COALESCE(attacl, acldefault('c', relowner))`；四类都通过 `aclexplode` 取得原始 catalog tuple。column 的
+默认 ACL 为空，不能把 table privilege 展开或伪装成 column tuple。禁止使用
+`has_schema_privilege`、`has_table_privilege`、`has_sequence_privilege`、information_schema effective
+视图或角色继承结果替代原始 ACL。
+
+PostgreSQL 17 的 `public` schema owner/grantor 必须按 catalog 原样识别为 `pg_database_owner`；table 与
+sequence grantor 必须是各 relation 的实际 owner。owner tuple 仍按 catalog 记录
+`is_grantable=false`，不得因 owner 的系统特权把它归一化为 true。expected inventory 必须覆盖当前 schema
+中的全部受管对象，包括首次安装由 Alembic 自动创建的 `alembic_version`；额外对象、额外/重复 tuple、
+未知 privilege、错误 grantor/grantee、错误 grant option 或漏掉一个 expected tuple 都必须 fail closed。
+
+#### 17.2.4 revision 级权限 delta 与事务边界
+
+对象权限不是 role-bootstrap 脚本的宽泛“grant all”副作用，而是与每个 Alembic revision 绑定的显式、
+可验证 policy。每一步在线升级顺序固定为：
+
+```text
+revision operation + alembic_version 行变更
+→ canonical catalog diff
+→ 只应用该 source revision 到 destination revision 的精确 grant/revoke delta
+→ 重读并验证 destination 完整 inventory
+→ 仅 0019 执行最终 before_commit typed guard
+```
+
+进入一步迁移前必须先证明 source inventory 精确匹配；普通 drift 不得通过预迁移 grant/revoke 自动修复。
+`0019` 不使用 autocommit 或 concurrent index，DDL、DML、Alembic version 行、权限 delta、destination
+verification 与最终 guard 位于同一外层事务；任一步失败或连接丢失都必须整体回滚。0019 是首次把
+17.2.3 的 retention policy 作为显式 delta 生效的 revision。
+
+`0016`～`0018` 包含 autocommit 批次或 `CREATE UNIQUE INDEX CONCURRENTLY`，因此失败时不得声称 revision
+operation、version 行和权限一定整体回滚。重跑只可接受该 migration 自己用固定名称创建、catalog 形状
+逐列精确匹配且没有额外 ACL 的 resume candidate；同名错误对象、额外权限、部分 contract、未知业务行
+变化或不匹配 revision 一律 fail closed。resume 只能继续原 revision 的既定步骤，不能借机采用 0019
+policy，也不能建立通用 repair 路径。
+
+standalone role-bootstrap、protected `db-reset` 的 post-create bootstrap、普通 migration 和 restore 的
+baseline/active grants verifier 都必须调用同一个 reader 和 revision/phase inventory 定义；只有被相应
+lifecycle locks 与 catalog admission 明确授权的入口才能应用已冻结 delta。任何 SQL 错误、最终 inventory
+不匹配或 0019 before_commit guard 失败，都必须在该入口允许的事务边界内回滚；对 0016～0018 的
+autocommit 历史只报告实际持久事实并走上述受限 resume，不得伪造“全事务回滚”证据。
+
+#### 17.2.5 OAuth 与 restore 持久事实的保留
 
 365 天工作区历史清理不得把 OAuth refresh 事件当作普通审计直接删除。generic AuditEvent delete 必须
 排除 `oauth.refresh_started`、`oauth.refresh_confirmed`、
@@ -1623,12 +1776,15 @@ expected lowercase `refresh_token_identity_v1` 为
 ### 17.4 删除能力
 
 - 清除邮箱缓存：取消并删除依赖对应线程且尚未认领的草稿和审批；已认领操作保留最小执行与
-  核对事实，不能因删除来源缓存而伪装成未执行。
-- 清除日历缓存：取消对应且尚未认领的提案和恢复操作；已认领操作按相同规则保留最小事实。
-- 从零创建且未引用源数据的本地草稿不随来源缓存删除。
-- 删除全部数据：先建立用户级写入屏障，取消未认领操作，并对已认领操作执行一次有界核对；
-  随后删除连接、草稿、提案、任务内容、密文和 provider IDs。即使结果仍未知也必须完成本地
-  删除，但应在删除前向用户明确提示外部副作用可能已经发生，并只保留不含个人内容的删除审计。
+  核对事实，不能因删除来源缓存而伪装成未执行。邮件绑定仅由
+  `source_thread_id IS NOT NULL OR source_message_id IS NOT NULL` 决定；两列都为空的独立草稿保留。
+- 清除日历缓存：取消并删除 `target_event_id IS NOT NULL` 且尚未认领的修改/恢复提案；已认领操作按
+  相同规则保留最小事实。`target_event_id IS NULL` 的 `calendar.create` 提案保留。
+- 两种来源清理都按 17.2.2 显式删除动作聚合与子记录，不依赖 cascade，也不删除从零创建且未引用
+  来源数据的动作。
+- 删除全部数据严格执行 17.2.2 的 inactive CAS 屏障、未认领失效、已认领单次只读核对、先提交本地
+  credential 删除后 best-effort revoke、显式子到父删除及最终匿名化协议。即使结果仍未知也必须完成
+  本地删除，但应在删除前向用户明确提示外部副作用可能已经发生，并只保留不含个人内容的删除审计。
 
 ## 18. 错误契约
 
@@ -1649,6 +1805,7 @@ expected lowercase `refresh_token_identity_v1` 为
 | `proposal_version_conflict` | 409，重新加载提案 |
 | `approval_invalidated_by_edit` | 409，提交新版本 |
 | `approval_execution_deadline_expired` | 409/任务失败，重新审批 |
+| `action_content_expired` | 清理原子失效未认领动作；已认领未知结果进入 `needs_attention` |
 | `mail_recipient_limit_exceeded` | 422，减少地址 |
 | `mail_thread_binding_conflict` | 409，源线程已变化或不可访问 |
 | `calendar_event_version_conflict` | 409，基于最新事件重新提案 |
