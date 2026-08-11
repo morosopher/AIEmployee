@@ -2344,10 +2344,10 @@ git commit -m "feat: add calendar change proposals"
   credential, audit-safe error-code, forward-only migration, schema-lifecycle lock, exact pre-step object grants,
   per-step grant delta/callback ordering, 0019 full rollback, 0016–0018 exact autocommit resume evidence, and
   maintenance-gate regressions.
-- Create: `backend/tests/integration/operations/test_database_maintenance_gate.py` — fixed low/high-bit target digest plus
-  management/target lock vectors, database-wide custom-setting/new-session visibility, malformed/role-override
-  rejection, lifecycle ordering, reset/drop/create zero-call behavior, and owner-entry zero-write coverage reused by
-  Task 27D.
+- Create: `backend/tests/integration/operations/test_database_maintenance_gate.py` — Cycle 2 creates PostgreSQL 17
+  read-only database ACL/runtime-role/bootstrap-candidate catalog and classification coverage with zero-mutation
+  assertions. Cycle 4 extends the same file with fixed low/high-bit target digests, management/target/schema locks,
+  lifecycle/reset/owner-entry, and mutation coverage; Task 27D later reuses this file.
 - Modify: `backend/tests/integration/conftest.py` — prove the ordinary session-level `upgrade head` entry keeps
   working through the frozen zero-bootstrap branch and cannot bypass the outer migration lock.
 - Modify: `compose.yaml` — make `role-bootstrap` finish candidate→baseline/password handling first, then run the
@@ -2873,6 +2873,17 @@ transient and accepted only for `ROLE_BOOTSTRAP` and `DB_RESET_POST_CREATE`; dir
 zero-write. Baseline and active are steady postures, not candidates. Actual password/ACL/object-grant mutation and
 same-transaction re-verification belong to Cycle 4, after the Cycle 3 object inventory exists.
 
+Also create `backend/tests/integration/operations/test_database_maintenance_gate.py` in this cycle. Add only tests
+whose names are selected by `-k "database_acl or runtime_role or bootstrap_candidate"`. Against real PostgreSQL 17,
+read only the canonical `aclexplode(COALESCE(...))` database ACL catalog, freeze owner
+`is_grantable=false`, verify the app/retention role attributes and both membership directions, and classify live
+snapshots as the closed bootstrap-candidate or steady postures defined by the unit matrix above. Every test must
+prove that database ACLs, roles, memberships, restore facts, schema, and business rows are unchanged before versus
+after the call. Do not create or rotate roles or passwords, execute `GRANT`, `REVOKE`, `ALTER DATABASE`, or
+object-grant mutation, acquire management/target/schema locks, invoke role-bootstrap/migrate/reset, or perform
+same-transaction post-mutation verification; those lifecycle and mutation paths belong to Cycles 3–4. Preserve the
+complete candidate unit matrix above, and leave every actual mutation for Cycle 4.
+
 - [ ] **Step 14: Run Cycle 2 and observe the ACL/runtime-role RED**
 
 Run:
@@ -3117,8 +3128,9 @@ every drift/no-repair negative.
 
 - [ ] **Step 21: Cycle 4 RED — write role-bootstrap, migration-entry, and protected-reset lifecycle tests**
 
-Extend `backend/tests/integration/db/test_migrations.py` and
-`backend/tests/integration/operations/test_database_maintenance_gate.py` with real PostgreSQL coverage:
+Extend the existing Cycle 2 read-only PostgreSQL coverage with lifecycle and mutation coverage in
+`backend/tests/integration/operations/test_database_maintenance_gate.py`, and extend
+`backend/tests/integration/db/test_migrations.py` for the same Cycle 4 boundary:
 
 - derive target bytes exactly as
   `b"ai_employee.restore_target.v1\0" + unsigned_decimal_system_identifier_ascii + b"\0" + exact_database_name_utf8`
