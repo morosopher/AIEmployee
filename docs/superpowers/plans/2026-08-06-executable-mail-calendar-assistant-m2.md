@@ -1,6 +1,6 @@
 # Executable Mail and Calendar Assistant M2 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Execution is strictly serial: at most one implementer or reviewer subagent may run at a time, and the next subagent starts only after the current task's review loop is closed.
 
 **Goal:** Extend the trusted M1 task center into an M2 assistant that can incrementally connect Google and Microsoft mail/calendar data, prepare editable local actions, and execute one precisely approved external write with durable reconciliation.
 
@@ -13,6 +13,10 @@
 ## Execution Rules
 
 - The approved source of truth is `docs/superpowers/specs/2026-08-06-executable-mail-calendar-assistant-m2-design.md`. Stop if implementation evidence contradicts a command, scope, approval, retry, or reconciliation invariant in that specification.
+- Execute the entire plan only through `superpowers:subagent-driven-development`: dispatch one fresh implementer for
+  each numbered task, then one specification reviewer, then one code-quality reviewer. Never run two subagents at
+  once, never start quality review before specification review passes, and never start the next task until every
+  issue has been fixed by the original implementer and approved by the corresponding reviewer.
 - Execute every behavior change red-green-refactor: add the focused failing test, run it and read the expected failure, implement the smallest complete behavior, rerun focused and adjacent tests, then commit.
 - Keep legacy `fake.write` records and M1 read paths compatible. A real M2 command must never fall back from encrypted payload columns to `ApprovalRequest.payload`.
 - Keep all real writes disabled by default. Automated tests use Fake providers and sanitized HTTP fixtures; only the release task may describe a separately authorized test-account run.
@@ -2288,7 +2292,8 @@ git commit -m "feat: add calendar change proposals"
 - Modify: `backend/migrations/env.py` — verify the current revision's exact object-grant inventory before the first
   migration DDL, maintain one per-step catalog snapshot on the same outer Alembic connection, apply and verify only
   the current step's new-object or explicit policy grant delta from `on_version_apply`, then run the frozen 0019
-  `before_commit` guard as that step's final fallible callback. The same outer online boundary acquires the
+  `before_commit` guard as that step's final fallible callback. Preserve explicit partial-persistence/resume evidence
+  for 0016–0018 autocommit/concurrent-index steps while keeping 0019 fully transactional. The same outer online boundary acquires the
   management-database lifecycle lease, common target-scoped maintenance lock/check, then the fixed schema-lifecycle
   exclusive lock, and holds them through transaction commit/rollback.
 - Create: `backend/src/ai_employee/application/calendar_event_aad.py` — the only versioned CalendarEvent field-AAD
@@ -2302,11 +2307,14 @@ git commit -m "feat: add calendar change proposals"
   and post-mutation verification.
 - Create: `backend/src/ai_employee/infrastructure/db/database_grants.py` — revision/phase-exact schema, table,
   column, and sequence grant inventories; catalog snapshots; pre-migration drift verifier; current-step grant-delta
-  application; and final exact verification. It is not a general repair entrypoint for pre-existing drift.
+  application; final exact verification; the complete 0019 retention table/column/sequence matrix; and closed,
+  migration-owned 0016–0018 resume descriptors. It is not a general repair entrypoint for pre-existing drift.
 - Create: `backend/tests/unit/infrastructure/db/test_database_access.py` — exact ACL tuple, safe-role, membership,
   candidate, and transition planning tests independent of PostgreSQL process state.
 - Create: `backend/tests/unit/infrastructure/db/test_database_grants.py` — revision/phase inventory, new-object and
   explicit-policy delta, pre-existing drift rejection, grantor/grant-option, and no-unrelated-repair tests.
+- Create: `backend/tests/integration/db/test_database_grants_catalog.py` — PostgreSQL 17 schema/table/column/sequence
+  ACL reader, grantor, default ACL, complete retention matrix, and exact negative-permission coverage.
 - Create: `backend/src/ai_employee/infrastructure/db/database_maintenance.py` — orchestration only: exact
   signed-system-ID conversion and target-lock vectors, management/target/schema locks, three database-wide restore
   facts and admission, and calls into `database_access.py`/`database_grants.py`. ACL, runtime-role, membership, and
@@ -2334,7 +2342,8 @@ git commit -m "feat: add calendar change proposals"
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_execution.py` — require an unexpired same-owner lease at renew and every running-task state write.
 - Modify: `backend/tests/integration/db/test_migrations.py` — 0019 data, constraint, cursor, required access/refresh
   credential, audit-safe error-code, forward-only migration, schema-lifecycle lock, exact pre-step object grants,
-  per-step grant delta/callback ordering, full rollback, and maintenance-gate regressions.
+  per-step grant delta/callback ordering, 0019 full rollback, 0016–0018 exact autocommit resume evidence, and
+  maintenance-gate regressions.
 - Create: `backend/tests/integration/operations/test_database_maintenance_gate.py` — fixed low/high-bit target digest plus
   management/target lock vectors, database-wide custom-setting/new-session visibility, malformed/role-override
   rejection, lifecycle ordering, reset/drop/create zero-call behavior, and owner-entry zero-write coverage reused by
@@ -2369,6 +2378,10 @@ git commit -m "feat: add calendar change proposals"
 - Modify: `backend/tests/unit/workers/test_execution_lease.py` — runner renewal-clock and rejected CAS contract regressions.
 - Modify: `backend/tests/unit/security/test_encryption.py` — public read-only key-version accessor and real
   `AeadCipher` key-version tamper rejection before AES-GCM.
+- Modify: `backend/tests/integration/retention/test_role_permissions.py` — exercise the full 0019 retention matrix
+  with the real login and prove every unlisted table/column/sequence/schema privilege is denied.
+- Modify: `backend/tests/unit/test_init_db_roles_script.py` — require a Secret-safe thin lifecycle wrapper with no
+  embedded grant SQL or broad table/sequence authorization.
 
 All provider behavior in this task uses Fake readers, synthetic encrypted values, or checked-in contract fixtures. Do not configure or access a real Google or Microsoft account, and do not add approval, `ToolExecution`, or provider-write behavior from Task 18 or later.
 
@@ -2643,7 +2656,22 @@ TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0
 
 Expected: PASS with independent freshness observation, fixed query count, minimal projections, no transaction during pure computation, correct large-event results, expected-version CAS, validated confirmation partitions, and operation-specific readiness.
 
-- [ ] **Step 9: Write failing framed-AAD, bootstrap-access, per-step grant, and 0019 tests**
+Steps 9–32 are six closed database-trust TDD loops and must execute strictly in this order:
+
+~~~text
+1. framed AAD
+2. database ACL/runtime roles
+3. object-grant reader + retention matrix
+4. role-bootstrap/migration/reset lifecycle
+5. 0019 migration + before_mutation/before_commit guard
+6. transactional-step/autocommit-resume integration
+~~~
+
+For each loop, write only that loop's RED tests, run and read the expected failure, add the minimum GREEN, and run
+the same focused command to PASS before creating the next loop's tests. The Task 16A implementer must not batch all
+six RED suites together or let a later implementation make an earlier unobserved test pass accidentally.
+
+- [ ] **Step 9: Cycle 1 RED — write only the framed-AAD and encrypted CalendarEvent boundary tests**
 
 Start with `backend/tests/unit/application/test_calendar_event_aad.py`; this is the first RED test in the step. Keep
 all expected values independent from production code. Define the 39-byte domain, complete expected bytes, complete
@@ -2698,172 +2726,29 @@ Parameterize failures for missing/empty IDs, non-string opaque IDs, uppercase/br
 invalid Unicode surrogate input, calendar IDs over the existing 512-scalar boundary, event IDs over the existing
 255-scalar boundary, unknown/case-changed fields, and a monkeypatched raw value whose byte length exceeds uint32.
 Every failure must raise `CalendarEventFieldAadFormatError` with one stable content-free message before any cipher
-call. Add AST/import-spy tests proving `SyncCalendarUseCase` and the precise CalendarEvent repository reader both
-import and call `calendar_event_field_aad_v2`; neither may contain the domain literal, a local frame encoder, an
-ASCII-only provider-ID encoder, a delimiter join, Unicode normalization, or a legacy AAD fallback.
+call. Keep this RED limited to the pure helper and single-key cipher boundary; writer/reader integration and AAD
+version persistence are introduced only with the 0019 migration in Cycle 5.
 
-Create `backend/tests/unit/infrastructure/db/test_database_access.py` and freeze the canonical database ACL query
-as this exact SQL, including `COALESCE` and `acldefault`:
+Do not add database ACL, object-grant, role-bootstrap, migration, or resume tests in this step. Cycle 1 must reach an
+observed RED and focused GREEN before Cycle 2 begins.
 
-~~~sql
-SELECT acl.grantee, acl.grantor, acl.privilege_type, acl.is_grantable
-FROM pg_database AS db
-CROSS JOIN LATERAL aclexplode(
-    COALESCE(db.datacl, acldefault('d', db.datdba))
-) AS acl
-WHERE db.oid = :target_database_oid
-~~~
+- [ ] **Step 10: Run Cycle 1 and observe the framed-AAD RED**
 
-With `O=owner`, `P=0`, `A=app`, and `R=retention`, assert exact sorted multisets for all four profiles:
-
-~~~text
-fresh_default =
-  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
-  (P,O,CONNECT,false) (P,O,TEMPORARY,false)
-
-pre_protocol_legacy = fresh_default +
-  (A,O,CONNECT,false) (R,O,CONNECT,false)
-
-baseline =
-  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
-  (A,O,CONNECT,false) (R,O,CONNECT,false)
-
-active =
-  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
-~~~
-
-All tuples, including owner tuples on PostgreSQL 17, must report `is_grantable=false`; implicit owner grant ability
-must never be normalized to `true`. Parameterize every extra/missing/duplicate tuple, unknown privilege/grantee,
-wrong grantor, any grant option, `PUBLIC CREATE`, app/retention `CREATE|TEMPORARY`, and an extra CONNECT grantee.
-Freeze both runtime roles as `LOGIN=true`, `INHERIT=true`, `SUPERUSER/CREATEDB/CREATEROLE/REPLICATION/BYPASSRLS=false`,
-`CONNLIMIT=-1`, `VALID UNTIL NULL`, `rolconfig NULL`, and zero `pg_auth_members` rows in either direction. Flip each
-attribute independently and add inbound/outbound membership cases.
-
-Candidate tests must accept only: `fresh_default` with both roles absent, `fresh_default` with both roles safe, or
-`pre_protocol_legacy` with both roles safe. A mixed/missing/unsafe role shape, any restore fact, active non-owner
-session, or object-grant drift rejects before `CREATE/ALTER ROLE`, password rotation, ACL/grant, DDL/DML, authority,
-or AuditEvent writes. Candidate is transient and accepted only for `ROLE_BOOTSTRAP` and
-`DB_RESET_POST_CREATE`; direct migration/restore admission is zero-write. Baseline and active are steady postures,
-not candidates. A successful candidate transition re-reads exact baseline ACL, safe roles, no membership, three
-restore facts absent, and the full baseline object-grant inventory in the same owner transaction; injected SQL or
-final-verification failure rolls back the complete role/password/ACL/object-grant change.
-
-Create `backend/tests/unit/infrastructure/db/test_database_grants.py`. Freeze revision- and phase-specific inventories
-for every schema, table, column, and sequence, with exact grantee, grantor, privilege, and `is_grantable=false`.
-Assert that `verify_pre_migration_object_grants()` rejects any missing, extra, duplicate, wrong-grantor, or
-grant-option tuple before the first migration DDL. For one-step synthetic upgrades, prove
-`apply_migration_grant_delta()` touches only objects created by that step or privileges named in that step's explicit
-policy delta; it must not repair pre-existing drift, unrelated old objects, unsafe roles, database ACL, or restore
-facts. Cover new table plus sequence, new column policy, explicit grant/revoke policy change, object removal, an
-unexpected object, and source/destination revision mismatch.
-
-Extend `backend/tests/integration/db/test_migrations.py` and
-`backend/tests/integration/operations/test_database_maintenance_gate.py` with real PostgreSQL coverage:
-
-- derive target bytes exactly as
-  `b"ai_employee.restore_target.v1\0" + unsigned_decimal_system_identifier_ascii + b"\0" + exact_database_name_utf8`
-  with no trailing NUL. Freeze system ID `72623859790382856`, database `ai_employee_restore_test`, digest
-  `71f328c1e8eb5d9cd2f8e1f815afac4b723f94a274900853c895fd9d72e60e49`, lifecycle key
-  `-9116408252019116299`, and target key `5971001870339114140`; independently freeze SQL `-1` → uint64
-  `18446744073709551615` and digest
-  `ad341314fd966ed68cfc480a025a162a7c8832ad16be408e627925b1d910637b`. Reject invalid signed-int64 input,
-  zero/>uint64, non-canonical decimal, empty/>63-byte/NUL/non-UTF-8 database names, normalization/case-folding, and
-  unverified absent-target names;
-- retain management→target→`SCHEMA_LIFECYCLE_LOCK=(20260806, 143)` order and
-  prove every online entry rejects held locks or malformed/active authority before any DDL/DML/version/grant write;
-- inspect real PostgreSQL 17 `aclexplode` output for all four exact ACL profiles and owner
-  `is_grantable=false`; exercise fresh roles absent/safe, legacy roles safe, every unsafe/mixed role and both
-  membership directions, with zero-write negative assertions;
-- prove first install and protected reset execute
-  `check → drop/create when applicable → candidate-to-baseline role-bootstrap → ordinary migration`; a direct
-  migration on either candidate performs zero DDL/DML/AuditEvent/authority writes;
-- before `context.run_migrations()`, inject missing or extra object grants at the current revision and prove the
-  pre-step verifier fails before the first revision operation and does not repair the drift;
-- for every applied revision step, record this strict order on the same outer connection and transaction:
-  revision operation plus Alembic version-row mutation → current-step catalog diff → exact grant delta → complete
-  destination inventory verification →, only for destination `20260809_0019`, Calendar guard `before_commit` as
-  the final fallible callback;
-- inject failure in grant SQL, destination verification, and the final 0019 guard. Each case must roll back the
-  step's DDL/DML, Alembic version row, and grant delta together. Non-0019 steps still apply/verify grants per step;
-  a fresh upgrade to head succeeds without a second owner session or a post-migration repair pass;
-- assert the `on_version_apply` callback accepts only keyword arguments `ctx`, `step`, `heads`, and `run_args`,
-  validates `step.is_upgrade`, `step.is_stamp`, `source_revision_ids`, `destination_revision_ids`, and
-  `up_revision_id`, and refuses stamp/downgrade/branch-shape mismatch before altering grants;
-- prove fresh and revision-0018 strict-empty databases use the built-in affected-set zero-bootstrap through ordinary
-  `upgrade head`; revision 0018 with any complete historical field triple and no injected guard fails before the
-  first 0019 DDL/DML. A typed Fake receives exactly `before_mutation` and `before_commit` on one transaction;
-  wrong/missing guard, phase, object identity, stamp, downgrade, or other revision fails closed. The final guard must
-  see destination grants verified and the 0019 version row visible inside the still-open transaction; rejecting it
-  leaves revision 0018 and every row/grant unchanged;
-- at revision 0018 seed two connections sharing one `calendar_id`, only one affected by a complete description
-  triple; a second affected event with complete description and location; exact cursors for both same-ID pairs and
-  an unrelated calendar; connected owning connections; enabled `calendar.read`; both access and refresh credential
-  rows; exact `ProviderCalendar` ownership; and a populated `directory` cursor. Assert 0019 preserves every event
-  identity, timestamp, non-AAD field, ciphertext, nonce, and key version; writes v1 only for complete historical
-  triples; leaves all-null groups NULL; clears cursor/`last_success_at` and writes only
-  `calendar_event_resync_required` for the exact affected non-directory pair; and leaves the same-ID other
-  connection, unrelated cursor, and all directory facts byte-for-byte unchanged;
-- parameterize partial field triples, missing exact cursor, disconnected connection, disabled/revoked capability,
-  missing access credential, missing refresh credential/access-only, missing exact ProviderCalendar, and any
-  constructible cross-user inconsistency. Every case fails before DDL/DML, remains at 0018, preserves all rows and
-  bytes, and creates no guessed marker. After success, assert independent all-null/all-non-null version constraints
-  with versions only 1 or 2 and a forward-only downgrade that performs no DDL/DML.
-
-Exercise Compose/E2E/tooling entrypoints. `role-bootstrap` must become healthy before migration starts; migration
-uses only the typed `migrate` CLI and contains no `; init-db-roles.sh` suffix or other post-migration grant repair.
-`scripts/init-db-roles.sh` must contain no SQL and forward only Secret-safe arguments to the typed
-`role-bootstrap` subcommand. `just db-reset` retains its non-production/exact-target/full-name confirmation but uses
-one live management lease through drop/create/bootstrap/migrate, with no direct `dropdb`/`createdb` recipe body or
-public skip flag. Keep the obsolete-0019 rejection: there is no repair, stamp, downgrade, or revision-rewrite recipe.
-
-In Google/Microsoft sync and precise reader tests, compute AAD only by importing
-`calendar_event_field_aad_v2(...)`, using the same exact user, connection, calendar, provider event, and field values
-as the writer. Assert provider IDs may contain non-ASCII UTF-8, two calendars with one provider event ID remain
-isolated, A/B delimiter collisions cannot swap ciphertext, old v1 and old colon-concatenated bytes cannot decrypt,
-and no reader fallback is attempted. Retain the real `AeadCipher.key_version` tamper test and the narrow
-`EncryptionKeyVersionError | EncryptionBoundaryError | InvalidTag | UnicodeDecodeError` mapping to the content-free
-`calendar_event_resync_required` error.
-
-- [ ] **Step 10: Run the framed-AAD/bootstrap/grant/0019 RED tests**
-
-First prove the one allowed Task 13 PostgreSQL container and database are ready:
-
-~~~bash
-docker inspect --format '{{.Name}} {{.State.Running}}' m2-task13-pg
-docker exec m2-task13-pg pg_isready -U ai_employee_test -d ai_employee_task13_test
-~~~
-
-Expected: `/m2-task13-pg true` and `accepting connections`.
-
-Then run:
+Run:
 
 ~~~bash
 TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
 uv run --project backend pytest \
   backend/tests/unit/application/test_calendar_event_aad.py \
-  backend/tests/unit/infrastructure/db/test_database_access.py \
-  backend/tests/unit/infrastructure/db/test_database_grants.py \
-  backend/tests/integration/db/test_migrations.py \
-  backend/tests/integration/operations/test_database_maintenance_gate.py \
-  backend/tests/integration/google/test_calendar_sync.py \
-  backend/tests/integration/microsoft/test_calendar_sync.py \
-  backend/tests/integration/m2/test_calendar_proposal_versions.py \
   backend/tests/unit/security/test_encryption.py -q
-bash scripts/test-run-e2e-backend.sh
-bash scripts/test-tooling.sh
-bash scripts/test-deployment.sh
 ~~~
 
-Expected: FAIL because the shared framed-AAD helper and static-vector contract do not exist; ACL/bootstrap logic is
-still duplicated in shell SQL and does not distinguish candidate from baseline; exact role/membership and
-PostgreSQL 17 grant-option checks are absent; migrations neither reject pre-existing object-grant drift nor apply
-new-object grants per step atomically; Compose still performs a post-migration role script; and revision 0019 plus
-its typed mutation/final guard, exact-pair cursor invalidation, key-version check, and fail-closed reader are absent.
+Expected: FAIL because `calendar_event_field_aad_v2` and its stable format error do not exist and the public
+single-key `key_version`/pre-AES-GCM mismatch boundary is missing.
 
-- [ ] **Step 11: Implement the framed AAD, canonical access/grants, and forward-only 0019 boundary**
+- [ ] **Step 11: Implement the minimum framed-AAD and encrypted-field boundary**
 
-Create `backend/src/ai_employee/application/calendar_event_aad.py` as the only CalendarEvent field-AAD encoder.
-Expose only the stable content-free `CalendarEventFieldAadFormatError` and use this complete implementation shape:
+Create `backend/src/ai_employee/application/calendar_event_aad.py` as the only CalendarEvent field-AAD encoder:
 
 ~~~python
 from typing import Literal, NoReturn
@@ -2905,10 +2790,9 @@ def _opaque_bytes(value: str, *, maximum_scalars: int) -> bytes:
 
 def _frame(raw: bytes) -> bytes:
     try:
-        prefix = len(raw).to_bytes(4, "big")
+        return len(raw).to_bytes(4, "big") + raw
     except OverflowError:
         _fail()
-    return prefix + raw
 
 
 def calendar_event_field_aad_v2(
@@ -2932,40 +2816,81 @@ def calendar_event_field_aad_v2(
     return _DOMAIN_V2 + b"".join(_frame(raw) for raw in raw_values)
 ~~~
 
-The implementation must validate `str(UUID(value)) == value` for both UUID fields, validate the existing non-empty
-512/255 scalar limits for the two opaque IDs, encode those IDs once with strict UTF-8 without normalization, accept
-only the two literal ASCII fields, and frame every raw value as `len(raw).to_bytes(4, "big") + raw` after the exact
-39-byte domain. Reject a surrogate or uint32 overflow before AEAD and never include input content in the exception.
-Do not expose a delimiter encoder, v1 helper, normalization option, or fallback.
+Update `AeadCipher` and its port with a read-only `key_version` property. Before AES-GCM decrypt, compare the
+persisted version exactly and raise `EncryptionKeyVersionError` on mismatch; keep malformed encrypted-value
+boundaries in `EncryptionBoundaryError`. Do not switch persisted CalendarEvent writers/readers in this cycle.
 
-Create `application/ports/calendar_aad_migration_guard.py` with the closed phase and protocol names consumed by
-the revision, environment, and Task 27C:
+- [ ] **Step 12: Re-run Cycle 1 GREEN before adding any ACL test**
 
-~~~python
-CalendarAadMigrationPhase = Literal["before_mutation", "before_commit"]
+Run the exact command from Step 10.
 
+Expected: PASS with the three independent bytes/base64/SHA vectors, A/B delimiter separation, Unicode
+no-normalization, canonical UUID/limit failures before cipher access, and key-version rejection before AES-GCM.
 
-@runtime_checkable
-class CalendarAadMigrationGuard(Protocol):
-    """在同一 Alembic transaction 上验证 0019 的两个冻结边界。"""
+- [ ] **Step 13: Cycle 2 RED — write only the database ACL and runtime-role posture tests**
 
-    def verify(
-        self,
-        *,
-        connection: Connection,
-        phase: CalendarAadMigrationPhase,
-    ) -> None:
-        """拒绝不满足 zero-bootstrap 或 artifact-bound rollout 的迁移。"""
+Create `backend/tests/unit/infrastructure/db/test_database_access.py` and freeze the canonical database ACL query
+as this exact SQL, including `COALESCE` and `acldefault`:
+
+~~~sql
+SELECT acl.grantee, acl.grantor, acl.privilege_type, acl.is_grantable
+FROM pg_database AS db
+CROSS JOIN LATERAL aclexplode(
+    COALESCE(db.datacl, acldefault('d', db.datdba))
+) AS acl
+WHERE db.oid = :target_database_oid
 ~~~
 
-The single resolver reads only `Config.attributes["calendar_aad_0019_guard"]`, runtime-checks this protocol, and
-returns either that exact instance or the built-in strict-empty affected-set guard. It must not accept truthy
-objects, environment allow flags, another phase spelling, or a different guard identity between calls. Revision
-0019 calls `.verify(..., phase="before_mutation")`; the final per-step callback calls the same instance with
-`phase="before_commit"`.
+With `O=owner`, `P=0`, `A=app`, and `R=retention`, assert exact sorted multisets for all four profiles:
 
-Create `backend/src/ai_employee/infrastructure/db/database_access.py` and keep all database ACL, runtime-role,
-membership, candidate, and baseline↔active transition logic here. Freeze these public types:
+~~~text
+fresh_default =
+  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
+  (P,O,CONNECT,false) (P,O,TEMPORARY,false)
+
+pre_protocol_legacy = fresh_default +
+  (A,O,CONNECT,false) (R,O,CONNECT,false)
+
+baseline =
+  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
+  (A,O,CONNECT,false) (R,O,CONNECT,false)
+
+active =
+  (O,O,CREATE,false) (O,O,CONNECT,false) (O,O,TEMPORARY,false)
+~~~
+
+All tuples, including owner tuples on PostgreSQL 17, must report `is_grantable=false`; implicit owner grant ability
+must never be normalized to `true`. Parameterize every extra/missing/duplicate tuple, unknown privilege/grantee,
+wrong grantor, any grant option, `PUBLIC CREATE`, app/retention `CREATE|TEMPORARY`, and an extra CONNECT grantee.
+Freeze both runtime roles as `LOGIN=true`, `INHERIT=true`, `SUPERUSER/CREATEDB/CREATEROLE/REPLICATION/BYPASSRLS=false`,
+`CONNLIMIT=-1`, `VALID UNTIL NULL`, `rolconfig NULL`, and zero `pg_auth_members` rows in either direction. Flip each
+attribute independently and add inbound/outbound membership cases.
+
+Candidate tests must accept only: `fresh_default` with both roles absent, `fresh_default` with both roles safe, or
+`pre_protocol_legacy` with both roles safe. A mixed/missing/unsafe role shape, any restore fact, active non-owner
+session, or a caller-supplied `object_grants_match=false` rejects before producing a mutation plan. Candidate is
+transient and accepted only for `ROLE_BOOTSTRAP` and `DB_RESET_POST_CREATE`; direct migration/restore admission is
+zero-write. Baseline and active are steady postures, not candidates. Actual password/ACL/object-grant mutation and
+same-transaction re-verification belong to Cycle 4, after the Cycle 3 object inventory exists.
+
+- [ ] **Step 14: Run Cycle 2 and observe the ACL/runtime-role RED**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/unit/infrastructure/db/test_database_access.py \
+  backend/tests/integration/operations/test_database_maintenance_gate.py -k "database_acl or runtime_role or bootstrap_candidate" -q
+~~~
+
+Expected: FAIL because there is no shared PostgreSQL 17 ACL reader, owner tuples are not frozen as
+`is_grantable=false`, runtime-role attributes/membership are not read as one posture, and candidate versus steady
+admission is still duplicated or implicit.
+
+- [ ] **Step 15: Implement the minimum canonical database access reader**
+
+Create `backend/src/ai_employee/infrastructure/db/database_access.py` and freeze these public types:
 
 ~~~python
 class DatabaseAclProfile(StrEnum):
@@ -2975,17 +2900,17 @@ class DatabaseAclProfile(StrEnum):
     ACTIVE = "active"
 
 
+class BootstrapCaller(StrEnum):
+    ROLE_BOOTSTRAP = "role_bootstrap"
+    DB_RESET_POST_CREATE = "db_reset_post_create"
+
+
 @dataclass(frozen=True, order=True, slots=True)
 class DatabaseAclTuple:
     grantee_oid: int
     grantor_oid: int
     privilege_type: str
     is_grantable: bool
-
-
-class BootstrapCaller(StrEnum):
-    ROLE_BOOTSTRAP = "role_bootstrap"
-    DB_RESET_POST_CREATE = "db_reset_post_create"
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -3031,16 +2956,106 @@ class BootstrapCandidate:
     snapshot: DatabaseAccessSnapshot
 ~~~
 
-Use the exact canonical SQL from Step 9 and compare the complete sorted multiset. Implement closed candidate
-classification, exact steady-profile verification, `bootstrap_candidate_to_baseline`,
-`transition_baseline_to_active`, and `transition_active_to_baseline` as narrow operations; do not add a generic
-repair function. A bootstrap transaction may create both missing roles or rotate passwords on two already-safe
-roles, revoke all PUBLIC database privileges, grant only owner/non-grantable app+retention CONNECT, and invoke the
-phase-specific object-grant helper. It may not repair an unsafe/mixed role, membership, wrong grantor, extra grant,
-object drift, or restore fact. Re-read every invariant before commit.
+The reader must execute the exact `aclexplode(COALESCE(datacl, acldefault('d', datdba)))` query from Step 13,
+compare the complete sorted multiset, and resolve app/retention role OIDs by exact names. Implement safe-role and
+zero-membership validation plus closed `BootstrapCaller`/`BootstrapCandidate` classification. Keep mutation
+planning narrow: `bootstrap_candidate_to_baseline`, `transition_baseline_to_active`, and
+`transition_active_to_baseline`; do not expose a generic repair API. A mutation plan may create both missing roles
+or rotate passwords on two already-safe roles, revoke PUBLIC database privileges, and grant only owner/non-grantable
+CONNECT. It must refuse unsafe/mixed roles, membership, wrong grantor, any extra ACL tuple, restore facts, active
+non-owner sessions, or object-grant drift before producing SQL.
 
-Create `backend/src/ai_employee/infrastructure/db/database_grants.py` as the independent object-grant contract.
-Freeze complete dataclass fields and never represent an unfinished type with an ellipsis:
+- [ ] **Step 16: Re-run Cycle 2 GREEN before writing object-grant tests**
+
+Run the exact command from Step 14.
+
+Expected: PASS for all four exact ACL profiles, PostgreSQL 17 owner `is_grantable=false`, every role-attribute and
+membership negative, the three allowed candidate shapes, and zero-write rejection for every non-candidate posture.
+
+- [ ] **Step 17: Cycle 3 RED — write the canonical object-grant reader and exact retention policy tests**
+
+Create `backend/tests/unit/infrastructure/db/test_database_grants.py`. Freeze revision- and phase-specific inventories
+for every schema, table, column, and sequence, with exact grantee, grantor, privilege, and `is_grantable=false`.
+Assert that `verify_pre_migration_object_grants()` rejects any missing, extra, duplicate, wrong-grantor, or
+grant-option tuple before the first migration DDL. For one-step synthetic upgrades, prove
+`apply_migration_grant_delta()` touches only objects created by that step or privileges named in that step's explicit
+policy delta; it must not repair pre-existing drift, unrelated old objects, unsafe roles, database ACL, or restore
+facts. Cover new table plus sequence, new column policy, explicit grant/revoke policy change, object removal, an
+unexpected object, and source/destination revision mismatch.
+
+Add `backend/tests/integration/db/test_database_grants_catalog.py` against PostgreSQL 17. The canonical reader must
+compare the complete sorted multiset
+`(object_kind, schema_name, object_name, column_name|null, grantee, grantor, privilege_type, is_grantable)` and use:
+
+~~~text
+schema   COALESCE(nspacl, acldefault('n', nspowner))
+table    COALESCE(relacl, acldefault('r', relowner))
+sequence COALESCE(relacl, acldefault('s', relowner))
+column   COALESCE(attacl, acldefault('c', relowner))
+~~~
+
+Each source is expanded with `aclexplode`. Column defaults are empty; table grants must never be expanded into
+column tuples. Assert `public` schema owner/grantor is the PostgreSQL 17 catalog role `pg_database_owner`, relation
+grantor is the actual owner, and owner tuples remain `is_grantable=false`. Reject effective-permission APIs,
+information_schema privilege views, role-inheritance expansion, duplicate/extra/missing tuples, wrong grantors,
+unknown privileges, and any grant option. Freeze the first-install transition explicitly: pre-run `base` may have no
+`alembic_version`; once Alembic creates its exact table automatically, the first step's catalog diff classifies that
+one shape as migration-owned and every destination inventory includes its complete ACL.
+
+Freeze the destination-0019 retention matrix exactly; no omitted table permission or UPDATE column may be inferred:
+
+~~~text
+connection_capabilities  SELECT, DELETE
+provider_calendars       SELECT, DELETE
+mail_drafts              SELECT, DELETE; UPDATE(status, updated_at)
+mail_draft_versions      SELECT, DELETE; UPDATE(body_ciphertext, body_nonce, body_key_version)
+calendar_change_proposals SELECT, DELETE; UPDATE(status, updated_at)
+calendar_change_snapshots SELECT, DELETE; UPDATE(content_ciphertext, content_nonce, content_key_version)
+oauth_attempts           SELECT, DELETE
+oauth_connections        SELECT, DELETE
+sync_cursors             SELECT, DELETE; UPDATE(cursor, last_success_at, last_attempt_at, last_error_code)
+email_messages           SELECT, DELETE; UPDATE(body_ciphertext, body_nonce, body_key_version, updated_at)
+calendar_events          SELECT, DELETE; UPDATE(
+  description_ciphertext, description_nonce, description_key_version, description_aad_version,
+  location_ciphertext, location_nonce, location_key_version, location_aad_version, updated_at)
+approval_requests        SELECT, DELETE; UPDATE(status, payload_ciphertext, payload_nonce, payload_key_version)
+tool_executions          SELECT, DELETE; UPDATE(status, error_code)
+task_runs                SELECT, DELETE; UPDATE(
+  status, error_code, scheduled_for, retry_recovery_at, approval_checkpoint_recovery_at,
+  lease_owner, lease_expires_at, finished_at, updated_at)
+users                    SELECT; no DELETE; UPDATE(
+  email, display_name, password_hash, is_active, timezone, locale, brief_time,
+  email_body_retention_days, source_metadata_retention_days, workspace_history_retention_days,
+  default_mail_connection_id, default_calendar_connection_id, default_calendar_id,
+  working_hours, meeting_buffer_minutes, updated_at)
+audit_events             SELECT, INSERT, DELETE; no UPDATE
+~~~
+
+The existing M1 delete tables `messages`, `conversations`, `daily_brief_items`, `daily_briefs`, `llm_invocations`,
+`task_steps`, `outbox_events`, `user_sessions`, `email_analyses`, `email_threads`, and `encrypted_credentials`
+remain `SELECT, DELETE` only. Retention receives schema `USAGE` only and sequence `USAGE` only on
+`audit_events_id_seq`; tests must reject `USAGE ON ALL SEQUENCES`, sequence `SELECT/UPDATE`, schema `CREATE`, table
+`TRUNCATE/REFERENCES/TRIGGER/MAINTAIN`, any grant option, and users DELETE. Revisions through 0018 keep their exact
+pre-0019 inventory and must not be pre-repaired to this matrix.
+
+- [ ] **Step 18: Run Cycle 3 and observe the object-grant/retention-policy RED**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/unit/infrastructure/db/test_database_grants.py \
+  backend/tests/integration/db/test_database_grants_catalog.py -q
+~~~
+
+Expected: FAIL because no canonical schema/table/sequence/column ACL reader exists, revision inventories do not
+include `alembic_version`, the 0019 retention matrix is not frozen, and there is no explicit source→destination
+policy delta or sequence-narrowing contract.
+
+- [ ] **Step 19: Implement the minimum canonical object-grant reader and frozen inventories**
+
+Create `backend/src/ai_employee/infrastructure/db/database_grants.py` with these stable types:
 
 ~~~python
 class GrantPhase(StrEnum):
@@ -3053,14 +3068,6 @@ class ObjectKind(StrEnum):
     TABLE = "table"
     COLUMN = "column"
     SEQUENCE = "sequence"
-
-
-@dataclass(frozen=True, order=True, slots=True)
-class CatalogObject:
-    object_kind: ObjectKind
-    schema_name: str
-    object_name: str
-    column_name: str | None
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -3079,7 +3086,6 @@ class ObjectGrantTuple:
 class CatalogObjectSnapshot:
     revision: str
     phase: GrantPhase
-    objects: tuple[CatalogObject, ...]
     grants: tuple[ObjectGrantTuple, ...]
 
 
@@ -3088,54 +3094,252 @@ class MigrationGrantDelta:
     source_revision: str
     destination_revision: str
     phase: GrantPhase
-    added_objects: tuple[CatalogObject, ...]
-    removed_objects: tuple[CatalogObject, ...]
     grants_to_revoke: tuple[ObjectGrantTuple, ...]
     grants_to_apply: tuple[ObjectGrantTuple, ...]
-    post_step_objects: tuple[CatalogObject, ...]
-
-
-@dataclass(slots=True)
-class MigrationGrantGuard:
-    connection: Connection
-    phase: GrantPhase
-    current_revision: str
-    before: CatalogObjectSnapshot
-    calendar_aad_guard: CalendarAadMigrationGuard
 ~~~
 
-Implement the exact APIs
-`verify_pre_migration_object_grants(connection, *, current_revision, phase) -> CatalogObjectSnapshot`,
-`apply_migration_grant_delta(connection, *, source_revision, destination_revision, phase, before) -> MigrationGrantDelta`,
-and `verify_object_grants(connection, *, revision, phase) -> None`. The module owns frozen inventories for every
-supported Alembic revision and restore phase, including schemas, tables, columns, and sequences. The pre-verifier
-must compare actual state before any DDL and never repair drift. Delta application may touch only the current
-step's newly created objects or an explicitly frozen source→destination policy delta; final verification compares
-the complete destination inventory. No CLI or script may expose this module as a general repair entrypoint.
+Implement `read_object_grants()`, `verify_pre_migration_object_grants()`,
+`apply_migration_grant_delta()`, and `verify_object_grants()` from one revision/phase inventory registry. SQL must
+be explicit per schema/table/column/sequence; never emit `ALL TABLES`, `ALL SEQUENCES`, `SECURITY DEFINER`, a grant
+option, or a generic repair command. The 0018→0019 delta applies exactly the matrix from Step 17, revokes retention
+sequence USAGE from every sequence except `audit_events_id_seq`, and leaves the application role policy unchanged
+except for grants required on objects created by that revision. A source-inventory mismatch raises before mutation;
+destination verification compares the whole multiset after delta application and returns the new
+`CatalogObjectSnapshot` for the callback chain.
 
-Keep `backend/src/ai_employee/infrastructure/db/database_maintenance.py` as orchestration only: exact target identity
-and lock vectors, management/target/schema locks, three restore catalog facts/admission, and calls into
-`database_access.py`/`database_grants.py`. It must not duplicate ACL SQL, role attributes, membership parsing, or
-object-grant inventories. Extend `backend/src/ai_employee/cli/database_maintenance.py` as the only
-`role-bootstrap | migrate | db-reset` lifecycle CLI. Its live in-process management lease is non-serializable and
-cannot be supplied by environment or file.
+- [ ] **Step 20: Re-run Cycle 3 GREEN before touching lifecycle entrypoints**
 
-In `backend/migrations/env.py`, after management/target admission and the exclusive schema lock but before
-`context.run_migrations()`, normalize the no-version state to the frozen `base` inventory token and call
-`verify_pre_migration_object_grants(..., phase=GrantPhase.BASELINE)`. Store the returned snapshot, current revision,
-same outer connection, and the already resolved Calendar guard in one typed `MigrationGrantGuard`. Configure one
-`on_version_apply` callback with keyword-only `ctx`, `step`, `heads`, and `run_args`. For each exact single-head
-upgrade step, after its operation and version-row mutation:
+Run the exact command from Step 18.
 
-1. verify callback connection, upgrade/stamp flags, source/destination IDs, and current snapshot chain;
-2. call `apply_migration_grant_delta()` for only that step;
-3. call `verify_object_grants()` for the complete destination revision and refresh the snapshot;
-4. if and only if the destination is `20260809_0019`, invoke the same Calendar guard's `before_commit` as the last
-   fallible callback for that step.
+Expected: PASS for the four raw catalog readers, exact grantor/owner semantics, complete revision inventories,
+explicit 0018→0019 retention delta, sequence narrowing, the exact first-install `alembic_version` transition, and
+every drift/no-repair negative.
 
-Any exception remains inside the same outer migration transaction and rolls back DDL/DML, the Alembic version row,
-and grants. Non-0019 steps use the same grant delta/verification path without invoking the Calendar guard. Do not
-run a second owner session or a post-upgrade grant repair.
+- [ ] **Step 21: Cycle 4 RED — write role-bootstrap, migration-entry, and protected-reset lifecycle tests**
+
+Extend `backend/tests/integration/db/test_migrations.py` and
+`backend/tests/integration/operations/test_database_maintenance_gate.py` with real PostgreSQL coverage:
+
+- derive target bytes exactly as
+  `b"ai_employee.restore_target.v1\0" + unsigned_decimal_system_identifier_ascii + b"\0" + exact_database_name_utf8`
+  with no trailing NUL. Freeze system ID `72623859790382856`, database `ai_employee_restore_test`, digest
+  `71f328c1e8eb5d9cd2f8e1f815afac4b723f94a274900853c895fd9d72e60e49`, lifecycle key
+  `-9116408252019116299`, and target key `5971001870339114140`; independently freeze SQL `-1` → uint64
+  `18446744073709551615` and digest
+  `ad341314fd966ed68cfc480a025a162a7c8832ad16be408e627925b1d910637b`. Reject invalid signed-int64 input,
+  zero/>uint64, non-canonical decimal, empty/>63-byte/NUL/non-UTF-8 database names, normalization/case-folding, and
+  unverified absent-target names;
+- retain management→target→`SCHEMA_LIFECYCLE_LOCK=(20260806, 143)` order and
+  prove every online entry rejects held locks or malformed/active authority before any DDL/DML/version/grant write;
+- inspect real PostgreSQL 17 `aclexplode` output for all four exact ACL profiles and owner
+  `is_grantable=false`; exercise fresh roles absent/safe, legacy roles safe, every unsafe/mixed role and both
+  membership directions, with zero-write negative assertions;
+- prove first install and protected reset execute
+  `check → drop/create when applicable → candidate-to-baseline role-bootstrap → ordinary migration`; a direct
+  migration on either candidate performs zero DDL/DML/AuditEvent/authority writes;
+
+Extend `backend/tests/integration/retention/test_role_permissions.py` and
+`backend/tests/unit/test_init_db_roles_script.py` so the production entrypoint is revision-aware rather than merely
+checking SQL text. In Cycle 4 the database remains at 0018: the retention login must match the frozen ≤0018
+inventory, and every 0019-only table/column/sequence privilege must still be denied with SQLSTATE `42501`. The
+script test requires a thin lifecycle wrapper with no broad grant SQL. Runtime proof of the destination-0019 matrix
+is added only after the 0019 RED test in Cycle 5; role-bootstrap must never grant it early.
+
+Exercise Compose/E2E/tooling entrypoints. `role-bootstrap` must become healthy before migration starts; migration
+uses only the typed `migrate` CLI and contains no `; init-db-roles.sh` suffix or other post-migration grant repair.
+`scripts/init-db-roles.sh` must contain no SQL and forward only Secret-safe arguments to the typed
+`role-bootstrap` subcommand. `just db-reset` retains its non-production/exact-target/full-name confirmation but uses
+one live management lease through drop/create/bootstrap/migrate, with no direct `dropdb`/`createdb` recipe body or
+public skip flag. Keep the obsolete-0019 rejection: there is no repair, stamp, downgrade, or revision-rewrite recipe.
+
+- [ ] **Step 22: Run Cycle 4 and observe the lifecycle RED**
+
+First verify the one authorized Task 13 PostgreSQL target:
+
+~~~bash
+docker inspect --format '{{.Name}} {{.State.Running}}' m2-task13-pg
+docker exec m2-task13-pg pg_isready -U ai_employee_test -d ai_employee_task13_test
+~~~
+
+Expected: `/m2-task13-pg true` and `accepting connections`.
+
+Then run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/integration/operations/test_database_maintenance_gate.py \
+  backend/tests/integration/retention/test_role_permissions.py \
+  backend/tests/unit/test_init_db_roles_script.py -q
+bash scripts/test-run-e2e-backend.sh
+bash scripts/test-tooling.sh
+bash scripts/test-deployment.sh
+~~~
+
+Expected: FAIL because lifecycle admission/locks and ACL mutations are still duplicated in shell/Compose recipes,
+the role script uses broad grants and a second owner session, migration can still be reached from a candidate, and
+reset still lacks one live management lease across check→drop→create→bootstrap→migrate.
+
+- [ ] **Step 23: Implement the minimum shared role-bootstrap/migrate/reset lifecycle**
+
+Create `backend/src/ai_employee/infrastructure/db/database_maintenance.py` as orchestration only. It owns the frozen
+target bytes/digests, management lifecycle lease, target maintenance lock, fixed
+`SCHEMA_LIFECYCLE_LOCK=(20260806, 143)`, direct reads of the three database-wide restore facts, and calls into
+`database_access.py`/`database_grants.py`; it must not duplicate their SQL or inventories.
+
+Create `backend/src/ai_employee/cli/database_maintenance.py` as the only
+`role-bootstrap | migrate | db-reset` lifecycle CLI. `role-bootstrap` recognizes only the two approved candidate
+callers, runs one owner transaction to create both absent safe roles or rotate both safe-role passwords, applies the
+exact revision/phase grants, re-reads every invariant, and commits only on exact baseline. `migrate` accepts only
+`pristine_idle`/`completed_idle`, never a candidate. `db-reset` holds one in-process management lease across exact
+target confirmation, authority check, drop, create, post-create bootstrap, and ordinary migration; it refuses
+active/`needs_attention` authority and never accepts an environment/file skip token.
+
+Keep the orchestration shape explicit:
+
+~~~python
+def bootstrap_candidate_to_baseline(context: DatabaseMaintenanceContext) -> None:
+    with context.acquire_management_lifecycle_lock() as management:
+        with management.acquire_target_lock() as target:
+            target.assert_restore_facts_absent()
+            candidate = target.read_bootstrap_candidate()
+            with target.acquire_schema_lifecycle_lock():
+                with target.owner_transaction() as transaction:
+                    transaction.apply_safe_runtime_roles(candidate)
+                    transaction.apply_database_acl(DatabaseAclProfile.BASELINE)
+                    transaction.apply_object_grants(revision=target.revision, phase=GrantPhase.BASELINE)
+                    transaction.verify_pristine_idle_before_commit()
+
+
+def reset_then_migrate(context: DatabaseMaintenanceContext) -> None:
+    with context.acquire_management_lifecycle_lock() as management:
+        management.confirm_exact_non_production_target()
+        management.assert_reset_allowed()
+        management.drop_and_create_target()
+        management.bootstrap_new_target()
+        management.run_typed_migration()
+~~~
+
+These are orchestration calls, not a second ACL/grant implementation; each called reader/mutator lives in the
+focused modules from Cycles 2–3.
+
+Turn `scripts/init-db-roles.sh` into a Secret-file-safe thin CLI wrapper with no SQL. Update `compose.yaml` so
+role-bootstrap completes before typed migration and remove the post-migration script suffix. Route `just db-upgrade`,
+`just db-reset`, integration/E2E bootstrap, and Compose migration through the shared wrapper. Keep app/retention
+passwords in Secret files and never place them in argv, environment diagnostics, logs, or audit metadata.
+
+- [ ] **Step 24: Re-run Cycle 4 GREEN before adding any 0019 migration test**
+
+Run the exact readiness and test commands from Step 22.
+
+Expected: PASS with management→target→schema ordering, exact candidate→baseline transition, direct-candidate
+migration zero writes, one-session protected reset, exact 0018 retention inventory with every 0019-only privilege
+still denied, no duplicated shell SQL, no post-migration repair, and no obsolete-0019 repair/stamp/downgrade path.
+
+- [ ] **Step 25: Cycle 5 RED — write only the 0019 migration and dual-stage guard tests**
+
+In `backend/tests/integration/db/test_migrations.py`, add the following focused 0019 cases and no lifecycle-resume
+case yet:
+
+- prove fresh and revision-0018 strict-empty databases use the built-in affected-set zero-bootstrap through ordinary
+  `upgrade head`; revision 0018 with any complete historical field triple and no injected guard fails before the
+  first 0019 DDL/DML. A typed Fake receives exactly `before_mutation` and `before_commit` on one transaction;
+  wrong/missing guard, phase, object identity, stamp, downgrade, or other revision fails closed. The final guard must
+  see destination grants verified and the 0019 version row visible inside the still-open transaction; rejecting it
+  leaves revision 0018 and every row/grant unchanged;
+- at revision 0018 seed two connections sharing one `calendar_id`, only one affected by a complete description
+  triple; a second affected event with complete description and location; exact cursors for both same-ID pairs and
+  an unrelated calendar; connected owning connections; enabled `calendar.read`; both access and refresh credential
+  rows; exact `ProviderCalendar` ownership; and a populated `directory` cursor. Assert 0019 preserves every event
+  identity, timestamp, non-AAD field, ciphertext, nonce, and key version; writes v1 only for complete historical
+  triples; leaves all-null groups NULL; clears cursor/`last_success_at` and writes only
+  `calendar_event_resync_required` for the exact affected non-directory pair; and leaves the same-ID other
+  connection, unrelated cursor, and all directory facts byte-for-byte unchanged;
+- parameterize partial field triples, missing exact cursor, disconnected connection, disabled/revoked capability,
+  missing access credential, missing refresh credential/access-only, missing exact ProviderCalendar, and any
+  constructible cross-user inconsistency. Every case fails before DDL/DML, remains at 0018, preserves all rows and
+  bytes, and creates no guessed marker. After success, assert independent all-null/all-non-null version constraints
+  with versions only 1 or 2 and a forward-only downgrade that performs no DDL/DML.
+
+Now add the destination runtime cases to `backend/tests/integration/retention/test_role_permissions.py`. After a
+real 0018→0019 migration, the retention login must exercise every Step 17 table permission and allowed UPDATE
+column, then prove every omitted column/privilege, users DELETE/reactivation, audit UPDATE, schema CREATE, broad
+sequence privilege, sequence SELECT/UPDATE, and grant option is denied. Also prove the only sequence USAGE is
+`audit_events_id_seq` and app still cannot UPDATE/DELETE audit rows.
+
+Add Google/Microsoft sync and precise-reader integration cases now that the schema change is in scope. Both writers
+and the reader must import `calendar_event_field_aad_v2` and pass the exact user, connection, calendar, provider
+event, and field. Assert non-ASCII opaque IDs, same provider event ID in two calendars, delimiter-collision swap,
+v1/unknown version, colon-concatenated bytes, tampered ciphertext/nonce/key/AAD version, and wrong key version all
+fail closed without a second decrypt. Only `InvalidTag`, `EncryptionKeyVersionError`, `EncryptionBoundaryError`, and
+`UnicodeDecodeError` map to `calendar_event_resync_required`; broad exceptions propagate.
+
+- [ ] **Step 26: Run Cycle 5 and observe the 0019/dual-guard RED**
+
+First prove the one allowed Task 13 PostgreSQL container and database are ready:
+
+~~~bash
+docker inspect --format '{{.Name}} {{.State.Running}}' m2-task13-pg
+docker exec m2-task13-pg pg_isready -U ai_employee_test -d ai_employee_task13_test
+~~~
+
+Expected: `/m2-task13-pg true` and `accepting connections`.
+
+Then run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/integration/db/test_migrations.py \
+  backend/tests/integration/retention/test_role_permissions.py \
+  backend/tests/integration/google/test_calendar_sync.py \
+  backend/tests/integration/microsoft/test_calendar_sync.py \
+  backend/tests/integration/m2/test_calendar_proposal_versions.py -q
+~~~
+
+Expected: FAIL because revision `20260809_0019`, the typed `before_mutation | before_commit` guard, independent AAD
+version columns/constraints, exact local recoverability preflight, and exact-pair cursor invalidation do not exist.
+
+- [ ] **Step 27: Implement the minimum forward-only 0019 revision and dual-stage guard**
+
+Create `backend/src/ai_employee/application/ports/calendar_aad_migration_guard.py` with the closed phase and protocol names consumed by
+the revision, environment, and Task 27C:
+
+~~~python
+CalendarAadMigrationPhase = Literal["before_mutation", "before_commit"]
+
+
+@runtime_checkable
+class CalendarAadMigrationGuard(Protocol):
+    """在同一 Alembic transaction 上验证 0019 的两个冻结边界。"""
+
+    def verify(
+        self,
+        *,
+        connection: Connection,
+        phase: CalendarAadMigrationPhase,
+    ) -> None:
+        """拒绝不满足 zero-bootstrap 或 artifact-bound rollout 的迁移。"""
+~~~
+
+The single resolver reads only `Config.attributes["calendar_aad_0019_guard"]`, runtime-checks this protocol, and
+returns either that exact instance or the built-in strict-empty affected-set guard. It must not accept truthy
+objects, environment allow flags, another phase spelling, or a different guard identity between calls. Revision
+0019 calls `.verify(..., phase="before_mutation")`; the final per-step callback calls the same instance with
+`phase="before_commit"`.
+
+In `backend/migrations/env.py`, resolve one exact Calendar guard instance before `context.run_migrations()` and keep
+it bound to the same outer connection. Add one `on_version_apply` callback with keyword-only `ctx`, `step`, `heads`,
+and `run_args`. For the focused 0018→0019 step it must validate the connection, single-head upgrade shape,
+source/destination IDs, and non-stamp/non-downgrade state; after the revision operation and Alembic version-row
+mutation it applies the already frozen 0018→0019 grant delta, verifies the complete 0019 inventory, then calls that
+same guard with `phase="before_commit"` as the final fallible callback. The revision itself calls the same instance
+with `phase="before_mutation"` before its first DDL/DML. Do not resolve a second object or accept an environment
+waiver. Generalized multi-step/autocommit resume handling is deliberately left for Cycle 6.
+
+0019 uses no autocommit or concurrent index. Guard, DDL/DML, version-row, policy delta, destination verification,
+and final guard all stay in one outer transaction; an injected failure at any point must restore revision 0018,
+every row, constraint, cursor, and grant exactly.
 
 Create `backend/migrations/versions/20260809_0019_calendar_event_field_aad_v2.py` with
 `revision = "20260809_0019"` and `down_revision = "20260809_0018"`. Resolve the exact
@@ -3147,21 +3351,149 @@ constraints, marks only complete historical triples as v1, and invalidates only 
 resolver, or fallback in the revision. Task 27C injects the artifact-backed guard but must not edit this revision,
 `env.py`, the AAD helper, or grant guard.
 
-Change both Calendar writers and the precise reader to import `calendar_event_field_aad_v2`. Pass canonical UUID
-text plus the exact opaque IDs and field; keep provider IDs UTF-8, not ASCII. The reader retains the independent
-four-column policy and maps only `InvalidTag`, `EncryptionKeyVersionError`, `EncryptionBoundaryError`, and
-`UnicodeDecodeError` to `calendar_event_resync_required`; it must not catch broad exceptions or make a second
-decrypt attempt. Keep the public read-only `AeadCipher.key_version` contract and compare persisted key version before
-AES-GCM.
+Add the two AAD version columns and independent four-column ORM constraints to `models/sources.py`. Change both
+Calendar writers and the precise repository reader to import the Cycle 1 helper. New writes always persist v2;
+normal reads accept only all-null or complete v2 groups. v1/unknown versions return
+`calendar_event_resync_required` without attempting decrypt. Preserve strict UTF-8 opaque IDs and the narrow error
+mapping from the RED cases; never add a colon fallback or omit `calendar_id`.
 
-Change `scripts/init-db-roles.sh` into a Secret-file-safe thin wrapper over the typed `role-bootstrap` subcommand.
-Compose must run role-bootstrap first, then the typed migration service; remove the post-migration script suffix.
-The protected reset path holds one management lease across check→drop→create→bootstrap→ordinary migration. A
-candidate may never enter migration, restore, the 0019 zero-bootstrap branch, or catalog authority writes.
+- [ ] **Step 28: Re-run Cycle 5 GREEN before adding transactional/autocommit resume tests**
 
-- [ ] **Step 12: Run focused, adjacent, and full verification**
+Run the exact readiness and focused pytest command from Step 26.
 
-Repeat the exact container readiness checks from Step 10, then run the focused gate:
+Expected: PASS for strict-empty and injected typed guards, exactly one `before_mutation` plus one `before_commit` on
+the same transaction, exact local-recoverability rejection, independent four-column constraints, v1/NULL marking,
+exact `(connection_id, calendar_id)` non-directory cursor invalidation, complete 0018→0019 grant delta, and total
+0019 rollback on final-guard failure. The real retention login matches the complete destination matrix, while 0018
+evidence proves none of those privileges appeared before the migration.
+
+- [ ] **Step 29: Cycle 6 RED — write transactional-step and autocommit-resume integration tests**
+
+Extend `backend/tests/integration/db/test_migrations.py` with a table-driven revision lifecycle harness. Before
+`context.run_migrations()`, inject missing/extra grants and prove ordinary drift fails before the first revision
+operation with no repair. For every applied step record:
+
+~~~text
+revision operation + alembic_version row mutation
+→ canonical catalog diff
+→ exact source→destination grant/revoke delta
+→ complete destination inventory verification
+→ only for 0019, before_commit guard
+~~~
+
+The callback accepts only keyword arguments `ctx`, `step`, `heads`, and `run_args`, validates exact single-head
+upgrade metadata, and rejects stamp/downgrade/branch mismatch before grants. Add failure injection for grant SQL,
+destination verification, callback connection identity, and final 0019 guard.
+
+Separate the assertions by transaction class:
+
+- For fully transactional revisions, especially 0019, failure rolls back DDL/DML, version row, grants, and guard
+  effects together.
+- For 0016–0018, seed each documented crash point after its autocommit batch or exact concurrent-index operation.
+  Re-entry may accept only objects created by that exact migration, with fixed names, exact catalog shape, and no
+  extra ACL. Freeze the only admissible migration-owned DML evidence as follows: 0016 and 0017 may retain any
+  committed subset of the fixed bounded backfill whose sole row mutation is
+  `email_messages.connection_id: NULL → owning email_threads.connection_id`; the remaining source rows may still be
+  `NULL`, and 0018 owns no business-row DML. The harness records seeded row identities and non-owned column
+  fingerprints before failure injection so it can prove the migration changed no other column and inserted or
+  deleted no row. Wrong-shape same-name objects, extra grants, unexpected columns/constraints, or business-row state
+  that is unknown or violates that revision's frozen DML shape fail closed. Tests must assert the already committed
+  artifact or exact backfill subset remains visible and must never claim whole-step rollback.
+- First install starts from the exact all-absent `base` shape, admits only Alembic's exact automatically created
+  `alembic_version` table as the first migration-owned object, then includes its full ACL in every destination
+  inventory while advancing one step at a time without a second owner session or post-upgrade grant repair.
+
+- [ ] **Step 30: Run Cycle 6 and observe the transaction/resume RED**
+
+Run:
+
+~~~bash
+TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
+uv run --project backend pytest \
+  backend/tests/integration/db/test_migrations.py -k "object_grant_lifecycle or autocommit_resume or transactional_rollback or first_install_inventory" -q
+~~~
+
+Expected: FAIL because `env.py` does not yet carry an exact per-step snapshot chain across all revisions, ordinary
+drift and migration-owned resume candidates are not distinguished, and existing autocommit/concurrent-index steps
+cannot yet produce honest partial-persistence evidence while 0019 proves full rollback.
+
+- [ ] **Step 31: Implement per-step grant lifecycle and exact 0016–0018 resume admission**
+
+Generalize `backend/migrations/env.py` to normalize no-version as `base`, call
+`verify_pre_migration_object_grants()` before `context.run_migrations()`, and store the source snapshot, current
+revision, same outer connection, phase, and already resolved Calendar guard in one typed state object. After every
+exact upgrade step and version-row mutation, apply only that step's frozen delta, verify the full destination
+inventory, refresh the snapshot chain, and invoke the Calendar final guard only for 0019. No other step may call it.
+
+Add closed resume-candidate descriptors to `database_grants.py` for 0016, 0017, and 0018 only. Each descriptor
+enumerates the migration-owned nullable columns, fixed concurrent-index/constraint names and exact shapes, and
+requires zero unexpected ACL. It may admit continuation of that same revision but may not apply destination grants
+early, mutate business rows for repair, accept an unknown artifact, or become a CLI repair endpoint. Preserve the
+existing migration-local exact index/constraint validators; do not replace them with name-only checks.
+
+For 0016 and 0017, make the resume descriptor verify the current migration-owned projection without writing it:
+every non-NULL `email_messages.connection_id` must equal the joined owning `email_threads.connection_id`, every
+remaining NULL is pending work for the original fixed-batch migration, and missing threads, cross-user ownership,
+or a different non-NULL connection fail closed. `provider_updated_at` and every other business column are outside
+the resume DML shape and admission never changes them. Re-entry invokes only the original revision so its bounded
+`NULL → owning connection_id` batches finish the remaining rows. For 0018, the descriptor is catalog-only because
+that revision performs no business-row DML. The integration harness must compare its pre-failure row-identity and
+non-owned-column fingerprints after each admitted resume, proving that only the exact 0016/0017 projection changed
+and that 0018 left all business rows byte-for-byte unchanged.
+
+Use one typed state transition for every callback:
+
+~~~python
+@dataclass(slots=True)
+class MigrationGrantState:
+    connection: Connection
+    phase: GrantPhase
+    current_revision: str
+    snapshot: CatalogObjectSnapshot
+    calendar_guard: CalendarAadMigrationGuard
+
+
+def apply_completed_upgrade_step(
+    *,
+    state: MigrationGrantState,
+    source_revision: str,
+    destination_revision: str,
+) -> None:
+    apply_migration_grant_delta(
+        state.connection,
+        source_revision=source_revision,
+        destination_revision=destination_revision,
+        phase=state.phase,
+        before=state.snapshot,
+    )
+    state.snapshot = verify_object_grants(
+        state.connection,
+        revision=destination_revision,
+        phase=state.phase,
+    )
+    state.current_revision = destination_revision
+    if destination_revision == "20260809_0019":
+        state.calendar_guard.verify(connection=state.connection, phase="before_commit")
+~~~
+
+The real `on_version_apply` validates Alembic's step metadata before calling this function; no callback may mutate
+state or grants before that validation succeeds.
+
+Keep lifecycle truth explicit in results and logs: a transactional failure reports rolled back; an autocommit
+failure reports the exact durable candidate and old Alembic revision. Neither path may log database credentials,
+row values, addresses, event content, or provider identifiers.
+
+- [ ] **Step 32: Re-run Cycle 6 GREEN**
+
+Run the exact command from Step 30.
+
+Expected: PASS with source-inventory preflight, complete per-step delta/verification order, 0019 full rollback,
+0016–0018 exact resume-only admission, wrong-shape/extra-ACL rejection, the explicit base→`alembic_version`
+first-step transition, and no generalized repair path.
+
+- [ ] **Step 33: Run focused, adjacent, and full verification**
+
+Repeat the exact container readiness checks from Step 22, then run the focused gate:
 
 ~~~bash
 TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test \
@@ -3169,8 +3501,11 @@ uv run --project backend pytest \
   backend/tests/unit/application/test_calendar_event_aad.py \
   backend/tests/unit/infrastructure/db/test_database_access.py \
   backend/tests/unit/infrastructure/db/test_database_grants.py \
+  backend/tests/integration/db/test_database_grants_catalog.py \
   backend/tests/integration/db/test_migrations.py \
   backend/tests/integration/operations/test_database_maintenance_gate.py \
+  backend/tests/integration/retention/test_role_permissions.py \
+  backend/tests/unit/test_init_db_roles_script.py \
   backend/tests/integration/google/test_calendar_sync.py \
   backend/tests/integration/microsoft/test_calendar_sync.py \
   backend/tests/integration/m2/test_calendar_proposal_versions.py \
@@ -3183,10 +3518,11 @@ bash scripts/test-deployment.sh
 Expected: PASS with all three independent AAD vectors, Unicode/no-normalization behavior, shared writer/reader
 helper identity, four exact PostgreSQL ACL profiles, owner `is_grantable=false`, safe roles and zero membership,
 candidate zero-write rejection, first-install/reset role-bootstrap-before-migrate ordering, pre-step object-drift
-failure, per-step new-object/policy grant delta, destination inventory verification, and full rollback when grant or
-final 0019 guard fails. Compose has no post-migration role script; no command uses a second owner session or repairs
-pre-existing grant drift. Preserve all existing 0019 local-recoverability, exact-pair, key-version, and no-fallback
-assertions.
+failure, the exact retention table/column/sequence matrix, per-step new-object/policy grant delta, destination
+inventory verification, full rollback for transactional 0019 failure, and honest exact-resume evidence for
+0016–0018 autocommit/concurrent-index failures. Compose has no post-migration role script; no command uses a second
+owner session or repairs pre-existing grant drift. Preserve all existing 0019 local-recoverability, exact-pair,
+key-version, and no-fallback assertions.
 
 Run adjacent calendar/worker tests:
 
@@ -3217,7 +3553,7 @@ authorization repair. These checks prove implementation readiness only; they do 
 production 0019 rollout or restore. Task 27C must treat revision 0019, `env.py`, the framed helper, and grant guard as
 immutable dependencies.
 
-- [ ] **Step 13: Commit**
+- [ ] **Step 34: Commit**
 
 ~~~bash
 git add compose.yaml backend/migrations/env.py \
@@ -3242,8 +3578,11 @@ git add compose.yaml backend/migrations/env.py \
   backend/tests/unit/application/test_calendar_event_aad.py \
   backend/tests/unit/infrastructure/db/test_database_access.py \
   backend/tests/unit/infrastructure/db/test_database_grants.py \
+  backend/tests/integration/db/test_database_grants_catalog.py \
   backend/tests/integration/conftest.py backend/tests/integration/db/test_migrations.py \
   backend/tests/integration/operations/test_database_maintenance_gate.py \
+  backend/tests/integration/retention/test_role_permissions.py \
+  backend/tests/unit/test_init_db_roles_script.py \
   backend/tests/integration/google/test_calendar_sync.py \
   backend/tests/integration/microsoft/test_calendar_sync.py \
   backend/tests/unit/application/test_calendar_proposals.py \
@@ -5288,10 +5627,39 @@ migration branches, or restore services.
 **Files:**
 - Modify: `backend/src/ai_employee/workers/retention.py`
 - Modify: `backend/src/ai_employee/workers/privacy.py`
-- Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
+- Modify: `backend/src/ai_employee/application/use_cases/privacy.py` — freeze the content-free
+  `privacy.deletion_started` / `privacy_deletion_started.v1` authority projection and one strict parser shared by barrier creation, TaskRun
+  acquisition, stale-task recovery, retention protection, and finalization.
+- Modify: `backend/src/ai_employee/application/use_cases/task_execution.py` — add the typed normal versus exact
+  inactive-all-data-recovery lease mode and its fresh bounded recovery-attempt budget without changing ordinary
+  Runner semantics.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_execution.py` — make TaskRun lease acquisition
+  lock and recheck the owning user's active state, while admitting only the same expired pre-barrier
+  `privacy.delete_all_data` RUNNING task with the unique exact winner authority as the closed recovery exception and
+  protecting only that winner's acquire/renew and generic terminal/retry writes after the barrier.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_retry_recovery.py` — preserve the M1 active-user
+  recovery behavior, leave inactive ordinary/non-winner tasks untouched, and re-enqueue only an expired RUNNING
+  deletion winner without changing it to QUEUED; apply `limit` only after actionable-candidate/current-bucket
+  prefiltering so zero-change rows cannot starve a winner.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/trusted_actions.py` — enforce the same active-user
+  barrier in ToolExecution claim, a read-only request-preparation check, and the committed provider request-start
+  transition.
+- Modify: `backend/src/ai_employee/application/use_cases/trusted_actions.py` — preserve the inactive-user outcome
+  across claim/request preparation/request-start orchestration without weakening pre-request command validation.
+- Modify: `backend/src/ai_employee/workers/trusted_actions.py` — keep the sequence active precheck → decrypt/validate
+  → committed request-start recheck → adapter call, and treat either inactive rejection as zero-provider-call.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
+- Create: `backend/tests/unit/application/test_privacy.py` — independently table-test the exact one-row authority
+  parser, including all zero/many/outer-binding/schema/request/extra-key negatives.
+- Modify: `backend/tests/integration/workers/test_retry_recovery.py` — freeze strict winner-authority admission,
+  RUNNING preservation, concurrent bucket deduplication, Redis-loss re-enqueue, Outbox replay, and acquisition-ACK-
+  loss recovery plus `> limit` zero-change-prefix starvation regression while retaining the active-user M1 matrix.
+- Modify: `backend/tests/unit/workers/test_execution_lease.py` — freeze the typed recovery lease mode, fresh bounded
+  attempt budget, and protected renew/terminal/retry behavior while keeping unrelated task kinds unchanged.
+- Modify: `backend/tests/integration/m2/test_tool_execution_claim.py` — race the inactive barrier against
+  ToolExecution claim and request-start, including a claim committed before the barrier.
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py`
 - Modify: `docs/operations.md` — extend, without replacing, Task 27D's manifest/restore sections with the final
   retention/privacy/operator integration.
@@ -5314,7 +5682,8 @@ Add documentation checks for the current-expiry effective deadline, four-entry a
 Task-16A/Task-27C migration boundary, framed AAD vectors, canonical ACL SQL, all four exact ACL tuple multisets,
 PostgreSQL 17 owner `is_grantable=false`, safe app/retention attributes and bidirectional zero-membership, the only
 fresh/legacy candidate shapes, role-bootstrap-before-migration/Compose-without-post-repair order, pre-step grant-
-inventory rejection, per-step new-object/policy grant delta and 0019-last-callback rollback, Task 27D schema/backup
+inventory rejection, per-step new-object/policy grant delta, transactional 0019-last-callback rollback, exact
+0016–0018 autocommit/concurrent-index resume evidence, Task 27D schema/backup
 locks plus manifest-bound publication, production management/target lifecycle locks, three catalog facts,
 `.env.example`/state-v4, DB-zero-write local already-applied evidence, psql backend registration plus deferred-guard
 pg_restore stream rollback/ordinal generic restore, active-attempt completion RESET, completed-call retention/zero-
@@ -5325,6 +5694,130 @@ obsolete-0019 non-production
 reset/production-stop disposition, and explicit release audit gate. This
 closeout may integrate those operator-facing facts but must not re-own their tooling implementation.
 
+In `test_all_data_deletion.py`, race the independent `users.is_active=true → false` CAS against
+`SqlAlchemyTaskExecutionStore.acquire()`. A barrier committed first must make every ordinary task acquisition return
+without `task.running`, a lease, or provider work. If an ordinary trusted-action TaskRun lease commits first but no
+ToolExecution exists, the later barrier wins before ToolExecution claim and privacy invalidates that unclaimed
+action with zero provider calls; it does not fabricate a reconcile result.
+
+The barrier winner must append exactly one `privacy.deletion_started` AuditEvent in the same true→false CAS
+transaction. Assert its outer `task_id` and `user_id`, `actor_type="system"`, `actor_id is None`, and exact metadata:
+
+~~~python
+assert started.event_metadata == {
+    "schema_version": "privacy_deletion_started.v1",
+    "request_id": REQUEST_ID,
+}
+~~~
+
+Race two different `privacy.delete_all_data` TaskRuns that both reached RUNNING with independent live leases and
+different request IDs before either barrier transaction. Exactly one CAS may win and create the sole authority; the
+loser creates no authority, receives no inactive recovery lease, performs no deletion/reconcile/provider call, and is
+eventually removed by the winner's child-to-parent deletion batches. The strict parser must load the complete
+per-user set of `privacy.deletion_started` rows before checking expected values; it must not prefilter by expected
+task/request and accidentally hide a conflicting row. Parameterize zero rows, multiple rows, NULL/wrong outer task,
+wrong outer user, missing/extra/wrong-schema metadata, empty/wrong request ID, and an authority bound to the other
+RUNNING deletion task as fail-closed cases. Ordinary 365-day retention must preserve every unconsumed started row,
+including malformed or conflicting sets, so cleanup can never manufacture a winner.
+
+In `test_privacy.py`, construct `PrivacyDeletionStartedFact` values directly and table-test the shared parser. One
+exact fact returns the frozen authority value; empty/multiple sequences, empty expected request, wrong event type,
+NULL/wrong task, wrong user, missing/extra/wrong-schema metadata, and non-string/empty/wrong request values all return
+`None` without coercion or exception-driven winner selection.
+
+Add the one closed acquisition exception. Start the exact deletion TaskRun normally, let its Worker lock that TaskRun
+then the user and atomically commit the inactive CAS plus exact winner authority, inject a crash after each phase
+boundary, expire its lease, and assert the same `task_id/user_id/deletion_request_id` is reacquired with
+`TaskLeaseMode.INACTIVE_ALL_DATA_RECOVERY`. Parameterize CREATED, QUEUED, RETRY_SCHEDULED, WAITING_APPROVAL, a live
+RUNNING lease, wrong task kind, different user, missing/extra/malformed deletion-request payload, a TaskRun that never
+started, any ToolExecution, and every missing/malformed/multiple/mismatched authority case as zero-claim negatives.
+Prove the exception cannot create a new task or authority, change the request ID, decrypt a trusted command, call a
+mail/calendar writer, or reactivate the user.
+
+Exercise `SqlAlchemyTaskExecutionStore.renew()` after the barrier with Task 16A's exact
+`task_id/lease_owner/renewed_at/lease_expires_at` signature and time-valid predicates. An active ordinary task keeps
+the Task 16A behavior. For an inactive user, the initial/recovery deletion winner with one exact authority may renew
+only while the persisted owner and old lease are still valid at `renewed_at`; an ordinary task, the CAS loser, wrong
+owner, expired lease, or zero/malformed/multiple/mismatched authority must return `False` and leave the deadline
+unchanged. This denial must make the Runner stop at the next node boundary without a later provider call.
+
+Inject crashes after the inactive CAS, after unclaimed-action invalidation, after the bounded read-only reconcile,
+after a connection credential-delete commit, after its best-effort revoke attempt, after the child-to-parent batches,
+and inside the final transaction after deleting the current task graph but before anonymization/audit insertion.
+Every pre-final retry must retain and reacquire the same deletion TaskRun; the injected final-transaction failure must
+roll back task deletion and user changes together. A successful final commit must atomically remove that last task
+graph, preserve one inactive anonymous user, and append one completion audit; ACK-loss replay then sees no TaskRun and
+does not create a second audit.
+
+Also inject a generic task-total timeout, step timeout, `DomainError`, unknown exception, and acquisition-ACK loss
+after the inactive CAS. None may write FAILED, CANCELLED, SUCCEEDED, RETRY_SCHEDULED, clear the recovery identity, or
+prevent a later expired-lease takeover. A recovery lease receives a fresh bounded attempt budget while retaining the
+original `started_at` as audit history; ordinary task kinds must keep the existing lifetime budget behavior.
+
+In `test_retry_recovery.py`, retain the complete active-user M1 matrix, then add inactive-user branches. An inactive
+ordinary task and a RUNNING deletion task without the sole exact authority must remain byte-for-byte in their prior
+task state and create no audit or Outbox. An expired RUNNING deletion winner must remain RUNNING with its expired
+lease owner/expiry history unchanged, create no `task.queued` audit, and atomically append only this content-free
+Outbox payload and key:
+
+~~~python
+assert recovery.payload == {"task_id": str(TASK_ID)}
+assert recovery.deduplication_key == (
+    f"task.execute:{TASK_ID}:inactive-deletion-recovery:{BUCKET_START.isoformat()}"
+)
+~~~
+
+Two concurrent scanners and repeated scans in the same five-minute UTC bucket must create one row through a
+conflict-safe deduplication insert. After that row is published, simulate Redis loss without acquisition and prove a
+later bucket may create one new row; replaying either Outbox remains identifier-only and never mutates the TaskRun.
+Once acquisition commits a fresh lease, scanning creates nothing until that lease expires. Simulate queue/acquisition
+ACK loss before and after the inactive barrier, expire the committed lease, and prove PostgreSQL re-enqueues the
+correct active task under M1 semantics or the exact inactive winner under the closed exception, never a loser.
+
+Freeze the scan-limit fairness invariant with deterministic ordered UUIDs. Seed more than `limit` inactive ordinary
+tasks, deletion non-winners/malformed-authority tasks, and exact winners that already have the current bucket's
+published deduplication key before a later exact winner. Call `recover_due(limit=LIMIT)` and prove those zero-change
+rows do not consume actionable slots: the later winner receives its Outbox without requiring mutation of the skipped
+rows. Repeat with enough active M1 candidates to fill an earlier batch; because those candidates transition, later
+scans must eventually reach the winner rather than repeatedly selecting an unchanged prefix.
+
+In `test_tool_execution_claim.py`, run the same two-order race for the
+TaskRun/ApprovalRequest/ToolExecution claim and separately seed an already claimed ToolExecution before the barrier.
+Its read-only request-preparation check must reject before command decryption. Also race the barrier between a
+successful preparation check and the committed request-start transition; the second locked recheck must reject
+without setting `request_started_at`, incrementing `write_attempt_count`, or calling the adapter. Assert that retries
+after the barrier remain zero-call and cannot reactivate the user.
+
+Seed every user setting away from its default before deletion, then assert the sole surviving row exactly has
+`password_hash is None`, `default_mail_connection_id is None`, `default_calendar_connection_id is None`,
+`default_calendar_id is None`, `timezone == "UTC"`, `locale == "zh-CN"`, `brief_time == time(8, 0)`, retention
+values `(30, 180, 365)`, `meeting_buffer_minutes == 10`, and this complete `working_hours` value:
+
+~~~python
+{
+    "monday": [["09:00", "18:00"]],
+    "tuesday": [["09:00", "18:00"]],
+    "wednesday": [["09:00", "18:00"]],
+    "thursday": [["09:00", "18:00"]],
+    "friday": [["09:00", "18:00"]],
+    "saturday": [],
+    "sunday": [],
+}
+~~~
+
+Assert `updated_at` advances and exactly one `privacy.deletion_completed` row remains across finalization races and
+retries. Its `task_id`, content columns, addresses, titles, provider IDs, and token-bearing fields are absent; freeze
+the exact content-free metadata assertion rather than only comparing its key set:
+
+~~~python
+assert completion.event_metadata == {
+    "operation": "all_data_deletion",
+    "request_id": REQUEST_ID,
+    "completed_at": NOW.isoformat(),
+    "trace_id": None,
+}
+~~~
+
 - [ ] **Step 2: Run the retention/privacy RED gate**
 
 ~~~bash
@@ -5332,11 +5825,18 @@ TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0
 uv run --project backend pytest \
   backend/tests/integration/retention/test_m2_action_retention.py \
   backend/tests/integration/privacy/test_source_cache_cleanup.py \
-  backend/tests/integration/privacy/test_all_data_deletion.py -q
+  backend/tests/integration/privacy/test_all_data_deletion.py \
+  backend/tests/unit/application/test_privacy.py \
+  backend/tests/integration/workers/test_outbox_dispatch.py \
+  backend/tests/integration/workers/test_retry_recovery.py \
+  backend/tests/integration/m2/test_tool_execution_claim.py \
+  backend/tests/unit/workers/test_execution_lease.py -q
 ~~~
 
 Expected: FAIL because M2 content groups, fence-aware cleanup, ordinary completion-audit retention/privacy deletion,
-deletion barrier, and the finalized operations/acceptance contract are incomplete.
+deletion barrier/winner authority, inactive renew admission, exact inactive deletion recovery, RUNNING-preserving
+PostgreSQL re-enqueue/final atomicity, scan-limit starvation prevention, and the finalized operations/acceptance
+contract are incomplete.
 
 - [ ] **Step 3: Implement lifecycle cleanup and freeze operator-facing contracts**
 
@@ -5347,6 +5847,149 @@ audits through catalog facts; restore completion authority remains in the databa
 GUC pair while AuditEvent follows ordinary user-scoped cleanup/privacy behavior. Do not move implementation back into
 this closeout task.
 
+Freeze one application-layer representation and parser for the deletion winner. Repositories project AuditEvent rows
+into this type; callers must pass the complete per-user started-event set, not a query already filtered to the
+expected task or request. The parser accepts exactly one row and performs no coercion or winner selection:
+
+~~~python
+PRIVACY_DELETION_STARTED_EVENT_TYPE = "privacy.deletion_started"
+PRIVACY_DELETION_STARTED_SCHEMA_VERSION = "privacy_deletion_started.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyDeletionStartedFact:
+    event_type: str
+    user_id: UUID
+    task_id: UUID | None
+    event_metadata: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyDeletionStartedAuthority:
+    user_id: UUID
+    task_id: UUID
+    request_id: str
+
+
+def parse_privacy_deletion_started_authority(
+    facts: Sequence[PrivacyDeletionStartedFact],
+    *,
+    expected_user_id: UUID,
+    expected_task_id: UUID,
+    expected_request_id: str,
+) -> PrivacyDeletionStartedAuthority | None:
+    if len(facts) != 1 or not expected_request_id:
+        return None
+    fact = facts[0]
+    expected_metadata: dict[str, JsonValue] = {
+        "schema_version": PRIVACY_DELETION_STARTED_SCHEMA_VERSION,
+        "request_id": expected_request_id,
+    }
+    if (
+        fact.event_type != PRIVACY_DELETION_STARTED_EVENT_TYPE
+        or fact.user_id != expected_user_id
+        or fact.task_id != expected_task_id
+        or fact.event_metadata != expected_metadata
+    ):
+        return None
+    return PrivacyDeletionStartedAuthority(
+        user_id=expected_user_id,
+        task_id=expected_task_id,
+        request_id=expected_request_id,
+    )
+~~~
+
+The initial TaskRun→user barrier transaction uses the same constants. Only a successful true→false CAS inserts the
+exact content-free event; a false CAS inserts nothing. Retention excludes every
+`PRIVACY_DELETION_STARTED_EVENT_TYPE` row from ordinary audit cutoff regardless of parser outcome. Only the final
+privacy transaction may consume these rows, after the strict parser succeeds.
+
+Implement the lease classification in the application boundary:
+
+~~~python
+class TaskLeaseMode(StrEnum):
+    NORMAL = "normal"
+    INACTIVE_ALL_DATA_RECOVERY = "inactive_all_data_recovery"
+
+
+@dataclass(frozen=True, slots=True)
+class LeasedTask:
+    # Existing fields remain unchanged.
+    lease_mode: TaskLeaseMode = TaskLeaseMode.NORMAL
+~~~
+
+TaskRun acquisition must lock the eligible TaskRun, then lock and recheck its owning user in the same transaction.
+For an active user, preserve the existing eligible states. For an inactive user, reject everything except a
+`privacy.delete_all_data` row already in RUNNING with non-NULL `started_at`, positive `attempt_count`, an expired
+non-NULL lease, no ToolExecution, `recover_waiting_approval=false`, and the exact one-key non-empty
+`{"deletion_request_id": request_id}` payload. While those rows remain locked, load and strictly parse the complete
+per-user started-authority set; only the exact winner receives `INACTIVE_ALL_DATA_RECOVERY` and may renew while
+deletion continues. CREATED/QUEUED/RETRY_SCHEDULED/WAITING_APPROVAL and a pre-CAS RUNNING loser can never enter the
+exception. The initial barrier transaction independently locks that current deletion TaskRun before the user,
+verifies the caller's task/owner/request binding and live lease, then performs the true→false CAS and exact authority
+insert atomically. A retry seeing false must prove it holds the typed recovery lease and the same strict authority
+before continuing.
+
+When `lease_mode` is `INACTIVE_ALL_DATA_RECOVERY`, `DurableTaskRunner` uses a fresh
+`task_timeout_seconds` budget for that acquisition while preserving the persisted original `started_at`; the normal
+mode keeps the existing lifetime budget calculation. Both modes retain the same step timeout and lease renewal
+requirements. Extend Task 16A's four-input `renew(task_id, lease_owner, renewed_at, lease_expires_at)` without
+weakening its strict old-lease/current-owner time predicates. Lock TaskRun then user; an active user follows Task 16A
+unchanged, while an inactive user may renew only when the complete started-authority set parses to that exact winner.
+An ordinary task, CAS loser, or missing/malformed/multiple/mismatched authority returns `False` without changing the
+lease. In `SqlAlchemyTaskExecutionStore`, `prepare_retry`, `schedule_retry`, `finish`, and `fail_internal` must apply
+the same locked user/task plus complete-authority classification: once this exact winner's user is inactive, they
+cannot requeue it or write SUCCEEDED/FAILED/CANCELLED/RETRY_SCHEDULED. They leave RUNNING and its lease history intact
+so expiry recovery can continue; only the privacy final transaction removes the task. Do not generalize this
+protection to another task kind, a CAS loser, or inactive-user status.
+
+Extend `SqlAlchemyTaskRetryRecoveryStore.recover_due()` under its existing short transaction and
+`FOR UPDATE SKIP LOCKED` boundary, but move user/authority classification into the SQL candidate predicate before
+`.limit(limit)`. Join the owning user and admit only this disjoint union:
+
+1. `users.is_active=true` plus the exact existing M1 RETRY_SCHEDULED/QUEUED/expired-RUNNING conditions and absence of
+   any unpublished `task.execute` Outbox.
+2. `users.is_active=false` plus an expired RUNNING `privacy.delete_all_data` row with non-NULL `started_at`, positive
+   `attempt_count`, exact one-key non-empty request payload, no ToolExecution, no unpublished `task.execute` Outbox,
+   no Outbox with the current
+   `task.execute:{task.id}:inactive-deletion-recovery:{_five_minute_bucket(now)}` key, exactly one per-user
+   `privacy.deletion_started` row, and that row's outer task/user plus exact metadata matching the candidate.
+
+Build the authority cardinality/exact-match SQL from the same event/schema constants as the application parser. It
+is only a no-starvation prefilter, never independent authority: after each TaskRun lock, lock its owning user using
+the barrier's TaskRun→user order, load the complete per-user authority set, and invoke the shared parser before any
+inactive insertion. Any post-lock mismatch fails closed. Because inactive ordinary/non-winner/malformed/current-
+bucket rows never enter the limited set, they remain unchanged without repeatedly occupying its prefix. Active users
+retain the exact M1 transition, `task.queued` audit, lease clearing, and Outbox behavior; those rows mutate out of the
+same candidate window, so a finite earlier active prefix cannot starve a later winner.
+
+For a parsed inactive winner, leave every TaskRun field unchanged and insert only a `task.execute` Outbox with
+`payload={"task_id": str(task.id)}` and the current-bucket key above. Use PostgreSQL
+`ON CONFLICT (deduplication_key) DO NOTHING` or an equivalent savepoint-safe conflict path so same-bucket concurrent
+scans return/count only an actually inserted row rather than rolling back unrelated candidates. A published row does
+not permanently suppress recovery: if Redis loses it and no lease acquisition occurs, a later bucket has a distinct
+key and may insert a new row. A committed acquisition moves the lease expiry forward and naturally suppresses scans
+until the new lease expires. Never convert this winner to QUEUED, clear its lease history, or append `task.queued`.
+
+ToolExecution claim must use the existing
+`TaskRun → ApprovalRequest → ToolExecution → action → version/snapshot` lock order and recheck active before creating
+the execution row. For an existing claim, first expose a locked, read-only active check that writes no request fact;
+the Worker invokes it before decrypting and validating the command. Immediately before adapter dispatch, the
+provider request-start transaction repeats the locked active check, then and only then sets `request_started_at`,
+increments `write_attempt_count`, and commits `executing`. This second check closes a barrier race after decryption
+without marking request-start on validation failure. The Worker treats either inactive outcome as zero-call and
+hands control back to privacy convergence; no boundary may set `users.is_active` to true.
+
+Pass the current deletion `task_id` and `lease_mode` into `PrivacyDeletionWorker.delete_all_data()`. All bounded
+task-graph batches exclude that TaskRun, its request/lease history, and every per-user started-authority row needed to
+detect malformed or conflicting recovery state; the same batches remove a pre-CAS loser and the rest of its task
+graph. The final transaction locks the surviving TaskRun then user, locks and strictly parses the complete authority
+set, revalidates the exact request binding and inactive state, explicitly deletes the winner authority and current
+task's remaining Audit/Outbox/dependent rows and TaskRun, writes every frozen anonymous default, and then inserts the
+sole completion audit. Do not commit between authority/task deletion, anonymization, and audit insertion. If that
+transaction rolls back, the recovery TaskRun and authority remain; if it commits but the queue ACK is lost, the
+existing `AllDataDeletionCompleted`/missing-task path returns without another completion event.
+
 - [ ] **Step 4: Verify and commit Task 27E**
 
 ~~~bash
@@ -5354,9 +5997,14 @@ TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0
 uv run --project backend pytest \
   backend/tests/integration/retention/test_m2_action_retention.py \
   backend/tests/integration/privacy/test_source_cache_cleanup.py \
-  backend/tests/integration/privacy/test_all_data_deletion.py -q
+  backend/tests/integration/privacy/test_all_data_deletion.py \
+  backend/tests/unit/application/test_privacy.py \
+  backend/tests/integration/workers/test_outbox_dispatch.py \
+  backend/tests/integration/workers/test_retry_recovery.py \
+  backend/tests/integration/m2/test_tool_execution_claim.py \
+  backend/tests/unit/workers/test_execution_lease.py -q
 git diff --check
-git add backend/src/ai_employee/workers/retention.py backend/src/ai_employee/workers/privacy.py backend/src/ai_employee/application/use_cases/privacy.py backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/integration/retention/test_m2_action_retention.py docs/operations.md docs/acceptance-checklist.md
+git add backend/src/ai_employee/workers/retention.py backend/src/ai_employee/workers/privacy.py backend/src/ai_employee/application/use_cases/privacy.py backend/src/ai_employee/application/use_cases/task_execution.py backend/src/ai_employee/infrastructure/db/repositories/task_execution.py backend/src/ai_employee/infrastructure/db/repositories/task_retry_recovery.py backend/src/ai_employee/infrastructure/db/repositories/trusted_actions.py backend/src/ai_employee/application/use_cases/trusted_actions.py backend/src/ai_employee/workers/trusted_actions.py backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/unit/application/test_privacy.py backend/tests/integration/workers/test_retry_recovery.py backend/tests/integration/m2/test_tool_execution_claim.py backend/tests/unit/workers/test_execution_lease.py backend/tests/integration/retention/test_m2_action_retention.py docs/operations.md docs/acceptance-checklist.md
 git commit -m "feat: protect m2 lifecycle data"
 ~~~
 
@@ -5369,7 +6017,21 @@ authoritative.
 **Cross-task file inventory (reference only):**
 - Modify: `backend/src/ai_employee/workers/retention.py` — atomically clear every CalendarEvent description/location four-column field group as well as existing M2 content groups, replace generic AuditEvent deletion with user-scoped fence-aware cleanup for unresolved 0019 refresh attempts, and keep `database.restore.completed` on the ordinary audit cutoff without a completion-GUC exemption.
 - Modify: `backend/src/ai_employee/workers/privacy.py`
-- Modify: `backend/src/ai_employee/application/use_cases/privacy.py`
+- Modify: `backend/src/ai_employee/application/use_cases/privacy.py` — shared exact projection/parser for the sole
+  content-free `privacy.deletion_started` winner authority with schema `privacy_deletion_started.v1`.
+- Modify: `backend/src/ai_employee/application/use_cases/task_execution.py` — typed normal versus inactive deletion
+  recovery lease mode and per-takeover bounded budget.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_execution.py` — ordinary TaskRun active-user
+  lock/recheck, one exact expired pre-barrier deletion-task winner-authority recovery candidate, and post-barrier
+  renew/terminal/retry guard while preserving Task 16A time-valid lease predicates.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/task_retry_recovery.py` — active-user M1 stale-task
+  recovery plus the exact inactive winner RUNNING-preserving, five-minute-bucket Outbox branch, with actionable
+  candidate/current-bucket prefiltering before `limit` so unchanged rows cannot starve a winner.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/trusted_actions.py` — ToolExecution claim,
+  read-only request preparation, and provider request-start active-user lock/recheck.
+- Modify: `backend/src/ai_employee/application/use_cases/trusted_actions.py` and
+  `backend/src/ai_employee/workers/trusted_actions.py` — active precheck → decrypt/validate → request-start recheck →
+  dispatch orchestration.
 - Create: `backend/src/ai_employee/application/ports/oauth_refresh.py` — provider-neutral automatic-refresh claim plus explicit-recovery connection lease, committed two-channel state machine, `calendar_aad_preflight | provider_refresh` automatic source union, zero-call unknown/retry contract, and new-session read-only `OAuthRefreshResultV1` reconciliation after commit ACK loss. The versioned result union maps automatic started to confirmed/replacement and recovery started to unsatisfied/replacement, validates each result's identity-change relationship before closure, and keeps append-only closure independent from current readiness.
 - Create: `backend/src/ai_employee/application/ports/credential_rotation.py` — typed connection-generation plus access/refresh physical snapshots and fixed identity version, versioned confirmed/unsatisfied/replacement result contracts with `refresh_identity_changed: bool`, and a separate current-readiness result including stable `oauth_credential_state_conflict`; confirmed enforces disposition/flag/identity-equality consistency, replacement enforces old != new plus changed=true, and unsatisfied has no credential post/expiry fields.
 - Modify: `backend/src/ai_employee/application/use_cases/connections.py` — extend connection-bound progressive authorization with the F/S/T unresolved-fence protocol; create `OAuthAttempt` plus `oauth.refresh_recovery_authorization_started` in the start transaction, keep the one-time code exchange outside the transaction, compare old/new refresh plaintext in controlled memory, reuse/extend `mark_progressive_authorization_failed` so safely known denial/missing/same/provider failures converge requested capabilities from `authorizing` to `action_required` at target `T` while stale `T` is a no-op, persist the matching unsatisfied result without closing the original fence, and atomically append replacement consumption only for a genuinely different non-empty token. A targetless callback that resolves to a fenced connection must fail before local credential/scope/capability persistence.
@@ -5412,6 +6074,10 @@ authoritative.
   27E documents and tests retention interaction without creating another parser or repair path.
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
+- Create: `backend/tests/unit/application/test_privacy.py`
+- Modify: `backend/tests/integration/workers/test_retry_recovery.py`
+- Modify: `backend/tests/integration/m2/test_tool_execution_claim.py`
+- Modify: `backend/tests/unit/workers/test_execution_lease.py`
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py` — M2 retention, CalendarEvent four-column atomic-clear regressions, and cross-cutoff/user-isolated 0019 refresh-fence cleanup races.
 - Create: `backend/tests/unit/application/test_calendar_aad_digests.py` — independent fixed canonical-byte/base64/SHA-256 vectors for all three v1 digest protocols; expected constants must not call production helpers.
 - Create: `backend/tests/unit/application/test_oauth_refresh_identity.py` — independent HKDF/HMAC implementation of the fixed synthetic vector, fixed APP root-key/version construction parity, same-plaintext re-encryption preserving identity/changed=false, changed=true A→B→A rollback, and missing/changed-key fail-closed cases.
@@ -5580,6 +6246,23 @@ async def test_all_data_deletion_reconciles_claimed_write_then_removes_local_pro
     assert await provider_resource_ids_for(USER_ID) == ()
 ~~~
 
+The same RED loop must freeze the sole winner authority and stale-recovery branch. Two deletion tasks with distinct
+request IDs may both be RUNNING before the barrier race, but only the true→false CAS winner writes the exact
+`privacy.deletion_started` fact with schema `privacy_deletion_started.v1`, and only that task can later receive
+`INACTIVE_ALL_DATA_RECOVERY`. The CAS loser performs zero takeover/reconcile/provider work and the winner's deletion
+batches remove it. Zero, multiple, malformed, extra-key, wrong-task/user/request, or conflicting authorities all fail
+closed; ordinary retention preserves every such row. `test_retry_recovery.py` must prove that active users retain the
+M1 state transition, inactive ordinary/non-winner rows have zero mutation, and an exact inactive winner stays RUNNING
+with its expired lease history while receiving an identifier-only
+`task.execute:{task_id}:inactive-deletion-recovery:{bucket_start_utc_iso8601}` Outbox. Concurrent same-bucket scans
+deduplicate conflict-safely; a published event lost with Redis may be emitted in a later bucket until acquisition
+writes a fresh lease, including after acquisition ACK loss. Seed more than `limit` lower-sorted inactive ordinary,
+non-winner/malformed-authority, and current-bucket-already-published rows before a valid winner; candidate prefiltering
+must exclude that unchanged prefix so the winner is not permanently starved. A finite active-M1 prefix may fill an
+earlier batch only if those rows transition out of the candidate window, after which the winner is reached.
+Task 16A's `renewed_at`/old-expiry semantics remain exact: after inactive, only the strict winner may renew; ordinary
+tasks, the CAS loser, wrong owner, expired lease, and authority parser failures return `False` with no deadline write.
+
 Cover 30-day mail body retention, 180-day metadata, event-end-plus-180-day calendar snapshots, 365-day history, deletion barriers, and retention-role permissions. Add a cutoff matrix proving an unresolved `oauth.refresh_started` survives beyond the normal audit deadline and still makes the next same/different-basename invocation return with `provider_calls == 0`; another user's fence and ordinary audit rows remain user-isolated and obey their own cutoff. Matching `oauth.refresh_confirmed` closes only its own automatic started. The cleanup path must reuse the exact versioned result-union parser used by reconcile: confirmed is legal only when missing/same means old == new plus `refresh_identity_changed=false`, or different means old != new plus changed=true; replacement is legal only with old != new plus changed=true. Reject every disposition/flag/equality mismatch. An exact `oauth.refresh_credential_replaced` may close an older unresolved fence only when it binds the original automatic attempt/started source/connection digest/F, both original pre-digests, old identity/fixed key version, the recovery OAuthAttempt and recovery-started event, valid F/S/T with `pre_generation=post_generation=T`, both required post-digests, different-token new identity/version, `refresh_identity_changed=true`, persisted expiry, stable result code, and strict event ordering. `oauth.refresh_recovery_unsatisfied` closes only its recovery attempt, so multiple unsatisfied pairs leave the original fence unresolved; its deletable group must match the versioned result schema, recovery event/OAuthAttempt, F/S/T, canonical requested capabilities, `capability_transition`, and stable error/result codes without requiring the current capability state to remain unchanged. Consumption remains valid after later generation, capability/scope, access, or refresh changes; generation-only, either physical digest alone, same-plaintext re-encryption, automatic different-token rotation, and access-only rotation must not release it. Retention never compares current credential lineage. For every deletable group, assert each event is older than cutoff—equivalently `max(created_at) < cutoff`; an old started paired with a newer confirmed/unsatisfied/consumption remains. Race retention against confirmed/recovery-result/consumption CAS and preserve the anonymized M1 user row.
 Also seed a valid completed `restore-call:v4` plus
 `ai_employee.restore_completion=restore_completion:v1:<digest>` zero-slot-bound pair with a matching old
@@ -5595,24 +6278,46 @@ catalog facts fail closed at the restore boundary, not in retention cleanup.
 
 ##### Detailed 27E retention RED evidence
 
-Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py -q`
+Run: `TEST_DATABASE_URL=postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/unit/application/test_privacy.py backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/integration/workers/test_retry_recovery.py backend/tests/integration/m2/test_tool_execution_claim.py backend/tests/unit/workers/test_execution_lease.py -q`
 
-Expected: FAIL because M2 tables and encrypted command groups are not included in cleanup/deletion, CalendarEvent retention does not yet prove that each description/location AAD version is cleared atomically with its ciphertext, nonce, and key version, generic AuditEvent cleanup still deletes unresolved refresh fences incorrectly, or completion audits are still exempted from ordinary retention/privacy deletion.
+Expected: FAIL because M2 tables and encrypted command groups are not included in cleanup/deletion, CalendarEvent retention does not yet prove that each description/location AAD version is cleared atomically with its ciphertext, nonce, and key version, generic AuditEvent cleanup still deletes unresolved refresh fences or deletion-started authorities incorrectly, completion audits are still exempted from ordinary retention/privacy deletion, inactive ordinary/loser renew is still admitted, inactive winner stale recovery still changes RUNNING to QUEUED, or pre-limit zero-change candidates starve a later winner.
 
 ##### Detailed 27E content-specific retention and source-cache implementation
 
-Clear each existing three-column AEAD group atomically. CalendarEvent description and location are
-independent four-column groups: for each field, clear `ciphertext`, `nonce`, `key_version`, and
-`aad_version` together in the same transaction. Never leave a version orphan, clear only the old
-triple, or temporarily violate the all-null/all-non-null field constraint. Apply the event-end-plus-180-day
-deadline to these CalendarEvent content fields as well as compensation snapshots. Before clearing an encrypted command still attached to a
-`reconciling` action, stop its automatic schedule and move it to `needs_attention` with
-`action_content_expired`; manual resolution and provider links remain available, but no adapter can be
-called without the authenticated command. A mail draft whose body expired becomes a content-free
-historical record and cannot submit. Calendar snapshot retention is calculated from event end when
-available, otherwise proposal retention. Source-mail deletion removes/cancels drafts bound to that
-connection/thread only; source-calendar deletion does the same for proposals/snapshots. Independently
-created drafts remain.
+Clear each existing three-column AEAD group atomically. CalendarEvent description and location are independent
+four-column groups: for each field, clear `ciphertext`, `nonce`, `key_version`, and `aad_version` together in the
+same transaction. Never leave a version orphan, clear only the old triple, or temporarily violate the
+all-null/all-non-null field constraint. Apply the event-end-plus-180-day deadline to these CalendarEvent content
+fields as well as compensation snapshots.
+
+For a MailDraft/CalendarChangeProposal content candidate, lock in this exact order and re-read every predicate after
+locking:
+
+~~~text
+TaskRun → ApprovalRequest → ToolExecution (when present)
+→ MailDraft/CalendarChangeProposal → MailDraftVersion/CalendarChangeSnapshot
+~~~
+
+Then converge in one transaction:
+
+- no ToolExecution: invalidate ApprovalRequest, cancel TaskRun and action, set `action_content_expired`, clear
+  `scheduled_for`, both recovery schedules, lease owner/expiry, and every automatic re-entry field;
+- non-terminal ToolExecution: action, ToolExecution, and TaskRun all become `needs_attention` with
+  `action_content_expired`; preserve provider IDs, check link, reconciliation counters, and manual-resolution entry;
+- terminal ToolExecution: clear content only and preserve the final execution result.
+
+Clear a mail version body and its ApprovalRequest payload in the same transaction. Clear a calendar snapshot and
+its ApprovalRequest payload in the same transaction. A partial clear or state transition rolls back. An expired
+mail draft remains only as a content-free, non-submittable historical record; calendar snapshot retention uses event
+end when available and proposal retention otherwise.
+
+Source-cache tests and implementation use only the frozen binding predicates. A mail action is source-bound iff
+`source_thread_id IS NOT NULL OR source_message_id IS NOT NULL`; both NULL means an independent draft that remains.
+A calendar action is source-bound iff `target_event_id IS NOT NULL`; `calendar.create` with a NULL target remains.
+For an unclaimed bound action, invalidate the task/approval and explicitly delete version/snapshot children,
+approval, then the action aggregate. For a claimed action, preserve the minimal ToolExecution/TaskRun facts, clear
+sensitive content, converge to `needs_attention` when required, then delete only resynchronizable source cache.
+Neither path may rely on cascade as proof or issue a provider write.
 
 Replace the final generic bounded delete for `AuditEventModel` with a dedicated user-scoped cleanup query. It may
 delete ordinary non-fence audit rows by cutoff, but the generic path must exclude exactly
@@ -5661,16 +6366,53 @@ BigInteger ID and content never become restore authority.
 
 ##### Detailed 27E all-data write barrier and bounded final reconciliation
 
-Before deleting rows, set the existing user active flag to false as the durable user-scoped write
-barrier and make the claim transaction reject inactive users. Invalidate every unclaimed action. For
-claimed/executing/reconciling actions, run one bounded read-only reconcile pass; regardless of result,
-remove local tokens, command/body/snapshot ciphertext, provider IDs, drafts, proposals, and tasks,
-then reuse M1's inactive anonymized user row and content-free deletion audit.
+Implement all-data deletion in these fixed phases:
 
-Refactor the privacy Worker from its Google-only revoker to the fixed provider registry. Hold at most
-one selected token per connection in controlled memory, delete every provider credential locally,
-then make one best-effort provider-specific revoke attempt. A provider without a safe delegated revoke
-endpoint records the token-free maintenance fact defined in Task 25; local deletion must still finish.
+1. In an independent short transaction lock the current `privacy.delete_all_data` TaskRun, verify its live owner and
+   exact task/user/request binding, then lock the user and CAS `users.is_active` from true to false. In that same
+   transaction, and only when the CAS changes true→false, append the sole exact content-free
+   `privacy.deletion_started` authority with schema `privacy_deletion_started.v1`, bound by outer task/user and
+   metadata request. Ordinary TaskRun claim/renew, ToolExecution claim, and provider request-start each lock and
+   recheck active; every new ordinary claim/request and every non-winner renewal after the barrier stops before
+   provider access. Only the same pre-CAS RUNNING deletion winner with an expired lease, exact binding, and the unique
+   strictly parsed authority may receive the typed inactive recovery lease or renew its still-valid current lease; it
+   cannot enter trusted execution. A concurrently RUNNING CAS loser creates no authority and never enters recovery.
+2. Invalidate every unclaimed action. For claimed/executing/reconciling actions, run at most one bounded read-only
+   reconcile pass; never replay a write. Regardless of the result, continue local deletion after warning that an
+   external side effect may already exist.
+3. For each connection, lock `connection → access credential → refresh credential → matching started audit`, select
+   at most one token into controlled memory, explicitly delete all local credential rows, and commit. Only after
+   that commit make one best-effort provider-specific revoke call. Failure cannot restore local credentials or stop
+   deletion, and no token may enter logs/audit/errors/intermediate tables.
+4. Explicitly delete child-to-parent in bounded user-scoped batches: action versions/snapshots and every other task
+   graph, provider/source rows, cursors/calendars/capabilities/attempts, then connections and remaining user-owned
+   rows. Do not depend on cascade to prove completeness; remove local provider IDs and completion audits as ordinary
+   user data while leaving database-wide restore catalog facts untouched. Preserve the current deletion TaskRun and
+   its exact `task_id/user_id/deletion_request_id`, RUNNING/lease history, and every deletion-started authority row
+   needed for strict zero/one/many validation until the final transaction. The same batches delete the CAS loser.
+5. In one final transaction lock the winner TaskRun then user, lock and strictly parse the complete per-user
+   deletion-started authority set, delete that authority plus the current deletion task's remaining
+   Audit/Outbox/dependent rows and TaskRun, preserve exactly one user row, keep `is_active=false`, write deterministic
+   non-routable anonymous email/display values, set `password_hash`, `default_mail_connection_id`,
+   `default_calendar_connection_id`, and `default_calendar_id` to NULL, set
+   `timezone=UTC`, `locale=zh-CN`, `brief_time=08:00`, retention `30/180/365`, Monday–Friday `09:00–18:00`, empty
+   weekends, and `meeting_buffer_minutes=10`, update `updated_at`, and append exactly one content-free
+   `privacy.deletion_completed` audit. Failure at any point rolls back authority/task deletion, anonymous defaults,
+   and audit together; commit-ACK loss observes the missing TaskRun plus existing completion and does not repeat it.
+
+PostgreSQL stale-task recovery uses the same parser. Active users keep M1 behavior. Inactive ordinary/non-winner
+tasks are not mutated or re-enqueued. An expired RUNNING winner stays RUNNING with lease history intact and receives
+only an identifier-only, conflict-safe five-minute-bucket Outbox. Same-bucket/concurrent scans deduplicate; after a
+published message is lost with Redis, later buckets may re-enqueue until a recovery acquisition writes a new lease.
+The active/actionable-winner SQL union and current-bucket exclusion run before `limit`; complete authority parsing
+still happens after TaskRun→user locks. More than `limit` inactive zero-change rows therefore cannot pin every scan to
+the same prefix.
+
+Refactor the privacy Worker from its Google-only revoker to the fixed provider registry. A provider without a safe
+delegated revoke endpoint contributes only the token-free bounded outcome defined in Task 25; it must not append a
+second user deletion audit. Local deletion still finishes. Tests must race the inactive barrier against
+claim/request-start and prove provider calls remain zero, plus race finalization/retry so the anonymous row and
+single completion audit remain unique.
 
 ##### Detailed 27A–27D preflight, recovery, deadline, and restore RED matrix
 
@@ -7515,7 +8257,9 @@ git commit -m "feat: add trusted action editors"
   candidate bootstrap/four-ACL/safe-role/zero-membership/per-step-grant/zero-bootstrap/typed-guard/schema-lifecycle-
   lock paths and Compose no-post-repair order, current-expiry effective-deadline tightening,
   cross-cutoff OAuth fence plus ordinary completion-audit retention/privacy deletion with independent completion-GUC
-  authority, serialized manifest backup/revision CAS,
+  authority, source-cache cleanup, exact all-data winner authority plus inactive renew admission,
+  RUNNING-preserving stale recovery/Redis-loss re-enqueue and `> limit` no-starvation evidence, serialized manifest
+  backup/revision CAS,
   immutable operations image, fixed low/high-bit target vectors,
   management→target→schema lifecycle/reset boundary, database gate/call/completion facts, exact baseline↔active
   access posture plus manifest-revision object grants, generic/sealed
@@ -7526,18 +8270,22 @@ git commit -m "feat: add trusted action editors"
   performs production migration or restore.
 - Modify: `backend/tests/integration/db/test_migrations.py` — release evidence for candidate rejection,
   role-bootstrap-first installation, four exact ACL/safe-role/membership postures, pre-step grant drift,
-  per-step grant delta/full rollback, fresh/zero/missing/Fake/final 0019 guard paths, and the outer schema-lifecycle
-  exclusive lock.
+  per-step grant delta, transactional 0019 full rollback, exact 0016–0018 autocommit/concurrent-index resume
+  candidates, fresh/zero/missing/Fake/final 0019 guard paths, and the outer schema-lifecycle exclusive lock.
 - Modify: `backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py` — release canary for all
   four launch entries and persisted sanitized audit.
 - Modify: `scripts/test-tooling.sh` — release-wrapper command/order/environment assertions, including deterministic
   Task13 selection when the environment is absent, exact-match-only external override, rejection of other and
   production-like DSNs before any child call, and inheritance by the explicit audit plus every pytest/shell command.
+  Capture the absolute real Bash before installing a dedicated Fake PATH for `just`, `uv`, `bash`, `python3`, and
+  `git`; launch the wrapper only through that real Bash so its nested `just ci` and `bash scripts/test-tooling.sh`
+  children are recorded and terminated by Fakes rather than recursively executing the gate.
 - Create: `scripts/verify-m2-sensitive-output.py`
 - Create: `docs/releases/2026-08-06-m2-release-evidence.md` — actual provider matrix and content-free framed-AAD plus
   0019 digest/HKDF-HMAC vectors; candidate/four-ACL/safe-role/membership/per-step-grant migration zero/guard paths;
   automatic/recovery result union; four-entry access-log
-  canary; current-expiry effective-deadline tightening; ordinal recovery; fixed Task13 release-test environment;
+  canary; current-expiry effective-deadline tightening; exact source-cache/privacy-deletion winner/renew/stale-
+  recovery/Redis-loss and scan-limit fairness evidence; ordinal recovery; fixed Task13 release-test environment;
   backup global/local/schema locks and orphan races; immutable operations image; generic manifest management/target
   locks, gate/call/completion facts, state-v4 psql backend registration/deferred-guard SQL stream/backend-exit/ordinal
   reconcile, same-ordinal fact preservation and controlled new-ordinal fresh-call-start/exact-current-pre/backend
@@ -7547,7 +8295,9 @@ git commit -m "feat: add trusted action editors"
 - Modify: `docs/acceptance-checklist.md` — require strict result-union/CAS/recovery evidence, framed CalendarEvent
   AAD vectors, candidate/four-ACL/safe-role/membership/per-step-grant migration guard paths, sanitized callback and
   real access-log canary, durable fence retention, current-expiry deadline
-  tightening, fixed release-test database inheritance, explicit audit invocation, manifest-bound generic restore
+  tightening, exact source-cache cleanup, unique privacy-deletion winner authority, inactive renew admission and
+  RUNNING-preserving/no-starvation PostgreSQL recovery, fixed release-test database inheritance, explicit audit
+  invocation, manifest-bound generic restore
   with management/target locks, gate/call/completion facts, read-only artifact plus separate state-v4 projection,
   psql backend registration/deferred-guard SQL stream/backend-exit/ordinal reconcile, same-ordinal fact preservation,
   controlled new-ordinal fresh-call-start/exact-current-pre/backend reset, exact baseline↔active access/object-grant
@@ -7567,12 +8317,35 @@ Extend `scripts/test-tooling.sh` first so it requires the release wrapper to con
 direct calendar-AAD audit command, framed-AAD vectors, canonical access/grant unit tests, migration candidate/fresh/
 zero/per-step-grant/final-guard tests, real-Uvicorn canary, current-expiry deadline tightening test, PostgreSQL
 backup/restore maintenance-gate integration, dedicated legacy conversion/scavenger shell test, and
-generic/sealed/legacy separation test. The assertion must fail when audit is present only inside `just ci`. The same
+generic/sealed/legacy separation test. It must also require direct execution of
+`test_source_cache_cleanup.py`, `test_all_data_deletion.py`, `test_privacy.py`, `test_outbox_dispatch.py`,
+`test_retry_recovery.py`, `test_tool_execution_claim.py`, and `test_execution_lease.py`, so source cleanup, winner
+authority, inactive renew/stale recovery, `> limit` scan fairness, barrier races, and recovery budgets are not
+accepted through indirect `just ci` coverage. The assertion must fail when audit or
+privacy-recovery evidence is
+present only inside `just ci`. The same
 test must run the wrapper with `TEST_DATABASE_URL` absent and prove every fake `just`,
 pytest, audit and shell child sees the exact Task13 URL; run it again with the same external value and prove it is
 accepted/exported; then use a different synthetic DSN and a production-like synthetic DSN and prove the wrapper
 fails before the first child command. Per-command prefixes, a late export, or an audit/integration subprocess that
 does not inherit the fixed value must fail the contract.
+
+The wrapper-under-test harness must be non-recursive by construction, not by a release-script escape hatch. Before
+prepending its Fake PATH, capture `real_bash="$(command -v bash)"` and require an absolute path. Copy the wrapper into
+the tooling sandbox, create executable Fakes for `just`, `uv`, `bash`, `python3`, and `git` that append command order,
+arguments, and whether `TEST_DATABASE_URL` equals the fixed Task13 value, then invoke exactly:
+
+~~~bash
+(
+  cd "${sandbox_dir}"
+  PATH="${release_fake_bin}:${PATH}" "${real_bash}" scripts/test-m2-release.sh
+)
+~~~
+
+The Fake `just` must terminate `just ci`; the Fake `bash` must terminate every nested audit/deployment/tooling shell
+child, including `bash scripts/test-tooling.sh`. Therefore the outer real `scripts/test-tooling.sh` never re-enters
+itself. Do not add `SKIP_*`, `UNDER_TEST`, recursion-depth, or any other production-visible bypass to
+`scripts/test-m2-release.sh`; absence of recursion must be proven entirely by the test harness.
 
 - [ ] **Step 2: Run focused fault/E2E tests and observe expected failures**
 
@@ -7627,7 +8400,7 @@ uv run --project backend pytest backend/tests/unit/application/test_calendar_eve
 uv run --project backend pytest backend/tests/unit/application/test_calendar_aad_digests.py backend/tests/unit/application/test_oauth_refresh_identity.py backend/tests/unit/application/test_oauth_refresh_coordinator.py backend/tests/unit/application/test_connection_capability_use_cases.py -q
 uv run --project backend pytest backend/tests/integration/m2/test_connection_capability_repository.py backend/tests/integration/m2/test_credential_rotation_repository.py backend/tests/integration/m2/test_oauth_refresh_coordinator.py backend/tests/integration/api/test_connections.py backend/tests/integration/google/test_oauth_flow.py backend/tests/integration/google/test_gmail_sync.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_oauth_flow.py backend/tests/integration/microsoft/test_mail_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/operations/test_calendar_aad_0019_preflight.py -q
 uv run --project backend pytest backend/tests/integration/operations/test_database_maintenance_gate.py backend/tests/integration/operations/test_postgres_backup_restore.py backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py -q
-uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/retention/test_role_permissions.py backend/tests/unit/test_init_db_roles_script.py -q
+uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/unit/application/test_privacy.py backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/integration/workers/test_retry_recovery.py backend/tests/integration/m2/test_tool_execution_claim.py backend/tests/unit/workers/test_execution_lease.py backend/tests/integration/retention/test_role_permissions.py backend/tests/unit/test_init_db_roles_script.py -q
 bash scripts/test-legacy-backup-conversion.sh
 bash scripts/test-deployment.sh
 bash scripts/test-tooling.sh
@@ -7681,7 +8454,13 @@ completion GUC pair remains authoritative, completed admission after audit delet
 completed catalog facts failing at the restore boundary, all fail-closed
 provider/lease/CAS/rollback cases, Taskiq/
 `TransientProviderError` zero-call delivery, closing-result-before-artifact resume under independent current readiness,
-and no replay of original D0 all pass. The gate additionally covers the 0019 typed rollout guard
+and no replay of original D0 all pass. The direct privacy/recovery suite also proves exact source-cache cleanup, that
+two pre-barrier RUNNING deletion requests produce one exact CAS-bound authority, only that winner can renew/recover,
+ordinary tasks and the CAS loser cannot renew after inactive, malformed/multiple/conflicting authority sets remain
+retained and fail closed, stale recovery leaves the winner RUNNING with expired lease history, same-bucket/concurrent
+scans deduplicate, later buckets recover published messages lost with Redis, acquisition ACK loss converges, more
+than `limit` lower-sorted zero-change rows cannot starve a later winner, and the CAS loser is never taken over and is
+removed by the winner. The gate additionally covers the 0019 typed rollout guard
 only after independently proving the three framed AAD bytes/base64/SHA vectors, A/B delimiter separation, Unicode
 no-normalization, shared writer/reader helper identity, exact canonical ACL query and all four tuple multisets,
 PostgreSQL 17 owner `is_grantable=false`, safe roles/zero membership, candidate-only bootstrap, role-bootstrap-
@@ -7989,6 +8768,23 @@ existence/count, event/schema/metadata, and digest are not authority. Malformed 
 completed call fails closed at restore admission/ACK; retention does not parse catalog facts or preserve completion
 audits.
 
+Include source-cache cleanup and the all-data recovery crash matrix in the release record: ordinary inactive TaskRun
+claims and renewals remain zero-write;
+race two distinct pre-barrier RUNNING `privacy.delete_all_data` requests and record that only the true→false CAS winner
+writes the exact sole `privacy.deletion_started` authority with schema `privacy_deletion_started.v1` and later
+receives `inactive_all_data_recovery` with
+exact task/user/request binding and an expired lease. Zero/malformed/multiple/conflicting authority sets fail closed
+and remain outside ordinary retention. Show only the exact winner can renew under Task 16A's owner/unexpired-time
+predicates, then recover after every phase boundary, generic total/step timeout, safe
+domain failure, unknown exception, and acquisition ACK loss without a terminal/retry state write, trusted-command
+decrypt, ToolExecution, mail/calendar provider write, or user reactivation. Record concurrent same-bucket stale scans,
+Outbox replay, a published recovery message lost with Redis followed by a later-bucket re-enqueue, RUNNING/lease-history
+preservation, actionable prefiltering that reaches a winner behind more than `limit` lower-sorted inactive
+ordinary/non-winner/current-bucket rows, loser zero-takeover and eventual deletion. Prove phase 5 retains the current
+winner TaskRun and authority;
+an injected failure inside the final authority/task-delete/anonymize/audit transaction rolls back all four, successful
+commit removes the authority/task and writes one completion audit, and queue ACK loss creates no duplicate.
+
 The normal release record must first include a generic disaster-restore drill for a supported backup revision,
 including an ordinary 0019 backup: versioned manifest schema, safe basename, UTC creation time, PostgreSQL/Alembic
 revision, encrypted dump digest/size, checksum filename, immutable backend image/content-free metadata, expected-post
@@ -8102,8 +8898,9 @@ git commit -m "test: freeze M2 release evidence"
 - CalendarEvent field AAD v2 canonical framing and three synthetic vectors, forward-only 0019 rotation, local
   recoverability, cross-calendar ciphertext isolation, fail-closed reads, four exact database ACL profiles, safe
   roles/zero membership, transient candidate bootstrap, role-bootstrap-before-migration ordering, pre-step object-
-  grant verification, per-step atomic grant delta, and the frozen mutation/final-commit typed migration guard with
-  fresh/strict-zero ordinary `upgrade head`, plus the outer schema-lifecycle exclusive lock shared by every online migration entry:
+  grant verification, the exact retention table/column/sequence matrix, per-step grant deltas, transactional 0019
+  rollback, exact 0016–0018 autocommit/concurrent-index resume admission, and the frozen mutation/final-commit typed
+  migration guard with fresh/strict-zero ordinary `upgrade head`, plus the outer schema-lifecycle exclusive lock shared by every online migration entry:
   Task 16A. Revision-global lease, artifact-backed injection without revision rewrites,
   exact-scope probes, current-access-row effective-deadline tightening, ordinal recovery, and post-resync-before-
   start: Task 27C. Generic backup global/local serialization, shared schema lock plus revision CAS, manifest/group
@@ -8121,9 +8918,14 @@ git commit -m "test: freeze M2 release evidence"
   corresponding content-free result-reconcile/recovery/fence/CAS/log/deadline evidence.
 - Progressive Google/Microsoft OAuth, personal/work accounts, scope dependencies, capability shutdown, disconnect, and revoke: Tasks 4, 8–10, and 25.
 - Idempotent claim, safe retry, lease-valid completion, unknown-result reconciliation, manual resolution,
-  compensation, Redis/checkpoint recovery, and crash points: Tasks 3, 16A, 18–25, Tasks 27A–27B, and Task 30.
+  compensation, Redis/checkpoint recovery, inactive deletion winner stale-task recovery, and crash points: Tasks 3,
+  16A, 18–25, Tasks 27A–27B, Task 27E, and Task 30.
 - API, SSE, action center, structured previews, needs-attention, accessibility, responsive layout, and server-authoritative recovery: Tasks 15, 17, 26, 28, and 29.
-- Security, no-store, access-log closure, redaction, retention, source deletion, all-data barrier, metrics, alerts,
+- Security, no-store, access-log closure, redaction, retention state convergence, exact source-bound
+  `source_thread_id/source_message_id/target_event_id` deletion, all-data inactive/claim/request-start barrier,
+  sole CAS-bound deletion-started authority, exact pre-barrier winner expired-lease recovery, RUNNING-preserving
+  PostgreSQL/Outbox re-enqueue after Redis or ACK loss, final authority/task-delete/anonymize/audit atomicity,
+  local-credential-delete-before-revoke ordering, deterministic user-default reset, metrics, alerts,
   deployment switches, dual restore, rollback, incident response, and release evidence: Tasks 1, 5–6, 25–26,
   Tasks 27A–27E, and Task 30.
 
@@ -8132,6 +8934,9 @@ git commit -m "test: freeze M2 release evidence"
 1. Tasks 1–6 establish the approved scope, pure contracts, migrations, and encrypted persistence. Checkpoint: empty-database migration and AAD/user-isolation tests pass before any provider expansion.
 2. Tasks 7–13 generalize reads and add Microsoft/Google parity. Checkpoint: both providers pass OAuth plus incremental mail/calendar contract tests with real writes still disabled.
 3. Tasks 14–20 add editable proposals and the provider-independent trusted execution/reconciliation core. Within this stage, execute Task 14 → Task 16 → Task 16A → Task 18 → Task 15 → Task 17 → Tasks 19–20. Task 16A must close calendar lease, freshness, bounded-query, transaction, confirmation, restore-input, and CalendarEvent AAD v2/0019 trust gaps before any proposal version can be frozen. Task 18 must precede the two REST tasks because their `/submit` routes can only return an honest, durable `202` after the atomic encrypted approval-submission use cases exist; creating an unhandled placeholder task is forbidden. Task numbering remains grouped by domain and does not imply execution order inside this stage. Checkpoint: Fake adapters prove one claim, no blind retry, and durable needs-attention/manual resolution.
+
+   Inside Task 16A, execute the six database-trust RED→GREEN loops serially and do not dispatch the next RED suite
+   until the previous focused GREEN passes. The plan-wide single-subagent rule above applies unchanged.
 4. Tasks 21–24 add one high-risk provider write path per task and commit. Checkpoint: each adapter independently passes success, rejection, timeout, unknown-result, reconciliation, and duplicate-delivery contracts before starting the next adapter.
 5. Tasks 25–26 and 27A–27E close revocation, API/SSE, observability, OAuth recovery, 0019 operations, privacy, retention, and
    deployment gaps. Execute the split work strictly as Task 25 → Task 26 → Task 27A → Task 27B → Task 27C →
@@ -8151,7 +8956,8 @@ git commit -m "test: freeze M2 release evidence"
    rollback reconcile; F/S/T progressive recovery and callback classification; current-readiness separation;
    current-access-row effective-deadline tightening where shorter expiry tightens and longer expiry does not extend;
    revision-global plus connection leases; exact-pair probes and ordinal recovery; Task 16A candidate/fresh/zero/
-   missing/Fake/final migration-guard paths, pre-step/per-step grant rollback, plus outer schema-lifecycle lock; manifest-bound generic backup publication with
+   missing/Fake/final migration-guard paths, pre-step drift rejection, transactional 0019 grant rollback, exact
+   0016–0018 partial-persistence/resume evidence, plus outer schema-lifecycle lock; manifest-bound generic backup publication with
    management/global/local locks, revision CAS, group retention/remote/orphan handling; lifecycle-wrapped reset with
    crashed-holder zero drop/create; gate/call/completion catalog facts plus exact baseline↔active access/grant
    postures and read-only artifacts/separate state-v4
@@ -8160,12 +8966,16 @@ git commit -m "test: freeze M2 release evidence"
    same-owner-session role verifier and unknown-outcome/reopen-not-applied resume; dedicated
    isolated legacy conversion/cleanup;
    independent sealed `calendar-aad-restore-0018` owner-before-secret/exact-image/read-only verification; explicit
-   release-script execution of `scripts/test-calendar-aad-0019-audit.sh`; whole-group fence retention; privacy
-   deletion barrier; and post-resync-before-start. No Task 27A–27E commit may combine another subtask's file list.
+   release-script execution of `scripts/test-calendar-aad-0019-audit.sh`; whole-group fence retention; source-cache
+   cleanup; privacy deletion barrier, sole CAS-bound winner authority, exact inactive winner renew/recovery takeover,
+   RUNNING-preserving stale-task re-enqueue across concurrent/Redis-loss/ACK-loss cases, `> limit` zero-change-prefix
+   fairness, loser cleanup, and final atomic authority/task cleanup; and
+   post-resync-before-start. No Task 27A–27E commit may combine another subtask's file list.
 6. Tasks 28–29 deliver the frontend projection and focused editors. Checkpoint: unit tests, strict type checking, lint, production build, keyboard/focus, and mobile behavior pass.
 7. Task 30 runs the full automated gate from one exact exported Task13 `TEST_DATABASE_URL`, including the direct
    calendar-AAD audit call, framed-AAD vectors, candidate/four-ACL/safe-role/membership/per-step-grant migration guard
-   matrix, access-log subprocess canary, current-expiry deadline tightening,
+   matrix, access-log subprocess canary, current-expiry deadline tightening, direct source-cache and deletion
+   winner/renew/stale-recovery tests,
    management/schema/backup lock and revision-CAS races, reset lifecycle bypass regression, manifest-bound
    gate/call/completion plus exact baseline↔active access/grant state-v4 psql backend registration/deferred-guard SQL
    stream/backend-exit/ordinal/completion-GUC generic restore, isolated legacy cleanup, and

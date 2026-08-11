@@ -1289,9 +1289,14 @@ MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期�
 
 删除全部数据采用可恢复的分阶段协议：
 
-1. 独立短事务对目标用户执行 `is_active=true → false` 的 CAS 写屏障；CAS 后的新 TaskRun claim、
-   ToolExecution claim 和 provider request-start 都必须锁后重检用户仍 active，否则在任何供应商调用前
-   拒绝。
+1. 独立短事务先锁定当前 `privacy.delete_all_data` TaskRun，再锁定目标用户，验证当前 Worker 仍持有该
+   RUNNING 任务的有效租约、`task_id/user_id/deletion_request_id` 与精确输入形状匹配，然后执行
+   `is_active=true → false` 的 CAS 写屏障，并在同一事务追加唯一、无内容的
+   `privacy.deletion_started` winner authority。authority 的 `task_id`/`user_id` 使用 AuditEvent 外层列，
+   metadata 精确为 `{"schema_version":"privacy_deletion_started.v1","request_id":<原请求 ID>}`；只有
+   CAS 实际命中 true→false 的任务可以写入，CAS 失败者不得追加第二条。CAS 后新的普通 TaskRun claim、
+   普通或非 winner TaskRun lease renew、ToolExecution claim 和 provider request-start 都必须锁后重检用户
+   仍 active，否则在任何供应商写调用前拒绝。
 2. 在屏障之后失效所有未认领动作；对每个已认领动作至多执行一次有界、只读 reconcile，禁止借删除
    请求重放写命令。结果仍未知时也继续本地删除，但必须先向用户说明外部副作用可能已经发生。
 3. 每个连接至多解密并在受控内存中保留一个用于 revoke 的 token；不得同时保留 access/refresh token，
@@ -1301,8 +1306,42 @@ MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期�
 4. 先在本地事务中显式删除该连接的 credential 行并提交，再使用内存中的单个 token best-effort 调用
    对应供应商 revoke。网络失败、供应商拒绝或 token 已失效均不得回滚或阻断已经提交的本地删除。
 5. 所有业务表按外键拓扑显式子到父、有界批次删除；不得把 cascade 当作覆盖证明，也不得跨用户读取
-   或删除。最后匿名化但保留 M1 用户根行，并追加唯一、无正文/地址/标题/provider ID 的
-   `privacy.deletion_completed` 审计事实。
+   或删除。此阶段必须保留当前删除 TaskRun 中用于恢复的最小事实，至少包括原
+   `task_id/user_id/deletion_request_id`、RUNNING 状态、租约历史和唯一 winner authority；其他任务图仍按
+   上述规则删除。最终事务锁定并严格重验该 authority，显式删除 authority、该删除任务剩余的
+   Audit/Outbox/TaskRun 事实、匿名化但保留 M1 用户根行，并追加唯一、无
+   正文/地址/标题/provider ID 的 `privacy.deletion_completed` 审计事实。最终事务任一步失败必须整体回滚，
+   使删除任务仍可恢复；提交成功但队列 ACK 丢失时，缺失 TaskRun 与既有精确完成审计共同表示已完成。
+
+这里的“新的普通 TaskRun claim”不包含同一预屏障删除操作的恢复接管。唯一例外是：用户已经 inactive，
+TaskRun 精确为 `privacy.delete_all_data`，原 `task_id/user_id/deletion_request_id` 和输入形状仍匹配，任务在
+CAS 前已经进入 RUNNING，当前租约已经过期，并存在唯一、严格解析且外层 task/user 与 metadata request
+全部匹配的 `privacy.deletion_started` winner authority，其 schema 必须为
+`privacy_deletion_started.v1`。零条、多条、格式错误或绑定到另一个删除任务的
+authority 一律 fail closed。该接管只能继续本节的失效、只读 reconcile、本地删除、credential 删除后
+best-effort revoke 与最终匿名化步骤；不得接管 QUEUED/CREATED/RETRY_SCHEDULED/WAITING_APPROVAL 任务，
+不得创建 ToolExecution、解密可信邮件/日历命令、执行邮件/日历供应商写入，或把 `is_active` 改回 true。
+用户 inactive 后，通用 TaskRun 成功/失败/取消/重试写入不得把该精确赢家删除任务移出 RUNNING；只有最终
+匿名化事务可以删除它。TaskRun 续租必须在 TaskRun→用户锁后重检：active 用户保持 M1 的 owner/未过期
+租约规则，inactive 用户只允许该唯一精确赢家续租；普通任务、CAS 失败者及 authority
+零条/多条/格式错误均返回续租失败。每次恢复接管仍受独立的租约、单步和本次尝试总预算约束，但不得因最初
+`started_at` 的通用总预算已经耗尽而在执行删除步骤前失败。除这个精确恢复候选外，inactive 用户的所有
+TaskRun claim 仍必须拒绝。
+
+PostgreSQL stale-task recovery 必须使用同一严格 authority parser。对于 active 用户，既有
+RETRY_SCHEDULED/QUEUED/过期 RUNNING → QUEUED 与 Outbox 行为保持不变；对于 inactive 用户，普通任务和
+非 winner 删除任务既不改状态也不补发。只有带精确 winner authority 的过期 RUNNING 删除任务保持
+RUNNING、保留过期租约历史，并原子追加去重 `task.execute` Outbox。恢复 Outbox 只含 `task_id`，同一扫描
+桶与并发扫描不得重复；去重键固定为
+`task.execute:{task_id}:inactive-deletion-recovery:{bucket_start_utc_iso8601}`。已发布消息在 Redis 丢失后允许
+由后续五分钟桶再次补发，直到某次接管写入新租约。扫描的 `limit` 必须在可行动候选预筛之后应用：
+inactive 普通任务、非 winner、格式错误/多条 authority，以及已经存在当前桶去重键的任务不能占用批次
+名额。实现可以使用互斥的 active-M1 与 inactive-winner 查询，或等价的 SQL 候选谓词；SQL 预筛只能缩小
+候选集，锁定 TaskRun→用户并读取完整 per-user authority 集后的共享 parser 仍是最终准入权威。候选预筛
+和同桶 conflict-safe 插入必须共同证明：即使在赢家之前存在超过 `limit` 个零变更任务，赢家也不会永久
+饥饿。
+普通 365 天审计保留不得删除尚未被最终事务消费的 `privacy.deletion_started` winner authority；格式错误或
+多条冲突 authority 同样保留并 fail closed，不能通过清理选择一个赢家。
 
 最终用户行必须保持 `is_active=false`，把 email/display name 替换为确定性、不可投递且不含原值的匿名
 表示，清空 `password_hash` 和三个默认连接/日历字段，并把所有设置恢复为冻结默认值：`timezone=UTC`、
@@ -1783,8 +1822,9 @@ expected lowercase `refresh_token_identity_v1` 为
 - 两种来源清理都按 17.2.2 显式删除动作聚合与子记录，不依赖 cascade，也不删除从零创建且未引用
   来源数据的动作。
 - 删除全部数据严格执行 17.2.2 的 inactive CAS 屏障、未认领失效、已认领单次只读核对、先提交本地
-  credential 删除后 best-effort revoke、显式子到父删除及最终匿名化协议。即使结果仍未知也必须完成
-  本地删除，但应在删除前向用户明确提示外部副作用可能已经发生，并只保留不含个人内容的删除审计。
+  credential 删除后 best-effort revoke、精确预屏障删除任务恢复接管、显式子到父删除及最终原子任务
+  清理/匿名化协议。即使结果仍未知也必须完成本地删除，但应在删除前向用户明确提示外部副作用可能
+  已经发生，并只保留不含个人内容的删除审计。
 
 ## 18. 错误契约
 
