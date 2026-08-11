@@ -1965,9 +1965,10 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   锁序。bootstrap matrix 必须复用共享 canonical ACL/runtime-role readers，逐项覆盖 fresh/default candidate
   的“两角色同时缺失”与“两角色同时 safe”、pre-protocol legacy candidate 的“两角色同时 safe”、已是
   `baseline posture` 的 `pristine_idle` 重复幂等 role-bootstrap、`completed_idle` 保留 completed pair 的幂等
-  最小 grants，以及 `active`/`needs_attention` 阻断。ACL 负例必须逐项覆盖 phase 外的 `PUBLIC CREATE`/
-  `PUBLIC TEMPORARY`、任一 `PUBLIC` grant option、app/retention 的 `CREATE`/`TEMPORARY`/任一 grant option、
-  额外 CONNECT grantee、错误 grantor、额外/duplicate/未知 tuple；role 负例必须逐个翻转
+  最小 grants，以及 `active`/`needs_attention` 阻断。ACL 负例必须逐项覆盖 owner 任一显式 grant option、
+  phase 外的 `PUBLIC CREATE`/`PUBLIC TEMPORARY`、任一 `PUBLIC` grant option、app/retention 的
+  `CREATE`/`TEMPORARY`/任一 grant option、额外 CONNECT grantee、错误 grantor、额外/duplicate/未知 tuple；
+  role 负例必须逐个翻转
   `rolcanlogin`、`rolinherit`、`rolsuper`、`rolcreaterole`、`rolcreatedb`、`rolreplication`、
   `rolbypassrls` 与 `rolconnlimit` 的冻结值，并覆盖 non-null `rolvaliduntil`、non-null `rolconfig`、
   `pg_auth_members` 任一方向 membership，以及各 phase 不允许的 missing/mixed role shape。每个负例连同
@@ -2472,14 +2473,19 @@ PostgreSQL catalog 名称 `CREATE | CONNECT | TEMPORARY`。未知 privilege、�
 错误 grant option、无法解析的 grantee 都 fail closed。禁止只比较 effective CONNECT、调用
 `has_database_privilege` 或把 ACL 文本做宽松包含判断。
 
+owner tuple 的 canonical catalog bytes 同样固定为 `grantor=datdba` 且 `is_grantable=false`。PostgreSQL 对
+database owner 的隐式可授权能力是系统特判，不编码为 ACL grant option；reader/verifier 不得据此把
+catalog `is_grantable` 推断或归一化为 `true`。四个合法 multiset 中所有 tuple 都必须
+`is_grantable=false`；任一 `true` 都是非法漂移，包括 owner 被显式授予 `WITH GRANT OPTION`。
+
 令 `O=datdba`、`P=PUBLIC/OID 0`、`A=ai_employee_app OID`、`R=ai_employee_retention OID`。四种唯一合法
 database ACL tuple multiset 冻结为：
 
 ```text
 fresh_default =
-  (O, O, CREATE,    true)
-  (O, O, CONNECT,   true)
-  (O, O, TEMPORARY, true)
+  (O, O, CREATE,    false)
+  (O, O, CONNECT,   false)
+  (O, O, TEMPORARY, false)
   (P, O, CONNECT,   false)
   (P, O, TEMPORARY, false)
 
@@ -2488,16 +2494,16 @@ pre_protocol_legacy = fresh_default +
   (R, O, CONNECT, false)
 
 baseline =
-  (O, O, CREATE,    true)
-  (O, O, CONNECT,   true)
-  (O, O, TEMPORARY, true)
+  (O, O, CREATE,    false)
+  (O, O, CONNECT,   false)
+  (O, O, TEMPORARY, false)
   (A, O, CONNECT,   false)
   (R, O, CONNECT,   false)
 
 active =
-  (O, O, CREATE,    true)
-  (O, O, CONNECT,   true)
-  (O, O, TEMPORARY, true)
+  (O, O, CREATE,    false)
+  (O, O, CONNECT,   false)
+  (O, O, TEMPORARY, false)
 ```
 
 每个列表都是完整 multiset，不是最低要求：fresh/default 之外 `PUBLIC` 不得有任何 database privilege；
