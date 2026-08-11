@@ -786,9 +786,12 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 选择，不能复制第二套 Microsoft 领域模型。
 
 `CalendarEvent` 的描述和地点密文必须绑定同一完整事件身份。历史 v1 AAD
-`user_id:connection_id:provider_event_id:field` 只用于识别需要重同步的旧记录；v2 AAD 固定为
-`user_id:connection_id:calendar_id:provider_event_id:field`，其中 `field` 只能是 `description` 或
-`location`。所有新同步写入必须使用 v2，不能继续按旧连接级身份生成字段密文。
+`user_id:connection_id:provider_event_id:field` 只用于识别需要重同步的旧记录，不能用于正常解密。
+当前 v2 必须由共享纯函数 `calendar_event_field_aad_v2`（或等价稳定命名）生成：固定 domain 后只按
+`user_id`、`connection_id`、`calendar_id`、`provider_event_id`、`field` 顺序写入五个
+`uint32_be(length) || raw_bytes` frame，禁止未分帧冒号拼接。同步 writer 与精确事件 reader 必须调用
+同一个版本化 helper，不能复制编码、去掉 `calendar_id`、执行 Unicode normalization 或提供 legacy
+fallback。所有新同步写入只允许使用第 17.1 节冻结的修正后 v2。
 
 邮件消息额外保存 nullable `provider_updated_at`；历史 Google 行允许为 `NULL`。消息与线程的
 描述字段更新必须遵守供应商版本排序，`latest_message_at` 只能单调增加。消息身份和线程归属
@@ -891,7 +894,9 @@ CalendarEvent 的供应商身份从旧 `(connection_id, provider_event_id)` 放�
 `description_ciphertext + description_nonce + description_key_version + description_aad_version` 必须
 全为 `NULL` 或全为非空；`location_ciphertext + location_nonce + location_key_version +
 location_aad_version` 使用相同的独立四列约束，两个字段不能共用版本标记。`aad_version` 是封闭
-版本标记：仅识别历史 `v1` 和当前 `v2`，其他值不得被当作任一已知格式读取。
+版本标记：仅识别历史 `v1` 和当前 `v2`，其他值不得被当作任一已知格式读取。`v2` 逐字表示
+第 17.1 节的 canonical framing；由于 `0019` 尚未发布，本次直接修正 v2，不新增 v3、兼容分支或
+旧 v2 fallback。
 
 ### 14.2 扩展实体
 
@@ -957,7 +962,8 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    迁移后禁止旧 Worker 回流。若 downgrade 前已产生跨日历同 ID，旧二元约束无法无损恢复，必须
    fail closed 并先由人工制定数据保留方案，迁移不得删除任一事件来强行回退。
 3. `0019` 是紧随 CalendarEvent 身份迁移的前向 AAD 轮换 revision。Task 16A 首次创建该 revision
-   时就必须同时冻结最终 typed rollout guard 协议与 helper，并让 migration 在任何 DDL/DML 前调用；
+   时就必须同时冻结最终 typed rollout guard 协议与第 17.1 节的 v2 canonical framing helper，并让
+   migration 在任何 DDL/DML 前调用；
    `backend/migrations/env.py` 还必须通过 Alembic `on_version_apply` 在版本表更新后、外层迁移事务
    最终提交前再次调用同一 guard。Task 16A 还必须在同一个 Alembic 外层在线迁移边界冻结独立的
    management/target/schema 三层 lifecycle boundary 与 schema-lifecycle session advisory 读写锁，固定键为
@@ -967,16 +973,20 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    Task 27D 的普通备份则从读取 dump 前 Alembic revision 起执行
    `pg_advisory_lock_shared(20260806, 143)`，覆盖完整 `pg_dump`、post-revision CAS 与本地 manifest-last
    发布。Compose migration、`just db-upgrade`、integration fixture、E2E bootstrap 与专用 0019 migration
-   one-off 都必须经过这一外层边界，不能各自实现可漂移的锁协议。该锁只绑定 dump 与 schema revision，
+   one-off 都必须经过这一外层边界，不能各自实现可漂移的锁协议；新建数据库必须先通过第 22 节的
+   受控 `bootstrap_candidate → pristine_idle` 过渡，之后才能进入普通 migration。该锁只绑定 dump 与 schema revision，
    不改变本 revision 已冻结的 typed guard 分支，也不替代 `(20260809, 19)` rollout lease 或恢复时的
    database-wide maintenance/call authority 与 CONNECT revocation。锁序固定为 management lifecycle →
-   target → schema；`db-reset` 必须由同一 typed lifecycle wrapper持锁覆盖 catalog 检查、drop、create 与
-   migration，不能直接执行未受保护的 `dropdb`/`createdb`。普通
-   `upgrade head` 仍是 fresh database、CI/E2E、Compose migration
-   service 和常规运维的唯一入口，因此 guard 必须有两个封闭分支：
+   target → schema；`db-reset` 必须由同一 typed lifecycle wrapper持锁覆盖 catalog 检查、drop、create、
+   bootstrap transition 与 migration，不能直接执行未受保护的 `dropdb`/`createdb`。普通
+   `upgrade head` 仍是已经完成 catalog bootstrap 的 fresh database、CI/E2E、Compose migration
+   service 和常规运维的唯一迁移入口；它不得把 PostgreSQL 默认 ACL 新库直接视为 `pristine_idle`。
+   这里的 0019 guard 仍只有两个封闭分支：
 
-   - fresh/new database，或在 0019 mutation 前以同一查询严格证明 affected set 为空时，使用内建
-     zero-bootstrap 分支，不要求生产 rollout artifact，但必须在 mutation 前和最终提交前重复空集合证明；
+   - 已经通过普通 catalog admission 的 fresh/new database，或在 0019 mutation 前以同一查询严格证明
+     affected set 为空时，使用内建 affected-set zero-bootstrap 分支，不要求生产 rollout artifact，但必须
+     在 mutation 前和最终提交前重复空集合证明；该分支与数据库 role/ACL bootstrap 是两件事，不能
+     接受或修复 `bootstrap_candidate`；
    - 数据库当前精确位于 0018 且存在历史完整 AEAD 三元组时，必须注入 schema-valid typed rollout
      guard；缺失、错误类型、artifact/image/affected-set/deadline 不匹配都在任何 DDL/DML 前 fail closed。
 
@@ -984,7 +994,7 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    0019 revision、`migrations/env.py` 或同 revision 的分支语义。Task 16A 之前仓库没有发布过任何
    `20260809_0019` revision；若旧开发/测试环境曾手工或实验性应用同名、未知或不完整的 obsolete 0019，
    先为该精确非生产目标创建取证备份，再仅使用上述 management lifecycle lock 与 catalog guard 保护的
-   `just db-reset` 完整重建并重新执行普通 `upgrade head`。holder crash 后的新 reset 必须拒绝 active/
+   `just db-reset` 完整重建，完成 bootstrap transition 后再执行普通 `upgrade head`。holder crash 后的新 reset 必须拒绝 active/
    `needs_attention` restore authority并保持 drop/create 为零。不得新增悬空 repair recipe、重写已应用
    revision、静默 stamp、伪 downgrade 或用普通
    upgrade 假装修复既有错误 revision。生产环境一旦发现未知、同名或 obsolete 0019，必须立即停止发布并
@@ -1010,8 +1020,9 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
    任一 pair 缺失上述事实，或连接已断开、能力为 disabled/revoked/其他非 enabled 状态时，升级都
    必须保持 revision `20260809_0018` 和全部数据不变，也不得创建猜测 marker。迁移本身不执行供应商
    网络 I/O；生产变更窗口还必须在备份、审计和 migration 前通过第 22 节定义的主动 refresh 加精确
-   pair 只读 probe preflight。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。通过
-   preflight 后，
+   pair 只读 probe preflight。迁移不得解密、重加密、删除、合并或改写任何 CalendarEvent 内容。迁移后的
+   专用 resync writer 与此后所有普通同步 writer 只允许调用第 17.1 节的共享 helper 写入修正后 v2；
+   reader 必须消费同一个 helper，不能存在旧 v2 冒号编码的迁移期读写窗口。本地可恢复性 preflight 通过后，
    只失效上述精确 pair 的游标：将 `cursor` 与
    `last_success_at` 置空，并把 `last_error_code` 设为不含内容的
    `calendar_event_resync_required`；其他 connection 即使复用相同 `calendar_id` 也不得变化，
@@ -1148,10 +1159,66 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
   AEAD 与 refresh-token identity service 使用同一版本；不得读取私有实现字段或在 Tasks 27A–27C 另造版本来源。
 - M2 命令、邮件正文、日程描述、地点和补偿快照使用字段或记录级 AEAD。
 - CalendarEvent 描述和地点分别验证自己的四列原子组。四列全空时字段读取为空字符串；四列非空
-  且版本为 v2 时，必须使用
-  `user_id:connection_id:calendar_id:provider_event_id:field` 作为 AAD 解密。v1 只作为历史迁移标记，
-  新写入和正常读取都禁止生成或解密 v1；读取 v1 或未知版本统一返回
-  `calendar_event_resync_required`，等待该日历受限重同步。
+  且版本为 v2 时，加解密必须调用同一个共享、版本化、无 I/O 的纯函数 helper。v2 canonical bytes
+  固定为：
+
+  ```text
+  b"AIEMPLOYEE/calendar-event-field-aad/v2\x00"
+  || frame(user_id)
+  || frame(connection_id)
+  || frame(calendar_id)
+  || frame(provider_event_id)
+  || frame(field)
+
+  frame(raw_bytes) = uint32_be(len(raw_bytes)) || raw_bytes
+  ```
+
+  domain 恰好 39 bytes。五个字段都必填且只编码一次：`user_id` 与 `connection_id` 必须先验证为
+  小写 canonical UUID ASCII；`calendar_id` 与 `provider_event_id` 使用严格 UTF-8 的原始标量字节；
+  `field` 只允许 ASCII `description` 或 `location`。frame 没有 NULL tag、delimiter、Unicode
+  normalization 或 JSON。缺失值、UUID 非 canonical、严格编码失败、未知 field、既有标量边界失败或
+  任一 raw byte length 无法用 uint32 表示时，必须在调用 AEAD 前 fail closed；稳定错误不得回显原始 ID。
+  writer 与 reader 禁止各自复制 framing、静默正规化、删除 `calendar_id` 或尝试 legacy bytes。
+
+  v1 只作为历史迁移标记与受限重同步触发器；新写和正常读取均不得生成或解密 v1。读取 v1 或未知
+  版本统一返回 `calendar_event_resync_required`。由于 `0019` 尚未发布，本协议直接定义修正后的 v2，
+  不新增 v3，也不保留任何旧的冒号拼接 v2 fallback。
+
+  以下完全合成向量冻结独立复算结果。规范总长度使用
+  `39 + Σ(4 + len(raw_field_bytes))` 计算；expected bytes/base64 必须作为测试常量保存，不能调用生产
+  helper 反向生成：
+
+  - delimiter vector A：user `aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`，connection
+    `bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`，calendar `a:b`，event `c`，field `description`。
+    五个 raw 长度依次为 `36, 36, 3, 1, 11`，规范总长度为 `146`，完整 base64 为：
+
+    ```text
+    QUlFTVBMT1lFRS9jYWxlbmRhci1ldmVudC1maWVsZC1hYWQvdjIAAAAAJGFhYWFhYWFhLWFhYWEtNGFhYS04YWFhLWFhYWFhYWFhYWFhYQAAACRiYmJiYmJiYi1iYmJiLTRiYmItOGJiYi1iYmJiYmJiYmJiYmIAAAADYTpiAAAAAWMAAAALZGVzY3JpcHRpb24=
+    ```
+
+    独立 SHA-256 交叉检查值为
+    `67ba9e40f2157a49de2d987e1f4d8e61c2a78a7d71d4da7ce13421fde58a8e70`。
+  - delimiter vector B 使用相同 user/connection/field，但 calendar `a`、event `b:c`。raw 长度为
+    `36, 36, 1, 3, 11`，规范总长度同为 `146`，完整 base64 为：
+
+    ```text
+    QUlFTVBMT1lFRS9jYWxlbmRhci1ldmVudC1maWVsZC1hYWQvdjIAAAAAJGFhYWFhYWFhLWFhYWEtNGFhYS04YWFhLWFhYWFhYWFhYWFhYQAAACRiYmJiYmJiYi1iYmJiLTRiYmItOGJiYi1iYmJiYmJiYmJiYmIAAAABYQAAAANiOmMAAAALZGVzY3JpcHRpb24=
+    ```
+
+    独立 SHA-256 为
+    `52e707318449a55779a023931f5914909d662944f5364545e1795edbcf555dad`；因此 `a:b`/`c` 与
+    `a`/`b:c` 即使未分帧拼接会得到相同可见文本，也必须产生不同 canonical bytes。
+  - Unicode vector 使用相同 user/connection，calendar `日历/α`、event `事件:é`、field `location`。
+    两个 opaque ID 的严格 UTF-8 分别为 hex `e697a5e58e862fceb1` 与 `e4ba8be4bbb63ac3a9`；五个 raw
+    长度为 `36, 36, 9, 9, 8`，规范总长度为 `157`，完整 base64 为：
+
+    ```text
+    QUlFTVBMT1lFRS9jYWxlbmRhci1ldmVudC1maWVsZC1hYWQvdjIAAAAAJGFhYWFhYWFhLWFhYWEtNGFhYS04YWFhLWFhYWFhYWFhYWFhYQAAACRiYmJiYmJiYi1iYmJiLTRiYmItOGJiYi1iYmJiYmJiYmJiYmIAAAAJ5pel5Y6GL86xAAAACeS6i+S7tjrDqQAAAAhsb2NhdGlvbg==
+    ```
+
+    独立 SHA-256 为
+    `0bdf656c1b037423e71c950df9f6bb5c56a737bcef8fe7d6e58e26d7dee04370`。helper 必须保留这些原始
+    scalar bytes；例如 composed `é` 与 `e` + U+0301 不得被 normalize 成相同 AAD。
 - 单密钥 AEAD reader 必须在调用 AES-GCM 前精确比较持久 `key_version` 与当前密钥版本；不匹配时
   抛出稳定类型化 key-version 错误，M2 不引入多 key keyring。CalendarEvent reader 遇到 cipher
   不可用、该 key-version 错误、明确类型化的解密边界错误、无效 UTF-8 或 v2 `InvalidTag` 时，必须
@@ -1644,7 +1711,12 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
 - 能力启用、关闭、断开和执行时复核。
 - 工作时间、DST、全天事件、缓冲和候选时间算法。
 - ETag、before snapshot 和恢复规则。
-- CalendarEvent v2 AAD 的精确序列、描述/地点独立版本选择，以及全空字段读取为空。
+- CalendarEvent v2 AAD 的 39-byte domain、五个无 NULL tag 的 `uint32_be` frame、精确字段顺序、
+  UUID ASCII/opaque-ID strict UTF-8/field whitelist、描述/地点独立版本选择，以及全空字段读取为空。
+  测试必须把第 17.1 节三个向量的完整 expected bytes/base64/长度作为独立常量，覆盖
+  `a:b`/`c` 与 `a`/`b:c` delimiter split collision、合法非 ASCII opaque ID、composed/decomposed
+  Unicode 不正规化、未知 field/编码或长度失败发生在 AEAD 调用前。writer 与 reader 必须注入或导入
+  同一个 helper identity；测试应使任何复制 framing、冒号拼接、去掉 calendar ID 或 legacy fallback 失败。
 - `credential_snapshot_digest_v1`、`refresh_credential_snapshot_digest_v1` 与 `rollout_digest_v1` 的字段
   framing、NULL/空 bytes 区分、UUID/整数/UTC 时间规范化、固定字段顺序和上述完整合成向量；expected
   bytes/base64/hash 必须是独立固定常量，不得由生产 helper 反向生成。
@@ -1700,8 +1772,10 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   disabled/revoked、缺失 access credential、缺失 refresh credential、仅 access-token 可用或缺失精确
   `ProviderCalendar` 时，都会在任何 DDL/DML 前 fail closed，revision 仍为 0018 且全部数据原样保留。
 - 0019 migration 测试必须覆盖 Task 16A 冻结的同一 typed guard 在 mutation 前与
-  `on_version_apply` 最终提交前各执行一次：fresh database 和严格空 affected set 的普通
-  `upgrade head` 走 zero-bootstrap 并正常服务 CI/E2E/Compose；revision 0018 且 affected set 非空时，
+  `on_version_apply` 最终提交前各执行一次：已经先完成 `bootstrap_candidate → pristine_idle` 的 fresh
+  database 和严格空 affected set 的普通 `upgrade head` 走 affected-set zero-bootstrap 并正常服务
+  CI/E2E/Compose；仍处于 default/legacy candidate 的数据库直接 migration 必须零 DDL/DML/AuditEvent。
+  revision 0018 且 affected set 非空时，
   缺失/错误 guard 必须在任何 DDL/DML 前失败。Fake guard 要证明两次调用使用同一 protocol；Task 27C
   的真实 artifact composition 只能注入该接口，不能通过改写 0019 或 `migrations/env.py` 改变结果。
   同一矩阵还必须冻结 `SCHEMA_LIFECYCLE_LOCK=(20260806, 143)`：独立 session 持 shared lock 时，
@@ -1888,11 +1962,19 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
 - database-maintenance integration 必须验证 signed-int64→uint64 conversion、低位与 SQL `-1` 高位 target
   digest，以及两种 lock-key synthetic vector，并用两个
   manifest、generic/sealed、并发 session 与 `db-reset` race 证明 management lifecycle → target → schema
-  锁序。restore holder crash 后，新 reset 取得 lifecycle lock仍必须从 durable gate/call/completion facts 拒绝，
-  drop/create/migration 为零；migration、role-bootstrap/init-db-roles 与 owner one-off 在 held lock、active
-  gate、malformed/role override/duplicate authority 下也保持 DDL/DML/audit/grant/CONNECT/call-authority/
-  `pg_restore` writes 为零。测试必须覆盖从管理库持锁、同一 typed lease 包住 reset check→drop→create→
-  migrate、exact GUC grammar、database-wide-only row、新 session 可见性与每次 transition CAS race。
+  锁序。bootstrap matrix 必须逐项覆盖 fresh/default candidate、pre-protocol legacy candidate、已是 baseline
+  `pristine_idle` 的重复幂等 role-bootstrap、`completed_idle` 保留 completed pair 的幂等最小 grants、
+  `active`/`needs_attention` 阻断、额外 CONNECT grantee、partial/revoked/未知 ACL、三项 catalog fact 任一
+  present/duplicate/role-specific/malformed、活动非 owner session，以及 role/ACL transaction SQL failure 与
+  crash 全量 rollback；测试还必须显式断言没有第四个 steady state，candidate 不能被 migration 或 restore
+  admission 接受。restore holder crash 后，新 reset 取得 lifecycle lock仍必须从 durable
+  gate/call/completion facts 拒绝，drop/create/bootstrap/migration 为零；migration、role-bootstrap/
+  init-db-roles 与 owner one-off 在 held lock、active gate、malformed/role override/duplicate authority 下也
+  保持 DDL/DML/audit/grant/CONNECT/call-authority/`pg_restore` writes 为零。测试必须覆盖从管理库持锁、
+  同一 live typed lease 包住 reset check→drop→create→bootstrap transition→ordinary migration，证明顺序不能
+  交换或拆 session；Compose/首次安装也必须 role-bootstrap 成功后才启动 migration。direct migration on
+  candidate 必须为零 DDL/DML，另覆盖 exact GUC grammar、database-wide-only row、新 session 可见性与
+  每次 transition CAS race。
 - restore 测试必须证明 no-gate exact-post `restore_already_applied` 是数据库零写、`psql_calls=0`、
   `pg_restore_calls=0`，只以 kind-aware no-clobber 方式发布 deterministic mode-`0600` local evidence；matching-gate direct edge 则
   CAS 到 `restore_succeeded` 并继续统一 completion。真实 call 先以新 ordinal CAS
@@ -1952,9 +2034,10 @@ API 的四个实际 Uvicorn 启动入口（生产 Compose、开发 Compose、根
   外部值统一导出为固定 Task13 `TEST_DATABASE_URL`，拒绝其他/production-like DSN，并显式执行
   `bash scripts/test-calendar-aad-0019-audit.sh`；audit、pytest 与其他 shell child 都必须继承同一值，不能
   只给单条命令加前缀，也不能以 `just ci` 可能间接包含该脚本作为发布证据。
-- 两个不同日历使用相同 `provider_event_id` 时，互换其描述或地点的完整四列密文组必须认证失败；
-  v1 行必须强制进入重同步，未知版本与 v2 密文/nonce/key version/version 篡改必须 fail closed，
-  且任何路径都不得回退尝试 v1 AAD。
+- 两个不同日历使用相同 `provider_event_id`，以及同一日历中的两个不同事件之间，互换描述或地点的
+  完整 `ciphertext + nonce + key_version + aad_version` 四列组都必须认证失败；v1 行必须强制进入重同步，
+  未知版本与 v2 四列中任一值篡改必须 fail closed，且任何路径都不得回退尝试 v1 AAD、未分帧 v2、
+  去掉 `calendar_id` 或其他事件 identity。
 - Google 增量目录与 Microsoft 完整目录快照的显式语义、空快照、缺席删除、重新出现重建和
   directory revision CAS；陈旧 Microsoft 快照不得覆盖先提交的目录事实。
 - Microsoft Calendar Worker 的 access/refresh token 轮换、无新 refresh token 保留、连续独立
@@ -2053,8 +2136,9 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   `(connection_id, calendar_id)`，不运行目录发现或连接级同步，并在成功提交同一 scope 的 v2 事件、
   cursor 与 freshness 后清除 `calendar_event_resync_required`。该入口和 `post-resync` 审计完成前，
   通用 Scheduler、普通 Taskiq Worker、API 与 Caddy 必须保持停止。
-- 0019 revision 在 Task 16A 创建时已经包含最终 typed guard：fresh/严格空集合的普通
-  `upgrade head` 可通过 zero-bootstrap；revision 0018 且 affected set 非空时，缺少注入 guard 必须在
+- 0019 revision 在 Task 16A 创建时已经包含最终 typed guard：已经先 admission 为 `pristine_idle` 的
+  fresh/严格空集合数据库可通过普通 `upgrade head` 的 affected-set zero-bootstrap；revision 0018 且
+  affected set 非空时，缺少注入 guard 必须在
   mutation 前失败，并在 `on_version_apply` 最终提交前再次核验。Task 27C 只提供真实 artifact guard
   composition，不改写 revision 或 Alembic 环境语义。
 - Task 16A 的 Alembic 外层在线迁移边界还统一持有固定
@@ -2063,6 +2147,14 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
   Task 27D backup 从 pre-revision 开始持对应 shared lock，覆盖 `pg_dump`、post-revision CAS 和本地
   manifest-last 发布；只有 pre/post revision 相等且同一 session 仍持锁才可发布。无需强制同一 MVCC
   snapshot，但 backup 期间 migration 不得提交，typed 0019 guard 语义保持不变。
+- restore catalog 的稳定 admission 永远只有 `pristine_idle | active | completed_idle`。default/legacy
+  `bootstrap_candidate` 只能由 standalone role-bootstrap 或 protected `db-reset` 的 create 后步骤，在同一
+  management/target/schema locks 与单一 owner transaction 下收敛为 baseline，再由普通 parser 读回
+  `pristine_idle`。candidate 不能启动 migration/restore、写三项 authority 或 AuditEvent；额外 grantee、
+  partial ACL、任一 catalog fact、活动非 owner session或 transaction failure 都必须零写/整体 rollback。
+  已有 pristine/completed 的 role-bootstrap 只做幂等最小 grants并保留 completed pair，active/
+  `needs_attention` 拒绝。`db-reset` 与首次安装顺序固定为 check→drop→create→bootstrap→ordinary migration，
+  且整个序列不能拆开 live management lease 或 target lifecycle。
 - 恢复 planner 遇到 `created/queued/running/retry_scheduled` 时必须始终复用该活动 ordinal，绝不分配
   新 ordinal；多个活动尝试是 fail-closed 不变量错误。只有上一尝试已经 `failed` 或 `cancelled`、marker
   仍存在且运维人员再次显式运行无参数 one-off 时，才能在精确 cursor 锁下分配下一个 ordinal。旧终态
@@ -2170,8 +2262,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 - OAuth scope 与能力矩阵一致；Microsoft 仅额外使用 delegated `User.Read` 获取 Graph `/me`
   的稳定身份，不请求目录/应用权限、Contacts、Gmail Draft 或 `Mail.ReadWrite`。
 - Token、真实命令、正文和日程敏感字段按规格加密。
-- 所有新同步的 CalendarEvent 描述和地点都标记为 v2 并绑定完整日历身份；跨日历同 event ID
-  密文互换、v2 篡改、v1/未知版本读取均 fail closed，且没有 legacy fallback。
+- 所有新同步的 CalendarEvent 描述和地点都标记为 v2，并由同一共享 helper 使用固定 domain 与五个
+  `uint32_be(length) || raw_bytes` frame 绑定完整日历/事件/字段身份；跨日历或跨事件完整四列密文互换、
+  delimiter split、Unicode normalization、v2 篡改、v1/未知版本读取均 fail closed，且没有冒号拼接、
+  去掉 calendar ID 或其他 legacy fallback。
 - OAuth refresh fence 只使用现有 OAuthAttempt 与 append-only AuditEvent，不新增 0018 Schema。
   automatic started/confirmed、progressive recovery started/unsatisfied 和 replacement consumption 都使用
   17.3 的关闭 metadata，按各自 schema 精确绑定适用的 matching attempt/source/started_source、F/S/T 或
@@ -2196,8 +2290,10 @@ CI 使用 HTTP mock 和脱敏 fixture，不访问真实供应商。
 M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 
 1. `just ci` 全部通过并保存本轮完整输出摘要。
-2. 安全 scope 审核、四入口 access-log 静态扫描与真实子进程 canary、0019 zero-bootstrap/typed-guard
-   迁移验证、current-expiry deadline 收紧测试、通用与 sealed restore 隔离测试，以及显式
+2. 安全 scope 审核、四入口 access-log 静态扫描与真实子进程 canary、CalendarEvent v2 固定 framing
+   向量/碰撞/Unicode/共享 helper 验证、transient bootstrap candidate/三稳态 admission/事务回滚与
+   create→bootstrap→migration 顺序、0019 affected-set zero-bootstrap/typed-guard 迁移验证、current-expiry
+   deadline 收紧测试、通用与 sealed restore 隔离测试，以及显式
    `scripts/test-calendar-aad-0019-audit.sh` release gate 全部通过。
 3. 专用 Google 测试账户完成新邮件、回复、全部回复、日程创建、修改和恢复。
 4. 一个专用 Microsoft 测试账户完成同等流程；另一账户类型至少通过完整 OAuth、同步和写入
@@ -2286,11 +2382,15 @@ state 文件、manifest basename、Compose project name 或进程 mutex 都不�
 锁序逐字冻结为 `management lifecycle lock → target lock → schema lifecycle lock`。generic/sealed restore
 依次取得三者并持 exclusive schema lock覆盖完整 attempt、psql backend registration/stream reconcile、
 grants、verifier 与 completion-GUC reopen；`db-reset` 的 management lock 覆盖精确
-环境/目标复核、catalog gate/call/completion facts 检查、drop、create 与普通 migration。holder crash 后，新 reset
+环境/目标复核、catalog gate/call/completion facts 检查、drop、create、bootstrap transition 与普通 migration。holder crash 后，新 reset
 即使取得 management lock，仍须从 catalog 拒绝 active/`needs_attention` attempt并保持 drop/create 为零。
 所有 drop/create 只能经该 wrapper；reset 内 migration 接受同一进程内绑定 live management session 的 typed
 lease，不能靠环境变量、文件或另一个 session 伪造。普通 migration/backup/role-bootstrap 等 lifecycle
 wrapper 也必须先取得 management lock，避免目标在其连接/检查期间被另一主机删除或替换。
+`db-reset` 不得在 create 后释放并重新开始 lifecycle：同一 live management lease 与 target lifecycle 必须
+覆盖 check→drop→create→bootstrap transition→ordinary migration；create 后立即逐字节复核目标身份并在
+同一 wrapper 内取得新目标 session/target lock，只有 bootstrap 重新 admission 为 `pristine_idle` 后才把
+该 typed lease 交给 ordinary migration。
 
 `target_identity_digest_v1` 的输入字节精确冻结为
 `SHA-256(b"ai_employee.restore_target.v1" || 0x00 || system_identifier_ascii || 0x00 || database_name_utf8)`，
@@ -2322,6 +2422,41 @@ target 上使用自己的 durable registry/scavenger 与普通 backup lifecycle 
 `ai_employee.restore_call_authority` 与 `ai_employee.restore_completion`。三者都只接受当前 database、`setrole=0` 的唯一 row/key；role-specific
 override、重复 key/row、malformed array、session-local override 或只信任 `current_setting`/缓存均 fail
 closed。新 owner session 的 `current_setting(..., true)` 只证明 catalog 值可见，不能替代权威 catalog 读取。
+
+稳定 catalog admission 之前定义一个受控的瞬态分类 `bootstrap_candidate`。它不是数据库状态、不会写入
+catalog，也不是第四个 steady/admitted restore state；该分类只在当前持锁调用内存在，不能被 migration、
+generic/sealed restore 或其他 owner lifecycle 当作 `pristine_idle`。只有 standalone `role-bootstrap`，以及
+protected `db-reset` 在本次 `CREATE DATABASE` 成功后的紧接 bootstrap 步骤可以请求该 transition。
+
+调用方必须先按既有顺序持有同一个 live management lifecycle lease 与 target lock，再在任何 mutation 前
+直接读取上述三项 database-wide restore facts。三项都必须完全 absent，且不存在 duplicate、role-specific、
+malformed 或未知表示；同时必须证明目标库没有非 owner session，API/Worker/Scheduler/migration/restore、
+其他 role-bootstrap 与所有能写业务数据的进程均未运行。数据库 ACL 还必须逐项匹配且只能匹配以下一个
+候选：
+
+1. fresh/reset PostgreSQL default candidate：`datacl IS NULL` 或逐权限等价的默认 ACL，`PUBLIC` 具有
+   PostgreSQL 默认 CONNECT；`ai_employee_app`/`ai_employee_retention` 可以尚不存在，或存在但没有显式
+   CONNECT。
+2. 当前 pre-protocol legacy candidate：`PUBLIC`、`ai_employee_app` 与 `ai_employee_retention` 都具有既有
+   预协议 CONNECT，且除此之外没有任何额外非 owner CONNECT grantee。
+
+任一 restore fact present、额外 CONNECT grantee、只撤销了部分主体、未知/非 canonical ACL、候选之间的
+混合状态、活动非 owner session或仍可能写入的业务进程，都必须在 role/ACL/Schema/AuditEvent 等任何写入
+前 fail closed；transition 不得自动撤销额外权限、补齐 partial ACL 或把异常状态“修复”为 baseline。
+
+候选通过后，调用方在相同 management/target locks 下取得既有 schema-lifecycle exclusive lock，并只用一个
+显式 owner transaction 完成全部 bootstrap：创建缺失的 app/retention roles；从受 Secret 保护且不记录日志的
+输入更新两者密码；撤销 `PUBLIC` CONNECT；授予 app/retention 最小 CONNECT 与既有最小
+schema/table/sequence 权限。PostgreSQL role/ACL DDL 必须依赖其事务语义整体提交；任一 SQL 错误、进程崩溃
+或最终校验失败都回滚整个 transaction，不能留下 partial role、password、ACL 或 object grants。提交前必须
+在同一 owner transaction 直接重读三项 restore facts 仍全部 absent，并验证 database ACL 已精确成为
+baseline、object grants 不多不少。只有这些检查通过才可 commit。
+
+commit 后仍保持 management/target/schema locks，并调用普通三态 parser 重新 admission；只有结果精确为
+`pristine_idle` 才算 transition 完成，随后才可启动 migration。`bootstrap_candidate` 自身不能启动 restore、
+写 maintenance gate/call/completion、写 `AuditEvent`、进入 0019 affected-set zero-bootstrap 或绕过 0019 typed
+guard。Compose 与首次安装固定执行 role-bootstrap 成功后再运行普通 migration；直接对 candidate 运行
+`upgrade head` 必须保持 DDL/DML/AuditEvent/catalog mutation 为零。
 
 crash-surviving gate 固定为 database 自定义 setting `ai_employee.maintenance_gate`。空闲状态只能是
 `ALTER DATABASE <target> RESET ai_employee.maintenance_gate`；活动值必须逐字节匹配
@@ -2385,8 +2520,9 @@ active ACL 固定为三者 CONNECT 全部 revoked。catalog admission 是三态�
 除此之外的任何组合都 fail closed，包括 gate-only、call-only、completion-only、active gate + completion、
 completed call 缺失、completed call/completion digest 不匹配、cross-attempt pair、gate reset + revoked ACL、
 或 active gate + baseline ACL。不得再用“completion absent + baseline ACL”单独判非法，因为它正是
-`pristine_idle`；首次安装、migration 与 role-bootstrap 必须能在该状态运行。`needs_attention` 是 active call
-的合法终态 phase，但只允许事故处置，不允许被 ordinary lifecycle 或新 attempt 覆盖。
+`pristine_idle`；但 PostgreSQL default/legacy candidate ACL 不是 baseline，必须先经过上面的 transient
+transition。稳定 admission 始终只有 `pristine_idle | active | completed_idle` 三态。`needs_attention` 是
+active call 的合法终态 phase，但只允许事故处置，不允许被 ordinary lifecycle 或新 attempt 覆盖。
 
 无 active gate 的新 generic/sealed 请求在 management lifecycle + target lock 下、建立 gate 与撤销 CONNECT
 之前，必须先通过只读 verifier 证明 current revision 和完整 `restore_fingerprint_v1` 逐字节等于 manifest
@@ -2425,7 +2561,10 @@ disposable target/registry，不占用或改写这组三个 catalog facts。
 matching restore 只有持锁 session 本身可以继续；不能靠 `AI_EMPLOYEE_RESTORE_CONNECT_FENCE`、attempt
 环境变量或第二条 owner connection 冒充 lock owner。正常 role bootstrap 在 gate 非空时绝不 grant
 CONNECT 或其他权限；restore 所需 object/schema grants 与 verifier functions 必须由持锁 owner
-maintenance executor 在同一 connection 上调用。migration wrapper、role bootstrap 或任意 owner one-off
+maintenance executor 在同一 connection 上调用。对已经 admission 为 `pristine_idle` 或 `completed_idle` 的
+数据库，standalone role-bootstrap 只允许更新 Secret 驱动的 role password 并幂等重申既有最小
+CONNECT/schema/table/sequence grants，不得清除 completed pair、扩权或重跑 candidate transition；`active`
+及其 `needs_attention` phase 一律拒绝。migration wrapper、role bootstrap 或任意 owner one-off
 若在 active gate 建立后启动，无论原 restore 仍活跃还是已经 crash，都必须在第一笔写前拒绝，测试要求
 migration/drop/create/grant/audit、CONNECT grants、`pg_restore` 与 catalog authority mutation 全为零。
 restore executor 的 management session 与 target owner session 只用于 manifest-bound generic/sealed，并从
@@ -2749,8 +2888,9 @@ backup/audit/migration/resync/restore verifier 必须拒绝当前镜像内容与
 5. 通过受限 `calendar-aad-migrate-0019` one-off 应用前向 `0019`。0019 revision 与
    `migrations/env.py` 的 mutation 前/`on_version_apply` 最终 guard 已由 Task 16A 冻结；该 one-off
    只能注入 Task 27C 的真实 artifact guard，在任何 DDL/DML 前和事务最终提交前校验 preflight artifact、
-   实际镜像内容 ID、精确 affected set、本地可恢复性和 effective deadline。fresh/严格空集合的普通
-   `upgrade head` 仍走内建 zero-bootstrap，非空 0018 数据库缺 guard 则 mutation 前失败；再执行
+   实际镜像内容 ID、精确 affected set、本地可恢复性和 effective deadline。已经 admission 为
+   `pristine_idle` 的 fresh/严格空集合数据库仍由普通 `upgrade head` 走内建 affected-set zero-bootstrap；
+   default/legacy bootstrap candidate 不能进入该分支，非空 0018 数据库缺 guard 则 mutation 前失败；再执行
    迁移后只读审计。验证
    只新增版本列/约束、v1 标记和精确 pair 的事件 scope 游标失效，其他 connection 的同名 calendar、
    directory cursor/revision 与全部事件 AEAD 字节均未变化。
@@ -2835,10 +2975,11 @@ v2-only Calendar 能力和核对能力的前滚修复镜像，而不是直接回
 | 会话被短暂接管后批准写入 | Secure/HttpOnly/SameSite、CSRF、10 分钟决定窗口、5 分钟认领窗口、会话撤销 |
 | 多账户选择错误 | 回复绑定原连接、新建使用可切换默认值、审批展示精确账户 |
 | 日程并发修改被覆盖 | 基础 ETag、执行前重读、条件更新、冲突后重新提案 |
-| CalendarEvent 旧 AAD 未绑定日历，或混跑 writer 导致跨日历密文替换 | v2 纳入 `calendar_id`、字段独立版本与四列约束、0019 强制受限重同步、排空旧 Worker、v2 `InvalidTag` 无 legacy fallback |
+| CalendarEvent 旧 AAD 未绑定日历，冒号 split collision 或混跑 writer 导致跨事件密文替换 | v2 使用固定 domain 与五个长度 frame 的共享纯 helper，UUID/strict UTF-8/field fail-closed 校验，字段独立版本与四列约束、固定 delimiter/Unicode 向量、0019 强制受限重同步、排空旧 Worker，且无 v1/旧 v2/去 calendar ID fallback |
 | 0019 依赖 access-only/不可用 refresh，或恢复跨过 token 有效窗口 | affected connection 必须有可解密可用 refresh；preflight 按 connection 主动 refresh、验证实际 scope 并轮换 AEAD；artifact deadline 固定，后续从 current access rows 重算并只允许收紧；超时仅允许 sealed-window 整库恢复到 0018 |
 | 历史 OAuth callback query 被 Uvicorn access logger 输出 | 四个真实启动入口全部关闭 access log；应用日志 schema 禁止 raw URL/query/request target；真实子进程 canary 同时证明 query 零泄露与脱敏审计正常 |
-| 0019 guard 只在专用 rollout CLI 存在，破坏 fresh DB 或普通 `upgrade head` | Task 16A 在 revision 内冻结 mutation 前与 `on_version_apply` 最终 guard；fresh/严格空集合走 zero-bootstrap，0018 非空无 typed guard 在 mutation 前失败；Task 27C 只注入，不重写 revision |
+| PostgreSQL 默认/legacy ACL 被误当作 `pristine_idle`，或 bootstrap crash 留下 partial role/ACL | admission 前只允许 standalone role-bootstrap 与 protected reset post-create 识别两个 exact `bootstrap_candidate`；同一 management/target/schema locks 下单一 owner transaction 建 role、更新 Secret password、撤销/授予最小权限并重读三 facts/ACL，错误整体 rollback；普通 migration/restore 零写拒绝 candidate，稳定状态仍只有三态 |
+| 0019 guard 只在专用 rollout CLI 存在，破坏 fresh DB 或普通 `upgrade head` | Task 16A 在 revision 内冻结 mutation 前与 `on_version_apply` 最终 guard；已先 admission 的 fresh/严格空集合走 affected-set zero-bootstrap，candidate 不能借此迁移，0018 非空无 typed guard 在 mutation 前失败；Task 27C 只注入，不重写 revision |
 | 双 Worker、Taskiq 重投或 `TransientProviderError` 导致同一 connection 重复 refresh/exchange | 所有 writer 共用 `OAuthRefreshCoordinator` 与 connection-scoped session lease；provider 前提交 attempt-bound started，网络外无业务事务，响应后同事务 CAS/result；网络未知、响应后 lock loss、CAS miss 或已确认 rollback 后续 delivery 只读 fence且 provider call 为零；commit ACK 丢失用新 session 按 user/connection/attempt 查询版本化 confirmed/unsatisfied/replacement result union，合法 matching event 永久关闭对应 attempt，再独立核对 current readiness；后续合法状态变化不复活，只有 changed=true 的 old-identity rollback 或缺行/AEAD/归属/状态冲突返回 `oauth_credential_state_conflict` 且零调用，无 result 才 unresolved且绝不补写 |
 | explicit recovery 拒绝或 missing/same token 后 capability 长期停在 `authorizing` | start 的 S→T 与 requested capability `authorizing` 原子提交；可安全确认的 unsatisfied 在同一短事务复用 `mark_progressive_authorization_failed` 收敛为 `action_required`、写稳定 error code并保留 actual scopes/last-verified facts；stale T 只做 no-op 与安全审计，用户可创建新 attempt，原 automatic fence 不被消费 |
 | Google callback 的歧义、错误分类被抹平或 error 重放绕过一次性授权状态 | Google 与 Microsoft 都要求 state 且仅接受互斥 code/error；缺 state、code+error、两者都缺失或 malformed error 在消费前拒绝；任何合法 error（含未知名称）都先一次性消费 state并在 target T 写 unsatisfied/no-op，raw error 不入库/日志且 replay fail closed；公开 Problem 与持久 error code 使用安全分类矩阵，保留 `microsoft_admin_consent_required`/`microsoft_reauthorization_required`，用户拒绝与未知名称回退 `oauth_authorization_failed`；targetless fenced identity 仍在保存前阻断 |
