@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from hmac import compare_digest
 from typing import Literal, Protocol, cast
+from unicodedata import category as unicode_category
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -188,6 +189,18 @@ class CalendarAvailabilityContext:
     missing_connection_ids: tuple[UUID, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CalendarAvailabilityRead:
+    """冻结短读事务输出，供事务外纯候选计算使用。
+
+    ``proposal`` 与 ``context`` 都是应用层不可变 DTO；adapter 关闭读事务后不得保留或
+    复用 ORM 对象。写阶段只使用其中的标量身份、版本和完整 desired mapping。
+    """
+
+    proposal: CalendarProposalSnapshot
+    context: CalendarAvailabilityContext
+
+
 class CalendarProposalContent(BaseModel):
     """表示编辑态快照中的完整期望状态与本地控制元数据。
 
@@ -298,6 +311,21 @@ class CalendarProposalContent(BaseModel):
             raise ValueError("calendar proposal interval requires timezone")
         return self
 
+    @model_validator(mode="after")
+    def confirmation_fields_partition_shell(self) -> "CalendarProposalContent":
+        """确保显式确认 shell 的已确认/待确认集合恰好覆盖四类字段。
+
+        历史 snapshot 没有显式确认语义时保持兼容；shell 标记为需要确认后，任意重叠、
+        遗漏或额外字段都必须在读取边界拒绝，避免未验证更新进入不可变快照。
+        """
+        if self.requires_explicit_confirmation:
+            confirmed = set(self.confirmed_fields)
+            required = set(self.required_confirmations)
+            shell = set(_SHELL_CONFIRMATIONS)
+            if confirmed & required or confirmed | required != shell:
+                raise ValueError("calendar proposal confirmations must partition the shell fields")
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class CalendarProposalView:
@@ -332,17 +360,44 @@ class CalendarProposalView:
 
     @property
     def submission_ready(self) -> bool:
-        """仅表示编辑内容字段齐全；Task 18 仍须独立冻结与审批。"""
-        return (
+        """按操作种类判断本地编辑态是否具备提交冻结的完整事实。
+
+        该属性只检查当前本地视图，不创建审批、任务或任何外部写入。四项确认必须完整，
+        公共文本身份不能只含空白；update/restore 还必须绑定供应商目标、ETag、稳定 before
+        和非空完整 diff，而 create 必须明确没有这三类历史目标绑定。
+        """
+        content_ready = (
             self.status is CalendarProposalStatus.EDITING
+            and self.content.confirmed_fields == _SHELL_CONFIRMATIONS
             and not self.content.required_confirmations
             and self.content.notification_policy is not None
             and self.content.starts_at is not None
             and self.content.ends_at is not None
             and self.content.timezone is not None
             and self.content.all_day is not None
-            and self.content.title is not None
+            and isinstance(self.content.title, str)
+            and self.content.title.strip() != ""
+            and isinstance(self.calendar_id, str)
+            and self.calendar_id.strip() != ""
         )
+        if not content_ready:
+            return False
+        if self.operation_kind == "create":
+            return (
+                self.target_event_id is None
+                and self.base_etag is None
+                and self.before_snapshot_id is None
+            )
+        if self.operation_kind in {"update", "restore"}:
+            return (
+                isinstance(self.target_event_id, str)
+                and self.target_event_id.strip() != ""
+                and isinstance(self.base_etag, str)
+                and self.base_etag.strip() != ""
+                and self.before_snapshot_id is not None
+                and bool(self.content.changed_fields)
+            )
+        return False
 
 
 class CalendarProposalRepository(Protocol):
@@ -430,9 +485,39 @@ class CalendarProposalSourceReader(Protocol):
         self,
         *,
         user_id: UUID,
+        observed_at: datetime,
         search_start: datetime,
         horizon_days: int,
     ) -> CalendarAvailabilityContext | None: ...
+
+
+class CalendarAvailabilityPersistence(Protocol):
+    """定义 suggestion 的两短事务持久化边界。
+
+    实现必须让 ``load_suggestion`` 的事务在返回前结束；候选函数随后在应用层运行；
+    ``save_suggestion`` 再用独立事务和 ``expected_version`` CAS 写入下一不可变版本。
+    """
+
+    async def load_suggestion(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        observed_at: datetime,
+        search_start: datetime,
+        horizon_days: int,
+    ) -> CalendarAvailabilityRead | None: ...
+
+    async def save_suggestion(
+        self,
+        *,
+        snapshot_id: UUID,
+        user_id: UUID,
+        proposal_id: UUID,
+        expected_version: int,
+        desired_state: Mapping[str, object],
+        retain_until: datetime,
+    ) -> CalendarProposalSnapshot | None: ...
 
 
 class CalendarProposalNotFoundError(Exception):
@@ -449,12 +534,20 @@ class CalendarProposalUseCase:
         calendar: CalendarProposalSourceReader,
         clock: Callable[[], datetime],
         id_factory: Callable[[], UUID] = uuid4,
+        availability: CalendarAvailabilityPersistence | None = None,
+        suggestion_function: Callable[..., AvailabilityResult] = suggest_meeting_times,
     ) -> None:
-        """注入提案、本人日历、时钟和 UUID 端口。"""
+        """注入提案、本人日历、可选两短事务端口、纯候选函数、时钟和 UUID。
+
+        ``availability`` 对创建、编辑和恢复不是必需依赖，因此构造器保留可选；但是
+        ``suggest_times()`` 必须显式注入该端口，否则会在访问任何仓储前稳定失败。
+        """
         self._proposals = proposals
         self._calendar = calendar
         self._clock = clock
         self._id_factory = id_factory
+        self._availability = availability
+        self._suggestion_function = suggestion_function
 
     async def create_shell(
         self,
@@ -481,7 +574,9 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=target.connection_id,
-            creation_idempotency_key=_idempotency_key(idempotency_key),
+            creation_idempotency_key=validate_calendar_creation_idempotency_key(
+                idempotency_key
+            ),
             creation_payload_hash=_creation_hash(
                 connection_id=target.connection_id,
                 calendar_id=target.calendar_id,
@@ -522,7 +617,9 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=connection_id,
-            creation_idempotency_key=_idempotency_key(idempotency_key),
+            creation_idempotency_key=validate_calendar_creation_idempotency_key(
+                idempotency_key
+            ),
             creation_payload_hash=_creation_hash(
                 connection_id=connection_id,
                 calendar_id=calendar_id,
@@ -571,7 +668,7 @@ class CalendarProposalUseCase:
         # recurrence 必须先返回稳定领域错误；对象形状不能被通用幂等哈希边界
         # 提前降级为没有 error_code 的 TypeError。
         _reject_recurrence_input(changes)
-        creation_key = _idempotency_key(
+        creation_key = validate_calendar_creation_idempotency_key(
             idempotency_key or _derived_update_key(event_id=event_id, changes=changes)
         )
         # 创建哈希明确排除随机 operation_id，因此先用零 UUID 形成规范请求，才能在
@@ -603,13 +700,19 @@ class CalendarProposalUseCase:
             # 若首次事务只留下 desired，重放沿用已持久化 operation_id 修复同一逻辑
             # 位置的 before；绝不生成第二个提案或替换既有 desired。
             persisted = _to_view(existing)
-            before = hash_before.model_copy(update={"operation_id": persisted.content.operation_id})
+            before_values = hash_before.model_dump(mode="python")
+            before_values["operation_id"] = persisted.content.operation_id
+            before = CalendarProposalContent.model_validate(before_values)
             snapshot = existing
             retain_until = existing.retain_until
         else:
             operation_id = self._id_factory()
-            before = hash_before.model_copy(update={"operation_id": operation_id})
-            desired = hash_desired.model_copy(update={"operation_id": operation_id})
+            before_values = hash_before.model_dump(mode="python")
+            before_values["operation_id"] = operation_id
+            before = CalendarProposalContent.model_validate(before_values)
+            desired_values = hash_desired.model_dump(mode="python")
+            desired_values["operation_id"] = operation_id
+            desired = CalendarProposalContent.model_validate(desired_values)
             retain_until = _retain_until(self._clock, target.retention_days)
             snapshot = await self._proposals.create(
                 proposal_id=self._id_factory(),
@@ -628,7 +731,9 @@ class CalendarProposalUseCase:
         # 重放可能返回旧提案；before 必须使用已持久化 operation_id，避免随机新 ID 令
         # 同一逻辑位置的不可变 snapshot 哈希发生变化。
         persisted = _to_view(snapshot)
-        before = before.model_copy(update={"operation_id": persisted.content.operation_id})
+        persisted_before_values = before.model_dump(mode="python")
+        persisted_before_values["operation_id"] = persisted.content.operation_id
+        before = CalendarProposalContent.model_validate(persisted_before_values)
         saved_before = await self._proposals.save_snapshot(
             snapshot_id=self._id_factory(),
             user_id=user_id,
@@ -696,7 +801,9 @@ class CalendarProposalUseCase:
                 before=await self._before_content(user_id=user_id, snapshot=current),
             )
             if set(changes).intersection(_TIME_FIELDS):
-                updated = updated.model_copy(update={"availability": None})
+                updated_values = updated.model_dump(mode="python")
+                updated_values["availability"] = None
+                updated = CalendarProposalContent.model_validate(updated_values)
         saved = await self._proposals.save_next_version(
             snapshot_id=self._id_factory(),
             user_id=user_id,
@@ -717,13 +824,32 @@ class CalendarProposalUseCase:
         expected_version: int,
         search_start: datetime,
     ) -> CalendarProposalView:
-        """为当前时长计算本人日历候选，并把结果缓存为下一不可变版本。"""
-        current = await self._proposals.get_current(
+        """用独立 freshness 时钟计算候选，并以版本 CAS 缓存下一不可变版本。
+
+        ``CalendarAvailabilityPersistence`` 的读事务在本方法获得冻结 DTO 前已经提交，
+        纯候选函数运行期间没有数据库事务，随后才开启独立写事务。构造器允许不注入该
+        端口以服务其他提案操作，但建议入口会 fail closed，绝不静默退回 caller-owned
+        repository 路径而绕过 expected-version CAS。
+
+        Raises:
+            StateConflictError: 未注入两短事务持久化端口，或当前提案不是定时事件。
+            CalendarProposalNotFoundError: 提案或其可用性上下文不存在/不属于当前用户。
+        """
+        availability_persistence = self._availability
+        if availability_persistence is None:
+            raise _calendar_availability_persistence_unavailable()
+        observed_at = _aware_utc(self._clock(), field="calendar proposal clock")
+        loaded = await availability_persistence.load_suggestion(
             user_id=user_id,
             proposal_id=proposal_id,
+            observed_at=observed_at,
+            search_start=search_start,
+            horizon_days=CALENDAR_AVAILABILITY_HORIZON_DAYS,
         )
-        if current is None:
+        if loaded is None:
             raise CalendarProposalNotFoundError
+        current = loaded.proposal
+        context = loaded.context
         content = CalendarProposalContent.model_validate(current.desired_snapshot.content)
         if content.starts_at is None or content.ends_at is None or content.all_day is not False:
             raise StateConflictError(
@@ -732,14 +858,7 @@ class CalendarProposalUseCase:
             )
         start = _parse_timed_instant(content.starts_at)
         end = _parse_timed_instant(content.ends_at)
-        context = await self._calendar.get_availability_context(
-            user_id=user_id,
-            search_start=search_start,
-            horizon_days=CALENDAR_AVAILABILITY_HORIZON_DAYS,
-        )
-        if context is None:
-            raise CalendarProposalNotFoundError
-        availability = suggest_meeting_times(
+        availability = self._suggestion_function(
             requested_duration=end - start,
             search_start=search_start,
             timezone=context.timezone,
@@ -751,13 +870,20 @@ class CalendarProposalUseCase:
             grid_minutes=CALENDAR_AVAILABILITY_GRID_MINUTES,
             limit=CALENDAR_AVAILABILITY_LIMIT,
         )
-        return await self.edit(
+        values = content.model_dump(mode="python")
+        values["availability"] = availability
+        updated = CalendarProposalContent.model_validate(values)
+        saved = await availability_persistence.save_suggestion(
+            snapshot_id=self._id_factory(),
             user_id=user_id,
             proposal_id=proposal_id,
             expected_version=expected_version,
-            changes={"availability": availability},
-            internal_cache_update=True,
+            desired_state=_content_json(updated),
+            retain_until=current.retain_until,
         )
+        if saved is None:
+            raise CalendarProposalNotFoundError
+        return _to_view(saved)
 
     async def confirm(
         self,
@@ -825,14 +951,16 @@ class CalendarProposalUseCase:
 
         _require_confirmation_value(content, normalized_confirmation, target=target)
         confirmed = _ordered_confirmations({*content.confirmed_fields, normalized_confirmation})
-        updated = content.model_copy(
-            update={
+        updated_values = content.model_dump(mode="python")
+        updated_values.update(
+            {
                 "confirmed_fields": confirmed,
                 "required_confirmations": _ordered_confirmations(
                     set(_SHELL_CONFIRMATIONS).difference(confirmed)
                 ),
             }
         )
+        updated = CalendarProposalContent.model_validate(updated_values)
         saved = await self._proposals.save_next_version(
             snapshot_id=self._id_factory(),
             user_id=user_id,
@@ -888,8 +1016,9 @@ class CalendarProposalUseCase:
         current_content = _content_from_provider_event(current, operation_id=operation_id)
         changed_fields = _changed_fields(current_content, historical)
         notification = _default_notification("restore", historical.attendees, changed_fields)
-        desired = historical.model_copy(
-            update={
+        desired_values = historical.model_dump(mode="python")
+        desired_values.update(
+            {
                 "operation_id": operation_id,
                 "notification_policy": notification,
                 "notification_policy_user_set": False,
@@ -901,6 +1030,7 @@ class CalendarProposalUseCase:
                 "availability": None,
             }
         )
+        desired = CalendarProposalContent.model_validate(desired_values)
         _require_supported_notification(target, notification)
         retain_until = _retain_until(self._clock, target.retention_days)
         snapshot = await self._proposals.create(
@@ -908,7 +1038,9 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=source.connection_id,
-            creation_idempotency_key=_idempotency_key(idempotency_key),
+            creation_idempotency_key=validate_calendar_creation_idempotency_key(
+                idempotency_key
+            ),
             creation_payload_hash=_creation_hash(
                 connection_id=source.connection_id,
                 calendar_id=source.calendar_id,
@@ -926,9 +1058,9 @@ class CalendarProposalUseCase:
             desired_state=_content_json(desired),
         )
         persisted = _to_view(snapshot)
-        current_content = current_content.model_copy(
-            update={"operation_id": persisted.content.operation_id}
-        )
+        current_values = current_content.model_dump(mode="python")
+        current_values["operation_id"] = persisted.content.operation_id
+        current_content = CalendarProposalContent.model_validate(current_values)
         saved_before = await self._proposals.save_snapshot(
             snapshot_id=self._id_factory(),
             user_id=user_id,
@@ -1125,8 +1257,9 @@ def _apply_user_changes(
     else:
         confirmed = _SHELL_CONFIRMATIONS
         required = ()
-    return candidate.model_copy(
-        update={
+    final_values = candidate.model_dump(mode="python")
+    final_values.update(
+        {
             "notification_policy": notification,
             "notification_policy_user_set": user_set_notification,
             "changed_fields": changed_fields,
@@ -1134,6 +1267,7 @@ def _apply_user_changes(
             "confirmed_fields": confirmed,
         }
     )
+    return CalendarProposalContent.model_validate(final_values)
 
 
 def _normalized_changes(changes: Mapping[str, object]) -> dict[str, object]:
@@ -1495,16 +1629,26 @@ def _retain_until(clock: Callable[[], datetime], retention_days: int) -> datetim
     return _aware_utc(clock(), field="calendar proposal clock") + timedelta(days=retention_days)
 
 
-def _idempotency_key(value: str) -> str:
-    """验证用户范围创建键为单行、不补空白且不超过数据库边界。"""
-    if (
-        not isinstance(value, str)
-        or value == ""
-        or value != value.strip()
-        or len(value) > 255
-        or "\r" in value
-        or "\n" in value
-    ):
+def validate_calendar_creation_idempotency_key(value: str) -> str:
+    """验证日历创建幂等键的共享、可重放边界。
+
+    Args:
+        value: 由 API、应用用例或恢复 Worker 携带的候选幂等键。
+
+    Returns:
+        原样返回已通过校验的键；不做前缀改写或大小写归一化，确保数据库唯一键与
+        审批/恢复载荷绑定的字节完全一致。
+
+    Raises:
+        ValueError: 候选值不是字符串、为空、带首尾空白、超过 255 个 Unicode 标量，
+            或包含任意 Unicode ``Cc`` 控制字符（包括 C0、DEL 与换行）。
+
+    该函数只依赖标准库，故 Worker 可以在解析持久恢复输入时复用同一边界，而不会
+    把 SQLAlchemy、供应商 SDK 或网络行为引入 application 层验证。
+    """
+    if not isinstance(value, str) or value == "" or value != value.strip() or len(value) > 255:
+        raise ValueError("calendar proposal idempotency key is invalid")
+    if any(unicode_category(character) == "Cc" for character in value):
         raise ValueError("calendar proposal idempotency key is invalid")
     return value
 
@@ -1531,6 +1675,14 @@ def _connection_capability_disabled() -> StateConflictError:
     return StateConflictError(
         error_code="connection_capability_disabled",
         message="calendar write capability is not enabled for the selected connection",
+    )
+
+
+def _calendar_availability_persistence_unavailable() -> StateConflictError:
+    """构造 suggestion 缺少两短事务持久化端口时的稳定 fail-closed 错误。"""
+    return StateConflictError(
+        error_code="calendar_availability_persistence_unavailable",
+        message="calendar availability persistence is unavailable",
     )
 
 
@@ -1564,6 +1716,8 @@ __all__ = [
     "CALENDAR_AVAILABILITY_LIMIT",
     "DEFAULT_CALENDAR_CONTENT_RETENTION_DAYS",
     "CalendarAvailabilityContext",
+    "CalendarAvailabilityPersistence",
+    "CalendarAvailabilityRead",
     "CalendarOperationKind",
     "CalendarProposalContent",
     "CalendarProposalEventBinding",
@@ -1580,4 +1734,5 @@ __all__ = [
     "CalendarSnapshot",
     "CalendarSnapshotKind",
     "parse_calendar_proposal_conversation_request",
+    "validate_calendar_creation_idempotency_key",
 ]

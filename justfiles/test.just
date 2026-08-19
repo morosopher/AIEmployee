@@ -12,8 +12,8 @@ test-frontend:
 
 [group('quality')]
 test-integration:
-    # 发布门禁必须同时覆盖真实边界、供应商契约和已批准的简报评测基线。
-    uv run --project backend pytest backend/tests/integration backend/tests/contract backend/tests/evals -q
+    # parent orchestrator 用两个独立 pytest session 隔离 roles-present 与 roles-absent 状态。
+    uv run --project backend python scripts/run_integration_tests.py
 
 [group('quality')]
 test-e2e:

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
+from typing import Literal
 from uuid import UUID
 
 import httpx
 import pytest
 import respx
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 
+from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
 from ai_employee.application.ports.calendar import (
     CalendarDirectoryPage,
     CalendarEvent,
@@ -28,6 +31,9 @@ from ai_employee.domain.errors import (
     StateConflictError,
     TransientProviderError,
     UserActionRequiredError,
+)
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
 )
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -52,6 +58,26 @@ from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.sync_calendar import CalendarSyncTaskStep
 
 GRAPH_CALENDARS_URL = "https://graph.microsoft.com/v1.0/me/calendars"
+
+# 每个测试异常退出时先释放本模块创建的所有异步 pool，再进入共享数据库清理。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """让本模块只使用 Cycle 5 已验证的 regular head 数据库。"""
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖全局 migrate fixture；共享 helper 已完成 typed lifecycle 与 catalog 复核。"""
+    del cycle5_regular_database_url
+    yield
 
 
 class _Reader:
@@ -80,6 +106,246 @@ class _Reader:
 
     async def get_current_event(self, calendar_id: str, provider_event_id: str):
         del calendar_id, provider_event_id
+
+
+@dataclass(slots=True)
+class _AadWriterReader:
+    """按精确 calendar scope 返回合成事件，验证 Microsoft writer 的真实 AEAD 边界。"""
+
+    events_by_calendar: dict[str, CalendarEvent]
+
+    async def directory_pages(
+        self, cursor: str | None = None
+    ) -> AsyncIterator[CalendarDirectoryPage]:
+        """本测试只执行精确 scope，同步若误入目录路径应立即失败。"""
+        del cursor
+        raise AssertionError("AAD writer test must not execute directory sync")
+        yield  # pragma: no cover - 保留 async generator 协议形状。
+
+    async def initial_pages(self, calendar_id: str) -> AsyncIterator[CalendarSyncPage]:
+        """返回与请求 scope 完全一致的单事件最终页。"""
+        yield CalendarSyncPage(
+            (self.events_by_calendar[calendar_id],),
+            None,
+            f"delta-{len(calendar_id.encode('utf-8'))}",
+        )
+
+    async def sync_pages(self, calendar_id: str, cursor: str) -> AsyncIterator[CalendarSyncPage]:
+        """测试每个 scope 只同步一次，旧 cursor 路径不应被调用。"""
+        del calendar_id, cursor
+        raise AssertionError("AAD writer test must use initial sync")
+        yield  # pragma: no cover - 保留 async generator 协议形状。
+
+    async def get_current_event(
+        self, calendar_id: str, provider_event_id: str
+    ) -> CalendarEvent | None:
+        """writer 测试不使用精确事件读取。"""
+        del calendar_id, provider_event_id
+        return None
+
+
+def _aad_writer_event(*, calendar_id: str, provider_event_id: str) -> CalendarEvent:
+    """构造可辨认原文，并保留 opaque calendar/event ID 的原始 Unicode。"""
+    return CalendarEvent(
+        event_id=provider_event_id,
+        calendar_id=calendar_id,
+        title=f"AAD event {calendar_id}",
+        description=f"description::{calendar_id}::{provider_event_id}",
+        location=f"location::{calendar_id}::{provider_event_id}",
+        starts_at=datetime(2030, 1, 3, 1, tzinfo=UTC),
+        ends_at=datetime(2030, 1, 3, 2, tzinfo=UTC),
+        all_day=False,
+        transparency="opaque",
+        status="confirmed",
+        timezone="UTC",
+        recurring_event_id=None,
+        etag=f"etag-{len(calendar_id)}-{len(provider_event_id)}",
+        provider_url="https://outlook.example.test/aad-event",
+        can_edit=True,
+    )
+
+
+async def _seed_microsoft_aad_writer(
+    *,
+    sessions: ManagedAsyncSessionMaker,
+    case_name: str,
+    identities: tuple[tuple[str, str], ...],
+) -> tuple[UUID, UUID, dict[str, CalendarEvent]]:
+    """创建只供一个真实 Microsoft writer 场景使用的连接与精确 scope。
+
+    Args:
+        sessions: 当前测试显式创建并负责清理的异步会话工厂。
+        case_name: 只用于生成合成用户身份的稳定场景名。
+        identities: 按 ``calendar_id + provider_event_id`` 提供的 opaque 身份集合。
+
+    Returns:
+        用户/连接 ID，以及按 calendar ID 索引的合成事件。
+    """
+    events_by_calendar = {
+        calendar_id: _aad_writer_event(
+            calendar_id=calendar_id,
+            provider_event_id=provider_event_id,
+        )
+        for calendar_id, provider_event_id in identities
+    }
+    async with sessions.begin() as session:
+        owner = UserModel(
+            email=f"microsoft-calendar-aad-{case_name}@example.test",
+            display_name=f"Microsoft Calendar AAD {case_name}",
+            password_hash=None,
+            timezone="UTC",
+            locale="zh-CN",
+            brief_time=time(8),
+            is_active=True,
+        )
+        session.add(owner)
+        await session.flush()
+        connection = OAuthConnectionModel(
+            user_id=owner.id,
+            provider="microsoft",
+            provider_account_id=f"aad-{case_name}-subject",
+            provider_tenant_id=f"aad-{case_name}-tenant",
+            account_type="work_school",
+            account_email=owner.email,
+            scopes=["Calendars.Read"],
+            status="connected",
+            last_error_code=None,
+        )
+        session.add(connection)
+        await session.flush()
+        session.add(
+            ConnectionCapabilityModel(
+                user_id=owner.id,
+                connection_id=connection.id,
+                capability="calendar.read",
+                status="enabled",
+                actual_scopes=["Calendars.Read"],
+            )
+        )
+        for index, (calendar_id, _) in enumerate(identities):
+            session.add(
+                ProviderCalendarModel(
+                    user_id=owner.id,
+                    connection_id=connection.id,
+                    provider_calendar_id=calendar_id,
+                    name=f"AAD calendar {index}",
+                    timezone="UTC",
+                    is_primary=index == 0,
+                    access_role="owner",
+                    can_write=True,
+                    provider_url=None,
+                )
+            )
+            session.add(
+                SyncCursorModel(
+                    connection_id=connection.id,
+                    resource_kind="calendar",
+                    scope_key=calendar_id,
+                    cursor=None,
+                )
+            )
+        user_id, connection_id = owner.id, connection.id
+    return user_id, connection_id, events_by_calendar
+
+
+async def _execute_microsoft_aad_writer_sync(
+    *,
+    sessions: ManagedAsyncSessionMaker,
+    cipher: AeadCipher,
+    user_id: UUID,
+    connection_id: UUID,
+    events_by_calendar: dict[str, CalendarEvent],
+    calendar_ids: tuple[str, ...],
+) -> None:
+    """通过真实 Microsoft registry 分派逐个执行精确 scope writer。"""
+
+    @asynccontextmanager
+    async def stores() -> AsyncIterator[SqlAlchemyCalendarSyncRepository]:
+        """为每个同步事务提供显式类型的 PostgreSQL repository。"""
+        async with sessions.begin() as session:
+            yield SqlAlchemyCalendarSyncRepository(session)
+
+    use_case = SyncCalendarUseCase(
+        stores,
+        ProviderAdapterRegistry(
+            microsoft_calendar=_AadWriterReader(events_by_calendar=events_by_calendar)
+        ),
+        cipher,
+    )
+    for calendar_id in calendar_ids:
+        await use_case.execute(
+            user_id=user_id,
+            connection_id=connection_id,
+            scope_key=calendar_id,
+        )
+
+
+async def _load_microsoft_aad_writer_rows(
+    *,
+    sessions: ManagedAsyncSessionMaker,
+    user_id: UUID,
+    connection_id: UUID,
+    calendar_ids: tuple[str, ...],
+) -> dict[str, CalendarEventModel]:
+    """读取本场景精确连接与 calendar 集合内的真实持久行。"""
+    async with sessions() as session:
+        rows = (
+            await session.scalars(
+                select(CalendarEventModel).where(
+                    CalendarEventModel.user_id == user_id,
+                    CalendarEventModel.connection_id == connection_id,
+                    CalendarEventModel.calendar_id.in_(calendar_ids),
+                )
+            )
+        ).all()
+    return {row.calendar_id: row for row in rows}
+
+
+def _encrypted_aad_writer_fields(
+    row: CalendarEventModel,
+) -> tuple[EncryptedValue, EncryptedValue]:
+    """把真实 ORM 四元组前置部分还原为 cipher 可消费的两个加密值。"""
+    assert row.description_ciphertext is not None
+    assert row.description_nonce is not None
+    assert row.description_key_version is not None
+    assert row.location_ciphertext is not None
+    assert row.location_nonce is not None
+    assert row.location_key_version is not None
+    return (
+        EncryptedValue(
+            row.description_ciphertext,
+            row.description_nonce,
+            row.description_key_version,
+        ),
+        EncryptedValue(
+            row.location_ciphertext,
+            row.location_nonce,
+            row.location_key_version,
+        ),
+    )
+
+
+def _decrypt_aad_writer_field(
+    *,
+    cipher: AeadCipher,
+    encrypted: EncryptedValue,
+    user_id: UUID,
+    connection_id: UUID,
+    calendar_id: str,
+    provider_event_id: str,
+    field: Literal["description", "location"],
+) -> str:
+    """使用共享五字段 framed v2 AAD 解密一个真实 writer 字段。"""
+    return cipher.decrypt(
+        encrypted,
+        calendar_event_field_aad_v2(
+            user_id=str(user_id),
+            connection_id=str(connection_id),
+            calendar_id=calendar_id,
+            provider_event_id=provider_event_id,
+            field=field,
+        ),
+    ).decode("utf-8")
 
 
 @dataclass(slots=True)
@@ -1300,3 +1566,146 @@ async def test_microsoft_calendar_sync_keeps_user_and_calendar_scopes_isolated(
         and scope.resource_kind == "calendar"
     ] == [("microsoft", "calendar", "directory")]
     await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_microsoft_calendar_writer_separates_delimiter_collision_and_legacy_aad(
+    database_url: str,
+) -> None:
+    """A/B 冒号碰撞身份必须各自绑定 v2，且拒绝 swap 与历史 v1 AAD。"""
+    collision_a = ("a:b", "c")
+    collision_b = ("a", "b:c")
+    identities = (collision_a, collision_b)
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"v" * 32)
+
+    try:
+        user_id, connection_id, events = await _seed_microsoft_aad_writer(
+            sessions=sessions,
+            case_name="delimiter",
+            identities=identities,
+        )
+        # Cycle 5 当前先冻结 0019 ORM 边界；版本列落地后才继续验证真实 writer 密文。
+        assert CalendarEventModel.description_aad_version is not None
+        await _execute_microsoft_aad_writer_sync(
+            sessions=sessions,
+            cipher=cipher,
+            user_id=user_id,
+            connection_id=connection_id,
+            events_by_calendar=events,
+            calendar_ids=(collision_a[0], collision_b[0]),
+        )
+        rows = await _load_microsoft_aad_writer_rows(
+            sessions=sessions,
+            user_id=user_id,
+            connection_id=connection_id,
+            calendar_ids=(collision_a[0], collision_b[0]),
+        )
+
+        assert set(rows) == {collision_a[0], collision_b[0]}
+        assert all(row.description_aad_version == 2 for row in rows.values())
+        assert all(row.location_aad_version == 2 for row in rows.values())
+
+        for calendar_id, provider_event_id in identities:
+            description, location = _encrypted_aad_writer_fields(rows[calendar_id])
+            assert _decrypt_aad_writer_field(
+                cipher=cipher,
+                encrypted=description,
+                user_id=user_id,
+                connection_id=connection_id,
+                calendar_id=calendar_id,
+                provider_event_id=provider_event_id,
+                field="description",
+            ) == events[calendar_id].description
+            assert _decrypt_aad_writer_field(
+                cipher=cipher,
+                encrypted=location,
+                user_id=user_id,
+                connection_id=connection_id,
+                calendar_id=calendar_id,
+                provider_event_id=provider_event_id,
+                field="location",
+            ) == events[calendar_id].location
+
+        first_description, first_location = _encrypted_aad_writer_fields(rows[collision_a[0]])
+        for encrypted, field in (
+            (first_description, "description"),
+            (first_location, "location"),
+        ):
+            swapped_aad = calendar_event_field_aad_v2(
+                user_id=str(user_id),
+                connection_id=str(connection_id),
+                calendar_id=collision_b[0],
+                provider_event_id=collision_b[1],
+                field=field,
+            )
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(encrypted, swapped_aad)
+
+            legacy_aad = (
+                f"{user_id}:{connection_id}:{collision_a[1]}:{field}".encode("ascii")
+            )
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(encrypted, legacy_aad)
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_microsoft_calendar_writer_preserves_unicode_opaque_ids_in_framed_aad(
+    database_url: str,
+) -> None:
+    """非 ASCII calendar/event ID 必须原样进入两字段的完整 framed v2 AAD。"""
+    unicode_identity = ("日历/α", "事件:é")
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"v" * 32)
+
+    try:
+        user_id, connection_id, events = await _seed_microsoft_aad_writer(
+            sessions=sessions,
+            case_name="unicode",
+            identities=(unicode_identity,),
+        )
+        # 先形成与 delimiter 节点相同的 schema RED，避免旧 ASCII writer 遮蔽版本列缺口。
+        assert CalendarEventModel.description_aad_version is not None
+        await _execute_microsoft_aad_writer_sync(
+            sessions=sessions,
+            cipher=cipher,
+            user_id=user_id,
+            connection_id=connection_id,
+            events_by_calendar=events,
+            calendar_ids=(unicode_identity[0],),
+        )
+        rows = await _load_microsoft_aad_writer_rows(
+            sessions=sessions,
+            user_id=user_id,
+            connection_id=connection_id,
+            calendar_ids=(unicode_identity[0],),
+        )
+
+        assert set(rows) == {unicode_identity[0]}
+        row = rows[unicode_identity[0]]
+        assert row.provider_event_id == unicode_identity[1]
+        assert row.description_aad_version == 2
+        assert row.location_aad_version == 2
+        description, location = _encrypted_aad_writer_fields(row)
+        assert _decrypt_aad_writer_field(
+            cipher=cipher,
+            encrypted=description,
+            user_id=user_id,
+            connection_id=connection_id,
+            calendar_id=unicode_identity[0],
+            provider_event_id=unicode_identity[1],
+            field="description",
+        ) == events[unicode_identity[0]].description
+        assert _decrypt_aad_writer_field(
+            cipher=cipher,
+            encrypted=location,
+            user_id=user_id,
+            connection_id=connection_id,
+            calendar_id=unicode_identity[0],
+            provider_event_id=unicode_identity[1],
+            field="location",
+        ) == events[unicode_identity[0]].location
+    finally:
+        await sessions.dispose()

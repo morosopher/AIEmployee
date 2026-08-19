@@ -165,6 +165,107 @@ async def test_all_data_deletion_attempts_revocation_once_without_blocking_local
         await session_factory.dispose()
 
 
+@pytest.mark.parametrize(
+    ("case_name", "persisted_key_version", "persisted_nonce"),
+    (
+        pytest.param("key-version-mismatch", 8, None, id="key-version-mismatch"),
+        pytest.param("malformed-nonce", 7, b"short", id="malformed-nonce"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_all_data_deletion_ignores_typed_credential_damage_before_local_cleanup(
+    database_url: str,
+    case_name: str,
+    persisted_key_version: int,
+    persisted_nonce: bytes | None,
+) -> None:
+    """明确的本地密文边界失败不能阻断连接删除、匿名化和完成审计。"""
+    session_factory = build_session_factory(database_url)
+    cipher = AeadCipher(b"d" * 32, key_version=7)
+    revoker = FailingRevoker()
+    request_id = f"typed-credential-damage-{case_name}"
+    try:
+        async with session_factory.begin() as session:
+            user = UserModel(
+                email=f"{case_name}@example.test",
+                display_name="Synthetic damaged credential owner",
+                password_hash=None,
+                timezone="UTC",
+                locale="zh-CN",
+                brief_time=time(8, 0),
+                is_active=True,
+            )
+            session.add(user)
+            await session.flush()
+            connection = OAuthConnectionModel(
+                user_id=user.id,
+                provider="google",
+                provider_account_id=f"damaged-{case_name}",
+                account_email=f"damaged-{case_name}@example.test",
+                scopes=["gmail.readonly"],
+                status="connected",
+                last_error_code=None,
+            )
+            session.add(connection)
+            await session.flush()
+            encrypted = cipher.encrypt(
+                b"synthetic-refresh-token",
+                f"{user.id}:{connection.id}:refresh_token".encode("ascii"),
+            )
+            session.add(
+                EncryptedCredentialModel(
+                    user_id=user.id,
+                    connection_id=connection.id,
+                    credential_kind="refresh_token",
+                    ciphertext=encrypted.ciphertext,
+                    nonce=encrypted.nonce if persisted_nonce is None else persisted_nonce,
+                    key_version=persisted_key_version,
+                    token_expires_at=None,
+                )
+            )
+            user_id: UUID = user.id
+
+        await PrivacyDeletionWorker(
+            session_factory,
+            credential_cipher=cipher,
+            oauth_revoker=revoker,
+        ).delete_all_data(user_id=user_id, request_id=request_id, batch_size=1)
+
+        async with session_factory() as session:
+            credential_count = await session.scalar(
+                select(func.count())
+                .select_from(EncryptedCredentialModel)
+                .where(EncryptedCredentialModel.user_id == user_id)
+            )
+            connection_count = await session.scalar(
+                select(func.count())
+                .select_from(OAuthConnectionModel)
+                .where(OAuthConnectionModel.user_id == user_id)
+            )
+            deleted_user = await session.get(UserModel, user_id)
+            completed_events = (
+                await session.scalars(
+                    select(AuditEventModel).where(
+                        AuditEventModel.user_id == user_id,
+                        AuditEventModel.event_type == "privacy.deletion_completed",
+                        AuditEventModel.event_metadata["request_id"].astext == request_id,
+                    )
+                )
+            ).all()
+
+        assert revoker.tokens == []
+        assert credential_count == connection_count == 0
+        assert deleted_user is not None
+        assert deleted_user.is_active is False
+        assert deleted_user.email == f"deleted-{user_id}@invalid.local"
+        assert deleted_user.display_name == "Deleted User"
+        assert len(completed_events) == 1
+        assert completed_events[0].event_metadata["operation"] == "all_data_deletion"
+        assert completed_events[0].event_metadata["request_id"] == request_id
+    finally:
+        await session_factory.dispose()
+
+
 @pytest.mark.asyncio
 async def test_all_data_deletion_retries_after_committed_batch_with_one_redacted_audit(
     database_url: str,

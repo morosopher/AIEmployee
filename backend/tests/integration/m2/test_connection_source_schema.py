@@ -2,12 +2,12 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, time
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from alembic import command
 from alembic.config import Config
 from sqlalchemy import URL, func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +29,7 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, buil
 from ai_employee.infrastructure.testing.test_support import (
     TestSupportFixtureService as SupportFixtureService,
 )
+from tests.integration.alembic_commands import run_alembic_upgrade
 
 M2_REVISION = "20260808_0016"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -623,12 +624,12 @@ async def test_microsoft_normalized_account_types_are_accepted(
         await session_factory.dispose()
 
 
-def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
+def _m1_google_rows_are_backfilled_without_inventing_source_facts(
     empty_migration_database: URL,
 ) -> None:
     """从 0010 升级时应保留游标，精确映射读 scope，并令未知写投影 fail-safe。"""
     config = _alembic_config(empty_migration_database)
-    command.upgrade(config, "20260804_0010")
+    run_alembic_upgrade(config, "20260804_0010")
 
     user_id = uuid4()
     enabled_connection_id = uuid4()
@@ -796,7 +797,7 @@ def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
             await engine.dispose()
 
     asyncio.run(seed_m1_rows())
-    command.upgrade(config, M2_REVISION)
+    run_alembic_upgrade(config, M2_REVISION)
 
     async def read_backfill() -> dict[str, object]:
         """读取升级后的规范化结果，完整值均为合成测试数据。"""
@@ -936,6 +937,24 @@ def test_m1_google_rows_are_backfilled_without_inventing_source_facts(
     assert event_row.attendees is None
     assert event_row.access_role is None
     assert event_row.can_edit is False
+
+
+class TestEmptyConnectionSourceMigration:
+    """让唯一 M1 backfill 空库契约局部关闭共享数据库自动 fixture。"""
+
+    @pytest.fixture(autouse=True, name="migrated_database")
+    def _without_session_migration(self) -> Iterator[None]:
+        """历史迁移用例不得预先升级共享 Task 13 数据库。"""
+        yield
+
+    @pytest.fixture(autouse=True, name="isolated_database")
+    async def _without_application_truncate(self) -> AsyncIterator[None]:
+        """历史迁移用例只依赖 UUID 临时库自身的 teardown。"""
+        yield
+
+    test_m1_google_rows_are_backfilled_without_inventing_source_facts = staticmethod(
+        _m1_google_rows_are_backfilled_without_inventing_source_facts
+    )
 
 
 @pytest.mark.asyncio

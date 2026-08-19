@@ -66,9 +66,15 @@ class TaskExecutionStore(Protocol):
         *,
         task_id: UUID,
         lease_owner: str,
+        renewed_at: datetime,
         lease_expires_at: datetime,
     ) -> bool:
-        """仅当前 owner 能在节点边界续租。"""
+        """仅当前 owner 能在节点边界续租且不能复活已过期租约。
+
+        ``renewed_at`` 是本次边界唯一采样的 UTC 时钟瞬间；实现必须同时验证持久租约
+        仍严格晚于该瞬间，并拒绝不晚于该瞬间的新截止时间。返回 ``False`` 表示租约
+        缺失、过期、已被接管或请求截止时间无效，调用方不得再写任何终态。
+        """
 
     async def schedule_retry(
         self,
@@ -392,11 +398,12 @@ class DurableTaskRunner:
                 raise _StepDeadlineExceeded from error
 
             if index + 1 < len(steps):
-                now = utc_instant(self._clock(), field="clock")
+                renewed_at = utc_instant(self._clock(), field="clock")
                 renewed = await self._store.renew(
                     task_id=task.task_id,
                     lease_owner=lease_owner,
-                    lease_expires_at=now + self._lease_duration,
+                    renewed_at=renewed_at,
+                    lease_expires_at=renewed_at + self._lease_duration,
                 )
                 if not renewed:
                     raise _LeaseLost

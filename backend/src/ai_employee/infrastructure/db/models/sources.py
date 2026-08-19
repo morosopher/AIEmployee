@@ -449,6 +449,22 @@ class CalendarEventModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "calendar_events"
     __table_args__ = (
+        CheckConstraint(
+            "(description_ciphertext IS NULL AND description_nonce IS NULL "
+            "AND description_key_version IS NULL AND description_aad_version IS NULL) "
+            "OR (description_ciphertext IS NOT NULL AND description_nonce IS NOT NULL "
+            "AND description_key_version IS NOT NULL AND description_aad_version IS NOT NULL "
+            "AND description_aad_version IN (1, 2))",
+            name="ck_calendar_events_description_aead_with_aad_all_or_none",
+        ),
+        CheckConstraint(
+            "(location_ciphertext IS NULL AND location_nonce IS NULL "
+            "AND location_key_version IS NULL AND location_aad_version IS NULL) "
+            "OR (location_ciphertext IS NOT NULL AND location_nonce IS NOT NULL "
+            "AND location_key_version IS NOT NULL AND location_aad_version IS NOT NULL "
+            "AND location_aad_version IN (1, 2))",
+            name="ck_calendar_events_location_aead_with_aad_all_or_none",
+        ),
         UniqueConstraint(
             "connection_id",
             "calendar_id",
@@ -469,9 +485,11 @@ class CalendarEventModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
     description_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
     description_key_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    description_aad_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     location_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
     location_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
     location_key_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    location_aad_version: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     all_day: Mapped[bool] = mapped_column(Boolean(), nullable=False)

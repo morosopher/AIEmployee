@@ -4,18 +4,26 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from uuid import UUID
 
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
 from ai_employee.application.ports.calendar import (
     CalendarConnectionState,
     CalendarEvent,
     ProviderCalendar,
 )
-from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.encryption import (
+    EncryptedValue,
+    Encryption,
+    EncryptionBoundaryError,
+    EncryptionKeyVersionError,
+)
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarAvailabilityContext,
     CalendarProposalEventBinding,
@@ -37,7 +45,6 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
-from ai_employee.infrastructure.security.encryption import AeadCipher
 
 _AVAILABILITY_FRESHNESS = timedelta(minutes=15)
 
@@ -103,6 +110,23 @@ def _sync_cursor_is_fresh(
     )
 
 
+def _sync_cursor_projection_is_fresh(
+    row: object | None,
+    *,
+    cutoff: datetime,
+) -> bool:
+    """判断最小游标 projection 是否新鲜，不依赖 ORM 对象或隐式加载。"""
+    if row is None:
+        return False
+    last_error_code = getattr(row, "last_error_code", None)
+    last_success_at = getattr(row, "last_success_at", None)
+    return (
+        last_error_code is None
+        and last_success_at is not None
+        and _database_utc(last_success_at) >= cutoff
+    )
+
+
 def _normalize_directory_revision(value: datetime | None) -> datetime | None:
     """把持久目录 revision 规范为 UTC-aware datetime。
 
@@ -150,7 +174,7 @@ class SqlAlchemyCalendarSyncRepository:
     def __init__(
         self,
         session: AsyncSession,
-        field_cipher: AeadCipher | None = None,
+        field_cipher: Encryption | None = None,
     ) -> None:
         """绑定调用方事务，并可选启用提案读取所需的字段解密。
 
@@ -323,155 +347,197 @@ class SqlAlchemyCalendarSyncRepository:
         self,
         *,
         user_id: UUID,
+        observed_at: datetime,
         search_start: datetime,
         horizon_days: int,
     ) -> CalendarAvailabilityContext | None:
-        """读取本人全部新鲜日历事件，并显式标记缺失连接。
+        """以固定五条集合查询读取最小本人可用性投影。
 
-        ``search_start`` 同时是建议窗口起点与本轮 freshness 观察时刻，便于测试注入并
-        避免宿主机时间参与确定性算法。任一目录/事件 cursor 失败、缺失或超过十五分钟
-        都只排除对应连接并把结果标为 partial，不查询参会人 Free/Busy。
+        ``observed_at`` 是 freshness 的独立观测时刻，``search_start`` 只决定候选窗口；
+        两者必须由调用方分别提供，避免把未来或过去的搜索窗口误当成数据新鲜度时钟。
+        查询只投影设置、连接/能力、目录、游标和五个事件状态字段，不 materialize
+        ``CalendarEventModel``，也不按连接循环发 SQL。
         """
         normalized_start = _aware_utc(search_start, field="availability search_start")
+        normalized_observed = _aware_utc(observed_at, field="availability observed_at")
         if type(horizon_days) is not int or horizon_days <= 0:
             raise ValueError("availability horizon_days must be a positive integer")
-        user = await self._session.scalar(
-            select(UserModel).where(UserModel.id == user_id, UserModel.is_active.is_(True))
-        )
-        if user is None:
+
+        # Query 1: 只读取建议所需的用户设置；避免把密码、默认连接等无关列带入边界。
+        user_row = (
+            await self._session.execute(
+                select(
+                    UserModel.timezone,
+                    UserModel.working_hours,
+                    UserModel.meeting_buffer_minutes,
+                ).where(UserModel.id == user_id, UserModel.is_active.is_(True))
+            )
+        ).one_or_none()
+        if user_row is None:
             return None
+
+        # Query 2: 一次性读取连接状态和两类日历能力；outer join 保留没有 capability 行的
+        # 连接，使其在相关目录存在时能被明确标为 missing，而不是制造 complete 假象。
         connection_rows = tuple(
             (
                 await self._session.execute(
-                    select(OAuthConnectionModel.id, OAuthConnectionModel.status)
-                    .where(OAuthConnectionModel.user_id == user_id)
-                    .order_by(OAuthConnectionModel.id)
-                )
-            ).all()
-        )
-        connection_statuses = {row.id: _connection_status(row.status) for row in connection_rows}
-        calendar_capabilities = tuple(
-            (
-                await self._session.scalars(
-                    select(ConnectionCapabilityModel).where(
-                        ConnectionCapabilityModel.user_id == user_id,
-                        ConnectionCapabilityModel.capability.in_(
+                    select(
+                        OAuthConnectionModel.id.label("connection_id"),
+                        OAuthConnectionModel.status.label("connection_status"),
+                        ConnectionCapabilityModel.capability,
+                        ConnectionCapabilityModel.status.label("capability_status"),
+                        ConnectionCapabilityModel.last_error_code,
+                    )
+                    .outerjoin(
+                        ConnectionCapabilityModel,
+                        (ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id)
+                        & (ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id)
+                        & ConnectionCapabilityModel.capability.in_(
                             ("calendar.read", "calendar.write")
                         ),
                     )
+                    .where(OAuthConnectionModel.user_id == user_id)
+                    .order_by(OAuthConnectionModel.id, ConnectionCapabilityModel.capability)
                 )
             ).all()
         )
-        read_capabilities = {
-            capability.connection_id: capability
-            for capability in calendar_capabilities
-            if capability.capability == "calendar.read"
-        }
-        directory_connection_ids = set(
+
+        # Query 3: 目录只返回连接归属和 opaque calendar ID，供 scope 集合和事件过滤使用。
+        calendar_rows = tuple(
             (
-                await self._session.scalars(
-                    select(ProviderCalendarModel.connection_id)
-                    .where(ProviderCalendarModel.user_id == user_id)
-                    .distinct()
+                await self._session.execute(
+                    select(
+                        ProviderCalendarModel.connection_id,
+                        ProviderCalendarModel.provider_calendar_id,
+                    ).where(ProviderCalendarModel.user_id == user_id)
+                    .order_by(
+                        ProviderCalendarModel.connection_id,
+                        ProviderCalendarModel.provider_calendar_id,
+                    )
                 )
             ).all()
         )
-        # 相关集合只来自 calendar 能力或既有目录事实；从未申请日历读取且没有目录的
-        # mail-only 连接不会被误报。相关连接即使授权失效也必须进入 missing，而不是
-        # 在 freshness 检查前消失并制造虚假的 complete。
+
+        # Query 4: 游标按精确 connection + scope 读取，且通过 connection join 强制用户隔离。
+        cursor_rows = tuple(
+            (
+                await self._session.execute(
+                    select(
+                        SyncCursorModel.connection_id,
+                        SyncCursorModel.scope_key,
+                        SyncCursorModel.last_success_at,
+                        SyncCursorModel.last_error_code,
+                    )
+                    .join(
+                        OAuthConnectionModel,
+                        OAuthConnectionModel.id == SyncCursorModel.connection_id,
+                    )
+                    .where(
+                        OAuthConnectionModel.user_id == user_id,
+                        SyncCursorModel.resource_kind == "calendar",
+                    )
+                )
+            ).all()
+        )
+
+        connection_statuses: dict[UUID, ConnectionStatus] = {}
+        read_capability_statuses: dict[UUID, CapabilityStatus] = {}
+        capability_connection_ids: set[UUID] = set()
+        for connection_row in connection_rows:
+            connection_id = connection_row.connection_id
+            connection_statuses[connection_id] = _connection_status(
+                connection_row.connection_status
+            )
+            if connection_row.capability is not None:
+                capability_connection_ids.add(connection_id)
+                if connection_row.capability == "calendar.read":
+                    read_capability_statuses[connection_id] = _capability_status(
+                        connection_row.capability_status
+                    )
+
+        calendars_by_connection: dict[UUID, tuple[str, ...]] = {}
+        calendar_accumulator: dict[UUID, list[str]] = {}
+        for calendar_row in calendar_rows:
+            calendar_accumulator.setdefault(calendar_row.connection_id, []).append(
+                calendar_row.provider_calendar_id
+            )
+        calendars_by_connection = {
+            connection_id: tuple(calendar_ids)
+            for connection_id, calendar_ids in calendar_accumulator.items()
+        }
+        cursor_by_scope = {
+            (cursor_row.connection_id, cursor_row.scope_key): cursor_row
+            for cursor_row in cursor_rows
+        }
         relevant_connection_ids = tuple(
             sorted(
-                {
-                    *(capability.connection_id for capability in calendar_capabilities),
-                    *directory_connection_ids,
-                },
+                {*capability_connection_ids, *calendars_by_connection},
                 key=str,
             )
         )
-        cutoff = normalized_start - _AVAILABILITY_FRESHNESS
+        cutoff = normalized_observed - _AVAILABILITY_FRESHNESS
         available_connections: list[UUID] = []
         missing_connections: list[UUID] = []
         for connection_id in relevant_connection_ids:
-            read_capability = read_capabilities.get(connection_id)
+            read_status = read_capability_statuses.get(connection_id)
             if (
                 connection_statuses.get(connection_id) is not ConnectionStatus.CONNECTED
-                or read_capability is None
-                or _capability_status(read_capability.status) is not CapabilityStatus.ENABLED
+                or read_status is not CapabilityStatus.ENABLED
             ):
                 missing_connections.append(connection_id)
                 continue
-            calendar_ids = tuple(
-                (
-                    await self._session.scalars(
-                        select(ProviderCalendarModel.provider_calendar_id)
-                        .where(
-                            ProviderCalendarModel.user_id == user_id,
-                            ProviderCalendarModel.connection_id == connection_id,
-                        )
-                        .order_by(ProviderCalendarModel.provider_calendar_id)
-                    )
-                ).all()
-            )
+            calendar_ids = calendars_by_connection.get(connection_id, ())
             required_scopes = {"directory", *calendar_ids}
-            cursors = tuple(
-                (
-                    await self._session.scalars(
-                        select(SyncCursorModel).where(
-                            SyncCursorModel.connection_id == connection_id,
-                            SyncCursorModel.resource_kind == "calendar",
-                            SyncCursorModel.scope_key.in_(required_scopes),
-                        )
-                    )
-                ).all()
-            )
-            by_scope = {cursor.scope_key: cursor for cursor in cursors}
             fresh = all(
-                _sync_cursor_is_fresh(by_scope.get(scope), cutoff=cutoff)
+                _sync_cursor_projection_is_fresh(
+                    cursor_by_scope.get((connection_id, scope)), cutoff=cutoff
+                )
                 for scope in required_scopes
             )
             (available_connections if fresh else missing_connections).append(connection_id)
 
-        events: tuple[CalendarEventModel, ...] = ()
-        if available_connections:
-            window_end = normalized_start + timedelta(days=horizon_days + 1)
-            # 候选算法会把每个忙碌事件向后扩展 meeting buffer；查询也必须向前读取
-            # 同样长度，否则 search_start 前刚结束的事件会被数据库提前丢弃。
-            window_start = normalized_start - timedelta(minutes=user.meeting_buffer_minutes)
-            events = tuple(
-                (
-                    await self._session.scalars(
-                        select(CalendarEventModel)
-                        .where(
-                            CalendarEventModel.user_id == user_id,
-                            CalendarEventModel.connection_id.in_(available_connections),
-                            CalendarEventModel.starts_at.is_not(None),
-                            CalendarEventModel.ends_at.is_not(None),
-                            CalendarEventModel.starts_at < window_end,
-                            CalendarEventModel.ends_at > window_start,
-                        )
-                        .order_by(
-                            CalendarEventModel.starts_at,
-                            CalendarEventModel.connection_id,
-                            CalendarEventModel.calendar_id,
-                            CalendarEventModel.provider_event_id,
-                        )
+        # Query 5: 只投影算法所需五列；即使没有可用连接也执行同一条 SELECT，保持
+        # query-count 与连接数量无关，并且绝不在 SQL 层 LIMIT 截断事件集合。
+        window_end = normalized_start + timedelta(days=horizon_days + 1)
+        window_start = normalized_start - timedelta(
+            minutes=user_row.meeting_buffer_minutes
+        )
+        event_rows = tuple(
+            (
+                await self._session.execute(
+                    select(
+                        CalendarEventModel.starts_at,
+                        CalendarEventModel.ends_at,
+                        CalendarEventModel.all_day,
+                        CalendarEventModel.transparency,
+                        CalendarEventModel.status,
                     )
-                ).all()
-            )
+                    .where(
+                        CalendarEventModel.user_id == user_id,
+                        CalendarEventModel.connection_id.in_(available_connections),
+                        CalendarEventModel.starts_at.is_not(None),
+                        CalendarEventModel.ends_at.is_not(None),
+                        CalendarEventModel.starts_at < window_end,
+                        CalendarEventModel.ends_at > window_start,
+                    )
+                    .order_by(CalendarEventModel.starts_at)
+                )
+            ).all()
+        )
         return CalendarAvailabilityContext(
-            timezone=user.timezone,
-            working_hours=WeeklyWorkingHours.from_mapping(user.working_hours),
-            meeting_buffer=timedelta(minutes=user.meeting_buffer_minutes),
+            timezone=user_row.timezone,
+            working_hours=WeeklyWorkingHours.from_mapping(user_row.working_hours),
+            meeting_buffer=timedelta(minutes=user_row.meeting_buffer_minutes),
             events=tuple(
                 AvailabilityEvent(
-                    starts_at=event.starts_at,
-                    ends_at=event.ends_at,
-                    all_day=event.all_day,
-                    transparency=event.transparency,
-                    status=event.status,
+                    starts_at=row.starts_at,
+                    ends_at=row.ends_at,
+                    all_day=row.all_day,
+                    transparency=row.transparency,
+                    status=row.status,
                 )
-                for event in events
-                if event.starts_at is not None and event.ends_at is not None
+                for row in event_rows
+                if row.starts_at is not None and row.ends_at is not None
             ),
             missing_connection_ids=tuple(missing_connections),
         )
@@ -479,25 +545,49 @@ class SqlAlchemyCalendarSyncRepository:
     def _decrypt_event_field(
         self,
         event: CalendarEventModel,
-        field: str,
+        field: Literal["description", "location"],
     ) -> str:
-        """解密一个记录绑定日历字段；全空旧行兼容为空，部分密文 fail closed。"""
+        """解密一个 v2 记录绑定字段；非完整四元组与认证失败均要求重同步。"""
         ciphertext = getattr(event, f"{field}_ciphertext")
         nonce = getattr(event, f"{field}_nonce")
         key_version = getattr(event, f"{field}_key_version")
-        if ciphertext is None and nonce is None and key_version is None:
+        aad_version = getattr(event, f"{field}_aad_version")
+        values = (ciphertext, nonce, key_version, aad_version)
+        if all(value is None for value in values):
             return ""
-        if self._field_cipher is None or ciphertext is None or nonce is None or key_version is None:
+        if (
+            self._field_cipher is None
+            or any(value is None for value in values)
+            or aad_version != 2
+        ):
             raise StateConflictError(
-                error_code="calendar_field_encryption_unavailable",
-                message="calendar event field encryption is unavailable",
+                error_code="calendar_event_resync_required",
+                message="Calendar event requires resynchronization",
             )
-        return self._field_cipher.decrypt(
-            EncryptedValue(ciphertext, nonce, key_version),
-            (f"{event.user_id}:{event.connection_id}:{event.provider_event_id}:{field}").encode(
-                "ascii"
-            ),
-        ).decode("utf-8")
+        assert isinstance(ciphertext, bytes)
+        assert isinstance(nonce, bytes)
+        assert isinstance(key_version, int)
+        try:
+            return self._field_cipher.decrypt(
+                EncryptedValue(ciphertext, nonce, key_version),
+                calendar_event_field_aad_v2(
+                    user_id=str(event.user_id),
+                    connection_id=str(event.connection_id),
+                    calendar_id=event.calendar_id,
+                    provider_event_id=event.provider_event_id,
+                    field=field,
+                ),
+            ).decode("utf-8")
+        except (
+            InvalidTag,
+            EncryptionKeyVersionError,
+            EncryptionBoundaryError,
+            UnicodeDecodeError,
+        ) as error:
+            raise StateConflictError(
+                error_code="calendar_event_resync_required",
+                message="Calendar event requires resynchronization",
+            ) from error
 
     async def _lock_syncable_connection(
         self,
@@ -632,9 +722,11 @@ class SqlAlchemyCalendarSyncRepository:
             description_ciphertext=encrypted_description.ciphertext,
             description_nonce=encrypted_description.nonce,
             description_key_version=encrypted_description.key_version,
+            description_aad_version=2,
             location_ciphertext=encrypted_location.ciphertext,
             location_nonce=encrypted_location.nonce,
             location_key_version=encrypted_location.key_version,
+            location_aad_version=2,
             starts_at=event.starts_at,
             ends_at=event.ends_at,
             all_day=event.all_day,
@@ -660,9 +752,11 @@ class SqlAlchemyCalendarSyncRepository:
                         "description_ciphertext",
                         "description_nonce",
                         "description_key_version",
+                        "description_aad_version",
                         "location_ciphertext",
                         "location_nonce",
                         "location_key_version",
+                        "location_aad_version",
                         "starts_at",
                         "ends_at",
                         "all_day",

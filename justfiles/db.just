@@ -1,8 +1,80 @@
 # 数据库 recipe 统一从根目录运行，确保 Alembic 配置路径和项目依赖解析稳定。
 [group('database')]
 db-upgrade:
-    # 清除可覆盖连接目标或 libpq service 的环境变量，保证迁移只消费应用显式提供的 DATABASE_URL。
-    env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER -u PGSERVICE -u PGSERVICEFILE uv run --project backend alembic -c backend/alembic.ini upgrade head
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${DATABASE_URL:?DATABASE_URL is required}"
+    : "${POSTGRES_BOOTSTRAP_PASSWORD_FILE:?POSTGRES_BOOTSTRAP_PASSWORD_FILE is required}"
+
+    # 应用 DATABASE_URL 在本地开发可能仍含 app/owner 密码；lifecycle 子进程只继承同一
+    # endpoint 的 passwordless URL，owner Secret 始终从显式文件读取。
+    lifecycle_url="$(AI_EMPLOYEE_LIFECYCLE_URL="${DATABASE_URL}" python3 - <<'PY'
+    import os
+    import re
+    from urllib.parse import quote, unquote, urlsplit
+
+
+    def strict_unquote_url_component(value: str) -> str:
+        """拒绝 malformed percent triplet，并且只执行一次严格 UTF-8 解码。"""
+
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None:
+            raise ValueError("malformed percent triplet")
+        return unquote(value, encoding="utf-8", errors="strict")
+
+
+    value = os.environ["AI_EMPLOYEE_LIFECYCLE_URL"]
+    if value != value.strip() or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise SystemExit("db-upgrade refused: DATABASE_URL is invalid")
+    if not value.startswith(("postgresql://", "postgresql+asyncpg://", "postgresql+psycopg://")):
+        raise SystemExit("db-upgrade refused: DATABASE_URL is invalid")
+    if "?" in value or "#" in value:
+        raise SystemExit("db-upgrade refused: DATABASE_URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        encoded_username = parsed.username
+        hostname = parsed.hostname
+        port = parsed.port
+        username = (
+            strict_unquote_url_component(encoded_username)
+            if encoded_username is not None
+            else None
+        )
+        # URL path 是传输编码，不是 PostgreSQL identity；strict unquote 后才可校验
+        # quoted database name 的真实 UTF-8 字节数，且不得 normalization 或截断。
+        database_name = strict_unquote_url_component(parsed.path.removeprefix("/"))
+        database_name_utf8 = database_name.encode("utf-8", errors="strict")
+    except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
+        raise SystemExit("db-upgrade refused: DATABASE_URL is invalid") from None
+    if (
+        username is None
+        or hostname is None
+        or hostname == ""
+        or port is None
+        or not 1 <= port <= 65535
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", username) is None
+        or len(username.encode("utf-8")) > 63
+        or database_name == ""
+        or "\0" in database_name
+        or not 1 <= len(database_name_utf8) <= 63
+    ):
+        raise SystemExit("db-upgrade refused: DATABASE_URL is invalid")
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    # lifecycle URL 只携带同一 decoded identity 的规范 percent-encoding；原密码及原始
+    # encoding 形式均不继续传播，encoded delimiter 也不会变成 query/fragment 覆盖项。
+    canonical_username = quote(username, safe="")
+    canonical_database_path = quote(database_name, safe="")
+    print(
+        f"postgresql+psycopg://{canonical_username}@{normalized_host}:{port}/"
+        f"{canonical_database_path}"
+    )
+    PY
+    )"
+    env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER \
+      -u PGSERVICE -u PGSERVICEFILE DATABASE_URL="${lifecycle_url}" \
+      uv run --project backend python -m ai_employee.cli.database_maintenance migrate \
+      --owner-password-file "${POSTGRES_BOOTSTRAP_PASSWORD_FILE}"
 
 [group('database')]
 db-revision name:
@@ -33,13 +105,19 @@ db-reset:
     database_name="${POSTGRES_DB-}"
     database_user="${POSTGRES_USER-}"
     database_url="${DATABASE_URL-}"
+    owner_password_file="${POSTGRES_BOOTSTRAP_PASSWORD_FILE-}"
+    app_password_file="${APP_DATABASE_PASSWORD_FILE-}"
+    retention_password_file="${RETENTION_DATABASE_PASSWORD_FILE-}"
     [[ -n "${database_name}" ]] || fail 'POSTGRES_DB is required'
     [[ -n "${database_user}" ]] || fail 'POSTGRES_USER is required'
     [[ -n "${database_url}" ]] || fail 'DATABASE_URL is required'
+    [[ -n "${owner_password_file}" ]] || fail 'POSTGRES_BOOTSTRAP_PASSWORD_FILE is required'
+    [[ -n "${app_password_file}" ]] || fail 'APP_DATABASE_PASSWORD_FILE is required'
+    [[ -n "${retention_password_file}" ]] || fail 'RETENTION_DATABASE_PASSWORD_FILE is required'
 
     # 使用 Python 标准库解析 URL，避免 Bash 字符串切片漏掉 username、host 或 port。
     # 敏感 URL 通过临时环境变量传入，不作为参数或错误消息输出；脚本只打印静态拒绝原因。
-    AI_EMPLOYEE_DB_RESET_ENV="${app_env}" \
+    lifecycle_url="$(AI_EMPLOYEE_DB_RESET_ENV="${app_env}" \
     AI_EMPLOYEE_DB_RESET_NAME="${database_name}" \
     AI_EMPLOYEE_DB_RESET_USER="${database_user}" \
     AI_EMPLOYEE_DB_RESET_URL="${database_url}" \
@@ -48,7 +126,7 @@ db-reset:
     import re
     import sys
     from typing import NoReturn
-    from urllib.parse import urlsplit
+    from urllib.parse import quote, unquote, urlsplit
 
 
     def reject(reason: str) -> NoReturn:
@@ -58,14 +136,22 @@ db-reset:
         raise SystemExit(1)
 
 
+    def strict_unquote_url_component(value: str) -> str:
+        """拒绝 malformed percent triplet，并且只执行一次严格 UTF-8 解码。"""
+
+        if re.search(r"%(?![0-9A-Fa-f]{2})", value) is not None:
+            raise ValueError("malformed percent triplet")
+        return unquote(value, encoding="utf-8", errors="strict")
+
+
     app_env = os.environ["AI_EMPLOYEE_DB_RESET_ENV"]
     database_name = os.environ["AI_EMPLOYEE_DB_RESET_NAME"]
     database_user = os.environ["AI_EMPLOYEE_DB_RESET_USER"]
     database_url = os.environ["AI_EMPLOYEE_DB_RESET_URL"]
 
 
-    def validate_identifier(label: str, value: str) -> None:
-        """验证 PostgreSQL 标识符的 ASCII 语法和 63 字节上限。"""
+    def validate_role_identifier(label: str, value: str) -> None:
+        """验证未加引号 runtime/owner role 的 ASCII 语法和 63 字节上限。"""
 
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
             reject(f"{label} must match [A-Za-z_][A-Za-z0-9_]*")
@@ -73,9 +159,22 @@ db-reset:
             reject(f"{label} must be at most 63 UTF-8 bytes")
 
 
-    validate_identifier("POSTGRES_DB", database_name)
-    validate_identifier("POSTGRES_USER", database_user)
-    if database_name.casefold() in {"postgres", "template0", "template1"}:
+    def validate_database_name(value: str) -> None:
+        """验证 quoted database name 的严格 UTF-8 字节边界并保持原始 code points。"""
+
+        if value == "" or "\0" in value:
+            reject("POSTGRES_DB must be non-empty and contain no NUL")
+        try:
+            encoded = value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            reject("POSTGRES_DB must be valid UTF-8")
+        if not 1 <= len(encoded) <= 63:
+            reject("POSTGRES_DB must be at most 63 UTF-8 bytes")
+
+
+    validate_database_name(database_name)
+    validate_role_identifier("POSTGRES_USER", database_user)
+    if database_name in {"postgres", "template0", "template1"}:
         reject("system databases cannot be reset")
     if app_env == "test" and not database_name.endswith("_test"):
         reject("test database name must end with _test")
@@ -93,7 +192,10 @@ db-reset:
         url_username = parsed_url.username
         url_hostname = parsed_url.hostname
         url_port = parsed_url.port
-    except ValueError:
+        if url_username is not None:
+            strict_unquote_url_component(url_username)
+        url_database_name = strict_unquote_url_component(parsed_url.path.removeprefix("/"))
+    except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
         # urlsplit 会对非法 IPv6 或 port 抛出 ValueError；不要把原始 URL 带入错误。
         reject("DATABASE_URL is malformed")
 
@@ -110,13 +212,19 @@ db-reset:
         reject("DATABASE_URL must not contain a query")
     if "#" in database_url:
         reject("DATABASE_URL must not contain a fragment")
-    if parsed_url.path != f"/{database_name}":
+    if url_database_name != database_name:
         reject("DATABASE_URL database must exactly match POSTGRES_DB")
 
     # 仅输出完成全部校验后的规范化端点，不回显密码、query、fragment 或完整 URL。
     normalized_host = f"[{url_hostname.lower()}]" if ":" in url_hostname else url_hostname.lower()
     print(f"Verified endpoint: {normalized_host}:{url_port}", file=sys.stderr)
+    canonical_database_path = quote(database_name, safe="")
+    print(
+        f"postgresql+psycopg://{database_user}@{normalized_host}:{url_port}/"
+        f"{canonical_database_path}"
+    )
     PY
+    )"
 
     printf 'APP_ENV=%s\nCompose service: postgres\nDatabase target: %s\nDatabase user: %s\n' \
       "${app_env}" "${database_name}" "${database_user}" >&2
@@ -125,7 +233,13 @@ db-reset:
     IFS= read -r confirmation || fail 'confirmation input is required'
     [[ "${confirmation}" == "${database_name}" ]] || fail 'confirmation did not match database target'
 
-    # 只有全部验证与精确确认完成后才允许 Fake/真实命令接触目标；set -e 保证迁移严格后置。
-    docker compose exec -T postgres dropdb --if-exists -U "${database_user}" "${database_name}"
-    docker compose exec -T postgres createdb -U "${database_user}" "${database_name}"
-    just db-upgrade
+    # 只有全部验证与逐字节确认完成后，单一 typed CLI 才能在同一 management lease 内执行
+    # authority→drop/create→post-create bootstrap→ordinary migrate；recipe 没有 destructive SQL。
+    env -u PGHOST -u PGHOSTADDR -u PGPORT -u PGDATABASE -u PGUSER \
+      -u PGSERVICE -u PGSERVICEFILE DATABASE_URL="${lifecycle_url}" \
+      uv run --project backend python -m ai_employee.cli.database_maintenance db-reset \
+      --owner-password-file "${owner_password_file}" \
+      --app-password-file "${app_password_file}" \
+      --retention-password-file "${retention_password_file}" \
+      --app-env "${app_env}" \
+      --confirmed-database-name "${confirmation}"

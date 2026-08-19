@@ -8,6 +8,21 @@ set -euo pipefail
 export APP_IMAGE_TAG="${APP_IMAGE_TAG:-ci-immutable-test}"
 export APP_DOMAIN="${APP_DOMAIN:-localhost}"
 
+# 原始 Compose lifecycle 契约在任何渲染/容器调用前先做静态拒绝；migration 只能调用
+# typed migrate，且必须等待 role-bootstrap 成功，不能追加 shell grant repair。
+role_bootstrap_section="$(
+  awk '/^  role-bootstrap:/{capture=1} capture && /^  migration:/{exit} capture{print}' compose.yaml
+)"
+migration_section="$(
+  awk '/^  migration:/{capture=1} capture && /^  api:/{exit} capture{print}' compose.yaml
+)"
+grep -Fq 'ai_employee.cli.database_maintenance role-bootstrap' <<<"${role_bootstrap_section}"
+grep -Fq 'ai_employee.cli.database_maintenance migrate' <<<"${migration_section}"
+grep -Fq 'condition: service_completed_successfully' <<<"${migration_section}"
+! grep -Fq 'init-db-roles.sh' <<<"${migration_section}"
+! grep -Fq 'alembic ' <<<"${migration_section}"
+! grep -Eq 'repair|stamp|downgrade|revision rewrite' <<<"${migration_section}"
+
 assert_file_secret_contract() {
   local configuration_label="$1"
   local secret_name="$2"
@@ -235,8 +250,8 @@ bash -n scripts/init-db-roles.sh
 bash -n scripts/check-process-health.sh
 bash scripts/test-process-health.sh
 
-# 这些断言守住 M1 的保留角色、SSE 流式转发、Redis 持久化和文件 Secret 边界。
-grep -q 'ai_employee_retention' scripts/init-db-roles.sh
+# 这些断言守住 typed role-bootstrap wrapper、SSE 流式转发、Redis 持久化和文件 Secret 边界。
+grep -Fq -- '--retention-password-file "$RETENTION_DATABASE_PASSWORD_FILE"' scripts/init-db-roles.sh
 grep -q 'flush_interval -1' Caddyfile
 # Compose 使用数组传递 Redis 参数；检查相邻的 flag/value，而不是依赖 shell 命令字符串格式。
 grep -Eq '"--appendonly"[[:space:]]*,[[:space:]]*"yes"' compose.yaml

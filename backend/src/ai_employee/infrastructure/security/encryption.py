@@ -6,7 +6,11 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.encryption import (
+    EncryptedValue,
+    EncryptionBoundaryError,
+    EncryptionKeyVersionError,
+)
 
 
 class AeadCipher:
@@ -28,6 +32,14 @@ class AeadCipher:
             raise ValueError("key_version must be positive")
         self._aead = AESGCM(key)
         self._key_version = key_version
+
+    @property
+    def key_version(self) -> int:
+        """返回当前单密钥版本，供持久化与读取边界进行一致性校验。
+
+        该属性没有 setter；轮换只能通过重新构建受组合根管理的 cipher，避免运行时静默改写版本。
+        """
+        return self._key_version
 
     @classmethod
     def from_file(cls, path: Path, key_version: int = 1) -> "AeadCipher":
@@ -56,7 +68,7 @@ class AeadCipher:
 
         Args:
             plaintext: 待保护的 Token 或已清洗的敏感正文。
-            aad: 格式为 ``user_id:record_id:secret_kind`` 的不可见归属绑定。
+            aad: 由调用方规范 helper 生成的不透明记录绑定 bytes；cipher 不解释其内部格式。
 
         Returns:
             包含随机 nonce、认证密文和当前版本的持久化值。
@@ -75,6 +87,29 @@ class AeadCipher:
             通过认证后的原始字节。
 
         Raises:
+            EncryptionKeyVersionError: 持久化版本与当前单密钥版本不匹配。
+            EncryptionBoundaryError: 持久化密文或 nonce 形状不满足冻结边界。
             cryptography.exceptions.InvalidTag: 密文、nonce 或归属上下文被替换时抛出。
+            TypeError: 调用方传入的 AAD 不是底层 AEAD 接受的 bytes 时原样传播。
+
+        Notes:
+            只有无需调用 AES-GCM 即可判定的持久化字段形状错误会转换为
+            ``EncryptionBoundaryError``。通过该边界后的调用方错误或未知底层异常均原样传播，
+            避免把程序错误误报为数据库密文损坏。
         """
+        # 版本不匹配意味着当前进程没有正确密钥，必须在任何 AES-GCM 调用前失败，
+        # 不能把认证失败误当成可用当前密钥重试或引入隐式 keyring。
+        if value.key_version != self._key_version:
+            raise EncryptionKeyVersionError("encrypted value key version does not match")
+
+        # 本实现只生成 12-byte nonce，且 AES-GCM 密文至少包含 16-byte tag；这些形状
+        # 可以在调用密码学库前确定性验证，而 AAD 与底层程序错误不能归类为持久化损坏。
+        if (
+            type(value.nonce) is not bytes
+            or len(value.nonce) != 12
+            or type(value.ciphertext) is not bytes
+            or len(value.ciphertext) < 16
+        ):
+            raise EncryptionBoundaryError("encrypted value is malformed")
+
         return self._aead.decrypt(value.nonce, value.ciphertext, aad)

@@ -8,6 +8,11 @@ import pytest
 BACKEND_SOURCE = Path(__file__).resolve().parents[2] / "src" / "ai_employee"
 
 
+def _matches_module_root(module_name: str, root_name: str) -> bool:
+    """仅匹配根包本身或其子模块，避免相同文本前缀造成误报。"""
+    return module_name == root_name or module_name.startswith(f"{root_name}.")
+
+
 def _imported_modules(path: Path) -> set[str]:
     """解析模块的直接 import，不执行会初始化 broker 或数据库配置的代码。"""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -27,8 +32,8 @@ def test_worker_modules_do_not_own_sqlalchemy_queries(module_name: str) -> None:
     forbidden = {
         name
         for name in imports
-        if name == "sqlalchemy"
-        or name.startswith(("sqlalchemy.", "ai_employee.infrastructure.db.models"))
+        if _matches_module_root(name, "sqlalchemy")
+        or _matches_module_root(name, "ai_employee.infrastructure.db.models")
     }
 
     assert forbidden == set()
@@ -38,7 +43,7 @@ def test_queue_enqueuer_does_not_import_worker_entrypoint() -> None:
     """Queue adapter 必须通过窄 sender 注入，不能反向硬依赖 Worker composition root。"""
     imports = _imported_modules(BACKEND_SOURCE / "infrastructure" / "queue" / "enqueue.py")
 
-    assert not any(name.startswith("ai_employee.workers") for name in imports)
+    assert not any(_matches_module_root(name, "ai_employee.workers") for name in imports)
 
 
 def test_background_orchestration_and_sql_stores_have_explicit_layer_modules() -> None:
@@ -53,13 +58,15 @@ def test_background_orchestration_and_sql_stores_have_explicit_layer_modules() -
     assert all(path.is_file() for path in expected)
 
 
-def test_application_layer_does_not_import_sqlalchemy_taskiq_or_redis() -> None:
-    """Application 用例与端口必须保持供应商无关，不能依赖持久化或队列 SDK。"""
-    forbidden_prefixes = ("sqlalchemy", "taskiq", "taskiq_redis", "redis")
+def test_application_layer_does_not_import_infrastructure_sdks() -> None:
+    """Application 用例与端口不能依赖迁移、持久化或队列基础设施 SDK。"""
+    forbidden_prefixes = ("alembic", "sqlalchemy", "taskiq", "taskiq_redis", "redis")
     violations: dict[str, list[str]] = {}
     for path in (BACKEND_SOURCE / "application").rglob("*.py"):
         imports = sorted(
-            name for name in _imported_modules(path) if name.startswith(forbidden_prefixes)
+            name
+            for name in _imported_modules(path)
+            if any(_matches_module_root(name, prefix) for prefix in forbidden_prefixes)
         )
         if imports:
             violations[str(path.relative_to(BACKEND_SOURCE))] = imports
@@ -82,9 +89,30 @@ def test_application_and_domain_do_not_add_provider_adapters_or_sdks() -> None:
     for layer_name in ("application", "domain"):
         for path in (BACKEND_SOURCE / layer_name).rglob("*.py"):
             imports = sorted(
-                name for name in _imported_modules(path) if name.startswith(forbidden_prefixes)
+                name
+                for name in _imported_modules(path)
+                if any(_matches_module_root(name, prefix) for prefix in forbidden_prefixes)
             )
             if imports:
                 violations[str(path.relative_to(BACKEND_SOURCE))] = imports
 
     assert violations == {}
+
+
+@pytest.mark.parametrize(
+    ("module_name", "root_name", "expected"),
+    (
+        ("alembic", "alembic", True),
+        ("alembic.config", "alembic", True),
+        ("alembic_helpers", "alembic", False),
+        ("redis.asyncio", "redis", True),
+        ("redistribution", "redis", False),
+    ),
+)
+def test_module_root_matching_avoids_text_prefix_false_positives(
+    module_name: str,
+    root_name: str,
+    expected: bool,
+) -> None:
+    """基础设施 SDK 检查只能命中 exact 根包或点分隔子模块。"""
+    assert _matches_module_root(module_name, root_name) is expected

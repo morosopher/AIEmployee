@@ -1,17 +1,36 @@
 """在真实 PostgreSQL 上验证恢复提案的事务外读取与原子版本事实。"""
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+import ast
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, time, timedelta
+from pathlib import Path
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import pytest
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import event, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
 from ai_employee.application.ports.calendar import CalendarEvent, CalendarReader
-from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.application.ports.encryption import (
+    EncryptedValue,
+    Encryption,
+    EncryptionBoundaryError,
+    EncryptionKeyVersionError,
+)
+from ai_employee.application.use_cases.task_execution import (
+    DurableTaskRunner,
+    LeasedTask,
+)
 from ai_employee.domain.calendar_availability import suggest_meeting_times
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
+)
 from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeProposalModel,
     CalendarChangeSnapshotModel,
@@ -31,8 +50,12 @@ from ai_employee.infrastructure.db.repositories.calendar import (
 from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.workers.prepare_calendar_restore import (
     CalendarRestoreReaderResolver,
     PrepareCalendarRestoreTaskStep,
@@ -48,6 +71,414 @@ PROVIDER_EVENT_ID = "synthetic-provider-event"
 NOW = datetime(2030, 3, 11, 8, tzinfo=UTC)
 RETAIN_UNTIL = NOW + timedelta(days=365)
 ACTION_CIPHER = ActionPayloadCipher.from_key(b"r" * 32)
+
+# 每个测试异常退出时先释放本模块创建的所有异步 pool，再进入共享数据库清理。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """让本模块只使用 Cycle 5 已验证的 regular head 数据库。"""
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖全局 migrate fixture；共享 helper 已完成 typed lifecycle 与 catalog 复核。"""
+    del cycle5_regular_database_url
+    yield
+
+
+def test_precise_calendar_reader_imports_and_calls_shared_framed_aad_v2() -> None:
+    """精确 CalendarEvent reader 必须复用 v2 helper，并传入完整五项身份。"""
+    reader_path = (
+        Path(__file__).resolve().parents[3]
+        / "src"
+        / "ai_employee"
+        / "infrastructure"
+        / "db"
+        / "repositories"
+        / "calendar.py"
+    )
+    module = ast.parse(reader_path.read_text(encoding="utf-8"))
+    imported = {
+        alias.name
+        for node in module.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "ai_employee.application.calendar_event_aad"
+        for alias in node.names
+    }
+    calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "calendar_event_field_aad_v2"
+    ]
+
+    expected_keywords = {
+        "user_id",
+        "connection_id",
+        "calendar_id",
+        "provider_event_id",
+        "field",
+    }
+    assert "calendar_event_field_aad_v2" in imported
+    assert calls
+    assert all(
+        {keyword.arg for keyword in call.keywords} == expected_keywords for call in calls
+    )
+
+
+@dataclass(slots=True)
+class _PersistedCalendarFieldEvent:
+    """表达 precise reader 所需的两组字段四元组与完整事件归属身份。"""
+
+    user_id: UUID = USER_ID
+    connection_id: UUID = CONNECTION_ID
+    calendar_id: str = CALENDAR_ID
+    provider_event_id: str = PROVIDER_EVENT_ID
+    description_ciphertext: bytes | None = b"ciphertext-with-tag"
+    description_nonce: bytes | None = b"0123456789ab"
+    description_key_version: int | None = 1
+    description_aad_version: int | None = 2
+    location_ciphertext: bytes | None = b"location-ciphertext-with-tag"
+    location_nonce: bytes | None = b"abcdefghijkl"
+    location_key_version: int | None = 1
+    location_aad_version: int | None = 2
+
+
+@dataclass(slots=True)
+class _DecryptOutcomeCipher:
+    """记录 reader 的单次 decrypt，并返回或抛出预设结果。"""
+
+    outcome: bytes | BaseException
+    calls: list[tuple[EncryptedValue, bytes]] = field(default_factory=list)
+
+    @property
+    def key_version(self) -> int:
+        """满足应用 Encryption 端口的只读版本属性。"""
+        return 1
+
+    def encrypt(self, plaintext: bytes, aad: bytes) -> EncryptedValue:
+        """精确读取测试不允许意外进入写路径。"""
+        del plaintext, aad
+        raise AssertionError("precise reader must not encrypt")
+
+    def decrypt(self, value: EncryptedValue, aad: bytes) -> bytes:
+        """只记录一次；未知异常必须由 production 原样传播。"""
+        self.calls.append((value, aad))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def _precise_calendar_repository(
+    cipher: Encryption | None,
+) -> SqlAlchemyCalendarSyncRepository:
+    """构造不执行 SQL 的 precise reader，并以应用协议接纳真实或记录型 cipher。"""
+    repository_factory = cast(
+        Callable[[AsyncSession, Encryption | None], SqlAlchemyCalendarSyncRepository],
+        SqlAlchemyCalendarSyncRepository,
+    )
+    return repository_factory(cast(AsyncSession, object()), cipher)
+
+
+def _decrypt_description(
+    repository: SqlAlchemyCalendarSyncRepository,
+    persisted: _PersistedCalendarFieldEvent,
+) -> str:
+    """经 production 私有边界读取合成 description，集中隔离 ORM 静态类型差异。"""
+    return repository._decrypt_event_field(
+        cast(CalendarEventModel, persisted),
+        "description",
+    )
+
+
+def _assert_description_requires_resync(
+    repository: SqlAlchemyCalendarSyncRepository,
+    persisted: _PersistedCalendarFieldEvent,
+) -> None:
+    """断言不可信持久化四元组统一收敛到稳定 resync 错误。"""
+    with pytest.raises(StateConflictError) as raised:
+        _decrypt_description(repository, persisted)
+
+    assert raised.value.error_code == "calendar_event_resync_required"
+
+
+def test_precise_calendar_reader_returns_empty_for_absent_field_without_decrypt() -> None:
+    """description 四列全空表示历史空字段，不得调用 cipher。"""
+    cipher = _DecryptOutcomeCipher(b"must not decrypt")
+    repository = _precise_calendar_repository(cipher)
+    persisted = _PersistedCalendarFieldEvent(
+        description_ciphertext=None,
+        description_nonce=None,
+        description_key_version=None,
+        description_aad_version=None,
+    )
+
+    assert _decrypt_description(repository, persisted) == ""
+    assert cipher.calls == []
+
+
+@pytest.mark.parametrize(
+    "persisted",
+    (
+        _PersistedCalendarFieldEvent(description_ciphertext=None),
+        _PersistedCalendarFieldEvent(description_nonce=None),
+        _PersistedCalendarFieldEvent(description_key_version=None),
+        _PersistedCalendarFieldEvent(description_aad_version=None),
+    ),
+    ids=("missing-ciphertext", "missing-nonce", "missing-key-version", "missing-aad-version"),
+)
+def test_precise_calendar_reader_rejects_partial_field_quadruple_without_decrypt(
+    persisted: _PersistedCalendarFieldEvent,
+) -> None:
+    """description 四元组缺任一列都必须要求 resync，不能尝试猜测或解密。"""
+    cipher = _DecryptOutcomeCipher(b"must not decrypt")
+
+    _assert_description_requires_resync(_precise_calendar_repository(cipher), persisted)
+
+    assert cipher.calls == []
+
+
+def test_precise_calendar_reader_rejects_complete_field_when_cipher_is_unavailable() -> None:
+    """完整 v2 四元组在 cipher 未注入时必须要求 resync，且不发生 decrypt。"""
+    _assert_description_requires_resync(
+        _precise_calendar_repository(None),
+        _PersistedCalendarFieldEvent(),
+    )
+
+
+@pytest.mark.parametrize("aad_version", (1, 3))
+def test_precise_calendar_reader_rejects_unsupported_aad_version_without_decrypt(
+    aad_version: int,
+) -> None:
+    """已知旧版与未知新版 AAD 都必须失败关闭，不能进入 cipher。"""
+    cipher = _DecryptOutcomeCipher(b"must not decrypt")
+    persisted = _PersistedCalendarFieldEvent(description_aad_version=aad_version)
+
+    _assert_description_requires_resync(_precise_calendar_repository(cipher), persisted)
+
+    assert cipher.calls == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        InvalidTag(),
+        EncryptionKeyVersionError("synthetic key version"),
+        EncryptionBoundaryError("synthetic encrypted boundary"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "synthetic invalid utf-8"),
+    ),
+)
+def test_precise_calendar_reader_maps_only_approved_decrypt_failures_once(
+    failure: BaseException,
+) -> None:
+    """四类持久密文失败统一要求 resync，且最多调用一次 decrypt。"""
+    cipher = _DecryptOutcomeCipher(failure)
+    repository = _precise_calendar_repository(cipher)
+
+    _assert_description_requires_resync(repository, _PersistedCalendarFieldEvent())
+
+    assert len(cipher.calls) == 1
+
+
+def test_precise_calendar_reader_propagates_unknown_decrypt_exception_once() -> None:
+    """未知程序错误不得伪装成可恢复密文错误，也不得触发 fallback decrypt。"""
+    failure = RuntimeError("synthetic unknown decrypt failure")
+    cipher = _DecryptOutcomeCipher(failure)
+    repository = _precise_calendar_repository(cipher)
+
+    with pytest.raises(RuntimeError, match="synthetic unknown decrypt failure"):
+        _decrypt_description(repository, _PersistedCalendarFieldEvent())
+
+    assert len(cipher.calls) == 1
+
+
+@dataclass(slots=True)
+class _RecordingEncryption:
+    """委托真实 AEAD 并记录 precise reader 实际消费的加密值与 AAD。"""
+
+    delegate: AeadCipher
+    calls: list[tuple[EncryptedValue, bytes]] = field(default_factory=list)
+
+    @property
+    def key_version(self) -> int:
+        """返回委托 cipher 的精确单密钥版本。"""
+        return self.delegate.key_version
+
+    def encrypt(self, plaintext: bytes, aad: bytes) -> EncryptedValue:
+        """测试夹具构造密文时保持真实 AEAD 行为。"""
+        return self.delegate.encrypt(plaintext, aad)
+
+    def decrypt(self, value: EncryptedValue, aad: bytes) -> bytes:
+        """记录一次 reader 调用后原样委托真实认证解密。"""
+        self.calls.append((value, aad))
+        return self.delegate.decrypt(value, aad)
+
+
+def _decrypt_precise_field(
+    repository: SqlAlchemyCalendarSyncRepository,
+    persisted: _PersistedCalendarFieldEvent,
+    field_name: Literal["description", "location"],
+) -> str:
+    """经 production 私有边界读取一个合成字段。"""
+    return repository._decrypt_event_field(
+        cast(CalendarEventModel, persisted),
+        field_name,
+    )
+
+
+def _assert_precise_field_requires_resync(
+    repository: SqlAlchemyCalendarSyncRepository,
+    persisted: _PersistedCalendarFieldEvent,
+    field_name: Literal["description", "location"],
+) -> None:
+    """断言真实 AEAD 失败统一收敛为稳定 resync 错误。"""
+    with pytest.raises(StateConflictError) as raised:
+        _decrypt_precise_field(repository, persisted, field_name)
+
+    assert raised.value.error_code == "calendar_event_resync_required"
+
+
+def test_precise_calendar_reader_decrypts_non_ascii_v2_fields_with_exact_framed_aad() -> None:
+    """两字段必须各以原始非 ASCII 身份和完整五项 framed AAD 解密一次。"""
+    calendar_id = "日历:a"
+    provider_event_id = "事件:b:c"
+    real_cipher = AeadCipher(b"p" * 32)
+    description_aad = calendar_event_field_aad_v2(
+        user_id=str(USER_ID),
+        connection_id=str(CONNECTION_ID),
+        calendar_id=calendar_id,
+        provider_event_id=provider_event_id,
+        field="description",
+    )
+    location_aad = calendar_event_field_aad_v2(
+        user_id=str(USER_ID),
+        connection_id=str(CONNECTION_ID),
+        calendar_id=calendar_id,
+        provider_event_id=provider_event_id,
+        field="location",
+    )
+    description = real_cipher.encrypt("机密描述".encode(), description_aad)
+    location = real_cipher.encrypt("会议室 α".encode(), location_aad)
+    persisted = _PersistedCalendarFieldEvent(
+        calendar_id=calendar_id,
+        provider_event_id=provider_event_id,
+        description_ciphertext=description.ciphertext,
+        description_nonce=description.nonce,
+        description_key_version=description.key_version,
+        description_aad_version=2,
+        location_ciphertext=location.ciphertext,
+        location_nonce=location.nonce,
+        location_key_version=location.key_version,
+        location_aad_version=2,
+    )
+    cipher = _RecordingEncryption(real_cipher)
+    repository = _precise_calendar_repository(cipher)
+
+    assert _decrypt_precise_field(repository, persisted, "description") == "机密描述"
+    assert _decrypt_precise_field(repository, persisted, "location") == "会议室 α"
+    assert cipher.calls == [(description, description_aad), (location, location_aad)]
+
+
+def test_precise_calendar_reader_rejects_delimiter_collision_identity_swap_once() -> None:
+    """A 身份密文换到冒号渲染相同的 B 身份后必须认证失败，且不得 fallback。"""
+    real_cipher = AeadCipher(b"s" * 32)
+    source_aad = calendar_event_field_aad_v2(
+        user_id=str(USER_ID),
+        connection_id=str(CONNECTION_ID),
+        calendar_id="a:b",
+        provider_event_id="c",
+        field="description",
+    )
+    encrypted = real_cipher.encrypt(b"delimiter-bound", source_aad)
+    persisted = _PersistedCalendarFieldEvent(
+        calendar_id="a",
+        provider_event_id="b:c",
+        description_ciphertext=encrypted.ciphertext,
+        description_nonce=encrypted.nonce,
+        description_key_version=encrypted.key_version,
+        description_aad_version=2,
+    )
+    cipher = _RecordingEncryption(real_cipher)
+
+    _assert_precise_field_requires_resync(
+        _precise_calendar_repository(cipher), persisted, "description"
+    )
+
+    assert len(cipher.calls) == 1
+    assert cipher.calls[0][1] == calendar_event_field_aad_v2(
+        user_id=str(USER_ID),
+        connection_id=str(CONNECTION_ID),
+        calendar_id="a",
+        provider_event_id="b:c",
+        field="description",
+    )
+
+
+def test_precise_calendar_reader_rejects_colon_legacy_ciphertext_marked_as_v2_once() -> None:
+    """使用历史 colon AAD 生成的密文即使伪标 v2，也必须要求重同步。"""
+    real_cipher = AeadCipher(b"l" * 32)
+    legacy_aad = (
+        f"{USER_ID}:{CONNECTION_ID}:{PROVIDER_EVENT_ID}:description".encode("ascii")
+    )
+    encrypted = real_cipher.encrypt(b"legacy-bound", legacy_aad)
+    persisted = _PersistedCalendarFieldEvent(
+        description_ciphertext=encrypted.ciphertext,
+        description_nonce=encrypted.nonce,
+        description_key_version=encrypted.key_version,
+        description_aad_version=2,
+    )
+    cipher = _RecordingEncryption(real_cipher)
+
+    _assert_precise_field_requires_resync(
+        _precise_calendar_repository(cipher), persisted, "description"
+    )
+
+    assert len(cipher.calls) == 1
+    assert cipher.calls[0][1] != legacy_aad
+
+
+@pytest.mark.parametrize("tamper", ("ciphertext", "nonce", "key_version"))
+def test_precise_calendar_reader_rejects_tampered_v2_field_once(tamper: str) -> None:
+    """密文、nonce 或密钥版本任一持久事实被改写都必须失败关闭且只 decrypt 一次。"""
+    real_cipher = AeadCipher(b"t" * 32)
+    aad = calendar_event_field_aad_v2(
+        user_id=str(USER_ID),
+        connection_id=str(CONNECTION_ID),
+        calendar_id=CALENDAR_ID,
+        provider_event_id=PROVIDER_EVENT_ID,
+        field="description",
+    )
+    encrypted = real_cipher.encrypt(b"tamper-bound", aad)
+    ciphertext = encrypted.ciphertext
+    nonce = encrypted.nonce
+    key_version = encrypted.key_version
+    if tamper == "ciphertext":
+        ciphertext = bytes((ciphertext[0] ^ 1,)) + ciphertext[1:]
+    elif tamper == "nonce":
+        nonce = bytes((nonce[0] ^ 1,)) + nonce[1:]
+    else:
+        key_version = 2
+    persisted = _PersistedCalendarFieldEvent(
+        description_ciphertext=ciphertext,
+        description_nonce=nonce,
+        description_key_version=key_version,
+        description_aad_version=2,
+    )
+    cipher = _RecordingEncryption(real_cipher)
+
+    _assert_precise_field_requires_resync(
+        _precise_calendar_repository(cipher), persisted, "description"
+    )
+
+    assert len(cipher.calls) == 1
 
 
 @dataclass(slots=True)
@@ -461,6 +892,237 @@ async def test_restore_uses_persisted_task_input_instead_of_message_copy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "error_type"),
+    (
+        (lambda payload: payload.pop("creation_idempotency_key"), TypeError),
+        (lambda payload: payload.__setitem__("unexpected", "synthetic"), TypeError),
+        (lambda payload: payload.__setitem__("source_snapshot_id", 42), TypeError),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", 42), TypeError),
+        (
+                lambda payload: payload.__setitem__(
+                "source_snapshot_id", "{" + str(SOURCE_BEFORE_ID) + "}"
+                ),
+            ValueError,
+        ),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", ""), ValueError),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", " "), ValueError),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", " padded"), ValueError),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", "padded "), ValueError),
+        (
+            lambda payload: payload.__setitem__("creation_idempotency_key", "x" * 256),
+            ValueError,
+        ),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", "bad\x01key"), ValueError),
+        (lambda payload: payload.__setitem__("creation_idempotency_key", "bad\x7fkey"), ValueError),
+    ),
+    ids=(
+        "missing-key",
+        "extra-key",
+        "snapshot-non-string",
+        "creation-non-string",
+        "non-canonical-uuid",
+        "empty-key",
+        "blank-key",
+        "leading-padding",
+        "trailing-padding",
+        "over-255",
+        "c0-control",
+        "del-control",
+    ),
+)
+async def test_restore_rejects_corrupt_persisted_input_before_resolver_or_reader(
+    database_url: str,
+    mutation: Callable[[dict[str, object]], object],
+    error_type: type[Exception],
+) -> None:
+    """恢复输入先做精确形状/边界校验，任何损坏载荷都不得解析 reader 或访问供应商。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        task_id, source_snapshot_id = await _seed_restore_source(session_factory)
+        payload: dict[str, object] = {
+            "source_snapshot_id": str(source_snapshot_id),
+            "creation_idempotency_key": f"calendar-restore:{task_id}",
+        }
+        mutation(payload)
+        async with session_factory.begin() as session:
+            task = await session.get(TaskRunModel, task_id)
+            assert task is not None
+            task.input_payload = payload  # type: ignore[assignment]
+            await session.flush()
+
+        reader = _AssertingReader(_TransactionProbe(), _current_provider_event())
+        resolver = _ReaderResolver(reader)
+        step = PrepareCalendarRestoreTaskStep(
+            session_factory,
+            action_cipher=ACTION_CIPHER,
+            reader_resolver=resolver,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(error_type):
+            await step.execute(
+                LeasedTask(
+                    task_id=task_id,
+                    user_id=USER_ID,
+                    kind="calendar.restore.prepare",
+                    input_payload=payload,
+                    started_at=NOW,
+                    lease_owner="calendar-restore-worker",
+                )
+            )
+        assert resolver.calls == []
+        assert reader.calls == []
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_arbitrary_valid_creation_key_without_route_prefix(
+    database_url: str,
+) -> None:
+    """恢复创建键只受共享形状边界约束，不强制尚未定义的路由前缀。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        task_id, source_snapshot_id = await _seed_restore_source(session_factory)
+        key = "synthetic-restore-key"
+        async with session_factory.begin() as session:
+            task = await session.get(TaskRunModel, task_id)
+            assert task is not None
+            task.input_payload = {
+                "source_snapshot_id": str(source_snapshot_id),
+                "creation_idempotency_key": key,
+            }
+        reader = _AssertingReader(_TransactionProbe(), _current_provider_event())
+        resolver = _ReaderResolver(reader)
+        step = PrepareCalendarRestoreTaskStep(
+            session_factory,
+            action_cipher=ACTION_CIPHER,
+            reader_resolver=resolver,
+            clock=lambda: NOW,
+        )
+        await step.execute(
+            LeasedTask(
+                task_id=task_id,
+                user_id=USER_ID,
+                kind="calendar.restore.prepare",
+                input_payload={},
+                started_at=NOW,
+                lease_owner="calendar-restore-worker",
+            )
+        )
+        async with session_factory() as session:
+            restored = await session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(CalendarChangeProposalModel.operation_kind == "restore")
+                .order_by(CalendarChangeProposalModel.created_at.desc())
+            )
+        assert restored is not None
+        assert restored.creation_idempotency_key == key
+        assert resolver.calls == [(USER_ID, CONNECTION_ID, "google", "UTC")]
+        assert reader.calls == [(CALENDAR_ID, PROVIDER_EVENT_ID)]
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restore_runner_loses_expired_lease_then_replacement_wins_once(
+    database_url: str,
+) -> None:
+    """真实 Runner 的过期 GET 不得提交结果，接管 owner 只能成功创建一次恢复提案。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        task_id, _source_snapshot_id = await _seed_restore_source(session_factory)
+        async with session_factory.begin() as session:
+            task = await session.get(TaskRunModel, task_id)
+            assert task is not None
+            task.status = TaskStatus.QUEUED.value
+            task.lease_owner = None
+            task.lease_expires_at = None
+
+        current = NOW
+        first_read = True
+
+        def clock() -> datetime:
+            """返回可控当前时刻；首次供应商 GET 后推进到旧租约之外。"""
+            return current
+
+        def expire_after_first_get() -> None:
+            """模拟首 owner 的只读 GET 跨过其刚取得的 30 秒租约。"""
+            nonlocal current, first_read
+            if first_read:
+                first_read = False
+                current = NOW + timedelta(seconds=31)
+
+        reader = _AssertingReader(
+            _TransactionProbe(),
+            _current_provider_event(),
+            before_return=expire_after_first_get,
+        )
+        resolver = _ReaderResolver(reader)
+        restore_step = PrepareCalendarRestoreTaskStep(
+            session_factory,
+            action_cipher=ACTION_CIPHER,
+            reader_resolver=resolver,
+            clock=clock,
+        )
+
+        class NoopStep:
+            """在恢复准备后制造一个续租边界而不产生外部副作用。"""
+
+            name = "restore_noop"
+
+            async def execute(self, task: LeasedTask) -> None:
+                """保持任务快照不变，供 Runner 进入下一节点边界。"""
+                del task
+
+        def runner() -> DurableTaskRunner:
+            """构造真实 DurableTaskRunner 与同一 SQLAlchemy lease store。"""
+            return DurableTaskRunner(
+                store=SqlAlchemyTaskExecutionStore(session_factory),
+                clock=clock,
+                lease_duration=timedelta(seconds=30),
+                task_timeout_seconds=600,
+                task_step_timeout_seconds=30,
+                max_transient_retries=0,
+                resolve_steps=lambda _task: (restore_step, NoopStep()),
+            )
+
+        first_result = await runner().run(task_id, lease_owner="restore-owner-a")
+        assert first_result is False
+        async with session_factory() as session:
+            first_task = await session.get(TaskRunModel, task_id)
+            first_restore_count = await session.scalar(
+                select(func.count()).select_from(CalendarChangeProposalModel).where(
+                    CalendarChangeProposalModel.operation_kind == "restore"
+                )
+            )
+        assert first_task is not None
+        assert first_task.result_payload is None
+        assert first_task.status == TaskStatus.RUNNING.value
+        assert first_task.lease_owner == "restore-owner-a"
+        assert first_restore_count == 0
+
+        second_result = await runner().run(task_id, lease_owner="restore-owner-b")
+        assert second_result is True
+        async with session_factory() as session:
+            second_task = await session.get(TaskRunModel, task_id)
+            restored = await session.scalar(
+                select(CalendarChangeProposalModel).where(
+                    CalendarChangeProposalModel.operation_kind == "restore"
+                )
+            )
+        assert second_task is not None
+        assert second_task.status == TaskStatus.SUCCEEDED.value
+        assert second_task.result_payload is not None
+        assert restored is not None
+        assert second_task.result_payload == {"calendar_proposal_id": str(restored.id)}
+        assert len(reader.calls) == 2
+        assert len(resolver.calls) == 2
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lease_expires_at", [None, NOW - timedelta(seconds=1)])
 async def test_restore_skips_provider_read_without_a_current_persisted_lease(
     database_url: str,
@@ -808,6 +1470,7 @@ async def test_availability_repository_loads_events_whose_buffer_reaches_window(
         async with session_factory() as session:
             context = await SqlAlchemyCalendarSyncRepository(session).get_availability_context(
                 user_id=USER_ID,
+                observed_at=NOW,
                 search_start=search_start,
                 horizon_days=14,
             )
@@ -1006,6 +1669,7 @@ async def test_availability_marks_all_relevant_unavailable_calendar_connections_
         async with session_factory() as session:
             context = await SqlAlchemyCalendarSyncRepository(session).get_availability_context(
                 user_id=USER_ID,
+                observed_at=NOW,
                 search_start=search_start,
                 horizon_days=14,
             )

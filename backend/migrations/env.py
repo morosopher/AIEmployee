@@ -1,15 +1,23 @@
-"""配置 Alembic 使用项目元数据与 SQLAlchemy 官方异步迁移流程。"""
+"""配置 Alembic 元数据，并只在 typed lifecycle 注入的同步 Connection 上迁移。"""
 
-import asyncio
 import os
 from logging.config import fileConfig
+from typing import cast
 
 from alembic import context
-from sqlalchemy import Connection, pool
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from alembic.runtime.environment import OnVersionApplyFn
 
+from ai_employee.application.ports.calendar_aad_migration_guard import (
+    CALENDAR_AAD_0019_GUARD_ATTRIBUTE,
+    resolve_calendar_aad_migration_guard,
+)
 from ai_employee.infrastructure.db import models as db_models
-from ai_employee.infrastructure.db.alembic import set_alembic_database_url
+from ai_employee.infrastructure.db.alembic import (
+    MigrationGrantLifecycle,
+    OnlineMigrationAuthority,
+    require_online_migration_authority,
+    set_alembic_database_url,
+)
 from ai_employee.infrastructure.db.base import Base
 
 config = context.config
@@ -20,7 +28,10 @@ if database_url is not None and not config.get_main_option("sqlalchemy.url"):
     set_alembic_database_url(config, database_url)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic 既可由一次性 CLI 启动，也会被测试/维护编排嵌入已有进程。保留宿主已创建
+    # logger 的 enabled 状态，避免迁移配置把 HTTP 安全边界及其他未列入 ini 的 logger
+    # 永久置为 disabled；已声明的 root/SQLAlchemy/Alembic 配置仍按 ini 正常应用。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # 导入模型模块是注册元数据所必需的显式副作用；保留引用可避免静态检查误判未使用导入。
 _ = db_models
@@ -29,6 +40,25 @@ target_metadata = Base.metadata
 _EXTERNAL_MANAGED_TABLES = frozenset(
     {"checkpoint_migrations", "checkpoints", "checkpoint_blobs", "checkpoint_writes"}
 )
+
+
+def _alembic_on_version_apply(
+    lifecycle: MigrationGrantLifecycle,
+) -> OnVersionApplyFn:
+    """把 keyword-only lifecycle callback 收窄为 Alembic 声明的 callback 类型。
+
+    Alembic 的公开文档和运行时都以 ``ctx``、``step``、``heads``、``run_args`` 四个
+    关键字调用 callback，但类型别名仍将它描述为位置参数 ``Callable``。这里只转换同一
+    callable 的静态视图，不增加包装层、参数改写或异常处理，因此 lifecycle 的严格形状
+    校验、调用顺序和同一实例状态保持不变。
+
+    Args:
+        lifecycle: 当前 online authority 绑定的 grant lifecycle 实例。
+
+    Returns:
+        原 callable 的 Alembic 静态类型视图。
+    """
+    return cast(OnVersionApplyFn, lifecycle.on_version_apply)
 
 
 def include_object(
@@ -63,45 +93,42 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def do_run_migrations(connection: Connection) -> None:
-    """在 Alembic 提供的同步桥接连接上执行迁移。
+def do_run_migrations(authority: OnlineMigrationAuthority) -> None:
+    """在 token 绑定的同一同步 Connection/transaction 上执行 grant-aware 迁移。
 
     Args:
-        connection: 由异步连接通过 ``run_sync`` 暴露的同步 SQLAlchemy 连接。
+        authority: typed lifecycle lease 在持锁 admission 后发行的不可拆分 capability。
     """
+    connection = authority.connection
+    lifecycle = authority.grant_lifecycle
+    if authority.expected_target_revision == "20260809_0019":
+        calendar_guard = resolve_calendar_aad_migration_guard(config)
+        # revision 与 final callback 都只读取这一已解析实例；即使 migration operation 修改
+        # Config attribute，lifecycle 内仍保留同一 identity。
+        config.attributes[CALENDAR_AAD_0019_GUARD_ATTRIBUTE] = calendar_guard
+        lifecycle.bind_calendar_aad_guard(calendar_guard)
 
     context.configure(
-        connection=connection, target_metadata=target_metadata, include_object=include_object
+        connection=connection,
+        target_metadata=target_metadata,
+        include_object=include_object,
+        on_version_apply=_alembic_on_version_apply(lifecycle),
     )
 
     with context.begin_transaction():
+        lifecycle.verify_before_migrations()
         context.run_migrations()
-
-
-async def run_async_migrations() -> None:
-    """创建一次性异步引擎并在线执行全部待应用迁移。
-
-    引擎使用 ``NullPool``，避免短生命周期迁移命令在退出前保留连接。无论迁移成功或失败，
-    引擎都会被释放，原始异常继续向调用方传播。
-    """
-
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-
-    try:
-        async with connectable.connect() as connection:
-            await connection.run_sync(do_run_migrations)
-    finally:
-        await connectable.dispose()
+        lifecycle.verify_after_migrations()
 
 
 def run_migrations_online() -> None:
-    """从同步 Alembic 入口驱动异步在线迁移。"""
+    """只消费 typed lifecycle 注入的完整 token，任一字段缺失均 fail closed。
 
-    asyncio.run(run_async_migrations())
+    ``database_maintenance`` CLI 已在该 target session 上持有 maintenance/schema advisory
+    locks；env.py 不能从 URL/Connection/默认 head 自行补 authority，否则 DDL 会脱离
+    identity-bound admission。
+    """
+    do_run_migrations(require_online_migration_authority(config))
 
 
 if context.is_offline_mode():

@@ -184,10 +184,28 @@ class SqlAlchemyTaskExecutionStore:
         *,
         task_id: UUID,
         lease_owner: str,
+        renewed_at: datetime,
         lease_expires_at: datetime,
     ) -> bool:
-        """仅当前 RUNNING owner 能把租约延长到指定未来时刻。"""
+        """仅当前且未过期 RUNNING owner 能把租约延长到指定未来时刻。
+
+        Args:
+            task_id: 待续租任务标识。
+            lease_owner: 必须与持久 owner 精确一致的执行者。
+            renewed_at: 本次续租边界唯一采样的 UTC 瞬间。
+            lease_expires_at: 请求写入的新租约截止时间。
+
+        Returns:
+            条件 UPDATE 命中并提交时为 ``True``；租约缺失、过期、被接管或请求截止
+            时间不晚于 ``renewed_at`` 时为 ``False``。CAS 未命中绝不回退覆盖。
+
+        Raises:
+            ValueError: 任一时间不带时区，或请求截止时间不严格晚于 ``renewed_at``。
+        """
+        renewed_at = utc_instant(renewed_at, field="renewed_at")
         lease_expires_at = utc_instant(lease_expires_at, field="lease_expires_at")
+        if lease_expires_at <= renewed_at:
+            raise ValueError("lease_expires_at must be later than renewed_at")
         async with self._session_factory.begin() as session:
             task_id_result = await session.scalar(
                 update(TaskRunModel)
@@ -195,6 +213,8 @@ class SqlAlchemyTaskExecutionStore:
                     TaskRunModel.id == task_id,
                     TaskRunModel.status == TaskStatus.RUNNING.value,
                     TaskRunModel.lease_owner == lease_owner,
+                    TaskRunModel.lease_expires_at.is_not(None),
+                    TaskRunModel.lease_expires_at > renewed_at,
                 )
                 .values(lease_expires_at=lease_expires_at)
                 .returning(TaskRunModel.id)
@@ -255,6 +275,8 @@ class SqlAlchemyTaskExecutionStore:
                         TaskRunModel.id == task_id,
                         TaskRunModel.status == TaskStatus.RUNNING.value,
                         TaskRunModel.lease_owner == lease_owner,
+                        TaskRunModel.lease_expires_at.is_not(None),
+                        TaskRunModel.lease_expires_at > finished_at,
                     )
                     .values(
                         status=status.value,
@@ -314,6 +336,8 @@ class SqlAlchemyTaskExecutionStore:
                         TaskRunModel.id == task_id,
                         TaskRunModel.status == TaskStatus.RUNNING.value,
                         TaskRunModel.lease_owner == lease_owner,
+                        TaskRunModel.lease_expires_at.is_not(None),
+                        TaskRunModel.lease_expires_at > scheduled_at,
                     )
                     .values(
                         status=TaskStatus.RETRY_SCHEDULED.value,
@@ -381,6 +405,8 @@ class SqlAlchemyTaskExecutionStore:
         same_owner_running = and_(
             TaskRunModel.status == TaskStatus.RUNNING.value,
             TaskRunModel.lease_owner == lease_owner,
+            TaskRunModel.lease_expires_at.is_not(None),
+            TaskRunModel.lease_expires_at > failed_at,
         )
         async with self._session_factory.begin() as session:
             row = (

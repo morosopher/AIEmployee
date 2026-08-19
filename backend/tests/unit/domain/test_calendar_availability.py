@@ -7,6 +7,7 @@ import pytest
 
 from ai_employee.domain.calendar_availability import (
     AvailabilityEvent,
+    _merge_buffered_intervals,
     suggest_meeting_times,
 )
 from ai_employee.domain.settings import (
@@ -172,6 +173,111 @@ def test_transparent_and_cancelled_events_do_not_block_candidates() -> None:
     )
 
     assert result.candidates[0].starts_at == datetime(2030, 3, 11, 9, tzinfo=UTC)
+
+
+def test_buffered_busy_intervals_are_sorted_and_merge_adjacent_ranges() -> None:
+    """先过滤非忙碌事实，再把嵌套/相邻半开区间合并为最小集合。"""
+    merged = _merge_buffered_intervals(
+        (
+            busy("2030-03-11T10:00:00Z", "2030-03-11T11:00:00Z"),
+            busy("2030-03-11T09:00:00Z", "2030-03-11T10:00:00Z"),
+            busy(
+                "2030-03-11T09:30:00Z",
+                "2030-03-11T09:45:00Z",
+                transparency="transparent",
+            ),
+            busy(
+                "2030-03-11T11:00:00Z",
+                "2030-03-11T11:30:00Z",
+                status="cancelled",
+            ),
+        ),
+        timedelta(minutes=15),
+    )
+
+    assert merged == (
+        (
+            datetime(2030, 3, 11, 8, 45, tzinfo=UTC),
+            datetime(2030, 3, 11, 11, 15, tzinfo=UTC),
+        ),
+    )
+
+
+def test_large_event_set_matches_independent_brute_force_oracle() -> None:
+    """超过一万条事件时仍与逐候选扫描原始事实的独立 oracle 完全一致。
+
+    大部分事件位于搜索窗口之外；真正影响结果的取消、透明、嵌套、相邻和后置忙碌事实
+    刻意放在第 10,000 条之后。如果实现先截断事件集合，候选会与 oracle 产生差异。本测试
+    只比较确定性结果，不测墙钟耗时，也不复用 production 的排序或区间合并 helper。
+    """
+    search_start = datetime(2030, 3, 11, 9, tzinfo=UTC)
+    duration = timedelta(minutes=30)
+    meeting_buffer = timedelta()
+    distant_start = datetime(2030, 4, 1, 0, tzinfo=UTC)
+    distant_busy = tuple(
+        AvailabilityEvent(
+            starts_at=distant_start + timedelta(minutes=index),
+            ends_at=distant_start + timedelta(minutes=index + 1),
+            all_day=False,
+            transparency="opaque",
+            status="confirmed",
+        )
+        for index in range(10_000)
+    )
+    events = distant_busy + (
+        # 这两项覆盖整个工作窗口，但按领域规则必须被过滤。
+        busy(
+            "2030-03-11T09:00:00Z",
+            "2030-03-11T12:00:00Z",
+            status="cancelled",
+        ),
+        busy(
+            "2030-03-11T09:00:00Z",
+            "2030-03-11T12:00:00Z",
+            transparency="transparent",
+        ),
+        # 三项形成嵌套与相邻的 [09:30, 10:15) 忙碌范围。
+        busy("2030-03-11T09:30:00Z", "2030-03-11T10:00:00Z"),
+        busy("2030-03-11T09:40:00Z", "2030-03-11T09:50:00Z"),
+        busy("2030-03-11T10:00:00Z", "2030-03-11T10:15:00Z"),
+        # 最后一项在截断边界之后影响前三个候选，防止“看似处理大集合”的假阳性。
+        busy("2030-03-11T10:30:00Z", "2030-03-11T11:00:00Z"),
+    )
+
+    result = suggest_meeting_times(
+        requested_duration=duration,
+        search_start=search_start,
+        timezone="UTC",
+        working_hours=hours_for(0, ("09:00", "12:00")),
+        meeting_buffer=meeting_buffer,
+        events=events,
+        horizon_days=1,
+        grid_minutes=15,
+        limit=3,
+    )
+
+    # Oracle 直接逐候选扫描所有原始事件；它不排序、不合并，也不调用被测私有 helper。
+    oracle: list[tuple[datetime, datetime]] = []
+    for minute_offset in range(0, 180, 15):
+        candidate_start = search_start + timedelta(minutes=minute_offset)
+        candidate_end = candidate_start + duration
+        if candidate_end > datetime(2030, 3, 11, 12, tzinfo=UTC):
+            continue
+        overlaps = any(
+            candidate_start < event.ends_at.astimezone(UTC) + meeting_buffer
+            and candidate_end > event.starts_at.astimezone(UTC) - meeting_buffer
+            for event in events
+            if event.status.casefold() != "cancelled"
+            and event.transparency.casefold() not in {"transparent", "free"}
+        )
+        if overlaps:
+            continue
+        oracle.append((candidate_start, candidate_end))
+        if len(oracle) == 3:
+            break
+
+    assert len(events) == 10_006
+    assert tuple((item.starts_at, item.ends_at) for item in result.candidates) == tuple(oracle)
 
 
 def test_missing_connections_make_result_partial_without_attendee_claim() -> None:

@@ -1,18 +1,22 @@
 """在 PostgreSQL 上验证 Calendar 加密、tombstone、游标与用户隔离。"""
 
+import ast
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time
+from pathlib import Path
 from uuid import UUID
 
 import httpx
 import pytest
 import respx
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
 from ai_employee.application.ports.calendar import (
     CalendarCursorExpiredError,
     CalendarDirectoryPage,
@@ -20,6 +24,7 @@ from ai_employee.application.ports.calendar import (
     CalendarSyncPage,
     ProviderCalendar,
 )
+from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarConnectionNotFoundError,
     CalendarSyncStoreFactory,
@@ -29,6 +34,9 @@ from ai_employee.domain.errors import (
     InternalInvariantError,
     PermanentProviderError,
     TransientProviderError,
+)
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
 )
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -52,6 +60,72 @@ from ai_employee.integrations.google.calendar import (
 )
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.generate_brief import GenerateBriefTaskStep
+
+# 每个测试异常退出时先释放本模块创建的所有异步 pool，再进入共享数据库清理。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """让本模块只使用 Cycle 5 已验证的 regular head 数据库。"""
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖全局 migrate fixture；共享 helper 已完成 typed lifecycle 与 catalog 复核。"""
+    del cycle5_regular_database_url
+    yield
+
+
+def test_calendar_sync_writer_imports_and_calls_shared_framed_aad_v2() -> None:
+    """共享 Calendar 同步 writer 必须复用 v2 helper，并传入完整五项身份。
+
+    这里集中审阅共享应用 writer 的 AST，而不是在供应商测试中重复结构契约。调用数量
+    与字段字面量属于实现细节；本回归只冻结 helper 导入，以及每次调用都显式传递完整的
+    user/connection/calendar/event/field 五项身份。
+    """
+    writer_path = (
+        Path(__file__).resolve().parents[3]
+        / "src"
+        / "ai_employee"
+        / "application"
+        / "use_cases"
+        / "sync_calendar.py"
+    )
+    module = ast.parse(writer_path.read_text(encoding="utf-8"))
+
+    imported = {
+        alias.name
+        for node in module.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "ai_employee.application.calendar_event_aad"
+        for alias in node.names
+    }
+    calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "calendar_event_field_aad_v2"
+    ]
+
+    expected_keywords = {
+        "calendar_id",
+        "connection_id",
+        "field",
+        "provider_event_id",
+        "user_id",
+    }
+    assert "calendar_event_field_aad_v2" in imported
+    assert calls
+    assert all(
+        {keyword.arg for keyword in call.keywords} == expected_keywords for call in calls
+    )
 
 
 class FakeCalendar:
@@ -2090,89 +2164,166 @@ async def test_directory_sync_keeps_other_calendar_success_when_one_scope_fails(
 
 @pytest.mark.asyncio
 async def test_same_provider_event_id_is_scoped_per_calendar(database_url: str) -> None:
-    """相同 provider event ID 必须按日历隔离，单 scope 增量不能覆盖另一行。"""
+    """相同 event ID 的敏感字段必须按日历绑定 v2 AAD，且增量更新互不覆盖。"""
     sessions, cipher, user_id, connection_id = await _seed_google_calendar_connection(database_url)
-    stores = _calendar_stores(sessions)
-    await SyncCalendarUseCase(
-        stores,
-        ProviderAdapterRegistry(google_calendar=SharedProviderEventReader(_directory_calendars())),
-        cipher,
-    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+    try:
+        stores = _calendar_stores(sessions)
+        await SyncCalendarUseCase(
+            stores,
+            ProviderAdapterRegistry(
+                google_calendar=SharedProviderEventReader(_directory_calendars())
+            ),
+            cipher,
+        ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
 
-    async with sessions() as session:
-        first_rows = tuple(
-            (
-                await session.scalars(
-                    select(CalendarEventModel)
-                    .where(
-                        CalendarEventModel.user_id == user_id,
-                        CalendarEventModel.connection_id == connection_id,
+        async with sessions() as session:
+            first_rows = tuple(
+                (
+                    await session.scalars(
+                        select(CalendarEventModel)
+                        .where(
+                            CalendarEventModel.user_id == user_id,
+                            CalendarEventModel.connection_id == connection_id,
+                        )
+                        .order_by(CalendarEventModel.calendar_id)
                     )
-                    .order_by(CalendarEventModel.calendar_id)
-                )
-            ).all()
-        )
-
-    assert [row.calendar_id for row in first_rows] == [
-        "primary",
-        "readonly@example.test",
-    ]
-    assert [
-        (row.provider_event_id, row.title, row.etag, row.provider_url) for row in first_rows
-    ] == [
-        (
-            "shared-event-id",
-            "Synthetic primary v1",
-            "etag-primary-v1",
-            "https://calendar.example.test/primary/shared-event-id",
-        ),
-        (
-            "shared-event-id",
-            "Synthetic readonly@example.test v1",
-            "etag-readonly@example.test-v1",
-            "https://calendar.example.test/readonly@example.test/shared-event-id",
-        ),
-    ]
-    readonly_before = _non_sensitive_event_projection(first_rows[1])
-
-    await SyncCalendarUseCase(
-        stores,
-        ProviderAdapterRegistry(
-            google_calendar=SharedProviderEventReader(
-                _directory_calendars(),
-                directory_tokens=("directory-token-2",),
-                event_generation=2,
-                empty_delta_scopes=frozenset({"readonly@example.test"}),
-                primary_version=2,
+                ).all()
             )
-        ),
-        cipher,
-    ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
 
-    async with sessions() as session:
-        second_rows = tuple(
+        assert [row.calendar_id for row in first_rows] == [
+            "primary",
+            "readonly@example.test",
+        ]
+        assert [
+            (row.provider_event_id, row.title, row.etag, row.provider_url)
+            for row in first_rows
+        ] == [
             (
-                await session.scalars(
-                    select(CalendarEventModel)
-                    .where(
-                        CalendarEventModel.user_id == user_id,
-                        CalendarEventModel.connection_id == connection_id,
-                    )
-                    .order_by(CalendarEventModel.calendar_id)
-                )
-            ).all()
-        )
+                "shared-event-id",
+                "Synthetic primary v1",
+                "etag-primary-v1",
+                "https://calendar.example.test/primary/shared-event-id",
+            ),
+            (
+                "shared-event-id",
+                "Synthetic readonly@example.test v1",
+                "etag-readonly@example.test-v1",
+                "https://calendar.example.test/readonly@example.test/shared-event-id",
+            ),
+        ]
+        assert all(row.description_aad_version == 2 for row in first_rows)
+        assert all(row.location_aad_version == 2 for row in first_rows)
 
-    assert [row.calendar_id for row in second_rows] == [
-        "primary",
-        "readonly@example.test",
-    ]
-    assert (second_rows[0].title, second_rows[0].etag) == (
-        "Synthetic primary v2",
-        "etag-primary-v2",
-    )
-    assert _non_sensitive_event_projection(second_rows[1]) == readonly_before
-    await sessions.dispose()
+        rows_by_calendar = {row.calendar_id: row for row in first_rows}
+        for calendar_id, row in rows_by_calendar.items():
+            other_calendar_id = (
+                "readonly@example.test" if calendar_id == "primary" else "primary"
+            )
+            description = EncryptedValue(
+                ciphertext=row.description_ciphertext,
+                nonce=row.description_nonce,
+                key_version=row.description_key_version,
+            )
+            location = EncryptedValue(
+                ciphertext=row.location_ciphertext,
+                nonce=row.location_nonce,
+                key_version=row.location_key_version,
+            )
+            description_aad = calendar_event_field_aad_v2(
+                user_id=str(user_id),
+                connection_id=str(connection_id),
+                calendar_id=calendar_id,
+                provider_event_id=row.provider_event_id,
+                field="description",
+            )
+            location_aad = calendar_event_field_aad_v2(
+                user_id=str(user_id),
+                connection_id=str(connection_id),
+                calendar_id=calendar_id,
+                provider_event_id=row.provider_event_id,
+                field="location",
+            )
+
+            assert cipher.decrypt(description, description_aad).decode("utf-8") == (
+                f"private description {calendar_id}"
+            )
+            assert cipher.decrypt(location, location_aad).decode("utf-8") == (
+                f"private location {calendar_id}"
+            )
+
+            swapped_description_aad = calendar_event_field_aad_v2(
+                user_id=str(user_id),
+                connection_id=str(connection_id),
+                calendar_id=other_calendar_id,
+                provider_event_id=row.provider_event_id,
+                field="description",
+            )
+            swapped_location_aad = calendar_event_field_aad_v2(
+                user_id=str(user_id),
+                connection_id=str(connection_id),
+                calendar_id=other_calendar_id,
+                provider_event_id=row.provider_event_id,
+                field="location",
+            )
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(description, swapped_description_aad)
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(location, swapped_location_aad)
+
+            legacy_description_aad = (
+                f"{user_id}:{connection_id}:{row.provider_event_id}:description".encode(
+                    "ascii"
+                )
+            )
+            legacy_location_aad = (
+                f"{user_id}:{connection_id}:{row.provider_event_id}:location".encode("ascii")
+            )
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(description, legacy_description_aad)
+            with pytest.raises(InvalidTag):
+                cipher.decrypt(location, legacy_location_aad)
+
+        readonly_before = _non_sensitive_event_projection(first_rows[1])
+
+        await SyncCalendarUseCase(
+            stores,
+            ProviderAdapterRegistry(
+                google_calendar=SharedProviderEventReader(
+                    _directory_calendars(),
+                    directory_tokens=("directory-token-2",),
+                    event_generation=2,
+                    empty_delta_scopes=frozenset({"readonly@example.test"}),
+                    primary_version=2,
+                )
+            ),
+            cipher,
+        ).execute(user_id=user_id, connection_id=connection_id, scope_key="directory")
+
+        async with sessions() as session:
+            second_rows = tuple(
+                (
+                    await session.scalars(
+                        select(CalendarEventModel)
+                        .where(
+                            CalendarEventModel.user_id == user_id,
+                            CalendarEventModel.connection_id == connection_id,
+                        )
+                        .order_by(CalendarEventModel.calendar_id)
+                    )
+                ).all()
+            )
+
+        assert [row.calendar_id for row in second_rows] == [
+            "primary",
+            "readonly@example.test",
+        ]
+        assert (second_rows[0].title, second_rows[0].etag) == (
+            "Synthetic primary v2",
+            "etag-primary-v2",
+        )
+        assert _non_sensitive_event_projection(second_rows[1]) == readonly_before
+    finally:
+        await sessions.dispose()
 
 
 @pytest.mark.asyncio

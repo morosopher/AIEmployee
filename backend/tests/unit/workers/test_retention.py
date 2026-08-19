@@ -1,6 +1,5 @@
 """验证保留清理的配置安全边界。"""
 
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,9 +49,7 @@ class _RecordingRetentionWorker(RetentionCleanupWorker):
         super().__init__(_NoopSessionFactory())  # type: ignore[arg-type]
         self.calls: list[str] = []
 
-    async def _scrub_email_bodies(
-        self, user_id: UUID, cutoff: datetime, batch_size: int
-    ) -> None:
+    async def _scrub_email_bodies(self, user_id: UUID, cutoff: datetime, batch_size: int) -> None:
         """记录正文擦除阶段。"""
         del user_id, cutoff, batch_size
         self.calls.append("body")
@@ -99,7 +96,9 @@ def test_production_retention_worker_rejects_missing_dedicated_dsn(
 
 
 @pytest.mark.asyncio
-async def test_workspace_history_and_disconnected_credentials_are_processed_before_run_audit() -> None:
+async def test_workspace_history_and_disconnected_credentials_are_processed_before_run_audit() -> (
+    None
+):
     """保留清理必须先删除到期工作区图、重置断开同步状态，最后才写当前轮审计。"""
     worker = _RecordingRetentionWorker()
     user = SimpleNamespace(
@@ -150,9 +149,7 @@ async def test_workspace_retention_deletes_expired_audit_events_in_bounded_batch
     """工作区保留必须回收 cutoff 前的审计内容，当前轮审计则在该阶段后写入。"""
     worker = _AuditPreservingRetentionWorker()
 
-    await worker._delete_workspace_history(
-        uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10
-    )
+    await worker._delete_workspace_history(uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10)
 
     assert AuditEventModel in worker.deleted_models
 
@@ -176,23 +173,7 @@ async def test_workspace_retention_only_removes_empty_conversations() -> None:
     """旧会话含有新消息时必须保留，不能由父行级联删除仍有效的消息。"""
     worker = _ConversationSafeRetentionWorker()
 
-    await worker._delete_workspace_history(
-        uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10
-    )
+    await worker._delete_workspace_history(uuid4(), datetime(2026, 8, 4, tzinfo=UTC), batch_size=10)
 
     assert ConversationModel not in worker.deleted_models
     assert worker.empty_conversation_calls == 1
-
-
-def test_retention_database_role_cannot_update_append_only_audit_events() -> None:
-    """专用角色可为全量删除回收旧审计，但不得修改既有审计内容。"""
-    script = (
-        Path(__file__).resolve().parents[4] / "scripts" / "init-db-roles.sh"
-    ).read_text(encoding="utf-8")
-
-    assert re.search(
-        r"GRANT\\s+[^;]*UPDATE[^;]*ON\\s+[^;]*audit_events[^;]*ai_employee_retention",
-        script,
-        flags=re.DOTALL,
-    ) is None
-    assert "GRANT SELECT, INSERT, DELETE ON audit_events TO ai_employee_retention;" in script

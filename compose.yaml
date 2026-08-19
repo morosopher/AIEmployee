@@ -94,9 +94,7 @@ services:
     restart: "no"
     user: "0:0"
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-ai_employee}"
-      PGHOST: postgres
-      PGUSER: ai_employee_owner
+      DATABASE_URL: "postgresql+psycopg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
       APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
       RETENTION_DATABASE_PASSWORD_FILE: /run/secrets/retention_database_password
       POSTGRES_BOOTSTRAP_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
@@ -107,7 +105,11 @@ services:
     command:
       - /bin/sh
       - -ec
-      - "export PGPASSWORD=\"$$(cat /run/secrets/postgres_bootstrap_password)\"; exec bash /app/scripts/init-db-roles.sh"
+      - >-
+        exec uv run --no-sync python -m ai_employee.cli.database_maintenance role-bootstrap
+        --owner-password-file /run/secrets/postgres_bootstrap_password
+        --app-password-file /run/secrets/app_database_password
+        --retention-password-file /run/secrets/retention_database_password
     depends_on:
       postgres:
         condition: service_healthy
@@ -117,21 +119,16 @@ services:
     restart: "no"
     user: "0:0"
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-ai_employee}"
-      PGHOST: postgres
-      PGUSER: ai_employee_owner
-      DATABASE_URL: "postgresql+asyncpg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
+      DATABASE_URL: "postgresql+psycopg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
       POSTGRES_BOOTSTRAP_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
-      APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
-      RETENTION_DATABASE_PASSWORD_FILE: /run/secrets/retention_database_password
     secrets:
       - postgres_bootstrap_password
-      - app_database_password
-      - retention_database_password
     command:
       - /bin/sh
       - -ec
-      - "export PGPASSWORD=\"$$(cat /run/secrets/postgres_bootstrap_password)\"; uv run --no-sync alembic -c alembic.ini upgrade head; exec bash /app/scripts/init-db-roles.sh"
+      - >-
+        exec uv run --no-sync python -m ai_employee.cli.database_maintenance migrate
+        --owner-password-file /run/secrets/postgres_bootstrap_password
     depends_on:
       role-bootstrap:
         condition: service_completed_successfully

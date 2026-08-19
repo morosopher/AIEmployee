@@ -306,7 +306,10 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
                     SyncCursorModel(
                         connection_id=connection_id,
                         resource_kind="calendar",
-                        scope_key="primary",
+                        # M2 的周期入口先同步目录，再由目录事实建立 primary scope；直接
+                        # 构造旧 M1 primary cursor 会在 provider 调用前安全拒绝，无法覆盖
+                        # 本测试要验证的 Fake 5xx→durable retry 路径。
+                        scope_key="directory",
                         cursor=None,
                     ),
                     TaskRunModel(
@@ -317,7 +320,7 @@ async def test_calendar_5xx_persists_capped_retry_scheduled_outbox(
                         idempotency_key=f"calendar-5xx:{task_id}",
                         input_payload={
                             "connection_id": str(connection_id),
-                            "scope_key": "primary",
+                            "scope_key": "directory",
                         },
                     ),
                 )

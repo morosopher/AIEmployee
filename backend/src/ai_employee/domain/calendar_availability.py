@@ -163,10 +163,13 @@ def suggest_meeting_times(
     completeness: AvailabilityCompleteness = (
         "partial" if normalized_missing else "complete"
     )
-    buffered_busy = _buffered_busy_events(events, meeting_buffer)
+    # 先把所有可用事件压缩成排序的半开忙碌区间；候选扫描只向前移动索引，避免每个
+    # 候选重新遍历完整事件集合。事件不能在数据库层 LIMIT，合并必须看到全部事实。
+    buffered_busy = _merge_buffered_intervals(events, meeting_buffer)
     local_start_date = search_start_utc.astimezone(zone).date()
     candidates: list[CandidateTime] = []
     seen: set[tuple[datetime, datetime]] = set()
+    busy_index = 0
 
     for day_offset in range(horizon_days):
         local_day = local_start_date + timedelta(days=day_offset)
@@ -195,11 +198,13 @@ def suggest_meeting_times(
                 if candidate_start < search_start_utc:
                     continue
                 identity = (candidate_start, candidate_end)
-                if identity in seen or _overlaps_any(
-                    candidate_start,
-                    candidate_end,
-                    buffered_busy,
-                ):
+                while busy_index < len(buffered_busy) and buffered_busy[busy_index][1] <= candidate_start:
+                    busy_index += 1
+                overlaps_busy = (
+                    busy_index < len(buffered_busy)
+                    and buffered_busy[busy_index][0] < candidate_end
+                )
+                if identity in seen or overlaps_busy:
                     continue
                 seen.add(identity)
                 candidates.append(CandidateTime(candidate_start, candidate_end))
@@ -232,25 +237,47 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
     return value.astimezone(UTC)
 
 
-def _buffered_busy_events(
+def _merge_buffered_intervals(
     events: tuple[AvailabilityEvent, ...],
     meeting_buffer: timedelta,
 ) -> tuple[tuple[datetime, datetime], ...]:
-    """过滤非忙碌事实并把每个区间前后扩展相同缓冲。"""
-    result: list[tuple[datetime, datetime]] = []
+    """过滤、缓冲、排序并合并本人日历忙碌区间。
+
+    使用半开区间 ``[start, end)``：重叠或刚好相邻的区间都可以合并，因为候选结束在
+    ``busy_start`` 的瞬间不冲突，而候选开始在已占用区间结束的瞬间也不冲突。调用方必须
+    在数据库读事务结束后传入完整 DTO 集合；本函数不执行任何 I/O 或截断。
+    """
+    intervals: list[tuple[datetime, datetime]] = []
     for event in events:
         if event.status.casefold() == "cancelled" or event.transparency.casefold() in {
             "transparent",
             "free",
         }:
             continue
-        result.append(
+        intervals.append(
             (
                 event.starts_at.astimezone(UTC) - meeting_buffer,
                 event.ends_at.astimezone(UTC) + meeting_buffer,
             )
         )
-    return tuple(result)
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        if end > previous_end:
+            merged[-1] = (previous_start, end)
+    return tuple(merged)
+
+
+def _buffered_busy_events(
+    events: tuple[AvailabilityEvent, ...],
+    meeting_buffer: timedelta,
+) -> tuple[tuple[datetime, datetime], ...]:
+    """兼容旧内部调用名；新路径统一使用合并后的忙碌区间。"""
+    return _merge_buffered_intervals(events, meeting_buffer)
 
 
 def _grid_points(

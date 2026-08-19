@@ -5,7 +5,7 @@ from datetime import UTC, datetime, time, timedelta
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.outbox import OutboxRelay
@@ -497,6 +497,215 @@ async def test_execution_lease_is_single_owner_replaceable_after_expiry_and_cas_
             lease_expires_at=now + timedelta(seconds=120),
         )
         assert terminal_claim is None
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execution_lease_writes_are_strictly_before_deadline_and_renew_is_time_valid(
+    database_url: str,
+) -> None:
+    """等于租约截止时间即失效，未来期限不能复活过期或被接管的 owner。"""
+    session_factory = build_session_factory(database_url)
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    deadline = now + timedelta(seconds=30)
+    try:
+        async with session_factory.begin() as session:
+            user = _user()
+            session.add(user)
+            await session.flush()
+            finish_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                lease_owner="worker-a",
+                lease_expires_at=deadline,
+                started_at=now,
+                idempotency_key="lease:strict:finish",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            retry_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                lease_owner="worker-a",
+                lease_expires_at=deadline,
+                started_at=now,
+                idempotency_key="lease:strict:retry",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            failure_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                lease_owner="worker-a",
+                lease_expires_at=deadline,
+                started_at=now,
+                idempotency_key="lease:strict:failure",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            renew_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                lease_owner="worker-a",
+                lease_expires_at=deadline,
+                started_at=now,
+                idempotency_key="lease:strict:renew",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            valid_renew_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.RUNNING.value,
+                lease_owner="worker-a",
+                lease_expires_at=deadline,
+                started_at=now,
+                idempotency_key="lease:strict:valid-renew",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            takeover_task = TaskRunModel(
+                user_id=user.id,
+                kind="daily_brief",
+                status=TaskStatus.QUEUED.value,
+                idempotency_key="lease:strict:takeover",
+                input_payload={"local_date": "2030-08-01"},
+            )
+            session.add_all(
+                (
+                    finish_task,
+                    retry_task,
+                    failure_task,
+                    renew_task,
+                    valid_renew_task,
+                    takeover_task,
+                )
+            )
+            await session.flush()
+            finish_id = finish_task.id
+            retry_id = retry_task.id
+            failure_id = failure_task.id
+            renew_id = renew_task.id
+            valid_renew_id = valid_renew_task.id
+            takeover_id = takeover_task.id
+
+        store = SqlAlchemyTaskExecutionStore(session_factory)
+        assert (
+            await store.finish(
+                task_id=finish_id,
+                lease_owner="worker-a",
+                status=TaskStatus.SUCCEEDED,
+                finished_at=deadline,
+                error_code=None,
+            )
+            is False
+        )
+        assert (
+            await store.schedule_retry(
+                task_id=retry_id,
+                lease_owner="worker-a",
+                scheduled_at=deadline,
+                retry_available_at=deadline + timedelta(seconds=5),
+                error_code="synthetic_retry",
+                attempt_count=1,
+            )
+            is False
+        )
+        assert (
+            await store.fail_internal(
+                task_id=failure_id,
+                lease_owner="worker-a",
+                failed_at=deadline,
+                error_code="task_execution_internal_error",
+            )
+            is False
+        )
+        assert (
+            await store.renew(
+                task_id=renew_id,
+                lease_owner="worker-a",
+                renewed_at=deadline,
+                lease_expires_at=deadline + timedelta(seconds=30),
+            )
+            is False
+        )
+        assert (
+            await store.renew(
+                task_id=renew_id,
+                lease_owner="worker-a",
+                renewed_at=deadline + timedelta(seconds=1),
+                lease_expires_at=deadline + timedelta(seconds=31),
+            )
+            is False
+        )
+        assert (
+            await store.renew(
+                task_id=valid_renew_id,
+                lease_owner="worker-a",
+                renewed_at=now + timedelta(seconds=1),
+                lease_expires_at=now + timedelta(seconds=31),
+            )
+            is True
+        )
+
+        first = await store.acquire(
+            task_id=takeover_id,
+            lease_owner="worker-a",
+            now=now,
+            lease_expires_at=deadline,
+        )
+        replacement = await store.acquire(
+            task_id=takeover_id,
+            lease_owner="worker-b",
+            now=deadline,
+            lease_expires_at=deadline + timedelta(seconds=30),
+        )
+        assert first is not None
+        assert replacement is not None
+        assert (
+            await store.renew(
+                task_id=takeover_id,
+                lease_owner="worker-a",
+                renewed_at=deadline + timedelta(seconds=1),
+                lease_expires_at=deadline + timedelta(seconds=31),
+            )
+            is False
+        )
+        assert (
+            await store.finish(
+                task_id=takeover_id,
+                lease_owner="worker-b",
+                status=TaskStatus.SUCCEEDED,
+                finished_at=deadline + timedelta(seconds=29),
+                error_code=None,
+            )
+            is True
+        )
+
+        async with session_factory() as session:
+            retry_outbox = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(
+                    OutboxEventModel.aggregate_id == retry_id,
+                    OutboxEventModel.topic == "task.execute",
+                )
+            )
+            persisted = {
+                task.id: task
+                for task in (
+                    await session.scalars(
+                        select(TaskRunModel).where(
+                            TaskRunModel.id.in_((finish_id, retry_id, failure_id, renew_id))
+                        )
+                    )
+                ).all()
+            }
+        assert retry_outbox == 0
+        assert persisted[finish_id].status == TaskStatus.RUNNING.value
+        assert persisted[retry_id].status == TaskStatus.RUNNING.value
+        assert persisted[failure_id].status == TaskStatus.RUNNING.value
+        assert persisted[renew_id].lease_expires_at == deadline
     finally:
         await session_factory.dispose()
 

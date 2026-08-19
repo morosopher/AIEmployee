@@ -20,6 +20,37 @@ for recipe in "${required_recipes[@]}"; do
   grep -Eq "(^| )${recipe}( |$)" <<<"${summary}"
 done
 
+# 标准 integration 入口必须交给 Python orchestrator 建立两个独立 pytest session；禁止
+# 回退为会混合 cluster-wide roles-present/absent 状态的单一 pytest 命令。
+integration_definition="$(just --show test-integration)"
+grep -Fq 'scripts/run_integration_tests.py' <<<"${integration_definition}"
+! grep -Fq 'pytest backend/tests/integration backend/tests/contract backend/tests/evals' \
+  <<<"${integration_definition}"
+
+# 所有普通数据库生命周期入口必须路由 typed CLI；recipe 不得保留 shell Alembic、
+# direct drop/create 或任何 obsolete-0019 repair/stamp/downgrade/revision rewrite。
+db_upgrade_definition="$(just --show db-upgrade)"
+db_reset_definition="$(just --show db-reset)"
+grep -Fq 'ai_employee.cli.database_maintenance migrate' <<<"${db_upgrade_definition}"
+grep -Fq 'ai_employee.cli.database_maintenance db-reset' <<<"${db_reset_definition}"
+for forbidden_lifecycle_text in \
+  'alembic -c backend/alembic.ini upgrade head' \
+  'dropdb ' \
+  'createdb ' \
+  ' repair' \
+  ' stamp' \
+  ' downgrade' \
+  'revision rewrite'; do
+  ! grep -Fq -- "${forbidden_lifecycle_text}" <<<"${db_upgrade_definition}"
+  ! grep -Fq -- "${forbidden_lifecycle_text}" <<<"${db_reset_definition}"
+done
+! grep -Eiq 'GRANT[[:space:]]+ALL|ALL[[:space:]]+(TABLES|SEQUENCES)|ALTER[[:space:]]+DEFAULT[[:space:]]+PRIVILEGES' \
+  scripts/init-db-roles.sh
+! grep -Fq 'init-db-roles.sh' <<<"$(
+  awk '/^  migration:/{capture=1} capture && /^  api:/{exit} capture{print}' compose.yaml
+)"
+! grep -Eiq 'obsolete[-_ ]?0019|repair[-_ ]?0019' justfiles/db.just scripts/run-e2e-backend.sh
+
 # 后续行为测试全部在临时目录运行；Fake 命令只记录参数，绝不连接真实 Docker、数据库或恢复脚本。
 sandbox_dir="$(mktemp -d "${TMPDIR:-/tmp}/ai-employee-tooling.XXXXXX")"
 cleanup() {
@@ -34,11 +65,13 @@ mkdir -p "${sandbox_dir}/just-temp"
 
 command_log="${sandbox_dir}/fake-commands.log"
 uv_environment_log="${sandbox_dir}/fake-uv-environment.log"
+typed_database_name_log="${sandbox_dir}/fake-typed-database-name.log"
 output_file="${sandbox_dir}/command-output.log"
 stdout_file="${sandbox_dir}/command-stdout.log"
 stderr_file="${sandbox_dir}/command-stderr.log"
 export TOOLING_TEST_LOG="${command_log}"
 export TOOLING_TEST_UV_ENV_LOG="${uv_environment_log}"
+export TOOLING_TEST_TYPED_DATABASE_NAME_LOG="${typed_database_name_log}"
 
 # Fake 命令把每个参数作为独立的制表符字段记录，能同时验证引用边界和参数原样性。
 cat >"${sandbox_dir}/fake-bin/docker" <<'FAKE_DOCKER'
@@ -57,8 +90,10 @@ cat >"${sandbox_dir}/fake-bin/uv" <<'FAKE_UV'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 迁移进程只能从 DATABASE_URL 解析连接目标；这里只记录 libpq 覆盖变量是否存在，绝不记录值。
-if [[ "$*" == *'alembic -c backend/alembic.ini upgrade head'* ]]; then
+# typed lifecycle 只能从 passwordless DATABASE_URL 解析目标；这里只记录 libpq override
+# 是否存在，并记录已经确认不含密码的 lifecycle URL。
+if [[ "$*" == *'ai_employee.cli.database_maintenance migrate'* \
+   || "$*" == *'ai_employee.cli.database_maintenance db-reset'* ]]; then
   printf 'uv-upgrade-environment' >>"${TOOLING_TEST_UV_ENV_LOG}"
   for variable_name in PGHOST PGHOSTADDR PGPORT PGDATABASE PGUSER PGSERVICE PGSERVICEFILE; do
     if [[ -v "${variable_name}" ]]; then
@@ -67,7 +102,21 @@ if [[ "$*" == *'alembic -c backend/alembic.ini upgrade head'* ]]; then
       printf '\t%s=unset' "${variable_name}" >>"${TOOLING_TEST_UV_ENV_LOG}"
     fi
   done
+  printf '\tDATABASE_URL=%s' "${DATABASE_URL-}" >>"${TOOLING_TEST_UV_ENV_LOG}"
   printf '\n' >>"${TOOLING_TEST_UV_ENV_LOG}"
+  AI_EMPLOYEE_TOOLING_DATABASE_URL="${DATABASE_URL-}" python3 - <<'PY'
+import os
+from urllib.parse import unquote, urlsplit
+
+value = os.environ["AI_EMPLOYEE_TOOLING_DATABASE_URL"]
+database_name = unquote(
+    urlsplit(value).path.removeprefix("/"),
+    encoding="utf-8",
+    errors="strict",
+)
+with open(os.environ["TOOLING_TEST_TYPED_DATABASE_NAME_LOG"], "a", encoding="utf-8") as log:
+    log.write(database_name + "\n")
+PY
 fi
 
 {
@@ -185,6 +234,31 @@ set_valid_database_environment() {
   export POSTGRES_DB=ai_employee_test
   export POSTGRES_USER=ai_employee
   export DATABASE_URL='postgresql+asyncpg://ai_employee:ai_employee@localhost:5432/ai_employee_test'
+  export POSTGRES_BOOTSTRAP_PASSWORD_FILE="${sandbox_dir}/owner-password"
+  export APP_DATABASE_PASSWORD_FILE="${sandbox_dir}/app-password"
+  export RETENTION_DATABASE_PASSWORD_FILE="${sandbox_dir}/retention-password"
+}
+
+expect_db_upgrade_failure() {
+  local label="$1"
+  local rejected_url="${DATABASE_URL-}"
+  local unexpectedly_allowed=false
+  clear_command_log
+  : >"${uv_environment_log}"
+  : >"${typed_database_name_log}"
+  if run_just_capture "${output_file}" just --yes db-upgrade; then
+    unexpectedly_allowed=true
+    printf 'tooling behavior contract failed: db-upgrade unexpectedly allowed %s\n' \
+      "${label}" >&2
+  fi
+  if [[ -n "${rejected_url}" && "$(<"${output_file}")" == *"${rejected_url}"* ]]; then
+    printf 'tooling behavior contract failed: db-upgrade output leaked rejected DATABASE_URL\n' >&2
+    exit 1
+  fi
+  assert_no_fake_calls
+  [[ ! -s "${uv_environment_log}" ]]
+  [[ ! -s "${typed_database_name_log}" ]]
+  [[ "${unexpectedly_allowed}" == false ]] || exit 1
 }
 
 expect_db_reset_failure() {
@@ -253,6 +327,104 @@ fi
 assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.create_admin\t--email\t'"${admin_email}"$'\t--password-file\t'"${admin_password_file}" "${command_log}"
 assert_line_count 1 "${command_log}"
 
+# just 只保留一个稳定入口，并把进程边界、suite lock 与 cleanup 交给 typed orchestrator。
+clear_command_log
+if ! run_just_capture "${output_file}" just --yes test-integration; then
+  printf 'tooling behavior contract failed: test-integration orchestrator entry failed\n' >&2
+  exit 1
+fi
+assert_exact_line \
+  $'uv\trun\t--project\tbackend\tpython\tscripts/run_integration_tests.py' \
+  "${command_log}"
+assert_line_count 1 "${command_log}"
+
+# 普通 db-upgrade 必须从现有 URL 只保留 endpoint，清除 libpq override，并调用 typed migrate。
+set_valid_database_environment
+export PGHOST=production.example PGHOSTADDR=203.0.113.10 PGPORT=6543
+export PGDATABASE=production_database PGUSER=production_user
+export PGSERVICE=production_service PGSERVICEFILE=/synthetic/production-service.conf
+clear_command_log
+: >"${uv_environment_log}"
+if ! run_just_capture "${output_file}" just --yes db-upgrade; then
+  printf 'tooling behavior contract failed: typed db-upgrade failed\n' >&2
+  exit 1
+fi
+assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.database_maintenance\tmigrate\t--owner-password-file\t'"${POSTGRES_BOOTSTRAP_PASSWORD_FILE}" "${command_log}"
+assert_line_count 1 "${command_log}"
+assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset\tDATABASE_URL=postgresql+psycopg://ai_employee@localhost:5432/ai_employee_test' "${uv_environment_log}"
+assert_line_count 1 "${uv_environment_log}"
+
+# 普通 migrate 的 wrapper 必须按 URL 语义取得 exact decoded PostgreSQL 数据库名，再把
+# passwordless lifecycle URL 规范编码；quoted UTF-8、组合字符和编码后的分隔符都不能
+# 被 owner role 的 ASCII identifier 规则误拒绝，也不能改变数据库 identity。
+valid_db_upgrade_cases=(
+  $'\u62a5\u4ef7\u5e93_test|\u62a5\u4ef7\u5e93_test|%E6%8A%A5%E4%BB%B7%E5%BA%93_test'
+  $'\u62a5\u4ef7%22\u5e93_test|\u62a5\u4ef7"\u5e93_test|%E6%8A%A5%E4%BB%B7%22%E5%BA%93_test'
+  $'Cafe%CC%81%2Fquote%3Fprice%23_test|Cafe\u0301/quote?price#_test|Cafe%CC%81%2Fquote%3Fprice%23_test'
+  'literal%25percent_test|literal%percent_test|literal%25percent_test'
+  'literal%252F_test|literal%2F_test|literal%252F_test'
+)
+for valid_db_upgrade_case in "${valid_db_upgrade_cases[@]}"; do
+  source_database_path="${valid_db_upgrade_case%%|*}"
+  remaining_case="${valid_db_upgrade_case#*|}"
+  exact_database_name="${remaining_case%%|*}"
+  canonical_database_path="${remaining_case#*|}"
+  set_valid_database_environment
+  export DATABASE_URL="postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/${source_database_path}"
+  clear_command_log
+  : >"${uv_environment_log}"
+  : >"${typed_database_name_log}"
+  if ! run_just_capture "${output_file}" just --yes db-upgrade; then
+    printf 'tooling behavior contract failed: db-upgrade rejected exact UTF-8 database %q\n' \
+      "${exact_database_name}" >&2
+    sed -n '1,80p' "${output_file}" >&2 || true
+    exit 1
+  fi
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.database_maintenance\tmigrate\t--owner-password-file\t'"${POSTGRES_BOOTSTRAP_PASSWORD_FILE}" "${command_log}"
+  assert_line_count 1 "${command_log}"
+  assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset\tDATABASE_URL=postgresql+psycopg://ai_employee@localhost:5432/'"${canonical_database_path}" "${uv_environment_log}"
+  assert_line_count 1 "${uv_environment_log}"
+  assert_exact_line "${exact_database_name}" "${typed_database_name_log}"
+  assert_line_count 1 "${typed_database_name_log}"
+  assert_not_contains 'synthetic-password-marker' "${uv_environment_log}"
+done
+
+# wrapper 的放宽只适用于 decoded database name；endpoint、owner role、query/fragment 以及
+# decoded UTF-8/NUL/63-byte 门禁仍必须在 fake typed migrate 首次调用前 fail closed。
+invalid_db_upgrade_urls=(
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/%00'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/%FF'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/ai_employee_test?host=elsewhere'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/ai_employee_test#fragment'
+  'postgresql+asyncpg://:synthetic-password-marker@localhost:5432/ai_employee_test'
+  'postgresql+asyncpg://bad-user:synthetic-password-marker@localhost:5432/ai_employee_test'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@:5432/ai_employee_test'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost/ai_employee_test'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:0/ai_employee_test'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/bad%'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/bad%4'
+  'postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/bad%GG'
+  'postgresql+asyncpg://ai_employee%:synthetic-password-marker@localhost:5432/ai_employee_test'
+  'postgresql+asyncpg://ai%4_employee:synthetic-password-marker@localhost:5432/ai_employee_test'
+  'postgresql+asyncpg://ai_employee%gG:synthetic-password-marker@localhost:5432/ai_employee_test'
+)
+for invalid_db_upgrade_url in "${invalid_db_upgrade_urls[@]}"; do
+  set_valid_database_environment
+  export DATABASE_URL="${invalid_db_upgrade_url}"
+  expect_db_upgrade_failure "invalid endpoint or decoded name"
+done
+
+set_valid_database_environment
+oversized_decoded_database_path="$(printf '%%C3%%A9%.0s' {1..32})"
+export DATABASE_URL="postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/${oversized_decoded_database_path}"
+expect_db_upgrade_failure 'database name over 63 decoded UTF-8 bytes'
+
+set_valid_database_environment
+oversized_upgrade_owner="$(printf 'a%.0s' {1..64})"
+export DATABASE_URL="postgresql+asyncpg://${oversized_upgrade_owner}:synthetic-password-marker@localhost:5432/ai_employee_test"
+expect_db_upgrade_failure 'owner role over 63 bytes'
+
 # service 参数同样不能逃逸；有参数时还必须经过 -- 与固定命令选项隔离。
 clear_command_log
 logs_sentinel="${sandbox_dir}/logs-injection-sentinel"
@@ -305,7 +477,9 @@ done
 
 # 关键配置缺失、URL 数据库不一致或数据库标识符不安全时，任何 fake 外部命令都不能先执行。
 set_valid_database_environment
-for missing_variable in POSTGRES_DB POSTGRES_USER DATABASE_URL; do
+for missing_variable in \
+  POSTGRES_DB POSTGRES_USER DATABASE_URL POSTGRES_BOOTSTRAP_PASSWORD_FILE \
+  APP_DATABASE_PASSWORD_FILE RETENTION_DATABASE_PASSWORD_FILE; do
   set_valid_database_environment
   unset "${missing_variable}"
   expect_db_reset_failure "missing ${missing_variable}"
@@ -315,11 +489,92 @@ set_valid_database_environment
 export DATABASE_URL='postgresql+asyncpg://ai_employee:ai_employee@localhost:5432/another_database'
 expect_db_reset_failure database-url-mismatch
 
+for system_database in postgres template0 template1; do
+  set_valid_database_environment
+  export APP_ENV=development
+  export POSTGRES_DB="${system_database}"
+  export DATABASE_URL="postgresql+asyncpg://ai_employee:ai_employee@localhost:5432/${system_database}"
+  expect_db_reset_failure "system database ${system_database}" 'system databases cannot be reset'
+done
+
+# quoted/Unicode 数据库名属于 PostgreSQL 的合法 UTF-8 标识符；guard 必须逐字保留，且
+# 只有 exact 小写系统库名称被拒绝，不能 normalization、case-fold 或套用 role 的 ASCII 语法。
+valid_database_cases=(
+  $'test|\u62a5\u4ef7"\u5e93_test|%E6%8A%A5%E4%BB%B7%22%E5%BA%93_test'
+  'test|Postgres_test|Postgres_test'
+  'development|Postgres|Postgres'
+)
+for valid_database_case in "${valid_database_cases[@]}"; do
+  valid_environment="${valid_database_case%%|*}"
+  remaining_database_case="${valid_database_case#*|}"
+  valid_database="${remaining_database_case%%|*}"
+  canonical_database_path="${remaining_database_case#*|}"
+  set_valid_database_environment
+  export APP_ENV="${valid_environment}"
+  export POSTGRES_DB="${valid_database}"
+  export DATABASE_URL="postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/${valid_database}"
+  clear_command_log
+  : >"${uv_environment_log}"
+  if ! run_just_with_input_split \
+    "${valid_database}" "${stdout_file}" "${stderr_file}" just --yes db-reset; then
+    printf 'tooling behavior contract failed: db-reset rejected exact UTF-8 database %q\n' \
+      "${valid_database}" >&2
+    exit 1
+  fi
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.database_maintenance\tdb-reset\t--owner-password-file\t'"${POSTGRES_BOOTSTRAP_PASSWORD_FILE}"$'\t--app-password-file\t'"${APP_DATABASE_PASSWORD_FILE}"$'\t--retention-password-file\t'"${RETENTION_DATABASE_PASSWORD_FILE}"$'\t--app-env\t'"${valid_environment}"$'\t--confirmed-database-name\t'"${valid_database}" "${command_log}"
+  assert_line_count 1 "${command_log}"
+  assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset\tDATABASE_URL=postgresql+psycopg://ai_employee@localhost:5432/'"${canonical_database_path}" "${uv_environment_log}"
+  assert_line_count 1 "${uv_environment_log}"
+done
+
+# 字面 percent 与 percent-encoding 不能形成两套 reset identity：合法 `%25` 与 `%252F`
+# 均只解码一次，输出再规范编码，typed CLI 最终仍看到人工确认的原始名称。
+valid_reset_percent_cases=(
+  'literal%_test|literal%25_test'
+  'literal%2F_test|literal%252F_test'
+  'literal%41_test|literal%2541_test'
+)
+for valid_reset_percent_case in "${valid_reset_percent_cases[@]}"; do
+  exact_percent_database="${valid_reset_percent_case%%|*}"
+  encoded_percent_database_path="${valid_reset_percent_case#*|}"
+  set_valid_database_environment
+  export APP_ENV=test
+  export POSTGRES_DB="${exact_percent_database}"
+  export DATABASE_URL="postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/${encoded_percent_database_path}"
+  clear_command_log
+  : >"${uv_environment_log}"
+  : >"${typed_database_name_log}"
+  if ! run_just_with_input_split \
+    "${POSTGRES_DB}" "${stdout_file}" "${stderr_file}" just --yes db-reset; then
+    printf 'tooling behavior contract failed: db-reset rejected exact percent database %q\n' \
+      "${POSTGRES_DB}" >&2
+    exit 1
+  fi
+  assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset\tDATABASE_URL=postgresql+psycopg://ai_employee@localhost:5432/'"${encoded_percent_database_path}" "${uv_environment_log}"
+  assert_exact_line "${POSTGRES_DB}" "${typed_database_name_log}"
+done
+
+set_valid_database_environment
+export APP_ENV=test
+export POSTGRES_DB='literal%41_test'
+export DATABASE_URL='postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/literal%41_test'
+expect_db_reset_failure 'percent-encoding decoded to a different database identity'
+
+for malformed_percent_database in 'bad%' 'bad%4' 'bad%GG'; do
+  set_valid_database_environment
+  export APP_ENV=development
+  export POSTGRES_DB="${malformed_percent_database}"
+  export DATABASE_URL="postgresql+asyncpg://ai_employee:synthetic-password-marker@localhost:5432/${malformed_percent_database}"
+  expect_db_reset_failure "malformed percent database ${malformed_percent_database}"
+done
+
+# 这些名称在 PostgreSQL 中本身合法；test 环境仍应由现有 exact ``_test`` 后缀门禁拒绝。
 unsafe_databases=(
-  '' postgres template0 template1 bad-name '1bad' 'bad name' 'bad;name' 'bad"name'
+  '' bad-name '1bad' 'bad name' 'bad;name' 'bad"name'
 )
 for unsafe_database in "${unsafe_databases[@]}"; do
   set_valid_database_environment
+  export APP_ENV=test
   export POSTGRES_DB="${unsafe_database}"
   export DATABASE_URL="postgresql+asyncpg://ai_employee:ai_employee@localhost:5432/${unsafe_database}"
   expect_db_reset_failure "unsafe database ${unsafe_database}"
@@ -479,11 +734,9 @@ for allowed_environment in development test; do
   assert_contains "Database user: ${POSTGRES_USER}" "${stderr_file}"
   assert_not_contains 'synthetic-password-marker' "${stderr_file}"
   assert_not_contains "${DATABASE_URL}" "${stderr_file}"
-  assert_exact_line $'docker\tcompose\texec\t-T\tpostgres\tdropdb\t--if-exists\t-U\tai_employee\tai_employee_test' "${command_log}"
-  assert_exact_line $'docker\tcompose\texec\t-T\tpostgres\tcreatedb\t-U\tai_employee\tai_employee_test' "${command_log}"
-  assert_exact_line $'uv\trun\t--project\tbackend\talembic\t-c\tbackend/alembic.ini\tupgrade\thead' "${command_log}"
-  assert_line_count 3 "${command_log}"
-  assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset' "${uv_environment_log}"
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.database_maintenance\tdb-reset\t--owner-password-file\t'"${POSTGRES_BOOTSTRAP_PASSWORD_FILE}"$'\t--app-password-file\t'"${APP_DATABASE_PASSWORD_FILE}"$'\t--retention-password-file\t'"${RETENTION_DATABASE_PASSWORD_FILE}"$'\t--app-env\t'"${allowed_environment}"$'\t--confirmed-database-name\tai_employee_test' "${command_log}"
+  assert_line_count 1 "${command_log}"
+  assert_exact_line $'uv-upgrade-environment\tPGHOST=unset\tPGHOSTADDR=unset\tPGPORT=unset\tPGDATABASE=unset\tPGUSER=unset\tPGSERVICE=unset\tPGSERVICEFILE=unset\tDATABASE_URL=postgresql+psycopg://ai_employee@localhost:5432/ai_employee_test' "${uv_environment_log}"
   assert_line_count 1 "${uv_environment_log}"
 
   restore_target="${sandbox_dir}/safe backup; \"copy\".dump"

@@ -1,7 +1,7 @@
 """验证 M2 加密草稿、日历提案、审批与工具执行的数据库不变量。"""
 
 import asyncio
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -9,7 +9,6 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
-from alembic import command
 from alembic.config import Config
 from sqlalchemy import (
     CheckConstraint,
@@ -50,6 +49,7 @@ from ai_employee.infrastructure.db.session import (
     ManagedAsyncSessionMaker,
     build_session_factory,
 )
+from tests.integration.alembic_commands import run_alembic_upgrade
 
 SQLSTATE_NOT_NULL = "23502"
 SQLSTATE_FOREIGN_KEY = "23503"
@@ -673,7 +673,7 @@ def test_orm_metadata_mirrors_aead_nonce_counter_and_manual_resolution_checks() 
     assert "confirmed_not_executed" in tool_checks["ck_tool_executions_manual_resolution_value"]
 
 
-def test_database_contains_named_aead_nonce_counter_and_manual_resolution_checks(
+def _database_contains_named_aead_nonce_counter_and_manual_resolution_checks(
     empty_migration_database: URL,
 ) -> None:
     """空库升级后必须真实存在所有安全检查，而非只在 Python 元数据中声明。"""
@@ -683,7 +683,7 @@ def test_database_contains_named_aead_nonce_counter_and_manual_resolution_checks
         alembic_config,
         empty_migration_database.render_as_string(hide_password=False),
     )
-    command.upgrade(alembic_config, "head")
+    run_alembic_upgrade(alembic_config, "head")
 
     expected_names = {
         "ck_mail_draft_versions_body_aead_all_or_none",
@@ -714,6 +714,24 @@ def test_database_contains_named_aead_nonce_counter_and_manual_resolution_checks
     )
     assert "confirmed_executed" in definitions["ck_tool_executions_manual_resolution_value"]
     assert "confirmed_not_executed" in definitions["ck_tool_executions_manual_resolution_value"]
+
+
+class TestEmptyTrustedActionMigration:
+    """让唯一空库契约局部遮蔽共享 migration/TRUNCATE 自动 fixture。"""
+
+    @pytest.fixture(autouse=True, name="migrated_database")
+    def _without_session_migration(self) -> Iterator[None]:
+        """空库用例不得先启动或改变共享 Task 13 数据库。"""
+        yield
+
+    @pytest.fixture(autouse=True, name="isolated_database")
+    async def _without_application_truncate(self) -> AsyncIterator[None]:
+        """空库用例只清理由自身 fixture 创建的 UUID 目标。"""
+        yield
+
+    test_database_contains_named_aead_nonce_counter_and_manual_resolution_checks = staticmethod(
+        _database_contains_named_aead_nonce_counter_and_manual_resolution_checks
+    )
 
 
 REQUIRED_NULL_CASES = (

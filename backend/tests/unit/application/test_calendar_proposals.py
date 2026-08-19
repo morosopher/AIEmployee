@@ -9,17 +9,24 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import ai_employee.application.use_cases.calendar_proposals as calendar_proposals_module
 from ai_employee.application.ports.calendar import CalendarEvent
 from ai_employee.application.use_cases.calendar_proposals import (
+    CALENDAR_AVAILABILITY_HORIZON_DAYS,
     CalendarAvailabilityContext,
+    CalendarAvailabilityRead,
+    CalendarConfirmation,
+    CalendarOperationKind,
     CalendarProposalContent,
     CalendarProposalEventBinding,
     CalendarProposalEventSnapshot,
     CalendarProposalSnapshot,
     CalendarProposalTargetSnapshot,
     CalendarProposalUseCase,
+    CalendarProposalView,
     CalendarRestoreSourceSnapshot,
     CalendarSnapshot,
+    CalendarSnapshotKind,
     parse_calendar_proposal_conversation_request,
 )
 from ai_employee.domain.actions import CalendarProposalStatus
@@ -147,6 +154,7 @@ class _ProposalRepository:
         self.proposals: dict[UUID, CalendarProposalSnapshot] = {}
         self.snapshots: dict[UUID, CalendarSnapshot] = {}
         self.by_key: dict[tuple[UUID, str], UUID] = {}
+        self.get_current_calls = 0
 
     async def get_by_creation_key(
         self, *, user_id: UUID, creation_idempotency_key: str
@@ -165,7 +173,7 @@ class _ProposalRepository:
         creation_idempotency_key: str,
         creation_payload_hash: str,
         calendar_id: str,
-        operation_kind: str,
+        operation_kind: CalendarOperationKind,
         target_event_id: str | None,
         base_etag: str | None,
         retain_until: datetime,
@@ -192,7 +200,7 @@ class _ProposalRepository:
             proposal_id=proposal_id,
             connection_id=connection_id,
             calendar_id=calendar_id,
-            operation_kind=cast(object, operation_kind),
+            operation_kind=operation_kind,
             target_event_id=target_event_id,
             base_etag=base_etag,
             creation_payload_hash=creation_payload_hash,
@@ -212,6 +220,7 @@ class _ProposalRepository:
     ) -> CalendarProposalSnapshot | None:
         """测试数据均属于单一用户，未知 ID 返回 None。"""
         del user_id
+        self.get_current_calls += 1
         return self.proposals.get(proposal_id)
 
     async def save_next_version(
@@ -266,7 +275,7 @@ class _ProposalRepository:
         user_id: UUID,
         proposal_id: UUID,
         version: int,
-        snapshot_kind: str,
+        snapshot_kind: CalendarSnapshotKind,
         content: Mapping[str, object],
         retain_until: datetime,
     ) -> CalendarSnapshot | None:
@@ -291,7 +300,7 @@ class _ProposalRepository:
             snapshot_id=snapshot_id,
             proposal_id=proposal_id,
             version=version,
-            snapshot_kind=cast(object, snapshot_kind),
+            snapshot_kind=snapshot_kind,
             content=cast(dict[str, JsonValue], dict(content)),
             canonical_hash="b" * 64,
             retain_until=retain_until,
@@ -342,6 +351,7 @@ class _CalendarSource:
         self.target = target or _target()
         self.event = event or _event()
         self.availability_calls = 0
+        self.availability_requests: list[tuple[datetime, datetime, int]] = []
 
     async def get_default_proposal_target(
         self, *, user_id: UUID
@@ -390,12 +400,14 @@ class _CalendarSource:
         self,
         *,
         user_id: UUID,
+        observed_at: datetime,
         search_start: datetime,
         horizon_days: int,
     ) -> CalendarAvailabilityContext | None:
-        """返回本人日历事件；接口没有参会人或 Free/Busy 参数。"""
-        del user_id, search_start, horizon_days
+        """返回本人日历事件并记录独立 freshness 观察时刻。"""
+        del user_id
         self.availability_calls += 1
+        self.availability_requests.append((observed_at, search_start, horizon_days))
         return CalendarAvailabilityContext(
             timezone="UTC",
             working_hours=_working_hours(),
@@ -410,6 +422,65 @@ class _CalendarSource:
                 ),
             ),
             missing_connection_ids=(MISSING_CONNECTION_ID,),
+        )
+
+
+class _AvailabilityPersistence:
+    """用两个窄 Fake 端口模拟 suggestion 的冻结读取与版本 CAS 保存。
+
+    Fake 故意复用提案仓储的 expected-version 检查，但把读取结果复制为不可变应用 DTO；
+    单元测试因此走与生产组合根相同的持久化端口，而不会回退到用例内部的 caller-owned
+    repository 路径。
+    """
+
+    def __init__(self, *, proposals: _ProposalRepository, calendar: _CalendarSource) -> None:
+        self._proposals = proposals
+        self._calendar = calendar
+
+    async def load_suggestion(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+        observed_at: datetime,
+        search_start: datetime,
+        horizon_days: int,
+    ) -> CalendarAvailabilityRead | None:
+        """冻结当前提案与本人日历事实，未知资源统一返回 None。"""
+        proposal = await self._proposals.get_current(
+            user_id=user_id,
+            proposal_id=proposal_id,
+        )
+        if proposal is None:
+            return None
+        context = await self._calendar.get_availability_context(
+            user_id=user_id,
+            observed_at=observed_at,
+            search_start=search_start,
+            horizon_days=horizon_days,
+        )
+        if context is None:
+            return None
+        return CalendarAvailabilityRead(proposal=proposal, context=context)
+
+    async def save_suggestion(
+        self,
+        *,
+        snapshot_id: UUID,
+        user_id: UUID,
+        proposal_id: UUID,
+        expected_version: int,
+        desired_state: Mapping[str, object],
+        retain_until: datetime,
+    ) -> CalendarProposalSnapshot | None:
+        """使用 Fake 仓储的真实 expected-version CAS 保存下一不可变版本。"""
+        return await self._proposals.save_next_version(
+            snapshot_id=snapshot_id,
+            user_id=user_id,
+            proposal_id=proposal_id,
+            expected_version=expected_version,
+            desired_state=desired_state,
+            retain_until=retain_until,
         )
 
 
@@ -431,16 +502,23 @@ def _use_case(
         NEXT_DESIRED_ID,
         NEXT_OPERATION_ID,
     ),
+    with_availability: bool = False,
 ) -> tuple[CalendarProposalUseCase, _ProposalRepository, _CalendarSource]:
-    """构造可观测的提案用例与两个窄 Fake 端口。"""
+    """构造可观测的提案用例，并按需注入两短事务 availability Fake。"""
     repository = proposals or _ProposalRepository()
     source = calendar or _CalendarSource()
+    availability = (
+        _AvailabilityPersistence(proposals=repository, calendar=source)
+        if with_availability
+        else None
+    )
     return (
         CalendarProposalUseCase(
             proposals=repository,
             calendar=source,
             clock=lambda: NOW,
             id_factory=_ids(*ids),
+            availability=availability,
         ),
         repository,
         source,
@@ -464,6 +542,7 @@ async def test_update_proposal_captures_etag_and_encrypted_before_snapshot() -> 
     assert before.snapshot_kind == "before"
     assert before.content["location"] == "Old room"
     assert proposal.content.location == "Synthetic room"
+    assert proposal.submission_ready is True
 
 
 @pytest.mark.asyncio
@@ -496,6 +575,7 @@ async def test_create_notification_default_depends_only_on_attendees(
     )
 
     assert proposal.notification_policy is expected
+    assert proposal.submission_ready is True
 
 
 @pytest.mark.asyncio
@@ -619,7 +699,7 @@ async def test_edit_increments_version_and_invalidates_cached_availability() -> 
 @pytest.mark.asyncio
 async def test_suggest_uses_only_personal_calendar_context_and_marks_partial() -> None:
     """建议入口只读取本人同步事件，结果不能声称查询过参会人 Free/Busy。"""
-    use_case, _, source = _use_case()
+    use_case, _, source = _use_case(with_availability=True)
     created = await use_case.create_event(
         user_id=USER_ID,
         connection_id=CONNECTION_ID,
@@ -647,6 +727,78 @@ async def test_suggest_uses_only_personal_calendar_context_and_marks_partial() -
     assert suggested.content.availability.completeness == "partial"
     assert suggested.content.availability.missing_connection_ids == (MISSING_CONNECTION_ID,)
     assert suggested.content.availability.attendee_availability_checked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "search_start",
+    (
+        datetime(2030, 3, 12, 9, tzinfo=UTC),
+        datetime(2030, 3, 10, 9, tzinfo=UTC),
+    ),
+)
+async def test_suggest_observes_freshness_once_independently_from_search_window(
+    search_start: datetime,
+) -> None:
+    """future/past 搜索窗口都必须绑定注入时钟的同一 freshness observation。"""
+    use_case, _, source = _use_case(with_availability=True)
+    created = await use_case.create_event(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        calendar_id=CALENDAR_ID,
+        idempotency_key=f"suggest-observed-at-{search_start.date().isoformat()}",
+        values={
+            "title": "Synthetic meeting",
+            "starts_at": datetime(2030, 3, 11, 9, tzinfo=UTC),
+            "ends_at": datetime(2030, 3, 11, 9, 30, tzinfo=UTC),
+            "timezone": "UTC",
+            "all_day": False,
+        },
+    )
+
+    await use_case.suggest_times(
+        user_id=USER_ID,
+        proposal_id=created.proposal_id,
+        expected_version=created.current_version,
+        search_start=search_start,
+    )
+
+    assert source.availability_requests == [
+        (NOW, search_start, CALENDAR_AVAILABILITY_HORIZON_DAYS)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_suggest_fails_closed_without_availability_persistence() -> None:
+    """未注入两短事务端口时必须稳定失败，且不得访问旧仓储或日历 fallback。"""
+    use_case, repository, source = _use_case()
+    created = await use_case.create_event(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        calendar_id=CALENDAR_ID,
+        idempotency_key="suggest-persistence-required",
+        values={
+            "title": "Synthetic meeting",
+            "starts_at": datetime(2030, 3, 11, 9, tzinfo=UTC),
+            "ends_at": datetime(2030, 3, 11, 9, 30, tzinfo=UTC),
+            "timezone": "UTC",
+            "all_day": False,
+        },
+    )
+    get_current_calls = repository.get_current_calls
+    availability_calls = source.availability_calls
+
+    with pytest.raises(StateConflictError) as error:
+        await use_case.suggest_times(
+            user_id=USER_ID,
+            proposal_id=created.proposal_id,
+            expected_version=created.current_version,
+            search_start=NOW,
+        )
+
+    assert error.value.error_code == "calendar_availability_persistence_unavailable"
+    assert repository.get_current_calls == get_current_calls
+    assert source.availability_calls == availability_calls
 
 
 @pytest.mark.asyncio
@@ -728,6 +880,7 @@ async def test_restore_uses_current_etag_complete_diff_and_new_operation_identit
         "title",
     }
     assert restored.notification_policy is NotificationPolicy.ALL
+    assert restored.submission_ready is True
     before = repository.snapshots[restored.before_snapshot_id]
     assert before.content["location"] == "Current room"
 
@@ -953,8 +1106,14 @@ async def test_shell_becomes_ready_only_after_each_typed_confirmation() -> None:
         ("notification_policy",),
         (),
     )
+    confirmations: tuple[CalendarConfirmation, ...] = (
+        "calendar",
+        "time",
+        "attendees",
+        "notification_policy",
+    )
     for confirmation, remaining in zip(
-        ("calendar", "time", "attendees", "notification_policy"),
+        confirmations,
         expected_remaining,
         strict=True,
     ):
@@ -1091,6 +1250,337 @@ def test_proposal_content_normalizes_legacy_confirmation_order() -> None:
         "attendees",
         "notification_policy",
     )
+
+
+@pytest.mark.parametrize(
+    ("confirmed_fields", "required_confirmations"),
+    (
+        # 同一字段不能同时出现在已确认和待确认集合。
+        (("calendar",), ("calendar", "time", "attendees", "notification_policy")),
+        # 两个集合的并集必须完整覆盖四项 shell 字段。
+        (("calendar",), ("time",)),
+        # 即使集合并集看似完整，也不能引入 shell 之外的字段。
+        (("calendar", "other"), ("time", "attendees", "notification_policy")),
+    ),
+)
+def test_explicit_confirmation_shell_requires_exact_disjoint_partition(
+    confirmed_fields: tuple[str, ...],
+    required_confirmations: tuple[str, ...],
+) -> None:
+    """显式确认 shell 必须以无重叠的两个集合完整覆盖四个确认槽位。"""
+    with pytest.raises(ValueError):
+        CalendarProposalContent(
+            operation_id=OPERATION_ID,
+            requires_explicit_confirmation=True,
+            confirmed_fields=confirmed_fields,
+            required_confirmations=required_confirmations,
+        )
+
+
+def test_historical_non_confirmation_snapshot_with_empty_tuples_remains_readable() -> None:
+    """旧版本未启用显式确认时，空确认元组仍可在读取边界兼容。"""
+    content = CalendarProposalContent(
+        operation_id=OPERATION_ID,
+        requires_explicit_confirmation=False,
+        confirmed_fields=(),
+        required_confirmations=(),
+    )
+
+    assert content.confirmed_fields == ()
+    assert content.required_confirmations == ()
+
+
+def _readiness_view(
+    *,
+    operation_kind: CalendarOperationKind,
+    calendar_id: str = CALENDAR_ID,
+    target_event_id: str | None = None,
+    base_etag: str | None = None,
+    before_snapshot_id: UUID | None = None,
+    title: str | None = "Synthetic meeting",
+    changed_fields: tuple[str, ...] = ("title",),
+    required_confirmations: tuple[str, ...] = (),
+    confirmed_fields: tuple[str, ...] = (
+        "calendar",
+        "time",
+        "attendees",
+        "notification_policy",
+    ),
+    requires_explicit_confirmation: bool = False,
+) -> CalendarProposalView:
+    """构造只用于 readiness 属性测试的最小、已类型化提案视图。"""
+    content = CalendarProposalContent(
+        operation_id=OPERATION_ID,
+        title=title,
+        starts_at="2030-03-12T09:00:00+00:00",
+        ends_at="2030-03-12T10:00:00+00:00",
+        timezone="UTC",
+        all_day=False,
+        notification_policy=NotificationPolicy.NONE,
+        changed_fields=changed_fields,
+        confirmed_fields=confirmed_fields,
+        required_confirmations=required_confirmations,
+        requires_explicit_confirmation=requires_explicit_confirmation,
+    )
+    return CalendarProposalView(
+        proposal_id=PROPOSAL_ID,
+        connection_id=CONNECTION_ID,
+        calendar_id=calendar_id,
+        operation_kind=operation_kind,
+        target_event_id=target_event_id,
+        base_etag=base_etag,
+        before_snapshot_id=before_snapshot_id,
+        current_version=1,
+        status=CalendarProposalStatus.EDITING,
+        retain_until=RETAIN_UNTIL,
+        content=content,
+    )
+
+
+def test_submission_ready_enforces_operation_bindings_and_nonempty_text() -> None:
+    """readiness 必须区分 create/update/restore 的目标绑定与空白文本。"""
+    create = _readiness_view(operation_kind="create")
+    assert create.submission_ready is True
+    assert replace(create, calendar_id="   ").submission_ready is False
+    assert replace(
+        create,
+        content=create.content.model_copy(update={"title": "   "}),
+    ).submission_ready is False
+    assert replace(create, target_event_id="provider-event").submission_ready is False
+    assert replace(create, base_etag='W/"etag"').submission_ready is False
+    assert replace(create, before_snapshot_id=BEFORE_ID).submission_ready is False
+    assert replace(
+        create,
+        content=create.content.model_copy(update={"confirmed_fields": ()}),
+    ).submission_ready is False
+
+    update = _readiness_view(
+        operation_kind="update",
+        target_event_id=PROVIDER_EVENT_ID,
+        base_etag='W/"etag"',
+        before_snapshot_id=BEFORE_ID,
+    )
+    assert update.submission_ready is True
+    assert replace(update, target_event_id="").submission_ready is False
+    assert replace(update, base_etag="   ").submission_ready is False
+    assert replace(update, before_snapshot_id=None).submission_ready is False
+    assert replace(
+        update,
+        content=update.content.model_copy(update={"changed_fields": ()}),
+    ).submission_ready is False
+
+    restore = replace(update, operation_kind="restore")
+    assert restore.submission_ready is True
+
+    filled_shell = _readiness_view(
+        operation_kind="create",
+        required_confirmations=("notification_policy",),
+        confirmed_fields=("calendar", "time", "attendees"),
+        requires_explicit_confirmation=True,
+    )
+    assert filled_shell.submission_ready is False
+
+
+@pytest.mark.asyncio
+async def test_create_update_replay_revalidates_persisted_operation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """中断重放不能让未验证的持久 operation identity 污染修复后的 before。"""
+    use_case, repository, _ = _use_case()
+    first = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"location": "Synthetic room"},
+        idempotency_key="update-replay-malformed-operation",
+    )
+    assert first.before_snapshot_id is not None
+    repository.snapshots.pop(first.before_snapshot_id)
+    repository.proposals[first.proposal_id] = replace(
+        repository.proposals[first.proposal_id],
+        before_snapshot_id=None,
+    )
+    original_to_view = calendar_proposals_module._to_view
+
+    def malformed_operation_view(snapshot: CalendarProposalSnapshot) -> CalendarProposalView:
+        """模拟重放读取边界把 operation_id 污染为未验证字符串。"""
+        view = original_to_view(snapshot)
+        if view.proposal_id == first.proposal_id and view.before_snapshot_id is None:
+            return replace(
+                view,
+                content=view.content.model_copy(update={"operation_id": "not-a-uuid"}),
+            )
+        return view
+
+    monkeypatch.setattr(calendar_proposals_module, "_to_view", malformed_operation_view)
+
+    with pytest.raises(ValueError):
+        await use_case.create_update(
+            user_id=USER_ID,
+            event_id=EVENT_ID,
+            changes={"location": "Synthetic room"},
+            idempotency_key="update-replay-malformed-operation",
+        )
+
+    assert repository.proposals[first.proposal_id].before_snapshot_id is None
+    assert not any(
+        snapshot.proposal_id == first.proposal_id and snapshot.snapshot_kind == "before"
+        for snapshot in repository.snapshots.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_revalidates_updated_content_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """confirm 的重建结果若被污染，必须在 CAS 写入前拒绝。"""
+    use_case, repository, _ = _use_case()
+    shell = await use_case.create_shell(
+        user_id=USER_ID,
+        idempotency_key="confirm-malformed-reconstruction",
+    )
+
+    monkeypatch.setattr(
+        calendar_proposals_module,
+        "_ordered_confirmations",
+        lambda _values: ("not-a-confirmation",),
+    )
+
+    with pytest.raises(ValueError):
+        await use_case.confirm(
+            user_id=USER_ID,
+            proposal_id=shell.proposal_id,
+            expected_version=shell.current_version,
+            confirmation="calendar",
+            connection_id=CONNECTION_ID,
+            calendar_id=CALENDAR_ID,
+        )
+
+    assert repository.proposals[shell.proposal_id].current_version == shell.current_version
+    confirmed_fields = repository.proposals[shell.proposal_id].desired_snapshot.content[
+        "confirmed_fields"
+    ]
+    assert isinstance(confirmed_fields, list)
+    assert "not-a-confirmation" not in confirmed_fields
+
+
+@pytest.mark.asyncio
+async def test_public_edit_revalidates_changed_fields_before_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """edit 经 _apply_user_changes 后不能把非法 changed_fields 写入新版本。"""
+    use_case, repository, _ = _use_case()
+    proposal = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"location": "Synthetic room"},
+    )
+
+    monkeypatch.setattr(
+        calendar_proposals_module,
+        "_changed_fields",
+        lambda _before, _desired: ("not-an-event-field",),
+    )
+
+    with pytest.raises(ValueError):
+        await use_case.edit(
+            user_id=USER_ID,
+            proposal_id=proposal.proposal_id,
+            expected_version=proposal.current_version,
+            changes={"title": "Edited title"},
+        )
+
+    assert repository.proposals[proposal.proposal_id].current_version == proposal.current_version
+
+
+@pytest.mark.asyncio
+async def test_create_restore_revalidates_desired_reconstruction_before_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore 的 desired 重建若产生非法 diff，必须不创建新提案。"""
+    use_case, repository, _ = _use_case(
+        ids=(
+            PROPOSAL_ID,
+            DESIRED_ID,
+            OPERATION_ID,
+            BEFORE_ID,
+            UUID("00000000-0000-0000-0000-000000000930"),
+            UUID("00000000-0000-0000-0000-000000000931"),
+            NEXT_OPERATION_ID,
+            UUID("00000000-0000-0000-0000-000000000932"),
+        )
+    )
+    source = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"location": "Historical room"},
+    )
+    assert source.before_snapshot_id is not None
+    proposal_count = len(repository.proposals)
+
+    monkeypatch.setattr(
+        calendar_proposals_module,
+        "_changed_fields",
+        lambda _before, _desired: ("not-an-event-field",),
+    )
+
+    with pytest.raises(ValueError):
+        await use_case.create_restore(
+            user_id=USER_ID,
+            source_snapshot_id=source.before_snapshot_id,
+            current_event=_provider_event(),
+            idempotency_key="restore-malformed-reconstruction",
+        )
+
+    assert len(repository.proposals) == proposal_count
+
+
+@pytest.mark.asyncio
+async def test_create_restore_revalidates_current_before_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore 的 current before 必须重新验证持久化 operation identity。"""
+    use_case, repository, _ = _use_case(
+        ids=(
+            PROPOSAL_ID,
+            DESIRED_ID,
+            OPERATION_ID,
+            BEFORE_ID,
+            UUID("00000000-0000-0000-0000-000000000933"),
+            UUID("00000000-0000-0000-0000-000000000934"),
+            NEXT_OPERATION_ID,
+            UUID("00000000-0000-0000-0000-000000000935"),
+        )
+    )
+    source = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"location": "Historical room"},
+    )
+    assert source.before_snapshot_id is not None
+    original_to_view = calendar_proposals_module._to_view
+
+    def malformed_operation_view(snapshot: CalendarProposalSnapshot) -> CalendarProposalView:
+        """模拟受信仓储边界返回了未验证 operation ID 的防御性回归输入。"""
+        view = original_to_view(snapshot)
+        return replace(
+            view,
+            content=view.content.model_copy(update={"operation_id": "not-a-uuid"}),
+        )
+
+    monkeypatch.setattr(calendar_proposals_module, "_to_view", malformed_operation_view)
+
+    with pytest.raises(ValueError):
+        await use_case.create_restore(
+            user_id=USER_ID,
+            source_snapshot_id=source.before_snapshot_id,
+            current_event=_provider_event(),
+            idempotency_key="restore-malformed-current-before",
+        )
+
+    restored = next(
+        proposal
+        for proposal in repository.proposals.values()
+        if proposal.proposal_id != source.proposal_id
+    )
+    assert restored.before_snapshot_id is None
 
 
 @pytest.mark.asyncio

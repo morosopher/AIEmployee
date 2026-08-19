@@ -14,6 +14,7 @@ from ai_employee.application.use_cases.calendar_proposals import (
     CalendarProposalTargetSnapshot,
     CalendarProposalUseCase,
     CalendarRestoreSourceSnapshot,
+    validate_calendar_creation_idempotency_key,
 )
 from ai_employee.application.use_cases.task_execution import LeasedTask, utc_instant
 from ai_employee.config import Settings
@@ -292,14 +293,34 @@ def _required_lease_owner(task: LeasedTask) -> str:
 
 
 def _restore_input(payload: Mapping[str, object]) -> tuple[UUID, str]:
-    """解析 PostgreSQL 持久任务载荷，并拒绝空键、非 UUID 或额外动态类型。"""
-    raw_snapshot = payload.get("source_snapshot_id")
-    creation_key = payload.get("creation_idempotency_key")
+    """解析精确、规范且可重放的恢复准备输入。
+
+    恢复 Worker 必须在解析连接身份或发起供应商 GET 之前完成这层边界校验。精确键集
+    防止未来字段被静默解释；UUID 只接受规范小写文本；创建键复用日历提案的公共
+    validator，确保 API、应用和 Worker 对空白、长度及所有 Unicode ``Cc`` 控制字符
+    采用完全相同的拒绝规则。
+
+    Args:
+        payload: 从 PostgreSQL JSONB 读取的任务输入映射。
+
+    Returns:
+        已解析的 source snapshot UUID 与原样幂等键。
+
+    Raises:
+        TypeError: 外层键集不精确或值类型不正确。
+        ValueError: UUID 非规范文本或创建键未通过共享边界校验。
+    """
+    expected_keys = frozenset({"source_snapshot_id", "creation_idempotency_key"})
+    if frozenset(payload) != expected_keys:
+        raise TypeError("calendar.restore.prepare input is invalid")
+    raw_snapshot = payload["source_snapshot_id"]
+    creation_key = payload["creation_idempotency_key"]
     if not isinstance(raw_snapshot, str) or not isinstance(creation_key, str):
         raise TypeError("calendar.restore.prepare input is invalid")
-    if creation_key == "":
-        raise ValueError("calendar.restore.prepare creation key is invalid")
-    return UUID(raw_snapshot), creation_key
+    parsed_snapshot = UUID(raw_snapshot)
+    if str(parsed_snapshot) != raw_snapshot:
+        raise ValueError("calendar.restore.prepare snapshot id is not canonical")
+    return parsed_snapshot, validate_calendar_creation_idempotency_key(creation_key)
 
 
 def _require_writable_target(

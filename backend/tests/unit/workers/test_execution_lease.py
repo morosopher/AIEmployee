@@ -368,7 +368,7 @@ class RecordingLeaseStore:
         self.task = task
         self.prepared: list[UUID] = []
         self.acquired: list[tuple[UUID, str, datetime, datetime]] = []
-        self.renewed: list[tuple[UUID, str, datetime]] = []
+        self.renewed: list[tuple[UUID, str, datetime, datetime]] = []
         self.finished: list[tuple[TaskStatus, str | None]] = []
         self.retry_recovery_deadlines: list[datetime | None] = []
         self.scheduled_retries: list[tuple[UUID, str, datetime, datetime, str, int]] = []
@@ -398,10 +398,11 @@ class RecordingLeaseStore:
         *,
         task_id: UUID,
         lease_owner: str,
+        renewed_at: datetime,
         lease_expires_at: datetime,
     ) -> bool:
-        """按测试开关模拟 CAS 续租成功或租约已经丢失。"""
-        self.renewed.append((task_id, lease_owner, lease_expires_at))
+        """按测试开关模拟带时间边界的 CAS 续租成功或租约已经丢失。"""
+        self.renewed.append((task_id, lease_owner, renewed_at, lease_expires_at))
         return self.allow_renew
 
     async def finish(
@@ -453,6 +454,44 @@ class RecordingLeaseStore:
         """记录前置持久化异常后的 owner/status 安全失败 CAS 意图。"""
         self.internal_failures.append((task_id, lease_owner, failed_at, error_code))
         return self.allow_internal_failure
+
+
+class StrictRenewalLeaseStore(RecordingLeaseStore):
+    """要求 Runner 传入同一时钟样本的严格续租测试 double。"""
+
+    def __init__(self, task: LeasedTask | None) -> None:
+        """初始化记录，并保留 ``renewed_at`` 供边界断言。"""
+        super().__init__(task)
+        self.strict_renewed: list[tuple[UUID, str, datetime, datetime]] = []
+        self.allow_strict_renew = True
+        self.later_writes = 0
+
+    async def renew(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        renewed_at: datetime,
+        lease_expires_at: datetime,
+    ) -> bool:
+        """拒绝旧的三参数续租接口，记录完整的时间有效租约输入。"""
+        self.strict_renewed.append((task_id, lease_owner, renewed_at, lease_expires_at))
+        return self.allow_strict_renew
+
+    async def finish(self, **kwargs: object) -> bool:
+        """记录续租失败后不应发生的终态写入。"""
+        self.later_writes += 1
+        return await super().finish(**kwargs)  # type: ignore[arg-type]
+
+    async def schedule_retry(self, **kwargs: object) -> bool:
+        """记录续租失败后不应发生的重试写入。"""
+        self.later_writes += 1
+        return await super().schedule_retry(**kwargs)  # type: ignore[arg-type]
+
+    async def fail_internal(self, **kwargs: object) -> bool:
+        """记录续租失败后不应发生的内部失败写入。"""
+        self.later_writes += 1
+        return await super().fail_internal(**kwargs)  # type: ignore[arg-type]
 
 
 class FailingPrepareStore(RecordingLeaseStore):
@@ -666,6 +705,52 @@ async def test_runner_does_not_commit_terminal_state_after_renew_loses_lease() -
 
     assert owned is False
     assert store.finished == []
+
+
+@pytest.mark.asyncio
+async def test_runner_renews_with_one_clock_sample_and_stops_all_writes_after_cas_miss() -> None:
+    """每个边界只采样一次时钟，续租失败后不再触发后续续租或终态写入。"""
+    samples = [
+        datetime(2026, 8, 1, 0, 0, tzinfo=UTC),
+        datetime(2026, 8, 1, 0, 0, 1, tzinfo=UTC),
+        datetime(2026, 8, 1, 0, 0, 2, tzinfo=UTC),
+        datetime(2026, 8, 1, 0, 0, 3, tzinfo=UTC),
+        datetime(2026, 8, 1, 0, 0, 4, tzinfo=UTC),
+    ]
+    calls: list[int] = []
+
+    def clock() -> datetime:
+        """按调用序列返回不同瞬间，暴露同一边界的重复采样。"""
+        index = len(calls)
+        calls.append(index)
+        return samples[index]
+
+    task = _leased_task(started_at=samples[0])
+    store = StrictRenewalLeaseStore(task)
+    store.allow_strict_renew = False
+
+    async def complete() -> None:
+        """模拟无副作用节点。"""
+
+    runner = DurableTaskRunner(
+        store=store,
+        clock=clock,
+        lease_duration=timedelta(seconds=30),
+        task_timeout_seconds=60,
+        task_step_timeout_seconds=10,
+        max_transient_retries=3,
+        resolve_steps=lambda _: (
+            CallableStep("first", complete),
+            CallableStep("second", complete),
+            CallableStep("third", complete),
+        ),
+    )
+
+    assert await runner.run(task.task_id, lease_owner="worker-a") is False
+    assert store.strict_renewed == [
+        (task.task_id, "worker-a", samples[2], samples[2] + timedelta(seconds=30))
+    ]
+    assert store.later_writes == 0
 
 
 @pytest.mark.asyncio

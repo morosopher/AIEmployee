@@ -11,9 +11,14 @@ import httpx
 from cryptography.exceptions import InvalidTag
 from sqlalchemy import delete, select, update
 
-from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.encryption import (
+    EncryptedValue,
+    EncryptionBoundaryError,
+    EncryptionKeyVersionError,
+)
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings, get_settings
+from ai_employee.domain.errors import InternalInvariantError
 from ai_employee.infrastructure.db.models.briefs import (
     ConversationModel,
     DailyBriefItemModel,
@@ -187,8 +192,14 @@ class PrivacyDeletionWorker:
                     ),
                 ).decode("utf-8")
                 await self._oauth_revoker.revoke(token)
-            except (httpx.HTTPError, InvalidTag, UnicodeDecodeError):
-                # 删除权不能依赖 Google、网络或一条已损坏的本地密文；不记录 token 或异常原文。
+            except (
+                httpx.HTTPError,
+                InvalidTag,
+                UnicodeDecodeError,
+                EncryptionKeyVersionError,
+                EncryptionBoundaryError,
+            ):
+                # 删除权不能依赖 Google、网络或明确不可用的本地密文；不记录 token 或异常原文。
                 continue
 
     @staticmethod
@@ -225,18 +236,39 @@ class PrivacyDeletionWorker:
         await self._delete_user_rows(AuditEventModel, user_id, batch_size)
 
     async def _finalize_deleted_user(self, *, user_id: UUID, request_id: str) -> None:
-        """原子匿名化用户并写入一次不含来源内容的完成审计。"""
-        now = datetime.now(UTC)
+        """原子匿名化用户并写入一次不含来源内容的完成审计。
+
+        同一用户行是删除流程稳定存在且 retention 已获最小列级 UPDATE 的串行化根。
+        先锁定该行，再以普通 SELECT 检查完成审计，可在并发重入下保持单条结果，同时
+        避免 ``SELECT ... FOR UPDATE`` 对 ``audit_events`` 隐式要求表级 UPDATE 权限。
+
+        Raises:
+            InternalInvariantError: 删除流程到达最终阶段时用户根行已经不存在。
+        """
         async with self._session_factory.begin() as session:
+            # audit_events 明确禁止 UPDATE；把互斥锁放在用户根行，既保留一次性审计，
+            # 又不会为实现幂等而扩大 retention destination grant matrix。
+            locked_user_id = await session.scalar(
+                select(UserModel.id).where(UserModel.id == user_id).with_for_update()
+            )
+            if locked_user_id is None:
+                # 全数据删除只匿名化用户根行，不删除它；缺失表示前序状态或并发边界已
+                # 被破坏。此处必须在任何 audit 查询/写入前稳定失败，不能依赖 FK 报错。
+                raise InternalInvariantError(
+                    error_code="privacy_deletion_user_missing",
+                    message="privacy deletion user is missing",
+                )
             existing = await session.scalar(
                 select(AuditEventModel.id).where(
                     AuditEventModel.user_id == user_id,
                     AuditEventModel.event_type == "privacy.deletion_completed",
                     AuditEventModel.event_metadata["request_id"].astext == request_id,
-                ).with_for_update()
+                )
             )
             if existing is not None:
                 return
+            # 时间只属于即将提交的新完成事实；缺失用户或幂等命中均不得产生无用时间值。
+            now = datetime.now(UTC)
             await session.execute(
                 update(UserModel)
                 .where(UserModel.id == user_id)

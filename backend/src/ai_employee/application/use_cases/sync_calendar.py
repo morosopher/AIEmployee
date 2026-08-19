@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
+from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
 from ai_employee.application.ports.calendar import (
     CalendarConnectionState,
     CalendarCursorExpiredError,
@@ -483,18 +484,25 @@ class SyncCalendarUseCase:
         return (
             self._cipher.encrypt(
                 event.description.encode("utf-8"),
-                self._aad(user_id, connection_id, event.event_id, "description"),
+                calendar_event_field_aad_v2(
+                    user_id=str(user_id),
+                    connection_id=str(connection_id),
+                    calendar_id=event.calendar_id,
+                    provider_event_id=event.event_id,
+                    field="description",
+                ),
             ),
             self._cipher.encrypt(
                 event.location.encode("utf-8"),
-                self._aad(user_id, connection_id, event.event_id, "location"),
+                calendar_event_field_aad_v2(
+                    user_id=str(user_id),
+                    connection_id=str(connection_id),
+                    calendar_id=event.calendar_id,
+                    provider_event_id=event.event_id,
+                    field="location",
+                ),
             ),
         )
-
-    @staticmethod
-    def _aad(user_id: UUID, connection_id: UUID, event_id: str, field: str) -> bytes:
-        """将密文与用户、连接、事件和字段种类精确绑定。"""
-        return f"{user_id}:{connection_id}:{event_id}:{field}".encode("ascii")
 
 
 __all__ = [
