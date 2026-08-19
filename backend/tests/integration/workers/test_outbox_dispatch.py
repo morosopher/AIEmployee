@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Iterator
 from datetime import UTC, datetime, time, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -197,7 +197,7 @@ class CrashOnceEnqueuer:
 def _user() -> UserModel:
     """构造仅含合成资料且显式使用 UTC 的活动用户。"""
     return UserModel(
-        email="outbox-worker@example.com",
+        email=f"outbox-worker-{uuid4().hex}@example.com",
         display_name="Outbox Worker",
         password_hash=None,
         timezone="UTC",
@@ -434,25 +434,49 @@ async def test_minute_relay_never_claims_unsupported_topic(database_url: str) ->
 
 
 @pytest.mark.asyncio
-async def test_malformed_lifecycle_payload_is_quarantined_then_manually_recoverable(
+@pytest.mark.parametrize(
+    "malformed_kind",
+    ("json-array", "json-null", "audit-id-overflow"),
+)
+async def test_malformed_lifecycle_payload_does_not_rollback_batch_and_is_recoverable(
     database_url: str,
+    malformed_kind: str,
 ) -> None:
-    """损坏的已知 topic 至少隔离一个 claim 窗口，人工修复后才允许真实发布。"""
+    """非法 JSON 形状隔离自身且不阻塞同批正常事件，人工修复后可发布。"""
     now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
-    current = now
-    task_id, audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+    current = now + timedelta(seconds=1)
+    malformed_task_id, malformed_audit_id, malformed_outbox_id = (
+        await _seed_lifecycle_outbox(
+            database_url,
+            topic="approval.invalidated",
+            now=now,
+        )
+    )
+    valid_task_id, valid_audit_id, valid_outbox_id = await _seed_lifecycle_outbox(
         database_url,
-        topic="approval.invalidated",
-        now=now,
+        topic="task.cancelled",
+        now=now + timedelta(microseconds=1),
     )
     session_factory = build_session_factory(database_url)
     enqueuer = RecordingEnqueuer()
     publisher = RecordingTaskEventPublisher()
     try:
         async with session_factory.begin() as session:
-            event = await session.get(OutboxEventModel, outbox_id, with_for_update=True)
+            event = await session.get(
+                OutboxEventModel,
+                malformed_outbox_id,
+                with_for_update=True,
+            )
             assert event is not None
-            event.payload = {"task_id": str(task_id)}
+            if malformed_kind == "json-array":
+                event.payload = ["synthetic-invalid-array"]  # type: ignore[assignment]
+            elif malformed_kind == "json-null":
+                event.payload = None  # type: ignore[assignment]
+            else:
+                event.payload = {
+                    "task_id": str(malformed_task_id),
+                    "audit_event_id": 2**100,
+                }
 
         relay = OutboxRelay(
             store=SqlAlchemyOutboxStore(session_factory),
@@ -464,41 +488,54 @@ async def test_malformed_lifecycle_payload_is_quarantined_then_manually_recovera
             retry_max=timedelta(seconds=300),
         )
 
-        assert await relay.relay_once(limit=1) == 0
+        assert await relay.relay_once(limit=2) == 1
         assert enqueuer.task_ids == []
-        assert publisher.events == []
+        assert publisher.events == [(valid_task_id, valid_audit_id)]
         async with session_factory() as session:
-            quarantined = await session.get(OutboxEventModel, outbox_id)
+            quarantined = await session.get(OutboxEventModel, malformed_outbox_id)
+            published_valid = await session.get(OutboxEventModel, valid_outbox_id)
         assert quarantined is not None
         assert quarantined.published_at is None
         assert quarantined.attempt_count == 1
         assert quarantined.last_error == "invalid_outbox_payload"
-        assert quarantined.available_at == now + timedelta(seconds=60)
+        assert quarantined.available_at == current + timedelta(seconds=60)
+        assert published_valid is not None
+        assert published_valid.published_at == current
+        assert published_valid.attempt_count == 0
+        assert published_valid.last_error is None
 
-        current = now + timedelta(seconds=59)
-        assert await relay.relay_once(limit=1) == 0
+        current += timedelta(seconds=59)
+        assert await relay.relay_once(limit=2) == 0
         async with session_factory() as session:
-            still_quarantined = await session.get(OutboxEventModel, outbox_id)
+            still_quarantined = await session.get(OutboxEventModel, malformed_outbox_id)
         assert still_quarantined is not None
         assert still_quarantined.attempt_count == 1
-        assert still_quarantined.available_at == now + timedelta(seconds=60)
+        assert still_quarantined.available_at == now + timedelta(seconds=61)
+        assert publisher.events == [(valid_task_id, valid_audit_id)]
 
         async with session_factory.begin() as session:
-            repairable = await session.get(OutboxEventModel, outbox_id, with_for_update=True)
+            repairable = await session.get(
+                OutboxEventModel,
+                malformed_outbox_id,
+                with_for_update=True,
+            )
             assert repairable is not None
             repairable.payload = {
-                "task_id": str(task_id),
-                "audit_event_id": audit_event_id,
+                "task_id": str(malformed_task_id),
+                "audit_event_id": malformed_audit_id,
             }
 
-        current = now + timedelta(seconds=60)
-        assert await relay.relay_once(limit=1) == 1
+        current += timedelta(seconds=1)
+        assert await relay.relay_once(limit=2) == 1
         assert enqueuer.task_ids == []
-        assert publisher.events == [(task_id, audit_event_id)]
+        assert publisher.events == [
+            (valid_task_id, valid_audit_id),
+            (malformed_task_id, malformed_audit_id),
+        ]
         async with session_factory() as session:
-            recovered = await session.get(OutboxEventModel, outbox_id)
+            recovered = await session.get(OutboxEventModel, malformed_outbox_id)
         assert recovered is not None
-        assert recovered.published_at == now + timedelta(seconds=60)
+        assert recovered.published_at == now + timedelta(seconds=61)
         assert recovered.attempt_count == 1
         assert recovered.last_error is None
     finally:

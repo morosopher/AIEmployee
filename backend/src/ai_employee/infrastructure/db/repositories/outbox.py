@@ -1,5 +1,6 @@
 """用 SQLAlchemy 实现 Outbox claim、确认与失败恢复端口。"""
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import cast
 from uuid import UUID
@@ -20,6 +21,7 @@ from ai_employee.infrastructure.db.models.tasks import (
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 _MINUTE_RELAY_TOPICS: tuple[str, ...] = tuple(topic.value for topic in OutboxTopic)
+_POSTGRES_SIGNED_BIGINT_MAX = 2**63 - 1
 
 
 class SqlAlchemyOutboxStore:
@@ -97,6 +99,14 @@ class SqlAlchemyOutboxStore:
             for event in events:
                 topic = OutboxTopic(event.topic)
                 audit_event_id: int | None = None
+                raw_payload: object = event.payload
+                if not isinstance(raw_payload, Mapping):
+                    # JSONB 可以持久化 array/null；运行时模型注解不能代替对象形状验证。
+                    event.available_at = claim_until
+                    event.attempt_count += 1
+                    event.last_error = "invalid_outbox_payload"
+                    continue
+                payload = cast(Mapping[object, object], raw_payload)
                 if topic is OutboxTopic.TASK_EXECUTE:
                     # 状态归队与 claim 位于同一事务；enqueue 从新连接观察时二者都已提交。
                     await session.execute(
@@ -108,19 +118,23 @@ class SqlAlchemyOutboxStore:
                         .values(status=TaskStatus.QUEUED.value, updated_at=now)
                     )
                 else:
-                    payload = event.payload
-                    raw_audit_event_id = payload.get("audit_event_id")
                     has_exact_payload = set(payload) == {"task_id", "audit_event_id"}
-                    has_valid_audit_id = (
-                        isinstance(raw_audit_event_id, int)
-                        and not isinstance(raw_audit_event_id, bool)
-                        and raw_audit_event_id > 0
-                    )
                     if (
                         not has_exact_payload
                         or payload.get("task_id") != str(event.aggregate_id)
-                        or not has_valid_audit_id
                     ):
+                        # 损坏的已知 topic 不能到达 Redis，也不能在每分钟扫描中形成热循环。
+                        event.available_at = claim_until
+                        event.attempt_count += 1
+                        event.last_error = "invalid_outbox_payload"
+                        continue
+                    raw_audit_event_id = payload.get("audit_event_id")
+                    has_valid_audit_id = (
+                        isinstance(raw_audit_event_id, int)
+                        and not isinstance(raw_audit_event_id, bool)
+                        and 1 <= raw_audit_event_id <= _POSTGRES_SIGNED_BIGINT_MAX
+                    )
+                    if not has_valid_audit_id:
                         # 损坏的已知 topic 不能到达 Redis，也不能在每分钟扫描中形成热循环。
                         event.available_at = claim_until
                         event.attempt_count += 1
@@ -152,12 +166,12 @@ class SqlAlchemyOutboxStore:
                         audit_event_id=audit_event_id,
                         resume=cast(
                             str | None,
-                            event.payload.get("resume")
-                            if event.payload.get("resume") in {"approved", "rejected"}
+                            payload.get("resume")
+                            if payload.get("resume") in {"approved", "rejected"}
                             else None,
                         ),
                         recover_approval_checkpoint=(
-                            event.payload.get("recover_approval_checkpoint") is True
+                            payload.get("recover_approval_checkpoint") is True
                         ),
                     )
                 )
