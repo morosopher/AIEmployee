@@ -11,6 +11,14 @@ from ai_employee.api.deps import ApiProblem, CsrfProtectedSession
 from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
 from ai_employee.domain.errors import StateConflictError
 
+_PUBLIC_APPROVAL_CONFLICT_CODES = frozenset(
+    {
+        "approval_conflict",
+        "approval_invalidated_by_edit",
+        "connection_capability_disabled",
+    }
+)
+
 
 class ApprovalDecisionRequest(BaseModel):
     """审批决定携带版本和载荷哈希，阻断陈旧或篡改授权。"""
@@ -43,10 +51,17 @@ def build_approvals_router() -> APIRouter:
                 payload_hash=payload.payload_hash,
                 now=datetime.now(UTC),
             )
-        except StateConflictError:
+        except StateConflictError as error:
+            # 只暴露审批协议声明的稳定恢复码；未知内部冲突仍统一收敛，避免把持久形状、
+            # 资源存在性或执行状态泄漏给调用方。
+            error_code = (
+                error.error_code
+                if error.error_code in _PUBLIC_APPROVAL_CONFLICT_CODES
+                else "approval_conflict"
+            )
             raise ApiProblem(
                 409,
-                "approval_conflict",
+                error_code,
                 "Approval conflict",
                 "The approval cannot be changed from its current state.",
             ) from None

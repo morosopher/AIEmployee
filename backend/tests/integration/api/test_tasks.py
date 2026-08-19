@@ -11,12 +11,17 @@ from fastapi import Response
 from sqlalchemy import select
 
 from ai_employee.config import get_settings
-from ai_employee.domain.tasks import TaskStatus
+from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.database_url import (
     TestDatabaseUrl as ValidatedTestDatabaseUrl,
 )
 from ai_employee.infrastructure.db.models.identity import UserModel
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel, TaskStepModel
+from ai_employee.infrastructure.db.models.tasks import (
+    ApprovalRequestModel,
+    AuditEventModel,
+    TaskRunModel,
+    TaskStepModel,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.main import create_app
@@ -485,3 +490,122 @@ async def test_task_and_approval_mutations_require_csrf(
     assert approval_response.status_code == 403
     assert task_response.json()["error_code"] == "csrf_rejected"
     assert approval_response.json()["error_code"] == "csrf_rejected"
+
+
+@pytest.mark.asyncio
+async def test_approval_api_preserves_invalidated_by_edit_error_code(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """真实审批 API 必须保留需要新版本才能恢复的稳定冲突码。"""
+    client, session_factory, user_id = task_client
+    async with session_factory.begin() as session:
+        task = TaskRunModel(
+            user_id=user_id,
+            kind="trusted_action",
+            status=TaskStatus.WAITING_APPROVAL.value,
+            idempotency_key="invalidated-approval-api",
+            input_payload={},
+        )
+        session.add(task)
+        await session.flush()
+        step = TaskStepModel(
+            task_id=task.id,
+            sequence=1,
+            name="await_approval",
+            kind="trusted_action",
+            status="pending",
+            input_summary={},
+        )
+        session.add(step)
+        await session.flush()
+        approval = ApprovalRequestModel(
+            task_id=task.id,
+            step_id=step.id,
+            version=1,
+            action="mail.send",
+            payload={},
+            payload_hash="a" * 64,
+            preview_markdown="",
+            status=ApprovalStatus.INVALIDATED.value,
+            expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+        session.add(approval)
+        await session.flush()
+        approval_id = approval.id
+
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+    response = await client.post(
+        f"/api/v1/approvals/{approval_id}/decision",
+        json={"decision": "approved", "version": 1, "payload_hash": "a" * 64},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "approval_invalidated_by_edit"
+
+
+@pytest.mark.asyncio
+async def test_cross_user_approval_is_hidden_by_real_api_and_repository(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+) -> None:
+    """真实路由与仓储组合不得泄漏其他用户审批的存在或特殊终态。"""
+    client, session_factory, _ = task_client
+    async with session_factory.begin() as session:
+        other_user = UserModel(
+            email="other-approval-api@example.test",
+            display_name="Other Approval API User",
+            password_hash=PasswordHasher().hash("synthetic-password"),
+            timezone="UTC",
+            locale="en-US",
+            brief_time=time(8),
+            is_active=True,
+        )
+        session.add(other_user)
+        await session.flush()
+        task = TaskRunModel(
+            user_id=other_user.id,
+            kind="trusted_action",
+            status=TaskStatus.WAITING_APPROVAL.value,
+            idempotency_key="foreign-invalidated-approval-api",
+            input_payload={},
+        )
+        session.add(task)
+        await session.flush()
+        step = TaskStepModel(
+            task_id=task.id,
+            sequence=1,
+            name="await_approval",
+            kind="trusted_action",
+            status="pending",
+            input_summary={},
+        )
+        session.add(step)
+        await session.flush()
+        approval = ApprovalRequestModel(
+            task_id=task.id,
+            step_id=step.id,
+            version=1,
+            action="mail.send",
+            payload={},
+            payload_hash="b" * 64,
+            preview_markdown="",
+            status=ApprovalStatus.INVALIDATED.value,
+            expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+        session.add(approval)
+        await session.flush()
+        approval_id = approval.id
+
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+    response = await client.post(
+        f"/api/v1/approvals/{approval_id}/decision",
+        json={"decision": "approved", "version": 1, "payload_hash": "b" * 64},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "approval_conflict"
+    async with session_factory() as session:
+        persisted = await session.get(ApprovalRequestModel, approval_id)
+    assert persisted is not None and persisted.status == ApprovalStatus.INVALIDATED.value
+    assert persisted.decided_at is None

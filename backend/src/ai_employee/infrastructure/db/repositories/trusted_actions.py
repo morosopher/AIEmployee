@@ -3,11 +3,12 @@
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from hmac import compare_digest
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.commands import canonical_command_json, trusted_command_hash
@@ -88,9 +89,22 @@ class SqlAlchemyTrustedActionRepository:
     ) -> ExistingTrustedActionSubmission | None:
         """按用户提交键读取既有 trusted task 及其唯一审批绑定。
 
-        该查询必须先于本地版本锁执行，因此相同请求即使资源随后进入待审批态，也只会
-        返回原任务。异常的 trusted task（缺审批或缺无敏感 ID 输入）整体 fail closed。
+        事务级 advisory lock 以域分离 SHA-256 的用户与键摘要为输入，把同一精确幂等边界的查询、资源锁
+        和冻结写入串行化。这样同资源请求不会在赢家改变本地状态后误报版本冲突，不同资源
+        也不会同时越过空查询后把数据库唯一约束泄漏出领域边界。64 位哈希碰撞最多让无关
+        键额外串行；随后仍按完整用户与键查询，因此不会错误复用其他任务。
         """
+        digest = sha256(
+            b"trusted-action-submission-idempotency-v1\0"
+            + user_id.bytes
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+        ).digest()
+        advisory_key = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(:advisory_key)"),
+            {"advisory_key": advisory_key},
+        )
         task = await self._session.scalar(
             select(TaskRunModel).where(
                 TaskRunModel.user_id == user_id,

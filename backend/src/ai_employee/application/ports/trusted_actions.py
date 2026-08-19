@@ -207,7 +207,7 @@ class TrustedActionSubmissionTransaction(Protocol):
         user_id: UUID,
         idempotency_key: str,
     ) -> ExistingTrustedActionSubmission | None:
-        """在锁版本前读取同键既有提交，保证重放不消费新 ID。"""
+        """串行化用户幂等键并在锁版本前读取既有提交，保证并发重放只消费一组 ID。"""
 
     async def lock_mail_draft(
         self,

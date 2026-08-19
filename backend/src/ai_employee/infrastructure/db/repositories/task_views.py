@@ -129,7 +129,15 @@ class SqlAlchemyTaskViewStore:
             if task is None:
                 return None
             current_status = TaskStatus(task.status)
-            if task.kind == "trusted_action" and current_status is TaskStatus.WAITING_APPROVAL:
+            if task.kind == "trusted_action":
+                # M2 可信任务只能在持久 interrupt 已建立的等待审批态撤回。queued 仍有初始
+                # Outbox 可能投递，running 则可能已跨过执行边界；二者都不能借普通任务取消
+                # 路径留下孤儿审批或掩盖未知外部结果。
+                if current_status is not TaskStatus.WAITING_APPROVAL:
+                    raise StateConflictError(
+                        error_code="task_state_conflict",
+                        message="trusted action is not waiting for approval",
+                    )
                 await self._withdraw_trusted_action(
                     session=session,
                     task=task,
@@ -285,6 +293,31 @@ class SqlAlchemyTaskViewStore:
                     actor_type="user",
                     actor_id=str(user_id),
                     event_metadata={"reason": "approval_withdrawn"},
+                ),
+                OutboxEventModel(
+                    topic="approval.invalidated",
+                    aggregate_id=task.id,
+                    deduplication_key=(
+                        f"approval.invalidated:{approval.id}:{approval.version}"
+                    ),
+                    payload={
+                        "task_id": str(task.id),
+                        "approval_id": str(approval.id),
+                        "status": ApprovalStatus.INVALIDATED.value,
+                        "version": approval.version,
+                    },
+                    available_at=now,
+                ),
+                OutboxEventModel(
+                    topic="task.cancelled",
+                    aggregate_id=task.id,
+                    deduplication_key=f"task.cancelled:{task.id}:approval-withdrawn",
+                    payload={
+                        "task_id": str(task.id),
+                        "approval_id": str(approval.id),
+                        "status": TaskStatus.CANCELLED.value,
+                    },
+                    available_at=now,
                 ),
             )
         )

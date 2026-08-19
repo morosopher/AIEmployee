@@ -227,7 +227,10 @@ class SqlAlchemyApprovalStore:
                 if task is None:
                     continue
                 approval.status = ApprovalStatus.EXPIRED.value
-                if approval.schema_version is not None:
+                is_m2_trusted_action = (
+                    approval.schema_version is not None and task.kind == "trusted_action"
+                )
+                if is_m2_trusted_action:
                     try:
                         await self._return_trusted_action_to_editing(
                             session=session,
@@ -239,6 +242,77 @@ class SqlAlchemyApprovalStore:
                         # 到期扫描不能因一条损坏绑定回滚其他审批；审批仍终态过期，
                         # 本地对象不存在时保持 fail-closed，后续诊断从审计骨架处理。
                         pass
+                if is_m2_trusted_action and task.status == TaskStatus.QUEUED.value:
+                    # 提交事务先创建 queued task 与初始 task.execute；若十分钟内 Worker 尚未
+                    # 建立 durable interrupt，到期必须同时终止任务并退休该未发布事件。仅把
+                    # 精确 initial 行标记为已处理，避免影响同任务未来其他持久事实。
+                    initial_event = await session.scalar(
+                        select(OutboxEventModel)
+                        .where(
+                            OutboxEventModel.aggregate_id == task.id,
+                            OutboxEventModel.topic == "task.execute",
+                            OutboxEventModel.deduplication_key
+                            == f"task.execute:{task.id}:initial",
+                        )
+                        .with_for_update()
+                    )
+                    if initial_event is not None and initial_event.published_at is None:
+                        initial_event.published_at = now
+                    task.status = TaskStatus.CANCELLED.value
+                    task.error_code = "approval_expired"
+                    task.finished_at = now
+                    task.lease_owner = None
+                    task.lease_expires_at = None
+                    task.scheduled_for = None
+                    task.retry_recovery_at = None
+                    task.approval_checkpoint_recovery_at = None
+                    session.add_all(
+                        (
+                            AuditEventModel(
+                                user_id=task.user_id,
+                                task_id=task.id,
+                                event_type="approval.expired",
+                                actor_type="system",
+                                actor_id=None,
+                                event_metadata={},
+                            ),
+                            AuditEventModel(
+                                user_id=task.user_id,
+                                task_id=task.id,
+                                event_type="task.cancelled",
+                                actor_type="system",
+                                actor_id=None,
+                                event_metadata={"reason": "approval_expired"},
+                            ),
+                            OutboxEventModel(
+                                topic="approval.expired",
+                                aggregate_id=task.id,
+                                deduplication_key=(
+                                    f"approval.expired:{approval.id}:{approval.version}"
+                                ),
+                                payload={
+                                    "task_id": str(task.id),
+                                    "approval_id": str(approval.id),
+                                    "status": ApprovalStatus.EXPIRED.value,
+                                    "version": approval.version,
+                                },
+                                available_at=now,
+                            ),
+                            OutboxEventModel(
+                                topic="task.cancelled",
+                                aggregate_id=task.id,
+                                deduplication_key=(
+                                    f"task.cancelled:{task.id}:approval-expired"
+                                ),
+                                payload={
+                                    "task_id": str(task.id),
+                                    "approval_id": str(approval.id),
+                                    "status": TaskStatus.CANCELLED.value,
+                                },
+                                available_at=now,
+                            ),
+                        )
+                    )
                 if task.status in {
                     TaskStatus.WAITING_APPROVAL.value,
                     TaskStatus.RUNNING.value,
