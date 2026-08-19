@@ -45,11 +45,19 @@ def test_mail_draft_ports_publish_exact_application_snapshot_types() -> None:
     assert state_snapshot is not None
     repository_hints = {
         name: get_type_hints(getattr(MailDraftRepository, name))["return"]
-        for name in ("list_current", "get_current", "create", "save_next_version", "cancel")
+        for name in (
+            "list_current",
+            "get_current",
+            "get_existing_creation",
+            "create",
+            "save_next_version",
+            "cancel",
+        )
     }
     assert repository_hints == {
         "list_current": tuple[draft_snapshot, ...],
         "get_current": draft_snapshot | None,
+        "get_existing_creation": draft_snapshot | None,
         "create": draft_snapshot,
         "save_next_version": draft_snapshot | None,
         "cancel": state_snapshot | None,
@@ -95,15 +103,16 @@ class _Connections:
         return tuple(value for value in self.connections if value.user_id == user_id)
 
     async def get_enabled_capabilities(self, *, user_id, connection_id):
-        if any(value.id == connection_id and value.user_id == user_id for value in self.connections):
+        if any(
+            value.id == connection_id and value.user_id == user_id for value in self.connections
+        ):
             return frozenset(self.capabilities)
         return None
 
     async def get_capability_states(self, *, user_id, connection_id):
         """返回当前连接的类型化状态，供新错误分类边界测试。"""
         if not any(
-            value.id == connection_id and value.user_id == user_id
-            for value in self.connections
+            value.id == connection_id and value.user_id == user_id for value in self.connections
         ):
             return None
         states = []
@@ -132,9 +141,7 @@ class _Connections:
 
 
 class _Sources:
-    def __init__(
-        self, *, history: tuple[MailRecipientHistoryEntry, ...] = ()
-    ) -> None:
+    def __init__(self, *, history: tuple[MailRecipientHistoryEntry, ...] = ()) -> None:
         self.history = history
         self.history_calls = 0
 
@@ -172,7 +179,26 @@ class _Sources:
 class _Drafts:
     def __init__(self) -> None:
         self.values: dict[UUID, MailDraftSnapshot] = {}
+        self.creation_keys: dict[tuple[UUID, str], UUID] = {}
+        self.creation_hashes: dict[UUID, str] = {}
         self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def get_existing_creation(
+        self,
+        *,
+        user_id,
+        creation_idempotency_key,
+        creation_payload_hash,
+    ):
+        draft_id = self.creation_keys.get((user_id, creation_idempotency_key))
+        if draft_id is None:
+            return None
+        if self.creation_hashes[draft_id] != creation_payload_hash:
+            raise StateConflictError(
+                error_code="idempotency_key_payload_mismatch",
+                message="idempotency key is already bound to different content",
+            )
+        return self.values[draft_id]
 
     async def create(self, **values):
         self.calls.append(("create", values))
@@ -197,6 +223,8 @@ class _Drafts:
             created_at=NOW,
         )
         self.values[value.draft_id] = value
+        self.creation_keys[(values["user_id"], values["creation_idempotency_key"])] = value.draft_id
+        self.creation_hashes[value.draft_id] = values["creation_payload_hash"]
         return value
 
     async def list_current(self, *, user_id, limit, offset):

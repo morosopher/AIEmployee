@@ -9,7 +9,7 @@ from uuid import UUID
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from ai_employee.application.ports.trusted_actions import ApprovalPreflightResult
 from ai_employee.config import get_settings
@@ -22,6 +22,7 @@ from ai_employee.infrastructure.db.database_url import (
     TestDatabaseUrl as ValidatedTestDatabaseUrl,
 )
 from ai_employee.infrastructure.db.models.actions import MailDraftModel
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     EmailMessageModel,
@@ -492,6 +493,55 @@ async def test_create_mail_draft_replays_same_resource_for_same_idempotency_key(
 
 
 @pytest.mark.asyncio
+async def test_create_mail_draft_exact_replay_ignores_later_connection_capability_change(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """创建重放先认已有请求事实，后续能力撤销不能把原 201 改写为动态校验失败。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_send_connection(clients)
+    headers = {
+        "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+        "Idempotency-Key": "task15-create-replay-after-capability-change",
+    }
+    payload = {
+        "connection_id": str(connection_id),
+        "to": ["stable-replay@example.test"],
+        "subject": "Stable synthetic replay",
+        "body_text": "Stable synthetic body",
+    }
+    first = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers=headers,
+        json=payload,
+    )
+    assert first.status_code == 201
+    async with clients.session_factory.begin() as session:
+        await session.execute(
+            update(ConnectionCapabilityModel)
+            .where(
+                ConnectionCapabilityModel.user_id == clients.owner_id,
+                ConnectionCapabilityModel.connection_id == connection_id,
+            )
+            .values(status=CapabilityStatus.DISABLED.value)
+        )
+        # 默认选择也属于动态配置；清空它可证明显式请求的重放不依赖当前用户设置。
+        await session.execute(
+            update(UserModel)
+            .where(UserModel.id == clients.owner_id)
+            .values(default_mail_connection_id=None)
+        )
+
+    replayed = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers=headers,
+        json=payload,
+    )
+
+    assert replayed.status_code == 201
+    assert replayed.json() == first.json()
+
+
+@pytest.mark.asyncio
 async def test_create_mail_draft_rejects_idempotency_key_payload_mismatch(
     authenticated_api_clients: AuthenticatedApiClients,
 ) -> None:
@@ -605,6 +655,133 @@ async def test_generate_mail_draft_returns_idempotent_persisted_task(
         "expected_version": 1,
         "instruction": "Write a concise synthetic reply.",
     }
+
+
+@pytest.mark.asyncio
+async def test_generate_mail_draft_rejects_same_key_with_different_instruction(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """generate 幂等键必须绑定完整任务输入，不能返回另一条 instruction 的任务。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_send_connection(clients)
+    csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
+    created = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "task15-create-for-generate-mismatch",
+        },
+        json={"connection_id": str(connection_id)},
+    )
+    assert created.status_code == 201
+    path = f"/api/v1/mail/drafts/{created.json()['id']}/generate"
+    headers = {
+        "X-CSRF-Token": csrf,
+        "Idempotency-Key": "task15-generate-payload-mismatch",
+    }
+    first = await clients.owner.post(
+        path,
+        headers=headers,
+        json={"version": 1, "instruction": "First synthetic instruction"},
+    )
+    assert first.status_code == 202
+
+    response = await clients.owner.post(
+        path,
+        headers=headers,
+        json={"version": 1, "instruction": "Different synthetic instruction"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "idempotency_key_payload_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_generate_mail_draft_exact_replay_survives_later_draft_version(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """精确 generate 重放绑定首次版本事实，草稿后续编辑不能把它降级为 409。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_send_connection(clients)
+    csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
+    created = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "task15-create-for-generate-late-replay",
+        },
+        json={"connection_id": str(connection_id)},
+    )
+    assert created.status_code == 201
+    draft_path = f"/api/v1/mail/drafts/{created.json()['id']}"
+    generate_path = f"{draft_path}/generate"
+    generate_headers = {
+        "X-CSRF-Token": csrf,
+        "Idempotency-Key": "task15-generate-late-replay",
+    }
+    generate_payload = {"version": 1, "instruction": "Stable synthetic instruction"}
+    first = await clients.owner.post(
+        generate_path,
+        headers=generate_headers,
+        json=generate_payload,
+    )
+    assert first.status_code == 202
+    advanced = await clients.owner.patch(
+        draft_path,
+        headers={"X-CSRF-Token": csrf},
+        json={"version": 1, "body_text": "Synthetic version two"},
+    )
+    assert advanced.status_code == 200
+
+    replayed = await clients.owner.post(
+        generate_path,
+        headers=generate_headers,
+        json=generate_payload,
+    )
+
+    assert replayed.status_code == 202
+    assert replayed.json() == first.json()
+
+
+@pytest.mark.asyncio
+async def test_generate_mail_draft_rejects_key_bound_to_another_task_kind(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """用户级任务键已绑定其他 kind 时，generate 必须拒绝而非返回无关任务。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_send_connection(clients)
+    csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
+    created = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": "task15-create-for-cross-kind-generate",
+        },
+        json={"connection_id": str(connection_id)},
+    )
+    assert created.status_code == 201
+    shared_key = "task15-generate-cross-kind-key"
+    transport = cast(httpx.ASGITransport, clients.owner._transport)
+    app = cast(FastAPI, transport.app)
+    unrelated = await app.state.create_task_use_case.execute(
+        user_id=clients.owner_id,
+        kind="synthetic.other",
+        input_payload={"synthetic": "unrelated"},
+        idempotency_key=shared_key,
+    )
+
+    response = await clients.owner.post(
+        f"/api/v1/mail/drafts/{created.json()['id']}/generate",
+        headers={
+            "X-CSRF-Token": csrf,
+            "Idempotency-Key": shared_key,
+        },
+        json={"version": 1, "instruction": "Synthetic instruction"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "idempotency_key_payload_mismatch"
+    assert response.json().get("task_id") != str(unrelated.task_id)
 
 
 @pytest.mark.asyncio
@@ -979,6 +1156,68 @@ async def test_create_mail_draft_rejects_invalid_address_and_unknown_field_safel
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("method", "path", "payload", "requires_idempotency_key"),
+    (
+        (
+            "post",
+            "/api/v1/mail/drafts",
+            {"mode": "reply", "body_text": "TASK15_REPLY_SOURCE_SENSITIVE"},
+            True,
+        ),
+        (
+            "post",
+            "/api/v1/mail/drafts",
+            {
+                "mode": "new",
+                "source_thread_id": "TASK15_NEW_SOURCE_SENSITIVE",
+            },
+            True,
+        ),
+        (
+            "post",
+            "/api/v1/mail/drafts",
+            {"subject": "Synthetic\r\nTASK15_CREATE_SUBJECT_SENSITIVE"},
+            True,
+        ),
+        (
+            "patch",
+            f"/api/v1/mail/drafts/{UUID(int=1)}",
+            {
+                "version": 1,
+                "subject": "Synthetic\r\nTASK15_PATCH_SUBJECT_SENSITIVE",
+            },
+            False,
+        ),
+    ),
+    ids=("reply-without-source", "new-with-source", "create-subject-crlf", "patch-subject-crlf"),
+)
+async def test_mail_draft_request_boundary_rejects_invalid_source_and_subject_safely(
+    authenticated_api_clients: AuthenticatedApiClients,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    path: str,
+    payload: dict[str, object],
+    requires_idempotency_key: bool,
+) -> None:
+    """来源形状和主题注入必须脱敏返回 422，且日志不复制请求中的合成敏感值。"""
+    clients = authenticated_api_clients
+    headers = {"X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or ""}
+    if requires_idempotency_key:
+        headers["Idempotency-Key"] = "task15-invalid-request-boundary"
+    marker = next(
+        value for value in payload.values() if isinstance(value, str) and "SENSITIVE" in value
+    )
+
+    response = await clients.owner.request(method, path, headers=headers, json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "request_validation_failed"
+    assert marker not in response.text
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "payload"),
     (
         ("/api/v1/mail/drafts", {}),
@@ -1003,7 +1242,7 @@ async def test_mail_draft_creation_actions_require_idempotency_key(
     )
 
     assert response.status_code == 422
-    assert response.json()["error_code"] == "idempotency_key_required"
+    assert response.json()["error_code"] == "request_validation_failed"
 
 
 @pytest.mark.asyncio

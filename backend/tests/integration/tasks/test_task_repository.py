@@ -17,6 +17,7 @@ from ai_employee.application.use_cases.tasks import (
     CreateTaskUseCase,
     TaskRepository,
 )
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
@@ -346,6 +347,62 @@ async def test_concurrent_same_idempotency_key_returns_one_task(database_url: st
         assert task_count == 1
         assert audit_count == 1
         assert outbox_count == 1
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_with_different_task_intent_rejects_loser(
+    database_url: str,
+) -> None:
+    """并发唯一约束输家必须比较赢家 kind/input，异载荷不能伪装成精确重放。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            user = _synthetic_user(
+                email="concurrent-mismatch-task-owner@example.com",
+                display_name="Concurrent Mismatch Task Owner",
+            )
+            session.add(user)
+            await session.flush()
+            user_id = user.id
+
+        repositories = BarrierTaskRepositoryFactory(session_factory, asyncio.Barrier(2))
+        dispatcher = CommitObservingDispatcher(session_factory)
+        use_case = CreateTaskUseCase(repositories, dispatcher=dispatcher)
+        results = await asyncio.gather(
+            use_case.execute(
+                user_id=user_id,
+                kind="daily_brief",
+                input_payload={"local_date": "2026-07-30"},
+                idempotency_key="task:concurrent:mismatch",
+            ),
+            use_case.execute(
+                user_id=user_id,
+                kind="mail_draft.generate",
+                input_payload={"draft_id": str(uuid4()), "expected_version": 1},
+                idempotency_key="task:concurrent:mismatch",
+            ),
+            return_exceptions=True,
+        )
+
+        assert sorted(type(result).__name__ for result in results) == [
+            "CreateTaskResult",
+            "StateConflictError",
+        ]
+        conflict = next(result for result in results if isinstance(result, StateConflictError))
+        assert conflict.error_code == "idempotency_key_payload_mismatch"
+        assert len(dispatcher.calls) == 1
+        async with session_factory() as session:
+            tasks = (
+                await session.scalars(
+                    select(TaskRunModel).where(
+                        TaskRunModel.user_id == user_id,
+                        TaskRunModel.idempotency_key == "task:concurrent:mismatch",
+                    )
+                )
+            ).all()
+        assert len(tasks) == 1
     finally:
         await session_factory.dispose()
 

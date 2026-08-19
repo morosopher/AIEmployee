@@ -39,6 +39,29 @@ class TaskDispatcher(Protocol):
 class TaskRepository(Protocol):
     """定义一次任务创建事务内所需的最小持久化能力。"""
 
+    async def get_existing(
+        self,
+        *,
+        user_id: UUID,
+        kind: str,
+        input_payload: dict[str, JsonValue],
+        idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """读取同键任务，并把键绑定到精确 kind 与完整 JSON 输入。
+
+        Args:
+            user_id: 当前认证用户，查询必须显式隔离该值。
+            kind: 调用方期望的稳定任务种类。
+            input_payload: 调用方期望的完整规范任务输入。
+            idempotency_key: 当前用户范围内的任务创建键。
+
+        Returns:
+            键不存在时返回 ``None``；精确命中时返回稳定任务标识。
+
+        Raises:
+            StateConflictError: 同键已经绑定其他 kind 或输入。
+        """
+
     async def create_with_outbox(
         self,
         *,
@@ -115,6 +138,45 @@ class CreateTaskUseCase:
         # 即使 Redis 失败也会返回已经持久化的 QUEUED 状态并把未发布事实留给 minute relay。
         status = await self._dispatcher.dispatch(result.task_id)
         return CreateTaskResult(task_id=result.task_id, status=status)
+
+    async def replay(
+        self,
+        *,
+        user_id: UUID,
+        kind: str,
+        input_payload: dict[str, JsonValue],
+        idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """在业务前置条件变化前识别一个已持久化的精确任务重放。
+
+        该读取只认当前用户、任务种类和完整 JSON 输入都一致的已有事实；键已绑定到
+        其他任务时 Repository 抛 ``idempotency_key_payload_mismatch``，不存在时返回
+        ``None``，调用方才继续执行当前资源版本或能力校验。精确命中仍复用统一 dispatcher，
+        保持与 :meth:`execute` 顺序重放相同的 PostgreSQL 恢复语义。
+
+        Args:
+            user_id: 当前认证用户。
+            kind: 期望任务种类。
+            input_payload: 期望的完整规范任务输入。
+            idempotency_key: 用户范围内的任务创建键。
+
+        Returns:
+            精确已有任务的稳定结果；当前键尚无事实时返回 ``None``。
+
+        Raises:
+            StateConflictError: 同键已绑定到不同 kind 或输入。
+        """
+        async with self._repositories() as repository:
+            existing = await repository.get_existing(
+                user_id=user_id,
+                kind=kind,
+                input_payload=input_payload,
+                idempotency_key=idempotency_key,
+            )
+        if existing is None:
+            return None
+        status = await self._dispatcher.dispatch(existing.task_id)
+        return CreateTaskResult(task_id=existing.task_id, status=status)
 
     async def execute_many(
         self, *, user_id: UUID, items: tuple[CreateTaskBatchItem, ...]

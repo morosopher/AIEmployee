@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ai_employee.api.deps import (
     ApiProblem,
@@ -29,10 +29,16 @@ from ai_employee.application.use_cases.trusted_actions import SubmitMailDraftUse
 from ai_employee.domain.actions import MailDraftStatus
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.mail_actions import MailMode, normalize_mailbox_address
+from ai_employee.domain.tasks import JsonValue
 
 IdempotencyKeyHeader = Annotated[
-    str | None,
-    Header(alias="Idempotency-Key", min_length=1, max_length=255),
+    str,
+    Header(
+        alias="Idempotency-Key",
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^\s\r\n](?:[^\r\n]*[^\s\r\n])?$",
+    ),
 ]
 
 
@@ -97,6 +103,25 @@ class CreateMailDraftRequest(BaseModel):
             normalize_mailbox_address(value)
         return values
 
+    @field_validator("subject")
+    @classmethod
+    def validate_subject(cls, value: str) -> str:
+        """在请求事务前拒绝主题 CR/LF，避免邮件 Header 注入与内部校验异常。"""
+        if "\r" in value or "\n" in value:
+            raise ValueError("mail subject must not contain CR or LF")
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_shape(self) -> "CreateMailDraftRequest":
+        """镜像应用输入的来源形状不变量，使非法请求统一进入脱敏 422 边界。"""
+        if self.mode is MailMode.NEW:
+            if self.source_thread_id is not None or self.source_message_id is not None:
+                raise ValueError("new mail must not contain source binding")
+            return self
+        if self.source_thread_id is None and self.source_message_id is None:
+            raise ValueError("reply mail requires a source thread or message")
+        return self
+
 
 class UpdateMailDraftRequest(BaseModel):
     """以客户端观察到的当前版本更新一封草稿。"""
@@ -118,6 +143,14 @@ class UpdateMailDraftRequest(BaseModel):
             for value in values:
                 normalize_mailbox_address(value)
         return values
+
+    @field_validator("subject")
+    @classmethod
+    def validate_subject(cls, value: str | None) -> str | None:
+        """PATCH 主题出现时拒绝 CR/LF，与创建和应用输入保持同一安全边界。"""
+        if value is not None and ("\r" in value or "\n" in value):
+            raise ValueError("mail subject must not contain CR or LF")
+        return value
 
 
 class GenerateMailDraftRequest(BaseModel):
@@ -198,16 +231,9 @@ def build_mail_router() -> APIRouter:
         authenticated: CsrfProtectedSession,
         response: Response,
         use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
-        idempotency_key: IdempotencyKeyHeader = None,
+        idempotency_key: IdempotencyKeyHeader,
     ) -> MailDraftResponse:
         """幂等创建版本一，只写本地加密草稿且不触发供应商草稿或发送。"""
-        if not idempotency_key:
-            raise ApiProblem(
-                422,
-                "idempotency_key_required",
-                "Idempotency key required",
-                "An Idempotency-Key header is required.",
-            )
         value = await use_case.create(
             CreateMailDraftInput(
                 user_id=authenticated.user.id,
@@ -284,16 +310,24 @@ def build_mail_router() -> APIRouter:
         authenticated: CsrfProtectedSession,
         tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)],
         drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
-        idempotency_key: IdempotencyKeyHeader = None,
+        idempotency_key: IdempotencyKeyHeader,
     ) -> AcceptedTaskResponse:
         """持久创建 body-only 模型草拟任务，并以客户端键复用 TaskRun。"""
-        if not idempotency_key:
-            raise ApiProblem(
-                422,
-                "idempotency_key_required",
-                "Idempotency key required",
-                "An Idempotency-Key header is required.",
-            )
+        task_input: dict[str, JsonValue] = {
+            "draft_id": str(draft_id),
+            "expected_version": payload.version,
+            "instruction": payload.instruction,
+        }
+        # 精确已有任务是已提交的业务事实，必须在读取当前草稿版本前识别；否则草稿后续
+        # 编辑会让合法重放错误变成 409。键已绑定其他 kind/input 时该读取直接稳定拒绝。
+        replayed = await tasks.replay(
+            user_id=authenticated.user.id,
+            kind="mail_draft.generate",
+            input_payload=task_input,
+            idempotency_key=idempotency_key,
+        )
+        if replayed is not None:
+            return AcceptedTaskResponse(task_id=replayed.task_id, status="queued")
         try:
             current = await drafts.get(
                 user_id=authenticated.user.id,
@@ -309,11 +343,7 @@ def build_mail_router() -> APIRouter:
         result = await tasks.execute(
             user_id=authenticated.user.id,
             kind="mail_draft.generate",
-            input_payload={
-                "draft_id": str(draft_id),
-                "expected_version": payload.version,
-                "instruction": payload.instruction,
-            },
+            input_payload=task_input,
             idempotency_key=idempotency_key,
         )
         return AcceptedTaskResponse(
@@ -338,16 +368,9 @@ def build_mail_router() -> APIRouter:
         ],
         drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
         clock: Annotated[Clock, Depends(get_auth_clock)],
-        idempotency_key: IdempotencyKeyHeader = None,
+        idempotency_key: IdempotencyKeyHeader,
     ) -> AcceptedTaskResponse:
         """原子冻结精确草稿版本、加密命令和单次人工审批，返回持久任务 ID。"""
-        if not idempotency_key:
-            raise ApiProblem(
-                422,
-                "idempotency_key_required",
-                "Idempotency key required",
-                "An Idempotency-Key header is required.",
-            )
         # 先做用户范围读取，把不存在与跨用户资源统一隐藏；提交用例内部的
         # ``draft_version_conflict`` 仅用于已知资源的版本/状态竞争。
         try:

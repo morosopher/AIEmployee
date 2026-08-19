@@ -57,6 +57,42 @@ class SqlAlchemyMailDraftRepository:
         self._session = session
         self._cipher = cipher
 
+    async def get_existing_creation(
+        self,
+        *,
+        user_id: UUID,
+        creation_idempotency_key: str,
+        creation_payload_hash: str,
+    ) -> MailDraftSnapshot | None:
+        """按用户与创建键读取草稿，并验证键精确绑定当前规范请求哈希。
+
+        该方法供应用用例在当前连接能力、默认设置和来源事实校验前识别已提交的创建重放；
+        ``create`` 的并发唯一约束输家也复用它，避免只按键返回另一请求创建的草稿。
+
+        Args:
+            user_id: 当前认证用户，查询必须显式隔离该值。
+            creation_idempotency_key: 用户范围内的创建重放键。
+            creation_payload_hash: 当前规范客户端请求的 SHA-256 摘要。
+
+        Returns:
+            键不存在时返回 ``None``；精确命中时返回当前解密草稿快照。
+
+        Raises:
+            StateConflictError: 键已绑定不同请求哈希，或既有正文已不可用。
+            cryptography.exceptions.InvalidTag: 既有正文密文或 AAD 被篡改。
+        """
+        existing = await self._session.scalar(
+            select(MailDraftModel).where(
+                MailDraftModel.user_id == user_id,
+                MailDraftModel.creation_idempotency_key == creation_idempotency_key,
+            )
+        )
+        if existing is None:
+            return None
+        if not compare_digest(existing.creation_payload_hash, creation_payload_hash):
+            raise _idempotency_payload_mismatch()
+        return await self._snapshot(existing)
+
     async def create(
         self,
         *,
@@ -151,17 +187,14 @@ class SqlAlchemyMailDraftRepository:
             .returning(MailDraftModel.id)
         )
         if inserted_id is None:
-            existing = await self._session.scalar(
-                select(MailDraftModel).where(
-                    MailDraftModel.user_id == user_id,
-                    MailDraftModel.creation_idempotency_key == creation_idempotency_key,
-                )
+            existing = await self.get_existing_creation(
+                user_id=user_id,
+                creation_idempotency_key=creation_idempotency_key,
+                creation_payload_hash=creation_payload_hash,
             )
             if existing is None:
                 raise RuntimeError("mail draft idempotency winner is not visible")
-            if not compare_digest(existing.creation_payload_hash, creation_payload_hash):
-                raise _idempotency_payload_mismatch()
-            return await self._snapshot(existing)
+            return existing
 
         self._session.add(version)
         await self._session.flush()
@@ -243,8 +276,7 @@ class SqlAlchemyMailDraftRepository:
             )
         ).all()
         return tuple(
-            self._snapshot_from_version(draft=draft, version=version)
-            for draft, version in rows
+            self._snapshot_from_version(draft=draft, version=version) for draft, version in rows
         )
 
     async def get_default_mail_connection(
@@ -277,9 +309,7 @@ class SqlAlchemyMailDraftRepository:
         )
         return None if row is None else _connection_snapshot(row)
 
-    async def list_connections(
-        self, *, user_id: UUID
-    ) -> tuple[MailDraftConnectionSnapshot, ...]:
+    async def list_connections(self, *, user_id: UUID) -> tuple[MailDraftConnectionSnapshot, ...]:
         """列出用户全部连接主账户地址，供 reply-all 与自动补全排除自身。"""
         rows = await self._session.scalars(
             select(OAuthConnectionModel)
@@ -302,9 +332,7 @@ class SqlAlchemyMailDraftRepository:
         if states is None:
             return None
         return frozenset(
-            state.capability
-            for state in states
-            if state.status is CapabilityStatus.ENABLED
+            state.capability for state in states if state.status is CapabilityStatus.ENABLED
         )
 
     async def get_capability_states(

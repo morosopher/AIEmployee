@@ -231,7 +231,9 @@ class UpdateMailDraftInput(BaseModel):
 
     user_id: UUID
     draft_id: UUID
-    expected_version: int = Field(ge=1, validation_alias=AliasChoices("expected_version", "version"))
+    expected_version: int = Field(
+        ge=1, validation_alias=AliasChoices("expected_version", "version")
+    )
     to_recipients: tuple[str, ...] | None = Field(
         default=None, validation_alias=AliasChoices("to_recipients", "to")
     )
@@ -266,10 +268,30 @@ class MailDraftRepository(Protocol):
         """列出当前用户的解密草稿快照。"""
         ...
 
-    async def get_current(
-        self, *, user_id: UUID, draft_id: UUID
-    ) -> MailDraftSnapshot | None:
+    async def get_current(self, *, user_id: UUID, draft_id: UUID) -> MailDraftSnapshot | None:
         """读取当前用户的一封精确当前版本。"""
+        ...
+
+    async def get_existing_creation(
+        self,
+        *,
+        user_id: UUID,
+        creation_idempotency_key: str,
+        creation_payload_hash: str,
+    ) -> MailDraftSnapshot | None:
+        """读取同键创建事实，并验证键精确绑定当前规范请求哈希。
+
+        Args:
+            user_id: 当前认证用户，读取必须显式隔离该值。
+            creation_idempotency_key: 用户范围内的草稿创建键。
+            creation_payload_hash: 当前规范客户端请求的 SHA-256 摘要。
+
+        Returns:
+            键不存在时返回 ``None``；精确命中时返回当前草稿快照。
+
+        Raises:
+            StateConflictError: 同键已绑定其他请求哈希，或既有正文不可用。
+        """
         ...
 
     async def create(
@@ -315,9 +337,7 @@ class MailDraftRepository(Protocol):
         """以 ``expected_version`` CAS 保存下一不可变版本。"""
         ...
 
-    async def cancel(
-        self, *, user_id: UUID, draft_id: UUID
-    ) -> MailDraftStateSnapshot | None:
+    async def cancel(self, *, user_id: UUID, draft_id: UUID) -> MailDraftStateSnapshot | None:
         """取消尚未发送且状态机允许取消的本地草稿。"""
         ...
 
@@ -349,9 +369,7 @@ class MailDraftConnectionReader(Protocol):
         """按当前用户读取显式连接。"""
         ...
 
-    async def list_connections(
-        self, *, user_id: UUID
-    ) -> tuple[MailDraftConnectionSnapshot, ...]:
+    async def list_connections(self, *, user_id: UUID) -> tuple[MailDraftConnectionSnapshot, ...]:
         """列出用户全部连接，供排除所有主账户地址。"""
         ...
 
@@ -446,10 +464,21 @@ class MailDraftUseCase:
     async def create(self, request: CreateMailDraftInput) -> MailDraftView:
         """校验连接、来源和地址后幂等创建纯本地版本一。
 
-        同一用户的 ``idempotency_key`` 会绑定规范化请求哈希。Repository 负责并发唯一
-        约束，哈希不一致必须抛 ``idempotency_key_payload_mismatch``，本用例不会为重放
-        创建第二行、审批、ToolExecution 或供应商草稿。
+        同一用户的 ``idempotency_key`` 会绑定不依赖当前默认连接、能力状态或来源派生值的
+        规范请求哈希。用例必须先读取该已有事实，再执行动态连接和来源校验；这样首次成功后
+        的精确重放始终返回原资源，而同键异载荷仍稳定抛
+        ``idempotency_key_payload_mismatch``。Repository 继续负责并发唯一约束输家的精确
+        哈希比较，本用例不会为重放创建第二行、审批、ToolExecution 或供应商草稿。
         """
+        creation_payload_hash = _creation_request_hash(request)
+        existing = await self._drafts.get_existing_creation(
+            user_id=request.user_id,
+            creation_idempotency_key=request.idempotency_key,
+            creation_payload_hash=creation_payload_hash,
+        )
+        if existing is not None:
+            return _snapshot_to_view(existing)
+
         connection, source = await self._resolve_connection_and_source(request)
         own_addresses = await self._own_addresses(user_id=request.user_id)
         to, cc, bcc = await self._resolve_recipients(
@@ -458,25 +487,13 @@ class MailDraftUseCase:
             own_addresses=own_addresses,
         )
         subject = _resolved_subject(request=request, source=source)
-        creation_payload_hash = _creation_payload_hash(
-            connection_id=connection.id,
-            mode=request.mode,
-            source=source,
-            to=to,
-            cc=cc,
-            bcc=bcc,
-            subject=subject,
-            body_text=request.body_text,
-        )
         now = _utc_now(self._clock)
         retention_days = await self._connections.get_mail_draft_retention_days(
             user_id=request.user_id
         )
         retain_until = now + timedelta(
             days=(
-                retention_days
-                if retention_days is not None
-                else DEFAULT_MAIL_BODY_RETENTION_DAYS
+                retention_days if retention_days is not None else DEFAULT_MAIL_BODY_RETENTION_DAYS
             )
         )
         snapshot = await self._drafts.create(
@@ -610,12 +627,8 @@ class MailDraftUseCase:
             raise _binding_immutable()
 
         to, cc, bcc = _normalize_and_limit_recipients(
-            request.to_recipients
-            if request.to_recipients is not None
-            else current.to_recipients,
-            request.cc_recipients
-            if request.cc_recipients is not None
-            else current.cc_recipients,
+            request.to_recipients if request.to_recipients is not None else current.to_recipients,
+            request.cc_recipients if request.cc_recipients is not None else current.cc_recipients,
             request.bcc_recipients
             if request.bcc_recipients is not None
             else current.bcc_recipients,
@@ -625,9 +638,7 @@ class MailDraftUseCase:
         )
         retain_until = _utc_now(self._clock) + timedelta(
             days=(
-                retention_days
-                if retention_days is not None
-                else DEFAULT_MAIL_BODY_RETENTION_DAYS
+                retention_days if retention_days is not None else DEFAULT_MAIL_BODY_RETENTION_DAYS
             )
         )
         saved = await self._drafts.save_next_version(
@@ -755,17 +766,14 @@ class MailDraftUseCase:
             ConnectionCapability.MAIL_SEND,
             ConnectionCapability.MAIL_READ,
         )
-        required_states = tuple(
-            by_capability.get(capability) for capability in required
-        )
+        required_states = tuple(by_capability.get(capability) for capability in required)
         if any(snapshot is None for snapshot in required_states):
             raise _connection_capability_disabled()
         if any(
             snapshot is not None
             and (
                 snapshot.last_error_code == "connection_scope_missing"
-                or snapshot.status
-                in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
+                or snapshot.status in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
             )
             for snapshot in required_states
         ):
@@ -798,9 +806,7 @@ class MailDraftUseCase:
             default_to = () if sender in own_addresses else (sender,)
             default_cc = tuple(
                 address
-                for address in (
-                    normalize_mailbox_address(value) for value in source.recipients
-                )
+                for address in (normalize_mailbox_address(value) for value in source.recipients)
                 if address not in own_addresses and address not in default_to
             )
         to = request.to_recipients or default_to
@@ -880,28 +886,37 @@ def _reply_subject(subject: str) -> str:
     return normalized[:255]
 
 
-def _creation_payload_hash(
-    *,
-    connection_id: UUID,
-    mode: MailMode,
-    source: MailDraftSourceMessage | None,
-    to: tuple[str, ...],
-    cc: tuple[str, ...],
-    bcc: tuple[str, ...],
-    subject: str,
-    body_text: str,
-) -> str:
-    """哈希完整规范创建意图，使同键异载荷无法复用已有草稿。"""
+def _creation_request_hash(request: CreateMailDraftInput) -> str:
+    """哈希不依赖动态读取结果的规范创建请求，使重放绑定首次提交意图。
+
+    显式收件人先按领域规则规范化和跨字段去重，因此大小写或重复地址不会制造第二种请求
+    表示。默认连接、连接能力、来源派生主题与回复收件人都不进入哈希；这些值可能在首次
+    创建后变化，若纳入会让完全相同的客户端请求无法重放已经持久化的创建事实。
+
+    Args:
+        request: 已通过应用 Schema 校验的原始创建请求。
+
+    Returns:
+        绑定规范客户端意图的 SHA-256 十六进制摘要。
+
+    Raises:
+        StateConflictError: 显式收件人规范化后仍超过 M2 单封草稿上限。
+    """
+    to, cc, bcc = _normalize_and_limit_recipients(
+        request.to_recipients,
+        request.cc_recipients,
+        request.bcc_recipients,
+    )
     payload = {
-        "connection_id": str(connection_id),
-        "mode": mode.value,
-        "source_thread_id": source.thread_id if source is not None else None,
-        "source_message_id": source.message_id if source is not None else None,
+        "connection_id": str(request.connection_id) if request.connection_id is not None else None,
+        "mode": request.mode.value,
+        "source_thread_id": request.source_thread_id,
+        "source_message_id": request.source_message_id,
         "to": list(to),
         "cc": list(cc),
         "bcc": list(bcc),
-        "subject": subject,
-        "body_text": body_text,
+        "subject": request.subject,
+        "body_text": request.body_text,
     }
     canonical = json.dumps(
         payload,

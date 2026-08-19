@@ -1,5 +1,6 @@
 """把任务创建端口映射到 SQLAlchemy 与 PostgreSQL 事务。"""
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
@@ -13,6 +14,7 @@ from ai_employee.application.use_cases.tasks import (
     CreateTaskResult,
     TaskRepository,
 )
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import JsonValue, TaskStatus
 from ai_employee.infrastructure.db.models.tasks import (
     AuditEventModel,
@@ -30,6 +32,44 @@ class SqlAlchemyTaskRepository:
     def __init__(self, session: AsyncSession) -> None:
         """绑定由 Repository factory 管理生命周期的异步 Session。"""
         self._session = session
+
+    async def get_existing(
+        self,
+        *,
+        user_id: UUID,
+        kind: str,
+        input_payload: dict[str, JsonValue],
+        idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """按用户与键读取任务，并验证它精确绑定当前 kind 和完整 JSON 输入。
+
+        Args:
+            user_id: 当前任务所属用户。
+            kind: 调用方期望的稳定任务种类。
+            input_payload: 调用方期望的完整 JSON 输入。
+            idempotency_key: 当前用户范围内的创建键。
+
+        Returns:
+            键不存在时返回 ``None``；精确命中时返回稳定任务 ID。
+
+        Raises:
+            StateConflictError: 键已绑定到不同 kind 或输入。
+            ValueError: 输入含 PostgreSQL JSONB 无法表达的非有限数字。
+        """
+        existing = await self._session.scalar(
+            select(TaskRunModel).where(
+                TaskRunModel.user_id == user_id,
+                TaskRunModel.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is None:
+            return None
+        _require_matching_task_intent(
+            existing=existing,
+            kind=kind,
+            input_payload=input_payload,
+        )
+        return CreateTaskResult(task_id=existing.id)
 
     async def create_with_outbox(
         self,
@@ -57,13 +97,14 @@ class SqlAlchemyTaskRepository:
         Returns:
             新建或已有任务的基础设施无关 UUID 结果。
         """
-        existing_task_query = select(TaskRunModel.id).where(
-            TaskRunModel.user_id == user_id,
-            TaskRunModel.idempotency_key == idempotency_key,
+        existing = await self.get_existing(
+            user_id=user_id,
+            kind=kind,
+            input_payload=input_payload,
+            idempotency_key=idempotency_key,
         )
-        existing_task_id = await self._session.scalar(existing_task_query)
-        if existing_task_id is not None:
-            return CreateTaskResult(task_id=existing_task_id)
+        if existing is not None:
+            return existing
 
         task_id = uuid4()
         status = TaskStatus.CREATED.value
@@ -82,11 +123,16 @@ class SqlAlchemyTaskRepository:
         )
         if claimed_task_id is None:
             # PostgreSQL 的 READ COMMITTED 会在冲突事务提交后让下一条 SELECT 看到赢家；
-            # 若仍不可见，说明数据库隔离或约束与本适配器的不变量不一致，不能伪造结果。
-            existing_task_id = await self._session.scalar(existing_task_query)
-            if existing_task_id is None:
+            # 输家必须重新比较赢家的 kind/input；仅按键返回 ID 会把并发异载荷伪装成重放。
+            existing = await self.get_existing(
+                user_id=user_id,
+                kind=kind,
+                input_payload=input_payload,
+                idempotency_key=idempotency_key,
+            )
+            if existing is None:
                 raise RuntimeError("task idempotency winner is not visible after conflict")
-            return CreateTaskResult(task_id=existing_task_id)
+            return existing
 
         audit = AuditEventModel(
             user_id=user_id,
@@ -139,3 +185,44 @@ class SqlAlchemyTaskRepositoryFactory:
         """用 ``sessionmaker.begin`` 将单次用例限制在一个数据库事务中。"""
         async with self._session_factory.begin() as session:
             yield SqlAlchemyTaskRepository(session)
+
+
+def _require_matching_task_intent(
+    *,
+    existing: TaskRunModel,
+    kind: str,
+    input_payload: dict[str, JsonValue],
+) -> None:
+    """以类型敏感的规范 JSON 比较任务输入，拒绝同键跨 kind 或异载荷复用。
+
+    不能直接依赖 Python 容器相等，因为 ``True == 1`` 会把 JSON boolean 与 number 错误
+    视为相同。规范序列化同时消除对象键顺序差异，并与 JSONB 的结构语义保持一致。
+
+    Args:
+        existing: 已由用户和幂等键定位的持久任务。
+        kind: 当前调用方期望的稳定任务种类。
+        input_payload: 当前调用方期望的完整 JSON 输入。
+
+    Raises:
+        StateConflictError: 已有任务 kind 或输入与当前意图不完全一致。
+        ValueError: 任一输入包含 JSON 无法表达的非有限数字。
+    """
+    existing_payload = json.dumps(
+        existing.input_payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    requested_payload = json.dumps(
+        input_payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if existing.kind != kind or existing_payload != requested_payload:
+        raise StateConflictError(
+            error_code="idempotency_key_payload_mismatch",
+            message="idempotency key is already bound to a different task intent",
+        )
