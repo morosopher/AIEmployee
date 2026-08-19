@@ -10,7 +10,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.exc import DBAPIError
 
 from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.use_cases.approvals import (
@@ -32,6 +33,7 @@ from ai_employee.domain.actions import (
 from ai_employee.domain.calendar_actions import NotificationPolicy
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.mail_actions import MailMode
 from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.database_url import TestDatabaseUrl as ValidatedTestDatabaseUrl
 from ai_employee.infrastructure.db.models.actions import (
@@ -42,6 +44,8 @@ from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     ConnectionCapabilityModel,
+    EmailMessageModel,
+    EmailThreadModel,
     OAuthConnectionModel,
     ProviderCalendarModel,
 )
@@ -57,6 +61,7 @@ from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyAppro
 from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
+from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.outbox import SqlAlchemyOutboxStore
 from ai_employee.infrastructure.db.repositories.task_views import SqlAlchemyTaskViewStore
@@ -218,6 +223,124 @@ async def _create_additional_mail_draft(database_url: str, *, idempotency_key: s
                 subject="Second synthetic subject",
                 body_text="Second synthetic body",
             )
+            return draft.draft_id
+    finally:
+        await session_factory.dispose()
+
+
+async def _seed_rethreaded_reply_draft(
+    database_url: str,
+    *,
+    mode: MailMode,
+) -> UUID:
+    """创建绑定线程一的回复草稿，再把同一 immutable 消息投影移动到线程二。"""
+    session_factory = build_session_factory(database_url)
+    source_thread_id = uuid4()
+    replacement_thread_id = uuid4()
+    try:
+        async with session_factory.begin() as session:
+            session.add_all(
+                (
+                    UserModel(
+                        id=USER_ID,
+                        email="rethreaded-reply@example.test",
+                        display_name="Rethreaded Reply",
+                        password_hash=None,
+                        timezone="UTC",
+                        locale="en-US",
+                        brief_time=time(8),
+                    ),
+                    OAuthConnectionModel(
+                        id=GOOGLE_CONNECTION_ID,
+                        user_id=USER_ID,
+                        provider="google",
+                        provider_account_id="synthetic-account",
+                        provider_tenant_id="",
+                        account_type="google",
+                        account_email="owner@example.test",
+                        scopes=[],
+                        status="connected",
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=USER_ID,
+                        connection_id=GOOGLE_CONNECTION_ID,
+                        capability=ConnectionCapability.MAIL_READ.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=[],
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=USER_ID,
+                        connection_id=GOOGLE_CONNECTION_ID,
+                        capability=ConnectionCapability.MAIL_SEND.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=[],
+                    ),
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    EmailThreadModel(
+                        id=source_thread_id,
+                        user_id=USER_ID,
+                        connection_id=GOOGLE_CONNECTION_ID,
+                        provider_thread_id="synthetic-thread-one",
+                        subject="Synthetic source subject",
+                        participants=[],
+                        latest_message_at=NOW,
+                        provider_url="https://provider.example.test/thread/one",
+                    ),
+                    EmailThreadModel(
+                        id=replacement_thread_id,
+                        user_id=USER_ID,
+                        connection_id=GOOGLE_CONNECTION_ID,
+                        provider_thread_id="synthetic-thread-two",
+                        subject="Synthetic replacement subject",
+                        participants=[],
+                        latest_message_at=NOW,
+                        provider_url="https://provider.example.test/thread/two",
+                    ),
+                )
+            )
+            await session.flush()
+            message = EmailMessageModel(
+                user_id=USER_ID,
+                connection_id=GOOGLE_CONNECTION_ID,
+                thread_id=source_thread_id,
+                provider_message_id="synthetic-immutable-message",
+                internet_message_id="<synthetic-message@example.test>",
+                received_at=NOW,
+                mailbox_scope_key="mailbox",
+                sender={"email": "peer@example.test"},
+                recipients=[{"email": "owner@example.test"}],
+                subject="Synthetic source subject",
+                snippet="Synthetic source snippet",
+                labels=["INBOX"],
+                headers={"references": "<older-message@example.test>"},
+                provider_url="https://provider.example.test/message/source",
+            )
+            session.add(message)
+            await session.flush()
+            drafts = SqlAlchemyMailDraftRepository(session, ACTION_CIPHER)
+            use_case = MailDraftUseCase(
+                drafts=drafts,
+                connections=drafts,
+                sources=SqlAlchemyMailSyncRepository(session),
+                clock=lambda: NOW,
+            )
+            create_reply = (
+                use_case.create_reply_all if mode is MailMode.REPLY_ALL else use_case.create_reply
+            )
+            draft = await create_reply(
+                user_id=USER_ID,
+                source_thread_id="synthetic-thread-one",
+                source_message_id="synthetic-immutable-message",
+                source_connection_id=GOOGLE_CONNECTION_ID,
+                idempotency_key=f"synthetic-rethreaded-{mode.value}",
+                body_text="Synthetic reply body",
+            )
+            # 同步 upsert 允许 immutable message 改挂线程；冻结必须重新证明原线程仍匹配。
+            message.thread_id = replacement_thread_id
             return draft.draft_id
     finally:
         await session_factory.dispose()
@@ -710,6 +833,425 @@ async def test_submit_mail_draft_freezes_one_encrypted_command(database_url: str
         )
         assert await session_factory.dispose() is None
     finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.parametrize("mode", (MailMode.REPLY, MailMode.REPLY_ALL))
+async def test_reply_submission_rejects_message_moved_to_another_thread(
+    database_url: str,
+    mode: MailMode,
+) -> None:
+    """回复冻结必须同时匹配草稿保存的 provider thread 与 immutable message。"""
+    draft_id = await _seed_rethreaded_reply_draft(database_url, mode=mode)
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            before = (
+                await session.scalar(select(func.count()).select_from(TaskRunModel)),
+                await session.scalar(select(func.count()).select_from(ApprovalRequestModel)),
+                await session.scalar(select(func.count()).select_from(OutboxEventModel)),
+            )
+
+        with pytest.raises(StateConflictError) as conflict:
+            await _submit_mail_draft(
+                database_url=database_url,
+                draft_id=draft_id,
+                expected_version=1,
+                idempotency_key=f"synthetic-rethreaded-submit-{mode.value}",
+                now=NOW,
+            )
+        assert conflict.value.error_code == "mail_thread_binding_conflict"
+
+        async with session_factory() as session:
+            after = (
+                await session.scalar(select(func.count()).select_from(TaskRunModel)),
+                await session.scalar(select(func.count()).select_from(ApprovalRequestModel)),
+                await session.scalar(select(func.count()).select_from(OutboxEventModel)),
+            )
+            draft = await session.get(MailDraftModel, draft_id)
+        assert after == before
+        assert draft is not None
+        assert draft.status == MailDraftStatus.EDITING.value
+        assert draft.current_version == 1
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.parametrize("payload_hash", ("é" * 64, "g" * 64, "A" * 64))
+async def test_repository_rejects_noncanonical_hash_before_constant_time_compare(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    payload_hash: str,
+) -> None:
+    """仓储必须在 compare_digest 前拒绝非 64 位 lowercase ASCII hex。"""
+    draft_id = await _seed_mail_draft(database_url)
+    task_id, approval_id, _ = await _submit_mail_draft(
+        database_url=database_url,
+        draft_id=draft_id,
+        expected_version=1,
+        idempotency_key=f"synthetic-invalid-hash-{ord(payload_hash[0])}",
+        now=NOW,
+    )
+    await _mark_waiting_for_approval(database_url, task_id=task_id)
+    session_factory = build_session_factory(database_url)
+    comparisons: list[tuple[str, str]] = []
+
+    def forbidden_compare(left: str, right: str) -> bool:
+        """记录任何越过形状验证的比较；非法输入不应触达此函数。"""
+        comparisons.append((left, right))
+        return False
+
+    approvals_module = importlib.import_module(
+        "ai_employee.infrastructure.db.repositories.approvals"
+    )
+    monkeypatch.setattr(approvals_module, "compare_digest", forbidden_compare)
+    try:
+        async with session_factory() as session:
+            before = (
+                tuple(
+                    (
+                        await session.execute(
+                            select(*TaskRunModel.__table__.columns).where(
+                                TaskRunModel.id == task_id
+                            )
+                        )
+                    ).one()
+                ),
+                tuple(
+                    (
+                        await session.execute(
+                            select(*ApprovalRequestModel.__table__.columns).where(
+                                ApprovalRequestModel.id == approval_id
+                            )
+                        )
+                    ).one()
+                ),
+                await session.scalar(
+                    select(func.count()).select_from(AuditEventModel).where(
+                        AuditEventModel.task_id == task_id
+                    )
+                ),
+                await session.scalar(
+                    select(func.count()).select_from(OutboxEventModel).where(
+                        OutboxEventModel.aggregate_id == task_id
+                    )
+                ),
+            )
+
+        with pytest.raises(StateConflictError) as conflict:
+            await ApprovalDecisionUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
+                approval_id=approval_id,
+                user_id=USER_ID,
+                decision=ApprovalStatus.APPROVED.value,
+                version=1,
+                payload_hash=payload_hash,
+                now=NOW + timedelta(minutes=1),
+            )
+        assert conflict.value.error_code == "approval_conflict"
+        assert comparisons == []
+
+        async with session_factory() as session:
+            after = (
+                tuple(
+                    (
+                        await session.execute(
+                            select(*TaskRunModel.__table__.columns).where(
+                                TaskRunModel.id == task_id
+                            )
+                        )
+                    ).one()
+                ),
+                tuple(
+                    (
+                        await session.execute(
+                            select(*ApprovalRequestModel.__table__.columns).where(
+                                ApprovalRequestModel.id == approval_id
+                            )
+                        )
+                    ).one()
+                ),
+                await session.scalar(
+                    select(func.count()).select_from(AuditEventModel).where(
+                        AuditEventModel.task_id == task_id
+                    )
+                ),
+                await session.scalar(
+                    select(func.count()).select_from(OutboxEventModel).where(
+                        OutboxEventModel.aggregate_id == task_id
+                    )
+                ),
+            )
+        assert after == before
+    finally:
+        await session_factory.dispose()
+
+
+async def test_cancel_and_resolve_share_task_first_lock_order_without_database_error(
+    database_url: str,
+) -> None:
+    """取消先排队等待 Task 锁时，审批决定不得先持 Approval 形成真实死锁环。"""
+    draft_id = await _seed_mail_draft(database_url)
+    task_id, approval_id, _ = await _submit_mail_draft(
+        database_url=database_url,
+        draft_id=draft_id,
+        expected_version=1,
+        idempotency_key="synthetic-cancel-resolve-lock-order",
+        now=NOW,
+    )
+    await _mark_waiting_for_approval(database_url, task_id=task_id)
+    await _persist_approval_interrupt(database_url, task_id=task_id)
+    session_factory = build_session_factory(database_url)
+    holder = session_factory()
+    cancel_task: asyncio.Task[object] | None = None
+    resolve_task: asyncio.Task[object] | None = None
+    first_task_lock = asyncio.Event()
+    second_task_lock = asyncio.Event()
+    task_lock_queries = 0
+    loop = asyncio.get_running_loop()
+
+    def observe_task_lock(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        """记录两个被测事务开始请求 TaskRun 行锁的确定性时点。"""
+        nonlocal task_lock_queries
+        normalized = " ".join(statement.lower().split())
+        if " from task_runs" not in normalized or "for update" not in normalized:
+            return
+        task_lock_queries += 1
+        target = first_task_lock if task_lock_queries == 1 else second_task_lock
+        loop.call_soon_threadsafe(target.set)
+
+    try:
+        async with session_factory() as session:
+            approval = await session.get(ApprovalRequestModel, approval_id)
+        assert approval is not None
+        await holder.begin()
+        await holder.execute(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        event.listen(
+            session_factory.engine.sync_engine,
+            "before_cursor_execute",
+            observe_task_lock,
+        )
+        cancel_task = asyncio.create_task(
+            CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+                task_id=task_id,
+                user_id=USER_ID,
+                now=NOW + timedelta(minutes=1),
+            )
+        )
+        await asyncio.wait_for(first_task_lock.wait(), timeout=2)
+        resolve_task = asyncio.create_task(
+            ApprovalDecisionUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
+                approval_id=approval_id,
+                user_id=USER_ID,
+                decision=ApprovalStatus.APPROVED.value,
+                version=1,
+                payload_hash=approval.payload_hash,
+                now=NOW + timedelta(minutes=1),
+            )
+        )
+        await asyncio.wait_for(second_task_lock.wait(), timeout=2)
+        await holder.rollback()
+        results = await asyncio.wait_for(
+            asyncio.gather(cancel_task, resolve_task, return_exceptions=True),
+            timeout=5,
+        )
+
+        assert not any(isinstance(result, DBAPIError) for result in results)
+        assert sum(not isinstance(result, BaseException) for result in results) == 1
+        conflicts = [result for result in results if isinstance(result, StateConflictError)]
+        assert len(conflicts) == 1
+
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            persisted_approval = await session.get(ApprovalRequestModel, approval_id)
+            draft = await session.get(MailDraftModel, draft_id)
+            lifecycle_audits = tuple(
+                (
+                    await session.scalars(
+                        select(AuditEventModel).where(
+                            AuditEventModel.task_id == task_id,
+                            AuditEventModel.event_type.in_(
+                                ("approval.invalidated", "task.cancelled")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            lifecycle_outbox = tuple(
+                (
+                    await session.scalars(
+                        select(OutboxEventModel).where(
+                            OutboxEventModel.aggregate_id == task_id,
+                            OutboxEventModel.topic.in_(
+                                ("approval.invalidated", "task.cancelled")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+        assert task is not None and task.status == TaskStatus.CANCELLED.value
+        assert persisted_approval is not None
+        assert persisted_approval.status == ApprovalStatus.INVALIDATED.value
+        assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+        assert {item.event_type for item in lifecycle_audits} == {
+            "approval.invalidated",
+            "task.cancelled",
+        }
+        assert {item.topic for item in lifecycle_outbox} == {
+            "approval.invalidated",
+            "task.cancelled",
+        }
+    finally:
+        event.remove(
+            session_factory.engine.sync_engine,
+            "before_cursor_execute",
+            observe_task_lock,
+        )
+        if holder.in_transaction():
+            await holder.rollback()
+        await holder.close()
+        for task in (cancel_task, resolve_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        await session_factory.dispose()
+
+
+async def test_cancel_and_expire_share_task_first_lock_order_without_database_error(
+    database_url: str,
+) -> None:
+    """取消先排队等待 Task 锁时，到期扫描不得先锁整批 Approval 形成死锁环。"""
+    draft_id = await _seed_mail_draft(database_url)
+    task_id, approval_id, _ = await _submit_mail_draft(
+        database_url=database_url,
+        draft_id=draft_id,
+        expected_version=1,
+        idempotency_key="synthetic-cancel-expire-lock-order",
+        now=NOW,
+    )
+    await _mark_waiting_for_approval(database_url, task_id=task_id)
+    session_factory = build_session_factory(database_url)
+    holder = session_factory()
+    cancel_task: asyncio.Task[object] | None = None
+    expire_task: asyncio.Task[object] | None = None
+    first_task_lock = asyncio.Event()
+    second_task_lock = asyncio.Event()
+    task_lock_queries = 0
+    loop = asyncio.get_running_loop()
+
+    def observe_task_lock(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        """记录 cancel 与 expiry 开始请求 TaskRun 行锁的确定性时点。"""
+        nonlocal task_lock_queries
+        normalized = " ".join(statement.lower().split())
+        if " from task_runs" not in normalized or "for update" not in normalized:
+            return
+        task_lock_queries += 1
+        target = first_task_lock if task_lock_queries == 1 else second_task_lock
+        loop.call_soon_threadsafe(target.set)
+
+    try:
+        await holder.begin()
+        await holder.execute(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        event.listen(
+            session_factory.engine.sync_engine,
+            "before_cursor_execute",
+            observe_task_lock,
+        )
+        cancel_task = asyncio.create_task(
+            CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+                task_id=task_id,
+                user_id=USER_ID,
+                now=NOW + timedelta(minutes=11),
+            )
+        )
+        await asyncio.wait_for(first_task_lock.wait(), timeout=2)
+        expire_task = asyncio.create_task(
+            ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
+                now=NOW + timedelta(minutes=11),
+                limit=10,
+            )
+        )
+        await asyncio.wait_for(second_task_lock.wait(), timeout=2)
+        await holder.rollback()
+        results = await asyncio.wait_for(
+            asyncio.gather(cancel_task, expire_task, return_exceptions=True),
+            timeout=5,
+        )
+
+        assert not any(isinstance(result, DBAPIError) for result in results)
+        assert any(not isinstance(result, BaseException) for result in results)
+
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, task_id)
+            approval = await session.get(ApprovalRequestModel, approval_id)
+            draft = await session.get(MailDraftModel, draft_id)
+            lifecycle_audits = tuple(
+                (
+                    await session.scalars(
+                        select(AuditEventModel).where(
+                            AuditEventModel.task_id == task_id,
+                            AuditEventModel.event_type.in_(
+                                ("approval.invalidated", "approval.expired", "task.cancelled")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            lifecycle_outbox = tuple(
+                (
+                    await session.scalars(
+                        select(OutboxEventModel).where(
+                            OutboxEventModel.aggregate_id == task_id,
+                            OutboxEventModel.topic.in_(
+                                ("approval.invalidated", "approval.expired", "task.cancelled")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+        assert task is not None and task.status == TaskStatus.CANCELLED.value
+        assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
+        assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+        assert {item.event_type for item in lifecycle_audits} == {
+            "approval.invalidated",
+            "task.cancelled",
+        }
+        assert {item.topic for item in lifecycle_outbox} == {
+            "approval.invalidated",
+            "task.cancelled",
+        }
+    finally:
+        event.remove(
+            session_factory.engine.sync_engine,
+            "before_cursor_execute",
+            observe_task_lock,
+        )
+        if holder.in_transaction():
+            await holder.rollback()
+        await holder.close()
+        for task in (cancel_task, expire_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
         await session_factory.dispose()
 
 

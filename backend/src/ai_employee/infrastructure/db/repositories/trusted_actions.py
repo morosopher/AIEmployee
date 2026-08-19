@@ -42,6 +42,7 @@ from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     ConnectionCapabilityModel,
     EmailMessageModel,
+    EmailThreadModel,
     OAuthConnectionModel,
     ProviderCalendarModel,
 )
@@ -181,6 +182,7 @@ class SqlAlchemyTrustedActionRepository:
             user_id=user_id,
             connection_id=connection.id,
             mode=snapshot.mode,
+            source_thread_id=snapshot.source_thread_id,
             source_message_id=snapshot.source_message_id,
         )
         return MailDraftSubmissionSnapshot(
@@ -498,18 +500,34 @@ class SqlAlchemyTrustedActionRepository:
         user_id: UUID,
         connection_id: UUID,
         mode: MailMode,
+        source_thread_id: str | None,
         source_message_id: str | None,
     ) -> ReplyThreadHeaders | None:
-        """从同步消息规范 Header 构造回复命令引用；新邮件明确为空。"""
+        """从仍属于冻结 provider thread 的精确消息构造回复 Header。
+
+        邮件 immutable ID 允许同步时改挂到另一个线程，因此只按 message ID 读取会把旧草稿
+        静默绑定到新线程。回复与全部回复必须同时重证用户、连接、provider message ID 和
+        草稿保存的 provider thread ID；任一事实变化都返回空投影，由应用层稳定拒绝冻结。
+        """
         if mode is MailMode.NEW:
             return None
-        if source_message_id is None:
+        if not source_thread_id or not source_message_id:
             return None
         message = await self._session.scalar(
-            select(EmailMessageModel).where(
+            select(EmailMessageModel)
+            .join(
+                EmailThreadModel,
+                (EmailThreadModel.id == EmailMessageModel.thread_id)
+                & (EmailThreadModel.user_id == EmailMessageModel.user_id)
+                & (EmailThreadModel.connection_id == EmailMessageModel.connection_id),
+            )
+            .where(
                 EmailMessageModel.user_id == user_id,
                 EmailMessageModel.connection_id == connection_id,
                 EmailMessageModel.provider_message_id == source_message_id,
+                EmailThreadModel.user_id == user_id,
+                EmailThreadModel.connection_id == connection_id,
+                EmailThreadModel.provider_thread_id == source_thread_id,
             )
         )
         if message is None:

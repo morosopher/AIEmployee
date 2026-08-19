@@ -10,6 +10,7 @@ import pytest
 from fastapi import Response
 from sqlalchemy import select
 
+from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
 from ai_employee.config import get_settings
 from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.database_url import (
@@ -490,6 +491,33 @@ async def test_task_and_approval_mutations_require_csrf(
     assert approval_response.status_code == 403
     assert task_response.json()["error_code"] == "csrf_rejected"
     assert approval_response.json()["error_code"] == "csrf_rejected"
+
+
+@pytest.mark.parametrize("payload_hash", ("é" * 64, "g" * 64, "A" * 64))
+async def test_approval_api_rejects_noncanonical_hash_before_use_case(
+    task_client: tuple[httpx.AsyncClient, ManagedAsyncSessionMaker, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    payload_hash: str,
+) -> None:
+    """审批请求只接受 64 位 lowercase hex，非法输入不得进入应用用例。"""
+    client, _, _ = task_client
+    calls: list[object] = []
+
+    async def record_unexpected_call(self: object, **kwargs: object) -> None:
+        """若 Pydantic 边界失效则记录调用，避免测试依赖真实审批是否存在。"""
+        del self
+        calls.append(kwargs)
+
+    monkeypatch.setattr(ApprovalDecisionUseCase, "execute", record_unexpected_call)
+    csrf = client.cookies.get("ai_employee_csrf") or ""
+    response = await client.post(
+        f"/api/v1/approvals/{UUID(int=0)}/decision",
+        json={"decision": "approved", "version": 1, "payload_hash": payload_hash},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 422
+    assert calls == []
 
 
 @pytest.mark.asyncio

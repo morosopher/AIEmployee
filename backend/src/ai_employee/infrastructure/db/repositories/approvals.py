@@ -205,26 +205,49 @@ class SqlAlchemyApprovalStore:
             )
 
     async def expire_overdue(self, *, now: datetime, limit: int) -> int:
-        """有界锁定过期待审批，追加无内容审计并终止关联任务。"""
+        """按 TaskRun→ApprovalRequest 固定锁序终止有界数量的过期审批。
+
+        候选查询只对关联 ``TaskRun`` 使用 ``FOR UPDATE ... SKIP LOCKED``，避免先锁
+        ApprovalRequest 后等待取消路径已经请求的 TaskRun，形成 Task↔Approval 死锁环。
+        取得任务锁后仍逐项锁定并重检精确审批，保证候选扫描与实际状态迁移之间的并发
+        决定、撤回或数据损坏不会被当作本轮到期事实。
+        """
         async with self._session_factory.begin() as session:
-            approvals = list(
+            candidates = tuple(
                 (
-                    await session.scalars(
-                        select(ApprovalRequestModel)
+                    await session.execute(
+                        select(TaskRunModel, ApprovalRequestModel.id)
+                        .join(
+                            ApprovalRequestModel,
+                            ApprovalRequestModel.task_id == TaskRunModel.id,
+                        )
                         .where(
                             ApprovalRequestModel.status == ApprovalStatus.PENDING.value,
                             ApprovalRequestModel.expires_at <= now,
                         )
                         .order_by(ApprovalRequestModel.expires_at, ApprovalRequestModel.id)
                         .limit(limit)
-                        .with_for_update(skip_locked=True)
+                        .with_for_update(of=TaskRunModel, skip_locked=True)
                     )
-                ).all()
+                )
+                .tuples()
+                .all()
             )
             expired_count = 0
-            for approval in approvals:
-                task = await session.get(TaskRunModel, approval.task_id, with_for_update=True)
-                if task is None:
+            for task, approval_id in candidates:
+                approval = await session.scalar(
+                    select(ApprovalRequestModel)
+                    .where(
+                        ApprovalRequestModel.id == approval_id,
+                        ApprovalRequestModel.task_id == task.id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    approval is None
+                    or approval.status != ApprovalStatus.PENDING.value
+                    or approval.expires_at > now
+                ):
                     continue
                 approval.status = ApprovalStatus.EXPIRED.value
                 is_m2_trusted_action = (
@@ -350,17 +373,12 @@ class SqlAlchemyApprovalStore:
     async def finish_fake_write(
         self, *, task_id: UUID, lease_owner: str, decision: str, payload_hash: str, now: datetime
     ) -> None:
-        """仅把已由审批决定恢复到队列的假写任务标记为成功。"""
-        async with self._session_factory.begin() as session:
-            approval = await session.scalar(
-                select(ApprovalRequestModel)
-                .where(
-                    ApprovalRequestModel.task_id == task_id,
-                    ApprovalRequestModel.payload_hash == payload_hash,
-                    ApprovalRequestModel.status == decision,
-                )
-                .with_for_update()
+        """按 TaskRun→ApprovalRequest 锁序把已恢复的假写任务标记为成功。"""
+        if not _is_canonical_payload_hash(payload_hash):
+            raise StateConflictError(
+                error_code="approval_conflict", message="approval is unavailable"
             )
+        async with self._session_factory.begin() as session:
             task = await session.scalar(
                 select(TaskRunModel)
                 .where(
@@ -370,11 +388,24 @@ class SqlAlchemyApprovalStore:
                 )
                 .with_for_update()
             )
-            if approval is None or task is None:
+            if task is None:
+                raise StateConflictError(error_code="task_conflict", message="task is unavailable")
+            approval = await session.scalar(
+                select(ApprovalRequestModel)
+                .where(
+                    ApprovalRequestModel.task_id == task.id,
+                    ApprovalRequestModel.payload_hash == payload_hash,
+                    ApprovalRequestModel.status == decision,
+                )
+                .with_for_update()
+            )
+            if approval is None:
                 raise StateConflictError(error_code="task_conflict", message="task is unavailable")
             frozen = ApprovalProposal.create(approval.action, approval.payload)
-            if not compare_digest(frozen.payload_hash, approval.payload_hash) or not compare_digest(
-                frozen.payload_hash, payload_hash
+            if (
+                not _is_canonical_payload_hash(approval.payload_hash)
+                or not compare_digest(frozen.payload_hash, approval.payload_hash)
+                or not compare_digest(frozen.payload_hash, payload_hash)
             ):
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
@@ -492,23 +523,47 @@ class SqlAlchemyApprovalStore:
         payload_hash: str,
         now: datetime,
     ) -> None:
-        """在一项锁定审批上执行所有权、状态、版本与哈希校验。"""
-        async with self._session_factory.begin() as session:
-            approval = await session.scalar(
-                select(ApprovalRequestModel)
-                .where(ApprovalRequestModel.id == approval_id)
-                .with_for_update()
+        """按 TaskRun→ApprovalRequest 锁序验证并解决一项精确审批。
+
+        非锁投影只用于找到审批声称的任务；所有可信判断都在随后锁定 TaskRun、再锁定
+        精确 ApprovalRequest 后重做。这样取消、到期与人工决定共享单一锁序，同时不会把
+        投影查询结果当成授权或生命周期事实。
+        """
+        if not _is_canonical_payload_hash(payload_hash):
+            raise StateConflictError(
+                error_code="approval_conflict", message="approval is unavailable"
             )
-            if approval is None:
+        async with self._session_factory.begin() as session:
+            task_id = await session.scalar(
+                select(ApprovalRequestModel.task_id)
+                .join(TaskRunModel, TaskRunModel.id == ApprovalRequestModel.task_id)
+                .where(
+                    ApprovalRequestModel.id == approval_id,
+                    TaskRunModel.user_id == user_id,
+                )
+            )
+            if task_id is None:
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
                 )
             task = await session.scalar(
                 select(TaskRunModel)
-                .where(TaskRunModel.id == approval.task_id, TaskRunModel.user_id == user_id)
+                .where(TaskRunModel.id == task_id, TaskRunModel.user_id == user_id)
                 .with_for_update()
             )
             if task is None:
+                raise StateConflictError(
+                    error_code="approval_conflict", message="approval is unavailable"
+                )
+            approval = await session.scalar(
+                select(ApprovalRequestModel)
+                .where(
+                    ApprovalRequestModel.id == approval_id,
+                    ApprovalRequestModel.task_id == task.id,
+                )
+                .with_for_update()
+            )
+            if approval is None or not _is_canonical_payload_hash(approval.payload_hash):
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
                 )
@@ -521,8 +576,6 @@ class SqlAlchemyApprovalStore:
                 approval.status != ApprovalStatus.PENDING.value
                 or approval.expires_at <= now
                 or approval.version != version
-                or len(payload_hash) != 64
-                or len(approval.payload_hash) != 64
                 or not compare_digest(approval.payload_hash, payload_hash)
                 or task.status != TaskStatus.WAITING_APPROVAL.value
             ):
@@ -771,3 +824,17 @@ class SqlAlchemyApprovalStore:
             error_code="approval_conflict",
             message=f"trusted approval binding is unavailable: {reason}",
         )
+
+
+def _is_canonical_payload_hash(value: object) -> bool:
+    """判断值是否为规范 SHA-256 lowercase ASCII hex 文本。
+
+    ``hmac.compare_digest`` 对非 ASCII ``str`` 会抛出 ``TypeError``，而单独检查长度也会
+    接受大写、非十六进制和 Unicode 字符。审批边界先执行此纯形状校验，随后才允许常量
+    时间比较；任何异常持久值或调用方输入都统一 fail closed 为 ``approval_conflict``。
+    """
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )

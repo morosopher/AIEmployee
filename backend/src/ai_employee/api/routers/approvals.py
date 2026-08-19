@@ -25,7 +25,7 @@ class ApprovalDecisionRequest(BaseModel):
 
     decision: str = Field(pattern="^(approved|rejected)$")
     version: int = Field(ge=1)
-    payload_hash: str = Field(min_length=64, max_length=64)
+    payload_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def build_approvals_router() -> APIRouter:
