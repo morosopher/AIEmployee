@@ -1218,6 +1218,47 @@ async def test_mail_draft_request_boundary_rejects_invalid_source_and_subject_sa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("mode", "source_payload", "marker"),
+    (
+        (
+            "reply",
+            {"source_thread_id": " TASK15_PADDED_THREAD_SENSITIVE "},
+            "TASK15_PADDED_THREAD_SENSITIVE",
+        ),
+        (
+            "reply_all",
+            {"source_message_id": "TASK15_MESSAGE_SENSITIVE\rbreak"},
+            "TASK15_MESSAGE_SENSITIVE",
+        ),
+    ),
+    ids=("reply-padded-thread", "reply-all-multiline-message"),
+)
+async def test_mail_draft_request_boundary_rejects_invalid_source_identifier_safely(
+    authenticated_api_clients: AuthenticatedApiClients,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    source_payload: dict[str, str],
+    marker: str,
+) -> None:
+    """非法回复来源必须由 FastAPI 脱敏为 422，不能进入会记录输入值的通用 500。"""
+    clients = authenticated_api_clients
+    response = await clients.owner.post(
+        "/api/v1/mail/drafts",
+        headers={
+            "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+            "Idempotency-Key": "task15-invalid-source-identifier",
+        },
+        json={"mode": mode, **source_payload},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "request_validation_failed"
+    assert marker not in response.text
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("path", "payload"),
     (
         ("/api/v1/mail/drafts", {}),

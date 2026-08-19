@@ -91,6 +91,26 @@ class CreateMailDraftRequest(BaseModel):
     subject: str = Field(default="", max_length=255)
     body_text: str = Field(default="", max_length=100_000)
 
+    @field_validator("source_thread_id", "source_message_id")
+    @classmethod
+    def validate_source_identifier(cls, value: str | None) -> str | None:
+        """拒绝空白包裹或多行来源标识符，但保持合法供应商 ID 原文不变。
+
+        Args:
+            value: 可选的 opaque 供应商线程或消息标识符。
+
+        Returns:
+            未经裁剪或规范化的原始合法值；字段未提供时返回 ``None``。
+
+        Raises:
+            ValueError: 值为空、包含首尾空白、回车或换行。
+        """
+        if value is None:
+            return None
+        if value != value.strip() or not value or "\r" in value or "\n" in value:
+            raise ValueError("source identifier must be nonempty, unpadded, and single-line")
+        return value
+
     @field_validator("to", "cc", "bcc")
     @classmethod
     def validate_recipient_addresses(cls, values: list[str]) -> list[str]:

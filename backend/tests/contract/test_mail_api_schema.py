@@ -84,6 +84,26 @@ def test_create_mail_draft_schema_rejects_invalid_source_shape(
         CreateMailDraftRequest(**payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_thread_id", " padded-thread "),
+        ("source_thread_id", "thread\rbreak"),
+        ("source_thread_id", "thread\nbreak"),
+        ("source_message_id", " padded-message "),
+        ("source_message_id", "message\rbreak"),
+        ("source_message_id", "message\nbreak"),
+    ),
+)
+def test_create_mail_draft_schema_rejects_unpadded_or_multiline_source_identifier(
+    field: str,
+    value: str,
+) -> None:
+    """公开来源标识符必须原样保持 opaque，但拒绝首尾空白与 CR/LF。"""
+    with pytest.raises(ValidationError):
+        CreateMailDraftRequest(mode="reply", **{field: value})
+
+
 def test_create_mail_draft_schema_rejects_subject_header_injection() -> None:
     """创建主题含 CR/LF 时必须在 HTTP 请求边界拒绝。"""
     with pytest.raises(ValidationError):
