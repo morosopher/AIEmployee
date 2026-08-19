@@ -198,7 +198,7 @@ async def cycle5_tracked_session_factories(
 ) -> AsyncIterator[None]:
     """让 Cycle 5 regular 测试异常时仍先释放本测试创建的全部数据库 pool。
 
-    此 fixture 只由三个显式 opt-in 的 Cycle 5 模块请求。依赖 ``isolated_database``
+    此 fixture 只由显式 opt-in 的 Cycle 5 regular 模块请求。依赖 ``isolated_database``
     使 registry 的 teardown 先于后置 TRUNCATE；函数级 teardown 又必然先于 session 级
     disposable cleanup，因此不需要终止未知 PostgreSQL session 或放宽 provenance 检查。
     """

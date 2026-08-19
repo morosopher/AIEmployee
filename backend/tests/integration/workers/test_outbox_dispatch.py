@@ -1,6 +1,7 @@
 """在真实 PostgreSQL 上验证 Outbox claim、投递确认与失败恢复。"""
 
 import asyncio
+from collections.abc import Iterator
 from datetime import UTC, datetime, time, timedelta
 from uuid import UUID
 
@@ -12,6 +13,9 @@ from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.schedules import DispatchDueDailyBriefsUseCase
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel, UserSessionModel
 from ai_employee.infrastructure.db.models.tasks import (
     AuditEventModel,
@@ -28,6 +32,35 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.session import build_session_factory
+
+# 本模块创建多个独立异步 pool；先使用 Cycle 5 disposable regular head，再由专用
+# registry 在每个测试结束时释放这些 pool，确保临时库 cleanup 与 anchor 复核前无遗留连接。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """把 Outbox 模块绑定到已完成 typed lifecycle 的 disposable regular head。
+
+    该覆盖禁止本模块把 Step 33 传入的 roles-absent 0018 anchor 当作普通应用库；
+    fixture 仅返回共享 helper 已验证的 URL，不自行迁移、授权或修改 anchor。
+    """
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖会话级迁移入口，并复用 disposable regular head 的既有迁移事实。
+
+    依赖参数保证数据库已经由 Cycle 5 helper 完成 role-bootstrap、迁移和 catalog
+    验证；本 fixture 本身保持零写，避免放宽 typed migration guard 或触碰共享 anchor。
+    """
+    del cycle5_regular_database_url
+    yield
 
 
 class RecordingEnqueuer:
