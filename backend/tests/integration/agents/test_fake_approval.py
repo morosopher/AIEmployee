@@ -1,5 +1,6 @@
 """验证假写审批在 PostgreSQL 中冻结并可安全终止。"""
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 
@@ -9,6 +10,9 @@ from sqlalchemy import select
 from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, TaskStatus
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
@@ -20,6 +24,27 @@ from ai_employee.infrastructure.db.models.tasks import (
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.session import build_session_factory
+
+# 旧 fake.write 回归与 M2 提交测试共享 Cycle 5 regular head；每个测试退出时先释放
+# 本模块创建的 pool，避免普通 migrated_database fixture 把 Task 13 anchor 当成应用库。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """只使用已通过 typed lifecycle 与 grants 复核的 regular head 数据库。"""
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖全局迁移 fixture；Cycle 5 helper 已完成精确数据库准入。"""
+    del cycle5_regular_database_url
+    yield
 
 
 async def test_expire_approvals_fails_overdue_task_without_tool_execution(

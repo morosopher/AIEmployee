@@ -1,6 +1,6 @@
 """以 PostgreSQL 锁实现审批决定与过期终止。"""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from hmac import compare_digest
 from uuid import UUID
 
@@ -11,8 +11,19 @@ from ai_employee.application.use_cases.approvals import (
     FakeWriteTask,
     PendingApproval,
 )
+from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import ApprovalProposal, ApprovalStatus, StepStatus, TaskStatus
+from ai_employee.infrastructure.db.models.actions import (
+    CalendarChangeProposalModel,
+    MailDraftModel,
+)
+from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
+    OAuthConnectionModel,
+    ProviderCalendarModel,
+)
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
     AuditEventModel,
@@ -216,6 +227,18 @@ class SqlAlchemyApprovalStore:
                 if task is None:
                     continue
                 approval.status = ApprovalStatus.EXPIRED.value
+                if approval.schema_version is not None:
+                    try:
+                        await self._return_trusted_action_to_editing(
+                            session=session,
+                            task=task,
+                            approval=approval,
+                            reason="approval_expired",
+                        )
+                    except StateConflictError:
+                        # 到期扫描不能因一条损坏绑定回滚其他审批；审批仍终态过期，
+                        # 本地对象不存在时保持 fail-closed，后续诊断从审计骨架处理。
+                        pass
                 if task.status in {
                     TaskStatus.WAITING_APPROVAL.value,
                     TaskStatus.RUNNING.value,
@@ -407,17 +430,34 @@ class SqlAlchemyApprovalStore:
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
                 )
-            proposal = ApprovalProposal.create(approval.action, approval.payload)
+            if approval.status == ApprovalStatus.INVALIDATED.value:
+                raise StateConflictError(
+                    error_code="approval_invalidated_by_edit",
+                    message="approval was invalidated and requires a new version",
+                )
             if (
                 approval.status != ApprovalStatus.PENDING.value
                 or approval.expires_at <= now
                 or approval.version != version
+                or len(payload_hash) != 64
+                or len(approval.payload_hash) != 64
                 or not compare_digest(approval.payload_hash, payload_hash)
-                or not compare_digest(approval.payload_hash, proposal.payload_hash)
                 or task.status != TaskStatus.WAITING_APPROVAL.value
             ):
                 raise StateConflictError(
                     error_code="approval_conflict", message="approval is unavailable"
+                )
+            if approval.schema_version is None:
+                proposal = ApprovalProposal.create(approval.action, approval.payload)
+                if not compare_digest(approval.payload_hash, proposal.payload_hash):
+                    raise StateConflictError(
+                        error_code="approval_conflict", message="approval is unavailable"
+                    )
+            else:
+                await self._validate_trusted_approval_current(
+                    session=session,
+                    task=task,
+                    approval=approval,
                 )
             durable_interrupt = await session.scalar(
                 text(
@@ -447,6 +487,15 @@ class SqlAlchemyApprovalStore:
             approval.status = decision
             approval.decided_at = now
             approval.decided_by_user_id = user_id
+            if approval.schema_version is not None and decision == ApprovalStatus.APPROVED.value:
+                approval.approved_execution_deadline_at = now + timedelta(minutes=5)
+            if approval.schema_version is not None and decision == ApprovalStatus.REJECTED.value:
+                await self._return_trusted_action_to_editing(
+                    session=session,
+                    task=task,
+                    approval=approval,
+                    reason="approval_rejected",
+                )
             task.status = TaskStatus.QUEUED.value
             task.error_code = None
             session.add(
@@ -468,3 +517,175 @@ class SqlAlchemyApprovalStore:
                     available_at=now,
                 )
             )
+
+    async def _validate_trusted_approval_current(
+        self,
+        *,
+        session: object,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+    ) -> None:
+        """在决定锁内重查 M2 本地版本、连接能力和日历目录权限。
+
+        完整命令无需为决定解密；持久 64 字符规范哈希已经绑定密文，决定边界只比较
+        调用方提供哈希并核对所有可撤销授权事实。任何能力或版本变化都拒绝决定，避免
+        用户批准的载荷在连接失效后被排队执行。
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        typed_session = session if isinstance(session, AsyncSession) else None
+        if typed_session is None:
+            raise RuntimeError("invalid session")
+        if (
+            approval.proposal_kind not in {"mail_draft", "calendar_proposal"}
+            or approval.proposal_id is None
+            or approval.proposal_version is None
+        ):
+            raise StateConflictError(
+                error_code="approval_conflict",
+                message="approval is unavailable",
+            )
+        connection_id: UUID
+        calendar_id: str | None = None
+        if approval.proposal_kind == "mail_draft":
+            draft = await typed_session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                draft is None
+                or draft.current_version != approval.proposal_version
+                or draft.status != MailDraftStatus.AWAITING_APPROVAL.value
+            ):
+                raise StateConflictError(
+                    error_code="approval_invalidated_by_edit",
+                    message="approval version is no longer current",
+                )
+            connection_id = draft.connection_id
+            read_capability = ConnectionCapability.MAIL_READ
+            write_capability = ConnectionCapability.MAIL_SEND
+        else:
+            proposal = await typed_session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == approval.proposal_id,
+                    CalendarChangeProposalModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                proposal is None
+                or proposal.current_version != approval.proposal_version
+                or proposal.status != CalendarProposalStatus.AWAITING_APPROVAL.value
+            ):
+                raise StateConflictError(
+                    error_code="approval_invalidated_by_edit",
+                    message="approval version is no longer current",
+                )
+            connection_id = proposal.connection_id
+            calendar_id = proposal.calendar_id
+            read_capability = ConnectionCapability.CALENDAR_READ
+            write_capability = ConnectionCapability.CALENDAR_WRITE
+
+        connection = await typed_session.scalar(
+            select(OAuthConnectionModel).where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == task.user_id,
+                OAuthConnectionModel.status == "connected",
+            )
+        )
+        capabilities = tuple(
+            (
+                await typed_session.scalars(
+                    select(ConnectionCapabilityModel).where(
+                        ConnectionCapabilityModel.user_id == task.user_id,
+                        ConnectionCapabilityModel.connection_id == connection_id,
+                        ConnectionCapabilityModel.capability.in_(
+                            (read_capability.value, write_capability.value)
+                        ),
+                    )
+                )
+            ).all()
+        )
+        capability_status = {row.capability: row.status for row in capabilities}
+        if connection is None or capability_status != {
+            read_capability.value: CapabilityStatus.ENABLED.value,
+            write_capability.value: CapabilityStatus.ENABLED.value,
+        }:
+            raise StateConflictError(
+                error_code="connection_capability_disabled",
+                message="provider write capability is not enabled",
+            )
+        if calendar_id is not None:
+            calendar = await typed_session.scalar(
+                select(ProviderCalendarModel).where(
+                    ProviderCalendarModel.user_id == task.user_id,
+                    ProviderCalendarModel.connection_id == connection_id,
+                    ProviderCalendarModel.provider_calendar_id == calendar_id,
+                    ProviderCalendarModel.can_write.is_(True),
+                )
+            )
+            if calendar is None:
+                raise StateConflictError(
+                    error_code="connection_capability_disabled",
+                    message="calendar is no longer writable",
+                )
+
+    async def _return_trusted_action_to_editing(
+        self,
+        *,
+        session: object,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+        reason: str,
+    ) -> None:
+        """把拒绝或过期审批绑定的当前本地对象恢复为 editing。
+
+        ApprovalRequest 仍保留原 ``proposal_version``，因此后续提交查询会永久判定该版本
+        已 consumed；用户必须先保存下一不可变版本，不能直接重放同一密文审批。
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        typed_session = session if isinstance(session, AsyncSession) else None
+        if typed_session is None:
+            raise RuntimeError("invalid session")
+        if approval.proposal_kind == "mail_draft" and approval.proposal_id is not None:
+            draft = await typed_session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                draft is not None
+                and draft.current_version == approval.proposal_version
+                and draft.status == MailDraftStatus.AWAITING_APPROVAL.value
+            ):
+                draft.status = MailDraftStatus.EDITING.value
+            return
+        if approval.proposal_kind == "calendar_proposal" and approval.proposal_id is not None:
+            proposal = await typed_session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == approval.proposal_id,
+                    CalendarChangeProposalModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                proposal is not None
+                and proposal.current_version == approval.proposal_version
+                and proposal.status == CalendarProposalStatus.AWAITING_APPROVAL.value
+            ):
+                proposal.status = CalendarProposalStatus.EDITING.value
+            return
+        raise StateConflictError(
+            error_code="approval_conflict",
+            message=f"trusted approval binding is unavailable: {reason}",
+        )

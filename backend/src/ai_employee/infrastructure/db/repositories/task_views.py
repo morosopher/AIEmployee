@@ -8,13 +8,20 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from ai_employee.application.use_cases.task_views import TaskSnapshot, TaskStepSnapshot
+from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
 from ai_employee.domain.errors import StateConflictError
-from ai_employee.domain.tasks import TaskStatus, transition_task
+from ai_employee.domain.tasks import ApprovalStatus, TaskStatus, transition_task
+from ai_employee.infrastructure.db.models.actions import (
+    CalendarChangeProposalModel,
+    MailDraftModel,
+)
 from ai_employee.infrastructure.db.models.tasks import (
+    ApprovalRequestModel,
     AuditEventModel,
     OutboxEventModel,
     TaskRunModel,
     TaskStepModel,
+    ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
@@ -122,28 +129,165 @@ class SqlAlchemyTaskViewStore:
             if task is None:
                 return None
             current_status = TaskStatus(task.status)
-            if current_status is TaskStatus.RUNNING and task.result_payload is not None:
+            if task.kind == "trusted_action" and current_status is TaskStatus.WAITING_APPROVAL:
+                await self._withdraw_trusted_action(
+                    session=session,
+                    task=task,
+                    user_id=user_id,
+                    now=now,
+                )
+                await session.flush()
+                withdrawn = True
+            else:
+                withdrawn = False
+            if not withdrawn and current_status is TaskStatus.RUNNING and task.result_payload is not None:
                 raise StateConflictError(
                     error_code="task_state_conflict",
                     message="task result is already committed",
                 )
-            transition_task(current_status, TaskStatus.CANCELLED)
-            task.status = TaskStatus.CANCELLED.value
-            task.finished_at = now
-            task.lease_owner = None
-            task.lease_expires_at = None
-            session.add(
+            elif not withdrawn:
+                transition_task(current_status, TaskStatus.CANCELLED)
+                task.status = TaskStatus.CANCELLED.value
+                task.finished_at = now
+                task.lease_owner = None
+                task.lease_expires_at = None
+                session.add(
+                    AuditEventModel(
+                        user_id=user_id,
+                        task_id=task_id,
+                        event_type="task.cancelled",
+                        actor_type="user",
+                        actor_id=str(user_id),
+                        event_metadata={},
+                    )
+                )
+            await session.flush()
+        return await self.get(task_id=task_id, user_id=user_id)
+
+    async def _withdraw_trusted_action(
+        self,
+        *,
+        session: object,
+        task: TaskRunModel,
+        user_id: UUID,
+        now: datetime,
+    ) -> None:
+        """撤回尚未认领的可信审批，并让绑定本地对象回到编辑态。
+
+        锁序由调用方已取得 TaskRun 开始，随后固定为 ApprovalRequest、ToolExecution 检查、
+        绑定草稿/提案。任何 ToolExecution 行都证明执行边界已经被认领，此时取消可能掩盖
+        已发生或未知的外部副作用，必须拒绝而不能只检查其当前状态。
+
+        Args:
+            session: 当前短事务的异步 SQLAlchemy 会话。
+            task: 已按用户范围 ``FOR UPDATE`` 锁定的可信任务。
+            user_id: 当前认证用户。
+            now: 取消事实的带时区 UTC 时间。
+
+        Raises:
+            StateConflictError: 审批形状异常、已终止或已有工具认领。
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        typed_session = session if isinstance(session, AsyncSession) else None
+        if typed_session is None:
+            raise RuntimeError("invalid session")
+        approval = await typed_session.scalar(
+            select(ApprovalRequestModel)
+            .where(ApprovalRequestModel.task_id == task.id)
+            .with_for_update()
+        )
+        if (
+            approval is None
+            or approval.schema_version is None
+            or approval.status != ApprovalStatus.PENDING.value
+            or approval.proposal_kind not in {"mail_draft", "calendar_proposal"}
+            or approval.proposal_id is None
+            or approval.proposal_version is None
+        ):
+            raise StateConflictError(
+                error_code="task_state_conflict",
+                message="trusted action cannot be withdrawn",
+            )
+        execution = await typed_session.scalar(
+            select(ToolExecutionModel.id)
+            .where(ToolExecutionModel.task_id == task.id)
+            .with_for_update()
+        )
+        if execution is not None:
+            raise StateConflictError(
+                error_code="task_state_conflict",
+                message="trusted action execution is already claimed",
+            )
+
+        if approval.proposal_kind == "mail_draft":
+            local = await typed_session.get(
+                MailDraftModel,
+                approval.proposal_id,
+                with_for_update=True,
+            )
+            if (
+                local is None
+                or local.user_id != user_id
+                or local.current_version != approval.proposal_version
+                or local.status != MailDraftStatus.AWAITING_APPROVAL.value
+            ):
+                raise StateConflictError(
+                    error_code="task_state_conflict",
+                    message="trusted action binding is unavailable",
+                )
+            local.status = MailDraftStatus.EDITING.value
+        else:
+            proposal = await typed_session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(CalendarChangeProposalModel.id == approval.proposal_id)
+                .with_for_update()
+            )
+            if (
+                proposal is None
+                or proposal.user_id != user_id
+                or proposal.current_version != approval.proposal_version
+                or proposal.status != CalendarProposalStatus.AWAITING_APPROVAL.value
+            ):
+                raise StateConflictError(
+                    error_code="task_state_conflict",
+                    message="trusted action binding is unavailable",
+                )
+            proposal.status = CalendarProposalStatus.EDITING.value
+
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.CANCELLED.value
+        task.error_code = None
+        task.finished_at = now
+        task.lease_owner = None
+        task.lease_expires_at = None
+        task.scheduled_for = None
+        task.retry_recovery_at = None
+        task.approval_checkpoint_recovery_at = None
+        typed_session.add_all(
+            (
                 AuditEventModel(
                     user_id=user_id,
-                    task_id=task_id,
+                    task_id=task.id,
+                    event_type="approval.invalidated",
+                    actor_type="user",
+                    actor_id=str(user_id),
+                    event_metadata={
+                        "approval_id": str(approval.id),
+                        "reason": "withdrawn",
+                        "status": ApprovalStatus.INVALIDATED.value,
+                    },
+                ),
+                AuditEventModel(
+                    user_id=user_id,
+                    task_id=task.id,
                     event_type="task.cancelled",
                     actor_type="user",
                     actor_id=str(user_id),
-                    event_metadata={},
-                )
+                    event_metadata={"reason": "approval_withdrawn"},
+                ),
             )
-            await session.flush()
-        return await self.get(task_id=task_id, user_id=user_id)
+        )
 
     async def retry(
         self, *, task_id: UUID, user_id: UUID, idempotency_key: str, now: datetime

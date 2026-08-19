@@ -13,7 +13,12 @@ from ai_employee.application.ports.calendar import (
     CalendarSyncPage,
 )
 from ai_employee.application.ports.mail import MailReader, MailScope, MailSyncPage
-from ai_employee.domain.errors import InternalInvariantError, PermanentProviderError
+from ai_employee.application.ports.trusted_actions import TrustedActionPreflight
+from ai_employee.domain.errors import (
+    InternalInvariantError,
+    PermanentProviderError,
+    StateConflictError,
+)
 
 
 class UnsupportedProviderError(PermanentProviderError):
@@ -150,9 +155,9 @@ class _GoogleCalendarCompatibilityAdapter:
 
 
 class ProviderAdapterRegistry:
-    """保存固定 Google/Microsoft 键的只读适配器，不提供运行期注册入口。"""
+    """保存固定 Google/Microsoft 读适配器与可信动作预检，不提供动态注册。"""
 
-    __slots__ = ("_calendar_readers", "_mail_readers")
+    __slots__ = ("_calendar_readers", "_mail_readers", "_trusted_action_preflights")
 
     def __init__(
         self,
@@ -163,8 +168,12 @@ class ProviderAdapterRegistry:
         | _GoogleCalendarProviderNeutralReader
         | None = None,
         microsoft_calendar: CalendarReader | None = None,
+        google_mail_preflight: TrustedActionPreflight | None = None,
+        google_calendar_preflight: TrustedActionPreflight | None = None,
+        microsoft_mail_preflight: TrustedActionPreflight | None = None,
+        microsoft_calendar_preflight: TrustedActionPreflight | None = None,
     ) -> None:
-        """以四个显式构造参数冻结注册表；未知键无法动态加入。"""
+        """以显式固定 slot 冻结读适配器与四类写动作预检。"""
         self._mail_readers = MappingProxyType(
             {
                 "google": (
@@ -183,6 +192,18 @@ class ProviderAdapterRegistry:
                     else None
                 ),
                 "microsoft": microsoft_calendar,
+            }
+        )
+        self._trusted_action_preflights = MappingProxyType(
+            {
+                ("google", "mail.send"): google_mail_preflight,
+                ("google", "calendar.create"): google_calendar_preflight,
+                ("google", "calendar.update"): google_calendar_preflight,
+                ("google", "calendar.restore"): google_calendar_preflight,
+                ("microsoft", "mail.send"): microsoft_mail_preflight,
+                ("microsoft", "calendar.create"): microsoft_calendar_preflight,
+                ("microsoft", "calendar.update"): microsoft_calendar_preflight,
+                ("microsoft", "calendar.restore"): microsoft_calendar_preflight,
             }
         )
 
@@ -207,6 +228,25 @@ class ProviderAdapterRegistry:
         if reader is None:
             raise ProviderAdapterUnavailableError
         return reader
+
+    def trusted_action_preflight(
+        self,
+        *,
+        provider: str,
+        action: str,
+    ) -> TrustedActionPreflight:
+        """按精确 provider/action 返回启动时固定的无副作用审批预检。
+
+        未知 provider、超出四种 M2 动作或当前进程未组装适配器都使用同一内容无关
+        错误，避免调用方把缺失动作误判为可批准或从错误中探测能力配置。
+        """
+        preflight = self._trusted_action_preflights.get((provider, action))
+        if preflight is None or preflight.provider != provider:
+            raise StateConflictError(
+                error_code="provider_action_unavailable",
+                message="provider action is unavailable",
+            )
+        return preflight
 
 
 __all__ = [

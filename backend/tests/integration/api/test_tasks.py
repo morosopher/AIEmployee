@@ -1,5 +1,6 @@
 """任务 REST 接口的集成验收测试。"""
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, time
 from typing import cast
 from uuid import UUID
@@ -11,11 +12,35 @@ from sqlalchemy import select
 
 from ai_employee.config import get_settings
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.db.database_url import (
+    TestDatabaseUrl as ValidatedTestDatabaseUrl,
+)
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel, TaskStepModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.main import create_app
+
+# 任务 API 回归使用 Cycle 5 regular head，并由 tracked fixture 在临时数据库清理前
+# 释放本模块创建的异步 pool；不得为了聚焦测试放宽 Task 13 anchor 的迁移 guard。
+pytestmark = pytest.mark.usefixtures("cycle5_tracked_session_factories")
+
+
+@pytest.fixture(scope="module", name="database_url")
+def _cycle5_database_url(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> ValidatedTestDatabaseUrl:
+    """把本模块绑定到已验证的 regular head 数据库。"""
+    return cycle5_regular_database_url
+
+
+@pytest.fixture(scope="module", autouse=True, name="migrated_database")
+def _cycle5_migrated_database(
+    cycle5_regular_database_url: ValidatedTestDatabaseUrl,
+) -> Iterator[None]:
+    """覆盖全局迁移 fixture；共享 helper 已完成 typed lifecycle 复核。"""
+    del cycle5_regular_database_url
+    yield
 
 
 @pytest.fixture
