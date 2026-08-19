@@ -22,8 +22,13 @@ from ai_employee.application.use_cases.mail_drafts import (
     MailDraftUseCase,
     UpdateMailDraftInput,
 )
+from ai_employee.application.use_cases.outbox import OutboxRelay
 from ai_employee.application.use_cases.task_views import CancelTaskUseCase
-from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
+from ai_employee.domain.actions import (
+    CalendarProposalStatus,
+    MailDraftStatus,
+    ToolExecutionStatus,
+)
 from ai_employee.domain.calendar_actions import NotificationPolicy
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import StateConflictError
@@ -53,6 +58,7 @@ from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
+from ai_employee.infrastructure.db.repositories.outbox import SqlAlchemyOutboxStore
 from ai_employee.infrastructure.db.repositories.task_views import SqlAlchemyTaskViewStore
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepository,
@@ -106,6 +112,30 @@ class _EnabledWritePolicy:
     def write_account_allowed(self, provider_identity_key: str) -> bool:
         """精确匹配合成 provider identity，不允许账户回退。"""
         return provider_identity_key == "google::synthetic-account"
+
+
+class _RecordingOutboxEnqueuer:
+    """记录过期事务之后 relay 尝试投递的任务 ID。"""
+
+    def __init__(self) -> None:
+        """初始化空的任务投递记录。"""
+        self.task_ids: list[UUID] = []
+
+    async def enqueue(self, task_id: UUID, **_: object) -> None:
+        """记录稳定任务标识；测试不接触真实 Taskiq 或 Redis。"""
+        self.task_ids.append(task_id)
+
+
+class _RecordingLifecyclePublisher:
+    """记录 relay 从生命周期 Outbox 解析出的审计唤醒标识。"""
+
+    def __init__(self) -> None:
+        """初始化空的任务/审计主键记录。"""
+        self.events: list[tuple[UUID, int]] = []
+
+    async def publish(self, *, task_id: UUID, event_id: int) -> None:
+        """只接受 TaskEventPublisher 的两个稳定标识参数。"""
+        self.events.append((task_id, event_id))
 
 
 async def _seed_mail_draft(database_url: str) -> UUID:
@@ -418,6 +448,91 @@ async def _submit_mail_draft(
             now=now,
         )
         return result.task_id, result.approval_id, result.operation_id
+    finally:
+        await session_factory.dispose()
+
+
+async def _trusted_withdrawal_storage_snapshot(
+    database_url: str,
+    *,
+    task_id: UUID,
+    approval_id: UUID,
+    draft_id: UUID,
+    execution_id: UUID,
+) -> tuple[object, ...]:
+    """读取撤回冲突涉及的完整持久行，供事务前后逐列比较。
+
+    Args:
+        database_url: disposable regular head 的异步测试 DSN。
+        task_id: 等待审批的可信任务标识。
+        approval_id: 与任务绑定的冻结审批标识。
+        draft_id: 与审批绑定的本地草稿标识。
+        execution_id: 已存在的工具认领标识。
+
+    Returns:
+        Task、Approval、Draft、ToolExecution 逐列值，以及该任务全部 Audit/Outbox
+        行的稳定有序快照。任何新增、删除或字段变化都会导致元组不相等。
+    """
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = tuple(
+                (
+                    await session.execute(
+                        select(*TaskRunModel.__table__.columns).where(
+                            TaskRunModel.id == task_id
+                        )
+                    )
+                ).one()
+            )
+            approval = tuple(
+                (
+                    await session.execute(
+                        select(*ApprovalRequestModel.__table__.columns).where(
+                            ApprovalRequestModel.id == approval_id
+                        )
+                    )
+                ).one()
+            )
+            draft = tuple(
+                (
+                    await session.execute(
+                        select(*MailDraftModel.__table__.columns).where(
+                            MailDraftModel.id == draft_id
+                        )
+                    )
+                ).one()
+            )
+            execution = tuple(
+                (
+                    await session.execute(
+                        select(*ToolExecutionModel.__table__.columns).where(
+                            ToolExecutionModel.id == execution_id
+                        )
+                    )
+                ).one()
+            )
+            audits = tuple(
+                tuple(row)
+                for row in (
+                    await session.execute(
+                        select(*AuditEventModel.__table__.columns)
+                        .where(AuditEventModel.task_id == task_id)
+                        .order_by(AuditEventModel.id)
+                    )
+                ).all()
+            )
+            outbox = tuple(
+                tuple(row)
+                for row in (
+                    await session.execute(
+                        select(*OutboxEventModel.__table__.columns)
+                        .where(OutboxEventModel.aggregate_id == task_id)
+                        .order_by(OutboxEventModel.id)
+                    )
+                ).all()
+            )
+        return task, approval, draft, execution, audits, outbox
     finally:
         await session_factory.dispose()
 
@@ -832,14 +947,36 @@ async def test_cancel_waiting_trusted_task_invalidates_without_tool_execution(
                     )
                 ).all()
             )
+            audit_events = tuple(
+                (
+                    await session.scalars(
+                        select(AuditEventModel)
+                        .where(AuditEventModel.task_id == result.task_id)
+                        .order_by(AuditEventModel.id)
+                    )
+                ).all()
+            )
         assert snapshot is not None and snapshot.status is TaskStatus.CANCELLED
         assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
         assert draft is not None and draft.status == MailDraftStatus.EDITING.value
         assert tool_count == 0
-        assert {event.topic for event in outbox_events} >= {
-            "approval.invalidated",
-            "task.cancelled",
+        lifecycle_audit_ids = {
+            event.event_type: event.id
+            for event in audit_events
+            if event.event_type in {"approval.invalidated", "task.cancelled"}
         }
+        lifecycle_outbox = {
+            event.topic: event
+            for event in outbox_events
+            if event.topic in {"approval.invalidated", "task.cancelled"}
+        }
+        assert set(lifecycle_audit_ids) == {"approval.invalidated", "task.cancelled"}
+        assert set(lifecycle_outbox) == {"approval.invalidated", "task.cancelled"}
+        for topic, event in lifecycle_outbox.items():
+            assert event.payload == {
+                "task_id": str(result.task_id),
+                "audit_event_id": lifecycle_audit_ids[topic],
+            }
 
         with pytest.raises(StateConflictError) as invalidated:
             await ApprovalDecisionUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
@@ -875,6 +1012,80 @@ async def test_cancel_waiting_trusted_task_invalidates_without_tool_execution(
         )
         assert replacement_task_id != result.task_id
         assert replacement_approval_id != result.approval_id
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.parametrize("execution_status", tuple(ToolExecutionStatus))
+async def test_cancel_waiting_trusted_task_with_tool_execution_is_zero_mutation(
+    database_url: str,
+    execution_status: ToolExecutionStatus,
+) -> None:
+    """任何稳定 ToolExecution 状态都关闭撤回边界，且冲突事务必须逐行零变更。"""
+    draft_id = await _seed_mail_draft(database_url)
+    task_id, approval_id, operation_id = await _submit_mail_draft(
+        database_url=database_url,
+        draft_id=draft_id,
+        expected_version=1,
+        idempotency_key=f"synthetic-tool-{execution_status.value}-cancel",
+        now=NOW,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            task = await session.get(TaskRunModel, task_id, with_for_update=True)
+            approval = await session.get(
+                ApprovalRequestModel,
+                approval_id,
+                with_for_update=True,
+            )
+            assert task is not None
+            assert approval is not None
+            task.status = TaskStatus.WAITING_APPROVAL.value
+            execution = ToolExecutionModel(
+                task_id=task_id,
+                step_id=approval.step_id,
+                tool_name=approval.action,
+                idempotency_key=f"trusted-withdrawal:{task_id}:{execution_status.value}",
+                operation_id=operation_id,
+                request_payload_hash=approval.payload_hash,
+                provider="google",
+                status=execution_status.value,
+                claimed_at=NOW,
+                request_started_at=(
+                    NOW + timedelta(seconds=1)
+                    if execution_status is not ToolExecutionStatus.CLAIMED
+                    else None
+                ),
+            )
+            session.add(execution)
+            await session.flush()
+            execution_id = execution.id
+
+        before = await _trusted_withdrawal_storage_snapshot(
+            database_url,
+            task_id=task_id,
+            approval_id=approval_id,
+            draft_id=draft_id,
+            execution_id=execution_id,
+        )
+
+        with pytest.raises(StateConflictError) as conflict:
+            await CancelTaskUseCase(SqlAlchemyTaskViewStore(session_factory)).execute(
+                task_id=task_id,
+                user_id=USER_ID,
+                now=NOW + timedelta(minutes=1),
+            )
+
+        assert conflict.value.error_code == "task_state_conflict"
+        after = await _trusted_withdrawal_storage_snapshot(
+            database_url,
+            task_id=task_id,
+            approval_id=approval_id,
+            draft_id=draft_id,
+            execution_id=execution_id,
+        )
+        assert after == before
     finally:
         await session_factory.dispose()
 
@@ -936,22 +1147,56 @@ async def test_queued_or_running_trusted_task_cancel_is_rejected_without_mutatio
         await session_factory.dispose()
 
 
-async def test_queued_m2_expiry_retires_task_and_initial_outbox(
+@pytest.mark.parametrize(
+    "initial_published_at",
+    (None, NOW + timedelta(minutes=1)),
+    ids=("unpublished-initial", "published-history"),
+)
+async def test_queued_m2_expiry_retires_only_unpublished_initial_outbox(
     database_url: str,
+    initial_published_at: datetime | None,
 ) -> None:
-    """queued M2 审批到期必须终止任务，并使初始执行事件不可再投递。"""
+    """queued 到期删除未发布 initial、保留已发布历史，且 relay 不再排队取消任务。"""
     draft_id = await _seed_mail_draft(database_url)
     task_id, approval_id, _ = await _submit_mail_draft(
         database_url=database_url,
         draft_id=draft_id,
         expected_version=1,
-        idempotency_key="synthetic-queued-expiry",
+        idempotency_key=(
+            "synthetic-queued-expiry-unpublished"
+            if initial_published_at is None
+            else "synthetic-queued-expiry-published"
+        ),
         now=NOW,
     )
     session_factory = build_session_factory(database_url)
+    published_initial_before: tuple[object, ...] | None = None
     try:
+        if initial_published_at is not None:
+            async with session_factory.begin() as session:
+                initial = await session.scalar(
+                    select(OutboxEventModel)
+                    .where(
+                        OutboxEventModel.deduplication_key
+                        == f"task.execute:{task_id}:initial"
+                    )
+                    .with_for_update()
+                )
+                assert initial is not None
+                initial.published_at = initial_published_at
+                published_initial_before = tuple(
+                    (
+                        await session.execute(
+                            select(*OutboxEventModel.__table__.columns).where(
+                                OutboxEventModel.id == initial.id
+                            )
+                        )
+                    ).one()
+                )
+
+        expiry_instant = NOW + timedelta(minutes=11)
         expired = await ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
-            now=NOW + timedelta(minutes=11),
+            now=expiry_instant,
             limit=10,
         )
         assert expired == 1
@@ -965,6 +1210,14 @@ async def test_queued_m2_expiry_retires_task_and_initial_outbox(
                     OutboxEventModel.deduplication_key == f"task.execute:{task_id}:initial"
                 )
             )
+            initial_storage = (
+                await session.execute(
+                    select(*OutboxEventModel.__table__.columns).where(
+                        OutboxEventModel.deduplication_key
+                        == f"task.execute:{task_id}:initial"
+                    )
+                )
+            ).one_or_none()
             outbox_events = tuple(
                 (
                     await session.scalars(
@@ -974,15 +1227,79 @@ async def test_queued_m2_expiry_retires_task_and_initial_outbox(
                     )
                 ).all()
             )
+            audit_events = tuple(
+                (
+                    await session.scalars(
+                        select(AuditEventModel)
+                        .where(AuditEventModel.task_id == task_id)
+                        .order_by(AuditEventModel.id)
+                    )
+                ).all()
+            )
         assert task is not None and task.status == TaskStatus.CANCELLED.value
         assert task.error_code == "approval_expired"
         assert approval is not None and approval.status == ApprovalStatus.EXPIRED.value
         assert draft is not None and draft.status == MailDraftStatus.EDITING.value
-        assert initial is not None and initial.published_at is not None
-        assert {event.topic for event in outbox_events} >= {
-            "approval.expired",
-            "task.cancelled",
+        if initial_published_at is None:
+            assert initial is None
+            assert initial_storage is None
+        else:
+            assert initial is not None
+            assert initial.published_at == initial_published_at
+            assert published_initial_before is not None
+            assert initial_storage is not None
+            assert tuple(initial_storage) == published_initial_before
+
+        lifecycle_audit_ids = {
+            event.event_type: event.id
+            for event in audit_events
+            if event.event_type in {"approval.expired", "task.cancelled"}
         }
+        lifecycle_outbox = {
+            event.topic: event
+            for event in outbox_events
+            if event.topic in {"approval.expired", "task.cancelled"}
+        }
+        assert set(lifecycle_audit_ids) == {"approval.expired", "task.cancelled"}
+        assert set(lifecycle_outbox) == {"approval.expired", "task.cancelled"}
+        for topic, event in lifecycle_outbox.items():
+            assert event.payload == {
+                "task_id": str(task_id),
+                "audit_event_id": lifecycle_audit_ids[topic],
+            }
+
+        enqueuer = _RecordingOutboxEnqueuer()
+        publisher = _RecordingLifecyclePublisher()
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: expiry_instant,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        assert await relay.relay_once(limit=10) == 2
+        assert enqueuer.task_ids == []
+        assert set(publisher.events) == {
+            (task_id, lifecycle_audit_ids["approval.expired"]),
+            (task_id, lifecycle_audit_ids["task.cancelled"]),
+        }
+        async with session_factory() as session:
+            published_lifecycle = tuple(
+                (
+                    await session.scalars(
+                        select(OutboxEventModel).where(
+                            OutboxEventModel.id.in_(
+                                tuple(event.id for event in lifecycle_outbox.values())
+                            )
+                        )
+                    )
+                ).all()
+            )
+        assert len(published_lifecycle) == 2
+        assert all(event.published_at == expiry_instant for event in published_lifecycle)
     finally:
         await session_factory.dispose()
 

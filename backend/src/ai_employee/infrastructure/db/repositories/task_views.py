@@ -272,28 +272,38 @@ class SqlAlchemyTaskViewStore:
         task.scheduled_for = None
         task.retry_recovery_at = None
         task.approval_checkpoint_recovery_at = None
+        approval_invalidated_audit = AuditEventModel(
+            user_id=user_id,
+            task_id=task.id,
+            event_type="approval.invalidated",
+            actor_type="user",
+            actor_id=str(user_id),
+            event_metadata={
+                "approval_id": str(approval.id),
+                "reason": "withdrawn",
+                "status": ApprovalStatus.INVALIDATED.value,
+            },
+        )
+        task_cancelled_audit = AuditEventModel(
+            user_id=user_id,
+            task_id=task.id,
+            event_type="task.cancelled",
+            actor_type="user",
+            actor_id=str(user_id),
+            event_metadata={"reason": "approval_withdrawn"},
+        )
         typed_session.add_all(
             (
-                AuditEventModel(
-                    user_id=user_id,
-                    task_id=task.id,
-                    event_type="approval.invalidated",
-                    actor_type="user",
-                    actor_id=str(user_id),
-                    event_metadata={
-                        "approval_id": str(approval.id),
-                        "reason": "withdrawn",
-                        "status": ApprovalStatus.INVALIDATED.value,
-                    },
-                ),
-                AuditEventModel(
-                    user_id=user_id,
-                    task_id=task.id,
-                    event_type="task.cancelled",
-                    actor_type="user",
-                    actor_id=str(user_id),
-                    event_metadata={"reason": "approval_withdrawn"},
-                ),
+                approval_invalidated_audit,
+                task_cancelled_audit,
+            )
+        )
+        # Outbox 只能引用数据库已经分配的审计主键；同一事务提交保证两类事实原子可见。
+        await typed_session.flush()
+        if approval_invalidated_audit.id is None or task_cancelled_audit.id is None:
+            raise RuntimeError("trusted withdrawal audit ids were not assigned")
+        typed_session.add_all(
+            (
                 OutboxEventModel(
                     topic="approval.invalidated",
                     aggregate_id=task.id,
@@ -302,9 +312,7 @@ class SqlAlchemyTaskViewStore:
                     ),
                     payload={
                         "task_id": str(task.id),
-                        "approval_id": str(approval.id),
-                        "status": ApprovalStatus.INVALIDATED.value,
-                        "version": approval.version,
+                        "audit_event_id": approval_invalidated_audit.id,
                     },
                     available_at=now,
                 ),
@@ -314,8 +322,7 @@ class SqlAlchemyTaskViewStore:
                     deduplication_key=f"task.cancelled:{task.id}:approval-withdrawn",
                     payload={
                         "task_id": str(task.id),
-                        "approval_id": str(approval.id),
-                        "status": TaskStatus.CANCELLED.value,
+                        "audit_event_id": task_cancelled_audit.id,
                     },
                     available_at=now,
                 ),

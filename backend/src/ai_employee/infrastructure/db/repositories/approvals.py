@@ -244,8 +244,8 @@ class SqlAlchemyApprovalStore:
                         pass
                 if is_m2_trusted_action and task.status == TaskStatus.QUEUED.value:
                     # 提交事务先创建 queued task 与初始 task.execute；若十分钟内 Worker 尚未
-                    # 建立 durable interrupt，到期必须同时终止任务并退休该未发布事件。仅把
-                    # 精确 initial 行标记为已处理，避免影响同任务未来其他持久事实。
+                    # 建立 durable interrupt，到期必须同时终止任务并删除该未发布事件。已
+                    # 发布 initial 是不可变历史，其他 deduplication key 也不属于本次到期。
                     initial_event = await session.scalar(
                         select(OutboxEventModel)
                         .where(
@@ -253,11 +253,12 @@ class SqlAlchemyApprovalStore:
                             OutboxEventModel.topic == "task.execute",
                             OutboxEventModel.deduplication_key
                             == f"task.execute:{task.id}:initial",
+                            OutboxEventModel.published_at.is_(None),
                         )
                         .with_for_update()
                     )
-                    if initial_event is not None and initial_event.published_at is None:
-                        initial_event.published_at = now
+                    if initial_event is not None:
+                        await session.delete(initial_event)
                     task.status = TaskStatus.CANCELLED.value
                     task.error_code = "approval_expired"
                     task.finished_at = now
@@ -266,24 +267,34 @@ class SqlAlchemyApprovalStore:
                     task.scheduled_for = None
                     task.retry_recovery_at = None
                     task.approval_checkpoint_recovery_at = None
+                    approval_expired_audit = AuditEventModel(
+                        user_id=task.user_id,
+                        task_id=task.id,
+                        event_type="approval.expired",
+                        actor_type="system",
+                        actor_id=None,
+                        event_metadata={},
+                    )
+                    task_cancelled_audit = AuditEventModel(
+                        user_id=task.user_id,
+                        task_id=task.id,
+                        event_type="task.cancelled",
+                        actor_type="system",
+                        actor_id=None,
+                        event_metadata={"reason": "approval_expired"},
+                    )
                     session.add_all(
                         (
-                            AuditEventModel(
-                                user_id=task.user_id,
-                                task_id=task.id,
-                                event_type="approval.expired",
-                                actor_type="system",
-                                actor_id=None,
-                                event_metadata={},
-                            ),
-                            AuditEventModel(
-                                user_id=task.user_id,
-                                task_id=task.id,
-                                event_type="task.cancelled",
-                                actor_type="system",
-                                actor_id=None,
-                                event_metadata={"reason": "approval_expired"},
-                            ),
+                            approval_expired_audit,
+                            task_cancelled_audit,
+                        )
+                    )
+                    # 生命周期 Outbox 只绑定数据库分配的审计 ID，不复制审批状态或本地内容。
+                    await session.flush()
+                    if approval_expired_audit.id is None or task_cancelled_audit.id is None:
+                        raise RuntimeError("trusted expiry audit ids were not assigned")
+                    session.add_all(
+                        (
                             OutboxEventModel(
                                 topic="approval.expired",
                                 aggregate_id=task.id,
@@ -292,9 +303,7 @@ class SqlAlchemyApprovalStore:
                                 ),
                                 payload={
                                     "task_id": str(task.id),
-                                    "approval_id": str(approval.id),
-                                    "status": ApprovalStatus.EXPIRED.value,
-                                    "version": approval.version,
+                                    "audit_event_id": approval_expired_audit.id,
                                 },
                                 available_at=now,
                             ),
@@ -306,8 +315,7 @@ class SqlAlchemyApprovalStore:
                                 ),
                                 payload={
                                     "task_id": str(task.id),
-                                    "approval_id": str(approval.id),
-                                    "status": TaskStatus.CANCELLED.value,
+                                    "audit_event_id": task_cancelled_audit.id,
                                 },
                                 available_at=now,
                             ),

@@ -6,10 +6,20 @@ from uuid import UUID
 
 from sqlalchemy import select, update
 
-from ai_employee.application.use_cases.outbox import ClaimedOutboxEvent, utc_instant
+from ai_employee.application.use_cases.outbox import (
+    ClaimedOutboxEvent,
+    OutboxTopic,
+    utc_instant,
+)
 from ai_employee.domain.tasks import TaskStatus
-from ai_employee.infrastructure.db.models.tasks import OutboxEventModel, TaskRunModel
+from ai_employee.infrastructure.db.models.tasks import (
+    AuditEventModel,
+    OutboxEventModel,
+    TaskRunModel,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+
+_MINUTE_RELAY_TOPICS: tuple[str, ...] = tuple(topic.value for topic in OutboxTopic)
 
 
 class SqlAlchemyOutboxStore:
@@ -40,13 +50,14 @@ class SqlAlchemyOutboxStore:
         limit: int,
         task_id: UUID | None = None,
     ) -> tuple[ClaimedOutboxEvent, ...]:
-        """按稳定顺序 claim 到期的未发布任务事件并先把 CREATED 归队。
+        """按稳定顺序 claim 固定 allowlist 内的到期未发布事件。
 
         Args:
             now: 本轮扫描的 UTC 瞬间。
             claim_until: claim 提交后再次允许扫描的 UTC 瞬间。
             limit: 本事务最多锁定的行数，必须为正。
-            task_id: 提交后立即投递时限定的任务；minute relay 省略。
+            task_id: 提交后立即投递时限定的任务；此模式只认领 ``task.execute``。
+                minute relay 省略，并认领固定的执行与三个生命周期 topic。
 
         Returns:
             提交后可安全进行外部 I/O 的不可变事件快照。
@@ -62,10 +73,15 @@ class SqlAlchemyOutboxStore:
             raise ValueError("limit must be positive")
 
         async with self._session_factory.begin() as session:
+            allowed_topics = (
+                (OutboxTopic.TASK_EXECUTE.value,)
+                if task_id is not None
+                else _MINUTE_RELAY_TOPICS
+            )
             query = (
                 select(OutboxEventModel)
                 .where(
-                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.topic.in_(allowed_topics),
                     OutboxEventModel.published_at.is_(None),
                     OutboxEventModel.available_at <= now,
                 )
@@ -79,22 +95,61 @@ class SqlAlchemyOutboxStore:
 
             claimed: list[ClaimedOutboxEvent] = []
             for event in events:
-                # 状态归队与 claim 位于同一事务；enqueue 回调从新连接观察时二者都已提交。
-                await session.execute(
-                    update(TaskRunModel)
-                    .where(
-                        TaskRunModel.id == event.aggregate_id,
-                        TaskRunModel.status == TaskStatus.CREATED.value,
+                topic = OutboxTopic(event.topic)
+                audit_event_id: int | None = None
+                if topic is OutboxTopic.TASK_EXECUTE:
+                    # 状态归队与 claim 位于同一事务；enqueue 从新连接观察时二者都已提交。
+                    await session.execute(
+                        update(TaskRunModel)
+                        .where(
+                            TaskRunModel.id == event.aggregate_id,
+                            TaskRunModel.status == TaskStatus.CREATED.value,
+                        )
+                        .values(status=TaskStatus.QUEUED.value, updated_at=now)
                     )
-                    .values(status=TaskStatus.QUEUED.value, updated_at=now)
-                )
+                else:
+                    payload = event.payload
+                    raw_audit_event_id = payload.get("audit_event_id")
+                    has_exact_payload = set(payload) == {"task_id", "audit_event_id"}
+                    has_valid_audit_id = (
+                        isinstance(raw_audit_event_id, int)
+                        and not isinstance(raw_audit_event_id, bool)
+                        and raw_audit_event_id > 0
+                    )
+                    if (
+                        not has_exact_payload
+                        or payload.get("task_id") != str(event.aggregate_id)
+                        or not has_valid_audit_id
+                    ):
+                        # 损坏的已知 topic 不能到达 Redis，也不能在每分钟扫描中形成热循环。
+                        event.available_at = claim_until
+                        event.attempt_count += 1
+                        event.last_error = "invalid_outbox_payload"
+                        continue
+                    assert isinstance(raw_audit_event_id, int)
+                    committed_audit_id = await session.scalar(
+                        select(AuditEventModel.id).where(
+                            AuditEventModel.id == raw_audit_event_id,
+                            AuditEventModel.task_id == event.aggregate_id,
+                            AuditEventModel.event_type == topic.value,
+                        )
+                    )
+                    if committed_audit_id is None:
+                        # 生命周期通知必须绑定本任务同类型的已提交审计行，禁止信任孤立 JSON。
+                        event.available_at = claim_until
+                        event.attempt_count += 1
+                        event.last_error = "invalid_outbox_payload"
+                        continue
+                    audit_event_id = committed_audit_id
                 event.available_at = claim_until
                 claimed.append(
                     ClaimedOutboxEvent(
                         event_id=event.id,
                         task_id=event.aggregate_id,
+                        topic=topic,
                         claim_until=claim_until,
                         attempt_count=event.attempt_count,
+                        audit_event_id=audit_event_id,
                         resume=cast(
                             str | None,
                             event.payload.get("resume")
@@ -109,11 +164,11 @@ class SqlAlchemyOutboxStore:
             return tuple(claimed)
 
     async def mark_published(self, claim: ClaimedOutboxEvent, *, published_at: datetime) -> bool:
-        """确认 enqueue，并在同一事务中为延迟重试启用 Redis 丢失恢复。
+        """确认一次类型化外部投递，并仅为延迟任务重试启用 Redis 丢失恢复。
 
-        只有成功 enqueue 后才把 ``retry_recovery_at`` 写入 PostgreSQL。因此 relay 被阻塞、
-        Redis 调度慢或进程在确认前崩溃时，未发布 Outbox 仍是唯一待交接事实，恢复扫描不会
-        抢先复制它。
+        只有 ``task.execute`` 成功 enqueue 后才可能把 ``retry_recovery_at`` 写入
+        PostgreSQL；生命周期通知仅确认自身 Outbox。relay 被阻塞、Redis 调度慢或进程在
+        确认前崩溃时，未发布 Outbox 仍是唯一待交接事实，恢复扫描不会抢先复制任务事件。
         """
         published_at = utc_instant(published_at, field="published_at")
         async with self._session_factory.begin() as session:
@@ -134,6 +189,8 @@ class SqlAlchemyOutboxStore:
             ).one_or_none()
             if published_event is None:
                 return False
+            if claim.topic is not OutboxTopic.TASK_EXECUTE:
+                return True
             aggregate_id = published_event.aggregate_id
             retry_key_prefix = f"task.execute:{aggregate_id}:retry:"
             retry_attempt = published_event.deduplication_key.removeprefix(retry_key_prefix)
@@ -163,10 +220,16 @@ class SqlAlchemyOutboxStore:
     ) -> bool:
         """在新短事务中记录内容无关错误码、增加次数并安排下一次扫描。
 
-        原始异常文本可能包含 Redis URL、网络地址或第三方载荷，因此数据库只保存固定
-        ``queue_enqueue_failed``，详细工程异常由上层结构化日志的脱敏策略另行处理。
+        原始异常文本可能包含 Redis URL、网络地址或第三方载荷，因此数据库只按投递类型
+        保存 ``queue_enqueue_failed`` 或 ``task_event_publish_failed``，详细工程异常由
+        上层结构化日志的脱敏策略另行处理。
         """
         available_at = utc_instant(available_at, field="available_at")
+        error_code = (
+            "queue_enqueue_failed"
+            if claim.topic is OutboxTopic.TASK_EXECUTE
+            else "task_event_publish_failed"
+        )
         async with self._session_factory.begin() as session:
             event_id = await session.scalar(
                 update(OutboxEventModel)
@@ -177,7 +240,7 @@ class SqlAlchemyOutboxStore:
                 )
                 .values(
                     attempt_count=OutboxEventModel.attempt_count + 1,
-                    last_error="queue_enqueue_failed",
+                    last_error=error_code,
                     available_at=available_at,
                 )
                 .returning(OutboxEventModel.id)

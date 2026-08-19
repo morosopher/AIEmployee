@@ -77,6 +77,53 @@ class RecordingEnqueuer:
             raise RuntimeError("synthetic queue unavailable")
 
 
+class RecordingTaskEventPublisher:
+    """记录生命周期审计唤醒，并可注入不包含业务内容的发布故障。"""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        """初始化发布记录与一次固定故障开关。"""
+        self.fail = fail
+        self.events: list[tuple[UUID, int]] = []
+
+    async def publish(self, *, task_id: UUID, event_id: int) -> None:
+        """只记录任务与已提交审计主键，禁止接收生命周期正文。"""
+        self.events.append((task_id, event_id))
+        if self.fail:
+            raise RuntimeError("synthetic task event publisher unavailable")
+
+
+class InspectingTaskEventPublisher:
+    """在 publish 回调中证明 claim 已提交而 published_at 尚未伪造。"""
+
+    def __init__(self, database_url: str, *, outbox_id: UUID) -> None:
+        """保存隔离数据库与待观察 Outbox 行。"""
+        self._database_url = database_url
+        self._outbox_id = outbox_id
+        self.events: list[tuple[UUID, int]] = []
+        self.observed: list[tuple[datetime | None, datetime, UUID | None, str]] = []
+
+    async def publish(self, *, task_id: UUID, event_id: int) -> None:
+        """从新事务读取 claim、审计归属和发布确认前状态。"""
+        session_factory = build_session_factory(self._database_url)
+        try:
+            async with session_factory() as session:
+                outbox = await session.get(OutboxEventModel, self._outbox_id)
+                audit = await session.get(AuditEventModel, event_id)
+            assert outbox is not None
+            assert audit is not None
+            self.events.append((task_id, event_id))
+            self.observed.append(
+                (
+                    outbox.published_at,
+                    outbox.available_at,
+                    audit.task_id,
+                    audit.event_type,
+                )
+            )
+        finally:
+            await session_factory.dispose()
+
+
 class InspectingEnqueuer:
     """在 enqueue 调用中从新事务读取 claim 已提交而 publish 尚未发生的状态。"""
 
@@ -158,6 +205,304 @@ def _user() -> UserModel:
         brief_time=time(8, 0),
         is_active=True,
     )
+
+
+async def _seed_lifecycle_outbox(
+    database_url: str,
+    *,
+    topic: str,
+    now: datetime,
+) -> tuple[UUID, int, UUID]:
+    """创建一条已提交审计及只含其主键的生命周期 Outbox 事实。
+
+    Args:
+        database_url: disposable regular head 的异步测试 DSN。
+        topic: 待验证的固定生命周期 topic。
+        now: Outbox 首次可投递时间。
+
+    Returns:
+        任务 ID、审计事件 ID 与 Outbox ID。
+    """
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            user = _user()
+            session.add(user)
+            await session.flush()
+            task = TaskRunModel(
+                user_id=user.id,
+                kind="trusted_action",
+                status=TaskStatus.CANCELLED.value,
+                idempotency_key=f"lifecycle:{topic}:{user.id}",
+                input_payload={},
+            )
+            session.add(task)
+            await session.flush()
+            audit = AuditEventModel(
+                user_id=user.id,
+                task_id=task.id,
+                event_type=topic,
+                actor_type="system",
+                actor_id=None,
+                event_metadata={},
+            )
+            session.add(audit)
+            await session.flush()
+            assert audit.id is not None
+            event = OutboxEventModel(
+                topic=topic,
+                aggregate_id=task.id,
+                deduplication_key=f"{topic}:{task.id}:synthetic",
+                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                available_at=now,
+            )
+            session.add(event)
+            await session.flush()
+            return task.id, audit.id, event.id
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "topic",
+    ("approval.invalidated", "approval.expired", "task.cancelled"),
+)
+async def test_minute_relay_publishes_fixed_lifecycle_audit_event_then_marks_outbox(
+    database_url: str,
+    topic: str,
+) -> None:
+    """分钟 relay 只向事件端口发送 task_id 与已提交审计 ID，成功后才确认发布。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    task_id, audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+        database_url,
+        topic=topic,
+        now=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    publisher = InspectingTaskEventPublisher(database_url, outbox_id=outbox_id)
+    try:
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        published = await relay.relay_once(limit=1)
+
+        assert published == 1
+        assert enqueuer.task_ids == []
+        assert publisher.events == [(task_id, audit_event_id)]
+        assert publisher.observed == [
+            (
+                None,
+                now + timedelta(seconds=60),
+                task_id,
+                topic,
+            )
+        ]
+        async with session_factory() as session:
+            event = await session.get(OutboxEventModel, outbox_id)
+        assert event is not None
+        assert event.published_at == now
+        assert event.attempt_count == 0
+        assert event.last_error is None
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_publish_failure_remains_unpublished_with_safe_backoff(
+    database_url: str,
+) -> None:
+    """事件发布故障不得伪造 published_at，并用固定错误码安排安全重试。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    task_id, audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+        database_url,
+        topic="approval.expired",
+        now=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    publisher = RecordingTaskEventPublisher(fail=True)
+    try:
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        published = await relay.relay_once(limit=1)
+
+        assert published == 0
+        assert enqueuer.task_ids == []
+        assert publisher.events == [(task_id, audit_event_id)]
+        async with session_factory() as session:
+            event = await session.get(OutboxEventModel, outbox_id)
+        assert event is not None
+        assert event.published_at is None
+        assert event.attempt_count == 1
+        assert event.last_error == "task_event_publish_failed"
+        assert event.available_at == now + timedelta(seconds=5)
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_immediate_dispatch_does_not_claim_lifecycle_event(database_url: str) -> None:
+    """请求提交后的即时 dispatch 只处理 task.execute，不能抢走生命周期通知。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    task_id, _audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+        database_url,
+        topic="task.cancelled",
+        now=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    publisher = RecordingTaskEventPublisher()
+    try:
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        status = await relay.dispatch(task_id)
+
+        assert status is TaskStatus.CANCELLED
+        assert enqueuer.task_ids == []
+        assert publisher.events == []
+        async with session_factory() as session:
+            event = await session.get(OutboxEventModel, outbox_id)
+        assert event is not None
+        assert event.available_at == now
+        assert event.published_at is None
+        assert event.attempt_count == 0
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_minute_relay_never_claims_unsupported_topic(database_url: str) -> None:
+    """固定 allowlist 之外的 topic 即使到期也保持原样且不触达任何外部端口。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    task_id, _audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+        database_url,
+        topic="synthetic.unsupported",
+        now=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    publisher = RecordingTaskEventPublisher()
+    try:
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: now,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        assert await relay.relay_once(limit=1) == 0
+
+        assert enqueuer.task_ids == []
+        assert publisher.events == []
+        async with session_factory() as session:
+            event = await session.get(OutboxEventModel, outbox_id)
+        assert event is not None
+        assert event.aggregate_id == task_id
+        assert event.available_at == now
+        assert event.published_at is None
+        assert event.attempt_count == 0
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_malformed_lifecycle_payload_is_quarantined_then_manually_recoverable(
+    database_url: str,
+) -> None:
+    """损坏的已知 topic 至少隔离一个 claim 窗口，人工修复后才允许真实发布。"""
+    now = datetime(2030, 8, 1, 0, 0, tzinfo=UTC)
+    current = now
+    task_id, audit_event_id, outbox_id = await _seed_lifecycle_outbox(
+        database_url,
+        topic="approval.invalidated",
+        now=now,
+    )
+    session_factory = build_session_factory(database_url)
+    enqueuer = RecordingEnqueuer()
+    publisher = RecordingTaskEventPublisher()
+    try:
+        async with session_factory.begin() as session:
+            event = await session.get(OutboxEventModel, outbox_id, with_for_update=True)
+            assert event is not None
+            event.payload = {"task_id": str(task_id)}
+
+        relay = OutboxRelay(
+            store=SqlAlchemyOutboxStore(session_factory),
+            enqueuer=enqueuer,
+            event_publisher=publisher,
+            clock=lambda: current,
+            claim_ttl=timedelta(seconds=60),
+            retry_base=timedelta(seconds=5),
+            retry_max=timedelta(seconds=300),
+        )
+
+        assert await relay.relay_once(limit=1) == 0
+        assert enqueuer.task_ids == []
+        assert publisher.events == []
+        async with session_factory() as session:
+            quarantined = await session.get(OutboxEventModel, outbox_id)
+        assert quarantined is not None
+        assert quarantined.published_at is None
+        assert quarantined.attempt_count == 1
+        assert quarantined.last_error == "invalid_outbox_payload"
+        assert quarantined.available_at == now + timedelta(seconds=60)
+
+        current = now + timedelta(seconds=59)
+        assert await relay.relay_once(limit=1) == 0
+        async with session_factory() as session:
+            still_quarantined = await session.get(OutboxEventModel, outbox_id)
+        assert still_quarantined is not None
+        assert still_quarantined.attempt_count == 1
+        assert still_quarantined.available_at == now + timedelta(seconds=60)
+
+        async with session_factory.begin() as session:
+            repairable = await session.get(OutboxEventModel, outbox_id, with_for_update=True)
+            assert repairable is not None
+            repairable.payload = {
+                "task_id": str(task_id),
+                "audit_event_id": audit_event_id,
+            }
+
+        current = now + timedelta(seconds=60)
+        assert await relay.relay_once(limit=1) == 1
+        assert enqueuer.task_ids == []
+        assert publisher.events == [(task_id, audit_event_id)]
+        async with session_factory() as session:
+            recovered = await session.get(OutboxEventModel, outbox_id)
+        assert recovered is not None
+        assert recovered.published_at == now + timedelta(seconds=60)
+        assert recovered.attempt_count == 1
+        assert recovered.last_error is None
+    finally:
+        await session_factory.dispose()
 
 
 @pytest.mark.asyncio

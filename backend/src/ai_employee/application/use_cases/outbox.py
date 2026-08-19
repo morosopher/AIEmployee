@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
@@ -21,11 +22,27 @@ class TaskEnqueuer(Protocol):
         """把任务标识投递到队列；实现不得携带业务正文或结果。"""
 
 
+class TaskEventNotifier(Protocol):
+    """定义只发布任务与已提交审计主键的瞬时通知端口。"""
+
+    async def publish(self, *, task_id: UUID, event_id: int) -> None:
+        """通知订阅者按审计主键重新读取 PostgreSQL 事实。"""
+
+
 class OutboxClock(Protocol):
     """提供可替换的带时区当前时间，便于退避与 claim 测试保持确定。"""
 
     def __call__(self) -> datetime:
         """返回当前时间瞬间；Relay 会进一步验证并规范为 UTC。"""
+
+
+class OutboxTopic(StrEnum):
+    """列出 M2 relay 唯一允许认领和投递的固定 Outbox topic。"""
+
+    TASK_EXECUTE = "task.execute"
+    APPROVAL_INVALIDATED = "approval.invalidated"
+    APPROVAL_EXPIRED = "approval.expired"
+    TASK_CANCELLED = "task.cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +51,25 @@ class ClaimedOutboxEvent:
 
     event_id: UUID
     task_id: UUID
+    topic: OutboxTopic
     claim_until: datetime
     attempt_count: int
+    audit_event_id: int | None = None
     resume: str | None = None
     recover_approval_checkpoint: bool = False
+
+    def __post_init__(self) -> None:
+        """拒绝 topic 与投递标识不匹配的快照，避免错误外部调用。
+
+        Raises:
+            ValueError: task.execute 携带审计 ID，或生命周期 topic 缺少正审计 ID。
+        """
+        if self.topic is OutboxTopic.TASK_EXECUTE:
+            if self.audit_event_id is not None:
+                raise ValueError("task execution claim cannot carry audit_event_id")
+            return
+        if self.audit_event_id is None or self.audit_event_id <= 0:
+            raise ValueError("lifecycle claim requires a positive audit_event_id")
 
 
 class OutboxStore(Protocol):
@@ -92,13 +124,14 @@ def utc_instant(value: datetime, *, field: str) -> datetime:
 
 
 class OutboxRelay:
-    """协调 claim、事务外 enqueue 以及成功/失败的独立持久确认。"""
+    """协调固定 topic claim、事务外类型化投递以及独立持久确认。"""
 
     def __init__(
         self,
         *,
         store: OutboxStore,
         enqueuer: TaskEnqueuer,
+        event_publisher: TaskEventNotifier | None = None,
         clock: OutboxClock,
         claim_ttl: timedelta,
         retry_base: timedelta,
@@ -109,6 +142,8 @@ class OutboxRelay:
         Args:
             store: 持久 claim 与结果确认端口。
             enqueuer: 只发送 task_id 的队列适配器。
+            event_publisher: 只发送 task_id 与审计 ID 的生命周期通知适配器。省略时
+                task.execute 仍可使用，但生命周期事件会安全失败并保留未发布事实。
             clock: 可替换的带时区时钟。
             claim_ttl: enqueue 结果未知时的恢复窗口。
             retry_base: 首次投递失败的退避时长。
@@ -125,6 +160,7 @@ class OutboxRelay:
             raise ValueError("retry_base cannot exceed retry_max")
         self._store = store
         self._enqueuer = enqueuer
+        self._event_publisher = event_publisher
         self._clock = clock
         self._claim_ttl = claim_ttl
         self._retry_base = retry_base
@@ -168,20 +204,35 @@ class OutboxRelay:
         return await self._store.get_task_status(task_id)
 
     async def _deliver(self, claims: tuple[ClaimedOutboxEvent, ...]) -> int:
-        """在 claim 事务之外执行队列 I/O，并为每条结果开启独立短确认事务。"""
+        """在 claim 事务外执行类型化 I/O，并为每条结果开启独立短确认事务。
+
+        ``task.execute`` 只进入 Taskiq；三个生命周期 topic 只进入任务事件发布端口，且
+        仅携带 ``task_id`` 与已提交 ``audit_event_id``。任何外部异常都保留未发布行，
+        由同一指数退避路径安排重试。
+        """
         published = 0
         for claim in claims:
             try:
-                if claim.resume is None:
-                    if claim.recover_approval_checkpoint:
-                        await self._enqueuer.enqueue(
-                            claim.task_id,
-                            recover_approval_checkpoint=True,
-                        )
+                if claim.topic is OutboxTopic.TASK_EXECUTE:
+                    if claim.resume is None:
+                        if claim.recover_approval_checkpoint:
+                            await self._enqueuer.enqueue(
+                                claim.task_id,
+                                recover_approval_checkpoint=True,
+                            )
+                        else:
+                            await self._enqueuer.enqueue(claim.task_id)
                     else:
-                        await self._enqueuer.enqueue(claim.task_id)
+                        await self._enqueuer.enqueue(claim.task_id, resume=claim.resume)
                 else:
-                    await self._enqueuer.enqueue(claim.task_id, resume=claim.resume)
+                    publisher = self._event_publisher
+                    if publisher is None:
+                        raise RuntimeError("task event publisher is unavailable")
+                    audit_event_id = claim.audit_event_id
+                    if audit_event_id is None:
+                        # dataclass 已拒绝该形状；保留显式防线以避免未来绕过构造器。
+                        raise RuntimeError("lifecycle outbox claim is invalid")
+                    await publisher.publish(task_id=claim.task_id, event_id=audit_event_id)
             except Exception:  # noqa: BLE001 - 外部队列边界需统一转为安全持久失败。
                 # 只捕获普通外部调用错误；取消信号等 BaseException 继续传播以便进程退出。
                 retry_at = self._now() + self._retry_delay(claim.attempt_count)

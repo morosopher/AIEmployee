@@ -6,6 +6,7 @@ from ai_employee.application.use_cases.outbox import OutboxClock, OutboxRelay
 from ai_employee.config import Settings
 from ai_employee.infrastructure.db.repositories.outbox import SqlAlchemyOutboxStore
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.queue.enqueue import TaskiqTaskEnqueuer, TaskSender
 
 
@@ -21,7 +22,7 @@ def build_outbox_relay(
     task_sender: TaskSender,
     clock: OutboxClock | None = None,
 ) -> OutboxRelay:
-    """构造即时投递与分钟扫描共享的 Outbox relay。
+    """构造即时任务投递与分钟任务/生命周期扫描共享的 Outbox relay。
 
     Args:
         session_factory: 进程级异步数据库 Session factory。
@@ -38,6 +39,7 @@ def build_outbox_relay(
             retry_recovery_delay=timedelta(seconds=settings.task_retry_recovery_seconds),
         ),
         enqueuer=TaskiqTaskEnqueuer(task_sender),
+        event_publisher=TaskEventPublisher(settings.redis_url),
         clock=clock or _utc_now,
         claim_ttl=timedelta(seconds=settings.outbox_claim_seconds),
         retry_base=timedelta(seconds=settings.outbox_retry_base_seconds),
