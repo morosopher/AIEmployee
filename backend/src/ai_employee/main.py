@@ -25,6 +25,7 @@ from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.briefs import build_briefs_router
 from ai_employee.api.routers.connections import build_connections_router
 from ai_employee.api.routers.conversations import build_conversations_router
+from ai_employee.api.routers.mail import build_mail_router
 from ai_employee.api.routers.privacy import build_privacy_router
 from ai_employee.api.routers.settings import build_settings_router
 from ai_employee.api.routers.system import build_system_router
@@ -59,6 +60,7 @@ from ai_employee.infrastructure.observability.sync import refresh_sync_age_metri
 from ai_employee.infrastructure.observability.tracing import initialize_tracing
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
+from ai_employee.integrations.registry import ProviderAdapterRegistry
 
 
 def create_app(
@@ -137,6 +139,10 @@ def create_app(
     # APP_TEST_MODE 的契约测试可在请求前一次性注入受 HTTP mock 保护的 mapping。测试
     # 模式会忽略该 state 并固定使用内置 fake；用例构造后复制冻结，不暴露运行时注册入口。
     app.state.oauth_adapters = None
+    # Task 21–24 落地真实写适配器前，API 仅持有不含任何 preflight 的冻结 registry；
+    # SubmitMailDraftUseCase 会先执行三层写入门禁，默认关闭时不触达该 registry。测试可在
+    # 首个请求前替换整个不可变对象以注入无网络 preflight，但不存在动态注册或扩展入口。
+    app.state.trusted_action_preflight_registry = ProviderAdapterRegistry()
     task_store = SqlAlchemyTaskViewStore(session_factory)
     app.state.create_task_use_case = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory),
@@ -198,6 +204,7 @@ def create_app(
     app.include_router(build_settings_router())
     app.include_router(build_tasks_router())
     app.include_router(build_approvals_router())
+    app.include_router(build_mail_router())
     # 故障注入只能在两个显式测试开关同时打开后注册；生产路由表中完全不存在该入口。
     if settings.app_env == "test" and settings.app_test_mode:
         from ai_employee.api.routers.test_support import (

@@ -1,9 +1,9 @@
 """组合认证应用端口、请求依赖与 RFC 9457 Problem Details 映射。"""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
-from typing import Annotated, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Protocol, cast
 from uuid import uuid4
 
 from fastapi import Depends, Request
@@ -55,6 +55,10 @@ from ai_employee.integrations.google.oauth import (
     build_authorization_url,
 )
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
+
+if TYPE_CHECKING:
+    from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
+    from ai_employee.application.use_cases.trusted_actions import SubmitMailDraftUseCase
 
 CSRF_COOKIE_NAME = "ai_employee_csrf"
 _LOGGER = logging.getLogger(__name__)
@@ -266,6 +270,15 @@ def _domain_problem(error: DomainError) -> ApiProblem:
             "Connection scope missing",
             "Reconnect the provider to grant the required access.",
         )
+    if error.error_code == "mail_recipient_limit_exceeded":
+        # 收件人数超限是用户可修改的请求内容，而不是资源状态竞争；虽然领域用例
+        # 复用 StateConflictError 携带稳定码，HTTP 语义仍按 M2 契约固定为 422。
+        return ApiProblem(
+            422,
+            error.error_code,
+            "Recipient limit exceeded",
+            "A mail draft can contain at most 50 unique recipients.",
+        )
     if isinstance(error, UserActionRequiredError):
         return ApiProblem(
             403, error.error_code, "User action required", "Complete the required action."
@@ -392,6 +405,68 @@ def get_identity_repositories(request: Request) -> IdentityRepositoryFactory:
 def get_auth_clock(request: Request) -> Clock:
     """读取可在测试中替换的 UTC 时钟。"""
     return cast(Clock, request.app.state.auth_clock)
+
+
+async def get_mail_draft_use_case(request: Request) -> AsyncIterator["MailDraftUseCase"]:
+    """为单个邮件草稿请求创建短事务用例并惰性读取应用主密钥。
+
+    加密器不能在 ``create_app`` 或模块导入阶段构造，否则只生成 OpenAPI 的进程也会
+    被迫读取部署 Secret。依赖进入请求后才读取密钥，并让同一 SQLAlchemy 事务同时
+    承担草稿 CAS、连接能力与本地来源查询；正常返回提交，异常统一回滚。
+
+    Yields:
+        绑定当前请求事务、记录级 AEAD 与显式 UTC 时钟的 ``MailDraftUseCase``。
+    """
+    from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
+    from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
+    from ai_employee.infrastructure.db.repositories.mail_drafts import (
+        SqlAlchemyMailDraftRepository,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    source_cipher = AeadCipher.from_file(settings.app_master_key_file)
+    session_factory = request.app.state.auth_session_factory
+    async with session_factory.begin() as session:
+        repository = SqlAlchemyMailDraftRepository(
+            session,
+            ActionPayloadCipher(source_cipher),
+        )
+        yield MailDraftUseCase(
+            drafts=repository,
+            connections=repository,
+            sources=SqlAlchemyMailSyncRepository(session, source_cipher),
+            clock=get_auth_clock(request).now,
+        )
+
+
+def get_submit_mail_draft_use_case(request: Request) -> "SubmitMailDraftUseCase":
+    """惰性组合原子邮件提交用例，并固定使用启动时冻结的 preflight registry。
+
+    Secret 只在真实 submit 请求到达后读取；默认 registry 不含任何写适配器。用例会先
+    检查全局、供应商与账户门禁，因此默认关闭写入时必定在 preflight、ID 和密文产生前
+    返回 ``external_writes_disabled``。测试只能在首个请求前替换整个不可变 registry，
+    API 不提供运行时注册动作或扩展供应商的入口。
+    """
+    from ai_employee.application.use_cases.trusted_actions import SubmitMailDraftUseCase
+    from ai_employee.infrastructure.db.repositories.trusted_actions import (
+        SqlAlchemyTrustedActionRepositoryFactory,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    command_cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
+    return SubmitMailDraftUseCase(
+        transactions=SqlAlchemyTrustedActionRepositoryFactory(
+            request.app.state.auth_session_factory,
+            command_cipher,
+        ),
+        preflights=request.app.state.trusted_action_preflight_registry,
+        write_policy=settings,
+        command_cipher=command_cipher,
+    )
 
 
 def get_auth_token_factory(request: Request) -> TokenFactory:
