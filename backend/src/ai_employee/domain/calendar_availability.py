@@ -6,7 +6,7 @@ from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ai_employee.domain.settings import WeeklyWorkingHours
+from ai_employee.domain.settings import WeeklyWorkingHours, WorkingInterval
 
 type AvailabilityCompleteness = Literal["complete", "partial"]
 
@@ -324,5 +324,7 @@ __all__ = [
     "AvailabilityEvent",
     "AvailabilityResult",
     "CandidateTime",
+    "WeeklyWorkingHours",
+    "WorkingInterval",
     "suggest_meeting_times",
 ]

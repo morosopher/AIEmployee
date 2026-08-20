@@ -7,13 +7,12 @@ import pytest
 
 from ai_employee.domain.calendar_availability import (
     AvailabilityEvent,
+    WeeklyWorkingHours,
+    WorkingInterval,
     _merge_buffered_intervals,
     suggest_meeting_times,
 )
-from ai_employee.domain.settings import (
-    WeeklyWorkingHours,
-    validate_meeting_buffer,
-)
+from ai_employee.domain.settings import validate_meeting_buffer
 
 MISSING_CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000901")
 _DAY_NAMES = (
@@ -378,3 +377,21 @@ def test_working_interval_is_immutable() -> None:
 
     with pytest.raises((AttributeError, TypeError)):
         interval.start = time(8, 0)  # type: ignore[misc]
+
+
+def test_availability_module_exports_immutable_working_hour_types() -> None:
+    """可用性公共边界必须暴露算法使用的两个不可变工作时间类型。"""
+    interval = WorkingInterval(time(9, 0), time(10, 0))
+    hours = WeeklyWorkingHours(
+        (
+            (interval,),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+    )
+
+    assert hours.intervals_for(0) == (interval,)
