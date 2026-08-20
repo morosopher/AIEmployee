@@ -44,6 +44,7 @@ from ai_employee.workers.prepare_calendar_restore import (
 from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_deletion_worker
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_mail import build_mail_sync_task_step
+from ai_employee.workers.trusted_actions import build_trusted_action_task_step
 
 RETRY_DELAY_SECONDS = 5
 _MAX_RETRY_JITTER_MICROSECONDS = 1_000_000
@@ -393,7 +394,28 @@ async def execute_task(
                         ),
                     )
                     if task is not None and task.kind == "fake_write"
-                    else build_task_runner()
+                    else (
+                        DurableTaskRunner(
+                            store=SqlAlchemyTaskExecutionStore(session_factory),
+                            clock=lambda: datetime.now(UTC),
+                            lease_duration=timedelta(seconds=settings.task_lease_seconds),
+                            task_timeout_seconds=settings.task_timeout_seconds,
+                            task_step_timeout_seconds=settings.task_step_timeout_seconds,
+                            max_transient_retries=DEFAULT_RETRY_COUNT,
+                            metrics=_worker_metrics,
+                            retry_jitter=_bounded_retry_jitter,
+                            resolve_steps=lambda _task: (
+                                build_trusted_action_task_step(
+                                    session_factory=session_factory,
+                                    settings=settings,
+                                    approval_store=approval_store,
+                                    resume=resume,
+                                ),
+                            ),
+                        )
+                        if task is not None and task.kind == "trusted_action"
+                        else build_task_runner()
+                    )
                 )
             if _worker_metrics is not None:
                 await refresh_stuck_task_metrics(

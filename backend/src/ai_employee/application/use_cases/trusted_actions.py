@@ -6,21 +6,35 @@ provider preflight、规范化命令、计算哈希并加密；所有持久 muta
 """
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hmac import compare_digest
 from typing import cast
 from uuid import UUID, uuid4
 
+from cryptography.exceptions import InvalidTag
+
 from ai_employee.application.commands import (
+    TrustedCommand,
+    TrustedCommandValidationError,
     canonical_command_json,
     parse_trusted_command,
     trusted_command_hash,
+)
+from ai_employee.application.ports.encryption import (
+    EncryptionBoundaryError,
+    EncryptionKeyVersionError,
 )
 from ai_employee.application.ports.trusted_actions import (
     CalendarProposalSubmissionSnapshot,
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
+    ProviderWriteOutcome,
+    TrustedActionAdapterRegistry,
     TrustedActionCommandCipher,
+    TrustedActionDispatchSnapshot,
+    TrustedActionExecutionSnapshot,
     TrustedActionPreflightRegistry,
     TrustedActionRisk,
     TrustedActionSubmission,
@@ -28,19 +42,384 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionSubmissionTransactionFactory,
     TrustedActionWritePolicy,
 )
-from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
+from ai_employee.domain.actions import (
+    CalendarProposalStatus,
+    MailDraftStatus,
+    ProviderWriteOutcomeKind,
+    ToolExecutionStatus,
+)
 from ai_employee.domain.calendar_actions import NotificationPolicy, calendar_client_event_id
-from ai_employee.domain.connections import CapabilityStatus
-from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.connections import CapabilityStatus, canonical_provider_identity_key
+from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.domain.mail_actions import MailMode
-from ai_employee.domain.tasks import TaskStatus
+from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
+from ai_employee.infrastructure.security.action_payloads import ActionPayloadFormatError
 
 APPROVAL_COMMAND_CONTENT_KIND = "approval_command"
 APPROVAL_TTL = timedelta(minutes=10)
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedActionGraphFacts:
+    """LangGraph 可 checkpoint 的审批哈希与持久决定投影。"""
+
+    payload_hash: str
+    decision: str | None
+
+
 class CalendarProposalSubmissionNotFoundError(Exception):
     """表示日历提交事务按用户锁定时未找到提案，供 API 统一隐藏归属。"""
+
+
+class _TrustedActionIntegrityError(Exception):
+    """仅在进程内标记冻结命令与持久标识不一致，且永不携带命令内容。"""
+
+
+class TrustedActionExecutionUseCase:
+    """以 PostgreSQL claim 事实驱动一次精确真实写入或只读结果核对。
+
+    首次 claim 在同一事务重查用户、租约、审批、五分钟截止、哈希、三层写开关、
+    连接能力与规范账户身份；一旦 ToolExecution 已存在，后续恢复只依赖该持久授权事实，
+    不会因审批截止已过而撤销一个已经按时完成的 claim。完整命令只在 claim 提交后解密，
+    并在独立 request-start 事务之前重新验证哈希及标识绑定。
+    """
+
+    def __init__(
+        self,
+        *,
+        transactions: TrustedActionSubmissionTransactionFactory,
+        adapters: TrustedActionAdapterRegistry,
+        write_policy: TrustedActionWritePolicy,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[], UUID] = uuid4,
+        dispose: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """保存短事务工厂、固定 adapter、写门禁与可替换时钟/ID 来源。"""
+        self._transactions = transactions
+        self._adapters = adapters
+        self._write_policy = write_policy
+        self._clock = clock
+        self._id_factory = id_factory
+        self._dispose = dispose
+
+    async def load_graph_facts(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+    ) -> TrustedActionGraphFacts:
+        """读取 identifier-only Graph 事实，并拒绝 checkpoint 哈希被替换。
+
+        初次调用允许 ``expected_payload_hash`` 为空，由数据库填入冻结哈希；恢复调用必须
+        使用规范 SHA-256 并做常量时间比较。审批决定始终来自 PostgreSQL，而非 resume 值。
+        """
+        async with self._transactions() as transaction:
+            facts = await transaction.load_graph_facts(
+                task_id=task_id,
+                approval_id=approval_id,
+                operation_id=operation_id,
+            )
+        if facts is None:
+            raise _trusted_action_unavailable()
+        payload_hash, decision = facts
+        if not _canonical_payload_hash(payload_hash) or (
+            expected_payload_hash and not _payload_hashes_match(payload_hash, expected_payload_hash)
+        ):
+            raise _trusted_action_unavailable()
+        return TrustedActionGraphFacts(payload_hash=payload_hash, decision=decision)
+
+    async def claim(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        lease_owner: str,
+    ) -> None:
+        """原子创建唯一 ToolExecution，或安全复用先前已提交的 claim。
+
+        授权失败需要与任务/审批状态原子持久化时，方法先正常退出事务使失败事实提交，
+        再向 Graph 抛出稳定冲突；因此不会因异常触发上下文回滚而遗失失效记录。
+        """
+        now = _utc_now(self._clock())
+        _validate_lease_owner(lease_owner)
+        deferred_error: StateConflictError | None = None
+        async with self._transactions() as transaction:
+            snapshot = await transaction.lock_execution(
+                task_id=task_id,
+                approval_id=approval_id,
+                operation_id=operation_id,
+            )
+            if snapshot is None:
+                raise _trusted_action_unavailable()
+            if not _payload_hashes_match(snapshot.payload_hash, expected_payload_hash):
+                deferred_error = _trusted_action_unavailable()
+            elif snapshot.execution is not None:
+                _validate_existing_claim(snapshot, lease_owner=lease_owner, now=now)
+                return
+            elif not _current_task_lease(snapshot, lease_owner=lease_owner, now=now):
+                raise _trusted_action_unavailable()
+            elif snapshot.approval_status != ApprovalStatus.APPROVED.value:
+                raise _approval_conflict()
+            else:
+                deferred_error = self._new_claim_error(snapshot, now=now)
+
+            if deferred_error is None:
+                # adapter 必须在 claim 前已经由固定组合根组装；否则不能留下一个永远无法
+                # dispatch、却已把本地对象推进 executing 的半授权 ToolExecution。
+                try:
+                    self._adapters.trusted_action_adapter(
+                        provider=snapshot.provider,
+                        action=snapshot.action,
+                    )
+                except StateConflictError as error:
+                    deferred_error = error
+                else:
+                    await transaction.create_tool_claim(
+                        snapshot=snapshot,
+                        execution_id=self._id_factory(),
+                        idempotency_key=_tool_idempotency_key(snapshot),
+                        claimed_at=now,
+                    )
+                    return
+
+            await transaction.fail_unclaimed_action(
+                snapshot=snapshot,
+                error_code=deferred_error.error_code,
+                failed_at=now,
+            )
+        if deferred_error is None:  # pragma: no cover - 上述分支已经穷尽。
+            raise _trusted_action_unavailable()
+        raise deferred_error
+
+    async def execute_or_reconcile(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        lease_owner: str,
+    ) -> None:
+        """从持久 ToolExecution 选择首次写、明确安全重试、只读核对或终态复用。
+
+        ``request_started_at`` 在 adapter 写调用前独立提交。并发 Graph 重放即使同时读到
+        ``claimed``，也只有该 CAS 的赢家能调用 ``execute``；``executing``、
+        ``reconciling`` 与异常的 claimed-with-start 只能调用只读 ``reconcile``。
+        """
+        _validate_lease_owner(lease_owner)
+        now = _utc_now(self._clock())
+        snapshot: TrustedActionDispatchSnapshot | None = None
+        try:
+            async with self._transactions() as transaction:
+                snapshot = await transaction.load_dispatch(
+                    task_id=task_id,
+                    approval_id=approval_id,
+                    operation_id=operation_id,
+                )
+                if snapshot is None:
+                    raise _trusted_action_unavailable()
+                command_payload = await transaction.load_command(
+                    user_id=snapshot.user_id,
+                    approval_id=snapshot.approval_id,
+                )
+                if command_payload is None:
+                    raise _TrustedActionIntegrityError
+            command = _validated_dispatch_command(
+                command_payload,
+                snapshot=snapshot,
+                expected_payload_hash=expected_payload_hash,
+            )
+        except (
+            ActionPayloadFormatError,
+            EncryptionBoundaryError,
+            EncryptionKeyVersionError,
+            InvalidTag,
+            TrustedCommandValidationError,
+            _TrustedActionIntegrityError,
+            TypeError,
+            ValueError,
+        ):
+            if snapshot is None:
+                raise _trusted_action_unavailable() from None
+            await self._persist_integrity_failure(
+                snapshot=snapshot,
+                failed_at=now,
+                lease_owner=lease_owner,
+            )
+            raise _trusted_action_unavailable() from None
+        except StateConflictError as error:
+            if snapshot is None or error.error_code != "trusted_action_unavailable":
+                raise
+            await self._persist_integrity_failure(
+                snapshot=snapshot,
+                failed_at=now,
+                lease_owner=lease_owner,
+            )
+            raise _trusted_action_unavailable() from None
+
+        adapter = self._adapters.trusted_action_adapter(
+            provider=snapshot.provider,
+            action=snapshot.action,
+        )
+        status = snapshot.execution.status
+        if status in {
+            ToolExecutionStatus.SUCCEEDED,
+            ToolExecutionStatus.CONFIRMED_FAILED,
+            ToolExecutionStatus.NEEDS_ATTENTION,
+        }:
+            return
+
+        from_reconciliation = status in {
+            ToolExecutionStatus.EXECUTING,
+            ToolExecutionStatus.RECONCILING,
+        } or (
+            status is ToolExecutionStatus.CLAIMED
+            and snapshot.execution.request_started_at is not None
+        )
+        if from_reconciliation:
+            outcome = await adapter.reconcile(command, snapshot.execution)
+        elif status in {
+            ToolExecutionStatus.CLAIMED,
+            ToolExecutionStatus.RETRYABLE_FAILED,
+        }:
+            async with self._transactions() as transaction:
+                request_started = await transaction.mark_request_started(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                    started_at=now,
+                )
+            if not request_started:
+                # 另一个重放已提交 request-start 或当前 owner 已失去租约；两种情况都禁止
+                # 本调用继续触达 provider。后续投递只会从持久状态决定核对或终态复用。
+                return
+            outcome = await adapter.execute(command)
+        else:
+            raise _trusted_action_unavailable()
+
+        if type(outcome) is not ProviderWriteOutcome:
+            raise TypeError("trusted action adapter returned an invalid outcome")
+        completed_at = _utc_now(self._clock())
+        async with self._transactions() as transaction:
+            await transaction.persist_provider_outcome(
+                snapshot=snapshot,
+                outcome=outcome,
+                completed_at=completed_at,
+                from_reconciliation=from_reconciliation,
+                lease_owner=lease_owner,
+            )
+        if outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED and outcome.retryable:
+            # 先提交明确“未应用”结果，再让 DurableTaskRunner 写入唯一 retry_scheduled
+            # Outbox。只有该持久状态允许下一轮重新进入 adapter.execute。
+            raise TransientProviderError(
+                error_code=outcome.error_code or "provider_write_retryable",
+                message="provider confirmed that the trusted action was not applied",
+                retry_after=outcome.retry_after_seconds,
+            )
+
+    async def finalize(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        decision: str,
+        lease_owner: str,
+    ) -> None:
+        """完成拒绝分支；批准分支只验证持久决定，不覆盖工具终态。"""
+        _validate_lease_owner(lease_owner)
+        if decision == ApprovalStatus.REJECTED.value:
+            async with self._transactions() as transaction:
+                rejected_facts = await transaction.load_graph_facts(
+                    task_id=task_id,
+                    approval_id=approval_id,
+                    operation_id=operation_id,
+                )
+                if (
+                    rejected_facts is None
+                    or rejected_facts[1] != ApprovalStatus.REJECTED.value
+                    or not _payload_hashes_match(rejected_facts[0], expected_payload_hash)
+                ):
+                    raise _approval_conflict()
+                await transaction.finalize_rejected(
+                    task_id=task_id,
+                    approval_id=approval_id,
+                    operation_id=operation_id,
+                    lease_owner=lease_owner,
+                    finished_at=_utc_now(self._clock()),
+                )
+            return
+        if decision != ApprovalStatus.APPROVED.value:
+            raise _approval_conflict()
+        approved_facts = await self.load_graph_facts(
+            task_id=task_id,
+            approval_id=approval_id,
+            operation_id=operation_id,
+            expected_payload_hash=expected_payload_hash,
+        )
+        if approved_facts.decision != ApprovalStatus.APPROVED.value:
+            raise _approval_conflict()
+
+    async def dispose(self) -> None:
+        """释放本用例独占的会话工厂；共享组合根可省略该回调。"""
+        if self._dispose is not None:
+            await self._dispose()
+
+    def _new_claim_error(
+        self,
+        snapshot: TrustedActionExecutionSnapshot,
+        *,
+        now: datetime,
+    ) -> StateConflictError | None:
+        """返回首次 claim 的稳定失败，不读取或返回任何命令内容。"""
+        if not snapshot.user_is_active:
+            return _trusted_action_unavailable()
+        if snapshot.approval_version <= 0 or snapshot.approved_execution_deadline_at is None:
+            return _approval_conflict()
+        deadline = _utc_now(snapshot.approved_execution_deadline_at)
+        if deadline <= now:
+            return StateConflictError(
+                error_code="approval_execution_deadline_expired",
+                message="approved trusted action execution deadline expired",
+            )
+        if not self._write_policy.provider_writes_enabled(snapshot.provider):
+            return StateConflictError(
+                error_code="external_writes_disabled",
+                message="external writes are disabled",
+            )
+        capability_error = _execution_capability_error(snapshot)
+        if capability_error is not None:
+            return capability_error
+        try:
+            provider_identity_key = canonical_provider_identity_key(
+                snapshot.provider,
+                snapshot.provider_tenant_id,
+                snapshot.provider_account_id,
+            )
+        except ValueError:
+            return _external_write_account_not_allowed()
+        if not self._write_policy.write_account_allowed(provider_identity_key):
+            return _external_write_account_not_allowed()
+        return None
+
+    async def _persist_integrity_failure(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        failed_at: datetime,
+        lease_owner: str,
+    ) -> None:
+        """用新事务提交零 provider 调用的认证失败终态。"""
+        async with self._transactions() as transaction:
+            await transaction.fail_claimed_integrity(
+                snapshot=snapshot,
+                failed_at=failed_at,
+                lease_owner=lease_owner,
+            )
 
 
 class SubmitMailDraftUseCase:
@@ -302,6 +681,156 @@ class SubmitCalendarProposalUseCase:
             )
             await transaction.create_submission(submission)
         return _result(submission)
+
+
+def _validated_dispatch_command(
+    payload: Mapping[str, object],
+    *,
+    snapshot: TrustedActionDispatchSnapshot,
+    expected_payload_hash: str,
+) -> TrustedCommand:
+    """重新解析解密命令，并同时绑定审批、Graph、操作、连接及本地版本。"""
+    command = parse_trusted_command(payload)
+    canonical_hash = trusted_command_hash(payload)
+    if (
+        not _payload_hashes_match(canonical_hash, snapshot.payload_hash)
+        or not _payload_hashes_match(canonical_hash, expected_payload_hash)
+        or command.operation_id != snapshot.operation_id
+        or command.connection_id != snapshot.connection_id
+        or command.action != snapshot.action
+        or command.schema_version != snapshot.schema_version
+    ):
+        raise _TrustedActionIntegrityError
+    if snapshot.proposal_kind == "mail_draft":
+        if (
+            command.action != "mail.send"
+            or getattr(command, "draft_id", None) != snapshot.proposal_id
+            or getattr(command, "draft_version", None) != snapshot.proposal_version
+        ):
+            raise _TrustedActionIntegrityError
+    elif snapshot.proposal_kind == "calendar_proposal":
+        if command.action not in {
+            "calendar.create",
+            "calendar.update",
+            "calendar.restore",
+        }:
+            raise _TrustedActionIntegrityError
+    else:
+        raise _TrustedActionIntegrityError
+    return command
+
+
+def _validate_existing_claim(
+    snapshot: TrustedActionExecutionSnapshot,
+    *,
+    lease_owner: str,
+    now: datetime,
+) -> None:
+    """验证既有 ToolExecution 的恢复资格，但不重新套用首次审批截止。"""
+    execution = snapshot.execution
+    if execution is None:
+        raise _trusted_action_unavailable()
+    if (
+        execution.task_id != snapshot.task_id
+        or execution.approval_id != snapshot.approval_id
+        or execution.operation_id != snapshot.operation_id
+        or execution.provider != snapshot.provider
+    ):
+        raise _trusted_action_unavailable()
+    if execution.status in {
+        ToolExecutionStatus.SUCCEEDED,
+        ToolExecutionStatus.CONFIRMED_FAILED,
+        ToolExecutionStatus.NEEDS_ATTENTION,
+    }:
+        return
+    if not snapshot.user_is_active or not _current_task_lease(
+        snapshot,
+        lease_owner=lease_owner,
+        now=now,
+    ):
+        raise _trusted_action_unavailable()
+
+
+def _current_task_lease(
+    snapshot: TrustedActionExecutionSnapshot,
+    *,
+    lease_owner: str,
+    now: datetime,
+) -> bool:
+    """要求当前调用者仍持有严格晚于本次判断时刻的 RUNNING 租约。"""
+    expires_at = snapshot.task_lease_expires_at
+    return (
+        snapshot.task_status is TaskStatus.RUNNING
+        and snapshot.task_lease_owner == lease_owner
+        and expires_at is not None
+        and _utc_now(expires_at) > now
+    )
+
+
+def _execution_capability_error(
+    snapshot: TrustedActionExecutionSnapshot,
+) -> StateConflictError | None:
+    """把 claim 时的新鲜连接/能力事实映射为稳定、无内容失败。"""
+    if snapshot.write_capability_error_code == "connection_scope_missing" or (
+        snapshot.write_capability_status
+        in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
+    ):
+        return StateConflictError(
+            error_code="connection_scope_missing",
+            message="provider write capability requires reauthorization",
+        )
+    if (
+        snapshot.connection_status != "connected"
+        or snapshot.read_capability_status is not CapabilityStatus.ENABLED
+        or snapshot.write_capability_status is not CapabilityStatus.ENABLED
+        or (snapshot.action.startswith("calendar.") and snapshot.calendar_can_write is not True)
+    ):
+        return _connection_capability_disabled()
+    return None
+
+
+def _tool_idempotency_key(snapshot: TrustedActionExecutionSnapshot) -> str:
+    """生成计划冻结的精确 action/task/approval/version/operation 幂等键。"""
+    return ":".join(
+        (
+            snapshot.action,
+            str(snapshot.task_id),
+            str(snapshot.approval_id),
+            str(snapshot.approval_version),
+            str(snapshot.operation_id),
+        )
+    )
+
+
+def _validate_lease_owner(value: str) -> None:
+    """拒绝空白或换行 owner，且不把它写入 Graph checkpoint。"""
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or "\r" in value
+        or "\n" in value
+        or len(value) > 255
+    ):
+        raise _trusted_action_unavailable()
+
+
+def _canonical_payload_hash(value: object) -> bool:
+    """判断值是否为 canonical lowercase SHA-256，供 compare_digest 前收窄。"""
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _payload_hashes_match(left: object, right: object) -> bool:
+    """只对两个规范 ASCII 哈希执行常量时间比较，异常形状直接 fail closed。"""
+    return (
+        _canonical_payload_hash(left)
+        and _canonical_payload_hash(right)
+        and compare_digest(cast(str, left), cast(str, right))
+    )
 
 
 def _mail_command_payload(
@@ -586,8 +1115,34 @@ def _provider_action_unavailable() -> StateConflictError:
     )
 
 
+def _trusted_action_unavailable() -> StateConflictError:
+    """构造不泄露审批存在性、命令内容或持久篡改维度的失败。"""
+    return StateConflictError(
+        error_code="trusted_action_unavailable",
+        message="trusted action is unavailable",
+    )
+
+
+def _approval_conflict() -> StateConflictError:
+    """构造审批决定或版本不再允许当前 Graph 分支的稳定冲突。"""
+    return StateConflictError(
+        error_code="approval_conflict",
+        message="approval is unavailable",
+    )
+
+
+def _external_write_account_not_allowed() -> StateConflictError:
+    """构造非生产规范账户身份未通过 allowlist 的稳定失败。"""
+    return StateConflictError(
+        error_code="external_write_account_not_allowed",
+        message="external write account is not allowed",
+    )
+
+
 __all__ = [
     "CalendarProposalSubmissionNotFoundError",
     "SubmitCalendarProposalUseCase",
     "SubmitMailDraftUseCase",
+    "TrustedActionExecutionUseCase",
+    "TrustedActionGraphFacts",
 ]

@@ -15,7 +15,12 @@ from uuid import UUID
 
 from ai_employee.application.commands import TrustedCommand
 from ai_employee.application.ports.encryption import EncryptedValue
-from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
+from ai_employee.domain.actions import (
+    CalendarProposalStatus,
+    MailDraftStatus,
+    ProviderWriteOutcomeKind,
+    ToolExecutionStatus,
+)
 from ai_employee.domain.calendar_actions import NotificationPolicy
 from ai_employee.domain.connections import CapabilityStatus
 from ai_employee.domain.mail_actions import MailMode, ReplyThreadHeaders
@@ -51,6 +56,97 @@ class TrustedActionPreflight(Protocol):
         """只验证表达能力，不访问网络、不创建供应商草稿或任何写入。"""
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderWriteOutcome:
+    """供应商写入或只读核对返回的内容无关规范结果。
+
+    ``retry_after_seconds`` 只允许出现在供应商明确证明未应用、且该失败允许安全重试
+    的结果上。unknown、永久拒绝和成功结果必须保持为空，避免应用层从模糊失败中
+    推导再次写入权限。
+    """
+
+    kind: ProviderWriteOutcomeKind
+    retryable: bool
+    retry_after_seconds: int | None
+    provider_resource_id: str | None
+    provider_request_id: str | None
+    correlation_id: str
+    provider_url: str | None
+    error_code: str | None
+
+    def __post_init__(self) -> None:
+        """验证安全重试形状与内容无关标识边界。
+
+        Raises:
+            TypeError: 枚举、布尔或秒数字段类型不正确。
+            ValueError: Retry-After 出现在不安全结果上，或标识含空白/换行。
+        """
+        if type(self.kind) is not ProviderWriteOutcomeKind:
+            raise TypeError("kind must be ProviderWriteOutcomeKind")
+        if type(self.retryable) is not bool:
+            raise TypeError("retryable must be bool")
+        if self.retry_after_seconds is not None:
+            if type(self.retry_after_seconds) is not int:
+                raise TypeError("retry_after_seconds must be int or None")
+            if self.retry_after_seconds < 0:
+                raise ValueError("retry_after_seconds must be non-negative")
+            if (
+                self.kind is not ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+                or not self.retryable
+            ):
+                raise ValueError("retry_after_seconds requires retryable confirmed_not_applied")
+        if self.retryable and self.kind is not ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED:
+            raise ValueError("retryable requires confirmed_not_applied")
+        for field_name, value, maximum in (
+            ("provider_resource_id", self.provider_resource_id, 512),
+            ("provider_request_id", self.provider_request_id, 255),
+            ("correlation_id", self.correlation_id, 255),
+            ("error_code", self.error_code, 100),
+        ):
+            if value is None and field_name != "correlation_id":
+                continue
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+                or "\r" in value
+                or "\n" in value
+                or len(value) > maximum
+            ):
+                raise ValueError(f"{field_name} is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReference:
+    """传给只读核对 adapter 的最小持久 ToolExecution 事实。"""
+
+    execution_id: UUID
+    task_id: UUID
+    approval_id: UUID
+    operation_id: UUID
+    provider: str
+    status: ToolExecutionStatus
+    request_started_at: datetime | None
+    write_attempt_count: int
+    provider_resource_id: str | None
+    provider_request_id: str | None
+    correlation_id: str | None
+
+
+class TrustedActionAdapter(TrustedActionPreflight, Protocol):
+    """固定 provider 的类型化真实写入与只读核对端口。"""
+
+    async def execute(self, command: TrustedCommand) -> ProviderWriteOutcome:
+        """执行一条已经过精确审批与持久 request-start 的命令。"""
+
+    async def reconcile(
+        self,
+        command: TrustedCommand,
+        execution: ExecutionReference,
+    ) -> ProviderWriteOutcome:
+        """只读核对一个可能已发送的精确 ToolExecution，绝不重放写请求。"""
+
+
 class TrustedActionPreflightRegistry(Protocol):
     """按精确 provider/action 返回固定 preflight 的注册表端口。"""
 
@@ -61,6 +157,18 @@ class TrustedActionPreflightRegistry(Protocol):
         action: str,
     ) -> TrustedActionPreflight:
         """返回进程启动时已固定组装的精确动作适配器。"""
+
+
+class TrustedActionAdapterRegistry(TrustedActionPreflightRegistry, Protocol):
+    """按固定 provider/action 返回真实写入 adapter 的窄注册表。"""
+
+    def trusted_action_adapter(
+        self,
+        *,
+        provider: str,
+        action: str,
+    ) -> TrustedActionAdapter:
+        """返回启动时冻结的精确 adapter，未知组合一律拒绝。"""
 
 
 class TrustedActionWritePolicy(Protocol):
@@ -198,6 +306,59 @@ class TrustedActionSubmissionResult:
     status: TaskStatus
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedActionExecutionSnapshot:
+    """claim 事务锁定后返回的审批、连接、能力与既有执行事实。"""
+
+    user_id: UUID
+    user_is_active: bool
+    task_id: UUID
+    task_status: TaskStatus
+    task_lease_owner: str | None
+    task_lease_expires_at: datetime | None
+    step_id: UUID
+    approval_id: UUID
+    approval_version: int
+    approval_status: str
+    approved_execution_deadline_at: datetime | None
+    action: str
+    schema_version: str
+    payload_hash: str
+    proposal_kind: str
+    proposal_id: UUID
+    proposal_version: int
+    operation_id: UUID
+    connection_id: UUID
+    provider: str
+    provider_tenant_id: str
+    provider_account_id: str
+    connection_status: str
+    read_capability_status: CapabilityStatus
+    write_capability_status: CapabilityStatus
+    write_capability_error_code: str | None
+    calendar_can_write: bool | None
+    execution: ExecutionReference | None
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedActionDispatchSnapshot:
+    """claim 提交后选择 execute、reconcile 或终态复用所需的最小事实。"""
+
+    user_id: UUID
+    task_id: UUID
+    approval_id: UUID
+    operation_id: UUID
+    connection_id: UUID
+    action: str
+    schema_version: str
+    payload_hash: str
+    proposal_kind: str
+    proposal_id: UUID
+    proposal_version: int
+    provider: str
+    execution: ExecutionReference
+
+
 class TrustedActionSubmissionTransaction(Protocol):
     """协调一次提交所需的短事务端口。"""
 
@@ -238,6 +399,100 @@ class TrustedActionSubmissionTransaction(Protocol):
     async def create_submission(self, submission: TrustedActionSubmission) -> None:
         """原子创建全部持久事实并把本地对象推进到 awaiting_approval。"""
 
+    async def load_graph_facts(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> tuple[str, str | None] | None:
+        """读取 identifier-only Graph 所需的冻结哈希与审批决定。"""
+
+    async def lock_execution(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> TrustedActionExecutionSnapshot | None:
+        """按 Task→Approval→ToolExecution 顺序锁定首次 claim 的全部事实。"""
+
+    async def fail_unclaimed_action(
+        self,
+        *,
+        snapshot: TrustedActionExecutionSnapshot,
+        error_code: str,
+        failed_at: datetime,
+    ) -> None:
+        """在没有 ToolExecution 时失效审批、失败任务并恢复本地编辑态。"""
+
+    async def create_tool_claim(
+        self,
+        *,
+        snapshot: TrustedActionExecutionSnapshot,
+        execution_id: UUID,
+        idempotency_key: str,
+        claimed_at: datetime,
+    ) -> None:
+        """原子插入唯一 ToolExecution、推进本地状态并追加 audit/outbox。"""
+
+    async def load_dispatch(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> TrustedActionDispatchSnapshot | None:
+        """读取已认领执行和加密命令绑定，不在此方法内解密。"""
+
+    async def load_command(
+        self,
+        *,
+        user_id: UUID,
+        approval_id: UUID,
+    ) -> dict[str, object] | None:
+        """认证解密并重新规范化一条精确审批命令。"""
+
+    async def mark_request_started(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+        started_at: datetime,
+    ) -> bool:
+        """独立提交 request-start 与唯一一次写尝试计数；并发 loser 返回 False。"""
+
+    async def persist_provider_outcome(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        outcome: ProviderWriteOutcome,
+        completed_at: datetime,
+        from_reconciliation: bool,
+        lease_owner: str,
+    ) -> None:
+        """原子保存内容无关结果、任务及本地对象状态。"""
+
+    async def fail_claimed_integrity(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        failed_at: datetime,
+        lease_owner: str,
+    ) -> None:
+        """在 provider request 前把 AEAD/哈希失败收敛为零调用安全终态。"""
+
+    async def finalize_rejected(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        lease_owner: str,
+        finished_at: datetime,
+    ) -> None:
+        """把持久拒绝决定完成为无外部副作用的成功任务。"""
+
 
 class TrustedActionSubmissionTransactionFactory(Protocol):
     """为每次提交创建自动提交或回滚的短事务。"""
@@ -250,9 +505,15 @@ __all__ = [
     "ApprovalPreflightResult",
     "ApprovalWarningCode",
     "CalendarProposalSubmissionSnapshot",
+    "ExecutionReference",
     "ExistingTrustedActionSubmission",
     "MailDraftSubmissionSnapshot",
+    "ProviderWriteOutcome",
+    "TrustedActionAdapter",
+    "TrustedActionAdapterRegistry",
     "TrustedActionCommandCipher",
+    "TrustedActionDispatchSnapshot",
+    "TrustedActionExecutionSnapshot",
     "TrustedActionPreflight",
     "TrustedActionPreflightRegistry",
     "TrustedActionRisk",

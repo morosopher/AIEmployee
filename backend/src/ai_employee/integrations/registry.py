@@ -13,7 +13,10 @@ from ai_employee.application.ports.calendar import (
     CalendarSyncPage,
 )
 from ai_employee.application.ports.mail import MailReader, MailScope, MailSyncPage
-from ai_employee.application.ports.trusted_actions import TrustedActionPreflight
+from ai_employee.application.ports.trusted_actions import (
+    TrustedActionAdapter,
+    TrustedActionPreflight,
+)
 from ai_employee.domain.errors import (
     InternalInvariantError,
     PermanentProviderError,
@@ -157,7 +160,12 @@ class _GoogleCalendarCompatibilityAdapter:
 class ProviderAdapterRegistry:
     """保存固定 Google/Microsoft 读适配器与可信动作预检，不提供动态注册。"""
 
-    __slots__ = ("_calendar_readers", "_mail_readers", "_trusted_action_preflights")
+    __slots__ = (
+        "_calendar_readers",
+        "_mail_readers",
+        "_trusted_action_adapters",
+        "_trusted_action_preflights",
+    )
 
     def __init__(
         self,
@@ -172,8 +180,16 @@ class ProviderAdapterRegistry:
         google_calendar_preflight: TrustedActionPreflight | None = None,
         microsoft_mail_preflight: TrustedActionPreflight | None = None,
         microsoft_calendar_preflight: TrustedActionPreflight | None = None,
+        google_mail_action: TrustedActionAdapter | None = None,
+        google_calendar_action: TrustedActionAdapter | None = None,
+        microsoft_mail_action: TrustedActionAdapter | None = None,
+        microsoft_calendar_action: TrustedActionAdapter | None = None,
     ) -> None:
-        """以显式固定 slot 冻结读适配器与四类写动作预检。"""
+        """以显式固定 slot 冻结读适配器、预检与四类真实动作 adapter。
+
+        ``*_action`` 同时实现无副作用 preflight；显式 ``*_preflight`` 仅保留 Task 18
+        审批提交兼容性，不能因具有相似方法名而自动获得真实写权限。
+        """
         self._mail_readers = MappingProxyType(
             {
                 "google": (
@@ -196,14 +212,29 @@ class ProviderAdapterRegistry:
         )
         self._trusted_action_preflights = MappingProxyType(
             {
-                ("google", "mail.send"): google_mail_preflight,
-                ("google", "calendar.create"): google_calendar_preflight,
-                ("google", "calendar.update"): google_calendar_preflight,
-                ("google", "calendar.restore"): google_calendar_preflight,
-                ("microsoft", "mail.send"): microsoft_mail_preflight,
-                ("microsoft", "calendar.create"): microsoft_calendar_preflight,
-                ("microsoft", "calendar.update"): microsoft_calendar_preflight,
-                ("microsoft", "calendar.restore"): microsoft_calendar_preflight,
+                ("google", "mail.send"): google_mail_action or google_mail_preflight,
+                ("google", "calendar.create"): google_calendar_action or google_calendar_preflight,
+                ("google", "calendar.update"): google_calendar_action or google_calendar_preflight,
+                ("google", "calendar.restore"): google_calendar_action or google_calendar_preflight,
+                ("microsoft", "mail.send"): microsoft_mail_action or microsoft_mail_preflight,
+                ("microsoft", "calendar.create"): microsoft_calendar_action
+                or microsoft_calendar_preflight,
+                ("microsoft", "calendar.update"): microsoft_calendar_action
+                or microsoft_calendar_preflight,
+                ("microsoft", "calendar.restore"): microsoft_calendar_action
+                or microsoft_calendar_preflight,
+            }
+        )
+        self._trusted_action_adapters = MappingProxyType(
+            {
+                ("google", "mail.send"): google_mail_action,
+                ("google", "calendar.create"): google_calendar_action,
+                ("google", "calendar.update"): google_calendar_action,
+                ("google", "calendar.restore"): google_calendar_action,
+                ("microsoft", "mail.send"): microsoft_mail_action,
+                ("microsoft", "calendar.create"): microsoft_calendar_action,
+                ("microsoft", "calendar.update"): microsoft_calendar_action,
+                ("microsoft", "calendar.restore"): microsoft_calendar_action,
             }
         )
 
@@ -247,6 +278,21 @@ class ProviderAdapterRegistry:
                 message="provider action is unavailable",
             )
         return preflight
+
+    def trusted_action_adapter(
+        self,
+        *,
+        provider: str,
+        action: str,
+    ) -> TrustedActionAdapter:
+        """返回固定真实动作 adapter，未知、动态或 provider 错配均 fail closed。"""
+        adapter = self._trusted_action_adapters.get((provider, action))
+        if adapter is None or adapter.provider != provider:
+            raise StateConflictError(
+                error_code="provider_action_unavailable",
+                message="provider action is unavailable",
+            )
+        return adapter
 
 
 __all__ = [

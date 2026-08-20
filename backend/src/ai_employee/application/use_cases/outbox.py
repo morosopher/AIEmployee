@@ -43,6 +43,11 @@ class OutboxTopic(StrEnum):
     APPROVAL_INVALIDATED = "approval.invalidated"
     APPROVAL_EXPIRED = "approval.expired"
     TASK_CANCELLED = "task.cancelled"
+    TOOL_CLAIMED = "tool.claimed"
+    TOOL_SUCCEEDED = "tool.succeeded"
+    TOOL_RETRYABLE_FAILED = "tool.retryable_failed"
+    TOOL_CONFIRMED_FAILED = "tool.confirmed_failed"
+    TOOL_RECONCILING = "tool.reconciling"
 
 
 @dataclass(frozen=True, slots=True)

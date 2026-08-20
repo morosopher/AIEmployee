@@ -3,6 +3,7 @@
 import json
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime
 from hashlib import sha256
 from hmac import compare_digest
 from typing import cast
@@ -15,12 +16,21 @@ from ai_employee.application.commands import canonical_command_json, trusted_com
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.ports.trusted_actions import (
     CalendarProposalSubmissionSnapshot,
+    ExecutionReference,
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
+    ProviderWriteOutcome,
+    TrustedActionDispatchSnapshot,
+    TrustedActionExecutionSnapshot,
     TrustedActionSubmission,
 )
 from ai_employee.application.use_cases.calendar_proposals import CalendarProposalContent
-from ai_employee.domain.actions import CalendarProposalStatus, MailDraftStatus
+from ai_employee.domain.actions import (
+    CalendarProposalStatus,
+    MailDraftStatus,
+    ProviderWriteOutcomeKind,
+    ToolExecutionStatus,
+)
 from ai_employee.domain.connections import (
     CapabilityStatus,
     ConnectionCapability,
@@ -38,6 +48,7 @@ from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeProposalModel,
     MailDraftModel,
 )
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     ConnectionCapabilityModel,
@@ -52,6 +63,7 @@ from ai_employee.infrastructure.db.models.tasks import (
     OutboxEventModel,
     TaskRunModel,
     TaskStepModel,
+    ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
@@ -467,6 +479,770 @@ class SqlAlchemyTrustedActionRepository:
         )
         await self._session.flush()
 
+    async def load_graph_facts(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> tuple[str, str | None] | None:
+        """读取 Graph 可持久化的哈希与审批决定，不解密真实命令。"""
+        row = (
+            await self._session.execute(
+                select(TaskRunModel, ApprovalRequestModel)
+                .join(
+                    ApprovalRequestModel,
+                    ApprovalRequestModel.task_id == TaskRunModel.id,
+                )
+                .where(
+                    TaskRunModel.id == task_id,
+                    TaskRunModel.kind == "trusted_action",
+                    ApprovalRequestModel.id == approval_id,
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        task, approval = row
+        if not _task_operation_matches(task, operation_id):
+            return None
+        decision = (
+            approval.status
+            if approval.status
+            in {
+                ApprovalStatus.APPROVED.value,
+                ApprovalStatus.REJECTED.value,
+                ApprovalStatus.INVALIDATED.value,
+                ApprovalStatus.EXPIRED.value,
+            }
+            else None
+        )
+        return approval.payload_hash, decision
+
+    async def lock_execution(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> TrustedActionExecutionSnapshot | None:
+        """按冻结锁序读取首次 claim 的全部授权事实。
+
+        锁序固定为 TaskRun → ApprovalRequest → ToolExecution → 本地动作；连接、用户、能力
+        与目录随后在同一事务读取。这样保留/隐私清理、审批失效和并发 Worker 不会形成
+        反向等待，也不会让先前无锁投影成为授权依据。
+        """
+        task = await self._session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if (
+            task is None
+            or task.kind != "trusted_action"
+            or not _task_operation_matches(task, operation_id)
+        ):
+            return None
+        approval = await self._session.scalar(
+            select(ApprovalRequestModel)
+            .where(
+                ApprovalRequestModel.id == approval_id,
+                ApprovalRequestModel.task_id == task.id,
+            )
+            .with_for_update()
+        )
+        if approval is None:
+            return None
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(
+                ToolExecutionModel.task_id == task.id,
+                ToolExecutionModel.operation_id == operation_id,
+            )
+            .with_for_update()
+        )
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        if binding is None:
+            return None
+        connection_id, calendar_id = binding
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+        )
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel).where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == task.user_id,
+            )
+        )
+        if user is None or connection is None or approval.schema_version is None:
+            return None
+        capabilities = await self._capabilities(user_id=task.user_id, connection_id=connection_id)
+        if approval.action == "mail.send":
+            read_capability = ConnectionCapability.MAIL_READ
+            write_capability = ConnectionCapability.MAIL_SEND
+        elif approval.action in {
+            "calendar.create",
+            "calendar.update",
+            "calendar.restore",
+        }:
+            read_capability = ConnectionCapability.CALENDAR_READ
+            write_capability = ConnectionCapability.CALENDAR_WRITE
+        else:
+            return None
+        calendar_can_write: bool | None = None
+        if calendar_id is not None:
+            calendar_can_write = bool(
+                await self._session.scalar(
+                    select(ProviderCalendarModel.can_write).where(
+                        ProviderCalendarModel.user_id == task.user_id,
+                        ProviderCalendarModel.connection_id == connection_id,
+                        ProviderCalendarModel.provider_calendar_id == calendar_id,
+                    )
+                )
+            )
+        try:
+            task_status = TaskStatus(task.status)
+            parsed_execution = (
+                _execution_reference(execution=execution, approval_id=approval.id)
+                if execution is not None
+                else None
+            )
+        except ValueError:
+            return None
+        return TrustedActionExecutionSnapshot(
+            user_id=task.user_id,
+            user_is_active=user.is_active,
+            task_id=task.id,
+            task_status=task_status,
+            task_lease_owner=task.lease_owner,
+            task_lease_expires_at=task.lease_expires_at,
+            step_id=approval.step_id,
+            approval_id=approval.id,
+            approval_version=approval.version,
+            approval_status=approval.status,
+            approved_execution_deadline_at=approval.approved_execution_deadline_at,
+            action=approval.action,
+            schema_version=approval.schema_version,
+            payload_hash=approval.payload_hash,
+            proposal_kind=approval.proposal_kind or "",
+            proposal_id=approval.proposal_id or UUID(int=0),
+            proposal_version=approval.proposal_version or 0,
+            operation_id=operation_id,
+            connection_id=connection_id,
+            provider=connection.provider,
+            provider_tenant_id=connection.provider_tenant_id,
+            provider_account_id=connection.provider_account_id,
+            connection_status=connection.status,
+            read_capability_status=capabilities.get(
+                read_capability,
+                (CapabilityStatus.DISABLED, None),
+            )[0],
+            write_capability_status=capabilities.get(
+                write_capability,
+                (CapabilityStatus.DISABLED, None),
+            )[0],
+            write_capability_error_code=capabilities.get(
+                write_capability,
+                (CapabilityStatus.DISABLED, None),
+            )[1],
+            calendar_can_write=calendar_can_write,
+            execution=parsed_execution,
+        )
+
+    async def fail_unclaimed_action(
+        self,
+        *,
+        snapshot: TrustedActionExecutionSnapshot,
+        error_code: str,
+        failed_at: datetime,
+    ) -> None:
+        """无 ToolExecution 时原子失效审批、失败任务并恢复本地编辑态。"""
+        task, approval = await self._locked_task_approval(
+            task_id=snapshot.task_id,
+            approval_id=snapshot.approval_id,
+        )
+        if task is None or approval is None:
+            raise _trusted_action_unavailable()
+        existing = await self._session.scalar(
+            select(ToolExecutionModel).where(
+                ToolExecutionModel.task_id == task.id,
+                ToolExecutionModel.operation_id == snapshot.operation_id,
+            )
+        )
+        if existing is not None:
+            raise _trusted_action_unavailable()
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.FAILED.value
+        task.error_code = error_code
+        task.finished_at = failed_at
+        _clear_task_scheduling(task)
+        await self._set_local_action_status(
+            task=task,
+            approval=approval,
+            mail_status=MailDraftStatus.EDITING,
+            calendar_status=CalendarProposalStatus.EDITING,
+            allowed_current={
+                MailDraftStatus.AWAITING_APPROVAL.value,
+                CalendarProposalStatus.AWAITING_APPROVAL.value,
+            },
+        )
+        audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="approval.invalidated",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": error_code},
+        )
+        self._session.add(audit)
+        await self._session.flush()
+        self._session.add(
+            OutboxEventModel(
+                topic="approval.invalidated",
+                aggregate_id=task.id,
+                deduplication_key=f"approval.invalidated:{approval.id}:{approval.version}",
+                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                available_at=failed_at,
+            )
+        )
+
+    async def create_tool_claim(
+        self,
+        *,
+        snapshot: TrustedActionExecutionSnapshot,
+        execution_id: UUID,
+        idempotency_key: str,
+        claimed_at: datetime,
+    ) -> None:
+        """在当前锁事务插入唯一 claim，并写入本地 executing、审计和 Outbox。"""
+        if snapshot.execution is not None:
+            return
+        existing = await self._session.scalar(
+            select(ToolExecutionModel).where(
+                ToolExecutionModel.task_id == snapshot.task_id,
+                ToolExecutionModel.operation_id == snapshot.operation_id,
+            )
+        )
+        if existing is not None:
+            return
+        execution = ToolExecutionModel(
+            id=execution_id,
+            task_id=snapshot.task_id,
+            step_id=snapshot.step_id,
+            tool_name=snapshot.action,
+            idempotency_key=idempotency_key,
+            operation_id=snapshot.operation_id,
+            request_payload_hash=snapshot.payload_hash,
+            provider=snapshot.provider,
+            status=ToolExecutionStatus.CLAIMED.value,
+            claimed_at=claimed_at,
+            write_attempt_count=0,
+            reconciliation_attempt_count=0,
+        )
+        self._session.add(execution)
+        task = await self._session.get(TaskRunModel, snapshot.task_id)
+        approval = await self._session.get(ApprovalRequestModel, snapshot.approval_id)
+        if task is None or approval is None:
+            raise _trusted_action_unavailable()
+        await self._set_local_action_status(
+            task=task,
+            approval=approval,
+            mail_status=MailDraftStatus.EXECUTING,
+            calendar_status=CalendarProposalStatus.EXECUTING,
+            allowed_current={
+                MailDraftStatus.AWAITING_APPROVAL.value,
+                CalendarProposalStatus.AWAITING_APPROVAL.value,
+            },
+        )
+        audit = AuditEventModel(
+            user_id=snapshot.user_id,
+            task_id=snapshot.task_id,
+            event_type="tool.claimed",
+            actor_type="worker",
+            actor_id=None,
+            event_metadata={
+                "action": snapshot.action,
+                "provider": snapshot.provider,
+                "approval_version": snapshot.approval_version,
+            },
+        )
+        self._session.add(audit)
+        await self._session.flush()
+        self._session.add(
+            OutboxEventModel(
+                topic="tool.claimed",
+                aggregate_id=snapshot.task_id,
+                deduplication_key=f"tool.claimed:{execution_id}",
+                payload={"task_id": str(snapshot.task_id), "audit_event_id": audit.id},
+                available_at=claimed_at,
+            )
+        )
+
+    async def load_dispatch(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+    ) -> TrustedActionDispatchSnapshot | None:
+        """读取 claim 后 dispatch 所需最小绑定；完整命令仍保持加密。"""
+        task = await self._session.get(TaskRunModel, task_id)
+        approval = await self._session.scalar(
+            select(ApprovalRequestModel).where(
+                ApprovalRequestModel.id == approval_id,
+                ApprovalRequestModel.task_id == task_id,
+            )
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel).where(
+                ToolExecutionModel.task_id == task_id,
+                ToolExecutionModel.operation_id == operation_id,
+            )
+        )
+        if (
+            task is None
+            or approval is None
+            or execution is None
+            or approval.schema_version is None
+            or approval.proposal_id is None
+            or approval.proposal_version is None
+            or not _task_operation_matches(task, operation_id)
+        ):
+            return None
+        connection_id = await self._action_connection_id(task=task, approval=approval)
+        if connection_id is None:
+            return None
+        try:
+            reference = _execution_reference(execution=execution, approval_id=approval.id)
+        except ValueError:
+            return None
+        return TrustedActionDispatchSnapshot(
+            user_id=task.user_id,
+            task_id=task.id,
+            approval_id=approval.id,
+            operation_id=operation_id,
+            connection_id=connection_id,
+            action=approval.action,
+            schema_version=approval.schema_version,
+            payload_hash=approval.payload_hash,
+            proposal_kind=approval.proposal_kind or "",
+            proposal_id=approval.proposal_id,
+            proposal_version=approval.proposal_version,
+            provider=execution.provider or "",
+            execution=reference,
+        )
+
+    async def mark_request_started(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+        started_at: datetime,
+    ) -> bool:
+        """以 ToolExecution 行锁提交唯一 request-start 与写尝试计数。"""
+        task = await self._session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == snapshot.task_id).with_for_update()
+        )
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == snapshot.user_id).with_for_update()
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(ToolExecutionModel.id == snapshot.execution.execution_id)
+            .with_for_update()
+        )
+        if (
+            task is None
+            or user is None
+            or not user.is_active
+            or task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= started_at
+            or execution is None
+        ):
+            return False
+        status = ToolExecutionStatus(execution.status)
+        if status is ToolExecutionStatus.CLAIMED:
+            if execution.request_started_at is not None:
+                return False
+        elif status is not ToolExecutionStatus.RETRYABLE_FAILED:
+            return False
+        if execution.request_started_at is None:
+            execution.request_started_at = started_at
+        execution.write_attempt_count += 1
+        execution.status = ToolExecutionStatus.EXECUTING.value
+        await self._session.flush()
+        return True
+
+    async def persist_provider_outcome(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        outcome: ProviderWriteOutcome,
+        completed_at: datetime,
+        from_reconciliation: bool,
+        lease_owner: str,
+    ) -> None:
+        """把 adapter 规范结果与任务/本地状态在同一事务收敛。"""
+        task, approval = await self._locked_task_approval(
+            task_id=snapshot.task_id,
+            approval_id=snapshot.approval_id,
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(ToolExecutionModel.id == snapshot.execution.execution_id)
+            .with_for_update()
+        )
+        if task is None or approval is None or execution is None:
+            raise _trusted_action_unavailable()
+        status = ToolExecutionStatus(execution.status)
+        if status in {
+            ToolExecutionStatus.SUCCEEDED,
+            ToolExecutionStatus.CONFIRMED_FAILED,
+        }:
+            return
+        allowed = (
+            {
+                ToolExecutionStatus.EXECUTING,
+                ToolExecutionStatus.RECONCILING,
+                ToolExecutionStatus.CLAIMED,
+            }
+            if from_reconciliation
+            else {ToolExecutionStatus.EXECUTING}
+        )
+        if (
+            status not in allowed
+            or task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+        ):
+            raise _trusted_action_unavailable()
+        execution.provider_resource_id = outcome.provider_resource_id
+        execution.provider_request_id = outcome.provider_request_id
+        execution.correlation_id = outcome.correlation_id
+        execution.error_code = outcome.error_code
+        execution.result_summary = _outcome_summary(outcome)
+        event_type: str
+        outbox_topic: str
+        if outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED:
+            execution.status = ToolExecutionStatus.SUCCEEDED.value
+            execution.completed_at = completed_at
+            task.status = TaskStatus.SUCCEEDED.value
+            task.error_code = None
+            task.finished_at = completed_at
+            _clear_task_scheduling(task)
+            await self._set_local_action_status(
+                task=task,
+                approval=approval,
+                mail_status=MailDraftStatus.SENT,
+                calendar_status=CalendarProposalStatus.APPLIED,
+                allowed_current={
+                    MailDraftStatus.EXECUTING.value,
+                    CalendarProposalStatus.EXECUTING.value,
+                    MailDraftStatus.NEEDS_ATTENTION.value,
+                    CalendarProposalStatus.NEEDS_ATTENTION.value,
+                },
+            )
+            # provider 结果事务会先于 DurableTaskRunner 的通用 finish 清除租约；因此任务
+            # 终态审计必须和 ToolExecution、本地对象及 TaskRun 在这里原子提交，不能依赖
+            # 随后的 owner CAS 补写，否则 ACK 正常返回时也会缺失 task.succeeded 时间线事实。
+            self._session.add(
+                AuditEventModel(
+                    user_id=task.user_id,
+                    task_id=task.id,
+                    event_type="task.succeeded",
+                    actor_type="worker",
+                    actor_id=lease_owner,
+                    event_metadata={"reason": "trusted_action_confirmed_applied"},
+                )
+            )
+            event_type = outbox_topic = "tool.succeeded"
+        elif outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED and outcome.retryable:
+            execution.status = ToolExecutionStatus.RETRYABLE_FAILED.value
+            event_type = outbox_topic = "tool.retryable_failed"
+        elif outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED:
+            execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+            execution.completed_at = completed_at
+            task.status = TaskStatus.FAILED.value
+            task.error_code = outcome.error_code or "provider_write_confirmed_not_applied"
+            task.finished_at = completed_at
+            _clear_task_scheduling(task)
+            await self._set_local_action_status(
+                task=task,
+                approval=approval,
+                mail_status=MailDraftStatus.EDITING,
+                calendar_status=CalendarProposalStatus.EDITING,
+                allowed_current={
+                    MailDraftStatus.EXECUTING.value,
+                    CalendarProposalStatus.EXECUTING.value,
+                    MailDraftStatus.NEEDS_ATTENTION.value,
+                    CalendarProposalStatus.NEEDS_ATTENTION.value,
+                },
+            )
+            event_type = outbox_topic = "tool.confirmed_failed"
+        else:
+            execution.status = ToolExecutionStatus.RECONCILING.value
+            task.status = TaskStatus.RECONCILING.value
+            task.error_code = "provider_write_outcome_unknown"
+            task.lease_owner = None
+            task.lease_expires_at = None
+            await self._set_local_action_status(
+                task=task,
+                approval=approval,
+                mail_status=MailDraftStatus.NEEDS_ATTENTION,
+                calendar_status=CalendarProposalStatus.NEEDS_ATTENTION,
+                allowed_current={
+                    MailDraftStatus.EXECUTING.value,
+                    CalendarProposalStatus.EXECUTING.value,
+                    MailDraftStatus.NEEDS_ATTENTION.value,
+                    CalendarProposalStatus.NEEDS_ATTENTION.value,
+                },
+            )
+            event_type = outbox_topic = "tool.reconciling"
+        audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type=event_type,
+            actor_type="worker",
+            actor_id=None,
+            event_metadata={
+                "action": snapshot.action,
+                "provider": snapshot.provider,
+                "outcome": outcome.kind.value,
+                "write_attempt_count": execution.write_attempt_count,
+            },
+        )
+        self._session.add(audit)
+        await self._session.flush()
+        self._session.add(
+            OutboxEventModel(
+                topic=outbox_topic,
+                aggregate_id=task.id,
+                deduplication_key=f"{outbox_topic}:{execution.id}:{execution.write_attempt_count}",
+                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                available_at=completed_at,
+            )
+        )
+
+    async def fail_claimed_integrity(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        failed_at: datetime,
+        lease_owner: str,
+    ) -> None:
+        """在零 provider 调用边界把命令认证失败持久化为明确本地失败。"""
+        task, approval = await self._locked_task_approval(
+            task_id=snapshot.task_id,
+            approval_id=snapshot.approval_id,
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(ToolExecutionModel.id == snapshot.execution.execution_id)
+            .with_for_update()
+        )
+        if task is None or approval is None or execution is None:
+            raise _trusted_action_unavailable()
+        if execution.request_started_at is not None:
+            raise _trusted_action_unavailable()
+        if task.status != TaskStatus.RUNNING.value or task.lease_owner != lease_owner:
+            raise _trusted_action_unavailable()
+        execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+        execution.error_code = "trusted_action_unavailable"
+        execution.completed_at = failed_at
+        execution.result_summary = {
+            "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+            "retryable": False,
+        }
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.FAILED.value
+        task.error_code = "trusted_action_unavailable"
+        task.finished_at = failed_at
+        _clear_task_scheduling(task)
+        await self._set_local_action_status(
+            task=task,
+            approval=approval,
+            mail_status=MailDraftStatus.EDITING,
+            calendar_status=CalendarProposalStatus.EDITING,
+            allowed_current={
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            },
+        )
+        task_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="task.failed",
+            actor_type="worker",
+            actor_id=lease_owner,
+            event_metadata={"error_code": "trusted_action_unavailable"},
+        )
+        tool_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="tool.confirmed_failed",
+            actor_type="worker",
+            actor_id=None,
+            event_metadata={
+                "action": snapshot.action,
+                "provider": snapshot.provider,
+                "outcome": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+                "write_attempt_count": execution.write_attempt_count,
+            },
+        )
+        self._session.add_all((task_audit, tool_audit))
+        await self._session.flush()
+        self._session.add(
+            OutboxEventModel(
+                topic="tool.confirmed_failed",
+                aggregate_id=task.id,
+                deduplication_key=f"tool.confirmed_failed:{execution.id}:integrity",
+                payload={"task_id": str(task.id), "audit_event_id": tool_audit.id},
+                available_at=failed_at,
+            )
+        )
+
+    async def finalize_rejected(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        lease_owner: str,
+        finished_at: datetime,
+    ) -> None:
+        """拒绝分支完成任务但绝不创建 ToolExecution 或改变供应商。"""
+        task, approval = await self._locked_task_approval(
+            task_id=task_id,
+            approval_id=approval_id,
+        )
+        if (
+            task is None
+            or approval is None
+            or not _task_operation_matches(task, operation_id)
+            or approval.status != ApprovalStatus.REJECTED.value
+            or task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+        ):
+            raise _trusted_action_unavailable()
+        task.status = TaskStatus.SUCCEEDED.value
+        task.error_code = None
+        task.finished_at = finished_at
+        _clear_task_scheduling(task)
+
+    async def _locked_task_approval(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+    ) -> tuple[TaskRunModel | None, ApprovalRequestModel | None]:
+        """复用 Task→Approval 固定锁序读取两个可信生命周期行。"""
+        task = await self._session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if task is None:
+            return None, None
+        approval = await self._session.scalar(
+            select(ApprovalRequestModel)
+            .where(
+                ApprovalRequestModel.id == approval_id,
+                ApprovalRequestModel.task_id == task_id,
+            )
+            .with_for_update()
+        )
+        return task, approval
+
+    async def _lock_action_binding(
+        self,
+        *,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+    ) -> tuple[UUID, str | None] | None:
+        """在 ToolExecution 之后锁定审批绑定的当前本地动作并返回连接/日历。"""
+        if (
+            approval.proposal_id is None
+            or approval.proposal_version is None
+            or approval.proposal_kind not in {"mail_draft", "calendar_proposal"}
+        ):
+            return None
+        if approval.proposal_kind == "mail_draft":
+            draft = await self._session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if draft is None or draft.current_version != approval.proposal_version:
+                return None
+            return draft.connection_id, None
+        proposal = await self._session.scalar(
+            select(CalendarChangeProposalModel)
+            .where(
+                CalendarChangeProposalModel.id == approval.proposal_id,
+                CalendarChangeProposalModel.user_id == task.user_id,
+            )
+            .with_for_update()
+        )
+        if proposal is None or proposal.current_version != approval.proposal_version:
+            return None
+        return proposal.connection_id, proposal.calendar_id
+
+    async def _action_connection_id(
+        self,
+        *,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+    ) -> UUID | None:
+        """只读解析审批绑定的连接 ID，不解密命令或信任供应商显示字段。"""
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        return binding[0] if binding is not None else None
+
+    async def _set_local_action_status(
+        self,
+        *,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+        mail_status: MailDraftStatus,
+        calendar_status: CalendarProposalStatus,
+        allowed_current: set[str],
+    ) -> None:
+        """只改写仍绑定冻结版本且处于预期状态的本地动作头。"""
+        if approval.proposal_kind == "mail_draft" and approval.proposal_id is not None:
+            draft = await self._session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                draft is None
+                or draft.current_version != approval.proposal_version
+                or draft.status not in allowed_current
+            ):
+                raise _trusted_action_unavailable()
+            draft.status = mail_status.value
+            return
+        if approval.proposal_kind == "calendar_proposal" and approval.proposal_id is not None:
+            proposal = await self._session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == approval.proposal_id,
+                    CalendarChangeProposalModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if (
+                proposal is None
+                or proposal.current_version != approval.proposal_version
+                or proposal.status not in allowed_current
+            ):
+                raise _trusted_action_unavailable()
+            proposal.status = calendar_status.value
+            return
+        raise _trusted_action_unavailable()
+
     async def _capabilities(
         self,
         *,
@@ -782,6 +1558,62 @@ def _canonical_command_object(payload: Mapping[str, object]) -> dict[str, object
     return dict(cast(dict[str, object], decoded))
 
 
+def _task_operation_matches(task: TaskRunModel, operation_id: UUID) -> bool:
+    """只接受任务输入中规范 UUID 与调用方精确 operation 相等的绑定。"""
+    raw_operation_id = task.input_payload.get("operation_id")
+    if type(raw_operation_id) is not str:
+        return False
+    try:
+        return UUID(raw_operation_id) == operation_id
+    except ValueError:
+        return False
+
+
+def _execution_reference(
+    *,
+    execution: ToolExecutionModel,
+    approval_id: UUID,
+) -> ExecutionReference:
+    """把 ORM ToolExecution 收窄为供应商中立、内容无关的应用 DTO。"""
+    if execution.operation_id is None or execution.provider is None:
+        raise ValueError("trusted execution binding is incomplete")
+    return ExecutionReference(
+        execution_id=execution.id,
+        task_id=execution.task_id,
+        approval_id=approval_id,
+        operation_id=execution.operation_id,
+        provider=execution.provider,
+        status=ToolExecutionStatus(execution.status),
+        request_started_at=execution.request_started_at,
+        write_attempt_count=execution.write_attempt_count,
+        provider_resource_id=execution.provider_resource_id,
+        provider_request_id=execution.provider_request_id,
+        correlation_id=execution.correlation_id,
+    )
+
+
+def _clear_task_scheduling(task: TaskRunModel) -> None:
+    """终止或移交核对时清除所有可让旧 Worker 再进入的调度/租约字段。"""
+    task.lease_owner = None
+    task.lease_expires_at = None
+    task.scheduled_for = None
+    task.retry_recovery_at = None
+    task.approval_checkpoint_recovery_at = None
+
+
+def _outcome_summary(outcome: ProviderWriteOutcome) -> dict[str, JsonValue]:
+    """只保存规范分类、计数提示与供应商不透明 ID，不保留原始响应。"""
+    summary: dict[str, JsonValue] = {
+        "kind": outcome.kind.value,
+        "retryable": outcome.retryable,
+    }
+    if outcome.retry_after_seconds is not None:
+        summary["retry_after_seconds"] = outcome.retry_after_seconds
+    if outcome.provider_url is not None:
+        summary["provider_url"] = outcome.provider_url
+    return summary
+
+
 def _calendar_submission_ready(
     *,
     proposal: CalendarChangeProposalModel,
@@ -796,7 +1628,8 @@ def _calendar_submission_ready(
     """
     content_ready = (
         proposal.status == CalendarProposalStatus.EDITING.value
-        and content.confirmed_fields == (
+        and content.confirmed_fields
+        == (
             "calendar",
             "time",
             "attendees",
