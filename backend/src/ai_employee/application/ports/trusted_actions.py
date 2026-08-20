@@ -16,6 +16,7 @@ from uuid import UUID
 from ai_employee.application.commands import TrustedCommand
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.domain.actions import (
+    DURABLE_RETRY_BACKOFF_CAP_SECONDS,
     CalendarProposalStatus,
     MailDraftStatus,
     ProviderWriteOutcomeKind,
@@ -90,6 +91,8 @@ class ProviderWriteOutcome:
                 raise TypeError("retry_after_seconds must be int or None")
             if self.retry_after_seconds < 0:
                 raise ValueError("retry_after_seconds must be non-negative")
+            if self.retry_after_seconds > DURABLE_RETRY_BACKOFF_CAP_SECONDS:
+                raise ValueError("retry_after_seconds exceeds the durable retry cap")
             if (
                 self.kind is not ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
                 or not self.retryable
@@ -122,10 +125,15 @@ class ExecutionReference:
 
     execution_id: UUID
     task_id: UUID
+    step_id: UUID
     approval_id: UUID
     operation_id: UUID
     provider: str
+    tool_name: str
+    idempotency_key: str
+    request_payload_hash: str
     status: ToolExecutionStatus
+    result_summary: dict[str, JsonValue] | None
     request_started_at: datetime | None
     write_attempt_count: int
     provider_resource_id: str | None
@@ -346,7 +354,9 @@ class TrustedActionDispatchSnapshot:
 
     user_id: UUID
     task_id: UUID
+    step_id: UUID
     approval_id: UUID
+    approval_version: int
     operation_id: UUID
     connection_id: UUID
     action: str
@@ -458,9 +468,8 @@ class TrustedActionSubmissionTransaction(Protocol):
         *,
         snapshot: TrustedActionDispatchSnapshot,
         lease_owner: str,
-        started_at: datetime,
     ) -> bool:
-        """独立提交 request-start 与唯一一次写尝试计数；并发 loser 返回 False。"""
+        """用锁内数据库时间提交 request-start 与唯一写尝试；并发 loser 返回 False。"""
 
     async def persist_provider_outcome(
         self,

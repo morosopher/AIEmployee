@@ -1,19 +1,22 @@
 """在真实 PostgreSQL 上验证 ToolExecution 原子认领与请求开始幂等边界。"""
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, time, timedelta
-from uuid import uuid4
+from time import sleep
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select, update
 
 from ai_employee.application.commands import parse_trusted_command, trusted_command_hash
+from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.ports.trusted_actions import (
     ApprovalPreflightResult,
     ExecutionReference,
     ProviderWriteOutcome,
 )
+from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.application.use_cases.trusted_actions import TrustedActionExecutionUseCase
 from ai_employee.config import Settings
 from ai_employee.domain.actions import (
@@ -21,7 +24,11 @@ from ai_employee.domain.actions import (
     ProviderWriteOutcomeKind,
     ToolExecutionStatus,
 )
-from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
+from ai_employee.domain.connections import (
+    CapabilityStatus,
+    ConnectionCapability,
+    canonical_provider_identity_key,
+)
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.domain.tasks import ApprovalStatus, TaskStatus
 from ai_employee.infrastructure.db.database_url import TestDatabaseUrl as ValidatedTestDatabaseUrl
@@ -39,11 +46,15 @@ from ai_employee.infrastructure.db.models.tasks import (
     TaskStepModel,
     ToolExecutionModel,
 )
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 
 NOW = datetime(2030, 1, 1, 0, 4, tzinfo=UTC)
@@ -74,10 +85,14 @@ def _cycle5_migrated_database(
 class _RecordingAdapter:
     """记录真实写/只读核对次数并只返回合成规范结果。"""
 
-    provider = "google"
-
-    def __init__(self, outcome: ProviderWriteOutcome | None = None) -> None:
-        """初始化计数器；默认返回 confirmed applied。"""
+    def __init__(
+        self,
+        outcome: ProviderWriteOutcome | None = None,
+        *,
+        provider: str = "google",
+    ) -> None:
+        """初始化固定 provider 与计数器；默认返回 confirmed applied。"""
+        self.provider = provider
         self.write_calls = 0
         self.reconcile_calls = 0
         self.outcome = outcome or ProviderWriteOutcome(
@@ -155,6 +170,48 @@ class _CrashAfterRequestStartAdapter(_RecordingAdapter):
         return self.outcome
 
 
+class _DelayedActionPayloadCipher(ActionPayloadCipher):
+    """在认证解密前注入确定性延迟，用于跨过短 TaskRun 租约。"""
+
+    def __init__(self, delay_seconds: float) -> None:
+        """使用与合成 fixture 相同的 AEAD 密钥并保存阻塞延迟。"""
+        super().__init__(AeadCipher(b"x" * 32))
+        self._delay_seconds = delay_seconds
+
+    def decrypt_json(
+        self,
+        value: EncryptedValue,
+        *,
+        user_id: UUID,
+        record_id: UUID,
+        content_kind: str,
+        action: str,
+        schema_version: str,
+    ) -> dict[str, object]:
+        """让旧实现预采样的应用时间在 request-start 前变为过期授权。"""
+        sleep(self._delay_seconds)
+        return super().decrypt_json(
+            value,
+            user_id=user_id,
+            record_id=record_id,
+            content_kind=content_kind,
+            action=action,
+            schema_version=schema_version,
+        )
+
+
+class _MutableClock:
+    """为真实 Runner 的多次投递提供显式可推进 UTC 时钟。"""
+
+    def __init__(self, current: datetime) -> None:
+        """保存当前合成 UTC 瞬间。"""
+        self.current = current
+
+    def __call__(self) -> datetime:
+        """返回本次 acquisition、退避或完成判断使用的同一瞬间。"""
+        return self.current
+
+
 class _Seed:
     """保存单个可信邮件动作的全部稳定测试标识。"""
 
@@ -169,7 +226,10 @@ class _Seed:
         self.operation_id = uuid4()
         self.execution_id = uuid4()
         self.owner = "worker-a"
+        self.provider = "google"
+        self.provider_tenant_id = ""
         self.provider_account_id = "synthetic-account"
+        self.account_type = "google"
 
     def command_payload(self) -> dict[str, object]:
         """返回一条包含合成正文但不会进入日志、审计或 checkpoint 的严格命令。"""
@@ -202,6 +262,9 @@ async def _seed_action(
     existing_execution_status: ToolExecutionStatus | None = None,
     request_started_at: datetime | None = None,
     lease_expires_at: datetime | None = None,
+    existing_result_summary: dict[str, object] | None = None,
+    user_is_active: bool = True,
+    task_status: TaskStatus = TaskStatus.RUNNING,
 ) -> str:
     """创建批准任务、加密命令、连接能力和可选既有 ToolExecution。"""
     command_payload = seed.command_payload()
@@ -227,7 +290,7 @@ async def _seed_action(
                     timezone="UTC",
                     locale="zh-CN",
                     brief_time=time(8, 0),
-                    is_active=True,
+                    is_active=user_is_active,
                 )
             )
             # 这些 ORM 模型刻意没有关系映射；先显式写入父用户，避免 flush 无法从裸 FK
@@ -237,10 +300,10 @@ async def _seed_action(
                 OAuthConnectionModel(
                     id=seed.connection_id,
                     user_id=seed.user_id,
-                    provider="google",
+                    provider=seed.provider,
                     provider_account_id=seed.provider_account_id,
-                    provider_tenant_id="",
-                    account_type="google",
+                    provider_tenant_id=seed.provider_tenant_id,
+                    account_type=seed.account_type,
                     account_email="sender@example.test",
                     scopes=["mail.read", "mail.send"],
                     status="connected",
@@ -291,15 +354,19 @@ async def _seed_action(
                     id=seed.task_id,
                     user_id=seed.user_id,
                     kind="trusted_action",
-                    status=TaskStatus.RUNNING.value,
+                    status=task_status.value,
                     idempotency_key=f"task:{seed.task_id}",
                     input_payload={
                         "approval_id": str(seed.approval_id),
                         "operation_id": str(seed.operation_id),
                     },
                     graph_thread_id=str(seed.task_id),
-                    lease_owner=seed.owner,
-                    lease_expires_at=lease_expires_at or NOW + timedelta(minutes=1),
+                    lease_owner=seed.owner if task_status is TaskStatus.RUNNING else None,
+                    lease_expires_at=(
+                        lease_expires_at or NOW + timedelta(minutes=1)
+                        if task_status is TaskStatus.RUNNING
+                        else None
+                    ),
                     started_at=NOW - timedelta(seconds=1),
                 )
             )
@@ -353,8 +420,9 @@ async def _seed_action(
                         ),
                         operation_id=seed.operation_id,
                         request_payload_hash=payload_hash,
-                        provider="google",
+                        provider=seed.provider,
                         status=existing_execution_status.value,
+                        result_summary=existing_result_summary,
                         claimed_at=NOW - timedelta(minutes=10),
                         request_started_at=request_started_at,
                         write_attempt_count=1 if request_started_at else 0,
@@ -365,15 +433,28 @@ async def _seed_action(
     return payload_hash
 
 
-def _settings(*, account: str = "synthetic-account", enabled: bool = True) -> Settings:
-    """构造只允许一个规范 Google 合成身份的非生产真实写门禁。"""
+def _settings(
+    *,
+    provider: str = "google",
+    tenant: str = "",
+    account: str = "synthetic-account",
+    external_enabled: bool = True,
+    provider_enabled: bool = True,
+    allowed_identity_key: str | None = None,
+) -> Settings:
+    """构造只允许一个规范合成身份的非生产真实写门禁。"""
+    identity_key = allowed_identity_key or canonical_provider_identity_key(
+        provider,
+        tenant,
+        account,
+    )
     return Settings(
         _env_file=None,
         app_env="staging",
-        external_writes_enabled=enabled,
-        google_writes_enabled=enabled,
-        microsoft_writes_enabled=False,
-        write_test_account_allowlist=[f"google::{account}"],
+        external_writes_enabled=external_enabled,
+        google_writes_enabled=provider == "google" and provider_enabled,
+        microsoft_writes_enabled=provider == "microsoft" and provider_enabled,
+        write_test_account_allowlist=[identity_key],
     )
 
 
@@ -382,16 +463,69 @@ def _workflow(
     adapter: _RecordingAdapter,
     *,
     settings: Settings | None = None,
+    clock: Callable[[], datetime] | None = None,
+    cipher: ActionPayloadCipher = ACTION_CIPHER,
+    registry: ProviderAdapterRegistry | None = None,
 ) -> TrustedActionExecutionUseCase:
     """组合真实 Repository、固定 registry 与确定性时钟。"""
     session_factory = build_session_factory(database_url)
+    if registry is None:
+        registry = (
+            ProviderAdapterRegistry(google_mail_action=adapter)
+            if adapter.provider == "google"
+            else ProviderAdapterRegistry(microsoft_mail_action=adapter)
+        )
     return TrustedActionExecutionUseCase(
-        transactions=SqlAlchemyTrustedActionRepositoryFactory(session_factory, ACTION_CIPHER),
-        adapters=ProviderAdapterRegistry(google_mail_action=adapter),
+        transactions=SqlAlchemyTrustedActionRepositoryFactory(session_factory, cipher),
+        adapters=registry,
         write_policy=settings or _settings(),
-        clock=lambda: NOW,
+        clock=clock or (lambda: NOW),
         dispose=session_factory.dispose,
     )
+
+
+class _TrustedWorkflowStep:
+    """让真实 DurableTaskRunner 驱动同一 claim/dispatch/finalize 应用路径。"""
+
+    name = "trusted_action_execution"
+
+    def __init__(
+        self,
+        *,
+        workflow: TrustedActionExecutionUseCase,
+        seed: _Seed,
+        payload_hash: str,
+    ) -> None:
+        """绑定一项冻结审批的稳定 ID 与共享执行用例。"""
+        self._workflow = workflow
+        self._seed = seed
+        self._payload_hash = payload_hash
+
+    async def execute(self, task: LeasedTask) -> None:
+        """使用 Runner 当前租约 owner 执行一次安全写尝试。"""
+        lease_owner = task.lease_owner or ""
+        await self._workflow.claim(
+            task_id=self._seed.task_id,
+            approval_id=self._seed.approval_id,
+            operation_id=self._seed.operation_id,
+            expected_payload_hash=self._payload_hash,
+            lease_owner=lease_owner,
+        )
+        await self._workflow.execute_or_reconcile(
+            task_id=self._seed.task_id,
+            approval_id=self._seed.approval_id,
+            operation_id=self._seed.operation_id,
+            expected_payload_hash=self._payload_hash,
+            lease_owner=lease_owner,
+        )
+        await self._workflow.finalize(
+            task_id=self._seed.task_id,
+            approval_id=self._seed.approval_id,
+            operation_id=self._seed.operation_id,
+            expected_payload_hash=self._payload_hash,
+            decision=ApprovalStatus.APPROVED.value,
+            lease_owner=lease_owner,
+        )
 
 
 async def _run_approved(
@@ -468,6 +602,9 @@ async def test_two_workers_create_one_claim_and_one_provider_call(database_url: 
     assert len(executions) == 1
     assert executions[0].status == ToolExecutionStatus.SUCCEEDED.value
     assert executions[0].write_attempt_count == 1
+    assert executions[0].idempotency_key == (
+        f"mail.send:{seed.task_id}:{seed.approval_id}:1:{seed.operation_id}"
+    )
     assert adapter.write_calls == 1
     assert adapter.reconcile_calls == 0
     assert sum(not isinstance(result, Exception) for result in results) == 1
@@ -524,18 +661,34 @@ async def test_claim_after_approved_deadline_invalidates_without_provider_call(
 async def test_stale_claim_before_request_is_recovered_with_one_write(database_url: str) -> None:
     """已按时认领但未提交 request-start 的过期租约可复用原 claim 首次写入。"""
     seed = _Seed()
-    seed.owner = "recovery-worker"
+    seed.owner = "stale-worker"
     payload_hash = await _seed_action(
         database_url,
         seed,
         deadline=NOW - timedelta(minutes=5),
         existing_execution_status=ToolExecutionStatus.CLAIMED,
         request_started_at=None,
-        lease_expires_at=NOW + timedelta(minutes=1),
+        lease_expires_at=NOW - timedelta(seconds=1),
     )
     adapter = _RecordingAdapter()
+    session_factory = build_session_factory(database_url)
+    try:
+        leased = await SqlAlchemyTaskExecutionStore(session_factory).acquire(
+            task_id=seed.task_id,
+            lease_owner="recovery-worker",
+            now=NOW,
+            lease_expires_at=NOW + timedelta(minutes=1),
+        )
+    finally:
+        await session_factory.dispose()
+    assert leased is not None and leased.lease_owner == "recovery-worker"
 
-    await _run_approved(_workflow(database_url, adapter), seed, payload_hash)
+    await _run_approved(
+        _workflow(database_url, adapter),
+        seed,
+        payload_hash,
+        owner="recovery-worker",
+    )
 
     session_factory = build_session_factory(database_url)
     try:
@@ -546,6 +699,343 @@ async def test_stale_claim_before_request_is_recovered_with_one_write(database_u
     assert len(executions) == 1 and executions[0].id == seed.execution_id
     assert executions[0].write_attempt_count == 1
     assert adapter.write_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_serializes_with_connection_first_capability_disable(
+    database_url: str,
+) -> None:
+    """claim 必须等待 connection-first 撤权事务并读取提交后的 disabled 能力。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    blocker_factory = build_session_factory(database_url)
+    claim_task: asyncio.Task[None] | None = None
+    try:
+        async with blocker_factory.begin() as blocker:
+            connection = await blocker.scalar(
+                select(OAuthConnectionModel)
+                .where(OAuthConnectionModel.id == seed.connection_id)
+                .with_for_update()
+            )
+            assert connection is not None
+            claim_task = asyncio.create_task(
+                workflow.claim(
+                    task_id=seed.task_id,
+                    approval_id=seed.approval_id,
+                    operation_id=seed.operation_id,
+                    expected_payload_hash=payload_hash,
+                    lease_owner=seed.owner,
+                )
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(claim_task), timeout=0.25)
+            await blocker.execute(
+                update(ConnectionCapabilityModel)
+                .where(
+                    ConnectionCapabilityModel.connection_id == seed.connection_id,
+                    ConnectionCapabilityModel.capability == ConnectionCapability.MAIL_SEND.value,
+                )
+                .values(status=CapabilityStatus.DISABLED.value)
+            )
+        assert claim_task is not None
+        with pytest.raises(StateConflictError) as raised:
+            await claim_task
+        assert raised.value.error_code == "connection_capability_disabled"
+    finally:
+        if claim_task is not None and not claim_task.done():
+            claim_task.cancel()
+            await asyncio.gather(claim_task, return_exceptions=True)
+        await workflow.dispose()
+        await blocker_factory.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution_count = await session.scalar(
+                select(func.count())
+                .select_from(ToolExecutionModel)
+                .where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_request_start_rechecks_lease_with_database_time_after_decryption(
+    database_url: str,
+) -> None:
+    """解密跨过租约后必须以锁内 PostgreSQL 时间拒绝 request-start。"""
+    seed = _Seed()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await session_factory.dispose()
+    assert isinstance(database_now, datetime)
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        lease_expires_at=database_now + timedelta(seconds=1),
+    )
+    adapter = _RecordingAdapter()
+    workflow = _workflow(
+        database_url,
+        adapter,
+        clock=lambda: database_now,
+        cipher=_DelayedActionPayloadCipher(1.25),
+    )
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        await workflow.execute_or_reconcile(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution is not None
+    assert execution.status == ToolExecutionStatus.CLAIMED.value
+    assert execution.request_started_at is None
+    assert execution.write_attempt_count == 0
+    assert adapter.write_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retryable_failed_requires_exact_persisted_not_applied_proof(
+    database_url: str,
+) -> None:
+    """仅状态名为 retryable_failed 不能授权第二次供应商写请求。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.RETRYABLE_FAILED,
+        request_started_at=NOW - timedelta(seconds=1),
+        existing_result_summary={
+            "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+            "retryable": False,
+        },
+    )
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        await workflow.dispose()
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_execution_provider_rebound_before_load(
+    database_url: str,
+) -> None:
+    """dispatch 必须从冻结 connection 重证 provider，不能信任执行行的自述值。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.CLAIMED,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(ToolExecutionModel)
+                .where(ToolExecutionModel.id == seed.execution_id)
+                .values(provider="microsoft")
+            )
+    finally:
+        await session_factory.dispose()
+
+    google_adapter = _RecordingAdapter(provider="google")
+    microsoft_adapter = _RecordingAdapter(provider="microsoft")
+    workflow = _workflow(
+        database_url,
+        google_adapter,
+        registry=ProviderAdapterRegistry(
+            google_mail_action=google_adapter,
+            microsoft_mail_action=microsoft_adapter,
+        ),
+    )
+    try:
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        await workflow.dispose()
+    assert google_adapter.write_calls == microsoft_adapter.write_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "retry_summary",
+        "idempotency_key",
+        "provider",
+        "tool_name",
+        "operation_id",
+        "request_payload_hash",
+    ],
+)
+async def test_request_start_cas_rechecks_retry_proof_and_binding(
+    database_url: str,
+    tamper: str,
+) -> None:
+    """dispatch 读取后的持久摘要或绑定篡改仍必须在锁内 CAS 被拒绝。"""
+    seed = _Seed()
+    valid_summary = {
+        "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+        "retryable": True,
+        "retry_after_seconds": 17,
+    }
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.RETRYABLE_FAILED,
+        request_started_at=NOW - timedelta(seconds=1),
+        existing_result_summary=valid_summary,
+    )
+    session_factory = build_session_factory(database_url)
+    transactions = SqlAlchemyTrustedActionRepositoryFactory(session_factory, ACTION_CIPHER)
+    try:
+        async with transactions() as transaction:
+            snapshot = await transaction.load_dispatch(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+            )
+        assert snapshot is not None
+        async with session_factory.begin() as session:
+            values: dict[str, object]
+            if tamper == "retry_summary":
+                values = {
+                    "result_summary": {
+                        "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+                        "retryable": True,
+                        "retry_after_seconds": 17,
+                        "unexpected": True,
+                    }
+                }
+            elif tamper == "idempotency_key":
+                values = {"idempotency_key": f"tampered:{seed.execution_id}"}
+            elif tamper == "provider":
+                values = {"provider": "microsoft"}
+            elif tamper == "tool_name":
+                values = {"tool_name": "calendar.create"}
+            elif tamper == "operation_id":
+                values = {"operation_id": uuid4()}
+            else:
+                values = {"request_payload_hash": "f" * 64}
+            await session.execute(
+                update(ToolExecutionModel)
+                .where(ToolExecutionModel.id == seed.execution_id)
+                .values(**values)
+            )
+        async with transactions() as transaction:
+            started = await transaction.mark_request_started(
+                snapshot=snapshot,
+                lease_owner=seed.owner,
+            )
+    finally:
+        await session_factory.dispose()
+    assert started is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        ToolExecutionStatus.SUCCEEDED,
+        ToolExecutionStatus.CONFIRMED_FAILED,
+        ToolExecutionStatus.NEEDS_ATTENTION,
+    ],
+)
+async def test_terminal_execution_returns_before_decryption_and_adapter_lookup(
+    database_url: str,
+    terminal_status: ToolExecutionStatus,
+) -> None:
+    """既有终态必须在破坏 AEAD 且无 adapter 时无副作用复用。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=terminal_status,
+        request_started_at=NOW - timedelta(seconds=1),
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(ApprovalRequestModel)
+                .where(ApprovalRequestModel.id == seed.approval_id)
+                .values(payload_nonce=b"z" * 12)
+            )
+    finally:
+        await session_factory.dispose()
+    adapter = _RecordingAdapter()
+    workflow = _workflow(
+        database_url,
+        adapter,
+        registry=ProviderAdapterRegistry(),
+    )
+    try:
+        await workflow.execute_or_reconcile(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            persisted_status = await session.scalar(
+                select(ToolExecutionModel.status).where(ToolExecutionModel.id == seed.execution_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert persisted_status == terminal_status.value
+    assert adapter.write_calls == adapter.reconcile_calls == 0
 
 
 @pytest.mark.asyncio
@@ -588,6 +1078,181 @@ async def test_non_production_claim_rejects_connection_outside_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_provider_only_kill_switch_blocks_claim_with_global_switch_enabled(
+    database_url: str,
+) -> None:
+    """全局开启但当前 provider 关闭时仍必须零 claim、零真实写入。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(
+        database_url,
+        adapter,
+        settings=_settings(external_enabled=True, provider_enabled=False),
+    )
+    try:
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.claim(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "external_writes_disabled"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution_count = await session.scalar(
+                select(func.count())
+                .select_from(ToolExecutionModel)
+                .where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_inactive_user_cannot_create_tool_execution_or_call_provider(
+    database_url: str,
+) -> None:
+    """删除屏障后的 inactive 用户必须在 claim 事务内 fail closed。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed, user_is_active=False)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.claim(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution_count = await session.scalar(
+                select(func.count())
+                .select_from(ToolExecutionModel)
+                .where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "tenant", "account", "account_type"),
+    [
+        ("google", "", "opaque:subject%1", "google"),
+        (
+            "microsoft",
+            "tenant-a",
+            "tenant-a:graph@opaque%1",
+            "work_school",
+        ),
+    ],
+)
+async def test_claim_uses_canonical_provider_identity_for_google_and_microsoft(
+    database_url: str,
+    provider: str,
+    tenant: str,
+    account: str,
+    account_type: str,
+) -> None:
+    """Google 保留字符与 Microsoft tenant-bound 身份只按共享 canonical key 放行。"""
+    seed = _Seed()
+    seed.provider = provider
+    seed.provider_tenant_id = tenant
+    seed.provider_account_id = account
+    seed.account_type = account_type
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter(provider=provider)
+    await _run_approved(
+        _workflow(
+            database_url,
+            adapter,
+            settings=_settings(provider=provider, tenant=tenant, account=account),
+        ),
+        seed,
+        payload_hash,
+    )
+    assert adapter.write_calls == 1
+    assert adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["different_google_canonical", "microsoft_tenant_mismatch"])
+async def test_claim_rejects_canonical_allowlist_or_tenant_binding_mismatch(
+    database_url: str,
+    case: str,
+) -> None:
+    """不同 canonical 身份及 Microsoft 内外 tenant 不一致都必须零 claim。"""
+    seed = _Seed()
+    if case == "different_google_canonical":
+        seed.provider_account_id = "opaque:subject"
+        settings = _settings(
+            allowed_identity_key=canonical_provider_identity_key(
+                "google",
+                "",
+                "opaque%3Asubject",
+            )
+        )
+        adapter = _RecordingAdapter()
+    else:
+        seed.provider = "microsoft"
+        seed.provider_tenant_id = "tenant-a"
+        seed.provider_account_id = "tenant-b:graph-user"
+        seed.account_type = "work_school"
+        settings = _settings(
+            provider="microsoft",
+            tenant="tenant-a",
+            account="tenant-a:graph-user",
+        )
+        adapter = _RecordingAdapter(provider="microsoft")
+    payload_hash = await _seed_action(database_url, seed)
+    workflow = _workflow(database_url, adapter, settings=settings)
+    try:
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.claim(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "external_write_account_not_allowed"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution_count = await session.scalar(
+                select(func.count())
+                .select_from(ToolExecutionModel)
+                .where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("capability_status", "enabled", "error_code"),
     [
@@ -609,7 +1274,11 @@ async def test_claim_rechecks_queued_capability_and_write_switches(
         capability_status=capability_status,
     )
     adapter = _RecordingAdapter()
-    workflow = _workflow(database_url, adapter, settings=_settings(enabled=enabled))
+    workflow = _workflow(
+        database_url,
+        adapter,
+        settings=_settings(external_enabled=enabled, provider_enabled=enabled),
+    )
     try:
         with pytest.raises(StateConflictError) as raised:
             await workflow.claim(
@@ -696,6 +1365,136 @@ async def test_claimed_command_aad_tampering_never_reaches_provider(database_url
 
 
 @pytest.mark.asyncio
+async def test_claimed_payload_hash_tampering_fails_before_request_start(
+    database_url: str,
+) -> None:
+    """claim 后审批哈希被替换时必须在解密和 request-start 前 fail closed。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(ApprovalRequestModel)
+                    .where(ApprovalRequestModel.id == seed.approval_id)
+                    .values(payload_hash="f" * 64)
+                )
+        finally:
+            await session_factory.dispose()
+
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution is not None and execution.request_started_at is None
+    assert execution.write_attempt_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_field", ["operation_id", "connection_id", "draft_id"])
+async def test_reencrypted_command_binding_mismatch_fails_before_request_start(
+    database_url: str,
+    binding_field: str,
+) -> None:
+    """攻击者重加密且同步篡改哈希也不能换绑 operation、connection 或 proposal。"""
+    seed = _Seed()
+    original_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=original_hash,
+            lease_owner=seed.owner,
+        )
+        tampered_command = seed.command_payload()
+        tampered_command[binding_field] = str(uuid4())
+        parse_trusted_command(tampered_command)
+        tampered_hash = trusted_command_hash(tampered_command)
+        encrypted = ACTION_CIPHER.encrypt_json(
+            tampered_command,
+            user_id=seed.user_id,
+            record_id=seed.approval_id,
+            content_kind="approval_command",
+            action="mail.send",
+            schema_version="mail_send.v1",
+        )
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(ApprovalRequestModel)
+                    .where(ApprovalRequestModel.id == seed.approval_id)
+                    .values(
+                        payload_ciphertext=encrypted.ciphertext,
+                        payload_nonce=encrypted.nonce,
+                        payload_key_version=encrypted.key_version,
+                        payload_hash=tampered_hash,
+                    )
+                )
+                await session.execute(
+                    update(ToolExecutionModel)
+                    .where(ToolExecutionModel.task_id == seed.task_id)
+                    .values(request_payload_hash=tampered_hash)
+                )
+        finally:
+            await session_factory.dispose()
+
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=tampered_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution is not None and execution.request_started_at is None
+    assert execution.write_attempt_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_confirmed_not_applied_retry_persists_exact_retryable_fact(
     database_url: str,
 ) -> None:
@@ -766,6 +1565,244 @@ async def test_confirmed_not_applied_retry_persists_exact_retryable_fact(
     assert retry_outbox is not None
     assert adapter.write_calls == 1
     assert adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_real_runner_retries_same_execution_once_then_exhausts_without_third_write(
+    database_url: str,
+) -> None:
+    """真实 Runner/Store 必须持久化 17 秒重试并在预算耗尽后阻止第三次写。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        task_status=TaskStatus.QUEUED,
+    )
+    adapter = _RecordingAdapter(
+        ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED,
+            retryable=True,
+            retry_after_seconds=17,
+            provider_resource_id=None,
+            provider_request_id="synthetic-durable-retry-request",
+            correlation_id="synthetic-durable-retry-correlation",
+            provider_url=None,
+            error_code="provider_busy",
+        )
+    )
+    clock = _MutableClock(NOW)
+    workflow = _workflow(database_url, adapter, clock=clock)
+    runner_factory = build_session_factory(database_url)
+    step = _TrustedWorkflowStep(workflow=workflow, seed=seed, payload_hash=payload_hash)
+    runner = DurableTaskRunner(
+        store=SqlAlchemyTaskExecutionStore(runner_factory),
+        clock=clock,
+        lease_duration=timedelta(minutes=1),
+        task_timeout_seconds=120,
+        task_step_timeout_seconds=30,
+        max_transient_retries=1,
+        resolve_steps=lambda _task: (step,),
+    )
+    try:
+        assert await runner.run(
+            seed.task_id,
+            lease_owner="durable-owner-1",
+            retry_delay=timedelta(seconds=5),
+        )
+        async with runner_factory() as session:
+            first_task = await session.get(TaskRunModel, seed.task_id)
+            first_execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+            retry_outbox = await session.scalar(
+                select(OutboxEventModel).where(
+                    OutboxEventModel.aggregate_id == seed.task_id,
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.deduplication_key == f"task.execute:{seed.task_id}:retry:1",
+                )
+            )
+        assert first_task is not None
+        assert first_task.status == TaskStatus.RETRY_SCHEDULED.value
+        assert first_task.attempt_count == 1
+        assert first_execution is not None
+        assert first_execution.status == ToolExecutionStatus.RETRYABLE_FAILED.value
+        assert first_execution.write_attempt_count == 1
+        assert retry_outbox is not None
+        assert retry_outbox.available_at == NOW + timedelta(seconds=17)
+
+        # 模拟 relay 在延迟到期后成功交接；下一条消息必须由新 owner 获取同一任务。
+        clock.current = NOW + timedelta(seconds=17)
+        async with runner_factory.begin() as session:
+            retry_event = await session.get(OutboxEventModel, retry_outbox.id)
+            assert retry_event is not None
+            retry_event.published_at = clock.current
+        assert await runner.run(
+            seed.task_id,
+            lease_owner="durable-owner-2",
+            retry_delay=timedelta(seconds=5),
+        )
+        # 第二次仍明确未应用，但最大重试次数已耗尽；重复投递不得取得第三次租约。
+        clock.current = NOW + timedelta(seconds=18)
+        assert not await runner.run(
+            seed.task_id,
+            lease_owner="durable-owner-3",
+            retry_delay=timedelta(seconds=5),
+        )
+
+        async with runner_factory() as session:
+            final_task = await session.get(TaskRunModel, seed.task_id)
+            executions = tuple(
+                (
+                    await session.scalars(
+                        select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+                    )
+                ).all()
+            )
+            retry_outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(
+                    OutboxEventModel.aggregate_id == seed.task_id,
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.deduplication_key.like(f"task.execute:{seed.task_id}:retry:%"),
+                )
+            )
+        assert final_task is not None
+        assert final_task.status == TaskStatus.FAILED.value
+        assert final_task.error_code == "task_retries_exhausted"
+        assert final_task.attempt_count == 2
+        assert len(executions) == 1
+        assert executions[0].write_attempt_count == 2
+        assert retry_outbox_count == 1
+        assert adapter.write_calls == 2
+        assert adapter.reconcile_calls == 0
+    finally:
+        await workflow.dispose()
+        await runner_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_permanent_not_applied_failure_atomically_writes_task_and_tool_audits(
+    database_url: str,
+) -> None:
+    """永久未应用结果必须在同一事务收敛任务、本地对象与两条审计。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter(
+        ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED,
+            retryable=False,
+            retry_after_seconds=None,
+            provider_resource_id=None,
+            provider_request_id="synthetic-rejected-request",
+            correlation_id="synthetic-rejected-correlation",
+            provider_url=None,
+            error_code="provider_rejected",
+        )
+    )
+    await _run_approved(_workflow(database_url, adapter), seed, payload_hash)
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+            task_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "task.failed",
+                )
+            )
+            tool_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "tool.confirmed_failed",
+                )
+            )
+            retry_outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(
+                    OutboxEventModel.aggregate_id == seed.task_id,
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.deduplication_key.like("%:retry:%"),
+                )
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.FAILED.value
+    assert task.error_code == "provider_rejected"
+    assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+    assert execution is not None
+    assert execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
+    assert execution.write_attempt_count == 1
+    assert task_failed_count == tool_failed_count == 1
+    assert retry_outbox_count == 0
+    assert adapter.write_calls == 1
+    assert adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_url_never_enters_result_audit_or_outbox(
+    database_url: str,
+) -> None:
+    """供应商检查 URL 端口值不得进入 Task 19 持久结果或事件载荷。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    sensitive_marker = "provider-url-sensitive-marker"
+    adapter = _RecordingAdapter(
+        ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.CONFIRMED_APPLIED,
+            retryable=False,
+            retry_after_seconds=None,
+            provider_resource_id="synthetic-resource",
+            provider_request_id="synthetic-request",
+            correlation_id="synthetic-correlation",
+            provider_url=(
+                f"javascript://user:{sensitive_marker}@example.test/path?token={sensitive_marker}"
+            ),
+            error_code=None,
+        )
+    )
+    await _run_approved(_workflow(database_url, adapter), seed, payload_hash)
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+            audit_payloads = tuple(
+                (
+                    await session.scalars(
+                        select(AuditEventModel.event_metadata).where(
+                            AuditEventModel.task_id == seed.task_id
+                        )
+                    )
+                ).all()
+            )
+            outbox_payloads = tuple(
+                (
+                    await session.scalars(
+                        select(OutboxEventModel.payload).where(
+                            OutboxEventModel.aggregate_id == seed.task_id
+                        )
+                    )
+                ).all()
+            )
+    finally:
+        await session_factory.dispose()
+    assert execution is not None
+    persisted = repr((execution.result_summary, audit_payloads, outbox_payloads))
+    assert sensitive_marker not in persisted
+    assert "provider_url" not in persisted
 
 
 @pytest.mark.asyncio

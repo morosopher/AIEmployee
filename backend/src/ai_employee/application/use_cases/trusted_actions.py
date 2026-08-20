@@ -47,6 +47,9 @@ from ai_employee.domain.actions import (
     MailDraftStatus,
     ProviderWriteOutcomeKind,
     ToolExecutionStatus,
+    durable_retry_summary_is_valid,
+    trusted_action_idempotency_key,
+    trusted_execution_binding_matches,
 )
 from ai_employee.domain.calendar_actions import NotificationPolicy, calendar_client_event_id
 from ai_employee.domain.connections import CapabilityStatus, canonical_provider_identity_key
@@ -211,17 +214,34 @@ class TrustedActionExecutionUseCase:
         ``reconciling`` 与异常的 claimed-with-start 只能调用只读 ``reconcile``。
         """
         _validate_lease_owner(lease_owner)
-        now = _utc_now(self._clock())
         snapshot: TrustedActionDispatchSnapshot | None = None
+        async with self._transactions() as transaction:
+            snapshot = await transaction.load_dispatch(
+                task_id=task_id,
+                approval_id=approval_id,
+                operation_id=operation_id,
+            )
+        if snapshot is None:
+            raise _trusted_action_unavailable()
+        status = snapshot.execution.status
+        if not _dispatch_execution_binding_is_valid(snapshot):
+            raise _trusted_action_unavailable()
+        if status in {
+            ToolExecutionStatus.SUCCEEDED,
+            ToolExecutionStatus.CONFIRMED_FAILED,
+            ToolExecutionStatus.NEEDS_ATTENTION,
+        }:
+            # 终态是已经提交的外部副作用结论；即使命令内容已按保留策略清除，或当前
+            # Worker 没有组装写 adapter，也只能复用结论，不能解密或改写既有事实。
+            return
+        if status is ToolExecutionStatus.RETRYABLE_FAILED and not (
+            snapshot.execution.request_started_at is not None
+            and snapshot.execution.write_attempt_count > 0
+            and durable_retry_summary_is_valid(snapshot.execution.result_summary)
+        ):
+            raise _trusted_action_unavailable()
         try:
             async with self._transactions() as transaction:
-                snapshot = await transaction.load_dispatch(
-                    task_id=task_id,
-                    approval_id=approval_id,
-                    operation_id=operation_id,
-                )
-                if snapshot is None:
-                    raise _trusted_action_unavailable()
                 command_payload = await transaction.load_command(
                     user_id=snapshot.user_id,
                     approval_id=snapshot.approval_id,
@@ -243,20 +263,18 @@ class TrustedActionExecutionUseCase:
             TypeError,
             ValueError,
         ):
-            if snapshot is None:
-                raise _trusted_action_unavailable() from None
             await self._persist_integrity_failure(
                 snapshot=snapshot,
-                failed_at=now,
+                failed_at=_utc_now(self._clock()),
                 lease_owner=lease_owner,
             )
             raise _trusted_action_unavailable() from None
         except StateConflictError as error:
-            if snapshot is None or error.error_code != "trusted_action_unavailable":
+            if error.error_code != "trusted_action_unavailable":
                 raise
             await self._persist_integrity_failure(
                 snapshot=snapshot,
-                failed_at=now,
+                failed_at=_utc_now(self._clock()),
                 lease_owner=lease_owner,
             )
             raise _trusted_action_unavailable() from None
@@ -265,14 +283,6 @@ class TrustedActionExecutionUseCase:
             provider=snapshot.provider,
             action=snapshot.action,
         )
-        status = snapshot.execution.status
-        if status in {
-            ToolExecutionStatus.SUCCEEDED,
-            ToolExecutionStatus.CONFIRMED_FAILED,
-            ToolExecutionStatus.NEEDS_ATTENTION,
-        }:
-            return
-
         from_reconciliation = status in {
             ToolExecutionStatus.EXECUTING,
             ToolExecutionStatus.RECONCILING,
@@ -290,7 +300,6 @@ class TrustedActionExecutionUseCase:
                 request_started = await transaction.mark_request_started(
                     snapshot=snapshot,
                     lease_owner=lease_owner,
-                    started_at=now,
                 )
             if not request_started:
                 # 另一个重放已提交 request-start 或当前 owner 已失去租约；两种情况都禁止
@@ -791,14 +800,34 @@ def _execution_capability_error(
 
 def _tool_idempotency_key(snapshot: TrustedActionExecutionSnapshot) -> str:
     """生成计划冻结的精确 action/task/approval/version/operation 幂等键。"""
-    return ":".join(
-        (
-            snapshot.action,
-            str(snapshot.task_id),
-            str(snapshot.approval_id),
-            str(snapshot.approval_version),
-            str(snapshot.operation_id),
-        )
+    return trusted_action_idempotency_key(
+        action=snapshot.action,
+        task_id=snapshot.task_id,
+        approval_id=snapshot.approval_id,
+        approval_version=snapshot.approval_version,
+        operation_id=snapshot.operation_id,
+    )
+
+
+def _dispatch_execution_binding_is_valid(snapshot: TrustedActionDispatchSnapshot) -> bool:
+    """在选择 execute/reconcile 前重证 dispatch DTO 的全部持久绑定。"""
+    execution = snapshot.execution
+    return execution.approval_id == snapshot.approval_id and trusted_execution_binding_matches(
+        execution_task_id=execution.task_id,
+        expected_task_id=snapshot.task_id,
+        execution_step_id=execution.step_id,
+        expected_step_id=snapshot.step_id,
+        execution_operation_id=execution.operation_id,
+        expected_operation_id=snapshot.operation_id,
+        execution_provider=execution.provider,
+        expected_provider=snapshot.provider,
+        execution_tool_name=execution.tool_name,
+        expected_action=snapshot.action,
+        execution_idempotency_key=execution.idempotency_key,
+        approval_id=snapshot.approval_id,
+        approval_version=snapshot.approval_version,
+        execution_payload_hash=execution.request_payload_hash,
+        expected_payload_hash=snapshot.payload_hash,
     )
 
 

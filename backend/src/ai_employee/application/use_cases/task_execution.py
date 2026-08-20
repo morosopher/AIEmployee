@@ -9,6 +9,7 @@ from typing import Protocol
 from uuid import UUID, uuid4
 
 from ai_employee.application.ports.observability import TaskMetricsObserver
+from ai_employee.domain.actions import DURABLE_RETRY_BACKOFF_CAP_SECONDS
 from ai_employee.domain.errors import DomainError, TransientProviderError
 from ai_employee.domain.tasks import JsonValue, TaskStatus
 
@@ -160,7 +161,7 @@ class DurableTaskRunner:
         max_transient_retries: int,
         resolve_steps: Callable[[LeasedTask], Sequence[TaskExecutionStep]],
         metrics: TaskMetricsObserver | None = None,
-        retry_backoff_cap: timedelta = timedelta(minutes=5),
+        retry_backoff_cap: timedelta = timedelta(seconds=DURABLE_RETRY_BACKOFF_CAP_SECONDS),
         retry_jitter: Callable[[int], timedelta] | None = None,
     ) -> None:
         """注入持久化、确定性时钟、预算与任务节点解析器。

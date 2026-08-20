@@ -2,10 +2,15 @@
 
 from collections.abc import Mapping
 from enum import StrEnum
+from hmac import compare_digest
 from types import MappingProxyType
-from typing import Final
+from typing import Final, TypeGuard
+from uuid import UUID
 
 from ai_employee.domain.errors import StateConflictError
+
+DURABLE_RETRY_BACKOFF_CAP_SECONDS: Final[int] = 300
+"""可信写结果与耐久任务退避共同使用的最大 Retry-After 秒数。"""
 
 
 class MailDraftStatus(StrEnum):
@@ -49,6 +54,118 @@ class ProviderWriteOutcomeKind(StrEnum):
     CONFIRMED_APPLIED = "confirmed_applied"
     CONFIRMED_NOT_APPLIED = "confirmed_not_applied"
     UNKNOWN = "unknown"
+
+
+def trusted_action_idempotency_key(
+    *,
+    action: str,
+    task_id: UUID,
+    approval_id: UUID,
+    approval_version: int,
+    operation_id: UUID,
+) -> str:
+    """生成冻结审批与单次操作共同绑定的稳定 ToolExecution 幂等键。
+
+    Args:
+        action: 四种已批准可信动作之一。
+        task_id: 承载该动作的 TaskRun 标识。
+        approval_id: 精确冻结命令的 ApprovalRequest 标识。
+        approval_version: 已批准且不可变的审批版本。
+        operation_id: 命令内绑定的单次操作标识。
+
+    Returns:
+        与 M2 规格一致的五段冒号分隔物理键。
+    """
+    return ":".join(
+        (
+            action,
+            str(task_id),
+            str(approval_id),
+            str(approval_version),
+            str(operation_id),
+        )
+    )
+
+
+def trusted_execution_binding_matches(
+    *,
+    execution_task_id: object,
+    expected_task_id: UUID,
+    execution_step_id: object,
+    expected_step_id: UUID,
+    execution_operation_id: object,
+    expected_operation_id: UUID,
+    execution_provider: object,
+    expected_provider: str,
+    execution_tool_name: object,
+    expected_action: str,
+    execution_idempotency_key: object,
+    approval_id: UUID,
+    approval_version: int,
+    execution_payload_hash: object,
+    expected_payload_hash: str,
+) -> bool:
+    """验证 ToolExecution 仍精确绑定当前审批、步骤、命令哈希和供应商。
+
+    该纯规则同时供应用层 dispatch 选择与锁内 Repository CAS 使用。两层都从各自
+    已读取的事实重新计算幂等键，不能把一条仅状态名相同、但已换绑步骤、动作、
+    provider、operation 或 payload 的行提升为真实写授权。
+
+    Returns:
+        全部绑定及规范 SHA-256 精确匹配时为 ``True``，否则 fail closed。
+    """
+    expected_idempotency_key = trusted_action_idempotency_key(
+        action=expected_action,
+        task_id=expected_task_id,
+        approval_id=approval_id,
+        approval_version=approval_version,
+        operation_id=expected_operation_id,
+    )
+    return (
+        execution_task_id == expected_task_id
+        and execution_step_id == expected_step_id
+        and execution_operation_id == expected_operation_id
+        and execution_provider == expected_provider
+        and execution_tool_name == expected_action
+        and execution_idempotency_key == expected_idempotency_key
+        and _canonical_sha256(execution_payload_hash)
+        and _canonical_sha256(expected_payload_hash)
+        and compare_digest(execution_payload_hash, expected_payload_hash)
+    )
+
+
+def durable_retry_summary_is_valid(summary: object) -> bool:
+    """判断持久结果是否精确证明上次写入未应用且允许安全重试。
+
+    JSONB 只接受 ``kind``、``retryable`` 与可选 ``retry_after_seconds`` 三个键；
+    多余键、布尔伪装整数、负数或超过统一五分钟上限都会拒绝。该证明必须与
+    ``retryable_failed`` 状态一起存在，单独的状态字符串不能授权再次写入。
+    """
+    if type(summary) is not dict:
+        return False
+    allowed_keys = {"kind", "retryable", "retry_after_seconds"}
+    required_keys = {"kind", "retryable"}
+    summary_keys = set(summary)
+    if not summary_keys.issubset(allowed_keys) or not required_keys.issubset(summary_keys):
+        return False
+    if (
+        summary["kind"] != ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value
+        or summary["retryable"] is not True
+    ):
+        return False
+    retry_after = summary.get("retry_after_seconds")
+    return retry_after is None or (
+        type(retry_after) is int and 0 <= retry_after <= DURABLE_RETRY_BACKOFF_CAP_SECONDS
+    )
+
+
+def _canonical_sha256(value: object) -> TypeGuard[str]:
+    """只接受小写十六进制 SHA-256，供常量时间绑定比较前收窄。"""
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 class ExecutionDirective(StrEnum):
@@ -103,33 +220,33 @@ class InvalidProviderWriteOutcome(StateConflictError):
 
 
 # 两层不可变结构确保运行期代码不能扩大邮件草稿状态图。
-MAIL_DRAFT_ALLOWED_TRANSITIONS: Final[
-    Mapping[MailDraftStatus, frozenset[MailDraftStatus]]
-] = MappingProxyType(
-    {
-        MailDraftStatus.EDITING: frozenset(
-            {MailDraftStatus.AWAITING_APPROVAL, MailDraftStatus.CANCELLED}
-        ),
-        MailDraftStatus.AWAITING_APPROVAL: frozenset(
-            {
-                MailDraftStatus.EXECUTING,
-                MailDraftStatus.EDITING,
-                MailDraftStatus.CANCELLED,
-            }
-        ),
-        MailDraftStatus.EXECUTING: frozenset(
-            {
-                MailDraftStatus.SENT,
-                MailDraftStatus.EDITING,
-                MailDraftStatus.NEEDS_ATTENTION,
-            }
-        ),
-        MailDraftStatus.SENT: frozenset(),
-        MailDraftStatus.NEEDS_ATTENTION: frozenset(
-            {MailDraftStatus.SENT, MailDraftStatus.EDITING}
-        ),
-        MailDraftStatus.CANCELLED: frozenset(),
-    }
+MAIL_DRAFT_ALLOWED_TRANSITIONS: Final[Mapping[MailDraftStatus, frozenset[MailDraftStatus]]] = (
+    MappingProxyType(
+        {
+            MailDraftStatus.EDITING: frozenset(
+                {MailDraftStatus.AWAITING_APPROVAL, MailDraftStatus.CANCELLED}
+            ),
+            MailDraftStatus.AWAITING_APPROVAL: frozenset(
+                {
+                    MailDraftStatus.EXECUTING,
+                    MailDraftStatus.EDITING,
+                    MailDraftStatus.CANCELLED,
+                }
+            ),
+            MailDraftStatus.EXECUTING: frozenset(
+                {
+                    MailDraftStatus.SENT,
+                    MailDraftStatus.EDITING,
+                    MailDraftStatus.NEEDS_ATTENTION,
+                }
+            ),
+            MailDraftStatus.SENT: frozenset(),
+            MailDraftStatus.NEEDS_ATTENTION: frozenset(
+                {MailDraftStatus.SENT, MailDraftStatus.EDITING}
+            ),
+            MailDraftStatus.CANCELLED: frozenset(),
+        }
+    )
 )
 
 # 日历使用独立映射，避免邮件误用 ``applied`` 或日历误用 ``sent``。
@@ -172,6 +289,7 @@ CALENDAR_PROPOSAL_ALLOWED_TRANSITIONS: Final[
         CalendarProposalStatus.CANCELLED: frozenset(),
     }
 )
+
 
 def directive_for_outcome(
     outcome: ProviderWriteOutcomeKind,

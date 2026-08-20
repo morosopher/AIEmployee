@@ -15,7 +15,10 @@ from ai_employee.application.ports.trusted_actions import (
     ProviderWriteOutcome,
 )
 from ai_employee.application.use_cases.trusted_actions import TrustedActionGraphFacts
-from ai_employee.domain.actions import ProviderWriteOutcomeKind
+from ai_employee.domain.actions import (
+    ProviderWriteOutcomeKind,
+    durable_retry_summary_is_valid,
+)
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 
@@ -257,6 +260,119 @@ def test_provider_write_outcome_rejects_retry_after_outside_safe_not_applied_cas
         error_code="provider_busy",
     )
     assert safe.retry_after_seconds == 30
+
+
+@pytest.mark.parametrize(
+    ("retry_after_seconds", "accepted"),
+    [
+        (300, True),
+        (301, False),
+        (10**20, False),
+        (10**400, False),
+        (True, False),
+        (-1, False),
+    ],
+)
+def test_provider_write_outcome_enforces_durable_retry_cap(
+    retry_after_seconds: object,
+    accepted: bool,
+) -> None:
+    """Retry-After 必须在进入持久重试状态前受统一五分钟上限约束。"""
+
+    def build() -> ProviderWriteOutcome:
+        """构造唯一允许携带 Retry-After 的明确未应用结果。"""
+        return ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED,
+            retryable=True,
+            retry_after_seconds=retry_after_seconds,  # type: ignore[arg-type]
+            provider_resource_id=None,
+            provider_request_id="synthetic-request",
+            correlation_id="synthetic-correlation",
+            provider_url=None,
+            error_code="provider_busy",
+        )
+
+    if accepted:
+        assert build().retry_after_seconds == 300
+    else:
+        with pytest.raises((TypeError, ValueError), match="retry_after_seconds"):
+            build()
+
+
+@pytest.mark.parametrize(
+    ("summary", "accepted"),
+    [
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": 0,
+            },
+            True,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": 300,
+            },
+            True,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": 301,
+            },
+            False,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": True,
+            },
+            False,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": -1,
+            },
+            False,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retryable": True,
+                "retry_after_seconds": 30,
+                "unexpected": "synthetic",
+            },
+            False,
+        ),
+        (
+            {
+                "kind": "confirmed_not_applied",
+                "retry_after_seconds": 30,
+            },
+            False,
+        ),
+        (
+            {
+                "retryable": True,
+                "retry_after_seconds": 30,
+            },
+            False,
+        ),
+    ],
+)
+def test_persisted_retry_summary_requires_exact_bounded_proof(
+    summary: object,
+    accepted: bool,
+) -> None:
+    """持久 retry 证明只接受关闭键集与统一五分钟边界内的普通整数。"""
+    assert durable_retry_summary_is_valid(summary) is accepted
 
 
 def test_registry_exposes_only_fixed_trusted_action_combinations() -> None:
