@@ -23,6 +23,8 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionDispatchSnapshot,
     TrustedActionExecutionSnapshot,
     TrustedActionSubmission,
+    durable_retry_summary_is_valid,
+    trusted_execution_binding_matches,
 )
 from ai_employee.application.use_cases.calendar_proposals import CalendarProposalContent
 from ai_employee.domain.actions import (
@@ -30,8 +32,6 @@ from ai_employee.domain.actions import (
     MailDraftStatus,
     ProviderWriteOutcomeKind,
     ToolExecutionStatus,
-    durable_retry_summary_is_valid,
-    trusted_execution_binding_matches,
 )
 from ai_employee.domain.connections import (
     CapabilityStatus,
@@ -565,7 +565,7 @@ class SqlAlchemyTrustedActionRepository:
         binding = await self._lock_action_binding(task=task, approval=approval)
         if binding is None:
             return None
-        connection_id, calendar_id = binding
+        connection_id, calendar_id, _ = binding
         user = await self._session.scalar(
             select(UserModel).where(UserModel.id == task.user_id).with_for_update()
         )
@@ -608,6 +608,11 @@ class SqlAlchemyTrustedActionRepository:
                 .with_for_update()
             )
             calendar_can_write = calendar.can_write if calendar is not None else False
+        # PostgreSQL 时间必须在固定锁序全部完成后采样；它与本事务看到的租约、审批
+        # deadline 和能力事实属于同一个授权瞬间，避免锁等待期间复用过时应用时钟。
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
+        if database_now is None:
+            return None
         try:
             task_status = TaskStatus(task.status)
             parsed_execution = (
@@ -624,6 +629,7 @@ class SqlAlchemyTrustedActionRepository:
             task_status=task_status,
             task_lease_owner=task.lease_owner,
             task_lease_expires_at=task.lease_expires_at,
+            database_now=database_now,
             step_id=approval.step_id,
             approval_id=approval.id,
             approval_version=approval.version,
@@ -793,7 +799,7 @@ class SqlAlchemyTrustedActionRepository:
         approval_id: UUID,
         operation_id: UUID,
     ) -> TrustedActionDispatchSnapshot | None:
-        """读取 claim 后 dispatch 所需最小绑定；完整命令仍保持加密。"""
+        """先读终态最小事实，非终态再加载本地动作、连接与加密命令绑定。"""
         task = await self._session.get(TaskRunModel, task_id)
         approval = await self._session.scalar(
             select(ApprovalRequestModel).where(
@@ -817,9 +823,39 @@ class SqlAlchemyTrustedActionRepository:
             or not _task_operation_matches(task, operation_id)
         ):
             return None
-        connection_id = await self._action_connection_id(task=task, approval=approval)
-        if connection_id is None:
+        try:
+            reference = _execution_reference(execution=execution, approval_id=approval.id)
+        except ValueError:
             return None
+        if reference.status in {
+            ToolExecutionStatus.SUCCEEDED,
+            ToolExecutionStatus.CONFIRMED_FAILED,
+            ToolExecutionStatus.NEEDS_ATTENTION,
+        }:
+            # 外部副作用结论只依赖 Task/Approval/ToolExecution 的内容无关绑定。
+            # 本地动作、连接或审批密文按保留策略清理后仍不得触发解密或 adapter lookup。
+            return TrustedActionDispatchSnapshot(
+                user_id=task.user_id,
+                task_id=task.id,
+                step_id=approval.step_id,
+                approval_id=approval.id,
+                approval_version=approval.version,
+                operation_id=operation_id,
+                connection_id=None,
+                calendar_id=None,
+                action=approval.action,
+                schema_version=approval.schema_version,
+                payload_hash=approval.payload_hash,
+                proposal_kind=approval.proposal_kind or "",
+                proposal_id=approval.proposal_id,
+                proposal_version=approval.proposal_version,
+                provider=reference.provider,
+                execution=reference,
+            )
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        if binding is None:
+            return None
+        connection_id, calendar_id, _ = binding
         connection_provider = await self._session.scalar(
             select(OAuthConnectionModel.provider).where(
                 OAuthConnectionModel.id == connection_id,
@@ -827,10 +863,6 @@ class SqlAlchemyTrustedActionRepository:
             )
         )
         if connection_provider is None:
-            return None
-        try:
-            reference = _execution_reference(execution=execution, approval_id=approval.id)
-        except ValueError:
             return None
         return TrustedActionDispatchSnapshot(
             user_id=task.user_id,
@@ -840,6 +872,7 @@ class SqlAlchemyTrustedActionRepository:
             approval_version=approval.version,
             operation_id=operation_id,
             connection_id=connection_id,
+            calendar_id=calendar_id,
             action=approval.action,
             schema_version=approval.schema_version,
             payload_hash=approval.payload_hash,
@@ -859,10 +892,10 @@ class SqlAlchemyTrustedActionRepository:
         """按固定锁序并以 PostgreSQL 权威时钟提交唯一 request-start。
 
         调用方时间可能在命令解密或行锁等待期间变旧，因此它绝不能授权外部写入。本事务
-        依次锁定 TaskRun、ApprovalRequest、ToolExecution、User 与 OAuthConnection，随后
-        才读取 ``clock_timestamp()``；只有当前 owner 的 RUNNING 租约在该数据库瞬间仍
-        严格有效，且执行 provider 仍绑定冻结 connection，才能递增真实写尝试计数并把
-        执行推进到 ``executing``。
+        依次锁定 TaskRun、ApprovalRequest、ToolExecution、本地草稿/提案、User 与
+        OAuthConnection，随后才读取 ``clock_timestamp()``；只有当前 owner 的 RUNNING
+        租约仍有效，且审批、本地版本、连接、日历及执行 provider 都保持冻结绑定，才能
+        递增真实写尝试计数并把执行推进到 ``executing``。
         """
         task = await self._session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == snapshot.task_id).with_for_update()
@@ -883,16 +916,25 @@ class SqlAlchemyTrustedActionRepository:
             )
             .with_for_update()
         )
+        binding = (
+            await self._lock_action_binding(task=task, approval=approval)
+            if task is not None and approval is not None
+            else None
+        )
         user = await self._session.scalar(
             select(UserModel).where(UserModel.id == snapshot.user_id).with_for_update()
         )
-        connection = await self._session.scalar(
-            select(OAuthConnectionModel)
-            .where(
-                OAuthConnectionModel.id == snapshot.connection_id,
-                OAuthConnectionModel.user_id == snapshot.user_id,
+        connection = (
+            await self._session.scalar(
+                select(OAuthConnectionModel)
+                .where(
+                    OAuthConnectionModel.id == snapshot.connection_id,
+                    OAuthConnectionModel.user_id == snapshot.user_id,
+                )
+                .with_for_update()
             )
-            .with_for_update()
+            if snapshot.connection_id is not None
+            else None
         )
         database_now = await self._session.scalar(select(func.clock_timestamp()))
         if (
@@ -908,14 +950,27 @@ class SqlAlchemyTrustedActionRepository:
             or database_now is None
             or task.lease_expires_at <= database_now
             or execution is None
+            or binding is None
         ):
             return False
+        action_connection_id, action_calendar_id, action_status = binding
         if (
             task.user_id != snapshot.user_id
             or not _task_operation_matches(task, snapshot.operation_id)
             or approval.step_id != snapshot.execution.step_id
             or approval.action != snapshot.action
+            or approval.schema_version != snapshot.schema_version
             or approval.version != snapshot.approval_version
+            or approval.proposal_kind != snapshot.proposal_kind
+            or approval.proposal_id != snapshot.proposal_id
+            or approval.proposal_version != snapshot.proposal_version
+            or action_connection_id != snapshot.connection_id
+            or action_calendar_id != snapshot.calendar_id
+            or action_status
+            not in {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            }
             or not compare_digest(approval.payload_hash, snapshot.payload_hash)
             or not trusted_execution_binding_matches(
                 execution_task_id=execution.task_id,
@@ -967,9 +1022,10 @@ class SqlAlchemyTrustedActionRepository:
         outcome: ProviderWriteOutcome,
         completed_at: datetime,
         from_reconciliation: bool,
+        may_retry_write: bool,
         lease_owner: str,
     ) -> None:
-        """把 adapter 规范结果与任务/本地状态在同一事务收敛。"""
+        """按本轮持久重试预算把 adapter 结果与本地事实原子收敛。"""
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
@@ -1042,14 +1098,29 @@ class SqlAlchemyTrustedActionRepository:
                 )
             )
             event_type = outbox_topic = "tool.succeeded"
-        elif outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED and outcome.retryable:
+        elif (
+            outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+            and outcome.retryable
+            and may_retry_write
+        ):
             execution.status = ToolExecutionStatus.RETRYABLE_FAILED.value
             event_type = outbox_topic = "tool.retryable_failed"
-        elif outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED:
+        else:
+            if outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED:
+                terminal_error_code = (
+                    "task_retries_exhausted"
+                    if outcome.retryable
+                    else outcome.error_code or "provider_write_confirmed_not_applied"
+                )
+            else:
+                # Task 20 才会增加持久只读核对调度。Task 19 不能留下无人消费的
+                # reconciling/needs_attention 半状态，也绝不能把 unknown 当成可重试写。
+                terminal_error_code = "provider_write_outcome_unknown"
             execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+            execution.error_code = terminal_error_code
             execution.completed_at = completed_at
             task.status = TaskStatus.FAILED.value
-            task.error_code = outcome.error_code or "provider_write_confirmed_not_applied"
+            task.error_code = terminal_error_code
             task.finished_at = completed_at
             _clear_task_scheduling(task)
             await self._set_local_action_status(
@@ -1077,25 +1148,6 @@ class SqlAlchemyTrustedActionRepository:
                 )
             )
             event_type = outbox_topic = "tool.confirmed_failed"
-        else:
-            execution.status = ToolExecutionStatus.RECONCILING.value
-            task.status = TaskStatus.RECONCILING.value
-            task.error_code = "provider_write_outcome_unknown"
-            task.lease_owner = None
-            task.lease_expires_at = None
-            await self._set_local_action_status(
-                task=task,
-                approval=approval,
-                mail_status=MailDraftStatus.NEEDS_ATTENTION,
-                calendar_status=CalendarProposalStatus.NEEDS_ATTENTION,
-                allowed_current={
-                    MailDraftStatus.EXECUTING.value,
-                    CalendarProposalStatus.EXECUTING.value,
-                    MailDraftStatus.NEEDS_ATTENTION.value,
-                    CalendarProposalStatus.NEEDS_ATTENTION.value,
-                },
-            )
-            event_type = outbox_topic = "tool.reconciling"
         audit = AuditEventModel(
             user_id=task.user_id,
             task_id=task.id,
@@ -1254,8 +1306,8 @@ class SqlAlchemyTrustedActionRepository:
         *,
         task: TaskRunModel,
         approval: ApprovalRequestModel,
-    ) -> tuple[UUID, str | None] | None:
-        """在 ToolExecution 之后锁定审批绑定的当前本地动作并返回连接/日历。"""
+    ) -> tuple[UUID, str | None, str] | None:
+        """在 ToolExecution 后锁定本地动作并返回连接、日历和当前状态。"""
         if (
             approval.proposal_id is None
             or approval.proposal_version is None
@@ -1273,7 +1325,7 @@ class SqlAlchemyTrustedActionRepository:
             )
             if draft is None or draft.current_version != approval.proposal_version:
                 return None
-            return draft.connection_id, None
+            return draft.connection_id, None, draft.status
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel)
             .where(
@@ -1284,7 +1336,7 @@ class SqlAlchemyTrustedActionRepository:
         )
         if proposal is None or proposal.current_version != approval.proposal_version:
             return None
-        return proposal.connection_id, proposal.calendar_id
+        return proposal.connection_id, proposal.calendar_id, proposal.status
 
     async def _action_connection_id(
         self,

@@ -38,6 +38,7 @@ class TrustedActionTaskStep:
         approval_store: ApprovalProposalStore,
         resume: str | None,
         checkpoint_database_url: str,
+        max_transient_retries: int,
     ) -> None:
         """保存一次消息共享的执行用例、审批 checkpoint 端口和恢复决定。
 
@@ -46,16 +47,20 @@ class TrustedActionTaskStep:
             approval_store: 只用于确认 ``__interrupt__`` 已持久化并暂停任务。
             resume: Outbox 中内容无关的唤醒值；授权决定仍由 Graph 重读 PostgreSQL。
             checkpoint_database_url: AsyncPostgresSaver 使用的 PostgreSQL URL。
+            max_transient_retries: 首次尝试后允许的耐久安全写重试次数。
 
         Raises:
             ValueError: resume 不是空、approved 或 rejected。
         """
         if resume is not None and resume not in {"approved", "rejected"}:
             raise ValueError("resume must be approved, rejected, or None")
+        if max_transient_retries < 0:
+            raise ValueError("max_transient_retries must not be negative")
         self._workflow = workflow
         self._approval_store = approval_store
         self._resume = resume
         self._checkpoint_database_url = checkpoint_database_url
+        self._max_transient_retries = max_transient_retries
 
     async def execute(self, task: LeasedTask) -> None:
         """使用当前租约 owner 调用 Graph，并把持久中断转为 Runner 控制流。
@@ -72,7 +77,14 @@ class TrustedActionTaskStep:
         """
         approval_id, operation_id = _trusted_action_identifiers(task.input_payload)
         lease_owner = task.lease_owner or ""
-        graph = TrustedActionGraph(workflow=self._workflow, lease_owner=lease_owner)
+        # 与 DurableTaskRunner 使用同一 PostgreSQL attempt_count 语义；第二次及后续
+        # 明确未应用结果只有在剩余预算内才可再次形成 retry_scheduled 写授权。
+        may_retry_write = task.attempt_count <= self._max_transient_retries
+        graph = TrustedActionGraph(
+            workflow=self._workflow,
+            lease_owner=lease_owner,
+            may_retry_write=may_retry_write,
+        )
         async with postgres_checkpointer(self._checkpoint_database_url) as saver:
             compiled = graph.compile(checkpointer=saver)
             config = {"configurable": {"thread_id": str(task.task_id)}}
@@ -104,6 +116,7 @@ def build_trusted_action_task_step(
     settings: Settings,
     approval_store: ApprovalProposalStore,
     resume: str | None,
+    max_transient_retries: int,
     adapters: TrustedActionAdapterRegistry | None = None,
 ) -> TrustedActionTaskStep:
     """用消息级数据库工厂和主密钥构造可信动作 Graph step。
@@ -113,6 +126,7 @@ def build_trusted_action_task_step(
         settings: 已验证进程配置，提供三层写门禁、checkpoint URL 与主密钥文件。
         approval_store: 与分类查询共享的审批 checkpoint 端口。
         resume: 内容无关的审批唤醒值；授权决定仍由 Graph 重读 PostgreSQL。
+        max_transient_retries: 与外层 DurableTaskRunner 相同的耐久临时重试上限。
         adapters: 测试或后续供应商任务显式注入的固定真实动作注册表。省略时使用
             空注册表，使尚未组装真实 adapter 的进程在 claim 前安全失败。
 
@@ -140,6 +154,7 @@ def build_trusted_action_task_step(
         approval_store=approval_store,
         resume=resume,
         checkpoint_database_url=settings.checkpoint_database_url,
+        max_transient_retries=max_transient_retries,
     )
 
 

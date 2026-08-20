@@ -410,6 +410,7 @@ async def execute_task(
                                     settings=settings,
                                     approval_store=approval_store,
                                     resume=resume,
+                                    max_transient_retries=DEFAULT_RETRY_COUNT,
                                 ),
                             ),
                         )

@@ -13,12 +13,10 @@ from ai_employee.application.ports.trusted_actions import (
     ApprovalPreflightResult,
     ExecutionReference,
     ProviderWriteOutcome,
-)
-from ai_employee.application.use_cases.trusted_actions import TrustedActionGraphFacts
-from ai_employee.domain.actions import (
-    ProviderWriteOutcomeKind,
     durable_retry_summary_is_valid,
 )
+from ai_employee.application.use_cases.trusted_actions import TrustedActionGraphFacts
+from ai_employee.domain.actions import ProviderWriteOutcomeKind
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 
@@ -119,9 +117,11 @@ class _RecordingWorkflow:
         operation_id: UUID,
         expected_payload_hash: str,
         lease_owner: str,
+        may_retry_write: bool,
     ) -> None:
         """记录持久认领后的执行节点；测试假实现不携带命令内容。"""
         del task_id, approval_id, operation_id, expected_payload_hash, lease_owner
+        assert may_retry_write is True
         self.calls.append("execute_or_reconcile")
 
     async def finalize(

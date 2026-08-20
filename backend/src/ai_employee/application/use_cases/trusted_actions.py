@@ -41,15 +41,15 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionSubmissionResult,
     TrustedActionSubmissionTransactionFactory,
     TrustedActionWritePolicy,
+    durable_retry_summary_is_valid,
+    trusted_action_idempotency_key,
+    trusted_execution_binding_matches,
 )
 from ai_employee.domain.actions import (
     CalendarProposalStatus,
     MailDraftStatus,
     ProviderWriteOutcomeKind,
     ToolExecutionStatus,
-    durable_retry_summary_is_valid,
-    trusted_action_idempotency_key,
-    trusted_execution_binding_matches,
 )
 from ai_employee.domain.calendar_actions import NotificationPolicy, calendar_client_event_id
 from ai_employee.domain.connections import CapabilityStatus, canonical_provider_identity_key
@@ -147,7 +147,6 @@ class TrustedActionExecutionUseCase:
         授权失败需要与任务/审批状态原子持久化时，方法先正常退出事务使失败事实提交，
         再向 Graph 抛出稳定冲突；因此不会因异常触发上下文回滚而遗失失效记录。
         """
-        now = _utc_now(self._clock())
         _validate_lease_owner(lease_owner)
         deferred_error: StateConflictError | None = None
         async with self._transactions() as transaction:
@@ -158,6 +157,9 @@ class TrustedActionExecutionUseCase:
             )
             if snapshot is None:
                 raise _trusted_action_unavailable()
+            # 首次授权必须使用全部行锁取得后的 PostgreSQL 权威时间。应用时钟可能在
+            # 等锁期间跨过租约或审批截止点，不能作为创建外部写授权事实的依据。
+            now = _utc_now(snapshot.database_now)
             if not _payload_hashes_match(snapshot.payload_hash, expected_payload_hash):
                 deferred_error = _trusted_action_unavailable()
             elif snapshot.execution is not None:
@@ -206,6 +208,7 @@ class TrustedActionExecutionUseCase:
         operation_id: UUID,
         expected_payload_hash: str,
         lease_owner: str,
+        may_retry_write: bool = True,
     ) -> None:
         """从持久 ToolExecution 选择首次写、明确安全重试、只读核对或终态复用。
 
@@ -214,6 +217,8 @@ class TrustedActionExecutionUseCase:
         ``reconciling`` 与异常的 claimed-with-start 只能调用只读 ``reconcile``。
         """
         _validate_lease_owner(lease_owner)
+        if type(may_retry_write) is not bool:
+            raise TypeError("may_retry_write must be bool")
         snapshot: TrustedActionDispatchSnapshot | None = None
         async with self._transactions() as transaction:
             snapshot = await transaction.load_dispatch(
@@ -318,9 +323,14 @@ class TrustedActionExecutionUseCase:
                 outcome=outcome,
                 completed_at=completed_at,
                 from_reconciliation=from_reconciliation,
+                may_retry_write=may_retry_write,
                 lease_owner=lease_owner,
             )
-        if outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED and outcome.retryable:
+        if (
+            outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+            and outcome.retryable
+            and may_retry_write
+        ):
             # 先提交明确“未应用”结果，再让 DurableTaskRunner 写入唯一 retry_scheduled
             # Outbox。只有该持久状态允许下一轮重新进入 adapter.execute。
             raise TransientProviderError(
@@ -718,11 +728,15 @@ def _validated_dispatch_command(
         ):
             raise _TrustedActionIntegrityError
     elif snapshot.proposal_kind == "calendar_proposal":
-        if command.action not in {
-            "calendar.create",
-            "calendar.update",
-            "calendar.restore",
-        }:
+        if (
+            command.action
+            not in {
+                "calendar.create",
+                "calendar.update",
+                "calendar.restore",
+            }
+            or getattr(command, "calendar_id", None) != snapshot.calendar_id
+        ):
             raise _TrustedActionIntegrityError
     else:
         raise _TrustedActionIntegrityError

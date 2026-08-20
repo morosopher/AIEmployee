@@ -256,6 +256,7 @@ def _runner(
                 approval_store=approval_store,
                 resume=resume,
                 checkpoint_database_url=checkpoint_database_url,
+                max_transient_retries=0,
             ),
         ),
     )
@@ -696,6 +697,7 @@ async def test_default_worker_registry_fails_before_claim_when_no_write_adapter_
                     settings=settings,
                     approval_store=approval_store,
                     resume=resume,
+                    max_transient_retries=0,
                     adapters=adapters,
                 ),
             ),

@@ -63,6 +63,7 @@ class TrustedActionGraphWorkflow(Protocol):
         operation_id: UUID,
         expected_payload_hash: str,
         lease_owner: str,
+        may_retry_write: bool,
     ) -> None:
         """从 ToolExecution 持久事实选择写入、只读核对或终态复用。"""
 
@@ -82,20 +83,30 @@ class TrustedActionGraphWorkflow(Protocol):
 class TrustedActionGraph:
     """把持久审批、claim 和 provider dispatch 排成固定五节点工作流。"""
 
-    def __init__(self, *, workflow: TrustedActionGraphWorkflow, lease_owner: str) -> None:
+    def __init__(
+        self,
+        *,
+        workflow: TrustedActionGraphWorkflow,
+        lease_owner: str,
+        may_retry_write: bool = True,
+    ) -> None:
         """保存应用用例与当前进程租约 owner，禁止把 owner checkpoint 化。
 
         Args:
             workflow: 所有业务校验与持久副作用所在的应用用例。
             lease_owner: 当前 DurableTaskRunner 获得的租约 owner。
+            may_retry_write: 当前 PostgreSQL 尝试次数仍位于耐久重试预算内时为真。
 
         Raises:
             ValueError: owner 为空或含首尾空白。
         """
         if not lease_owner or lease_owner != lease_owner.strip():
             raise ValueError("lease_owner must be a nonempty unpadded string")
+        if type(may_retry_write) is not bool:
+            raise TypeError("may_retry_write must be bool")
         self._workflow = workflow
         self._lease_owner = lease_owner
+        self._may_retry_write = may_retry_write
 
     async def load_approval(self, state: TrustedActionState) -> dict[str, object]:
         """从 PostgreSQL 重读冻结哈希与决定，不解密任何命令。"""
@@ -153,6 +164,7 @@ class TrustedActionGraph:
             operation_id=identifiers.operation_id,
             expected_payload_hash=identifiers.expected_payload_hash,
             lease_owner=self._lease_owner,
+            may_retry_write=self._may_retry_write,
         )
         return {"messages": [*state["messages"], "tool outcome persisted"]}
 
