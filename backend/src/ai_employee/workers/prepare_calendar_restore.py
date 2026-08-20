@@ -194,11 +194,12 @@ class PrepareCalendarRestoreTaskStep:
                 )
             proposals = SqlAlchemyCalendarProposalRepository(session, self._action_cipher)
             calendar = SqlAlchemyCalendarSyncRepository(session, self._source_cipher)
-            # source/target 必须在供应商 GET 后重新读取；若期间被删除、换绑或撤权，
-            # create_restore 会在同一事务中 fail closed，绝不提交陈旧读取结果。
-            refreshed_source = await proposals.get_restore_source(
+            # source/target 必须在供应商 GET 后按新的 write_now 重新锁定并验证；若期间
+            # 生命周期、保留密文或本地精确事件绑定变化，绝不提交陈旧读取结果。
+            refreshed_source = await proposals.get_eligible_restore_source(
                 user_id=user_id,
                 source_snapshot_id=persisted_snapshot_id,
+                now=write_now,
             )
             if refreshed_source != read_plan.source:
                 raise CalendarProposalNotFoundError
@@ -239,9 +240,10 @@ class PrepareCalendarRestoreTaskStep:
                 return None
             source_snapshot_id, creation_key = _restore_input(task_row.input_payload)
             proposals = SqlAlchemyCalendarProposalRepository(session, self._action_cipher)
-            source = await proposals.get_restore_source(
+            source = await proposals.get_eligible_restore_source(
                 user_id=user_id,
                 source_snapshot_id=source_snapshot_id,
+                now=read_now,
             )
             if source is None:
                 raise CalendarProposalNotFoundError

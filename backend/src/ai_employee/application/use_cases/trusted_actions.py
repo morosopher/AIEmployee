@@ -39,6 +39,10 @@ APPROVAL_COMMAND_CONTENT_KIND = "approval_command"
 APPROVAL_TTL = timedelta(minutes=10)
 
 
+class CalendarProposalSubmissionNotFoundError(Exception):
+    """表示日历提交事务按用户锁定时未找到提案，供 API 统一隐藏归属。"""
+
+
 class SubmitMailDraftUseCase:
     """冻结当前邮件草稿版本为精确 ``mail.send`` 加密审批。"""
 
@@ -256,7 +260,9 @@ class SubmitCalendarProposalUseCase:
                 proposal_id=proposal_id,
             )
             if snapshot is None:
-                raise _version_conflict("proposal_version_conflict")
+                # 不存在与跨用户都由用户范围锁查询收敛到同一信号；API 可以据此返回
+                # 404，而无需在独立原子提交事务外再持有一个请求级 CRUD 事务。
+                raise CalendarProposalSubmissionNotFoundError
             _validate_calendar_snapshot(snapshot, expected_version=expected_version)
             _validate_write_gate(
                 provider=snapshot.provider,
@@ -350,9 +356,7 @@ def _calendar_command_payload(
         "all_day": snapshot.all_day,
         "attendees": list(snapshot.attendees),
         "notification_policy": (
-            snapshot.notification_policy.value
-            if snapshot.notification_policy is not None
-            else None
+            snapshot.notification_policy.value if snapshot.notification_policy is not None else None
         ),
     }
     if snapshot.operation_kind == "create":
@@ -582,4 +586,8 @@ def _provider_action_unavailable() -> StateConflictError:
     )
 
 
-__all__ = ["SubmitCalendarProposalUseCase", "SubmitMailDraftUseCase"]
+__all__ = [
+    "CalendarProposalSubmissionNotFoundError",
+    "SubmitCalendarProposalUseCase",
+    "SubmitMailDraftUseCase",
+]

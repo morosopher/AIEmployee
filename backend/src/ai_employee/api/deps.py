@@ -57,8 +57,16 @@ from ai_employee.integrations.google.oauth import (
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 
 if TYPE_CHECKING:
+    from ai_employee.application.use_cases.calendar_proposals import (
+        CalendarProposalUseCase,
+        CalendarRestoreEnqueueUseCase,
+    )
     from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
-    from ai_employee.application.use_cases.trusted_actions import SubmitMailDraftUseCase
+    from ai_employee.application.use_cases.settings import UpdateUserSettings
+    from ai_employee.application.use_cases.trusted_actions import (
+        SubmitCalendarProposalUseCase,
+        SubmitMailDraftUseCase,
+    )
 
 CSRF_COOKIE_NAME = "ai_employee_csrf"
 _LOGGER = logging.getLogger(__name__)
@@ -441,6 +449,113 @@ async def get_mail_draft_use_case(request: Request) -> AsyncIterator["MailDraftU
         )
 
 
+async def get_calendar_proposal_use_case(
+    request: Request,
+) -> AsyncIterator["CalendarProposalUseCase"]:
+    """为普通日历提案 CRUD 创建一个短事务用例。
+
+    Secret 在请求进入后才读取；本依赖只用于创建、读取、编辑和取消。候选计算使用独立
+    ``get_calendar_availability_use_case``，避免在纯 CPU 算法期间持有数据库事务。
+    """
+    from ai_employee.application.use_cases.calendar_proposals import CalendarProposalUseCase
+    from ai_employee.infrastructure.db.repositories.calendar import (
+        SqlAlchemyCalendarSyncRepository,
+    )
+    from ai_employee.infrastructure.db.repositories.calendar_proposals import (
+        SqlAlchemyCalendarProposalRepository,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    source_cipher = AeadCipher.from_file(settings.app_master_key_file)
+    async with request.app.state.auth_session_factory.begin() as session:
+        yield CalendarProposalUseCase(
+            proposals=SqlAlchemyCalendarProposalRepository(
+                session,
+                ActionPayloadCipher(source_cipher),
+            ),
+            calendar=SqlAlchemyCalendarSyncRepository(session, source_cipher),
+            clock=get_auth_clock(request).now,
+        )
+
+
+async def get_calendar_availability_use_case(
+    request: Request,
+) -> AsyncIterator["CalendarProposalUseCase"]:
+    """组合不持有事务的候选用例；读/算/写由现有两短事务 adapter 分离。"""
+    from ai_employee.application.use_cases.calendar_proposals import CalendarProposalUseCase
+    from ai_employee.infrastructure.db.repositories.calendar import (
+        SqlAlchemyCalendarSyncRepository,
+    )
+    from ai_employee.infrastructure.db.repositories.calendar_availability import (
+        SqlAlchemyCalendarAvailabilityRepository,
+    )
+    from ai_employee.infrastructure.db.repositories.calendar_proposals import (
+        SqlAlchemyCalendarProposalRepository,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    source_cipher = AeadCipher.from_file(settings.app_master_key_file)
+    action_cipher = ActionPayloadCipher(source_cipher)
+    session_factory = request.app.state.auth_session_factory
+    # 普通 session 只为满足未使用的 CRUD 端口；不进入 ``begin``，候选 adapter 自己完成
+    # 短读提交、事务外 CPU 计算和短写 CAS。
+    async with session_factory() as session:
+        yield CalendarProposalUseCase(
+            proposals=SqlAlchemyCalendarProposalRepository(session, action_cipher),
+            calendar=SqlAlchemyCalendarSyncRepository(session, source_cipher),
+            availability=SqlAlchemyCalendarAvailabilityRepository(
+                session_factory,
+                action_cipher,
+            ),
+            clock=get_auth_clock(request).now,
+        )
+
+
+def get_calendar_restore_enqueue_use_case(
+    request: Request,
+) -> "CalendarRestoreEnqueueUseCase":
+    """惰性组合 source 验证与 TaskRun/Outbox 原子入队用例。"""
+    from ai_employee.application.use_cases.calendar_proposals import (
+        CalendarRestoreEnqueueUseCase,
+    )
+    from ai_employee.infrastructure.db.repositories.calendar_proposals import (
+        SqlAlchemyCalendarRestoreEnqueueRepositoryFactory,
+    )
+    from ai_employee.infrastructure.db.repositories.task_views import (
+        PostgresQueuedTaskDispatcher,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    session_factory = request.app.state.auth_session_factory
+    return CalendarRestoreEnqueueUseCase(
+        repositories=SqlAlchemyCalendarRestoreEnqueueRepositoryFactory(
+            session_factory,
+            ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file)),
+        ),
+        dispatcher=PostgresQueuedTaskDispatcher(session_factory),
+        clock=get_auth_clock(request).now,
+    )
+
+
+async def get_settings_use_case(
+    request: Request,
+) -> AsyncIterator["UpdateUserSettings"]:
+    """为设置 GET/PATCH 创建一个由请求拥有的短事务用例。"""
+    from ai_employee.application.use_cases.settings import UpdateUserSettings
+    from ai_employee.infrastructure.db.repositories.settings import (
+        SqlAlchemySettingsRepository,
+    )
+
+    async with request.app.state.auth_session_factory.begin() as session:
+        yield UpdateUserSettings(SqlAlchemySettingsRepository(session))
+
+
 def get_submit_mail_draft_use_case(request: Request) -> "SubmitMailDraftUseCase":
     """惰性组合原子邮件提交用例，并固定使用启动时冻结的 preflight registry。
 
@@ -459,6 +574,32 @@ def get_submit_mail_draft_use_case(request: Request) -> "SubmitMailDraftUseCase"
     settings = get_auth_settings(request)
     command_cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
     return SubmitMailDraftUseCase(
+        transactions=SqlAlchemyTrustedActionRepositoryFactory(
+            request.app.state.auth_session_factory,
+            command_cipher,
+        ),
+        preflights=request.app.state.trusted_action_preflight_registry,
+        write_policy=settings,
+        command_cipher=command_cipher,
+    )
+
+
+def get_submit_calendar_proposal_use_case(
+    request: Request,
+) -> "SubmitCalendarProposalUseCase":
+    """惰性组合日历提案冻结用例，复用可信审批的写门禁与 AEAD。"""
+    from ai_employee.application.use_cases.trusted_actions import (
+        SubmitCalendarProposalUseCase,
+    )
+    from ai_employee.infrastructure.db.repositories.trusted_actions import (
+        SqlAlchemyTrustedActionRepositoryFactory,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    command_cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
+    return SubmitCalendarProposalUseCase(
         transactions=SqlAlchemyTrustedActionRepositoryFactory(
             request.app.state.auth_session_factory,
             command_cipher,

@@ -1,77 +1,150 @@
-"""暴露用户简报偏好设置，并以 CSRF 保护所有修改。"""
+"""暴露完整用户工作设置，并以 CSRF 保护所有修改。"""
 
-from fastapi import APIRouter, Request
+from datetime import datetime, time
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ai_employee.api.deps import CsrfProtectedSession, CurrentSession
+from ai_employee.api.deps import (
+    CsrfProtectedSession,
+    CurrentSession,
+    get_settings_use_case,
+)
+from ai_employee.application.use_cases.settings import (
+    UpdateUserSettings,
+    UserSettingsView,
+    validate_working_hours_patch,
+)
 from ai_employee.domain.settings import (
     validate_brief_time,
     validate_locale,
+    validate_meeting_buffer,
     validate_retention,
     validate_timezone,
 )
-from ai_employee.infrastructure.db.models.identity import UserModel
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 
 
 class SettingsPatch(BaseModel):
-    """只允许本任务定义的六项用户偏好进行部分更新。"""
+    """允许部分更新 M1 保留设置与 M2 默认连接、工作时间和会议缓冲。"""
+
     model_config = ConfigDict(extra="forbid")
+
     timezone: str | None = None
     locale: str | None = None
     brief_time: str | None = None
-    email_body_retention_days: int | None = Field(default=None)
-    source_metadata_retention_days: int | None = Field(default=None)
-    workspace_history_retention_days: int | None = Field(default=None)
+    email_body_retention_days: int | None = None
+    source_metadata_retention_days: int | None = None
+    workspace_history_retention_days: int | None = None
+    default_mail_connection_id: UUID | None = None
+    default_calendar_connection_id: UUID | None = None
+    default_calendar_id: str | None = Field(default=None, min_length=1, max_length=512)
+    working_hours: dict[str, list[list[str]]] | None = None
+    meeting_buffer_minutes: int | None = Field(default=None, ge=0, le=120)
+
     @field_validator("timezone")
     @classmethod
-    def timezone_valid(cls, value: str | None) -> str | None: return validate_timezone(value) if value is not None else value
+    def timezone_valid(cls, value: str | None) -> str | None:
+        """验证显式 IANA 时区；``None`` 只表示字段未提供或不更新。"""
+        return validate_timezone(value) if value is not None else value
+
     @field_validator("locale")
     @classmethod
-    def locale_valid(cls, value: str | None) -> str | None: return validate_locale(value) if value is not None else value
+    def locale_valid(cls, value: str | None) -> str | None:
+        """规范 BCP47 风格 locale。"""
+        return validate_locale(value) if value is not None else value
+
     @field_validator("brief_time")
     @classmethod
-    def time_valid(cls, value: str | None) -> str | None: validate_brief_time(value) if value is not None else None; return value
-    @field_validator("email_body_retention_days", "source_metadata_retention_days", "workspace_history_retention_days")
+    def time_valid(cls, value: str | None) -> str | None:
+        """只接受零填充 HH:MM；持久层会保存为墙上 ``time``。"""
+        if value is not None:
+            validate_brief_time(value)
+        return value
+
+    @field_validator(
+        "email_body_retention_days",
+        "source_metadata_retention_days",
+        "workspace_history_retention_days",
+    )
     @classmethod
-    def retention_valid(cls, value: int | None) -> int | None: return validate_retention(value) if value is not None else value
+    def retention_valid(cls, value: int | None) -> int | None:
+        """限制三类保留期并拒绝 bool 等整数子类。"""
+        if value is not None:
+            if type(value) is not int:
+                raise ValueError("retention must be an integer")
+            return validate_retention(value)
+        return value
+
+    @field_validator("working_hours")
+    @classmethod
+    def working_hours_valid(
+        cls,
+        value: dict[str, list[list[str]]] | None,
+    ) -> dict[str, list[list[str]]] | None:
+        """允许任意已知星期子集，并规范化每个提交日内的不重叠区间。"""
+        if value is None:
+            return None
+        return validate_working_hours_patch(value)
+
+    @field_validator("meeting_buffer_minutes")
+    @classmethod
+    def meeting_buffer_valid(cls, value: int | None) -> int | None:
+        """限制会议前后共同使用的缓冲为 0～120 分钟。"""
+        return validate_meeting_buffer(value) if value is not None else value
 
 
 class SettingsResponse(BaseModel):
-    """设置的公开投影。"""
+    """设置的完整公开投影，工作时间固定覆盖星期一到星期日。"""
+
+    model_config = ConfigDict(extra="forbid")
+
     timezone: str
     locale: str
-    brief_time: object
+    brief_time: time
     email_body_retention_days: int
     source_metadata_retention_days: int
     workspace_history_retention_days: int
-    updated_at: object
+    default_mail_connection_id: UUID | None
+    default_calendar_connection_id: UUID | None
+    default_calendar_id: str | None
+    working_hours: dict[str, list[list[str]]]
+    meeting_buffer_minutes: int
+    updated_at: datetime
+
+
+def _settings_response(value: UserSettingsView) -> SettingsResponse:
+    """显式映射应用 DTO，防止未来设置字段未经审查自动公开。"""
+    return SettingsResponse.model_validate(value, from_attributes=True)
 
 
 def build_settings_router() -> APIRouter:
     """构建 settings GET/PATCH 路由。"""
     router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
-    async def load(request: Request, user_id: object) -> UserModel:
-        async with request.app.state.auth_session_factory() as session:
-            value = await session.get(UserModel, user_id)
-            if value is None: raise RuntimeError("authenticated user disappeared")
-            return value
+
     @router.get("", response_model=SettingsResponse)
-    async def get_settings(authenticated: CurrentSession, request: Request) -> SettingsResponse:
-        """返回当前用户已持久化偏好。"""
-        return SettingsResponse.model_validate(await load(request, authenticated.user.id), from_attributes=True)
+    async def get_settings(
+        authenticated: CurrentSession,
+        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case)],
+    ) -> SettingsResponse:
+        """返回当前用户已持久化且规范化的完整工作设置。"""
+        return _settings_response(await use_case.get(user_id=authenticated.user.id))
+
     @router.patch("", response_model=SettingsResponse)
-    async def patch_settings(payload: SettingsPatch, authenticated: CsrfProtectedSession, request: Request) -> SettingsResponse:
-        """原子更新所提供字段，并写入不含值的设置审计事件。"""
-        values = payload.model_dump(exclude_none=True)
-        if not values: return SettingsResponse.model_validate(await load(request, authenticated.user.id), from_attributes=True)
-        if "brief_time" in values: values["brief_time"] = validate_brief_time(values["brief_time"])
-        async with request.app.state.auth_session_factory.begin() as session:
-            user = await session.get(UserModel, authenticated.user.id, with_for_update=True)
-            if user is None: raise RuntimeError("authenticated user disappeared")
-            for key, value in values.items(): setattr(user, key, value)
-            session.add(AuditEventModel(user_id=authenticated.user.id, task_id=None, event_type="settings.updated", actor_type="user", actor_id=str(authenticated.user.id), event_metadata={"changed_fields": sorted(values)}))
-            await session.flush()
-            result = SettingsResponse.model_validate(user, from_attributes=True)
-        return result
+    async def patch_settings(
+        payload: SettingsPatch,
+        authenticated: CsrfProtectedSession,
+        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case)],
+    ) -> SettingsResponse:
+        """原子更新提供字段，并写入只包含字段名的设置审计事件。"""
+        value = await use_case.update(
+            user_id=authenticated.user.id,
+            values=payload.model_dump(exclude_unset=True),
+        )
+        return _settings_response(value)
+
     return router
+
+
+__all__ = ["SettingsPatch", "SettingsResponse", "build_settings_router"]

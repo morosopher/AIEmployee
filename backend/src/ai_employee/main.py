@@ -23,6 +23,7 @@ from ai_employee.api.deps import (
 from ai_employee.api.routers.approvals import build_approvals_router
 from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.briefs import build_briefs_router
+from ai_employee.api.routers.calendar import build_calendar_router
 from ai_employee.api.routers.connections import build_connections_router
 from ai_employee.api.routers.conversations import build_conversations_router
 from ai_employee.api.routers.mail import build_mail_router
@@ -198,6 +199,7 @@ def create_app(
 
     app.include_router(build_auth_router())
     app.include_router(build_connections_router())
+    app.include_router(build_calendar_router())
     app.include_router(build_privacy_router())
     app.include_router(build_briefs_router())
     app.include_router(build_conversations_router())

@@ -21,6 +21,9 @@ from ai_employee.application.ports.encryption import (
     EncryptionBoundaryError,
     EncryptionKeyVersionError,
 )
+from ai_employee.application.use_cases.calendar_proposals import (
+    CalendarProposalNotFoundError,
+)
 from ai_employee.application.use_cases.task_execution import (
     DurableTaskRunner,
     LeasedTask,
@@ -66,6 +69,7 @@ CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000932")
 SOURCE_PROPOSAL_ID = UUID("00000000-0000-0000-0000-000000000933")
 SOURCE_DESIRED_ID = UUID("00000000-0000-0000-0000-000000000934")
 SOURCE_BEFORE_ID = UUID("00000000-0000-0000-0000-000000000935")
+SOURCE_LOCAL_EVENT_ID = UUID("00000000-0000-0000-0000-000000000936")
 CALENDAR_ID = "synthetic-calendar"
 PROVIDER_EVENT_ID = "synthetic-provider-event"
 NOW = datetime(2030, 3, 11, 8, tzinfo=UTC)
@@ -129,9 +133,7 @@ def test_precise_calendar_reader_imports_and_calls_shared_framed_aad_v2() -> Non
     }
     assert "calendar_event_field_aad_v2" in imported
     assert calls
-    assert all(
-        {keyword.arg for keyword in call.keywords} == expected_keywords for call in calls
-    )
+    assert all({keyword.arg for keyword in call.keywords} == expected_keywords for call in calls)
 
 
 @dataclass(slots=True)
@@ -425,9 +427,7 @@ def test_precise_calendar_reader_rejects_delimiter_collision_identity_swap_once(
 def test_precise_calendar_reader_rejects_colon_legacy_ciphertext_marked_as_v2_once() -> None:
     """使用历史 colon AAD 生成的密文即使伪标 v2，也必须要求重同步。"""
     real_cipher = AeadCipher(b"l" * 32)
-    legacy_aad = (
-        f"{USER_ID}:{CONNECTION_ID}:{PROVIDER_EVENT_ID}:description".encode("ascii")
-    )
+    legacy_aad = f"{USER_ID}:{CONNECTION_ID}:{PROVIDER_EVENT_ID}:description".encode("ascii")
     encrypted = real_cipher.encrypt(b"legacy-bound", legacy_aad)
     persisted = _PersistedCalendarFieldEvent(
         description_ciphertext=encrypted.ciphertext,
@@ -599,6 +599,9 @@ async def _seed_restore_source(  # type: ignore[no-untyped-def]
                 status="connected",
             )
         )
+        # 先落实连接父行，避免后续 repository 查询触发 autoflush 时，由 SQLAlchemy
+        # 在缺少 ORM relationship 排序提示的情况下先发送目录、事件或提案子行。
+        await session.flush()
         session.add_all(
             ConnectionCapabilityModel(
                 user_id=USER_ID,
@@ -620,6 +623,30 @@ async def _seed_restore_source(  # type: ignore[no-untyped-def]
                 access_role="owner",
                 can_write=True,
                 provider_url="https://calendar.example.test/calendar",
+            )
+        )
+        session.add(
+            CalendarEventModel(
+                id=SOURCE_LOCAL_EVENT_ID,
+                user_id=USER_ID,
+                connection_id=CONNECTION_ID,
+                provider_event_id=PROVIDER_EVENT_ID,
+                calendar_id=CALENDAR_ID,
+                title="Synchronized source event",
+                starts_at=datetime(2030, 3, 11, 9, tzinfo=UTC),
+                ends_at=datetime(2030, 3, 11, 10, tzinfo=UTC),
+                all_day=False,
+                transparency="opaque",
+                status="confirmed",
+                timezone="UTC",
+                recurring_event_id=None,
+                etag='W/"etag-old"',
+                organizer=None,
+                attendees=[],
+                access_role="owner",
+                can_edit=True,
+                provider_url="https://calendar.example.test/event",
+                provider_updated_at=NOW,
             )
         )
         repository = SqlAlchemyCalendarProposalRepository(session, ACTION_CIPHER)
@@ -678,6 +705,14 @@ async def _seed_restore_source(  # type: ignore[no-untyped-def]
             },
             retain_until=RETAIN_UNTIL,
         )
+        source_proposal = await session.get(
+            CalendarChangeProposalModel,
+            SOURCE_PROPOSAL_ID,
+        )
+        assert source_proposal is not None
+        # 合法恢复来源只能来自已经真实应用的 update；各 fail-closed 用例会在 seed
+        # 完成后显式破坏单一事实，避免 valid-path 测试依赖不真实的 editing 基线。
+        source_proposal.status = "applied"
         session.add(
             TaskRunModel(
                 id=task_id,
@@ -791,6 +826,80 @@ async def test_restore_provider_read_is_outside_transaction_and_result_is_atomic
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_source",
+    (
+        "not-applied",
+        "not-update",
+        "expired-snapshot",
+        "cleared-ciphertext",
+        "missing-event",
+        "mismatched-event",
+    ),
+)
+async def test_restore_skips_provider_read_when_source_is_not_eligible(
+    database_url: str,
+    invalid_source: str,
+) -> None:
+    """供应商访问前必须一次重检完整 source 不变量，否则 resolver/reader 均不调用。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        task_id, source_snapshot_id = await _seed_restore_source(session_factory)
+        async with session_factory.begin() as session:
+            proposal = await session.get(CalendarChangeProposalModel, SOURCE_PROPOSAL_ID)
+            assert proposal is not None
+            snapshot = await session.get(CalendarChangeSnapshotModel, SOURCE_BEFORE_ID)
+            assert snapshot is not None
+            event_row = await session.get(CalendarEventModel, SOURCE_LOCAL_EVENT_ID)
+            assert event_row is not None
+            if invalid_source == "not-applied":
+                proposal.status = "editing"
+            elif invalid_source == "not-update":
+                proposal.operation_kind = "restore"
+            elif invalid_source == "expired-snapshot":
+                snapshot.retain_until = NOW
+            elif invalid_source == "cleared-ciphertext":
+                snapshot.content_ciphertext = None
+                snapshot.content_nonce = None
+                snapshot.content_key_version = None
+            elif invalid_source == "missing-event":
+                await session.delete(event_row)
+            elif invalid_source == "mismatched-event":
+                event_row.provider_event_id = "different-provider-event"
+            else:  # pragma: no cover - 参数集合由本测试静态冻结。
+                raise AssertionError("unknown invalid restore source variant")
+
+        reader = _AssertingReader(_TransactionProbe(), _current_provider_event())
+        resolver = _ReaderResolver(reader)
+        step = PrepareCalendarRestoreTaskStep(
+            session_factory,
+            action_cipher=ACTION_CIPHER,
+            reader_resolver=resolver,
+            clock=lambda: NOW,
+        )
+
+        with pytest.raises(CalendarProposalNotFoundError):
+            await step.execute(
+                LeasedTask(
+                    task_id=task_id,
+                    user_id=USER_ID,
+                    kind="calendar.restore.prepare",
+                    input_payload={
+                        "source_snapshot_id": str(source_snapshot_id),
+                        "creation_idempotency_key": f"calendar-restore:{task_id}",
+                    },
+                    started_at=NOW,
+                    lease_owner="calendar-restore-worker",
+                )
+            )
+
+        assert resolver.calls == []
+        assert reader.calls == []
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 async def test_restore_rolls_back_proposal_when_before_snapshot_persistence_fails(
     database_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -900,9 +1009,9 @@ async def test_restore_uses_persisted_task_input_instead_of_message_copy(
         (lambda payload: payload.__setitem__("source_snapshot_id", 42), TypeError),
         (lambda payload: payload.__setitem__("creation_idempotency_key", 42), TypeError),
         (
-                lambda payload: payload.__setitem__(
+            lambda payload: payload.__setitem__(
                 "source_snapshot_id", "{" + str(SOURCE_BEFORE_ID) + "}"
-                ),
+            ),
             ValueError,
         ),
         (lambda payload: payload.__setitem__("creation_idempotency_key", ""), ValueError),
@@ -1092,9 +1201,9 @@ async def test_restore_runner_loses_expired_lease_then_replacement_wins_once(
         async with session_factory() as session:
             first_task = await session.get(TaskRunModel, task_id)
             first_restore_count = await session.scalar(
-                select(func.count()).select_from(CalendarChangeProposalModel).where(
-                    CalendarChangeProposalModel.operation_kind == "restore"
-                )
+                select(func.count())
+                .select_from(CalendarChangeProposalModel)
+                .where(CalendarChangeProposalModel.operation_kind == "restore")
             )
         assert first_task is not None
         assert first_task.result_payload is None

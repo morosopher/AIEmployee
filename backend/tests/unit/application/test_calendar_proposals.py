@@ -763,9 +763,7 @@ async def test_suggest_observes_freshness_once_independently_from_search_window(
         search_start=search_start,
     )
 
-    assert source.availability_requests == [
-        (NOW, search_start, CALENDAR_AVAILABILITY_HORIZON_DAYS)
-    ]
+    assert source.availability_requests == [(NOW, search_start, CALENDAR_AVAILABILITY_HORIZON_DAYS)]
 
 
 @pytest.mark.asyncio
@@ -883,6 +881,52 @@ async def test_restore_uses_current_etag_complete_diff_and_new_operation_identit
     assert restored.submission_ready is True
     before = repository.snapshots[restored.before_snapshot_id]
     assert before.content["location"] == "Current room"
+
+
+@pytest.mark.asyncio
+async def test_restore_creation_key_replay_reuses_existing_before_provider_validation() -> None:
+    """恢复幂等重放必须复用已持久提案，不重新依赖供应商当前事实。"""
+    use_case, repository, _ = _use_case(
+        ids=(
+            PROPOSAL_ID,
+            DESIRED_ID,
+            OPERATION_ID,
+            BEFORE_ID,
+            NEXT_DESIRED_ID,
+            NEXT_OPERATION_ID,
+            UUID("00000000-0000-0000-0000-000000000928"),
+            UUID("00000000-0000-0000-0000-000000000929"),
+            UUID("00000000-0000-0000-0000-000000000930"),
+            UUID("00000000-0000-0000-0000-000000000931"),
+        )
+    )
+    source = await use_case.create_update(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        changes={"location": "Historical room"},
+    )
+    assert source.before_snapshot_id is not None
+    restored = await use_case.create_restore(
+        user_id=USER_ID,
+        source_snapshot_id=source.before_snapshot_id,
+        current_event=_provider_event(),
+        idempotency_key="restore-replay-key",
+    )
+    proposal_count = len(repository.proposals)
+    snapshot_count = len(repository.snapshots)
+
+    # 第二次请求模拟供应商事件已删除；同一创建键仍应返回第一次冻结的本地事实。
+    replay = await use_case.create_restore(
+        user_id=USER_ID,
+        source_snapshot_id=source.before_snapshot_id,
+        current_event=None,
+        idempotency_key="restore-replay-key",
+    )
+
+    assert replay.proposal_id == restored.proposal_id
+    assert replay.current_version == restored.current_version
+    assert len(repository.proposals) == proposal_count
+    assert len(repository.snapshots) == snapshot_count
 
 
 @pytest.mark.asyncio
@@ -1342,17 +1386,23 @@ def test_submission_ready_enforces_operation_bindings_and_nonempty_text() -> Non
     create = _readiness_view(operation_kind="create")
     assert create.submission_ready is True
     assert replace(create, calendar_id="   ").submission_ready is False
-    assert replace(
-        create,
-        content=create.content.model_copy(update={"title": "   "}),
-    ).submission_ready is False
+    assert (
+        replace(
+            create,
+            content=create.content.model_copy(update={"title": "   "}),
+        ).submission_ready
+        is False
+    )
     assert replace(create, target_event_id="provider-event").submission_ready is False
     assert replace(create, base_etag='W/"etag"').submission_ready is False
     assert replace(create, before_snapshot_id=BEFORE_ID).submission_ready is False
-    assert replace(
-        create,
-        content=create.content.model_copy(update={"confirmed_fields": ()}),
-    ).submission_ready is False
+    assert (
+        replace(
+            create,
+            content=create.content.model_copy(update={"confirmed_fields": ()}),
+        ).submission_ready
+        is False
+    )
 
     update = _readiness_view(
         operation_kind="update",
@@ -1364,10 +1414,13 @@ def test_submission_ready_enforces_operation_bindings_and_nonempty_text() -> Non
     assert replace(update, target_event_id="").submission_ready is False
     assert replace(update, base_etag="   ").submission_ready is False
     assert replace(update, before_snapshot_id=None).submission_ready is False
-    assert replace(
-        update,
-        content=update.content.model_copy(update={"changed_fields": ()}),
-    ).submission_ready is False
+    assert (
+        replace(
+            update,
+            content=update.content.model_copy(update={"changed_fields": ()}),
+        ).submission_ready
+        is False
+    )
 
     restore = replace(update, operation_kind="restore")
     assert restore.submission_ready is True
@@ -1429,7 +1482,9 @@ async def test_create_update_replay_revalidates_persisted_operation_identity(
 
 
 @pytest.mark.asyncio
-async def test_confirm_revalidates_updated_content_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_confirm_revalidates_updated_content_before_persisting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """confirm 的重建结果若被污染，必须在 CAS 写入前拒绝。"""
     use_case, repository, _ = _use_case()
     shell = await use_case.create_shell(

@@ -8,6 +8,7 @@
 import json
 import re
 from collections.abc import Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ai_employee.application.ports.calendar import CalendarEvent
+from ai_employee.application.use_cases.tasks import CreateTaskResult, TaskDispatcher
 from ai_employee.domain.actions import CalendarProposalStatus
 from ai_employee.domain.calendar_actions import NotificationPolicy
 from ai_employee.domain.calendar_availability import (
@@ -126,6 +128,26 @@ class CalendarRestoreSourceSnapshot:
     connection_id: UUID
     calendar_id: str
     provider_event_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarRestoreSourceProjection:
+    """表示恢复入队前锁定的最小持久历史事实。
+
+    该投影同时保留 snapshot 类别、源提案生命周期、本地目标事件 UUID 与密文保留状态。
+    API 只能在这些事实全部验证后创建恢复任务，且不得把 path 事件或其它动态字段复制进
+    Worker 的持久输入。
+    """
+
+    source_snapshot_id: UUID
+    source_proposal_id: UUID
+    snapshot_kind: str
+    operation_kind: str
+    proposal_status: CalendarProposalStatus
+    target_event_id: str | None
+    target_local_event_id: UUID | None
+    retain_until: datetime
+    ciphertext_present: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +483,21 @@ class CalendarProposalRepository(Protocol):
         self, *, user_id: UUID, source_snapshot_id: UUID
     ) -> CalendarRestoreSourceSnapshot | None: ...
 
+    async def list_current(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+    ) -> tuple[CalendarProposalSnapshot, ...]: ...
+
+    async def cancel(
+        self,
+        *,
+        user_id: UUID,
+        proposal_id: UUID,
+    ) -> CalendarProposalSnapshot | None: ...
+
 
 class CalendarProposalSourceReader(Protocol):
     """定义本地连接、目录、事件、设置与本人可用性读取端口。"""
@@ -549,6 +586,47 @@ class CalendarProposalUseCase:
         self._availability = availability
         self._suggestion_function = suggestion_function
 
+    async def list(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+    ) -> tuple[CalendarProposalView, ...]:
+        """按当前用户与稳定分页参数列出提案当前版本。"""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("calendar proposal limit must be between 1 and 100")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("calendar proposal offset must be nonnegative")
+        return tuple(
+            _to_view(snapshot)
+            for snapshot in await self._proposals.list_current(
+                user_id=user_id,
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+    async def get(self, *, user_id: UUID, proposal_id: UUID) -> CalendarProposalView:
+        """读取当前用户拥有的提案，不存在或跨用户时统一隐藏。"""
+        snapshot = await self._proposals.get_current(
+            user_id=user_id,
+            proposal_id=proposal_id,
+        )
+        if snapshot is None:
+            raise CalendarProposalNotFoundError
+        return _to_view(snapshot)
+
+    async def cancel(self, *, user_id: UUID, proposal_id: UUID) -> CalendarProposalView:
+        """取消仍处于 editing/stale 的纯本地提案，不产生任务或外部副作用。"""
+        snapshot = await self._proposals.cancel(
+            user_id=user_id,
+            proposal_id=proposal_id,
+        )
+        if snapshot is None:
+            raise CalendarProposalNotFoundError
+        return _to_view(snapshot)
+
     async def create_shell(
         self,
         *,
@@ -574,9 +652,7 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=target.connection_id,
-            creation_idempotency_key=validate_calendar_creation_idempotency_key(
-                idempotency_key
-            ),
+            creation_idempotency_key=validate_calendar_creation_idempotency_key(idempotency_key),
             creation_payload_hash=_creation_hash(
                 connection_id=target.connection_id,
                 calendar_id=target.calendar_id,
@@ -617,9 +693,7 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=connection_id,
-            creation_idempotency_key=validate_calendar_creation_idempotency_key(
-                idempotency_key
-            ),
+            creation_idempotency_key=validate_calendar_creation_idempotency_key(idempotency_key),
             creation_payload_hash=_creation_hash(
                 connection_id=connection_id,
                 calendar_id=calendar_id,
@@ -821,7 +895,7 @@ class CalendarProposalUseCase:
         *,
         user_id: UUID,
         proposal_id: UUID,
-        expected_version: int,
+        expected_version: int | None,
         search_start: datetime,
     ) -> CalendarProposalView:
         """用独立 freshness 时钟计算候选，并以版本 CAS 缓存下一不可变版本。
@@ -873,11 +947,12 @@ class CalendarProposalUseCase:
         values = content.model_dump(mode="python")
         values["availability"] = availability
         updated = CalendarProposalContent.model_validate(values)
+        version_for_save = current.current_version if expected_version is None else expected_version
         saved = await availability_persistence.save_suggestion(
             snapshot_id=self._id_factory(),
             user_id=user_id,
             proposal_id=proposal_id,
-            expected_version=expected_version,
+            expected_version=version_for_save,
             desired_state=_content_json(updated),
             retain_until=current.retain_until,
         )
@@ -991,6 +1066,43 @@ class CalendarProposalUseCase:
         重新校验 source 归属、连接能力、目录写权限和 provider 当前事实，然后同时保存
         新 desired、当前 before、当前 ETag 与新 operation identity。
         """
+        creation_key = validate_calendar_creation_idempotency_key(idempotency_key)
+        existing = await self._proposals.get_by_creation_key(
+            user_id=user_id,
+            creation_idempotency_key=creation_key,
+        )
+        if existing is not None:
+            # 恢复创建键绑定的是第一次读取到的 ETag、历史 source 和完整 desired。重放
+            # 必须先复用这份已冻结事实；否则供应商事件在第一次成功后被删除或版本变化时，
+            # 重放会错误地先执行 provider GET，既破坏幂等响应，也可能把同键请求误报为
+            # 外部冲突。非 restore 提案占用同一用户键时直接拒绝，避免跨操作种类复用。
+            if existing.operation_kind != "restore":
+                raise StateConflictError(
+                    error_code="idempotency_key_payload_mismatch",
+                    message="idempotency key is already bound to different content",
+                )
+            try:
+                persisted_content = CalendarProposalContent.model_validate(
+                    existing.desired_snapshot.content
+                )
+                persisted_hash = _creation_hash(
+                    connection_id=existing.connection_id,
+                    calendar_id=existing.calendar_id,
+                    operation_kind="restore",
+                    target_event_id=existing.target_event_id,
+                    content=persisted_content,
+                    base_etag=existing.base_etag,
+                    source_snapshot_id=source_snapshot_id,
+                )
+            except (TypeError, ValueError):
+                # 已持久化内容损坏时不能把它当作安全重放；让调用方进入稳定的
+                # idempotency/conflict 处理，而不是访问供应商或生成第二个提案。
+                raise StateConflictError(
+                    error_code="idempotency_key_payload_mismatch",
+                    message="idempotency key is already bound to invalid content",
+                ) from None
+            _require_matching_creation_hash(existing, persisted_hash)
+            return _to_view(existing)
         source = await self._proposals.get_restore_source(
             user_id=user_id,
             source_snapshot_id=source_snapshot_id,
@@ -1038,9 +1150,7 @@ class CalendarProposalUseCase:
             snapshot_id=self._id_factory(),
             user_id=user_id,
             connection_id=source.connection_id,
-            creation_idempotency_key=validate_calendar_creation_idempotency_key(
-                idempotency_key
-            ),
+            creation_idempotency_key=creation_key,
             creation_payload_hash=_creation_hash(
                 connection_id=source.connection_id,
                 calendar_id=source.calendar_id,
@@ -1096,6 +1206,71 @@ class CalendarProposalUseCase:
         if before is None:
             raise CalendarProposalNotFoundError
         return CalendarProposalContent.model_validate(before.content)
+
+
+class CalendarRestoreEnqueueRepository(Protocol):
+    """定义恢复准备任务验证与原子创建所需的窄事务端口。"""
+
+    async def enqueue_restore_prepare(
+        self,
+        *,
+        user_id: UUID,
+        event_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+        now: datetime,
+    ) -> CreateTaskResult: ...
+
+
+class CalendarRestoreEnqueueRepositoryFactory(Protocol):
+    """为一次恢复请求创建自动提交或回滚的短事务。"""
+
+    def __call__(self) -> AbstractAsyncContextManager[CalendarRestoreEnqueueRepository]: ...
+
+
+class CalendarRestoreEnqueueUseCase:
+    """验证历史 before 快照并排队 ``calendar.restore.prepare``。
+
+    路由只解析用户输入；本边界要求仓储先锁定、验证 source 的归属、类别、生命周期、
+    精确本地事件绑定和密文保留，再在同一事务内创建 TaskRun、AuditEvent 与 Outbox。
+    任务输入严格只有 source snapshot ID 与恢复提案创建幂等键；本用例不创建恢复提案、
+    ApprovalRequest 或冻结命令。
+    """
+
+    def __init__(
+        self,
+        repositories: CalendarRestoreEnqueueRepositoryFactory,
+        dispatcher: TaskDispatcher,
+        clock: Callable[[], datetime],
+    ) -> None:
+        """保存事务工厂、提交后投递器与显式 UTC 时钟。"""
+        self._repositories = repositories
+        self._dispatcher = dispatcher
+        self._clock = clock
+
+    async def execute(
+        self,
+        *,
+        user_id: UUID,
+        event_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CreateTaskResult:
+        """创建或精确重放一个恢复准备任务，并返回其持久状态。"""
+        checked_key = validate_calendar_creation_idempotency_key(creation_idempotency_key)
+        now = _aware_utc(self._clock(), field="calendar restore clock")
+        async with self._repositories() as repository:
+            result = await repository.enqueue_restore_prepare(
+                user_id=user_id,
+                event_id=event_id,
+                source_snapshot_id=source_snapshot_id,
+                creation_idempotency_key=checked_key,
+                now=now,
+            )
+        return CreateTaskResult(
+            task_id=result.task_id,
+            status=await self._dispatcher.dispatch(result.task_id),
+        )
 
 
 def parse_calendar_proposal_conversation_request(text: str) -> bool:
@@ -1730,6 +1905,10 @@ __all__ = [
     "CalendarProposalTargetSnapshot",
     "CalendarProposalUseCase",
     "CalendarProposalView",
+    "CalendarRestoreEnqueueRepository",
+    "CalendarRestoreEnqueueRepositoryFactory",
+    "CalendarRestoreEnqueueUseCase",
+    "CalendarRestoreSourceProjection",
     "CalendarRestoreSourceSnapshot",
     "CalendarSnapshot",
     "CalendarSnapshotKind",
