@@ -509,9 +509,7 @@ async def _seed_calendar_action(
     session_factory = build_session_factory(database_url)
     try:
         async with session_factory.begin() as session:
-            await session.execute(
-                delete(MailDraftModel).where(MailDraftModel.id == seed.draft_id)
-            )
+            await session.execute(delete(MailDraftModel).where(MailDraftModel.id == seed.draft_id))
             session.add_all(
                 (
                     ConnectionCapabilityModel(
@@ -1667,9 +1665,7 @@ async def test_provider_outcome_cas_rejects_stale_lease_and_rebound_execution_fa
         try:
             async with session_factory.begin() as session:
                 execution_id = await session.scalar(
-                    select(ToolExecutionModel.id).where(
-                        ToolExecutionModel.task_id == seed.task_id
-                    )
+                    select(ToolExecutionModel.id).where(ToolExecutionModel.task_id == seed.task_id)
                 )
                 assert isinstance(execution_id, UUID)
                 if tamper == "lease_owner":
@@ -1786,9 +1782,7 @@ async def test_provider_outcome_cas_rejects_stale_lease_and_rebound_execution_fa
                     elif tamper == "execution_hash":
                         execution_values = {"request_payload_hash": "f" * 64}
                     else:
-                        execution_values = {
-                            "idempotency_key": f"tampered:{seed.execution_id}"
-                        }
+                        execution_values = {"idempotency_key": f"tampered:{seed.execution_id}"}
                     await session.execute(
                         update(ToolExecutionModel)
                         .where(ToolExecutionModel.task_id == seed.task_id)
@@ -2676,14 +2670,13 @@ async def test_pre_request_infrastructure_failure_atomically_restores_editable_a
     await _seed_action(
         database_url,
         seed,
-        existing_execution_status=(
-            ToolExecutionStatus.CLAIMED if claimed_before_failure else None
-        ),
+        existing_execution_status=(ToolExecutionStatus.CLAIMED if claimed_before_failure else None),
         task_status=TaskStatus.QUEUED,
     )
     adapter = _RecordingAdapter()
     clock = _MutableClock(NOW)
     session_factory = build_session_factory(database_url)
+
     def resolve_steps(_task: LeasedTask) -> tuple[_PreRequestFailureStep, ...]:
         """在精确基础设施边界制造 request-start 前失败。"""
         if failure_point == "resolver":

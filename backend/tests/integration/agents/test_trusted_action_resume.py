@@ -477,9 +477,7 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
     user_id = uuid4()
     connection_id = uuid4()
     provider_started = asyncio.Event()
-    provider_release = (
-        None if interruption in {"exception", "unknown"} else asyncio.Event()
-    )
+    provider_release = None if interruption in {"exception", "unknown"} else asyncio.Event()
     unknown_outcome = (
         ProviderWriteOutcome(
             kind=ProviderWriteOutcomeKind.UNKNOWN,
@@ -498,9 +496,7 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
         started=provider_started,
         release=provider_release,
         execute_error=(
-            RuntimeError("synthetic provider interruption")
-            if interruption == "exception"
-            else None
+            RuntimeError("synthetic provider interruption") if interruption == "exception" else None
         ),
         execute_outcome=unknown_outcome,
     )
@@ -587,9 +583,7 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
             unresolved_task = await session.get(TaskRunModel, submission.task_id)
             unresolved_draft = await session.get(MailDraftModel, draft_id)
             unresolved_execution = await session.scalar(
-                select(ToolExecutionModel).where(
-                    ToolExecutionModel.task_id == submission.task_id
-                )
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == submission.task_id)
             )
             failed_audits = await session.scalar(
                 select(func.count())
@@ -632,9 +626,7 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
             final_task = await session.get(TaskRunModel, submission.task_id)
             final_draft = await session.get(MailDraftModel, draft_id)
             final_execution = await session.scalar(
-                select(ToolExecutionModel).where(
-                    ToolExecutionModel.task_id == submission.task_id
-                )
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == submission.task_id)
             )
         assert final_task is not None and final_task.status == TaskStatus.SUCCEEDED.value
         assert final_draft is not None and final_draft.status == MailDraftStatus.SENT.value

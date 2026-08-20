@@ -330,10 +330,14 @@ class TrustedActionExecutionUseCase:
                 )
             raise
 
-        if status in {
-            ToolExecutionStatus.CLAIMED,
-            ToolExecutionStatus.RETRYABLE_FAILED,
-        } and not from_reconciliation:
+        if (
+            status
+            in {
+                ToolExecutionStatus.CLAIMED,
+                ToolExecutionStatus.RETRYABLE_FAILED,
+            }
+            and not from_reconciliation
+        ):
             request_start_error_code: str | None = None
             try:
                 async with self._transactions() as transaction:
