@@ -56,3 +56,16 @@ def test_settings_patch_openapi_distinguishes_omission_from_explicit_null() -> N
         for field_name, field_schema in properties.items()
         if _declares_null(field_schema)
     } == _NULLABLE_PATCH_FIELDS
+
+
+def test_settings_patch_openapi_exposes_standard_meeting_buffer_bounds() -> None:
+    """会议缓冲使用标准 JSON Schema 边界键，且仍可省略但不可显式传 null。"""
+    schema = create_app().openapi()["components"]["schemas"]["SettingsPatch"]
+    field_schema = schema["properties"]["meeting_buffer_minutes"]
+
+    assert field_schema["type"] == "integer"
+    assert field_schema["minimum"] == 0
+    assert field_schema["maximum"] == 120
+    assert not {"ge", "le"}.intersection(field_schema)
+    assert "meeting_buffer_minutes" not in schema.get("required", [])
+    assert not _declares_null(field_schema)

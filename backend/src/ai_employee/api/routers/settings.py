@@ -33,6 +33,7 @@ class SettingsPatch(BaseModel):
     非 nullable 字段仍以 ``None`` 表示 PATCH 中的内部 omission 默认值，但通过
     ``SkipJsonSchema`` 从公开契约排除 null；显式 JSON null 则由前置 validator 拒绝。
     三个默认连接/日历字段保留普通 ``T | None``，因此契约与运行时都允许清空。
+    会议缓冲的数值边界绑定到 ``StrictInt`` 分支，避免联合外层约束泄漏非标准 schema 键。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -47,11 +48,7 @@ class SettingsPatch(BaseModel):
     default_calendar_connection_id: UUID | None = None
     default_calendar_id: str | None = Field(default=None, min_length=1, max_length=512)
     working_hours: dict[str, list[list[str]]] | SkipJsonSchema[None] = None
-    meeting_buffer_minutes: StrictInt | SkipJsonSchema[None] = Field(
-        default=None,
-        ge=0,
-        le=120,
-    )
+    meeting_buffer_minutes: Annotated[StrictInt, Field(ge=0, le=120)] | SkipJsonSchema[None] = None
 
     @field_validator(
         "timezone",

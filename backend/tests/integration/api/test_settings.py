@@ -481,6 +481,8 @@ async def test_patch_rejects_unavailable_default_connection_with_stable_conflict
         {"source_metadata_retention_days": True},
         {"workspace_history_retention_days": 0},
         {"workspace_history_retention_days": True},
+        {"meeting_buffer_minutes": -1},
+        {"meeting_buffer_minutes": 121},
         {"meeting_buffer_minutes": True},
         {"unexpected": "field"},
     ),
