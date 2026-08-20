@@ -5,6 +5,7 @@
 provider preflight、规范化命令、计算哈希并加密；所有持久 mutation 由同一事务端口完成。
 """
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -31,11 +32,13 @@ from ai_employee.application.ports.trusted_actions import (
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
     ProviderWriteOutcome,
+    RequestStartDisposition,
     TrustedActionAdapterRegistry,
     TrustedActionCommandCipher,
     TrustedActionDispatchSnapshot,
     TrustedActionExecutionSnapshot,
     TrustedActionPreflightRegistry,
+    TrustedActionRequestStartAuthorization,
     TrustedActionRisk,
     TrustedActionSubmission,
     TrustedActionSubmissionResult,
@@ -76,6 +79,10 @@ class CalendarProposalSubmissionNotFoundError(Exception):
 
 class _TrustedActionIntegrityError(Exception):
     """仅在进程内标记冻结命令与持久标识不一致，且永不携带命令内容。"""
+
+
+class TrustedActionAttemptAbandoned(Exception):
+    """表示当前 Worker 不得完成任务，后续投递只能从持久事实恢复。"""
 
 
 class TrustedActionExecutionUseCase:
@@ -268,6 +275,12 @@ class TrustedActionExecutionUseCase:
             TypeError,
             ValueError,
         ):
+            if snapshot.execution.request_started_at is not None:
+                await self._preserve_started_attempt(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                )
+                raise TrustedActionAttemptAbandoned from None
             await self._persist_integrity_failure(
                 snapshot=snapshot,
                 failed_at=_utc_now(self._clock()),
@@ -277,17 +290,26 @@ class TrustedActionExecutionUseCase:
         except StateConflictError as error:
             if error.error_code != "trusted_action_unavailable":
                 raise
+            if snapshot.execution.request_started_at is not None:
+                await self._preserve_started_attempt(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                )
+                raise TrustedActionAttemptAbandoned from None
             await self._persist_integrity_failure(
                 snapshot=snapshot,
                 failed_at=_utc_now(self._clock()),
                 lease_owner=lease_owner,
             )
             raise _trusted_action_unavailable() from None
+        except BaseException:
+            if snapshot.execution.request_started_at is not None:
+                await self._preserve_started_attempt(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                )
+            raise
 
-        adapter = self._adapters.trusted_action_adapter(
-            provider=snapshot.provider,
-            action=snapshot.action,
-        )
         from_reconciliation = status in {
             ToolExecutionStatus.EXECUTING,
             ToolExecutionStatus.RECONCILING,
@@ -295,37 +317,83 @@ class TrustedActionExecutionUseCase:
             status is ToolExecutionStatus.CLAIMED
             and snapshot.execution.request_started_at is not None
         )
-        if from_reconciliation:
-            outcome = await adapter.reconcile(command, snapshot.execution)
-        elif status in {
-            ToolExecutionStatus.CLAIMED,
-            ToolExecutionStatus.RETRYABLE_FAILED,
-        }:
-            async with self._transactions() as transaction:
-                request_started = await transaction.mark_request_started(
+        try:
+            adapter = self._adapters.trusted_action_adapter(
+                provider=snapshot.provider,
+                action=snapshot.action,
+            )
+        except BaseException:
+            if snapshot.execution.request_started_at is not None:
+                await self._preserve_started_attempt(
                     snapshot=snapshot,
                     lease_owner=lease_owner,
                 )
-            if not request_started:
-                # 另一个重放已提交 request-start 或当前 owner 已失去租约；两种情况都禁止
-                # 本调用继续触达 provider。后续投递只会从持久状态决定核对或终态复用。
-                return
-            outcome = await adapter.execute(command)
-        else:
+            raise
+
+        if status in {
+            ToolExecutionStatus.CLAIMED,
+            ToolExecutionStatus.RETRYABLE_FAILED,
+        } and not from_reconciliation:
+            request_start_error_code: str | None = None
+            try:
+                async with self._transactions() as transaction:
+                    request_start = await transaction.mark_request_started(
+                        snapshot=snapshot,
+                        lease_owner=lease_owner,
+                        authorize=self._request_start_authorization_error,
+                    )
+                    if request_start.disposition is RequestStartDisposition.INVALIDATED:
+                        request_start_error_code = request_start.error_code
+            except BaseException:
+                # request-start 提交后的 ACK 丢失与真实 rollback 对调用方形状相同；用
+                # dispatch 冻结投影做幂等 abandon，数据库只会释放确已开始的同一尝试。
+                await self._preserve_started_attempt(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                )
+                raise
+            if request_start_error_code is not None:
+                raise StateConflictError(
+                    error_code=request_start_error_code,
+                    message="trusted action authorization changed before request start",
+                )
+            if request_start.disposition is not RequestStartDisposition.STARTED:
+                # 租约已丢失或另一调用已经提交 request-start 时，本调用绝不能释放赢家
+                # 的 live lease，也不能让 Graph/Runner 把 loser 当作成功完成。
+                raise TrustedActionAttemptAbandoned
+        elif not from_reconciliation:
             raise _trusted_action_unavailable()
 
-        if type(outcome) is not ProviderWriteOutcome:
-            raise TypeError("trusted action adapter returned an invalid outcome")
-        completed_at = _utc_now(self._clock())
-        async with self._transactions() as transaction:
-            await transaction.persist_provider_outcome(
+        try:
+            outcome = (
+                await adapter.reconcile(command, snapshot.execution)
+                if from_reconciliation
+                else await adapter.execute(command)
+            )
+            if type(outcome) is not ProviderWriteOutcome:
+                raise TypeError("trusted action adapter returned an invalid outcome")
+            completed_at = _utc_now(self._clock())
+            async with self._transactions() as transaction:
+                await transaction.persist_provider_outcome(
+                    snapshot=snapshot,
+                    outcome=outcome,
+                    completed_at=completed_at,
+                    from_reconciliation=from_reconciliation,
+                    may_retry_write=may_retry_write,
+                    lease_owner=lease_owner,
+                )
+        except BaseException:
+            # 只有本调用已赢得 request-start 或正持有恢复租约时才走到这里；provider、
+            # 结果 CAS 或 commit-ACK 异常均先释放精确未决尝试，再保留原控制流。
+            await self._preserve_started_attempt(
                 snapshot=snapshot,
-                outcome=outcome,
-                completed_at=completed_at,
-                from_reconciliation=from_reconciliation,
-                may_retry_write=may_retry_write,
                 lease_owner=lease_owner,
             )
+            raise
+        if outcome.kind is ProviderWriteOutcomeKind.UNKNOWN:
+            # Repository 已保留 request-start 与 UNKNOWN 摘要并释放租约；专属 TaskStep
+            # 将该控制流映射为 Runner no-finish，禁止通用成功/失败终态覆盖未决事实。
+            raise TrustedActionAttemptAbandoned
         if (
             outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
             and outcome.retryable
@@ -383,6 +451,116 @@ class TrustedActionExecutionUseCase:
         if approved_facts.decision != ApprovalStatus.APPROVED.value:
             raise _approval_conflict()
 
+    async def abandon_started_attempt(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        lease_owner: str,
+    ) -> bool:
+        """从标识重建并认证冻结投影后释放中断租约，供 Graph 外层故障恢复。
+
+        Args:
+            task_id: 当前可信动作任务 ID。
+            approval_id: 冻结审批 ID。
+            operation_id: 稳定操作 ID。
+            expected_payload_hash: Graph 中唯一保存的内容无关冻结哈希。
+            lease_owner: 当前 DurableTaskRunner owner。
+
+        Returns:
+            Repository 已确认并保留同一未决尝试时为 ``True``；请求尚未开始、事实已
+            终结或租约已被另一个 owner 接管时为 ``False``。
+        """
+        _validate_lease_owner(lease_owner)
+        if not _canonical_payload_hash(expected_payload_hash):
+            return False
+        try:
+            async with self._transactions() as transaction:
+                snapshot = await transaction.load_dispatch(
+                    task_id=task_id,
+                    approval_id=approval_id,
+                    operation_id=operation_id,
+                )
+            if (
+                snapshot is None
+                or not _dispatch_execution_binding_is_valid(snapshot)
+                or not _payload_hashes_match(snapshot.payload_hash, expected_payload_hash)
+                or snapshot.execution.request_started_at is None
+                or snapshot.execution.status
+                not in {
+                    ToolExecutionStatus.EXECUTING,
+                    ToolExecutionStatus.RECONCILING,
+                }
+            ):
+                return False
+            # Graph 外异常没有 request-start 前的进程内 snapshot，因此必须重新认证
+            # AEAD 命令并绑定 action/schema/operation/connection/proposal/calendar 后才可
+            # 使用当前投影。完整命令只在本地内存短暂存在，绝不写入 checkpoint。
+            async with self._transactions() as transaction:
+                command_payload = await transaction.load_command(
+                    user_id=snapshot.user_id,
+                    approval_id=snapshot.approval_id,
+                )
+            if command_payload is None:
+                return False
+            _validated_dispatch_command(
+                command_payload,
+                snapshot=snapshot,
+                expected_payload_hash=expected_payload_hash,
+            )
+        except (
+            ActionPayloadFormatError,
+            EncryptionBoundaryError,
+            EncryptionKeyVersionError,
+            InvalidTag,
+            StateConflictError,
+            TrustedCommandValidationError,
+            _TrustedActionIntegrityError,
+            TypeError,
+            ValueError,
+        ):
+            return False
+        return await self._abandon_snapshot(snapshot=snapshot, lease_owner=lease_owner)
+
+    async def _abandon_snapshot(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+    ) -> bool:
+        """把未 checkpoint 化的 request-start 前投影交给锁内 abandon CAS。"""
+        async with self._transactions() as transaction:
+            return await transaction.abandon_started_attempt(
+                snapshot=snapshot,
+                lease_owner=lease_owner,
+            )
+
+    async def _preserve_started_attempt(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+    ) -> None:
+        """在异常传播前屏蔽当前调用并提交精确 request-start abandon CAS。
+
+        Repository 返回 ``False`` 表示请求未开始、冻结绑定已变化或 lease 已失效；这些
+        情况都不能回退覆盖。若持久保护本身异常，普通异常转换为放弃完成，避免 Runner
+        尝试通用终态；任务取消则仍保留原取消语义，由到期租约允许后续恢复。
+        """
+        try:
+            await asyncio.shield(
+                self._abandon_snapshot(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                )
+            )
+        except Exception:  # noqa: BLE001 - 保护边界失败时禁止退回通用终态。
+            current_task = asyncio.current_task()
+            if current_task is None or not current_task.cancelling():
+                raise TrustedActionAttemptAbandoned from None
+
     async def dispose(self) -> None:
         """释放本用例独占的会话工厂；共享组合根可省略该回调。"""
         if self._dispose is not None:
@@ -423,6 +601,36 @@ class TrustedActionExecutionUseCase:
             return _external_write_account_not_allowed()
         if not self._write_policy.write_account_allowed(provider_identity_key):
             return _external_write_account_not_allowed()
+        return None
+
+    def _request_start_authorization_error(
+        self,
+        authorization: TrustedActionRequestStartAuthorization,
+    ) -> str | None:
+        """在 Repository 持有固定行锁时复用当前应用写策略并返回稳定错误码。"""
+        if not authorization.user_is_active:
+            return "trusted_action_unavailable"
+        if not self._write_policy.provider_writes_enabled(authorization.provider):
+            return "external_writes_disabled"
+        capability_error = _capability_error_code(
+            connection_status=authorization.connection_status,
+            read_capability_status=authorization.read_capability_status,
+            write_capability_status=authorization.write_capability_status,
+            write_capability_error_code=authorization.write_capability_error_code,
+            calendar_can_write=authorization.calendar_can_write,
+        )
+        if capability_error is not None:
+            return capability_error
+        try:
+            provider_identity_key = canonical_provider_identity_key(
+                authorization.provider,
+                authorization.provider_tenant_id,
+                authorization.provider_account_id,
+            )
+        except ValueError:
+            return "external_write_account_not_allowed"
+        if not self._write_policy.write_account_allowed(provider_identity_key):
+            return "external_write_account_not_allowed"
         return None
 
     async def _persist_integrity_failure(
@@ -794,21 +1002,43 @@ def _execution_capability_error(
     snapshot: TrustedActionExecutionSnapshot,
 ) -> StateConflictError | None:
     """把 claim 时的新鲜连接/能力事实映射为稳定、无内容失败。"""
-    if snapshot.write_capability_error_code == "connection_scope_missing" or (
-        snapshot.write_capability_status
-        in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
-    ):
+    error_code = _capability_error_code(
+        connection_status=snapshot.connection_status,
+        read_capability_status=snapshot.read_capability_status,
+        write_capability_status=snapshot.write_capability_status,
+        write_capability_error_code=snapshot.write_capability_error_code,
+        calendar_can_write=snapshot.calendar_can_write,
+    )
+    if error_code == "connection_scope_missing":
         return StateConflictError(
             error_code="connection_scope_missing",
             message="provider write capability requires reauthorization",
         )
-    if (
-        snapshot.connection_status != "connected"
-        or snapshot.read_capability_status is not CapabilityStatus.ENABLED
-        or snapshot.write_capability_status is not CapabilityStatus.ENABLED
-        or (snapshot.action.startswith("calendar.") and snapshot.calendar_can_write is not True)
-    ):
+    if error_code is not None:
         return _connection_capability_disabled()
+    return None
+
+
+def _capability_error_code(
+    *,
+    connection_status: str,
+    read_capability_status: CapabilityStatus,
+    write_capability_status: CapabilityStatus,
+    write_capability_error_code: str | None,
+    calendar_can_write: bool | None,
+) -> str | None:
+    """把 claim 与 request-start 共用的最新能力事实映射为稳定错误码。"""
+    if write_capability_error_code == "connection_scope_missing" or (
+        write_capability_status in {CapabilityStatus.ACTION_REQUIRED, CapabilityStatus.REVOKED}
+    ):
+        return "connection_scope_missing"
+    if (
+        connection_status != "connected"
+        or read_capability_status is not CapabilityStatus.ENABLED
+        or write_capability_status is not CapabilityStatus.ENABLED
+        or calendar_can_write is False
+    ):
+        return "connection_capability_disabled"
     return None
 
 

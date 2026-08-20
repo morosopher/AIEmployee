@@ -20,13 +20,18 @@ from ai_employee.application.ports.trusted_actions import (
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
     ProviderWriteOutcome,
+    RequestStartAuthorizer,
+    RequestStartDisposition,
+    RequestStartResult,
     TrustedActionDispatchSnapshot,
     TrustedActionExecutionSnapshot,
+    TrustedActionRequestStartAuthorization,
     TrustedActionSubmission,
     durable_retry_summary_is_valid,
     trusted_execution_binding_matches,
 )
 from ai_employee.application.use_cases.calendar_proposals import CalendarProposalContent
+from ai_employee.application.use_cases.task_execution import utc_instant
 from ai_employee.domain.actions import (
     CalendarProposalStatus,
     MailDraftStatus,
@@ -71,6 +76,9 @@ from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
+from ai_employee.infrastructure.db.repositories.task_execution import (
+    SqlAlchemyTaskExecutionStore,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
@@ -700,7 +708,7 @@ class SqlAlchemyTrustedActionRepository:
                 CalendarProposalStatus.AWAITING_APPROVAL.value,
             },
         )
-        audit = AuditEventModel(
+        approval_audit = AuditEventModel(
             user_id=task.user_id,
             task_id=task.id,
             event_type="approval.invalidated",
@@ -708,14 +716,27 @@ class SqlAlchemyTrustedActionRepository:
             actor_id=None,
             event_metadata={"reason": error_code},
         )
-        self._session.add(audit)
+        task_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="task.failed",
+            actor_type="worker",
+            actor_id=snapshot.task_lease_owner,
+            event_metadata={
+                "status": TaskStatus.FAILED.value,
+                "error_code": error_code,
+            },
+        )
+        # 本事务已经清除任务租约，通用 Runner 的 owner CAS 不会再补写终态审计；
+        # 因此审批失效与 task.failed 必须和状态、本地编辑态一起原子提交。
+        self._session.add_all((approval_audit, task_audit))
         await self._session.flush()
         self._session.add(
             OutboxEventModel(
                 topic="approval.invalidated",
                 aggregate_id=task.id,
                 deduplication_key=f"approval.invalidated:{approval.id}:{approval.version}",
-                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                payload={"task_id": str(task.id), "audit_event_id": approval_audit.id},
                 available_at=failed_at,
             )
         )
@@ -888,14 +909,15 @@ class SqlAlchemyTrustedActionRepository:
         *,
         snapshot: TrustedActionDispatchSnapshot,
         lease_owner: str,
-    ) -> bool:
+        authorize: RequestStartAuthorizer,
+    ) -> RequestStartResult:
         """按固定锁序并以 PostgreSQL 权威时钟提交唯一 request-start。
 
         调用方时间可能在命令解密或行锁等待期间变旧，因此它绝不能授权外部写入。本事务
         依次锁定 TaskRun、ApprovalRequest、ToolExecution、本地草稿/提案、User 与
-        OAuthConnection，随后才读取 ``clock_timestamp()``；只有当前 owner 的 RUNNING
-        租约仍有效，且审批、本地版本、连接、日历及执行 provider 都保持冻结绑定，才能
-        递增真实写尝试计数并把执行推进到 ``executing``。
+        OAuthConnection、capability 与 ProviderCalendar，随后才读取 ``clock_timestamp()``。
+        应用层 authorizer 在这些锁仍由同一短事务持有时重算全局/供应商开关与规范账户
+        allowlist；只有全部事实仍成立，才能递增真实写尝试计数并推进到 ``executing``。
         """
         task = await self._session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == snapshot.task_id).with_for_update()
@@ -916,6 +938,26 @@ class SqlAlchemyTrustedActionRepository:
             )
             .with_for_update()
         )
+        if task is None or approval is None or execution is None:
+            return RequestStartResult(RequestStartDisposition.ABANDONED)
+        try:
+            execution_status = ToolExecutionStatus(execution.status)
+        except ValueError:
+            return RequestStartResult(RequestStartDisposition.ABANDONED)
+        if execution_status in {
+            ToolExecutionStatus.EXECUTING,
+            ToolExecutionStatus.RECONCILING,
+        } or (
+            execution_status is ToolExecutionStatus.CLAIMED
+            and execution.request_started_at is not None
+        ):
+            return RequestStartResult(RequestStartDisposition.RECONCILE)
+        if execution_status in {
+            ToolExecutionStatus.SUCCEEDED,
+            ToolExecutionStatus.CONFIRMED_FAILED,
+            ToolExecutionStatus.NEEDS_ATTENTION,
+        }:
+            return RequestStartResult(RequestStartDisposition.ABANDONED)
         binding = (
             await self._lock_action_binding(task=task, approval=approval)
             if task is not None and approval is not None
@@ -936,43 +978,78 @@ class SqlAlchemyTrustedActionRepository:
             if snapshot.connection_id is not None
             else None
         )
+        capabilities = (
+            await self._capabilities(
+                user_id=snapshot.user_id,
+                connection_id=snapshot.connection_id,
+                lock_rows=True,
+            )
+            if snapshot.connection_id is not None
+            else {}
+        )
+        if snapshot.action == "mail.send":
+            read_capability = ConnectionCapability.MAIL_READ
+            write_capability = ConnectionCapability.MAIL_SEND
+        elif snapshot.action in {
+            "calendar.create",
+            "calendar.update",
+            "calendar.restore",
+        }:
+            read_capability = ConnectionCapability.CALENDAR_READ
+            write_capability = ConnectionCapability.CALENDAR_WRITE
+        else:
+            read_capability = None
+            write_capability = None
+        calendar_can_write: bool | None = None
+        if binding is not None and binding[1] is not None:
+            calendar = await self._session.scalar(
+                select(ProviderCalendarModel)
+                .where(
+                    ProviderCalendarModel.user_id == snapshot.user_id,
+                    ProviderCalendarModel.connection_id == binding[0],
+                    ProviderCalendarModel.provider_calendar_id == binding[1],
+                )
+                .with_for_update()
+            )
+            calendar_can_write = calendar.can_write if calendar is not None else False
         database_now = await self._session.scalar(select(func.clock_timestamp()))
         if (
-            task is None
-            or approval is None
-            or user is None
-            or not user.is_active
-            or connection is None
-            or connection.provider != snapshot.provider
-            or task.status != TaskStatus.RUNNING.value
+            task.status != TaskStatus.RUNNING.value
             or task.lease_owner != lease_owner
             or task.lease_expires_at is None
             or database_now is None
             or task.lease_expires_at <= database_now
-            or execution is None
-            or binding is None
         ):
-            return False
-        action_connection_id, action_calendar_id, action_status = binding
-        if (
-            task.user_id != snapshot.user_id
-            or not _task_operation_matches(task, snapshot.operation_id)
-            or approval.step_id != snapshot.execution.step_id
-            or approval.action != snapshot.action
-            or approval.schema_version != snapshot.schema_version
-            or approval.version != snapshot.approval_version
-            or approval.proposal_kind != snapshot.proposal_kind
-            or approval.proposal_id != snapshot.proposal_id
-            or approval.proposal_version != snapshot.proposal_version
-            or action_connection_id != snapshot.connection_id
-            or action_calendar_id != snapshot.calendar_id
-            or action_status
-            not in {
+            return RequestStartResult(RequestStartDisposition.ABANDONED)
+        action_connection_id, action_calendar_id, action_status = (
+            binding if binding is not None else (None, None, None)
+        )
+        binding_is_valid = (
+            user is not None
+            and connection is not None
+            and connection.provider == snapshot.provider
+            and read_capability is not None
+            and write_capability is not None
+        )
+        binding_is_valid = binding_is_valid and (
+            task.user_id == snapshot.user_id
+            and _task_operation_matches(task, snapshot.operation_id)
+            and approval.step_id == snapshot.execution.step_id
+            and approval.action == snapshot.action
+            and approval.schema_version == snapshot.schema_version
+            and approval.version == snapshot.approval_version
+            and approval.proposal_kind == snapshot.proposal_kind
+            and approval.proposal_id == snapshot.proposal_id
+            and approval.proposal_version == snapshot.proposal_version
+            and action_connection_id == snapshot.connection_id
+            and action_calendar_id == snapshot.calendar_id
+            and action_status
+            in {
                 MailDraftStatus.EXECUTING.value,
                 CalendarProposalStatus.EXECUTING.value,
             }
-            or not compare_digest(approval.payload_hash, snapshot.payload_hash)
-            or not trusted_execution_binding_matches(
+            and compare_digest(approval.payload_hash, snapshot.payload_hash)
+            and trusted_execution_binding_matches(
                 execution_task_id=execution.task_id,
                 expected_task_id=task.id,
                 execution_step_id=execution.step_id,
@@ -989,31 +1066,168 @@ class SqlAlchemyTrustedActionRepository:
                 execution_payload_hash=execution.request_payload_hash,
                 expected_payload_hash=approval.payload_hash,
             )
-        ):
-            return False
-        status = ToolExecutionStatus(execution.status)
-        if status is ToolExecutionStatus.CLAIMED:
+        )
+        if execution_status is ToolExecutionStatus.CLAIMED:
             if (
                 execution.request_started_at is not None
                 or execution.write_attempt_count != 0
                 or execution.result_summary is not None
             ):
-                return False
-        elif status is ToolExecutionStatus.RETRYABLE_FAILED:
+                return RequestStartResult(RequestStartDisposition.RECONCILE)
+        elif execution_status is ToolExecutionStatus.RETRYABLE_FAILED:
             if (
                 execution.request_started_at is None
                 or execution.write_attempt_count <= 0
                 or not durable_retry_summary_is_valid(execution.result_summary)
             ):
-                return False
+                binding_is_valid = False
         else:
-            return False
+            return RequestStartResult(RequestStartDisposition.ABANDONED)
+        authorization_error: str | None = "trusted_action_unavailable"
+        if (
+            binding_is_valid
+            and user is not None
+            and connection is not None
+            and read_capability is not None
+            and write_capability is not None
+        ):
+            authorization_error = authorize(
+                TrustedActionRequestStartAuthorization(
+                    user_is_active=user.is_active,
+                    provider=connection.provider,
+                    provider_tenant_id=connection.provider_tenant_id,
+                    provider_account_id=connection.provider_account_id,
+                    connection_status=connection.status,
+                    read_capability_status=capabilities.get(
+                        read_capability,
+                        (CapabilityStatus.DISABLED, None),
+                    )[0],
+                    write_capability_status=capabilities.get(
+                        write_capability,
+                        (CapabilityStatus.DISABLED, None),
+                    )[0],
+                    write_capability_error_code=capabilities.get(
+                        write_capability,
+                        (CapabilityStatus.DISABLED, None),
+                    )[1],
+                    calendar_can_write=calendar_can_write,
+                )
+            )
+        if authorization_error is not None:
+            await self._settle_request_start_failure(
+                snapshot=snapshot,
+                task=task,
+                approval=approval,
+                execution=execution,
+                error_code=authorization_error,
+                failed_at=database_now,
+                lease_owner=lease_owner,
+            )
+            return RequestStartResult(
+                RequestStartDisposition.INVALIDATED,
+                error_code=authorization_error,
+            )
         if execution.request_started_at is None:
             execution.request_started_at = database_now
         execution.write_attempt_count += 1
         execution.status = ToolExecutionStatus.EXECUTING.value
         await self._session.flush()
-        return True
+        return RequestStartResult(RequestStartDisposition.STARTED)
+
+    async def _settle_request_start_failure(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+        execution: ToolExecutionModel,
+        error_code: str,
+        failed_at: datetime,
+        lease_owner: str,
+    ) -> None:
+        """在已证明本轮尚未发出写请求时原子失效 claim 与冻结本地版本。
+
+        Args:
+            snapshot: dispatch 首次读取的冻结标识与本地版本。
+            task: 已按固定顺序锁定且仍由当前 owner 持有的 TaskRun。
+            approval: 与该任务绑定的已锁审批；即使非敏感元数据被篡改也会失效。
+            execution: 已锁 ToolExecution，必须仍处于未开始写入或明确未应用状态。
+            error_code: 应用策略或绑定校验返回的稳定无内容失败码。
+            failed_at: 全部相关行锁取得后的 PostgreSQL 权威时间。
+            lease_owner: 当前执行者，用于任务审计 actor 与 owner 证明。
+        """
+        execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+        execution.error_code = error_code
+        execution.completed_at = failed_at
+        execution.result_summary = {
+            "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+            "retryable": False,
+        }
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.FAILED.value
+        task.error_code = error_code
+        task.finished_at = failed_at
+        _clear_task_scheduling(task)
+        await self._set_snapshot_action_status(
+            snapshot=snapshot,
+            mail_status=MailDraftStatus.EDITING,
+            calendar_status=CalendarProposalStatus.EDITING,
+            allowed_current={
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            },
+        )
+        approval_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="approval.invalidated",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": error_code},
+        )
+        task_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="task.failed",
+            actor_type="worker",
+            actor_id=lease_owner,
+            event_metadata={"error_code": error_code},
+        )
+        tool_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="tool.confirmed_failed",
+            actor_type="worker",
+            actor_id=None,
+            event_metadata={
+                "action": snapshot.action,
+                "provider": snapshot.provider,
+                "outcome": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+                "write_attempt_count": execution.write_attempt_count,
+            },
+        )
+        self._session.add_all((approval_audit, task_audit, tool_audit))
+        await self._session.flush()
+        self._session.add_all(
+            (
+                OutboxEventModel(
+                    topic="approval.invalidated",
+                    aggregate_id=task.id,
+                    deduplication_key=(
+                        f"approval.invalidated:{approval.id}:{approval.version}:request-start"
+                    ),
+                    payload={"task_id": str(task.id), "audit_event_id": approval_audit.id},
+                    available_at=failed_at,
+                ),
+                OutboxEventModel(
+                    topic="tool.confirmed_failed",
+                    aggregate_id=task.id,
+                    deduplication_key=f"tool.confirmed_failed:{execution.id}:request-start",
+                    payload={"task_id": str(task.id), "audit_event_id": tool_audit.id},
+                    available_at=failed_at,
+                ),
+            )
+        )
 
     async def persist_provider_outcome(
         self,
@@ -1025,7 +1239,15 @@ class SqlAlchemyTrustedActionRepository:
         may_retry_write: bool,
         lease_owner: str,
     ) -> None:
-        """按本轮持久重试预算把 adapter 结果与本地事实原子收敛。"""
+        """以锁后数据库时间、live lease 与完整冻结绑定 CAS 提交 provider 结果。
+
+        ``completed_at`` 仅保留应用端口兼容性，不能授权或决定持久时间；供应商网络等待
+        期间它可能已经陈旧。事务依次锁 Task、Approval、ToolExecution、本地动作、
+        Connection 与目标日历，最后读取 ``clock_timestamp()``，只有当前 owner 的租约
+        仍有效且全部冻结标识未换绑才允许写入结果。连接在请求发出后的正常断开、scope
+        撤销或目录 ``can_write`` 变化不会抹掉真实结果，因为本边界只核对目标身份，不重跑
+        request-start 写授权策略。
+        """
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
@@ -1037,12 +1259,43 @@ class SqlAlchemyTrustedActionRepository:
         )
         if task is None or approval is None or execution is None:
             raise _trusted_action_unavailable()
-        status = ToolExecutionStatus(execution.status)
+        try:
+            status = ToolExecutionStatus(execution.status)
+        except ValueError:
+            raise _trusted_action_unavailable() from None
         if status in {
             ToolExecutionStatus.SUCCEEDED,
             ToolExecutionStatus.CONFIRMED_FAILED,
         }:
             return
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        connection = (
+            await self._session.scalar(
+                select(OAuthConnectionModel)
+                .where(
+                    OAuthConnectionModel.id == snapshot.connection_id,
+                    OAuthConnectionModel.user_id == snapshot.user_id,
+                )
+                .with_for_update()
+            )
+            if snapshot.connection_id is not None
+            else None
+        )
+        calendar = None
+        if snapshot.calendar_id is not None and snapshot.connection_id is not None:
+            calendar = await self._session.scalar(
+                select(ProviderCalendarModel)
+                .where(
+                    ProviderCalendarModel.user_id == snapshot.user_id,
+                    ProviderCalendarModel.connection_id == snapshot.connection_id,
+                    ProviderCalendarModel.provider_calendar_id == snapshot.calendar_id,
+                )
+                .with_for_update()
+            )
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
+        if binding is None or connection is None or database_now is None:
+            raise _trusted_action_unavailable()
+        action_connection_id, action_calendar_id, action_status = binding
         allowed = (
             {
                 ToolExecutionStatus.EXECUTING,
@@ -1052,10 +1305,57 @@ class SqlAlchemyTrustedActionRepository:
             if from_reconciliation
             else {ToolExecutionStatus.EXECUTING}
         )
+        expected_write_attempt_count = (
+            snapshot.execution.write_attempt_count
+            if from_reconciliation
+            else snapshot.execution.write_attempt_count + 1
+        )
         if (
             status not in allowed
+            or task.kind != "trusted_action"
+            or task.user_id != snapshot.user_id
             or task.status != TaskStatus.RUNNING.value
             or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+            or not _task_operation_matches(task, snapshot.operation_id)
+            or approval.step_id != snapshot.step_id
+            or approval.status != ApprovalStatus.APPROVED.value
+            or approval.action != snapshot.action
+            or approval.schema_version != snapshot.schema_version
+            or approval.version != snapshot.approval_version
+            or approval.proposal_kind != snapshot.proposal_kind
+            or approval.proposal_id != snapshot.proposal_id
+            or approval.proposal_version != snapshot.proposal_version
+            or not compare_digest(approval.payload_hash, snapshot.payload_hash)
+            or action_connection_id != snapshot.connection_id
+            or action_calendar_id != snapshot.calendar_id
+            or action_status
+            not in {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            }
+            or connection.provider != snapshot.provider
+            or (snapshot.calendar_id is not None and calendar is None)
+            or execution.request_started_at is None
+            or execution.write_attempt_count != expected_write_attempt_count
+            or not trusted_execution_binding_matches(
+                execution_task_id=execution.task_id,
+                expected_task_id=snapshot.task_id,
+                execution_step_id=execution.step_id,
+                expected_step_id=snapshot.step_id,
+                execution_operation_id=execution.operation_id,
+                expected_operation_id=snapshot.operation_id,
+                execution_provider=execution.provider,
+                expected_provider=snapshot.provider,
+                execution_tool_name=execution.tool_name,
+                expected_action=snapshot.action,
+                execution_idempotency_key=execution.idempotency_key,
+                approval_id=snapshot.approval_id,
+                approval_version=snapshot.approval_version,
+                execution_payload_hash=execution.request_payload_hash,
+                expected_payload_hash=snapshot.payload_hash,
+            )
         ):
             raise _trusted_action_unavailable()
         execution.provider_resource_id = outcome.provider_resource_id
@@ -1063,14 +1363,22 @@ class SqlAlchemyTrustedActionRepository:
         execution.correlation_id = outcome.correlation_id
         execution.error_code = outcome.error_code
         execution.result_summary = _outcome_summary(outcome)
+        if outcome.kind is ProviderWriteOutcomeKind.UNKNOWN:
+            # UNKNOWN 只证明响应语义不明确，绝不能伪造 confirmed_not_applied。Task 19
+            # 保留 executing 三元组并立即释放租约，后续重复投递只会从持久 request-start
+            # 事实进入 adapter.reconcile；不创建 Task 20 的核对状态、事件或调度。
+            task.lease_owner = None
+            task.lease_expires_at = database_now
+            await self._session.flush()
+            return
         event_type: str
         outbox_topic: str
         if outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED:
             execution.status = ToolExecutionStatus.SUCCEEDED.value
-            execution.completed_at = completed_at
+            execution.completed_at = database_now
             task.status = TaskStatus.SUCCEEDED.value
             task.error_code = None
-            task.finished_at = completed_at
+            task.finished_at = database_now
             _clear_task_scheduling(task)
             await self._set_local_action_status(
                 task=task,
@@ -1112,16 +1420,12 @@ class SqlAlchemyTrustedActionRepository:
                     if outcome.retryable
                     else outcome.error_code or "provider_write_confirmed_not_applied"
                 )
-            else:
-                # Task 20 才会增加持久只读核对调度。Task 19 不能留下无人消费的
-                # reconciling/needs_attention 半状态，也绝不能把 unknown 当成可重试写。
-                terminal_error_code = "provider_write_outcome_unknown"
             execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
             execution.error_code = terminal_error_code
-            execution.completed_at = completed_at
+            execution.completed_at = database_now
             task.status = TaskStatus.FAILED.value
             task.error_code = terminal_error_code
-            task.finished_at = completed_at
+            task.finished_at = database_now
             _clear_task_scheduling(task)
             await self._set_local_action_status(
                 task=task,
@@ -1169,8 +1473,127 @@ class SqlAlchemyTrustedActionRepository:
                 aggregate_id=task.id,
                 deduplication_key=f"{outbox_topic}:{execution.id}:{execution.write_attempt_count}",
                 payload={"task_id": str(task.id), "audit_event_id": audit.id},
-                available_at=completed_at,
+                available_at=database_now,
             )
+        )
+
+    async def abandon_started_attempt(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+    ) -> bool:
+        """以 request-start 前 dispatch 冻结投影释放中断租约且不伪造结果。
+
+        Args:
+            snapshot: 当前进程在 request-start 前读取的完整内容无关绑定；不进入
+                LangGraph checkpoint，也不包含命令、密文或用户正文。
+            lease_owner: 被异常、取消或超时中断的当前 Worker owner。
+
+        Returns:
+            已确认存在同一未决写尝试且租约已释放（或先前已由同一路径释放）时为
+            ``True``；事实不匹配、请求尚未开始或另一个 owner 已接管时为 ``False``。
+
+        Notes:
+            TaskRun 保持 ``running``，ToolExecution 与本地动作保持 ``executing``。
+            只有当前 owner 的租约在锁后数据库时间仍严格有效时才可首次释放；随后
+            ``lease_expires_at`` 写为该数据库时间而不是 ``NULL``，让 acquisition CAS
+            可立即接管并让同一 abandon 幂等重放，同时不创建 Task 20 核对事件。
+        """
+        task, approval = await self._locked_task_approval(
+            task_id=snapshot.task_id,
+            approval_id=snapshot.approval_id,
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(ToolExecutionModel.id == snapshot.execution.execution_id)
+            .with_for_update()
+        )
+        if task is None or approval is None or execution is None:
+            return False
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        connection = (
+            await self._session.scalar(
+                select(OAuthConnectionModel)
+                .where(
+                    OAuthConnectionModel.id == snapshot.connection_id,
+                    OAuthConnectionModel.user_id == snapshot.user_id,
+                )
+                .with_for_update()
+            )
+            if snapshot.connection_id is not None
+            else None
+        )
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
+        if binding is None or connection is None or database_now is None:
+            return False
+        try:
+            execution_status = ToolExecutionStatus(execution.status)
+        except ValueError:
+            return False
+        action_connection_id, action_calendar_id, action_status = binding
+        unresolved = (
+            task.kind == "trusted_action"
+            and task.status == TaskStatus.RUNNING.value
+            and task.user_id == snapshot.user_id
+            and _task_operation_matches(task, snapshot.operation_id)
+            and approval.id == snapshot.approval_id
+            and approval.status == ApprovalStatus.APPROVED.value
+            and approval.step_id == snapshot.step_id
+            and approval.action == snapshot.action
+            and approval.schema_version == snapshot.schema_version
+            and approval.version == snapshot.approval_version
+            and approval.proposal_kind == snapshot.proposal_kind
+            and approval.proposal_id == snapshot.proposal_id
+            and approval.proposal_version == snapshot.proposal_version
+            and compare_digest(approval.payload_hash, snapshot.payload_hash)
+            and action_connection_id == snapshot.connection_id
+            and action_calendar_id == snapshot.calendar_id
+            and action_status
+            in {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            }
+            and execution_status
+            in {
+                ToolExecutionStatus.EXECUTING,
+                ToolExecutionStatus.RECONCILING,
+            }
+            and execution.request_started_at is not None
+            and execution.write_attempt_count > 0
+            and snapshot.execution.approval_id == snapshot.approval_id
+            and trusted_execution_binding_matches(
+                execution_task_id=execution.task_id,
+                expected_task_id=snapshot.task_id,
+                execution_step_id=execution.step_id,
+                expected_step_id=snapshot.step_id,
+                execution_operation_id=execution.operation_id,
+                expected_operation_id=snapshot.operation_id,
+                execution_provider=execution.provider,
+                expected_provider=snapshot.provider,
+                execution_tool_name=execution.tool_name,
+                expected_action=snapshot.action,
+                execution_idempotency_key=execution.idempotency_key,
+                approval_id=snapshot.approval_id,
+                approval_version=snapshot.approval_version,
+                execution_payload_hash=execution.request_payload_hash,
+                expected_payload_hash=snapshot.payload_hash,
+            )
+            and connection.provider == snapshot.provider
+        )
+        if not unresolved:
+            return False
+        if task.lease_owner == lease_owner:
+            if task.lease_expires_at is None or task.lease_expires_at <= database_now:
+                return False
+            task.lease_owner = None
+            task.lease_expires_at = database_now
+            await self._session.flush()
+            return True
+        return (
+            task.lease_owner is None
+            and task.lease_expires_at is not None
+            and task.lease_expires_at <= database_now
         )
 
     async def fail_claimed_integrity(
@@ -1278,6 +1701,18 @@ class SqlAlchemyTrustedActionRepository:
         task.error_code = None
         task.finished_at = finished_at
         _clear_task_scheduling(task)
+        # 拒绝分支在本事务内直接清除租约；通用 Runner 随后的成功 CAS 必然未命中，
+        # 所以必须在这里追加且只追加一次 task.succeeded 时间线事实。
+        self._session.add(
+            AuditEventModel(
+                user_id=task.user_id,
+                task_id=task.id,
+                event_type="task.succeeded",
+                actor_type="worker",
+                actor_id=lease_owner,
+                event_metadata={"reason": "approval_rejected"},
+            )
+        )
 
     async def _locked_task_approval(
         self,
@@ -1389,6 +1824,51 @@ class SqlAlchemyTrustedActionRepository:
                 or proposal.current_version != approval.proposal_version
                 or proposal.status not in allowed_current
             ):
+                raise _trusted_action_unavailable()
+            proposal.status = calendar_status.value
+            return
+        raise _trusted_action_unavailable()
+
+    async def _set_snapshot_action_status(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        mail_status: MailDraftStatus,
+        calendar_status: CalendarProposalStatus,
+        allowed_current: set[str],
+    ) -> None:
+        """按 dispatch 原始本地标识收敛失效状态，不信任已被篡改的审批投影。"""
+        if snapshot.proposal_kind == "mail_draft":
+            draft = await self._session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == snapshot.proposal_id,
+                    MailDraftModel.user_id == snapshot.user_id,
+                )
+                .with_for_update()
+            )
+            if draft is None:
+                raise _trusted_action_unavailable()
+            if draft.status == mail_status.value:
+                return
+            if draft.status not in allowed_current:
+                raise _trusted_action_unavailable()
+            draft.status = mail_status.value
+            return
+        if snapshot.proposal_kind == "calendar_proposal":
+            proposal = await self._session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == snapshot.proposal_id,
+                    CalendarChangeProposalModel.user_id == snapshot.user_id,
+                )
+                .with_for_update()
+            )
+            if proposal is None:
+                raise _trusted_action_unavailable()
+            if proposal.status == calendar_status.value:
+                return
+            if proposal.status not in allowed_current:
                 raise _trusted_action_unavailable()
             proposal.status = calendar_status.value
             return
@@ -1688,6 +2168,292 @@ class SqlAlchemyTrustedActionRepository:
         return canonical
 
 
+class SqlAlchemyTrustedActionTaskExecutionStore(SqlAlchemyTaskExecutionStore):
+    """复用通用租约实现，并为 request-start 前失败提供可信动作原子终态。
+
+    通用 Runner 只能看见 TaskRun，因此 resolver、主密钥、checkpoint 或总预算在真实
+    请求开始前失败时，普通 ``finish()`` 会留下仍冻结的审批和本地动作。本实现只覆盖
+    FAILED 完成：先按可信锁序证明请求从未开始，再把审批、任务、本地对象及可选 claim
+    一起收敛；任何已存在 request-start 的尝试都返回 ``False``，禁止伪造外部结果。
+    """
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存同一消息级连接池，同时复用现有 acquire/renew/retry 实现。"""
+        super().__init__(session_factory)
+        self._trusted_session_factory = session_factory
+
+    async def finish(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        status: TaskStatus,
+        finished_at: datetime,
+        error_code: str | None,
+        retry_recovery_at: datetime | None = None,
+    ) -> bool:
+        """FAILED 时原子收敛未开始请求的可信动作，其余状态保留通用语义。
+
+        Args:
+            task_id: 当前可信动作 TaskRun ID。
+            lease_owner: DurableTaskRunner 当前 owner。
+            status: Runner 请求写入的任务状态。
+            finished_at: Runner 采样的带时区完成时间。
+            error_code: 不含供应商内容的稳定失败码。
+            retry_recovery_at: 仅通用 ``retry_scheduled`` 路径允许的恢复时间。
+
+        Returns:
+            原子可信终态已提交时为 ``True``；租约、绑定或 request-start 证明不成立时
+            为 ``False``。非 FAILED 状态委托给通用 store。
+        """
+        if status is not TaskStatus.FAILED:
+            return await super().finish(
+                task_id=task_id,
+                lease_owner=lease_owner,
+                status=status,
+                finished_at=finished_at,
+                error_code=error_code,
+                retry_recovery_at=retry_recovery_at,
+            )
+        failed_at = utc_instant(finished_at, field="finished_at")
+        if retry_recovery_at is not None:
+            raise ValueError("retry_recovery_at is only valid for retry_scheduled")
+        if type(error_code) is not str or not error_code.strip():
+            return False
+        async with self._trusted_session_factory.begin() as session:
+            return await self._fail_before_request(
+                session=session,
+                task_id=task_id,
+                lease_owner=lease_owner,
+                failed_at=failed_at,
+                error_code=error_code,
+            )
+
+    @staticmethod
+    async def _fail_before_request(
+        *,
+        session: AsyncSession,
+        task_id: UUID,
+        lease_owner: str,
+        failed_at: datetime,
+        error_code: str,
+    ) -> bool:
+        """在同一事务证明零写调用并收敛 Task、Approval、claim 与本地对象。"""
+        task = await session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if task is None or task.kind != "trusted_action":
+            return False
+        raw_approval_id = task.input_payload.get("approval_id")
+        raw_operation_id = task.input_payload.get("operation_id")
+        if (
+            set(task.input_payload) != {"approval_id", "operation_id"}
+            or type(raw_approval_id) is not str
+            or type(raw_operation_id) is not str
+        ):
+            return False
+        try:
+            approval_id = UUID(raw_approval_id)
+            operation_id = UUID(raw_operation_id)
+        except ValueError:
+            return False
+        approval = await session.scalar(
+            select(ApprovalRequestModel)
+            .where(
+                ApprovalRequestModel.id == approval_id,
+                ApprovalRequestModel.task_id == task.id,
+            )
+            .with_for_update()
+        )
+        if approval is None:
+            return False
+        execution = await session.scalar(
+            select(ToolExecutionModel)
+            .where(
+                ToolExecutionModel.task_id == task.id,
+                ToolExecutionModel.operation_id == operation_id,
+            )
+            .with_for_update()
+        )
+
+        action: MailDraftModel | CalendarChangeProposalModel | None = None
+        connection_id: UUID | None = None
+        if approval.proposal_kind == "mail_draft" and approval.proposal_id is not None:
+            draft = await session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if draft is not None and draft.current_version == approval.proposal_version:
+                action = draft
+                connection_id = draft.connection_id
+        elif approval.proposal_kind == "calendar_proposal" and approval.proposal_id is not None:
+            proposal = await session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == approval.proposal_id,
+                    CalendarChangeProposalModel.user_id == task.user_id,
+                )
+                .with_for_update()
+            )
+            if proposal is not None and proposal.current_version == approval.proposal_version:
+                action = proposal
+                connection_id = proposal.connection_id
+        if action is None or connection_id is None:
+            return False
+        connection = await session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == task.user_id,
+            )
+            .with_for_update()
+        )
+        database_now = await session.scalar(select(func.clock_timestamp()))
+        if connection is None or database_now is None:
+            return False
+        if (
+            task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+            or task.lease_expires_at <= failed_at
+            or not _task_operation_matches(task, operation_id)
+            or approval.status
+            not in {
+                ApprovalStatus.PENDING.value,
+                ApprovalStatus.APPROVED.value,
+            }
+        ):
+            return False
+
+        expected_action_status = (
+            MailDraftStatus.EXECUTING.value
+            if isinstance(action, MailDraftModel) and execution is not None
+            else CalendarProposalStatus.EXECUTING.value
+            if isinstance(action, CalendarChangeProposalModel) and execution is not None
+            else MailDraftStatus.AWAITING_APPROVAL.value
+            if isinstance(action, MailDraftModel)
+            else CalendarProposalStatus.AWAITING_APPROVAL.value
+        )
+        if action.status != expected_action_status:
+            return False
+        if execution is not None:
+            try:
+                execution_status = ToolExecutionStatus(execution.status)
+            except ValueError:
+                return False
+            if (
+                approval.status != ApprovalStatus.APPROVED.value
+                or execution_status is not ToolExecutionStatus.CLAIMED
+                or execution.request_started_at is not None
+                or execution.write_attempt_count != 0
+                or execution.result_summary is not None
+                or not trusted_execution_binding_matches(
+                    execution_task_id=execution.task_id,
+                    expected_task_id=task.id,
+                    execution_step_id=execution.step_id,
+                    expected_step_id=approval.step_id,
+                    execution_operation_id=execution.operation_id,
+                    expected_operation_id=operation_id,
+                    execution_provider=execution.provider,
+                    expected_provider=connection.provider,
+                    execution_tool_name=execution.tool_name,
+                    expected_action=approval.action,
+                    execution_idempotency_key=execution.idempotency_key,
+                    approval_id=approval.id,
+                    approval_version=approval.version,
+                    execution_payload_hash=execution.request_payload_hash,
+                    expected_payload_hash=approval.payload_hash,
+                )
+            ):
+                return False
+
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.FAILED.value
+        task.error_code = error_code
+        task.finished_at = failed_at
+        _clear_task_scheduling(task)
+        action.status = (
+            MailDraftStatus.EDITING.value
+            if isinstance(action, MailDraftModel)
+            else CalendarProposalStatus.EDITING.value
+        )
+        if execution is not None:
+            execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+            execution.error_code = error_code
+            execution.completed_at = failed_at
+            execution.result_summary = {
+                "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+                "retryable": False,
+            }
+
+        approval_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="approval.invalidated",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": error_code},
+        )
+        task_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type="task.failed",
+            actor_type="worker",
+            actor_id=lease_owner,
+            event_metadata={
+                "status": TaskStatus.FAILED.value,
+                "error_code": error_code,
+            },
+        )
+        audits = [approval_audit, task_audit]
+        tool_audit: AuditEventModel | None = None
+        if execution is not None:
+            tool_audit = AuditEventModel(
+                user_id=task.user_id,
+                task_id=task.id,
+                event_type="tool.confirmed_failed",
+                actor_type="worker",
+                actor_id=lease_owner,
+                event_metadata={
+                    "action": approval.action,
+                    "provider": connection.provider,
+                    "outcome": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+                    "write_attempt_count": 0,
+                },
+            )
+            audits.append(tool_audit)
+        session.add_all(audits)
+        await session.flush()
+        outbox_events = [
+            OutboxEventModel(
+                topic="approval.invalidated",
+                aggregate_id=task.id,
+                deduplication_key=(
+                    f"approval.invalidated:{approval.id}:{approval.version}:pre-request"
+                ),
+                payload={"task_id": str(task.id), "audit_event_id": approval_audit.id},
+                available_at=failed_at,
+            )
+        ]
+        if execution is not None and tool_audit is not None:
+            outbox_events.append(
+                OutboxEventModel(
+                    topic="tool.confirmed_failed",
+                    aggregate_id=task.id,
+                    deduplication_key=f"tool.confirmed_failed:{execution.id}:pre-request",
+                    payload={"task_id": str(task.id), "audit_event_id": tool_audit.id},
+                    available_at=failed_at,
+                )
+            )
+        session.add_all(outbox_events)
+        return True
+
+
 class SqlAlchemyTrustedActionRepositoryFactory:
     """为一次可信提交提供自动提交或回滚的短事务 Repository。"""
 
@@ -1844,4 +2610,5 @@ __all__ = [
     "APPROVAL_COMMAND_CONTENT_KIND",
     "SqlAlchemyTrustedActionRepository",
     "SqlAlchemyTrustedActionRepositoryFactory",
+    "SqlAlchemyTrustedActionTaskExecutionStore",
 ]

@@ -17,13 +17,17 @@ from ai_employee.application.ports.trusted_actions import (
     ProviderWriteOutcome,
 )
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
-from ai_employee.application.use_cases.trusted_actions import TrustedActionExecutionUseCase
+from ai_employee.application.use_cases.trusted_actions import (
+    TrustedActionAttemptAbandoned,
+    TrustedActionExecutionUseCase,
+)
 from ai_employee.config import Settings
 from ai_employee.domain.actions import (
     MailDraftStatus,
     ProviderWriteOutcomeKind,
     ToolExecutionStatus,
 )
+from ai_employee.domain.calendar_actions import calendar_client_event_id
 from ai_employee.domain.connections import (
     CapabilityStatus,
     ConnectionCapability,
@@ -55,6 +59,7 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
 )
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
+    SqlAlchemyTrustedActionTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
@@ -94,11 +99,15 @@ class _RecordingAdapter:
         outcome: ProviderWriteOutcome | None = None,
         *,
         provider: str = "google",
+        started: asyncio.Event | None = None,
+        release: asyncio.Event | None = None,
     ) -> None:
         """初始化固定 provider 与计数器；默认返回 confirmed applied。"""
         self.provider = provider
         self.write_calls = 0
         self.reconcile_calls = 0
+        self.started = started
+        self.release = release
         self.outcome = outcome or ProviderWriteOutcome(
             kind=ProviderWriteOutcomeKind.CONFIRMED_APPLIED,
             retryable=False,
@@ -119,7 +128,12 @@ class _RecordingAdapter:
         """让并发调用在请求开始 CAS 后交错，再返回同一合成结果。"""
         assert command is not None
         self.write_calls += 1
-        await asyncio.sleep(0)
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        else:
+            await asyncio.sleep(0)
         return self.outcome
 
     async def reconcile(
@@ -214,6 +228,21 @@ class _MutableClock:
     def __call__(self) -> datetime:
         """返回本次 acquisition、退避或完成判断使用的同一瞬间。"""
         return self.current
+
+
+class _PreRequestFailureStep:
+    """在任何 provider request-start 之前模拟 checkpoint/节点基础设施失败。"""
+
+    name = "synthetic_pre_request_failure"
+
+    def __init__(self, error: Exception) -> None:
+        """保存不含命令内容的合成异常。"""
+        self._error = error
+
+    async def execute(self, task: LeasedTask) -> None:
+        """确认仍是可信任务后抛出预定异常，不触达 adapter。"""
+        assert task.kind == "trusted_action"
+        raise self._error
 
 
 class _Seed:
@@ -432,6 +461,119 @@ async def _seed_action(
                         write_attempt_count=1 if request_started_at else 0,
                     )
                 )
+    finally:
+        await session_factory.dispose()
+    return payload_hash
+
+
+async def _seed_calendar_action(
+    database_url: str,
+    seed: _Seed,
+    *,
+    calendar_id: str = "synthetic-calendar",
+) -> str:
+    """把通用可信邮件 fixture 收窄成已批准的 calendar.create 动作。
+
+    该辅助函数保留同一用户、连接、TaskRun 与审批标识，只替换本地动作、能力和
+    AEAD 命令绑定，便于 request-start 竞态测试精确修改目录 ``can_write``，而不在
+    测试中复制整套可信执行建模。
+    """
+    await _seed_action(database_url, seed)
+    command_payload: dict[str, object] = {
+        "schema_version": "calendar_create.v1",
+        "action": "calendar.create",
+        "operation_id": str(seed.operation_id),
+        "connection_id": str(seed.connection_id),
+        "calendar_id": calendar_id,
+        "title": "Synthetic meeting",
+        "description": "Synthetic description",
+        "location": "Synthetic room",
+        "starts_at": "2030-01-01T01:00:00Z",
+        "ends_at": "2030-01-01T02:00:00Z",
+        "timezone": "UTC",
+        "all_day": False,
+        "attendees": ["owner@example.test"],
+        "notification_policy": "all",
+        "client_event_id": calendar_client_event_id(seed.operation_id),
+    }
+    parse_trusted_command(command_payload)
+    payload_hash = trusted_command_hash(command_payload)
+    encrypted = ACTION_CIPHER.encrypt_json(
+        command_payload,
+        user_id=seed.user_id,
+        record_id=seed.approval_id,
+        content_kind="approval_command",
+        action="calendar.create",
+        schema_version="calendar_create.v1",
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                delete(MailDraftModel).where(MailDraftModel.id == seed.draft_id)
+            )
+            session.add_all(
+                (
+                    ConnectionCapabilityModel(
+                        user_id=seed.user_id,
+                        connection_id=seed.connection_id,
+                        capability=ConnectionCapability.CALENDAR_READ.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=["calendar.read"],
+                    ),
+                    ConnectionCapabilityModel(
+                        user_id=seed.user_id,
+                        connection_id=seed.connection_id,
+                        capability=ConnectionCapability.CALENDAR_WRITE.value,
+                        status=CapabilityStatus.ENABLED.value,
+                        actual_scopes=["calendar.write"],
+                    ),
+                    ProviderCalendarModel(
+                        user_id=seed.user_id,
+                        connection_id=seed.connection_id,
+                        provider_calendar_id=calendar_id,
+                        name="Synthetic calendar",
+                        timezone="UTC",
+                        is_primary=True,
+                        access_role="owner",
+                        can_write=True,
+                        provider_url=None,
+                    ),
+                    CalendarChangeProposalModel(
+                        id=seed.draft_id,
+                        user_id=seed.user_id,
+                        connection_id=seed.connection_id,
+                        creation_idempotency_key=f"proposal:{seed.draft_id}",
+                        creation_payload_hash="c" * 64,
+                        calendar_id=calendar_id,
+                        operation_kind="create",
+                        target_event_id=None,
+                        base_etag=None,
+                        current_version=1,
+                        status="awaiting_approval",
+                        retain_until=NOW + timedelta(days=30),
+                    ),
+                )
+            )
+            await session.execute(
+                update(ApprovalRequestModel)
+                .where(ApprovalRequestModel.id == seed.approval_id)
+                .values(
+                    action="calendar.create",
+                    payload={"storage": "encrypted", "schema_version": "calendar_create.v1"},
+                    schema_version="calendar_create.v1",
+                    payload_ciphertext=encrypted.ciphertext,
+                    payload_nonce=encrypted.nonce,
+                    payload_key_version=encrypted.key_version,
+                    payload_hash=payload_hash,
+                    proposal_kind="calendar_proposal",
+                )
+            )
+            await session.execute(
+                update(TaskStepModel)
+                .where(TaskStepModel.id == seed.step_id)
+                .values(input_summary={"action": "calendar.create", "proposal_version": 1})
+            )
     finally:
         await session_factory.dispose()
     return payload_hash
@@ -891,13 +1033,14 @@ async def test_request_start_rechecks_lease_with_database_time_after_decryption(
             expected_payload_hash=payload_hash,
             lease_owner=seed.owner,
         )
-        await workflow.execute_or_reconcile(
-            task_id=seed.task_id,
-            approval_id=seed.approval_id,
-            operation_id=seed.operation_id,
-            expected_payload_hash=payload_hash,
-            lease_owner=seed.owner,
-        )
+        with pytest.raises(TrustedActionAttemptAbandoned):
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
     finally:
         await workflow.dispose()
 
@@ -914,6 +1057,194 @@ async def test_request_start_rechecks_lease_with_database_time_after_decryption(
     assert execution.request_started_at is None
     assert execution.write_attempt_count == 0
     assert adapter.write_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("revocation", "expected_error_code"),
+    [
+        ("global_switch", "external_writes_disabled"),
+        ("provider_switch", "external_writes_disabled"),
+        ("connection_disconnected", "connection_capability_disabled"),
+        ("mail_read_disabled", "connection_capability_disabled"),
+        ("mail_send_revoked", "connection_scope_missing"),
+        ("account_identity_changed", "external_write_account_not_allowed"),
+    ],
+)
+async def test_request_start_rechecks_current_mail_write_authorization_after_claim(
+    database_url: str,
+    revocation: str,
+    expected_error_code: str,
+) -> None:
+    """claim 后被撤销的任一写授权必须在 request-start 锁内安全失效。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    settings = _settings()
+    workflow = _workflow(database_url, adapter, settings=settings)
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        if revocation == "global_switch":
+            settings.external_writes_enabled = False
+        elif revocation == "provider_switch":
+            settings.google_writes_enabled = False
+        else:
+            session_factory = build_session_factory(database_url)
+            try:
+                async with session_factory.begin() as session:
+                    if revocation == "connection_disconnected":
+                        await session.execute(
+                            update(OAuthConnectionModel)
+                            .where(OAuthConnectionModel.id == seed.connection_id)
+                            .values(status="disconnected")
+                        )
+                    elif revocation == "account_identity_changed":
+                        await session.execute(
+                            update(OAuthConnectionModel)
+                            .where(OAuthConnectionModel.id == seed.connection_id)
+                            .values(provider_account_id="rebound-account")
+                        )
+                    else:
+                        capability = (
+                            ConnectionCapability.MAIL_READ
+                            if revocation == "mail_read_disabled"
+                            else ConnectionCapability.MAIL_SEND
+                        )
+                        status = (
+                            CapabilityStatus.DISABLED
+                            if revocation == "mail_read_disabled"
+                            else CapabilityStatus.REVOKED
+                        )
+                        await session.execute(
+                            update(ConnectionCapabilityModel)
+                            .where(
+                                ConnectionCapabilityModel.connection_id == seed.connection_id,
+                                ConnectionCapabilityModel.capability == capability.value,
+                            )
+                            .values(
+                                status=status.value,
+                                last_error_code=(
+                                    "connection_scope_missing"
+                                    if status is CapabilityStatus.REVOKED
+                                    else None
+                                ),
+                            )
+                        )
+            finally:
+                await session_factory.dispose()
+
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == expected_error_code
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.FAILED.value
+    assert task.error_code == expected_error_code
+    assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
+    assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+    assert execution is not None
+    assert execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
+    assert execution.request_started_at is None
+    assert execution.write_attempt_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_request_start_rechecks_calendar_directory_write_permission_after_claim(
+    database_url: str,
+) -> None:
+    """claim 后目录权限变成只读时，request-start 必须在供应商调用前失效。"""
+    seed = _Seed()
+    calendar_id = "synthetic-calendar"
+    payload_hash = await _seed_calendar_action(
+        database_url,
+        seed,
+        calendar_id=calendar_id,
+    )
+    adapter = _RecordingAdapter()
+    workflow = _workflow(
+        database_url,
+        adapter,
+        registry=ProviderAdapterRegistry(google_calendar_action=adapter),
+    )
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(ProviderCalendarModel)
+                    .where(
+                        ProviderCalendarModel.connection_id == seed.connection_id,
+                        ProviderCalendarModel.provider_calendar_id == calendar_id,
+                    )
+                    .values(can_write=False, access_role="reader")
+                )
+        finally:
+            await session_factory.dispose()
+
+        with pytest.raises(StateConflictError) as raised:
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert raised.value.error_code == "connection_capability_disabled"
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            proposal = await session.get(CalendarChangeProposalModel, seed.draft_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.FAILED.value
+    assert task.error_code == "connection_capability_disabled"
+    assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
+    assert proposal is not None and proposal.status == "editing"
+    assert execution is not None
+    assert execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
+    assert execution.request_started_at is None
+    assert execution.write_attempt_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1124,10 +1455,13 @@ async def test_request_start_cas_rechecks_retry_proof_and_binding(
             started = await transaction.mark_request_started(
                 snapshot=snapshot,
                 lease_owner=seed.owner,
+                authorize=lambda _authorization: None,
             )
     finally:
         await session_factory.dispose()
-    assert started is False
+    assert not isinstance(started, bool)
+    assert getattr(started, "disposition", None) == "invalidated"
+    assert getattr(started, "error_code", None) == "trusted_action_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1264,10 +1598,449 @@ async def test_calendar_request_start_cas_rechecks_frozen_target_binding(
             started = await transaction.mark_request_started(
                 snapshot=snapshot,
                 lease_owner=seed.owner,
+                authorize=lambda _authorization: None,
             )
     finally:
         await session_factory.dispose()
-    assert started is False
+    assert not isinstance(started, bool)
+    assert getattr(started, "disposition", None) == "invalidated"
+    assert getattr(started, "error_code", None) == "trusted_action_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "lease_owner",
+        "lease_expired",
+        "task_operation",
+        "approval_action",
+        "approval_schema",
+        "approval_hash",
+        "approval_version",
+        "approval_proposal_kind",
+        "approval_proposal_id",
+        "approval_proposal_version",
+        "execution_task",
+        "execution_step",
+        "execution_operation",
+        "execution_provider",
+        "execution_tool",
+        "execution_hash",
+        "execution_idempotency_key",
+        "draft_version",
+        "draft_connection",
+    ],
+)
+async def test_provider_outcome_cas_rejects_stale_lease_and_rebound_execution_facts(
+    database_url: str,
+    tamper: str,
+) -> None:
+    """provider 返回后只有仍持有 live lease 与完整冻结绑定的 owner 能提交结果。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    provider_started = asyncio.Event()
+    provider_release = asyncio.Event()
+    adapter = _RecordingAdapter(started=provider_started, release=provider_release)
+    workflow = _workflow(database_url, adapter)
+    dispatch: asyncio.Task[None] | None = None
+    execution_id: UUID | None = None
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        dispatch = asyncio.create_task(
+            workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                execution_id = await session.scalar(
+                    select(ToolExecutionModel.id).where(
+                        ToolExecutionModel.task_id == seed.task_id
+                    )
+                )
+                assert isinstance(execution_id, UUID)
+                if tamper == "lease_owner":
+                    await session.execute(
+                        update(TaskRunModel)
+                        .where(TaskRunModel.id == seed.task_id)
+                        .values(lease_owner="replacement-owner")
+                    )
+                elif tamper == "lease_expired":
+                    database_now = await session.scalar(select(func.clock_timestamp()))
+                    assert isinstance(database_now, datetime)
+                    await session.execute(
+                        update(TaskRunModel)
+                        .where(TaskRunModel.id == seed.task_id)
+                        .values(lease_expires_at=database_now - timedelta(microseconds=1))
+                    )
+                elif tamper == "task_operation":
+                    await session.execute(
+                        update(TaskRunModel)
+                        .where(TaskRunModel.id == seed.task_id)
+                        .values(
+                            input_payload={
+                                "approval_id": str(seed.approval_id),
+                                "operation_id": str(uuid4()),
+                            }
+                        )
+                    )
+                elif tamper.startswith("approval_"):
+                    approval_values: dict[str, object]
+                    if tamper == "approval_action":
+                        approval_values = {"action": "calendar.create"}
+                    elif tamper == "approval_schema":
+                        approval_values = {"schema_version": "calendar_create.v1"}
+                    elif tamper == "approval_hash":
+                        approval_values = {"payload_hash": "f" * 64}
+                    elif tamper == "approval_version":
+                        approval_values = {"version": 2}
+                    elif tamper == "approval_proposal_kind":
+                        approval_values = {"proposal_kind": "calendar_proposal"}
+                    elif tamper == "approval_proposal_id":
+                        approval_values = {"proposal_id": uuid4()}
+                    else:
+                        approval_values = {"proposal_version": 2}
+                    await session.execute(
+                        update(ApprovalRequestModel)
+                        .where(ApprovalRequestModel.id == seed.approval_id)
+                        .values(**approval_values)
+                    )
+                elif tamper.startswith("execution_"):
+                    execution_values: dict[str, object]
+                    if tamper == "execution_task":
+                        alternate_task_id = uuid4()
+                        alternate_step_id = uuid4()
+                        session.add(
+                            TaskRunModel(
+                                id=alternate_task_id,
+                                user_id=seed.user_id,
+                                kind="trusted_action",
+                                status=TaskStatus.RUNNING.value,
+                                idempotency_key=f"outcome-task:{alternate_task_id}",
+                                input_payload={
+                                    "approval_id": str(seed.approval_id),
+                                    "operation_id": str(seed.operation_id),
+                                },
+                                result_payload=None,
+                                error_code=None,
+                                graph_thread_id=str(alternate_task_id),
+                                current_step="execute",
+                                attempt_count=1,
+                                lease_owner=seed.owner,
+                                lease_expires_at=NOW + timedelta(minutes=1),
+                                scheduled_for=NOW,
+                                started_at=NOW,
+                            )
+                        )
+                        await session.flush()
+                        session.add(
+                            TaskStepModel(
+                                id=alternate_step_id,
+                                task_id=alternate_task_id,
+                                sequence=1,
+                                name="alternate_execute",
+                                kind="trusted_action",
+                                status="running",
+                                input_summary={"action": "mail.send", "proposal_version": 1},
+                            )
+                        )
+                        await session.flush()
+                        execution_values = {
+                            "task_id": alternate_task_id,
+                            "step_id": alternate_step_id,
+                        }
+                    elif tamper == "execution_step":
+                        alternate_step_id = uuid4()
+                        session.add(
+                            TaskStepModel(
+                                id=alternate_step_id,
+                                task_id=seed.task_id,
+                                sequence=2,
+                                name="alternate_execute",
+                                kind="trusted_action",
+                                status="running",
+                                input_summary={"action": "mail.send", "proposal_version": 1},
+                            )
+                        )
+                        await session.flush()
+                        execution_values = {"step_id": alternate_step_id}
+                    elif tamper == "execution_operation":
+                        execution_values = {"operation_id": uuid4()}
+                    elif tamper == "execution_provider":
+                        execution_values = {"provider": "microsoft"}
+                    elif tamper == "execution_tool":
+                        execution_values = {"tool_name": "calendar.create"}
+                    elif tamper == "execution_hash":
+                        execution_values = {"request_payload_hash": "f" * 64}
+                    else:
+                        execution_values = {
+                            "idempotency_key": f"tampered:{seed.execution_id}"
+                        }
+                    await session.execute(
+                        update(ToolExecutionModel)
+                        .where(ToolExecutionModel.task_id == seed.task_id)
+                        .values(**execution_values)
+                    )
+                elif tamper == "draft_version":
+                    await session.execute(
+                        update(MailDraftModel)
+                        .where(MailDraftModel.id == seed.draft_id)
+                        .values(current_version=2)
+                    )
+                else:
+                    alternate_connection_id = uuid4()
+                    session.add(
+                        OAuthConnectionModel(
+                            id=alternate_connection_id,
+                            user_id=seed.user_id,
+                            provider="google",
+                            provider_account_id=f"alternate-{alternate_connection_id}",
+                            provider_tenant_id="",
+                            account_type="google",
+                            account_email="alternate-outcome@example.test",
+                            scopes=["mail.read", "mail.send"],
+                            status="connected",
+                        )
+                    )
+                    await session.flush()
+                    await session.execute(
+                        update(MailDraftModel)
+                        .where(MailDraftModel.id == seed.draft_id)
+                        .values(connection_id=alternate_connection_id)
+                    )
+        finally:
+            await session_factory.dispose()
+        provider_release.set()
+        with pytest.raises(StateConflictError) as raised:
+            await dispatch
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        provider_release.set()
+        if dispatch is not None and not dispatch.done():
+            dispatch.cancel()
+            await asyncio.gather(dispatch, return_exceptions=True)
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.get(ToolExecutionModel, execution_id)
+            success_audits = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "tool.succeeded",
+                )
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.RUNNING.value
+    assert draft is not None and draft.status == MailDraftStatus.EXECUTING.value
+    assert execution is not None and execution.status == ToolExecutionStatus.EXECUTING.value
+    assert execution.completed_at is None
+    assert success_audits == 0
+    assert adapter.write_calls == 1
+    assert adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ["proposal_version", "proposal_calendar", "proposal_connection"],
+)
+async def test_calendar_provider_outcome_cas_rechecks_local_target_binding(
+    database_url: str,
+    tamper: str,
+) -> None:
+    """日历结果提交必须重锁当前提案版本、连接与精确 provider calendar。"""
+    seed = _Seed()
+    calendar_id = "synthetic-calendar"
+    payload_hash = await _seed_calendar_action(
+        database_url,
+        seed,
+        calendar_id=calendar_id,
+    )
+    provider_started = asyncio.Event()
+    provider_release = asyncio.Event()
+    adapter = _RecordingAdapter(started=provider_started, release=provider_release)
+    workflow = _workflow(
+        database_url,
+        adapter,
+        registry=ProviderAdapterRegistry(google_calendar_action=adapter),
+    )
+    dispatch: asyncio.Task[None] | None = None
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        dispatch = asyncio.create_task(
+            workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                if tamper == "proposal_version":
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(current_version=2)
+                    )
+                elif tamper == "proposal_calendar":
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(calendar_id="rebound-calendar")
+                    )
+                else:
+                    alternate_connection_id = uuid4()
+                    session.add(
+                        OAuthConnectionModel(
+                            id=alternate_connection_id,
+                            user_id=seed.user_id,
+                            provider="google",
+                            provider_account_id=f"alternate-{alternate_connection_id}",
+                            provider_tenant_id="",
+                            account_type="google",
+                            account_email="alternate-calendar-outcome@example.test",
+                            scopes=["calendar.read", "calendar.write"],
+                            status="connected",
+                        )
+                    )
+                    await session.flush()
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(connection_id=alternate_connection_id)
+                    )
+        finally:
+            await session_factory.dispose()
+        provider_release.set()
+        with pytest.raises(StateConflictError) as raised:
+            await dispatch
+        assert raised.value.error_code == "trusted_action_unavailable"
+    finally:
+        provider_release.set()
+        if dispatch is not None and not dispatch.done():
+            dispatch.cancel()
+            await asyncio.gather(dispatch, return_exceptions=True)
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.RUNNING.value
+    assert execution is not None and execution.status == ToolExecutionStatus.EXECUTING.value
+    assert execution.completed_at is None
+    assert adapter.write_calls == 1
+    assert adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_outcome_survives_normal_connection_revocation_after_request(
+    database_url: str,
+) -> None:
+    """请求已发送后的正常断开与 scope 撤销不能抹掉供应商明确成功结果。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed)
+    provider_started = asyncio.Event()
+    provider_release = asyncio.Event()
+    adapter = _RecordingAdapter(started=provider_started, release=provider_release)
+    workflow = _workflow(database_url, adapter)
+    dispatch: asyncio.Task[None] | None = None
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        dispatch = asyncio.create_task(
+            workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        )
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(OAuthConnectionModel)
+                    .where(OAuthConnectionModel.id == seed.connection_id)
+                    .values(status="disconnected")
+                )
+                await session.execute(
+                    update(ConnectionCapabilityModel)
+                    .where(ConnectionCapabilityModel.connection_id == seed.connection_id)
+                    .values(
+                        status=CapabilityStatus.REVOKED.value,
+                        last_error_code="connection_scope_missing",
+                    )
+                )
+        finally:
+            await session_factory.dispose()
+        provider_release.set()
+        await dispatch
+    finally:
+        provider_release.set()
+        if dispatch is not None and not dispatch.done():
+            dispatch.cancel()
+            await asyncio.gather(dispatch, return_exceptions=True)
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+    assert draft is not None and draft.status == MailDraftStatus.SENT.value
+    assert execution is not None and execution.status == ToolExecutionStatus.SUCCEEDED.value
+    assert execution.write_attempt_count == 1
+    assert adapter.write_calls == 1
+    assert adapter.reconcile_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1358,6 +2131,16 @@ async def test_non_production_claim_rejects_connection_outside_allowlist(
                 lease_owner=seed.owner,
             )
         assert raised.value.error_code == "external_write_account_not_allowed"
+        # 同一队列事实重复到达时，已失败任务不能再次追加终态审计。
+        with pytest.raises(StateConflictError) as repeated:
+            await workflow.claim(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        assert repeated.value.error_code == "trusted_action_unavailable"
     finally:
         await workflow.dispose()
 
@@ -1370,10 +2153,19 @@ async def test_non_production_claim_rejects_connection_outside_allowlist(
             execution_count = await session.scalar(
                 select(func.count()).select_from(ToolExecutionModel)
             )
+            task_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "task.failed",
+                )
+            )
     finally:
         await session_factory.dispose()
     assert task_error == "external_write_account_not_allowed"
     assert execution_count == 0
+    assert task_failed_count == 1
     assert adapter.write_calls == 0
 
 
@@ -1665,6 +2457,75 @@ async def test_claimed_command_aad_tampering_never_reaches_provider(database_url
 
 
 @pytest.mark.asyncio
+async def test_post_request_ciphertext_damage_preserves_unresolved_attempt(
+    database_url: str,
+) -> None:
+    """request-start 后密文认证失败只能释放精确租约，不能伪造未执行终态。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.EXECUTING,
+        request_started_at=NOW - timedelta(seconds=1),
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            ciphertext = await session.scalar(
+                select(ApprovalRequestModel.payload_ciphertext).where(
+                    ApprovalRequestModel.id == seed.approval_id
+                )
+            )
+            assert isinstance(ciphertext, bytes) and ciphertext
+            damaged = ciphertext[:-1] + bytes((ciphertext[-1] ^ 1,))
+            await session.execute(
+                update(ApprovalRequestModel)
+                .where(ApprovalRequestModel.id == seed.approval_id)
+                .values(payload_ciphertext=damaged)
+            )
+    finally:
+        await session_factory.dispose()
+
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        with pytest.raises(TrustedActionAttemptAbandoned):
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            execution = await session.get(ToolExecutionModel, seed.execution_id)
+            task_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "task.failed",
+                )
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.RUNNING.value
+    assert task.lease_owner is None and task.finished_at is None
+    assert approval is not None and approval.status == ApprovalStatus.APPROVED.value
+    assert execution is not None and execution.status == ToolExecutionStatus.EXECUTING.value
+    assert execution.request_started_at is not None and execution.completed_at is None
+    assert task_failed_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_claimed_payload_hash_tampering_fails_before_request_start(
     database_url: str,
 ) -> None:
@@ -1795,6 +2656,409 @@ async def test_reencrypted_command_binding_mismatch_fails_before_request_start(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_point", "claimed_before_failure", "expected_error_code"),
+    [
+        ("resolver", False, "internal_worker_error"),
+        ("master_key", False, "internal_worker_error"),
+        ("checkpoint_after_claim", True, "internal_worker_error"),
+        ("task_budget", False, "task_timeout"),
+    ],
+)
+async def test_pre_request_infrastructure_failure_atomically_restores_editable_action(
+    database_url: str,
+    failure_point: str,
+    claimed_before_failure: bool,
+    expected_error_code: str,
+) -> None:
+    """resolver、密钥、checkpoint 与总预算失败都不得留下冻结半状态。"""
+    seed = _Seed()
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=(
+            ToolExecutionStatus.CLAIMED if claimed_before_failure else None
+        ),
+        task_status=TaskStatus.QUEUED,
+    )
+    adapter = _RecordingAdapter()
+    clock = _MutableClock(NOW)
+    session_factory = build_session_factory(database_url)
+    def resolve_steps(_task: LeasedTask) -> tuple[_PreRequestFailureStep, ...]:
+        """在精确基础设施边界制造 request-start 前失败。"""
+        if failure_point == "resolver":
+            raise RuntimeError("synthetic resolver failure")
+        if failure_point == "master_key":
+            raise OSError("synthetic key file failure")
+        if failure_point == "checkpoint_after_claim":
+            return (_PreRequestFailureStep(RuntimeError("synthetic checkpoint failure")),)
+        pytest.fail("expired task budget must stop before step resolution")
+
+    runner = DurableTaskRunner(
+        store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
+        clock=clock,
+        lease_duration=timedelta(minutes=1),
+        task_timeout_seconds=0.5 if failure_point == "task_budget" else 60,
+        task_step_timeout_seconds=0.25 if failure_point == "task_budget" else 30,
+        max_transient_retries=0,
+        resolve_steps=resolve_steps,
+    )
+    try:
+        assert await runner.run(seed.task_id, lease_owner="pre-request-worker")
+        assert not await runner.run(seed.task_id, lease_owner="duplicate-worker")
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.scalar(
+                select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+            )
+            task_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "task.failed",
+                )
+            )
+            approval_invalidated_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "approval.invalidated",
+                )
+            )
+            tool_failed_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "tool.confirmed_failed",
+                )
+            )
+    finally:
+        await session_factory.dispose()
+
+    assert task is not None and task.status == TaskStatus.FAILED.value
+    assert task.error_code == expected_error_code
+    assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
+    assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+    assert task_failed_count == approval_invalidated_count == 1
+    if claimed_before_failure:
+        assert execution is not None
+        assert execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
+        assert execution.request_started_at is None
+        assert execution.write_attempt_count == 0
+        assert execution.result_summary == {
+            "kind": ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED.value,
+            "retryable": False,
+        }
+        assert tool_failed_count == 1
+    else:
+        assert execution is None
+        assert tool_failed_count == 0
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "execution_task",
+        "execution_step",
+        "execution_operation",
+        "execution_provider",
+        "execution_tool",
+        "execution_hash",
+        "execution_idempotency_key",
+        "approval_action",
+        "approval_schema",
+        "approval_hash",
+        "approval_proposal_kind",
+        "approval_proposal_id",
+        "approval_proposal_version",
+        "draft_version",
+        "draft_connection",
+        "lease_expired",
+    ],
+)
+async def test_abandon_started_attempt_rechecks_complete_binding_and_live_lease(
+    database_url: str,
+    tamper: str,
+) -> None:
+    """释放未决租约前必须重证完整冻结绑定与当前 owner 的 live DB lease。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.EXECUTING,
+        request_started_at=NOW - timedelta(seconds=1),
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            if tamper.startswith("execution_"):
+                execution_values: dict[str, object]
+                if tamper == "execution_task":
+                    alternate_task_id = uuid4()
+                    alternate_step_id = uuid4()
+                    session.add(
+                        TaskRunModel(
+                            id=alternate_task_id,
+                            user_id=seed.user_id,
+                            kind="trusted_action",
+                            status=TaskStatus.RUNNING.value,
+                            idempotency_key=f"alternate-task:{alternate_task_id}",
+                            input_payload={
+                                "approval_id": str(seed.approval_id),
+                                "operation_id": str(seed.operation_id),
+                            },
+                            result_payload=None,
+                            error_code=None,
+                            graph_thread_id=str(alternate_task_id),
+                            current_step="execute",
+                            attempt_count=1,
+                            lease_owner=seed.owner,
+                            lease_expires_at=NOW + timedelta(minutes=1),
+                            scheduled_for=NOW,
+                            started_at=NOW,
+                        )
+                    )
+                    await session.flush()
+                    session.add(
+                        TaskStepModel(
+                            id=alternate_step_id,
+                            task_id=alternate_task_id,
+                            sequence=1,
+                            name="alternate_execute",
+                            kind="trusted_action",
+                            status="running",
+                            input_summary={"action": "mail.send", "proposal_version": 1},
+                        )
+                    )
+                    await session.flush()
+                    execution_values = {
+                        "task_id": alternate_task_id,
+                        "step_id": alternate_step_id,
+                    }
+                elif tamper == "execution_step":
+                    alternate_step_id = uuid4()
+                    session.add(
+                        TaskStepModel(
+                            id=alternate_step_id,
+                            task_id=seed.task_id,
+                            sequence=2,
+                            name="alternate_execute",
+                            kind="trusted_action",
+                            status="running",
+                            input_summary={"action": "mail.send", "proposal_version": 1},
+                        )
+                    )
+                    await session.flush()
+                    execution_values = {"step_id": alternate_step_id}
+                elif tamper == "execution_operation":
+                    execution_values = {"operation_id": uuid4()}
+                elif tamper == "execution_provider":
+                    execution_values = {"provider": "microsoft"}
+                elif tamper == "execution_tool":
+                    execution_values = {"tool_name": "calendar.create"}
+                elif tamper == "execution_hash":
+                    execution_values = {"request_payload_hash": "f" * 64}
+                else:
+                    execution_values = {"idempotency_key": f"tampered:{seed.execution_id}"}
+                await session.execute(
+                    update(ToolExecutionModel)
+                    .where(ToolExecutionModel.id == seed.execution_id)
+                    .values(**execution_values)
+                )
+            elif tamper.startswith("approval_"):
+                approval_values: dict[str, object]
+                if tamper == "approval_action":
+                    approval_values = {"action": "calendar.create"}
+                elif tamper == "approval_schema":
+                    approval_values = {"schema_version": "calendar_create.v1"}
+                elif tamper == "approval_hash":
+                    approval_values = {"payload_hash": "f" * 64}
+                elif tamper == "approval_proposal_kind":
+                    approval_values = {"proposal_kind": "calendar_proposal"}
+                elif tamper == "approval_proposal_id":
+                    approval_values = {"proposal_id": uuid4()}
+                else:
+                    approval_values = {"proposal_version": 2}
+                await session.execute(
+                    update(ApprovalRequestModel)
+                    .where(ApprovalRequestModel.id == seed.approval_id)
+                    .values(**approval_values)
+                )
+            elif tamper == "draft_version":
+                await session.execute(
+                    update(MailDraftModel)
+                    .where(MailDraftModel.id == seed.draft_id)
+                    .values(current_version=2)
+                )
+            elif tamper == "draft_connection":
+                alternate_connection_id = uuid4()
+                session.add(
+                    OAuthConnectionModel(
+                        id=alternate_connection_id,
+                        user_id=seed.user_id,
+                        provider="google",
+                        provider_account_id=f"alternate-{alternate_connection_id}",
+                        provider_tenant_id="",
+                        account_type="google",
+                        account_email="alternate-abandon@example.test",
+                        scopes=["mail.read", "mail.send"],
+                        status="connected",
+                    )
+                )
+                await session.flush()
+                await session.execute(
+                    update(MailDraftModel)
+                    .where(MailDraftModel.id == seed.draft_id)
+                    .values(connection_id=alternate_connection_id)
+                )
+            else:
+                database_now = await session.scalar(select(func.clock_timestamp()))
+                assert isinstance(database_now, datetime)
+                await session.execute(
+                    update(TaskRunModel)
+                    .where(TaskRunModel.id == seed.task_id)
+                    .values(lease_expires_at=database_now - timedelta(microseconds=1))
+                )
+    finally:
+        await session_factory.dispose()
+
+    workflow = _workflow(database_url, _RecordingAdapter())
+    try:
+        assert not await workflow.abandon_started_attempt(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.lease_owner == seed.owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ["proposal_version", "proposal_calendar", "proposal_connection"],
+)
+async def test_calendar_abandon_rechecks_local_target_binding(
+    database_url: str,
+    tamper: str,
+) -> None:
+    """日历未决尝试释放前必须重证当前版本、连接和精确 calendar 目标。"""
+    seed = _Seed()
+    payload_hash = await _seed_calendar_action(database_url, seed)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(
+        database_url,
+        adapter,
+        registry=ProviderAdapterRegistry(google_calendar_action=adapter),
+    )
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        session_factory = build_session_factory(database_url)
+        try:
+            transactions = SqlAlchemyTrustedActionRepositoryFactory(
+                session_factory,
+                ACTION_CIPHER,
+            )
+            async with transactions() as transaction:
+                snapshot = await transaction.load_dispatch(
+                    task_id=seed.task_id,
+                    approval_id=seed.approval_id,
+                    operation_id=seed.operation_id,
+                )
+            assert snapshot is not None
+            async with transactions() as transaction:
+                request_start = await transaction.mark_request_started(
+                    snapshot=snapshot,
+                    lease_owner=seed.owner,
+                    authorize=lambda _authorization: None,
+                )
+            assert request_start.disposition.value == "started"
+        finally:
+            await session_factory.dispose()
+
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                if tamper == "proposal_version":
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(current_version=2)
+                    )
+                elif tamper == "proposal_calendar":
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(calendar_id="rebound-calendar")
+                    )
+                else:
+                    alternate_connection_id = uuid4()
+                    session.add(
+                        OAuthConnectionModel(
+                            id=alternate_connection_id,
+                            user_id=seed.user_id,
+                            provider="google",
+                            provider_account_id=f"alternate-{alternate_connection_id}",
+                            provider_tenant_id="",
+                            account_type="google",
+                            account_email="alternate-calendar-abandon@example.test",
+                            scopes=["calendar.read", "calendar.write"],
+                            status="connected",
+                        )
+                    )
+                    await session.flush()
+                    await session.execute(
+                        update(CalendarChangeProposalModel)
+                        .where(CalendarChangeProposalModel.id == seed.draft_id)
+                        .values(connection_id=alternate_connection_id)
+                    )
+        finally:
+            await session_factory.dispose()
+
+        assert not await workflow.abandon_started_attempt(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+    finally:
+        await workflow.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.lease_owner == seed.owner
+    assert adapter.write_calls == adapter.reconcile_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_confirmed_not_applied_retry_persists_exact_retryable_fact(
     database_url: str,
 ) -> None:
@@ -1900,7 +3164,7 @@ async def test_real_runner_retries_same_execution_once_then_exhausts_without_thi
         max_transient_retries=1,
     )
     runner = DurableTaskRunner(
-        store=SqlAlchemyTaskExecutionStore(runner_factory),
+        store=SqlAlchemyTrustedActionTaskExecutionStore(runner_factory),
         clock=clock,
         lease_duration=timedelta(minutes=1),
         task_timeout_seconds=120,
@@ -1973,6 +3237,7 @@ async def test_real_runner_retries_same_execution_once_then_exhausts_without_thi
                     OutboxEventModel.deduplication_key.like(f"task.execute:{seed.task_id}:retry:%"),
                 )
             )
+            database_now = await session.scalar(select(func.clock_timestamp()))
             task_failed_count = await session.scalar(
                 select(func.count())
                 .select_from(AuditEventModel)
@@ -2006,7 +3271,10 @@ async def test_real_runner_retries_same_execution_once_then_exhausts_without_thi
         assert executions[0].write_attempt_count == 2
         assert executions[0].status == ToolExecutionStatus.CONFIRMED_FAILED.value
         assert executions[0].error_code == "task_retries_exhausted"
-        assert executions[0].completed_at == clock.current - timedelta(seconds=1)
+        assert executions[0].completed_at is not None
+        assert database_now is not None
+        assert executions[0].completed_at <= database_now
+        assert database_now - executions[0].completed_at < timedelta(seconds=10)
         assert retry_outbox_count == 1
         assert task_failed_count == tool_failed_count == tool_failed_outbox_count == 1
         assert adapter.write_calls == 2
@@ -2085,10 +3353,10 @@ async def test_permanent_not_applied_failure_atomically_writes_task_and_tool_aud
 
 
 @pytest.mark.asyncio
-async def test_unknown_outcome_is_a_stable_task19_failure_without_reconciliation_state(
+async def test_unknown_outcome_preserves_task19_unresolved_fact_until_read_only_reconciliation(
     database_url: str,
 ) -> None:
-    """Task 19 未实现核对调度时，unknown 不得留下悬空 reconciling 状态。"""
+    """UNKNOWN 不得伪造未应用；重复投递只能以同一执行事实只读核对。"""
     seed = _Seed()
     payload_hash = await _seed_action(database_url, seed)
     adapter = _RecordingAdapter(
@@ -2103,70 +3371,139 @@ async def test_unknown_outcome_is_a_stable_task19_failure_without_reconciliation
             error_code="synthetic_unknown",
         )
     )
-    await _run_approved(_workflow(database_url, adapter), seed, payload_hash)
+    workflow = _workflow(database_url, adapter)
+    try:
+        await workflow.claim(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner=seed.owner,
+        )
+        with pytest.raises(TrustedActionAttemptAbandoned):
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory() as session:
+                task = await session.get(TaskRunModel, seed.task_id)
+                draft = await session.get(MailDraftModel, seed.draft_id)
+                execution = await session.scalar(
+                    select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+                )
+                task_failed_count = await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEventModel)
+                    .where(
+                        AuditEventModel.task_id == seed.task_id,
+                        AuditEventModel.event_type == "task.failed",
+                    )
+                )
+                tool_failed_count = await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEventModel)
+                    .where(
+                        AuditEventModel.task_id == seed.task_id,
+                        AuditEventModel.event_type == "tool.confirmed_failed",
+                    )
+                )
+                reconciling_audit_count = await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEventModel)
+                    .where(
+                        AuditEventModel.task_id == seed.task_id,
+                        AuditEventModel.event_type == "tool.reconciling",
+                    )
+                )
+                reconciling_outbox_count = await session.scalar(
+                    select(func.count())
+                    .select_from(OutboxEventModel)
+                    .where(
+                        OutboxEventModel.aggregate_id == seed.task_id,
+                        OutboxEventModel.topic == "tool.reconciling",
+                    )
+                )
+                retry_outbox_count = await session.scalar(
+                    select(func.count())
+                    .select_from(OutboxEventModel)
+                    .where(
+                        OutboxEventModel.aggregate_id == seed.task_id,
+                        OutboxEventModel.topic == "task.execute",
+                        OutboxEventModel.deduplication_key.like("%:retry:%"),
+                    )
+                )
+        finally:
+            await session_factory.dispose()
+        assert task is not None and task.status == TaskStatus.RUNNING.value
+        assert task.lease_owner is None and task.finished_at is None
+        assert draft is not None and draft.status == MailDraftStatus.EXECUTING.value
+        assert execution is not None
+        assert execution.status == ToolExecutionStatus.EXECUTING.value
+        assert execution.error_code == "synthetic_unknown"
+        assert execution.completed_at is None
+        assert execution.result_summary == {
+            "kind": ProviderWriteOutcomeKind.UNKNOWN.value,
+            "retryable": False,
+        }
+        assert task_failed_count == tool_failed_count == 0
+        assert reconciling_audit_count == reconciling_outbox_count == retry_outbox_count == 0
+        assert adapter.write_calls == 1
+        assert adapter.reconcile_calls == 0
+
+        session_factory = build_session_factory(database_url)
+        try:
+            leased = await SqlAlchemyTaskExecutionStore(session_factory).acquire(
+                task_id=seed.task_id,
+                lease_owner="recovery-worker",
+                now=NOW,
+                lease_expires_at=NOW + timedelta(minutes=1),
+            )
+        finally:
+            await session_factory.dispose()
+        assert leased is not None
+        adapter.outcome = ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.CONFIRMED_APPLIED,
+            retryable=False,
+            retry_after_seconds=None,
+            provider_resource_id="synthetic-resource",
+            provider_request_id="synthetic-request",
+            correlation_id="synthetic-correlation",
+            provider_url=None,
+            error_code=None,
+        )
+        await workflow.execute_or_reconcile(
+            task_id=seed.task_id,
+            approval_id=seed.approval_id,
+            operation_id=seed.operation_id,
+            expected_payload_hash=payload_hash,
+            lease_owner="recovery-worker",
+        )
+    finally:
+        await workflow.dispose()
 
     session_factory = build_session_factory(database_url)
     try:
         async with session_factory() as session:
-            task = await session.get(TaskRunModel, seed.task_id)
-            draft = await session.get(MailDraftModel, seed.draft_id)
-            execution = await session.scalar(
+            final_task = await session.get(TaskRunModel, seed.task_id)
+            final_draft = await session.get(MailDraftModel, seed.draft_id)
+            final_execution = await session.scalar(
                 select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
-            )
-            task_failed_count = await session.scalar(
-                select(func.count())
-                .select_from(AuditEventModel)
-                .where(
-                    AuditEventModel.task_id == seed.task_id,
-                    AuditEventModel.event_type == "task.failed",
-                )
-            )
-            tool_failed_count = await session.scalar(
-                select(func.count())
-                .select_from(AuditEventModel)
-                .where(
-                    AuditEventModel.task_id == seed.task_id,
-                    AuditEventModel.event_type == "tool.confirmed_failed",
-                )
-            )
-            reconciling_audit_count = await session.scalar(
-                select(func.count())
-                .select_from(AuditEventModel)
-                .where(
-                    AuditEventModel.task_id == seed.task_id,
-                    AuditEventModel.event_type == "tool.reconciling",
-                )
-            )
-            reconciling_outbox_count = await session.scalar(
-                select(func.count())
-                .select_from(OutboxEventModel)
-                .where(
-                    OutboxEventModel.aggregate_id == seed.task_id,
-                    OutboxEventModel.topic == "tool.reconciling",
-                )
-            )
-            retry_outbox_count = await session.scalar(
-                select(func.count())
-                .select_from(OutboxEventModel)
-                .where(
-                    OutboxEventModel.aggregate_id == seed.task_id,
-                    OutboxEventModel.topic == "task.execute",
-                    OutboxEventModel.deduplication_key.like("%:retry:%"),
-                )
             )
     finally:
         await session_factory.dispose()
-    assert task is not None and task.status == TaskStatus.FAILED.value
-    assert task.error_code == "provider_write_outcome_unknown"
-    assert draft is not None and draft.status == MailDraftStatus.EDITING.value
-    assert execution is not None
-    assert execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
-    assert execution.error_code == "provider_write_outcome_unknown"
-    assert execution.completed_at == NOW
-    assert task_failed_count == tool_failed_count == 1
-    assert reconciling_audit_count == reconciling_outbox_count == retry_outbox_count == 0
+    assert final_task is not None and final_task.status == TaskStatus.SUCCEEDED.value
+    assert final_draft is not None and final_draft.status == MailDraftStatus.SENT.value
+    assert final_execution is not None
+    assert final_execution.status == ToolExecutionStatus.SUCCEEDED.value
+    assert final_execution.write_attempt_count == 1
     assert adapter.write_calls == 1
-    assert adapter.reconcile_calls == 0
+    assert adapter.reconcile_calls == 1
 
 
 @pytest.mark.asyncio
@@ -2251,13 +3588,24 @@ async def test_crash_after_committed_request_start_recovers_only_by_reconciliati
                 lease_owner=seed.owner,
             )
 
+        session_factory = build_session_factory(database_url)
+        try:
+            leased = await SqlAlchemyTaskExecutionStore(session_factory).acquire(
+                task_id=seed.task_id,
+                lease_owner="recovery-worker",
+                now=NOW,
+                lease_expires_at=NOW + timedelta(minutes=1),
+            )
+        finally:
+            await session_factory.dispose()
+        assert leased is not None
         adapter.fail_execute = False
         await workflow.execute_or_reconcile(
             task_id=seed.task_id,
             approval_id=seed.approval_id,
             operation_id=seed.operation_id,
             expected_payload_hash=payload_hash,
-            lease_owner=seed.owner,
+            lease_owner="recovery-worker",
         )
     finally:
         await workflow.dispose()

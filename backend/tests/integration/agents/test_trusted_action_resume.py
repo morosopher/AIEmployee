@@ -45,9 +45,9 @@ from ai_employee.infrastructure.db.models.tasks import (
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
-from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
+    SqlAlchemyTrustedActionTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import (
     ManagedAsyncSessionMaker,
@@ -109,12 +109,16 @@ class _RecordingAdapter:
         *,
         started: asyncio.Event | None = None,
         release: asyncio.Event | None = None,
+        execute_error: Exception | None = None,
+        execute_outcome: ProviderWriteOutcome | None = None,
     ) -> None:
-        """初始化计数器及可选的并发测试门。"""
+        """初始化计数器、可选并发测试门与 request-start 后合成异常。"""
         self.write_calls = 0
         self.reconcile_calls = 0
         self.started = started
         self.release = release
+        self.execute_error = execute_error
+        self.execute_outcome = execute_outcome
 
     def validate_for_approval(self, command: object) -> ApprovalPreflightResult:
         """确认严格命令可无损表达，且审批前不访问外部系统。"""
@@ -129,6 +133,23 @@ class _RecordingAdapter:
             self.started.set()
         if self.release is not None:
             await self.release.wait()
+        if self.execute_error is not None:
+            raise self.execute_error
+        return self.execute_outcome or self._confirmed_applied()
+
+    async def reconcile(
+        self,
+        command: object,
+        execution: ExecutionReference,
+    ) -> ProviderWriteOutcome:
+        """只读核对独立计数，恢复路径绝不复用或重放 ``execute``。"""
+        assert command is not None and execution.provider == self.provider
+        self.reconcile_calls += 1
+        return self._confirmed_applied()
+
+    @staticmethod
+    def _confirmed_applied() -> ProviderWriteOutcome:
+        """返回不含正文的固定明确已应用结果。"""
         return ProviderWriteOutcome(
             kind=ProviderWriteOutcomeKind.CONFIRMED_APPLIED,
             retryable=False,
@@ -139,16 +160,6 @@ class _RecordingAdapter:
             provider_url=None,
             error_code=None,
         )
-
-    async def reconcile(
-        self,
-        command: object,
-        execution: ExecutionReference,
-    ) -> ProviderWriteOutcome:
-        """本切片不应进入核对；若进入仍返回内容无关的明确结果。"""
-        assert command is not None and execution.provider == self.provider
-        self.reconcile_calls += 1
-        return await self.execute(command)
 
 
 class _MutableClock:
@@ -240,15 +251,17 @@ def _runner(
     clock: _MutableClock,
     resume: str | None,
     checkpoint_database_url: str,
+    task_timeout_seconds: float = 60,
+    task_step_timeout_seconds: float = 30,
 ) -> DurableTaskRunner:
     """组合只含一个可信动作步骤的真实持久 Runner。"""
     approval_store = SqlAlchemyApprovalStore(session_factory)
     return DurableTaskRunner(
-        store=SqlAlchemyTaskExecutionStore(session_factory),
+        store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
         clock=clock,
         lease_duration=timedelta(minutes=1),
-        task_timeout_seconds=60,
-        task_step_timeout_seconds=30,
+        task_timeout_seconds=task_timeout_seconds,
+        task_step_timeout_seconds=task_step_timeout_seconds,
         max_transient_retries=0,
         resolve_steps=lambda _task: (
             TrustedActionTaskStep(
@@ -451,6 +464,192 @@ async def test_approved_resume_uses_durable_interrupt_without_checkpointing_comm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interruption",
+    ["exception", "cancelled", "step_timeout", "task_timeout", "unknown"],
+)
+async def test_request_started_interruption_stays_unresolved_and_redelivery_only_reconciles(
+    database_url: str,
+    interruption: str,
+) -> None:
+    """request-start 后异常、取消及两级超时都必须释放租约并只读恢复。"""
+    session_factory = build_session_factory(database_url)
+    user_id = uuid4()
+    connection_id = uuid4()
+    provider_started = asyncio.Event()
+    provider_release = (
+        None if interruption in {"exception", "unknown"} else asyncio.Event()
+    )
+    unknown_outcome = (
+        ProviderWriteOutcome(
+            kind=ProviderWriteOutcomeKind.UNKNOWN,
+            retryable=False,
+            retry_after_seconds=None,
+            provider_resource_id=None,
+            provider_request_id="synthetic-unknown-request",
+            correlation_id="synthetic-unknown-correlation",
+            provider_url=None,
+            error_code="synthetic_unknown",
+        )
+        if interruption == "unknown"
+        else None
+    )
+    adapter = _RecordingAdapter(
+        started=provider_started,
+        release=provider_release,
+        execute_error=(
+            RuntimeError("synthetic provider interruption")
+            if interruption == "exception"
+            else None
+        ),
+        execute_outcome=unknown_outcome,
+    )
+    registry = ProviderAdapterRegistry(google_mail_action=adapter)
+    policy = _EnabledWritePolicy()
+    clock = _MutableClock(NOW)
+    transactions = SqlAlchemyTrustedActionRepositoryFactory(session_factory, ACTION_CIPHER)
+    try:
+        draft_id = await _create_draft(
+            session_factory,
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        submission = await SubmitMailDraftUseCase(
+            transactions=transactions,
+            preflights=registry,
+            write_policy=policy,
+            command_cipher=ACTION_CIPHER,
+        ).execute(
+            user_id=user_id,
+            draft_id=draft_id,
+            expected_version=1,
+            idempotency_key=f"started-interruption:{interruption}:{uuid4()}",
+            now=clock(),
+        )
+        workflow = TrustedActionExecutionUseCase(
+            transactions=transactions,
+            adapters=registry,
+            write_policy=policy,
+            clock=clock,
+        )
+        assert await _runner(
+            session_factory,
+            workflow=workflow,
+            clock=clock,
+            resume=None,
+            checkpoint_database_url=database_url,
+        ).run(submission.task_id, lease_owner="initial-worker")
+        async with session_factory() as session:
+            approval = await session.get(ApprovalRequestModel, submission.approval_id)
+        assert approval is not None
+        clock.value = NOW + timedelta(seconds=1)
+        await ApprovalDecisionUseCase(SqlAlchemyApprovalStore(session_factory)).execute(
+            approval_id=submission.approval_id,
+            user_id=user_id,
+            decision="approved",
+            version=approval.version,
+            payload_hash=approval.payload_hash,
+            now=clock(),
+        )
+        clock.value = NOW + timedelta(seconds=2)
+        task_timeout_seconds = 2.2 if interruption == "task_timeout" else 60
+        task_step_timeout_seconds = 0.75 if interruption == "step_timeout" else 2.0
+        interrupted_runner = _runner(
+            session_factory,
+            workflow=workflow,
+            clock=clock,
+            resume="approved",
+            checkpoint_database_url=database_url,
+            task_timeout_seconds=task_timeout_seconds,
+            task_step_timeout_seconds=task_step_timeout_seconds,
+        )
+        if interruption in {"exception", "unknown"}:
+            await interrupted_runner.run(
+                submission.task_id,
+                lease_owner=f"{interruption}-worker",
+            )
+        else:
+            interrupted = asyncio.create_task(
+                interrupted_runner.run(
+                    submission.task_id,
+                    lease_owner=f"{interruption}-worker",
+                )
+            )
+            await asyncio.wait_for(provider_started.wait(), timeout=2)
+            if interruption == "cancelled":
+                interrupted.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await interrupted
+            else:
+                await interrupted
+
+        async with session_factory() as session:
+            unresolved_task = await session.get(TaskRunModel, submission.task_id)
+            unresolved_draft = await session.get(MailDraftModel, draft_id)
+            unresolved_execution = await session.scalar(
+                select(ToolExecutionModel).where(
+                    ToolExecutionModel.task_id == submission.task_id
+                )
+            )
+            failed_audits = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == submission.task_id,
+                    AuditEventModel.event_type == "task.failed",
+                )
+            )
+        assert unresolved_task is not None
+        assert unresolved_task.status == TaskStatus.RUNNING.value
+        assert unresolved_task.lease_owner is None
+        assert unresolved_task.finished_at is None
+        assert unresolved_draft is not None
+        assert unresolved_draft.status == MailDraftStatus.EXECUTING.value
+        assert unresolved_execution is not None
+        assert unresolved_execution.status == ToolExecutionStatus.EXECUTING.value
+        assert unresolved_execution.request_started_at is not None
+        assert unresolved_execution.write_attempt_count == 1
+        assert failed_audits == 0
+        assert adapter.write_calls == 1
+        assert adapter.reconcile_calls == 0
+
+        if provider_release is not None:
+            provider_release.set()
+        adapter.execute_error = None
+        clock.value = NOW + timedelta(seconds=3)
+        await _runner(
+            session_factory,
+            workflow=workflow,
+            clock=clock,
+            resume="approved",
+            checkpoint_database_url=database_url,
+        ).run(
+            submission.task_id,
+            lease_owner=f"{interruption}-recovery-worker",
+        )
+
+        async with session_factory() as session:
+            final_task = await session.get(TaskRunModel, submission.task_id)
+            final_draft = await session.get(MailDraftModel, draft_id)
+            final_execution = await session.scalar(
+                select(ToolExecutionModel).where(
+                    ToolExecutionModel.task_id == submission.task_id
+                )
+            )
+        assert final_task is not None and final_task.status == TaskStatus.SUCCEEDED.value
+        assert final_draft is not None and final_draft.status == MailDraftStatus.SENT.value
+        assert final_execution is not None
+        assert final_execution.status == ToolExecutionStatus.SUCCEEDED.value
+        assert final_execution.write_attempt_count == 1
+        assert adapter.write_calls == 1
+        assert adapter.reconcile_calls == 1
+    finally:
+        if provider_release is not None:
+            provider_release.set()
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
 async def test_execute_task_routes_trusted_action_to_checkpoint_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -495,6 +694,7 @@ async def test_execute_task_routes_trusted_action_to_checkpoint_step(
         def __init__(self, **kwargs: object) -> None:
             """保存节点解析器供 run 使用。"""
             captured["resolve_steps"] = kwargs["resolve_steps"]
+            captured["runner_store"] = kwargs["store"]
 
         async def run(self, received_task_id: UUID, **_: object) -> bool:
             """解析一次稳定可信任务快照。"""
@@ -554,6 +754,7 @@ async def test_execute_task_routes_trusted_action_to_checkpoint_step(
     )
 
     assert captured["steps"] == (step,)
+    assert isinstance(captured["runner_store"], SqlAlchemyTrustedActionTaskExecutionStore)
     kwargs = captured["step_kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["session_factory"] is factory
@@ -628,6 +829,13 @@ async def test_rejected_database_decision_overrides_approved_resume_value(
             resume="approved",
             checkpoint_database_url=database_url,
         ).run(submission.task_id, lease_owner="resume-worker")
+        assert not await _runner(
+            session_factory,
+            workflow=workflow,
+            clock=clock,
+            resume="rejected",
+            checkpoint_database_url=database_url,
+        ).run(submission.task_id, lease_owner="duplicate-worker")
 
         async with session_factory() as session:
             task = await session.get(TaskRunModel, submission.task_id)
@@ -638,10 +846,19 @@ async def test_rejected_database_decision_overrides_approved_resume_value(
                 .select_from(ToolExecutionModel)
                 .where(ToolExecutionModel.task_id == submission.task_id)
             )
+            task_succeeded_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == submission.task_id,
+                    AuditEventModel.event_type == "task.succeeded",
+                )
+            )
         assert task is not None and task.status == TaskStatus.SUCCEEDED.value
         assert decided is not None and decided.status == ApprovalStatus.REJECTED.value
         assert draft is not None and draft.status == MailDraftStatus.EDITING.value
         assert execution_count == 0
+        assert task_succeeded_count == 1
         assert adapter.write_calls == adapter.reconcile_calls == 0
     finally:
         await session_factory.dispose()
@@ -685,7 +902,7 @@ async def test_default_worker_registry_fails_before_claim_when_no_write_adapter_
     ) -> DurableTaskRunner:
         """让测试显式选择提交用 fake adapter 或生产默认空 registry。"""
         return DurableTaskRunner(
-            store=SqlAlchemyTaskExecutionStore(session_factory),
+            store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
             clock=clock,
             lease_duration=timedelta(minutes=1),
             task_timeout_seconds=60,

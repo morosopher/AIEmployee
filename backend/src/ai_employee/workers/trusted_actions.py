@@ -1,5 +1,6 @@
 """在 DurableTaskRunner 租约内驱动 identifier-only 可信动作 Graph。"""
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from uuid import UUID
@@ -14,7 +15,10 @@ from ai_employee.application.use_cases.task_execution import (
     LeasedTask,
     TaskWaitingApproval,
 )
-from ai_employee.application.use_cases.trusted_actions import TrustedActionExecutionUseCase
+from ai_employee.application.use_cases.trusted_actions import (
+    TrustedActionAttemptAbandoned,
+    TrustedActionExecutionUseCase,
+)
 from ai_employee.config import Settings
 from ai_employee.domain.tasks import JsonValue
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
@@ -80,34 +84,87 @@ class TrustedActionTaskStep:
         # 与 DurableTaskRunner 使用同一 PostgreSQL attempt_count 语义；第二次及后续
         # 明确未应用结果只有在剩余预算内才可再次形成 retry_scheduled 写授权。
         may_retry_write = task.attempt_count <= self._max_transient_retries
-        graph = TrustedActionGraph(
-            workflow=self._workflow,
-            lease_owner=lease_owner,
-            may_retry_write=may_retry_write,
-        )
-        async with postgres_checkpointer(self._checkpoint_database_url) as saver:
-            compiled = graph.compile(checkpointer=saver)
-            config = {"configurable": {"thread_id": str(task.task_id)}}
-            if self._resume is None:
-                result = await compiled.ainvoke(
-                    {
-                        "task_id": str(task.task_id),
-                        "approval_id": str(approval_id),
-                        "operation_id": str(operation_id),
-                        "payload_hash": "",
-                        "decision": None,
-                        "messages": [],
-                    },
-                    config=config,
+        expected_payload_hash = ""
+        try:
+            # 提前读取的哈希仍是内容无关事实，仅用于 identifier-only Graph 输入；
+            # provider 边界的 abandon 由应用用例持有未 checkpoint 化的 dispatch 投影。
+            facts = await self._workflow.load_graph_facts(
+                task_id=task.task_id,
+                approval_id=approval_id,
+                operation_id=operation_id,
+                expected_payload_hash="",
+            )
+            expected_payload_hash = facts.payload_hash
+            graph = TrustedActionGraph(
+                workflow=self._workflow,
+                lease_owner=lease_owner,
+                may_retry_write=may_retry_write,
+            )
+            async with postgres_checkpointer(self._checkpoint_database_url) as saver:
+                compiled = graph.compile(checkpointer=saver)
+                config = {"configurable": {"thread_id": str(task.task_id)}}
+                if self._resume is None:
+                    result = await compiled.ainvoke(
+                        {
+                            "task_id": str(task.task_id),
+                            "approval_id": str(approval_id),
+                            "operation_id": str(operation_id),
+                            "payload_hash": expected_payload_hash,
+                            "decision": None,
+                            "messages": [],
+                        },
+                        config=config,
+                    )
+                else:
+                    result = await compiled.ainvoke(Command(resume=self._resume), config=config)
+        except TrustedActionAttemptAbandoned:
+            # request-start CAS loser、UNKNOWN 或已由另一调用提交的 executing 事实都不是
+            # 成功节点；应用用例已用未 checkpoint 化的 dispatch 投影处理需要释放的
+            # 精确尝试，这里只映射为 Runner no-finish，不能让 loser 释放赢家租约。
+            raise TaskWaitingApproval from None
+        except BaseException:
+            # checkpointer 打开、Graph checkpoint 写入或其它节点外基础设施故障可能发生在
+            # 已有 request-start 的恢复投递上。应用用例会从 identifier-only 输入重载并
+            # 认证 AEAD 命令后再释放，绝不把额外绑定或明文塞入 checkpoint。
+            try:
+                await self._preserve_started_attempt(
+                    task=task,
+                    approval_id=approval_id,
+                    operation_id=operation_id,
+                    expected_payload_hash=expected_payload_hash,
+                    lease_owner=lease_owner,
                 )
-            else:
-                result = await compiled.ainvoke(Command(resume=self._resume), config=config)
+            except Exception:  # noqa: BLE001 - 保护边界失败时禁止退回通用任务终态。
+                current_task = asyncio.current_task()
+                if current_task is None or not current_task.cancelling():
+                    raise TaskWaitingApproval from None
+            raise
         if isinstance(result, Mapping) and "__interrupt__" in result:
             await self._approval_store.confirm_approval_checkpoint(
                 task_id=task.task_id,
                 lease_owner=lease_owner,
             )
             raise TaskWaitingApproval
+
+    async def _preserve_started_attempt(
+        self,
+        *,
+        task: LeasedTask,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        lease_owner: str,
+    ) -> bool:
+        """屏蔽取消并让应用层重载认证精确绑定后提交幂等 abandon CAS。"""
+        return await asyncio.shield(
+            self._workflow.abandon_started_attempt(
+                task_id=task.task_id,
+                approval_id=approval_id,
+                operation_id=operation_id,
+                expected_payload_hash=expected_payload_hash,
+                lease_owner=lease_owner,
+            )
+        )
 
 
 def build_trusted_action_task_step(

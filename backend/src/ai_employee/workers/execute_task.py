@@ -24,6 +24,9 @@ from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyAppro
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
+from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    SqlAlchemyTrustedActionTaskExecutionStore,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
@@ -396,7 +399,7 @@ async def execute_task(
                     if task is not None and task.kind == "fake_write"
                     else (
                         DurableTaskRunner(
-                            store=SqlAlchemyTaskExecutionStore(session_factory),
+                            store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
                             clock=lambda: datetime.now(UTC),
                             lease_duration=timedelta(seconds=settings.task_lease_seconds),
                             task_timeout_seconds=settings.task_timeout_seconds,

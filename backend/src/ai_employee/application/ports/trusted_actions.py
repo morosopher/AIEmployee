@@ -5,7 +5,7 @@
 随后以记录绑定 AEAD 三元组进入提交记录。
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -154,6 +154,50 @@ class TrustedActionRisk(StrEnum):
 
     MEDIUM = "medium"
     HIGH = "high"
+
+
+class RequestStartDisposition(StrEnum):
+    """描述 request-start 锁内 CAS 的四种内容无关结论。"""
+
+    STARTED = "started"
+    ABANDONED = "abandoned"
+    RECONCILE = "reconcile"
+    INVALIDATED = "invalidated"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestStartResult:
+    """把开始、放弃、只读核对或安全失效与稳定错误码一起返回应用层。"""
+
+    disposition: RequestStartDisposition
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        """要求只有安全失效结果携带稳定错误码。"""
+        if self.disposition is RequestStartDisposition.INVALIDATED:
+            if type(self.error_code) is not str or not self.error_code.strip():
+                raise ValueError("invalidated request-start result requires error_code")
+        elif self.error_code is not None:
+            raise ValueError("only invalidated request-start result accepts error_code")
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedActionRequestStartAuthorization:
+    """保存 request-start 固定锁序下读取的最新用户、连接与能力事实。"""
+
+    user_is_active: bool
+    provider: str
+    provider_tenant_id: str
+    provider_account_id: str
+    connection_status: str
+    read_capability_status: CapabilityStatus
+    write_capability_status: CapabilityStatus
+    write_capability_error_code: str | None
+    calendar_can_write: bool | None
+
+
+RequestStartAuthorizer = Callable[[TrustedActionRequestStartAuthorization], str | None]
+"""在 Repository 持有全部固定行锁时调用的无 I/O 应用写策略。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,8 +629,9 @@ class TrustedActionSubmissionTransaction(Protocol):
         *,
         snapshot: TrustedActionDispatchSnapshot,
         lease_owner: str,
-    ) -> bool:
-        """用锁内数据库时间提交 request-start 与唯一写尝试；并发 loser 返回 False。"""
+        authorize: RequestStartAuthorizer,
+    ) -> RequestStartResult:
+        """在最新门禁通过时提交 request-start，并类型化返回 CAS 结论。"""
 
     async def persist_provider_outcome(
         self,
@@ -599,6 +644,14 @@ class TrustedActionSubmissionTransaction(Protocol):
         lease_owner: str,
     ) -> None:
         """按本轮持久重试预算原子保存结果、任务及本地对象状态。"""
+
+    async def abandon_started_attempt(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+    ) -> bool:
+        """以进程内 dispatch 冻结投影释放 request-start 租约并保留未决事实。"""
 
     async def fail_claimed_integrity(
         self,
@@ -636,6 +689,9 @@ __all__ = [
     "ExistingTrustedActionSubmission",
     "MailDraftSubmissionSnapshot",
     "ProviderWriteOutcome",
+    "RequestStartAuthorizer",
+    "RequestStartDisposition",
+    "RequestStartResult",
     "TrustedActionAdapter",
     "TrustedActionAdapterRegistry",
     "TrustedActionCommandCipher",
@@ -643,6 +699,7 @@ __all__ = [
     "TrustedActionExecutionSnapshot",
     "TrustedActionPreflight",
     "TrustedActionPreflightRegistry",
+    "TrustedActionRequestStartAuthorization",
     "TrustedActionRisk",
     "TrustedActionSubmission",
     "TrustedActionSubmissionResult",
