@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic.json_schema import SkipJsonSchema
 
 from ai_employee.api.deps import (
     CsrfProtectedSession,
@@ -27,21 +28,30 @@ from ai_employee.domain.settings import (
 
 
 class SettingsPatch(BaseModel):
-    """允许部分更新 M1 保留设置与 M2 默认连接、工作时间和会议缓冲。"""
+    """允许部分更新 M1 保留设置与 M2 默认连接、工作时间和会议缓冲。
+
+    非 nullable 字段仍以 ``None`` 表示 PATCH 中的内部 omission 默认值，但通过
+    ``SkipJsonSchema`` 从公开契约排除 null；显式 JSON null 则由前置 validator 拒绝。
+    三个默认连接/日历字段保留普通 ``T | None``，因此契约与运行时都允许清空。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    timezone: str | None = None
-    locale: str | None = None
-    brief_time: str | None = None
-    email_body_retention_days: StrictInt | None = None
-    source_metadata_retention_days: StrictInt | None = None
-    workspace_history_retention_days: StrictInt | None = None
+    timezone: str | SkipJsonSchema[None] = None
+    locale: str | SkipJsonSchema[None] = None
+    brief_time: str | SkipJsonSchema[None] = None
+    email_body_retention_days: StrictInt | SkipJsonSchema[None] = None
+    source_metadata_retention_days: StrictInt | SkipJsonSchema[None] = None
+    workspace_history_retention_days: StrictInt | SkipJsonSchema[None] = None
     default_mail_connection_id: UUID | None = None
     default_calendar_connection_id: UUID | None = None
     default_calendar_id: str | None = Field(default=None, min_length=1, max_length=512)
-    working_hours: dict[str, list[list[str]]] | None = None
-    meeting_buffer_minutes: StrictInt | None = Field(default=None, ge=0, le=120)
+    working_hours: dict[str, list[list[str]]] | SkipJsonSchema[None] = None
+    meeting_buffer_minutes: StrictInt | SkipJsonSchema[None] = Field(
+        default=None,
+        ge=0,
+        le=120,
+    )
 
     @field_validator(
         "timezone",
