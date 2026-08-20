@@ -43,10 +43,33 @@ class SettingsPatch(BaseModel):
     working_hours: dict[str, list[list[str]]] | None = None
     meeting_buffer_minutes: StrictInt | None = Field(default=None, ge=0, le=120)
 
+    @field_validator(
+        "timezone",
+        "locale",
+        "brief_time",
+        "email_body_retention_days",
+        "source_metadata_retention_days",
+        "workspace_history_retention_days",
+        "working_hours",
+        "meeting_buffer_minutes",
+        mode="before",
+    )
+    @classmethod
+    def non_nullable_setting_present(cls, value: object) -> object:
+        """拒绝已提供字段的 JSON null，同时让真正省略的 PATCH 字段保持不更新。
+
+        Pydantic 默认不会为未提供字段执行本 validator，因此模型仍可用 ``None`` 作为
+        内部 omission 默认值；显式 JSON null 则在路由调用 application 前稳定映射为 422。
+        三个允许清空的默认连接/日历字段未列入本校验器。
+        """
+        if value is None:
+            raise ValueError("setting must not be null")
+        return value
+
     @field_validator("timezone")
     @classmethod
     def timezone_valid(cls, value: str | None) -> str | None:
-        """验证显式 IANA 时区；``None`` 只表示字段未提供或不更新。"""
+        """验证显式 IANA 时区；字段省略时不会进入本 validator。"""
         return validate_timezone(value) if value is not None else value
 
     @field_validator("locale")

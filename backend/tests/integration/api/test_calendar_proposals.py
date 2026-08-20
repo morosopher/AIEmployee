@@ -856,10 +856,15 @@ async def test_restore_api_hides_cross_user_source_without_queue_facts(
 
 
 @pytest.mark.asyncio
-async def test_restore_api_replay_returns_same_persistent_task(
+@pytest.mark.parametrize(
+    "source_invalidation",
+    ("ciphertext-cleared", "expired", "event-deleted"),
+)
+async def test_restore_api_replay_returns_same_task_after_source_invalidation(
     authenticated_api_clients: AuthenticatedApiClients,
+    source_invalidation: str,
 ) -> None:
-    """相同 source 与创建键重放返回同一 TaskRun，不追加第二个 Outbox。"""
+    """任务已提交后，source 清理或失效不得破坏同一冻结输入的精确重放。"""
     clients = authenticated_api_clients
     event_id, snapshot_id, _proposal_id = await _seed_restore_source(clients)
     headers = {
@@ -870,10 +875,70 @@ async def test_restore_api_replay_returns_same_persistent_task(
     payload = {"snapshot_id": str(snapshot_id)}
 
     first = await clients.owner.post(path, headers=headers, json=payload)
+    assert first.status_code == 202
+
+    async with clients.session_factory.begin() as session:
+        snapshot = await session.get(CalendarChangeSnapshotModel, snapshot_id)
+        assert snapshot is not None
+        if source_invalidation == "ciphertext-cleared":
+            snapshot.content_ciphertext = None
+            snapshot.content_nonce = None
+            snapshot.content_key_version = None
+        elif source_invalidation == "expired":
+            snapshot.retain_until = datetime.now(UTC) - timedelta(minutes=1)
+        elif source_invalidation == "event-deleted":
+            event = await session.get(CalendarEventModel, event_id)
+            assert event is not None
+            await session.delete(event)
+        else:  # pragma: no cover - 参数集合由本测试静态冻结。
+            raise AssertionError("unknown source invalidation")
+
     replay = await clients.owner.post(path, headers=headers, json=payload)
 
-    assert first.status_code == replay.status_code == 202
+    assert replay.status_code == 202
     assert replay.json()["task_id"] == first.json()["task_id"]
+    async with clients.session_factory() as session:
+        tasks = tuple((await session.scalars(select(TaskRunModel))).all())
+        outbox = tuple((await session.scalars(select(OutboxEventModel))).all())
+    assert len(tasks) == 1
+    assert len(outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_api_same_key_different_input_keeps_payload_mismatch_precedence(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """同键异 source 必须先按持久任务判定 409，即使新 source 的 AEAD 已被清理。"""
+    clients = authenticated_api_clients
+    first_event_id, first_snapshot_id, _first_proposal_id = await _seed_restore_source(clients)
+    second_event_id, second_snapshot_id, _second_proposal_id = await _seed_restore_source(clients)
+    headers = {
+        "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+        "Idempotency-Key": "task17-restore-payload-mismatch",
+    }
+
+    first = await clients.owner.post(
+        f"/api/v1/calendar/events/{first_event_id}/restore-proposal",
+        headers=headers,
+        json={"snapshot_id": str(first_snapshot_id)},
+    )
+    assert first.status_code == 202
+
+    async with clients.session_factory.begin() as session:
+        second_snapshot = await session.get(CalendarChangeSnapshotModel, second_snapshot_id)
+        assert second_snapshot is not None
+        second_snapshot.content_ciphertext = None
+        second_snapshot.content_nonce = None
+        second_snapshot.content_key_version = None
+
+    mismatch = await clients.owner.post(
+        f"/api/v1/calendar/events/{second_event_id}/restore-proposal",
+        headers=headers,
+        json={"snapshot_id": str(second_snapshot_id)},
+    )
+
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error_code"] == "idempotency_key_payload_mismatch"
     async with clients.session_factory() as session:
         tasks = tuple((await session.scalars(select(TaskRunModel))).all())
         outbox = tuple((await session.scalars(select(OutboxEventModel))).all())

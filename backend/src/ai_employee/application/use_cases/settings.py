@@ -86,9 +86,15 @@ class UpdateUserSettings:
         """验证并规范化 PATCH 字段；未知字段由严格 API Schema 先行拒绝。"""
         validated = dict(values)
         if "timezone" in validated:
-            validated["timezone"] = validate_timezone(str(validated["timezone"]))
+            raw_timezone = validated["timezone"]
+            if type(raw_timezone) is not str:
+                raise TypeError("timezone must be a string")
+            validated["timezone"] = validate_timezone(raw_timezone)
         if "locale" in validated:
-            validated["locale"] = validate_locale(str(validated["locale"]))
+            raw_locale = validated["locale"]
+            if type(raw_locale) is not str:
+                raise TypeError("locale must be a string")
+            validated["locale"] = validate_locale(raw_locale)
         if "brief_time" in validated:
             raw_brief_time = validated["brief_time"]
             if not isinstance(raw_brief_time, str):

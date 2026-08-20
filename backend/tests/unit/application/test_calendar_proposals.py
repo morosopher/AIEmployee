@@ -176,12 +176,32 @@ def _restore_projection(**overrides: object) -> CalendarRestoreSourceProjection:
 
 
 class _RestoreEnqueueRepository:
-    """记录 application 是否先验证窄投影，再创建唯一任务事实。"""
+    """记录 application 是否先识别精确重放，再验证 source 与创建任务。"""
 
-    def __init__(self, projection: CalendarRestoreSourceProjection | None) -> None:
+    def __init__(
+        self,
+        projection: CalendarRestoreSourceProjection | None,
+        *,
+        existing: CreateTaskResult | None = None,
+    ) -> None:
         self.projection = projection
+        self.existing = existing
         self.calls: list[str] = []
         self.created: list[dict[str, object]] = []
+
+    async def get_existing_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """按冻结两键输入模拟精确 TaskRun 重放检查。"""
+        assert user_id == USER_ID
+        assert source_snapshot_id == BEFORE_ID
+        assert creation_idempotency_key.startswith("synthetic-restore-")
+        self.calls.append("get_existing_restore_prepare_task")
+        return self.existing
 
     async def get_restore_source_projection(
         self,
@@ -228,9 +248,11 @@ class _RestoreDispatcher:
 
 def _restore_enqueue_use_case(
     projection: CalendarRestoreSourceProjection | None,
+    *,
+    existing: CreateTaskResult | None = None,
 ) -> tuple[CalendarRestoreEnqueueUseCase, _RestoreEnqueueRepository, _RestoreDispatcher]:
     """组装单事务 restore enqueue 用例与可观察 Fake。"""
-    repository = _RestoreEnqueueRepository(projection)
+    repository = _RestoreEnqueueRepository(projection, existing=existing)
 
     @asynccontextmanager
     async def repositories() -> AsyncIterator[_RestoreEnqueueRepository]:
@@ -258,6 +280,7 @@ async def test_restore_enqueue_validates_projection_before_atomic_task_creation(
 
     assert result == CreateTaskResult(task_id=RESTORE_TASK_ID, status=TaskStatus.QUEUED)
     assert repository.calls == [
+        "get_existing_restore_prepare_task",
         "get_restore_source_projection",
         "create_restore_prepare_task",
     ]
@@ -284,9 +307,33 @@ async def test_restore_enqueue_missing_projection_fails_before_task_creation() -
             creation_idempotency_key="synthetic-restore-missing",
         )
 
-    assert repository.calls == ["get_restore_source_projection"]
+    assert repository.calls == [
+        "get_existing_restore_prepare_task",
+        "get_restore_source_projection",
+    ]
     assert repository.created == []
     assert dispatcher.task_ids == []
+
+
+@pytest.mark.asyncio
+async def test_restore_enqueue_replays_existing_task_before_mutable_source_validation() -> None:
+    """精确已有任务必须在 source 已清理时仍提交读取事务并重新投递同一 ID。"""
+    use_case, repository, dispatcher = _restore_enqueue_use_case(
+        None,
+        existing=CreateTaskResult(task_id=RESTORE_TASK_ID),
+    )
+
+    result = await use_case.execute(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        source_snapshot_id=BEFORE_ID,
+        creation_idempotency_key="synthetic-restore-replay",
+    )
+
+    assert result == CreateTaskResult(task_id=RESTORE_TASK_ID, status=TaskStatus.QUEUED)
+    assert repository.calls == ["get_existing_restore_prepare_task"]
+    assert repository.created == []
+    assert dispatcher.task_ids == [RESTORE_TASK_ID]
 
 
 @pytest.mark.asyncio
@@ -332,7 +379,10 @@ async def test_restore_enqueue_ineligible_projection_fails_closed(
         )
 
     assert raised.value.error_code == "calendar_restore_source_conflict"
-    assert repository.calls == ["get_restore_source_projection"]
+    assert repository.calls == [
+        "get_existing_restore_prepare_task",
+        "get_restore_source_projection",
+    ]
     assert repository.created == []
     assert dispatcher.task_ids == []
 

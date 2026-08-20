@@ -1,12 +1,14 @@
 """验证用户设置 API 的校验、CSRF 与调度读取闭环。"""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
+from typing import NoReturn
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
 
+from ai_employee.application.use_cases.settings import UpdateUserSettings
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.infrastructure.db.database_url import (
     TestDatabaseUrl as ValidatedTestDatabaseUrl,
@@ -17,6 +19,7 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     ProviderCalendarModel,
 )
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.identity import SqlAlchemyActiveUserScheduleReader
 from ai_employee.infrastructure.db.session import build_session_factory  # noqa: F401
 
@@ -97,6 +100,42 @@ async def _seed_settings_connection(
                 )
             )
     return connection_id
+
+
+async def _persisted_settings_and_update_audits(
+    clients: AuthenticatedApiClients,
+) -> tuple[dict[str, object], frozenset[int]]:
+    """读取完整持久设置与当前用户 settings.updated 审计 ID，供失败原子性断言。"""
+    async with clients.session_factory() as session:
+        user = await session.scalar(select(UserModel).where(UserModel.id == clients.owner_id))
+        assert user is not None
+        settings = {
+            "timezone": user.timezone,
+            "locale": user.locale,
+            "brief_time": user.brief_time,
+            "email_body_retention_days": user.email_body_retention_days,
+            "source_metadata_retention_days": user.source_metadata_retention_days,
+            "workspace_history_retention_days": user.workspace_history_retention_days,
+            "default_mail_connection_id": user.default_mail_connection_id,
+            "default_calendar_connection_id": user.default_calendar_connection_id,
+            "default_calendar_id": user.default_calendar_id,
+            "working_hours": {
+                day: [list(interval) for interval in intervals]
+                for day, intervals in user.working_hours.items()
+            },
+            "meeting_buffer_minutes": user.meeting_buffer_minutes,
+        }
+        audit_ids = frozenset(
+            (
+                await session.scalars(
+                    select(AuditEventModel.id).where(
+                        AuditEventModel.user_id == clients.owner_id,
+                        AuditEventModel.event_type == "settings.updated",
+                    )
+                )
+            ).all()
+        )
+    return settings, audit_ids
 
 
 @pytest.mark.asyncio
@@ -286,6 +325,58 @@ async def test_patch_accepts_explicit_null_to_clear_default_connections(
     assert cleared.json()["default_mail_connection_id"] is None
     assert cleared.json()["default_calendar_connection_id"] is None
     assert cleared.json()["default_calendar_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "timezone",
+        "locale",
+        "brief_time",
+        "email_body_retention_days",
+        "source_metadata_retention_days",
+        "workspace_history_retention_days",
+        "working_hours",
+        "meeting_buffer_minutes",
+    ),
+)
+async def test_patch_rejects_explicit_null_for_non_nullable_settings_without_writes(
+    authenticated_api_clients: AuthenticatedApiClients,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+) -> None:
+    """非 nullable 设置显式 null 必须止于 Pydantic 422，且设置与审计均不变化。"""
+    clients = authenticated_api_clients
+    before_settings, before_audits = await _persisted_settings_and_update_audits(clients)
+    application_calls = 0
+
+    async def reject_application_entry(
+        _use_case: UpdateUserSettings,
+        *,
+        user_id: UUID,
+        values: Mapping[str, object],
+    ) -> NoReturn:
+        """若 Pydantic 边界失守则立即失败，并避免测试通过异常映射掩盖调用。"""
+        nonlocal application_calls
+        del user_id, values
+        application_calls += 1
+        raise AssertionError("invalid settings payload entered application use case")
+
+    monkeypatch.setattr(UpdateUserSettings, "update", reject_application_entry)
+
+    response = await clients.owner.patch(
+        "/api/v1/settings",
+        headers={"X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or ""},
+        json={field_name: None},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "request_validation_failed"
+    assert application_calls == 0
+    after_settings, after_audits = await _persisted_settings_and_update_audits(clients)
+    assert after_settings == before_settings
+    assert after_audits == before_audits
 
 
 @pytest.mark.asyncio

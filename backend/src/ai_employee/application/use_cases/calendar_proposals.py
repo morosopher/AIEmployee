@@ -1216,6 +1216,15 @@ class CalendarProposalUseCase:
 class CalendarRestoreEnqueueRepository(Protocol):
     """定义恢复准备任务验证与原子创建所需的窄事务端口。"""
 
+    async def get_existing_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """按用户、类型与冻结两键输入读取精确已有任务，异载荷时失败关闭。"""
+
     async def get_restore_source_projection(
         self,
         *,
@@ -1241,10 +1250,11 @@ class CalendarRestoreEnqueueRepositoryFactory(Protocol):
 class CalendarRestoreEnqueueUseCase:
     """验证历史 before 快照并排队 ``calendar.restore.prepare``。
 
-    路由只解析用户输入；本边界要求仓储先锁定、验证 source 的归属、类别、生命周期、
-    精确本地事件绑定和密文保留，再在同一事务内创建 TaskRun、AuditEvent 与 Outbox。
-    任务输入严格只有 source snapshot ID 与恢复提案创建幂等键；本用例不创建恢复提案、
-    ApprovalRequest 或冻结命令。
+    路由只解析用户输入；本边界先按严格两键任务输入识别已提交的顺序重放，使历史
+    source 后续过期、内容清理或事件删除都不能改变既有请求结果。只有键尚未绑定任务时，
+    仓储才锁定、验证 source 的归属、类别、生命周期、精确本地事件绑定和密文保留，并在
+    同一事务内创建 TaskRun、AuditEvent 与 Outbox。本用例不创建恢复提案、ApprovalRequest
+    或冻结命令。
     """
 
     def __init__(
@@ -1268,22 +1278,27 @@ class CalendarRestoreEnqueueUseCase:
     ) -> CreateTaskResult:
         """创建或精确重放一个恢复准备任务，并返回其持久状态。"""
         checked_key = validate_calendar_creation_idempotency_key(creation_idempotency_key)
-        now = _aware_utc(self._clock(), field="calendar restore clock")
         async with self._repositories() as repository:
-            projection = await repository.get_restore_source_projection(
-                user_id=user_id,
-                source_snapshot_id=source_snapshot_id,
-            )
-            validate_calendar_restore_source_projection(
-                projection,
-                event_id=event_id,
-                now=now,
-            )
-            result = await repository.create_restore_prepare_task(
+            result = await repository.get_existing_restore_prepare_task(
                 user_id=user_id,
                 source_snapshot_id=source_snapshot_id,
                 creation_idempotency_key=checked_key,
             )
+            if result is None:
+                projection = await repository.get_restore_source_projection(
+                    user_id=user_id,
+                    source_snapshot_id=source_snapshot_id,
+                )
+                validate_calendar_restore_source_projection(
+                    projection,
+                    event_id=event_id,
+                    now=_aware_utc(self._clock(), field="calendar restore clock"),
+                )
+                result = await repository.create_restore_prepare_task(
+                    user_id=user_id,
+                    source_snapshot_id=source_snapshot_id,
+                    creation_idempotency_key=checked_key,
+                )
         return CreateTaskResult(
             task_id=result.task_id,
             status=await self._dispatcher.dispatch(result.task_id),

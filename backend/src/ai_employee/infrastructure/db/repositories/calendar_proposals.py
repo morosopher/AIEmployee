@@ -673,11 +673,42 @@ class SqlAlchemyCalendarProposalRepository:
             持久输入刻意不包含 REST path ``event_id``、动态时间或别名 ``snapshot_id``；Worker
             只从 PostgreSQL 重新读取并二次验证 source，不能信任队列消息复制的业务事实。
         """
-        payload: dict[str, JsonValue] = {
-            "source_snapshot_id": str(source_snapshot_id),
-            "creation_idempotency_key": creation_idempotency_key,
-        }
+        payload = _restore_prepare_task_payload(
+            source_snapshot_id=source_snapshot_id,
+            creation_idempotency_key=creation_idempotency_key,
+        )
         return await SqlAlchemyTaskRepository(self._session).create_with_outbox(
+            user_id=user_id,
+            kind="calendar.restore.prepare",
+            input_payload=payload,
+            idempotency_key=creation_idempotency_key,
+        )
+
+    async def get_existing_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CreateTaskResult | None:
+        """在读取任何可变 source 前按精确恢复任务意图识别顺序重放。
+
+        Args:
+            user_id: 当前认证用户，参与任务幂等隔离。
+            source_snapshot_id: 冻结任务输入中的历史 snapshot ID。
+            creation_idempotency_key: 同时写入任务输入与 TaskRun 唯一键的客户端键。
+
+        Returns:
+            同用户、同 kind、同完整输入的已有任务；键不存在时返回 ``None``。
+
+        Raises:
+            StateConflictError: 同键已绑定到其他任务 kind 或不同恢复输入。
+        """
+        payload = _restore_prepare_task_payload(
+            source_snapshot_id=source_snapshot_id,
+            creation_idempotency_key=creation_idempotency_key,
+        )
+        return await SqlAlchemyTaskRepository(self._session).get_existing(
             user_id=user_id,
             kind="calendar.restore.prepare",
             input_payload=payload,
@@ -1022,6 +1053,27 @@ class SqlAlchemyCalendarRestoreEnqueueRepositoryFactory:
         """异常时整体回滚 source 锁定、TaskRun、AuditEvent 与 Outbox。"""
         async with self._session_factory.begin() as session:
             yield SqlAlchemyCalendarProposalRepository(session, self._cipher)
+
+
+def _restore_prepare_task_payload(
+    *,
+    source_snapshot_id: UUID,
+    creation_idempotency_key: str,
+) -> dict[str, JsonValue]:
+    """构造 restore prepare 创建与重放比较共享的唯一冻结任务输入。
+
+    Args:
+        source_snapshot_id: 历史 before snapshot 的稳定 UUID。
+        creation_idempotency_key: 恢复提案创建与 TaskRun 共用的用户范围键。
+
+    Returns:
+        只含 ``source_snapshot_id`` 与 ``creation_idempotency_key`` 的新字典；REST path
+        event、动态时钟和可变 source 投影绝不进入任务意图。
+    """
+    return {
+        "source_snapshot_id": str(source_snapshot_id),
+        "creation_idempotency_key": creation_idempotency_key,
+    }
 
 
 def _canonical_hash(payload: PreparedActionPayload) -> str:
