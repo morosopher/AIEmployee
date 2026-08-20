@@ -5,7 +5,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from ai_employee.api.deps import (
     CsrfProtectedSession,
@@ -34,14 +34,14 @@ class SettingsPatch(BaseModel):
     timezone: str | None = None
     locale: str | None = None
     brief_time: str | None = None
-    email_body_retention_days: int | None = None
-    source_metadata_retention_days: int | None = None
-    workspace_history_retention_days: int | None = None
+    email_body_retention_days: StrictInt | None = None
+    source_metadata_retention_days: StrictInt | None = None
+    workspace_history_retention_days: StrictInt | None = None
     default_mail_connection_id: UUID | None = None
     default_calendar_connection_id: UUID | None = None
     default_calendar_id: str | None = Field(default=None, min_length=1, max_length=512)
     working_hours: dict[str, list[list[str]]] | None = None
-    meeting_buffer_minutes: int | None = Field(default=None, ge=0, le=120)
+    meeting_buffer_minutes: StrictInt | None = Field(default=None, ge=0, le=120)
 
     @field_validator("timezone")
     @classmethod

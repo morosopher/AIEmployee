@@ -18,6 +18,7 @@ from ai_employee.application.use_cases.calendar_proposals import (
     CalendarOperationKind,
     CalendarProposalSnapshot,
     CalendarProposalStateSnapshot,
+    CalendarRestoreSourceProjection,
     CalendarRestoreSourceSnapshot,
     CalendarSnapshot,
     CalendarSnapshotKind,
@@ -556,79 +557,122 @@ class SqlAlchemyCalendarProposalRepository:
             provider_event_id=row.target_event_id,
         )
 
-    async def enqueue_restore_prepare(
+    async def get_restore_source_projection(
         self,
         *,
         user_id: UUID,
-        event_id: UUID,
+        source_snapshot_id: UUID,
+    ) -> CalendarRestoreSourceProjection | None:
+        """锁定并投影 application 恢复资格判断需要的全部持久事实。
+
+        本方法只执行用户范围读取，不解释 snapshot 类别、提案生命周期、保留期或事件
+        绑定是否合格。application 在同一事务上下文内完成纯校验后，才可调用
+        ``create_restore_prepare_task`` 创建 TaskRun、AuditEvent 与 Outbox。精确事件查询
+        使用提案保存的 connection/calendar/provider event 三元组；未找到时仍返回 source
+        投影并把事件字段置空，使其稳定映射为 409 而不是伪装成 source 404。
+
+        Args:
+            user_id: 当前认证用户；snapshot、proposal 与 event 查询都显式隔离该值。
+            source_snapshot_id: 请求指定的历史 snapshot ID。
+
+        Returns:
+            锁定的最小非敏感事实；snapshot 或父 proposal 不存在/跨用户时返回 ``None``。
+        """
+        row = (
+            await self._session.execute(
+                select(
+                    CalendarChangeSnapshotModel.id.label("source_snapshot_id"),
+                    CalendarChangeSnapshotModel.proposal_id.label("source_proposal_id"),
+                    CalendarChangeSnapshotModel.snapshot_kind,
+                    CalendarChangeSnapshotModel.retain_until,
+                    CalendarChangeSnapshotModel.content_ciphertext,
+                    CalendarChangeSnapshotModel.content_nonce,
+                    CalendarChangeSnapshotModel.content_key_version,
+                    CalendarChangeProposalModel.operation_kind,
+                    CalendarChangeProposalModel.status.label("proposal_status"),
+                    CalendarChangeProposalModel.connection_id.label("proposal_connection_id"),
+                    CalendarChangeProposalModel.calendar_id.label("proposal_calendar_id"),
+                    CalendarChangeProposalModel.target_event_id.label("proposal_provider_event_id"),
+                )
+                .join(
+                    CalendarChangeProposalModel,
+                    CalendarChangeProposalModel.id == CalendarChangeSnapshotModel.proposal_id,
+                )
+                .where(
+                    CalendarChangeSnapshotModel.id == source_snapshot_id,
+                    CalendarChangeSnapshotModel.user_id == user_id,
+                    CalendarChangeProposalModel.user_id == user_id,
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+
+        event = None
+        if row.proposal_provider_event_id is not None:
+            event = (
+                await self._session.execute(
+                    select(
+                        CalendarEventModel.id.label("target_local_event_id"),
+                        CalendarEventModel.connection_id.label("event_connection_id"),
+                        CalendarEventModel.calendar_id.label("event_calendar_id"),
+                        CalendarEventModel.provider_event_id.label("event_provider_event_id"),
+                    )
+                    .where(
+                        CalendarEventModel.user_id == user_id,
+                        CalendarEventModel.connection_id == row.proposal_connection_id,
+                        CalendarEventModel.calendar_id == row.proposal_calendar_id,
+                        CalendarEventModel.provider_event_id == row.proposal_provider_event_id,
+                    )
+                    .with_for_update()
+                )
+            ).one_or_none()
+
+        return CalendarRestoreSourceProjection(
+            source_snapshot_id=row.source_snapshot_id,
+            source_proposal_id=row.source_proposal_id,
+            snapshot_kind=row.snapshot_kind,
+            operation_kind=row.operation_kind,
+            # 未知数据库状态交给 application 的严格比较归类为冲突，避免在读取边界
+            # 抛出未分类 ValueError 并错误地转成 500。
+            proposal_status=cast(CalendarProposalStatus, row.proposal_status),
+            target_local_event_id=(event.target_local_event_id if event is not None else None),
+            proposal_connection_id=row.proposal_connection_id,
+            proposal_calendar_id=row.proposal_calendar_id,
+            proposal_provider_event_id=row.proposal_provider_event_id,
+            event_connection_id=(event.event_connection_id if event is not None else None),
+            event_calendar_id=(event.event_calendar_id if event is not None else None),
+            event_provider_event_id=(event.event_provider_event_id if event is not None else None),
+            retain_until=row.retain_until,
+            ciphertext_present=(
+                row.content_ciphertext is not None
+                and row.content_nonce is not None
+                and row.content_key_version is not None
+            ),
+        )
+
+    async def create_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
         source_snapshot_id: UUID,
         creation_idempotency_key: str,
-        now: datetime,
     ) -> CreateTaskResult:
-        """验证历史恢复来源并与 TaskRun/Outbox 在同一事务中原子落库。
+        """在调用方已验证 source 的同一事务中原子创建恢复准备任务。
 
-        缺失或跨用户 source 通过用户过滤后返回 404 所需的 ``None`` 语义；source 存在但
-        不是保留中的 before、其提案不是已应用 update、目标事件与 path 不精确绑定，或
-        AEAD 三元组已被清理时，统一抛出不含内容的 409。调用方事务不会在验证失败后
-        创建任何任务、审计或 Outbox 事实。
+        Args:
+            user_id: 当前认证用户和任务持久归属用户。
+            source_snapshot_id: 已在本事务内锁定并验证的历史 before snapshot ID。
+            creation_idempotency_key: 恢复提案创建与任务重放共享的稳定用户范围键。
+
+        Returns:
+            新建或精确重放的持久任务标识与状态。
+
+        Notes:
+            持久输入刻意不包含 REST path ``event_id``、动态时间或别名 ``snapshot_id``；Worker
+            只从 PostgreSQL 重新读取并二次验证 source，不能信任队列消息复制的业务事实。
         """
-        checked_now = _as_utc(now)
-        snapshot = await self._session.scalar(
-            select(CalendarChangeSnapshotModel)
-            .where(
-                CalendarChangeSnapshotModel.id == source_snapshot_id,
-                CalendarChangeSnapshotModel.user_id == user_id,
-            )
-            .with_for_update()
-        )
-        if snapshot is None:
-            raise _calendar_restore_source_not_found()
-        proposal = await self._session.scalar(
-            select(CalendarChangeProposalModel)
-            .where(
-                CalendarChangeProposalModel.id == snapshot.proposal_id,
-                CalendarChangeProposalModel.user_id == user_id,
-            )
-            .with_for_update()
-        )
-        if proposal is None:
-            raise _calendar_restore_source_not_found()
-        if snapshot.snapshot_kind != "before":
-            raise _calendar_restore_source_conflict()
-        if (
-            proposal.operation_kind != "update"
-            or proposal.status != CalendarProposalStatus.APPLIED.value
-        ):
-            raise _calendar_restore_source_conflict()
-        if snapshot.retain_until <= checked_now:
-            raise _calendar_restore_source_conflict()
-        if (
-            snapshot.content_ciphertext is None
-            or snapshot.content_nonce is None
-            or snapshot.content_key_version is None
-        ):
-            raise _calendar_restore_source_conflict()
-        if proposal.target_event_id is None:
-            raise _calendar_restore_source_conflict()
-        event = await self._session.scalar(
-            select(CalendarEventModel)
-            .where(
-                CalendarEventModel.id == event_id,
-                CalendarEventModel.user_id == user_id,
-            )
-            .with_for_update()
-        )
-        if event is None:
-            # A user-owned but missing event is an invalid lifecycle/binding fact rather than
-            # a source ownership miss; callers can offer a deterministic resync action.
-            raise _calendar_restore_source_conflict()
-        if (
-            event.connection_id != proposal.connection_id
-            or event.calendar_id != proposal.calendar_id
-            or event.provider_event_id != proposal.target_event_id
-        ):
-            raise _calendar_restore_source_conflict()
-
         payload: dict[str, JsonValue] = {
             "source_snapshot_id": str(source_snapshot_id),
             "creation_idempotency_key": creation_idempotency_key,
@@ -1032,22 +1076,6 @@ def _calendar_snapshot_unavailable() -> StateConflictError:
     return StateConflictError(
         error_code="calendar_snapshot_unavailable",
         message="calendar snapshot content is unavailable",
-    )
-
-
-def _calendar_restore_source_not_found() -> StateConflictError:
-    """构造用户隔离 source 缺失信号；API 会将该稳定码隐藏为 404。"""
-    return StateConflictError(
-        error_code="calendar_restore_source_not_found",
-        message="calendar restore source was not found",
-    )
-
-
-def _calendar_restore_source_conflict() -> StateConflictError:
-    """构造历史来源类别、生命周期、绑定或保留失效的稳定 409。"""
-    return StateConflictError(
-        error_code="calendar_restore_source_conflict",
-        message="calendar restore source is not eligible",
     )
 
 

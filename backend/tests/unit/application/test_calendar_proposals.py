@@ -1,6 +1,7 @@
 """验证版本化日历提案的应用层授权、默认值与恢复规则。"""
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
@@ -20,22 +21,26 @@ from ai_employee.application.use_cases.calendar_proposals import (
     CalendarProposalContent,
     CalendarProposalEventBinding,
     CalendarProposalEventSnapshot,
+    CalendarProposalNotFoundError,
     CalendarProposalSnapshot,
     CalendarProposalTargetSnapshot,
     CalendarProposalUseCase,
     CalendarProposalView,
+    CalendarRestoreEnqueueUseCase,
+    CalendarRestoreSourceProjection,
     CalendarRestoreSourceSnapshot,
     CalendarSnapshot,
     CalendarSnapshotKind,
     parse_calendar_proposal_conversation_request,
 )
+from ai_employee.application.use_cases.tasks import CreateTaskResult
 from ai_employee.domain.actions import CalendarProposalStatus
 from ai_employee.domain.calendar_actions import NotificationPolicy
 from ai_employee.domain.calendar_availability import AvailabilityEvent
 from ai_employee.domain.connections import CapabilityStatus, ConnectionStatus
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.settings import WeeklyWorkingHours
-from ai_employee.domain.tasks import JsonValue
+from ai_employee.domain.tasks import JsonValue, TaskStatus
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000911")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000912")
@@ -52,6 +57,7 @@ NOW = datetime(2030, 3, 11, 8, tzinfo=UTC)
 RETAIN_UNTIL = NOW + timedelta(days=365)
 CALENDAR_ID = "synthetic-calendar"
 PROVIDER_EVENT_ID = "synthetic-event"
+RESTORE_TASK_ID = UUID("00000000-0000-0000-0000-000000000928")
 
 
 def _working_hours() -> WeeklyWorkingHours:
@@ -145,6 +151,190 @@ def _provider_event(
         attendees=({"email": "attendee@example.test"},),
         can_edit=can_edit,
     )
+
+
+def _restore_projection(**overrides: object) -> CalendarRestoreSourceProjection:
+    """构造恢复入队边界需要的完整、非敏感持久事实投影。"""
+    values: dict[str, object] = {
+        "source_snapshot_id": BEFORE_ID,
+        "source_proposal_id": PROPOSAL_ID,
+        "snapshot_kind": "before",
+        "operation_kind": "update",
+        "proposal_status": CalendarProposalStatus.APPLIED,
+        "target_local_event_id": EVENT_ID,
+        "proposal_connection_id": CONNECTION_ID,
+        "proposal_calendar_id": CALENDAR_ID,
+        "proposal_provider_event_id": PROVIDER_EVENT_ID,
+        "event_connection_id": CONNECTION_ID,
+        "event_calendar_id": CALENDAR_ID,
+        "event_provider_event_id": PROVIDER_EVENT_ID,
+        "retain_until": RETAIN_UNTIL,
+        "ciphertext_present": True,
+    }
+    values.update(overrides)
+    return CalendarRestoreSourceProjection(**values)  # type: ignore[arg-type]
+
+
+class _RestoreEnqueueRepository:
+    """记录 application 是否先验证窄投影，再创建唯一任务事实。"""
+
+    def __init__(self, projection: CalendarRestoreSourceProjection | None) -> None:
+        self.projection = projection
+        self.calls: list[str] = []
+        self.created: list[dict[str, object]] = []
+
+    async def get_restore_source_projection(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+    ) -> CalendarRestoreSourceProjection | None:
+        """返回固定投影并记录读取发生在任务创建之前。"""
+        assert user_id == USER_ID
+        assert source_snapshot_id == BEFORE_ID
+        self.calls.append("get_restore_source_projection")
+        return self.projection
+
+    async def create_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
+        source_snapshot_id: UUID,
+        creation_idempotency_key: str,
+    ) -> CreateTaskResult:
+        """记录任务创建参数，证明 path event 与动态时间不会进入持久输入。"""
+        self.calls.append("create_restore_prepare_task")
+        self.created.append(
+            {
+                "user_id": user_id,
+                "source_snapshot_id": source_snapshot_id,
+                "creation_idempotency_key": creation_idempotency_key,
+            }
+        )
+        return CreateTaskResult(task_id=RESTORE_TASK_ID)
+
+
+class _RestoreDispatcher:
+    """记录提交后投递；资格失败时调用次数必须保持为零。"""
+
+    def __init__(self) -> None:
+        self.task_ids: list[UUID] = []
+
+    async def dispatch(self, task_id: UUID) -> TaskStatus:
+        """返回 queued，模拟 Outbox 已由独立事务安全认领。"""
+        self.task_ids.append(task_id)
+        return TaskStatus.QUEUED
+
+
+def _restore_enqueue_use_case(
+    projection: CalendarRestoreSourceProjection | None,
+) -> tuple[CalendarRestoreEnqueueUseCase, _RestoreEnqueueRepository, _RestoreDispatcher]:
+    """组装单事务 restore enqueue 用例与可观察 Fake。"""
+    repository = _RestoreEnqueueRepository(projection)
+
+    @asynccontextmanager
+    async def repositories() -> AsyncIterator[_RestoreEnqueueRepository]:
+        yield repository
+
+    dispatcher = _RestoreDispatcher()
+    return (
+        CalendarRestoreEnqueueUseCase(repositories, dispatcher, lambda: NOW),
+        repository,
+        dispatcher,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_enqueue_validates_projection_before_atomic_task_creation() -> None:
+    """合法 source 必须先经 application 校验，再仅用两个冻结输入创建任务。"""
+    use_case, repository, dispatcher = _restore_enqueue_use_case(_restore_projection())
+
+    result = await use_case.execute(
+        user_id=USER_ID,
+        event_id=EVENT_ID,
+        source_snapshot_id=BEFORE_ID,
+        creation_idempotency_key="synthetic-restore-enqueue",
+    )
+
+    assert result == CreateTaskResult(task_id=RESTORE_TASK_ID, status=TaskStatus.QUEUED)
+    assert repository.calls == [
+        "get_restore_source_projection",
+        "create_restore_prepare_task",
+    ]
+    assert repository.created == [
+        {
+            "user_id": USER_ID,
+            "source_snapshot_id": BEFORE_ID,
+            "creation_idempotency_key": "synthetic-restore-enqueue",
+        }
+    ]
+    assert dispatcher.task_ids == [RESTORE_TASK_ID]
+
+
+@pytest.mark.asyncio
+async def test_restore_enqueue_missing_projection_fails_before_task_creation() -> None:
+    """缺失或跨用户 source 必须保留 404 语义且不创建、投递任务。"""
+    use_case, repository, dispatcher = _restore_enqueue_use_case(None)
+
+    with pytest.raises(CalendarProposalNotFoundError):
+        await use_case.execute(
+            user_id=USER_ID,
+            event_id=EVENT_ID,
+            source_snapshot_id=BEFORE_ID,
+            creation_idempotency_key="synthetic-restore-missing",
+        )
+
+    assert repository.calls == ["get_restore_source_projection"]
+    assert repository.created == []
+    assert dispatcher.task_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"snapshot_kind": "desired"},
+        {"operation_kind": "restore"},
+        {"proposal_status": CalendarProposalStatus.EDITING},
+        {"target_local_event_id": UUID("00000000-0000-0000-0000-000000000929")},
+        {"retain_until": NOW},
+        {"ciphertext_present": False},
+        {"proposal_provider_event_id": None},
+        {"event_connection_id": ALTERNATE_CONNECTION_ID},
+        {"event_calendar_id": "other-calendar"},
+        {"event_provider_event_id": "other-event"},
+    ),
+    ids=(
+        "wrong-kind",
+        "wrong-operation",
+        "wrong-status",
+        "path-event-mismatch",
+        "expired",
+        "ciphertext-cleared",
+        "missing-provider-event",
+        "connection-mismatch",
+        "calendar-mismatch",
+        "provider-event-mismatch",
+    ),
+)
+async def test_restore_enqueue_ineligible_projection_fails_closed(
+    overrides: dict[str, object],
+) -> None:
+    """类别、生命周期、保留或精确供应商身份任一失配均不得产生队列事实。"""
+    use_case, repository, dispatcher = _restore_enqueue_use_case(_restore_projection(**overrides))
+
+    with pytest.raises(StateConflictError) as raised:
+        await use_case.execute(
+            user_id=USER_ID,
+            event_id=EVENT_ID,
+            source_snapshot_id=BEFORE_ID,
+            creation_idempotency_key="synthetic-restore-conflict",
+        )
+
+    assert raised.value.error_code == "calendar_restore_source_conflict"
+    assert repository.calls == ["get_restore_source_projection"]
+    assert repository.created == []
+    assert dispatcher.task_ids == []
 
 
 class _ProposalRepository:

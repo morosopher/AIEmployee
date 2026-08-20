@@ -385,8 +385,12 @@ async def test_patch_rejects_unavailable_default_connection_with_stable_conflict
         {"brief_time": "9:45"},
         {"brief_time": "24:00"},
         {"email_body_retention_days": 0},
+        {"email_body_retention_days": True},
         {"source_metadata_retention_days": 3651},
+        {"source_metadata_retention_days": True},
         {"workspace_history_retention_days": 0},
+        {"workspace_history_retention_days": True},
+        {"meeting_buffer_minutes": True},
         {"unexpected": "field"},
     ),
 )

@@ -1,6 +1,6 @@
-"""日历提案与恢复 API 的公开 Schema 契约 RED 测试。"""
+"""日历提案与恢复 API 的公开 Schema 契约测试。"""
 
-from datetime import date
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
@@ -89,14 +89,41 @@ def test_all_day_request_uses_iso_dates() -> None:
             "connection_id": uuid4(),
             "calendar_id": "calendar",
             "title": "Synthetic holiday",
-            "starts_at": date(2030, 1, 1),
-            "ends_at": date(2030, 1, 2),
+            "starts_at": "2030-01-01",
+            "ends_at": "2030-01-02",
             "timezone": "Asia/Shanghai",
             "all_day": True,
         }
     )
     assert request.starts_at == date(2030, 1, 1)
     assert request.ends_at == date(2030, 1, 2)
+
+
+@pytest.mark.parametrize(
+    "invalid_time",
+    (
+        123,
+        True,
+        date(2030, 1, 1),
+        datetime(2030, 1, 1, 9, tzinfo=UTC),
+    ),
+    ids=("number", "boolean", "python-date", "python-datetime"),
+)
+def test_create_request_rejects_non_string_temporal_values(invalid_time: object) -> None:
+    """公开 JSON 边界只接受 ISO 字符串，禁止 Pydantic 数字时间与 Python 对象直通。"""
+    with pytest.raises(ValidationError):
+        TypeAdapter(CreateProposalRequest).validate_python(
+            {
+                "operation_kind": "create",
+                "connection_id": uuid4(),
+                "calendar_id": "calendar",
+                "title": "Synthetic event",
+                "starts_at": invalid_time,
+                "ends_at": "2030-01-01T10:00:00+00:00",
+                "timezone": "UTC",
+                "all_day": False,
+            }
+        )
 
 
 def test_timed_request_rejects_date_values_and_naive_datetimes() -> None:
@@ -119,6 +146,94 @@ def test_timed_request_rejects_date_values_and_naive_datetimes() -> None:
                 **base,
                 "starts_at": "2030-01-01T09:00:00",
                 "ends_at": "2030-01-01T10:00:00",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema", "identity"),
+    (
+        (CreateUpdateProposalRequest, {"operation_kind": "update", "event_id": uuid4()}),
+        (UpdateProposalRequest, {"version": 1}),
+    ),
+    ids=("create-update", "patch"),
+)
+def test_update_requests_reject_mixed_or_naive_intervals(
+    schema: type[object],
+    identity: dict[str, object],
+) -> None:
+    """update 与 PATCH 不能让混合 date/datetime 或无 offset 时间进入应用用例。"""
+    with pytest.raises(ValidationError):
+        TypeAdapter(schema).validate_python(
+            {
+                **identity,
+                "starts_at": "2030-01-01",
+                "ends_at": "2030-01-01T10:00:00+00:00",
+                "all_day": False,
+            }
+        )
+    with pytest.raises(ValidationError):
+        TypeAdapter(schema).validate_python(
+            {
+                **identity,
+                "starts_at": "2030-01-01T09:00:00",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema", "identity"),
+    (
+        (CreateUpdateProposalRequest, {"operation_kind": "update", "event_id": uuid4()}),
+        (UpdateProposalRequest, {"version": 1}),
+    ),
+    ids=("create-update", "patch"),
+)
+def test_partial_update_allows_one_strict_temporal_value(
+    schema: type[object],
+    identity: dict[str, object],
+) -> None:
+    """部分更新可只给一端，但该值自身仍必须是严格 ISO aware datetime。"""
+    request = TypeAdapter(schema).validate_python(
+        {
+            **identity,
+            "starts_at": "2030-01-01T09:00:00Z",
+            "all_day": False,
+        }
+    )
+    assert request.starts_at == datetime(2030, 1, 1, 9, tzinfo=UTC)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("schema", "identity"),
+    (
+        (
+            CreateEventProposalRequest,
+            {
+                "operation_kind": "create",
+                "connection_id": uuid4(),
+                "calendar_id": "calendar",
+                "title": "Synthetic holiday",
+                "timezone": "UTC",
+            },
+        ),
+        (CreateUpdateProposalRequest, {"operation_kind": "update", "event_id": uuid4()}),
+        (UpdateProposalRequest, {"version": 1}),
+    ),
+    ids=("create", "create-update", "patch"),
+)
+def test_all_day_intervals_require_exclusive_end(
+    schema: type[object],
+    identity: dict[str, object],
+) -> None:
+    """全天结束日期是独占边界，必须严格晚于开始日期。"""
+    with pytest.raises(ValidationError):
+        TypeAdapter(schema).validate_python(
+            {
+                **identity,
+                "starts_at": "2030-01-01",
+                "ends_at": "2030-01-01",
+                "all_day": True,
             }
         )
 

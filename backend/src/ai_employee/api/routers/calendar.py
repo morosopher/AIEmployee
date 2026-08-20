@@ -1,5 +1,6 @@
 """暴露非重复日历提案、确定性候选、提交与历史恢复 REST 边界。"""
 
+import re
 from datetime import UTC, date, datetime
 from typing import Annotated, Literal, cast
 from uuid import UUID
@@ -63,7 +64,17 @@ class _StrictCalendarModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class _CalendarEventFields(_StrictCalendarModel):
+class _StrictCalendarTemporalModel(_StrictCalendarModel):
+    """为所有请求时间字段执行 JSON 字符串级严格解析。"""
+
+    @field_validator("starts_at", "ends_at", mode="before", check_fields=False)
+    @classmethod
+    def strict_temporal_value(cls, value: object) -> date | datetime | None:
+        """只接受 ISO date 或携带 offset 的 ISO datetime 字符串。"""
+        return _parse_calendar_temporal(value)
+
+
+class _CalendarEventFields(_StrictCalendarTemporalModel):
     """创建请求共享的完整、供应商中立非重复事件字段。"""
 
     title: str = Field(min_length=1, max_length=255)
@@ -130,7 +141,7 @@ class CreateEventProposalRequest(_CalendarEventFields):
     calendar_id: str = Field(min_length=1, max_length=512)
 
 
-class CreateUpdateProposalRequest(_StrictCalendarModel):
+class CreateUpdateProposalRequest(_StrictCalendarTemporalModel):
     """从用户拥有的本地非重复事件创建修改提案。"""
 
     operation_kind: Literal["update"]
@@ -168,9 +179,15 @@ class CreateUpdateProposalRequest(_StrictCalendarModel):
 
     @model_validator(mode="after")
     def has_changes(self) -> "CreateUpdateProposalRequest":
-        """要求 update 变体至少提供一个明确变更字段。"""
+        """要求 update 至少有一个变更，并校验已提供时间字段的组合。"""
         if not set(self.model_fields_set).difference({"operation_kind", "event_id"}):
             raise ValueError("update proposal requires at least one change")
+        _validate_partial_calendar_interval(
+            starts_at=self.starts_at,
+            ends_at=self.ends_at,
+            all_day=self.all_day,
+            fields_set=self.model_fields_set,
+        )
         return self
 
 
@@ -180,7 +197,7 @@ type CreateProposalRequest = Annotated[
 ]
 
 
-class UpdateProposalRequest(_StrictCalendarModel):
+class UpdateProposalRequest(_StrictCalendarTemporalModel):
     """以客户端观察到的当前版本 CAS 保存下一不可变提案版本。"""
 
     version: int = Field(ge=1)
@@ -208,9 +225,15 @@ class UpdateProposalRequest(_StrictCalendarModel):
 
     @model_validator(mode="after")
     def has_changes(self) -> "UpdateProposalRequest":
-        """拒绝只携带版本但没有任何编辑字段的空 PATCH。"""
+        """拒绝空 PATCH，并校验已提供时间字段的表示与顺序。"""
         if not set(self.model_fields_set).difference({"version"}):
             raise ValueError("calendar proposal patch requires at least one change")
+        _validate_partial_calendar_interval(
+            starts_at=self.starts_at,
+            ends_at=self.ends_at,
+            all_day=self.all_day,
+            fields_set=self.model_fields_set,
+        )
         return self
 
 
@@ -307,6 +330,85 @@ class AcceptedTaskResponse(_StrictCalendarModel):
 
     task_id: UUID
     status: Literal["queued"]
+
+
+_ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _parse_calendar_temporal(value: object) -> date | datetime | None:
+    """严格解析公开请求中的日期或带时区日期时间。
+
+    Args:
+        value: Pydantic 进行任何宽松转换前观察到的原始字段值。
+
+    Returns:
+        ``None``，或由 ISO 字符串解析出的纯 ``date`` / aware ``datetime``。
+
+    Raises:
+        ValueError: 输入不是字符串、不是受支持的 ISO 表示或 datetime 缺少时区。
+    """
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("calendar temporal values must be ISO strings")
+    if _ISO_DATE_PATTERN.fullmatch(value) is not None:
+        try:
+            return date.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError("calendar date must be a valid ISO date") from error
+    if "T" not in value:
+        raise ValueError("calendar datetime must be an ISO date-time string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("calendar datetime must be a valid ISO date-time") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("calendar datetime must be timezone-aware")
+    return parsed
+
+
+def _validate_partial_calendar_interval(
+    *,
+    starts_at: date | datetime | None,
+    ends_at: date | datetime | None,
+    all_day: bool | None,
+    fields_set: set[str],
+) -> None:
+    """验证 update/PATCH 中已提供时间字段，不要求缺失的另一端。
+
+    Args:
+        starts_at: 已严格解析的可选开始日期或瞬间。
+        ends_at: 已严格解析的可选结束日期或瞬间。
+        all_day: 请求显式提供的全天模式，或未提供时的 ``None``。
+        fields_set: Pydantic 记录的显式字段集合，用于区分省略与默认 ``None``。
+
+    Raises:
+        ValueError: 已提供字段与显式全天模式不匹配、两端混用表示或结束不晚于开始。
+    """
+    provided_start = "starts_at" in fields_set
+    provided_end = "ends_at" in fields_set
+    provided = tuple(
+        value
+        for is_present, value in ((provided_start, starts_at), (provided_end, ends_at))
+        if is_present
+    )
+    if any(value is None for value in provided):
+        raise ValueError("calendar temporal values cannot be null")
+    if all_day is True and any(type(value) is not date for value in provided):
+        raise ValueError("all-day intervals must use ISO dates")
+    if all_day is False and any(not isinstance(value, datetime) for value in provided):
+        raise ValueError("timed intervals must use date-time values")
+    if not (provided_start and provided_end):
+        return
+    if type(starts_at) is date and type(ends_at) is date:
+        if ends_at <= starts_at:
+            raise ValueError("calendar ends_at must be after starts_at")
+        return
+    if isinstance(starts_at, datetime) and isinstance(ends_at, datetime):
+        if ends_at.astimezone(UTC) <= starts_at.astimezone(UTC):
+            raise ValueError("calendar ends_at must be after starts_at")
+        return
+    raise ValueError("calendar interval endpoints must use the same representation")
 
 
 def _missing_proposal() -> ApiProblem:
@@ -648,14 +750,14 @@ def build_calendar_router() -> APIRouter:
                 source_snapshot_id=payload.snapshot_id,
                 creation_idempotency_key=idempotency_key,
             )
+        except CalendarProposalNotFoundError:
+            raise ApiProblem(
+                404,
+                "calendar_restore_source_not_found",
+                "Calendar restore source not found",
+                "The requested restore source was not found.",
+            ) from None
         except StateConflictError as error:
-            if error.error_code == "calendar_restore_source_not_found":
-                raise ApiProblem(
-                    404,
-                    "calendar_restore_source_not_found",
-                    "Calendar restore source not found",
-                    "The requested restore source was not found.",
-                ) from None
             actionable = _actionable_calendar_conflict(error)
             if actionable is not None:
                 raise actionable from None

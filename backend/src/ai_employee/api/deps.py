@@ -233,6 +233,10 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
         route_path = getattr(route, "path", request.url.path)
         metrics.api_errors.labels(route=route_path, error_code=problem_error.error_code).inc()
     headers: dict[str, str] = {}
+    # 日历响应可能包含标题、地点、时间或历史错误上下文；即使由统一异常处理器
+    # 重新构造 Problem Details，也必须继承路由成功响应的 no-store 隔离策略。
+    if request.url.path.startswith("/api/v1/calendar/"):
+        headers["Cache-Control"] = "no-store"
     if isinstance(problem_error, _TransientApiProblem) and problem_error.retry_after is not None:
         headers["Retry-After"] = str(int(problem_error.retry_after))
     return JSONResponse(

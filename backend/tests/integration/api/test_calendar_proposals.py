@@ -16,7 +16,10 @@ from ai_employee.api.deps import get_submit_calendar_proposal_use_case
 from ai_employee.config import get_settings
 from ai_employee.domain.actions import CalendarProposalStatus
 from ai_employee.infrastructure.db.database_url import TestDatabaseUrl as ValidatedTestDatabaseUrl
-from ai_employee.infrastructure.db.models.actions import CalendarChangeProposalModel
+from ai_employee.infrastructure.db.models.actions import (
+    CalendarChangeProposalModel,
+    CalendarChangeSnapshotModel,
+)
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     ConnectionCapabilityModel,
@@ -75,8 +78,12 @@ async def _seed_restore_source(
     *,
     source_kind: Literal["before", "desired"] = "before",
     proposal_status: CalendarProposalStatus = CalendarProposalStatus.APPLIED,
+    proposal_operation: Literal["update", "restore"] = "update",
     retain_until: datetime | None = None,
     event_id: UUID | None = None,
+    recurring_event_id: str | None = None,
+    etag: str | None = 'W/"task17-etag"',
+    calendar_can_write: bool = True,
 ) -> tuple[UUID, UUID, UUID]:
     """写入可审计合成事件、update 提案和历史 snapshot，供 API 恢复测试使用。"""
     connection_id = uuid4()
@@ -118,8 +125,8 @@ async def _seed_restore_source(
                 name="Synthetic calendar",
                 timezone="UTC",
                 is_primary=True,
-                access_role="owner",
-                can_write=True,
+                access_role="owner" if calendar_can_write else "reader",
+                can_write=calendar_can_write,
                 provider_url="https://calendar.example.test/task17",
             )
         )
@@ -140,8 +147,8 @@ async def _seed_restore_source(
                 transparency="opaque",
                 status="confirmed",
                 timezone="UTC",
-                recurring_event_id=None,
-                etag='W/"task17-etag"',
+                recurring_event_id=recurring_event_id,
+                etag=etag,
                 organizer=None,
                 attendees=[],
                 access_role="owner",
@@ -195,6 +202,7 @@ async def _seed_restore_source(
         proposal = await session.get(CalendarChangeProposalModel, proposal_id)
         assert proposal is not None
         proposal.status = proposal_status.value
+        proposal.operation_kind = proposal_operation
         await session.flush()
     return local_event_id, source_snapshot_id, proposal_id
 
@@ -272,6 +280,27 @@ async def _create_calendar_proposal(
     )
 
 
+async def _create_update_proposal(
+    clients: AuthenticatedApiClients,
+    *,
+    event_id: UUID,
+    idempotency_key: str,
+) -> httpx.Response:
+    """经真实 API 从本地事件创建 update 提案，供供应商事实错误映射测试复用。"""
+    return await clients.owner.post(
+        "/api/v1/calendar/proposals",
+        headers={
+            "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+            "Idempotency-Key": idempotency_key,
+        },
+        json={
+            "operation_kind": "update",
+            "event_id": str(event_id),
+            "location": "Updated synthetic room",
+        },
+    )
+
+
 @dataclass(slots=True)
 class _TransactionProbe:
     """记录应用引擎当前打开事务数，证明 submit 不包裹另一个请求事务。"""
@@ -325,6 +354,216 @@ async def test_calendar_routes_are_registered() -> None:
 
 
 @pytest.mark.asyncio
+async def test_calendar_mutations_all_require_csrf(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """创建、编辑、取消、候选、提交和恢复虽不直接外写，也都必须拒绝无 CSRF 请求。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_writable_calendar(clients)
+    created = await _create_calendar_proposal(
+        clients,
+        connection_id=connection_id,
+        idempotency_key="task17-csrf-source",
+    )
+    event_id, snapshot_id, _source_proposal_id = await _seed_restore_source(clients)
+    assert created.status_code == 201
+    proposal_id = created.json()["id"]
+    version = created.json()["version"]
+
+    responses = (
+        await clients.owner.post(
+            "/api/v1/calendar/proposals",
+            headers={"Idempotency-Key": "task17-csrf-create"},
+            json={
+                "operation_kind": "create",
+                "connection_id": str(connection_id),
+                "calendar_id": "task17-create-calendar",
+                "title": "CSRF rejected event",
+                "starts_at": "2030-01-02T09:00:00Z",
+                "ends_at": "2030-01-02T10:00:00Z",
+                "timezone": "UTC",
+            },
+        ),
+        await clients.owner.patch(
+            f"/api/v1/calendar/proposals/{proposal_id}",
+            json={"version": version, "title": "CSRF rejected patch"},
+        ),
+        await clients.owner.delete(f"/api/v1/calendar/proposals/{proposal_id}"),
+        await clients.owner.post(
+            f"/api/v1/calendar/proposals/{proposal_id}/suggest-times",
+            json={"version": version, "search_start": "2030-01-07T09:00:00Z"},
+        ),
+        await clients.owner.post(
+            f"/api/v1/calendar/proposals/{proposal_id}/submit",
+            headers={"Idempotency-Key": "task17-csrf-submit"},
+            json={"version": version},
+        ),
+        await clients.owner.post(
+            f"/api/v1/calendar/events/{event_id}/restore-proposal",
+            headers={"Idempotency-Key": "task17-csrf-restore"},
+            json={"snapshot_id": str(snapshot_id)},
+        ),
+    )
+
+    assert [response.status_code for response in responses] == [403] * len(responses)
+    assert all(response.json()["error_code"] == "csrf_rejected" for response in responses)
+
+
+@pytest.mark.asyncio
+async def test_calendar_validation_errors_are_no_store(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """Pydantic 在路由 body 解析前失败时，统一 Problem Details 仍不得被缓存。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_writable_calendar(clients)
+
+    response = await clients.owner.post(
+        "/api/v1/calendar/proposals",
+        headers={
+            "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+            "Idempotency-Key": "task17-invalid-time-no-store",
+        },
+        json={
+            "operation_kind": "create",
+            "connection_id": str(connection_id),
+            "calendar_id": "task17-create-calendar",
+            "title": "Invalid numeric time",
+            "starts_at": 123,
+            "ends_at": "2030-01-02T10:00:00Z",
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json()["error_code"] == "request_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_calendar_crud_replay_suggestions_and_no_store_contract(
+    authenticated_api_clients: AuthenticatedApiClients,
+) -> None:
+    """真实 HTTP 覆盖同载荷重放、CRUD、候选、版本 CAS、跨用户隐藏与 no-store。"""
+    clients = authenticated_api_clients
+    connection_id = await _seed_writable_calendar(clients)
+    key = "task17-calendar-crud"
+
+    created = await _create_calendar_proposal(
+        clients,
+        connection_id=connection_id,
+        idempotency_key=key,
+    )
+    replay = await _create_calendar_proposal(
+        clients,
+        connection_id=connection_id,
+        idempotency_key=key,
+    )
+    assert created.status_code == replay.status_code == 201
+    assert replay.json() == created.json()
+    proposal_id = created.json()["id"]
+    assert created.headers["Cache-Control"] == replay.headers["Cache-Control"] == "no-store"
+
+    listed = await clients.owner.get("/api/v1/calendar/proposals")
+    fetched = await clients.owner.get(f"/api/v1/calendar/proposals/{proposal_id}")
+    other_fetched = await clients.other.get(f"/api/v1/calendar/proposals/{proposal_id}")
+    assert listed.status_code == fetched.status_code == 200
+    assert listed.headers["Cache-Control"] == fetched.headers["Cache-Control"] == "no-store"
+    assert [item["id"] for item in listed.json()["items"]] == [proposal_id]
+    assert fetched.json() == created.json()
+    assert other_fetched.status_code == 404
+    assert other_fetched.json()["error_code"] == "calendar_proposal_not_found"
+
+    csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
+    updated = await clients.owner.patch(
+        f"/api/v1/calendar/proposals/{proposal_id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"version": 1, "title": "Updated planning session"},
+    )
+    stale = await clients.owner.patch(
+        f"/api/v1/calendar/proposals/{proposal_id}",
+        headers={"X-CSRF-Token": csrf},
+        json={"version": 1, "title": "Stale update"},
+    )
+    assert updated.status_code == 200
+    assert updated.headers["Cache-Control"] == "no-store"
+    assert updated.json()["version"] == 2
+    assert updated.json()["title"] == "Updated planning session"
+    assert stale.status_code == 409
+    assert stale.json()["error_code"] == "proposal_version_conflict"
+
+    other_csrf = clients.other.cookies.get("ai_employee_csrf") or ""
+    other_patch = await clients.other.patch(
+        f"/api/v1/calendar/proposals/{proposal_id}",
+        headers={"X-CSRF-Token": other_csrf},
+        json={"version": 2, "title": "Cross-user update"},
+    )
+    other_delete = await clients.other.delete(
+        f"/api/v1/calendar/proposals/{proposal_id}",
+        headers={"X-CSRF-Token": other_csrf},
+    )
+    assert other_patch.status_code == other_delete.status_code == 404
+    assert other_patch.json()["error_code"] == "calendar_proposal_not_found"
+    assert other_delete.json()["error_code"] == "calendar_proposal_not_found"
+
+    suggested = await clients.owner.post(
+        f"/api/v1/calendar/proposals/{proposal_id}/suggest-times",
+        headers={"X-CSRF-Token": csrf},
+        json={"version": 2, "search_start": "2030-01-07T09:00:00Z"},
+    )
+    assert suggested.status_code == 200
+    assert suggested.headers["Cache-Control"] == "no-store"
+    assert suggested.json()["version"] == 3
+    assert len(suggested.json()["candidates"]) <= 3
+    assert suggested.json()["completeness"] == "partial"
+    assert suggested.json()["missing_connections"] == [str(connection_id)]
+    assert suggested.json()["attendee_availability_checked"] is False
+
+    cancelled = await clients.owner.delete(
+        f"/api/v1/calendar/proposals/{proposal_id}",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.headers["Cache-Control"] == "no-store"
+    assert cancelled.json()["status"] == "cancelled"
+
+    async with clients.session_factory() as session:
+        proposals = tuple((await session.scalars(select(CalendarChangeProposalModel))).all())
+    assert len(proposals) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("seed_overrides", "expected_error_code"),
+    (
+        ({"recurring_event_id": "synthetic-series"}, "calendar_recurring_event_unsupported"),
+        ({"calendar_can_write": False}, "calendar_read_only"),
+        ({"etag": None}, "calendar_event_version_conflict"),
+    ),
+    ids=("recurrence", "read-only", "etag-missing"),
+)
+async def test_update_creation_maps_event_precondition_conflicts(
+    authenticated_api_clients: AuthenticatedApiClients,
+    seed_overrides: dict[str, object],
+    expected_error_code: str,
+) -> None:
+    """重复日程、只读目录与缺失 ETag 都返回稳定、无内容的 409。"""
+    clients = authenticated_api_clients
+    event_id, _snapshot_id, _proposal_id = await _seed_restore_source(
+        clients,
+        **seed_overrides,  # type: ignore[arg-type]
+    )
+
+    response = await _create_update_proposal(
+        clients,
+        event_id=event_id,
+        idempotency_key=f"task17-update-conflict-{expected_error_code}",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == expected_error_code
+
+
+@pytest.mark.asyncio
 async def test_create_replay_mismatch_returns_actionable_conflict(
     authenticated_api_clients: AuthenticatedApiClients,
 ) -> None:
@@ -347,6 +586,7 @@ async def test_create_replay_mismatch_returns_actionable_conflict(
     assert first.status_code == 201
     assert first.headers["Cache-Control"] == "no-store"
     assert mismatch.status_code == 409
+    assert mismatch.headers["Cache-Control"] == "no-store"
     assert mismatch.json()["error_code"] == "idempotency_key_payload_mismatch"
     assert mismatch.json()["detail"] == (
         "Use a new Idempotency-Key when calendar request content changes."
@@ -447,6 +687,7 @@ async def test_submit_hides_cross_user_proposal(
     )
 
     assert response.status_code == 404
+    assert response.headers["Cache-Control"] == "no-store"
     assert response.json()["error_code"] == "calendar_proposal_not_found"
 
 
@@ -498,18 +739,20 @@ async def test_restore_api_atomically_creates_exact_task_and_outbox(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("source_kind", "proposal_status", "expired"),
+    ("source_kind", "proposal_status", "proposal_operation", "expired"),
     (
-        ("desired", CalendarProposalStatus.APPLIED, False),
-        ("before", CalendarProposalStatus.EDITING, False),
-        ("before", CalendarProposalStatus.APPLIED, True),
+        ("desired", CalendarProposalStatus.APPLIED, "update", False),
+        ("before", CalendarProposalStatus.EDITING, "update", False),
+        ("before", CalendarProposalStatus.APPLIED, "restore", False),
+        ("before", CalendarProposalStatus.APPLIED, "update", True),
     ),
-    ids=("wrong-kind", "not-applied", "expired"),
+    ids=("wrong-kind", "not-applied", "wrong-operation", "expired"),
 )
 async def test_restore_api_rejects_ineligible_source_without_queue_facts(
     authenticated_api_clients: AuthenticatedApiClients,
     source_kind: Literal["before", "desired"],
     proposal_status: CalendarProposalStatus,
+    proposal_operation: Literal["update", "restore"],
     expired: bool,
 ) -> None:
     """历史类别、生命周期或保留失效均返回 409，且没有部分 Task/Outbox。"""
@@ -523,6 +766,7 @@ async def test_restore_api_rejects_ineligible_source_without_queue_facts(
         clients,
         source_kind=source_kind,
         proposal_status=proposal_status,
+        proposal_operation=proposal_operation,
         retain_until=retain_until,
     )
     csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
@@ -543,6 +787,47 @@ async def test_restore_api_rejects_ineligible_source_without_queue_facts(
         outbox = tuple((await session.scalars(select(OutboxEventModel))).all())
     assert tasks == ()
     assert outbox == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant",
+    ("path-event-mismatch", "ciphertext-cleared"),
+)
+async def test_restore_api_rejects_binding_or_cleared_ciphertext_without_queue_facts(
+    authenticated_api_clients: AuthenticatedApiClients,
+    variant: str,
+) -> None:
+    """path UUID 不匹配或 AEAD 三元组已清理时必须 409，且 Task/Outbox 均为零。"""
+    clients = authenticated_api_clients
+    event_id, snapshot_id, _proposal_id = await _seed_restore_source(clients)
+    path_event_id = event_id
+    if variant == "path-event-mismatch":
+        path_event_id = uuid4()
+    elif variant == "ciphertext-cleared":
+        async with clients.session_factory.begin() as session:
+            snapshot = await session.get(CalendarChangeSnapshotModel, snapshot_id)
+            assert snapshot is not None
+            snapshot.content_ciphertext = None
+            snapshot.content_nonce = None
+            snapshot.content_key_version = None
+    else:  # pragma: no cover - 参数集合由本测试静态冻结。
+        raise AssertionError("unknown restore invalidation variant")
+
+    response = await clients.owner.post(
+        f"/api/v1/calendar/events/{path_event_id}/restore-proposal",
+        headers={
+            "X-CSRF-Token": clients.owner.cookies.get("ai_employee_csrf") or "",
+            "Idempotency-Key": f"task17-restore-{variant}",
+        },
+        json={"snapshot_id": str(snapshot_id)},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "calendar_restore_source_conflict"
+    async with clients.session_factory() as session:
+        assert await session.scalar(select(TaskRunModel.id)) is None
+        assert await session.scalar(select(OutboxEventModel.id)) is None
 
 
 @pytest.mark.asyncio

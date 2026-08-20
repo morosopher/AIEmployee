@@ -144,8 +144,13 @@ class CalendarRestoreSourceProjection:
     snapshot_kind: str
     operation_kind: str
     proposal_status: CalendarProposalStatus
-    target_event_id: str | None
     target_local_event_id: UUID | None
+    proposal_connection_id: UUID
+    proposal_calendar_id: str
+    proposal_provider_event_id: str | None
+    event_connection_id: UUID | None
+    event_calendar_id: str | None
+    event_provider_event_id: str | None
     retain_until: datetime
     ciphertext_present: bool
 
@@ -1211,14 +1216,19 @@ class CalendarProposalUseCase:
 class CalendarRestoreEnqueueRepository(Protocol):
     """定义恢复准备任务验证与原子创建所需的窄事务端口。"""
 
-    async def enqueue_restore_prepare(
+    async def get_restore_source_projection(
         self,
         *,
         user_id: UUID,
-        event_id: UUID,
+        source_snapshot_id: UUID,
+    ) -> CalendarRestoreSourceProjection | None: ...
+
+    async def create_restore_prepare_task(
+        self,
+        *,
+        user_id: UUID,
         source_snapshot_id: UUID,
         creation_idempotency_key: str,
-        now: datetime,
     ) -> CreateTaskResult: ...
 
 
@@ -1260,17 +1270,83 @@ class CalendarRestoreEnqueueUseCase:
         checked_key = validate_calendar_creation_idempotency_key(creation_idempotency_key)
         now = _aware_utc(self._clock(), field="calendar restore clock")
         async with self._repositories() as repository:
-            result = await repository.enqueue_restore_prepare(
+            projection = await repository.get_restore_source_projection(
                 user_id=user_id,
+                source_snapshot_id=source_snapshot_id,
+            )
+            validate_calendar_restore_source_projection(
+                projection,
                 event_id=event_id,
+                now=now,
+            )
+            result = await repository.create_restore_prepare_task(
+                user_id=user_id,
                 source_snapshot_id=source_snapshot_id,
                 creation_idempotency_key=checked_key,
-                now=now,
             )
         return CreateTaskResult(
             task_id=result.task_id,
             status=await self._dispatcher.dispatch(result.task_id),
         )
+
+
+def validate_calendar_restore_source_projection(
+    projection: CalendarRestoreSourceProjection | None,
+    *,
+    event_id: UUID,
+    now: datetime,
+) -> CalendarRestoreSourceProjection:
+    """验证历史恢复来源的类别、生命周期、保留期与精确事件身份。
+
+    Args:
+        projection: 仓储在当前事务内锁定并返回的最小持久事实；``None`` 表示 source
+            不存在或不属于当前用户。
+        event_id: REST path 中当前用户选择的本地事件 UUID。
+        now: 用于严格判断密文保留期的带时区当前时间。
+
+    Returns:
+        已验证且仍处于同一调用方事务中的原投影。
+
+    Raises:
+        CalendarProposalNotFoundError: source 不存在或跨用户。
+        StateConflictError: source 类别、生命周期、保留、密文或精确身份不再合格。
+        ValueError: ``now`` 不是带时区时间。
+    """
+    checked_now = _aware_utc(now, field="calendar restore validation clock")
+    if projection is None:
+        raise CalendarProposalNotFoundError
+
+    try:
+        retain_until = _aware_utc(
+            projection.retain_until,
+            field="calendar restore source retention",
+        )
+    except ValueError:
+        raise _calendar_restore_source_conflict() from None
+
+    proposal_identity = (
+        projection.proposal_connection_id,
+        projection.proposal_calendar_id,
+        projection.proposal_provider_event_id,
+    )
+    event_identity = (
+        projection.event_connection_id,
+        projection.event_calendar_id,
+        projection.event_provider_event_id,
+    )
+    if (
+        projection.snapshot_kind != "before"
+        or projection.operation_kind != "update"
+        or projection.proposal_status != CalendarProposalStatus.APPLIED
+        or retain_until <= checked_now
+        or not projection.ciphertext_present
+        or projection.target_local_event_id != event_id
+        or projection.proposal_provider_event_id is None
+        or projection.proposal_provider_event_id == ""
+        or proposal_identity != event_identity
+    ):
+        raise _calendar_restore_source_conflict()
+    return projection
 
 
 def parse_calendar_proposal_conversation_request(text: str) -> bool:
@@ -1877,6 +1953,14 @@ def _calendar_event_deleted() -> StateConflictError:
     )
 
 
+def _calendar_restore_source_conflict() -> StateConflictError:
+    """构造不泄露历史日程内容或具体失配字段的恢复来源冲突。"""
+    return StateConflictError(
+        error_code="calendar_restore_source_conflict",
+        message="calendar restore source is not eligible",
+    )
+
+
 def _calendar_event_not_editable() -> StateConflictError:
     """构造供应商或目录不再允许修改的稳定错误。"""
     return StateConflictError(
@@ -1914,4 +1998,5 @@ __all__ = [
     "CalendarSnapshotKind",
     "parse_calendar_proposal_conversation_request",
     "validate_calendar_creation_idempotency_key",
+    "validate_calendar_restore_source_projection",
 ]
