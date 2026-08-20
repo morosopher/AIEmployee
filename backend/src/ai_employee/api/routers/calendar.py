@@ -20,6 +20,7 @@ from ai_employee.api.deps import (
     get_calendar_restore_enqueue_use_case,
     get_submit_calendar_proposal_use_case,
 )
+from ai_employee.application.commands import parse_strict_rfc3339_datetime
 from ai_employee.application.use_cases.auth import Clock
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarProposalNotFoundError,
@@ -70,7 +71,7 @@ class _StrictCalendarTemporalModel(_StrictCalendarModel):
     @field_validator("starts_at", "ends_at", mode="before", check_fields=False)
     @classmethod
     def strict_temporal_value(cls, value: object) -> date | datetime | None:
-        """只接受 ISO date 或携带 offset 的 ISO datetime 字符串。"""
+        """在 Pydantic 转换前只接受 ISO date 或严格 RFC3339 字符串。"""
         return _parse_calendar_temporal(value)
 
 
@@ -249,13 +250,23 @@ class SuggestTimesRequest(_StrictCalendarModel):
     version: int | None = Field(default=None, ge=1)
     search_start: datetime | None = None
 
-    @field_validator("search_start")
+    @field_validator("search_start", mode="before")
     @classmethod
-    def aware_search_start(cls, value: datetime | None) -> datetime | None:
-        """搜索下界出现时必须携带时区。"""
-        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
-            raise ValueError("search_start must be timezone-aware")
-        return value
+    def strict_search_start(cls, value: object) -> datetime | None:
+        """在任何宽松转换前复用可信命令的严格 RFC3339 边界。
+
+        Args:
+            value: JSON body 中可选 ``search_start`` 的原始值。
+
+        Returns:
+            ``None``，或带明确 offset 的已解析 datetime。
+
+        Raises:
+            ValueError: 输入不是字符串或不满足公共严格 RFC3339 规则。
+        """
+        if value is None:
+            return None
+        return parse_strict_rfc3339_datetime(value)
 
 
 class RestoreProposalRequest(_StrictCalendarModel):
@@ -336,35 +347,25 @@ _ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _parse_calendar_temporal(value: object) -> date | datetime | None:
-    """严格解析公开请求中的日期或带时区日期时间。
+    """把公开请求解析为全天 ISO 日期或公共严格 RFC3339 datetime。
 
     Args:
         value: Pydantic 进行任何宽松转换前观察到的原始字段值。
 
     Returns:
-        ``None``，或由 ISO 字符串解析出的纯 ``date`` / aware ``datetime``。
+        ``None``，或由线格式字符串解析出的纯 ``date`` / aware ``datetime``。
 
     Raises:
-        ValueError: 输入不是字符串、不是受支持的 ISO 表示或 datetime 缺少时区。
+        ValueError: 输入不是字符串、日期无效或不满足公共严格 RFC3339 规则。
     """
     if value is None:
         return None
-    if type(value) is not str:
-        raise ValueError("calendar temporal values must be ISO strings")
-    if _ISO_DATE_PATTERN.fullmatch(value) is not None:
+    if isinstance(value, str) and _ISO_DATE_PATTERN.fullmatch(value) is not None:
         try:
             return date.fromisoformat(value)
         except ValueError as error:
             raise ValueError("calendar date must be a valid ISO date") from error
-    if "T" not in value:
-        raise ValueError("calendar datetime must be an ISO date-time string")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as error:
-        raise ValueError("calendar datetime must be a valid ISO date-time") from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("calendar datetime must be timezone-aware")
-    return parsed
+    return parse_strict_rfc3339_datetime(value)
 
 
 def _validate_partial_calendar_interval(

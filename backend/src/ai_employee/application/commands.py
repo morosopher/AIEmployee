@@ -41,13 +41,14 @@ _RFC3339_DATETIME_PATTERN = re.compile(
 _ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def _parse_strict_rfc3339_datetime(value: object) -> datetime:
-    """把 M2 允许的严格 RFC3339 文本解析为 aware ``datetime``。
+def parse_strict_rfc3339_datetime(value: object) -> datetime:
+    """把 M2 公共边界允许的严格 RFC3339 文本解析为 aware ``datetime``。
 
-    M2 的冻结命令精度明确限制为微秒：小数秒只能包含一至六位，超过六位必须
-    拒绝，不能依赖 ``datetime.fromisoformat`` 静默截断后让不同输入得到同一哈希。
-    数字 offset 的小时范围为 00..23、分钟为 00..59；``-00:00`` 在 RFC3339
-    表示未知本地 offset，并非可绑定的明确瞬间，因此与其他非法 offset 一并拒绝。
+    可信命令、日历 REST 和其它应用入口必须复用本函数，避免某一入口依赖
+    ``datetime.fromisoformat`` 的宽松语法后接受缺秒、compact time、周日期或逗号
+    小数。M2 精度限制为微秒：小数秒只能包含一至六位，超过六位必须拒绝，防止
+    不同输入被静默截断为同一审批哈希。数字 offset 的小时范围为 00..23、分钟为
+    00..59；``-00:00`` 表示未知本地 offset，并非可绑定的明确瞬间。
 
     Args:
         value: 从标准 JSON 解码得到的候选 datetime 值。
@@ -155,7 +156,7 @@ class MailSendCommandSchema(_StrictCommandSchema):
         Raises:
             ValueError: 原始值不是严格 RFC 3339 datetime 字符串。
         """
-        return _parse_strict_rfc3339_datetime(value)
+        return parse_strict_rfc3339_datetime(value)
 
     @model_validator(mode="after")
     def _validate_and_normalize_domain_contract(self) -> Self:
@@ -213,7 +214,7 @@ class _CalendarCommandSchema(_StrictCommandSchema):
                 return date.fromisoformat(value)
             except ValueError as exc:
                 raise ValueError("calendar date must be a valid ISO date") from exc
-        return _parse_strict_rfc3339_datetime(value)
+        return parse_strict_rfc3339_datetime(value)
 
 
 class CalendarCreateCommandSchema(_CalendarCommandSchema):
@@ -427,10 +428,7 @@ def _copy_standard_json(
             raise ValueError("trusted command JSON containers must not contain cycles")
         active_ids.add(container_id)
         try:
-            return [
-                _copy_standard_json(child, active_container_ids=active_ids)
-                for child in value
-            ]
+            return [_copy_standard_json(child, active_container_ids=active_ids) for child in value]
         finally:
             active_ids.remove(container_id)
     raise TypeError("trusted command payload must contain only standard JSON values")
@@ -569,6 +567,7 @@ __all__ = [
     "TrustedCommandSchema",
     "TrustedCommandValidationError",
     "canonical_command_json",
+    "parse_strict_rfc3339_datetime",
     "parse_trusted_command",
     "trusted_command_hash",
 ]

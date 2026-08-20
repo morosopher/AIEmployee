@@ -1,11 +1,22 @@
 """日历提案与恢复 API 的公开 Schema 契约测试。"""
 
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from pydantic import TypeAdapter, ValidationError
 
+from ai_employee.api.deps import (
+    ApiProblem,
+    get_authenticated_session,
+    get_calendar_proposal_use_case,
+    handle_api_problem,
+    handle_request_validation_error,
+)
 from ai_employee.api.routers.calendar import (
     AcceptedTaskResponse,
     CalendarProposalListResponse,
@@ -13,10 +24,37 @@ from ai_employee.api.routers.calendar import (
     CreateProposalRequest,
     CreateUpdateProposalRequest,
     RestoreProposalRequest,
+    SuggestTimesRequest,
     SuggestTimesResponse,
     UpdateProposalRequest,
+    build_calendar_router,
 )
 from ai_employee.main import create_app
+
+_NON_STRING_TEMPORAL_VALUES = (
+    pytest.param(123, id="number"),
+    pytest.param(True, id="boolean"),
+    pytest.param(date(2030, 1, 1), id="python-date"),
+    pytest.param(
+        datetime.fromisoformat("2030-01-01T09:00:00"),
+        id="python-naive-datetime",
+    ),
+    pytest.param(
+        datetime(2030, 1, 1, 9, tzinfo=UTC),
+        id="python-aware-datetime",
+    ),
+)
+_NON_RFC3339_DATETIME_VALUES = (
+    pytest.param("2030-01-01T09:00Z", id="missing-seconds"),
+    pytest.param("2030-01-01T090000Z", id="compact-time"),
+    pytest.param("2030-W01-1T09:00:00Z", id="week-date"),
+    pytest.param("2030-01-01T09:00:00,1Z", id="comma-fraction"),
+    pytest.param("2030-01-01T09:00:00.1234567Z", id="seven-digit-fraction"),
+    pytest.param("2030-01-01T09:00:00+0000", id="compact-offset"),
+    pytest.param("2030-01-01T09:00:00-00:00", id="unknown-offset"),
+    pytest.param("2030-01-01T09:00:60Z", id="leap-second"),
+    pytest.param("2030-01-01T09:00:00+24:00", id="offset-out-of-range"),
+)
 
 
 def test_calendar_api_exposes_all_eight_routes() -> None:
@@ -101,29 +139,27 @@ def test_all_day_request_uses_iso_dates() -> None:
 
 @pytest.mark.parametrize(
     "invalid_time",
-    (
-        123,
-        True,
-        date(2030, 1, 1),
-        datetime(2030, 1, 1, 9, tzinfo=UTC),
-    ),
-    ids=("number", "boolean", "python-date", "python-datetime"),
+    _NON_STRING_TEMPORAL_VALUES,
 )
-def test_create_request_rejects_non_string_temporal_values(invalid_time: object) -> None:
+@pytest.mark.parametrize("field_name", ("starts_at", "ends_at"))
+def test_create_request_rejects_non_string_temporal_values(
+    invalid_time: object,
+    field_name: str,
+) -> None:
     """公开 JSON 边界只接受 ISO 字符串，禁止 Pydantic 数字时间与 Python 对象直通。"""
+    payload: dict[str, object] = {
+        "operation_kind": "create",
+        "connection_id": uuid4(),
+        "calendar_id": "calendar",
+        "title": "Synthetic event",
+        "starts_at": "2030-01-01T09:00:00+00:00",
+        "ends_at": "2030-01-01T10:00:00+00:00",
+        "timezone": "UTC",
+        "all_day": False,
+    }
+    payload[field_name] = invalid_time
     with pytest.raises(ValidationError):
-        TypeAdapter(CreateProposalRequest).validate_python(
-            {
-                "operation_kind": "create",
-                "connection_id": uuid4(),
-                "calendar_id": "calendar",
-                "title": "Synthetic event",
-                "starts_at": invalid_time,
-                "ends_at": "2030-01-01T10:00:00+00:00",
-                "timezone": "UTC",
-                "all_day": False,
-            }
-        )
+        TypeAdapter(CreateProposalRequest).validate_python(payload)
 
 
 def test_timed_request_rejects_date_values_and_naive_datetimes() -> None:
@@ -148,6 +184,31 @@ def test_timed_request_rejects_date_values_and_naive_datetimes() -> None:
                 "ends_at": "2030-01-01T10:00:00",
             }
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_time",
+    _NON_RFC3339_DATETIME_VALUES,
+)
+@pytest.mark.parametrize("field_name", ("starts_at", "ends_at"))
+def test_create_timed_request_rejects_non_rfc3339_values(
+    invalid_time: str,
+    field_name: str,
+) -> None:
+    """定时创建只接受与可信命令相同的严格 RFC3339 线格式。"""
+    payload: dict[str, object] = {
+        "operation_kind": "create",
+        "connection_id": uuid4(),
+        "calendar_id": "calendar",
+        "title": "Synthetic event",
+        "starts_at": "2030-01-01T08:00:00Z",
+        "ends_at": "2030-01-01T10:00:00Z",
+        "timezone": "UTC",
+        "all_day": False,
+    }
+    payload[field_name] = invalid_time
+    with pytest.raises(ValidationError):
+        TypeAdapter(CreateProposalRequest).validate_python(payload)
 
 
 @pytest.mark.parametrize(
@@ -202,6 +263,76 @@ def test_partial_update_allows_one_strict_temporal_value(
         }
     )
     assert request.starts_at == datetime(2030, 1, 1, 9, tzinfo=UTC)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("schema", "identity"),
+    (
+        (CreateUpdateProposalRequest, {"operation_kind": "update", "event_id": uuid4()}),
+        (UpdateProposalRequest, {"version": 1}),
+    ),
+    ids=("create-update", "patch"),
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    (*_NON_STRING_TEMPORAL_VALUES, *_NON_RFC3339_DATETIME_VALUES),
+)
+@pytest.mark.parametrize("field_name", ("starts_at", "ends_at"))
+def test_update_timed_requests_reject_non_rfc3339_values(
+    schema: type[object],
+    identity: dict[str, object],
+    invalid_value: object,
+    field_name: str,
+) -> None:
+    """创建修改与 PATCH 的单端时间也必须共享严格 RFC3339 边界。"""
+    with pytest.raises(ValidationError):
+        TypeAdapter(schema).validate_python(
+            {
+                **identity,
+                field_name: invalid_value,
+                "all_day": False,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    (*_NON_STRING_TEMPORAL_VALUES, *_NON_RFC3339_DATETIME_VALUES),
+)
+def test_suggest_search_start_rejects_non_rfc3339_values(invalid_value: object) -> None:
+    """候选搜索下界必须在 Pydantic 转换前执行同一字符串级严格规则。"""
+    with pytest.raises(ValidationError):
+        SuggestTimesRequest.model_validate({"search_start": invalid_value})
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2030-01-01T09:00:00Z",
+        "2030-01-01T09:00:00.1Z",
+        "2030-01-01T09:00:00.123456+08:00",
+    ),
+)
+def test_calendar_timed_inputs_accept_strict_rfc3339_values(value: str) -> None:
+    """完整秒、1–6 位小数与冒号 offset 在创建和建议入口均应被接受。"""
+    request = TypeAdapter(CreateProposalRequest).validate_python(
+        {
+            "operation_kind": "create",
+            "connection_id": uuid4(),
+            "calendar_id": "calendar",
+            "title": "Synthetic event",
+            "starts_at": value,
+            "ends_at": "2030-01-01T11:00:00Z",
+            "timezone": "Asia/Shanghai",
+            "all_day": False,
+        }
+    )
+    suggestion = SuggestTimesRequest.model_validate({"search_start": value})
+
+    assert isinstance(request.starts_at, datetime)
+    assert request.starts_at.utcoffset() is not None
+    assert suggestion.search_start is not None
+    assert suggestion.search_start.utcoffset() is not None
 
 
 @pytest.mark.parametrize(
@@ -289,9 +420,31 @@ def test_calendar_mutating_routes_require_idempotency_key_header() -> None:
         assert header["required"] is True
 
 
-def test_calendar_sensitive_responses_declare_no_store_policy() -> None:
-    """契约保留 no-store 响应要求，避免日程内容落入浏览器缓存。"""
-    paths = create_app().openapi()["paths"]
-    for path, methods in paths.items():
-        if path.startswith("/api/v1/calendar/"):
-            assert methods
+@pytest.mark.asyncio
+async def test_calendar_sensitive_http_responses_are_no_store() -> None:
+    """真实成功响应与 Problem Details 错误都必须携带 no-store Header。"""
+
+    class _ListProposals:
+        """为成功路径提供不访问数据库的最小日历提案用例。"""
+
+        async def list(self, **_kwargs: object) -> list[object]:
+            """返回空页以聚焦验证响应 Header。"""
+            return []
+
+    app = FastAPI()
+    app.add_exception_handler(ApiProblem, handle_api_problem)
+    app.add_exception_handler(RequestValidationError, handle_request_validation_error)
+    app.include_router(build_calendar_router())
+    authenticated = SimpleNamespace(user=SimpleNamespace(id=uuid4()))
+    app.dependency_overrides[get_authenticated_session] = lambda: authenticated
+    app.dependency_overrides[get_calendar_proposal_use_case] = lambda: _ListProposals()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+        success = await client.get("/api/v1/calendar/proposals")
+        problem = await client.get("/api/v1/calendar/proposals/not-a-uuid")
+
+    assert success.status_code == 200
+    assert success.headers["Cache-Control"] == "no-store"
+    assert problem.status_code == 422
+    assert problem.headers["Cache-Control"] == "no-store"
+    assert problem.headers["content-type"].startswith("application/problem+json")
