@@ -195,6 +195,7 @@ async def test_all_data_deletion_requires_exact_confirmation_and_creates_queued_
     assert other_user.json()["task_id"] != accepted.json()["task_id"]
 
     task_id = UUID(accepted.json()["task_id"])
+    other_task_id = UUID(other_user.json()["task_id"])
     async with clients.session_factory() as session:
         task = await session.scalar(
             select(TaskRunModel).where(
@@ -202,11 +203,21 @@ async def test_all_data_deletion_requires_exact_confirmation_and_creates_queued_
                 TaskRunModel.user_id == clients.owner_id,
             )
         )
+        other_task = await session.scalar(
+            select(TaskRunModel).where(
+                TaskRunModel.id == other_task_id,
+                TaskRunModel.user_id == clients.other_id,
+            )
+        )
 
     assert task is not None
+    assert other_task is not None
     assert task.kind == "privacy.delete_all_data"
     assert set(task.input_payload) == {"deletion_request_id"}
     assert isinstance(task.input_payload["deletion_request_id"], str)
+    assert (
+        task.input_payload["deletion_request_id"] != other_task.input_payload["deletion_request_id"]
+    )
     assert "confirmation" not in task.input_payload
     assert dispatcher.dispatched_task_ids.count(task_id) == 2
-    assert dispatcher.dispatched_task_ids.count(UUID(other_user.json()["task_id"])) == 1
+    assert dispatcher.dispatched_task_ids.count(other_task_id) == 1

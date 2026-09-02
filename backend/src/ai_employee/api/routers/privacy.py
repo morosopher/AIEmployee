@@ -1,7 +1,6 @@
 """提供 CSRF 防护的异步隐私删除请求接口。"""
 
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, Request, status
 from pydantic import BaseModel, ConfigDict
@@ -13,7 +12,9 @@ from ai_employee.application.use_cases.privacy import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 
-IdempotencyKeyHeader = Annotated[str | None, Header(alias="Idempotency-Key", min_length=1, max_length=255)]
+IdempotencyKeyHeader = Annotated[
+    str | None, Header(alias="Idempotency-Key", min_length=1, max_length=255)
+]
 
 
 class DeleteAllDataRequest(BaseModel):
@@ -41,10 +42,19 @@ def build_privacy_router() -> APIRouter:
     def require_key(value: str | None) -> str:
         """统一验证客户端重放保护键。"""
         if value is None:
-            raise ApiProblem(422, "idempotency_key_required", "Idempotency key required", "An Idempotency-Key header is required.")
+            raise ApiProblem(
+                422,
+                "idempotency_key_required",
+                "Idempotency key required",
+                "An Idempotency-Key header is required.",
+            )
         return value
 
-    @router.post("/source-cache-deletions", status_code=status.HTTP_202_ACCEPTED, response_model=PrivacyTaskResponse)
+    @router.post(
+        "/source-cache-deletions",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=PrivacyTaskResponse,
+    )
     async def request_source_cache_deletion(
         authenticated: CsrfProtectedSession,
         task_creator: Annotated[CreateTaskUseCase, Depends(creator)],
@@ -56,7 +66,11 @@ def build_privacy_router() -> APIRouter:
         )
         return PrivacyTaskResponse(task_id=str(result.task_id), status=result.status.value)
 
-    @router.post("/all-data-deletions", status_code=status.HTTP_202_ACCEPTED, response_model=PrivacyTaskResponse)
+    @router.post(
+        "/all-data-deletions",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=PrivacyTaskResponse,
+    )
     async def request_all_data_deletion(
         payload: DeleteAllDataRequest,
         authenticated: CsrfProtectedSession,
@@ -65,11 +79,15 @@ def build_privacy_router() -> APIRouter:
     ) -> PrivacyTaskResponse:
         """验证精确确认短语后请求全数据删除，确认文本不会写入 TaskRun。"""
         if payload.confirmation != "DELETE ALL DATA":
-            raise ApiProblem(422, "deletion_confirmation_invalid", "Invalid deletion confirmation", "The confirmation must exactly match DELETE ALL DATA.")
+            raise ApiProblem(
+                422,
+                "deletion_confirmation_invalid",
+                "Invalid deletion confirmation",
+                "The confirmation must exactly match DELETE ALL DATA.",
+            )
         result = await RequestAllDataDeletionUseCase(task_creator).execute(
             user_id=authenticated.user.id,
             idempotency_key=require_key(idempotency_key),
-            request_id=uuid4().hex,
         )
         return PrivacyTaskResponse(task_id=str(result.task_id), status=result.status.value)
 
