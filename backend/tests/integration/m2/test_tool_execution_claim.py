@@ -15,6 +15,7 @@ from ai_employee.application.ports.trusted_actions import (
     ApprovalPreflightResult,
     ExecutionReference,
     ProviderWriteOutcome,
+    TrustedActionDispatchSnapshot,
 )
 from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
 from ai_employee.application.use_cases.trusted_actions import (
@@ -58,6 +59,7 @@ from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    SqlAlchemyTrustedActionRepository,
     SqlAlchemyTrustedActionRepositoryFactory,
     SqlAlchemyTrustedActionTaskExecutionStore,
 )
@@ -709,6 +711,279 @@ async def _run_approved(
         )
     finally:
         await workflow.dispose()
+
+
+async def _load_dispatch_snapshot_for_test(
+    database_url: str,
+    seed: _Seed,
+) -> TrustedActionDispatchSnapshot:
+    """读取可信 dispatch 投影，供 Repository 终态租约回归直接调用。"""
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+            snapshot = await repository.load_dispatch(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+            )
+            assert snapshot is not None
+            return snapshot
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["expired", "equal_completion", "owner_mismatch", "takeover"])
+async def test_fail_claimed_integrity_requires_live_lease(
+    database_url: str,
+    case: str,
+) -> None:
+    """旧 owner 或截止相等时不得写入可信认证失败终态。"""
+    seed = _Seed()
+    clock_factory = build_session_factory(database_url)
+    try:
+        async with clock_factory() as session:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await clock_factory.dispose()
+    assert isinstance(database_now, datetime)
+
+    lease_expires_at = (
+        database_now - timedelta(seconds=1)
+        if case == "expired"
+        else database_now + timedelta(seconds=30)
+    )
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.CLAIMED,
+        lease_expires_at=lease_expires_at,
+    )
+    snapshot = await _load_dispatch_snapshot_for_test(database_url, seed)
+    failed_at = lease_expires_at if case == "equal_completion" else database_now
+    caller_owner = seed.owner
+    if case == "owner_mismatch":
+        caller_owner = "different-owner"
+    elif case == "takeover":
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory.begin() as session:
+                await session.execute(
+                    update(TaskRunModel)
+                    .where(TaskRunModel.id == seed.task_id)
+                    .values(lease_owner="new-owner")
+                )
+        finally:
+            await session_factory.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+            with pytest.raises(StateConflictError):
+                await repository.fail_claimed_integrity(
+                    snapshot=snapshot,
+                    failed_at=failed_at,
+                    lease_owner=caller_owner,
+                )
+    finally:
+        await session_factory.dispose()
+
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.get(ToolExecutionModel, seed.execution_id)
+            audit_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(AuditEventModel.task_id == seed.task_id)
+            )
+            outbox_count = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(OutboxEventModel.aggregate_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.RUNNING.value
+    assert task.lease_owner == ("new-owner" if case == "takeover" else seed.owner)
+    assert approval is not None and approval.status == ApprovalStatus.APPROVED.value
+    assert draft is not None and draft.status == MailDraftStatus.EXECUTING.value
+    assert execution is not None and execution.status == ToolExecutionStatus.CLAIMED.value
+    assert audit_count == outbox_count == 0
+    assert payload_hash == snapshot.payload_hash
+
+
+@pytest.mark.asyncio
+async def test_fail_claimed_integrity_accepts_live_owner_lease(database_url: str) -> None:
+    """当前 owner 的租约同时晚于数据库时间和完成时间时才可收敛。"""
+    seed = _Seed()
+    clock_factory = build_session_factory(database_url)
+    try:
+        async with clock_factory() as session:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await clock_factory.dispose()
+    assert isinstance(database_now, datetime)
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.CLAIMED,
+        lease_expires_at=database_now + timedelta(minutes=1),
+    )
+    snapshot = await _load_dispatch_snapshot_for_test(database_url, seed)
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+            await repository.fail_claimed_integrity(
+                snapshot=snapshot,
+                failed_at=database_now + timedelta(seconds=1),
+                lease_owner=seed.owner,
+            )
+    finally:
+        await session_factory.dispose()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            draft = await session.get(MailDraftModel, seed.draft_id)
+            execution = await session.get(ToolExecutionModel, seed.execution_id)
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.FAILED.value
+    assert approval is not None and approval.status == ApprovalStatus.INVALIDATED.value
+    assert draft is not None and draft.status == MailDraftStatus.EDITING.value
+    assert execution is not None and execution.status == ToolExecutionStatus.CONFIRMED_FAILED.value
+    assert payload_hash == snapshot.payload_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["expired", "equal_completion", "owner_mismatch", "takeover"])
+async def test_finalize_rejected_requires_live_lease(database_url: str, case: str) -> None:
+    """拒绝分支也必须在锁后确认当前 owner 的严格 live lease。"""
+    seed = _Seed()
+    clock_factory = build_session_factory(database_url)
+    try:
+        async with clock_factory() as session:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await clock_factory.dispose()
+    assert isinstance(database_now, datetime)
+    lease_expires_at = (
+        database_now - timedelta(seconds=1)
+        if case == "expired"
+        else database_now + timedelta(seconds=30)
+    )
+    await _seed_action(database_url, seed, lease_expires_at=lease_expires_at)
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(ApprovalRequestModel)
+                .where(ApprovalRequestModel.id == seed.approval_id)
+                .values(status=ApprovalStatus.REJECTED.value)
+            )
+            if case == "takeover":
+                await session.execute(
+                    update(TaskRunModel)
+                    .where(TaskRunModel.id == seed.task_id)
+                    .values(lease_owner="new-owner")
+                )
+    finally:
+        await session_factory.dispose()
+    finished_at = lease_expires_at if case == "equal_completion" else database_now
+    caller_owner = "different-owner" if case == "owner_mismatch" else seed.owner
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+            with pytest.raises(StateConflictError):
+                await repository.finalize_rejected(
+                    task_id=seed.task_id,
+                    approval_id=seed.approval_id,
+                    operation_id=seed.operation_id,
+                    lease_owner=caller_owner,
+                    finished_at=finished_at,
+                )
+    finally:
+        await session_factory.dispose()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            approval = await session.get(ApprovalRequestModel, seed.approval_id)
+            audit_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(AuditEventModel.task_id == seed.task_id)
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.RUNNING.value
+    assert task.lease_owner == ("new-owner" if case == "takeover" else seed.owner)
+    assert approval is not None and approval.status == ApprovalStatus.REJECTED.value
+    assert audit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_rejected_accepts_live_owner_lease(database_url: str) -> None:
+    """拒绝分支由当前 live owner 执行时写入唯一任务成功审计。"""
+    seed = _Seed()
+    clock_factory = build_session_factory(database_url)
+    try:
+        async with clock_factory() as session:
+            database_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await clock_factory.dispose()
+    assert isinstance(database_now, datetime)
+    lease_expires_at = database_now + timedelta(minutes=1)
+    await _seed_action(database_url, seed, lease_expires_at=lease_expires_at)
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(ApprovalRequestModel)
+                .where(ApprovalRequestModel.id == seed.approval_id)
+                .values(status=ApprovalStatus.REJECTED.value)
+            )
+    finally:
+        await session_factory.dispose()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+            await repository.finalize_rejected(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                lease_owner=seed.owner,
+                finished_at=database_now + timedelta(seconds=1),
+            )
+    finally:
+        await session_factory.dispose()
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            audit_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.task_id == seed.task_id,
+                    AuditEventModel.event_type == "task.succeeded",
+                )
+            )
+    finally:
+        await session_factory.dispose()
+    assert task is not None and task.status == TaskStatus.SUCCEEDED.value
+    assert task.lease_owner is None and task.lease_expires_at is None
+    assert audit_count == 1
 
 
 @pytest.mark.asyncio

@@ -1603,7 +1603,14 @@ class SqlAlchemyTrustedActionRepository:
         failed_at: datetime,
         lease_owner: str,
     ) -> None:
-        """在零 provider 调用边界把命令认证失败持久化为明确本地失败。"""
+        """在零 provider 调用边界把命令认证失败持久化为明确本地失败。
+
+        终态写入仍属于当前 DurableTaskRunner 的租约权限：TaskRun 与关联行锁定后，
+        必须以 PostgreSQL ``clock_timestamp()`` 证明 owner 租约严格晚于数据库当前
+        时间和调用方完成时间。过期、恰好到期或已被接管的 owner 只能 fail closed，
+        不能留下可信动作终态、审计或 Outbox。
+        """
+        failed_at = utc_instant(failed_at, field="failed_at")
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
@@ -1617,7 +1624,16 @@ class SqlAlchemyTrustedActionRepository:
             raise _trusted_action_unavailable()
         if execution.request_started_at is not None:
             raise _trusted_action_unavailable()
-        if task.status != TaskStatus.RUNNING.value or task.lease_owner != lease_owner:
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
+        if database_now is None:
+            raise _trusted_action_unavailable()
+        if (
+            task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+            or task.lease_expires_at <= failed_at
+        ):
             raise _trusted_action_unavailable()
         execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
         execution.error_code = "trusted_action_unavailable"
@@ -1683,18 +1699,29 @@ class SqlAlchemyTrustedActionRepository:
         lease_owner: str,
         finished_at: datetime,
     ) -> None:
-        """拒绝分支完成任务但绝不创建 ToolExecution 或改变供应商。"""
+        """拒绝分支完成任务但绝不创建 ToolExecution 或改变供应商。
+
+        拒绝也必须由当前仍持有的 live lease 提交。固定锁序取得 TaskRun 与
+        ApprovalRequest 后才采样 PostgreSQL 当前时间，并要求租约严格晚于该时间及
+        ``finished_at``；任何 miss 都回滚整个事务，避免旧 owner 伪造成功时间线。
+        """
+        finished_at = utc_instant(finished_at, field="finished_at")
         task, approval = await self._locked_task_approval(
             task_id=task_id,
             approval_id=approval_id,
         )
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
         if (
             task is None
             or approval is None
+            or database_now is None
             or not _task_operation_matches(task, operation_id)
             or approval.status != ApprovalStatus.REJECTED.value
             or task.status != TaskStatus.RUNNING.value
             or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+            or task.lease_expires_at <= finished_at
         ):
             raise _trusted_action_unavailable()
         task.status = TaskStatus.SUCCEEDED.value
@@ -2181,6 +2208,25 @@ class SqlAlchemyTrustedActionTaskExecutionStore(SqlAlchemyTaskExecutionStore):
         """保存同一消息级连接池，同时复用现有 acquire/renew/retry 实现。"""
         super().__init__(session_factory)
         self._trusted_session_factory = session_factory
+
+    async def get_authoritative_task_kind(self, *, task_id: UUID) -> str | None:
+        """在独立短事务中锁定并读取权威 ``TaskRun.kind``。
+
+        分类读取异常后不能把可能属于 trusted action 的任务交给通用失败 Runner。
+        该方法沿用 TaskRun 的行锁边界，在提交前取得数据库中的不可变 kind；调用方
+        只有拿到明确结果后才能选择 fake、trusted 或 M1 通用执行器。读取失败由调用方
+        转为延期控制流，不在这里伪造任务终态。
+
+        Args:
+            task_id: 待分类的持久任务标识。
+
+        Returns:
+            当前 TaskRun.kind；任务不存在时返回 ``None``。
+        """
+        async with self._trusted_session_factory.begin() as session:
+            return await session.scalar(
+                select(TaskRunModel.kind).where(TaskRunModel.id == task_id).with_for_update()
+            )
 
     async def finish(
         self,

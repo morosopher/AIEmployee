@@ -16,7 +16,11 @@ from ai_employee.application.ports.trusted_actions import (
 )
 from ai_employee.application.use_cases.approvals import ApprovalDecisionUseCase
 from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
-from ai_employee.application.use_cases.task_execution import DurableTaskRunner, LeasedTask
+from ai_employee.application.use_cases.task_execution import (
+    DurableTaskRunner,
+    LeasedTask,
+    TaskWaitingApproval,
+)
 from ai_employee.application.use_cases.trusted_actions import (
     SubmitMailDraftUseCase,
     TrustedActionExecutionUseCase,
@@ -45,6 +49,7 @@ from ai_employee.infrastructure.db.models.tasks import (
 )
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
+from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
     SqlAlchemyTrustedActionTaskExecutionStore,
@@ -752,6 +757,262 @@ async def test_execute_task_routes_trusted_action_to_checkpoint_step(
     assert kwargs["session_factory"] is factory
     assert kwargs["approval_store"] is captured["approval_store"]
     assert kwargs["resume"] == "approved"
+    assert factory.disposed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authoritative_kind", ["trusted_action", "fake_write", None])
+async def test_execute_task_classification_failure_never_generic_finishes_trusted_task(
+    monkeypatch: pytest.MonkeyPatch,
+    authoritative_kind: str | None,
+) -> None:
+    """分类读异常后必须锁定权威 kind，未知时不能创建通用失败 Runner。"""
+    task_id = uuid4()
+    expected_task_id = task_id
+    captured: dict[str, object] = {}
+    runner_created = [0]
+
+    class _Factory:
+        """记录消息级连接池是否最终释放。"""
+
+        disposed = False
+
+        async def dispose(self) -> None:
+            """模拟释放本次消息专属连接池。"""
+            self.disposed = True
+
+    class _Store:
+        """让首次分类读取稳定失败，逼近数据库响应丢失后的恢复边界。"""
+
+        def __init__(self, received_factory: object) -> None:
+            """保存消息工厂，确认分类存储沿用同一资源边界。"""
+            captured["approval_store"] = self
+            captured["store_factory"] = received_factory
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> object:
+            """模拟分类查询异常而不携带任务内容。"""
+            del task_id
+            raise RuntimeError("synthetic classification read failure")
+
+    class _Step:
+        """代表可信动作专属节点。"""
+
+        name = "trusted_action_graph"
+
+        async def execute(self, task: LeasedTask) -> None:
+            """不访问数据库，只验证节点接口可被解析。"""
+            del task
+
+    class _Runner:
+        """记录 fallback 是否错误地采用通用 TaskExecutionStore。"""
+
+        def __init__(self, **kwargs: object) -> None:
+            """保存 store 与节点解析器，避免真正获取合成任务租约。"""
+            runner_created[0] += 1
+            captured["runner_store"] = kwargs["store"]
+            captured["resolve_steps"] = kwargs["resolve_steps"]
+
+        async def run(self, received_task_id: UUID, **_: object) -> bool:
+            """解析一次 trusted kind 节点；真实 lease 竞态由 PostgreSQL 套件覆盖。"""
+            assert received_task_id == expected_task_id
+            resolver = captured["resolve_steps"]
+            assert callable(resolver)
+            steps = tuple(
+                resolver(
+                    LeasedTask(
+                        task_id=received_task_id,
+                        kind=authoritative_kind or "trusted_action",
+                        input_payload={},
+                        started_at=NOW,
+                        lease_owner="worker-a",
+                    )
+                )
+            )
+            captured["steps"] = steps
+            if authoritative_kind is None:
+                assert len(steps) == 1
+                with pytest.raises(TaskWaitingApproval):
+                    await steps[0].execute(
+                        LeasedTask(
+                            task_id=received_task_id,
+                            kind="trusted_action",
+                            input_payload={},
+                            started_at=NOW,
+                            lease_owner="worker-a",
+                        )
+                    )
+            return False
+
+    factory = _Factory()
+    trusted_step = _Step()
+
+    def _build_factory(_database_url: str, *, task_event_publisher: object) -> _Factory:
+        """返回合成消息工厂并保留 Outbox publisher 参数。"""
+        assert task_event_publisher is not None
+        return factory
+
+    async def _authoritative_kind(self: object, *, task_id: UUID) -> str | None:
+        """返回锁内重读的合成 TaskRun.kind，或模拟第二次查询仍失败。"""
+        del self
+        assert task_id == expected_task_id
+        if authoritative_kind is None:
+            raise RuntimeError("synthetic authoritative classification failure")
+        return authoritative_kind
+
+    def _build_step(**kwargs: object) -> _Step:
+        """记录可信专属 step 的组合参数。"""
+        captured["step_kwargs"] = kwargs
+        return trusted_step
+
+    async def _skip_metrics(**_: object) -> None:
+        """分类路由测试不启动指标扫描。"""
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", _build_factory)
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", _Store)
+    monkeypatch.setattr(execute_task_module, "DurableTaskRunner", _Runner)
+    monkeypatch.setattr(execute_task_module, "refresh_stuck_task_metrics", _skip_metrics)
+    monkeypatch.setattr(
+        execute_task_module,
+        "build_trusted_action_task_step",
+        _build_step,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionTaskExecutionStore,
+        "get_authoritative_task_kind",
+        _authoritative_kind,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        execute_task_module,
+        "build_task_runner",
+        lambda: pytest.fail("classification fallback must not generic-finish a trusted task"),
+    )
+
+    await execute_task_module.execute_task.original_func(str(task_id))
+
+    if authoritative_kind == "trusted_action":
+        assert runner_created[0] == 1
+        assert isinstance(captured["runner_store"], SqlAlchemyTrustedActionTaskExecutionStore)
+        assert captured["steps"] == (trusted_step,)
+        kwargs = captured["step_kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["session_factory"] is factory
+    elif authoritative_kind == "fake_write":
+        assert runner_created[0] == 1
+        assert isinstance(captured["runner_store"], SqlAlchemyTaskExecutionStore)
+        steps = captured["steps"]
+        assert len(steps) == 1
+        assert isinstance(steps[0], execute_task_module._FakeWriteStep)
+    else:
+        assert runner_created[0] == 1
+        assert isinstance(
+            captured["runner_store"],
+            execute_task_module._ClassificationDeferredTaskExecutionStore,
+        )
+        assert captured["steps"]
+        deferred_store = captured["runner_store"]
+        assert isinstance(
+            deferred_store, execute_task_module._ClassificationDeferredTaskExecutionStore
+        )
+        assert (
+            await deferred_store.finish(
+                task_id=task_id,
+                lease_owner="worker-a",
+                status=TaskStatus.FAILED,
+                finished_at=NOW,
+                error_code="internal_worker_error",
+            )
+            is False
+        )
+        assert (
+            await deferred_store.fail_internal(
+                task_id=task_id,
+                lease_owner="worker-a",
+                failed_at=NOW,
+                error_code="task_execution_internal_error",
+            )
+            is False
+        )
+    assert factory.disposed is True
+
+
+@pytest.mark.asyncio
+async def test_execute_task_classification_failure_preserves_m1_legacy_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """权威重查明确返回 M1 kind 时仍走原有通用 Runner，不误套可信动作边界。"""
+    task_id = uuid4()
+    expected_task_id = task_id
+    captured: dict[str, object] = {}
+
+    class _Factory:
+        """记录分类异常路径是否释放消息级资源。"""
+
+        disposed = False
+
+        async def dispose(self) -> None:
+            """模拟释放本次消息创建的连接池。"""
+            self.disposed = True
+
+    class _Store:
+        """让首个分类查询失败，随后由权威锁内查询决定 M1 kind。"""
+
+        def __init__(self, received_factory: object) -> None:
+            """保留审批存储的资源参数，确保入口没有换用隐式池。"""
+            captured["approval_store"] = self
+            captured["store_factory"] = received_factory
+
+        async def get_fake_write_task(self, *, task_id: UUID) -> object:
+            """模拟分类查询在响应边界丢失。"""
+            del task_id
+            raise RuntimeError("synthetic classification read failure")
+
+    class _GenericRunner:
+        """捕获 M1 通用 Runner，避免执行真实任务节点。"""
+
+        async def run(self, received_task_id: UUID, **_: object) -> bool:
+            """确认通用 Runner 收到原始 task_id 后安全返回。"""
+            assert received_task_id == task_id
+            captured["ran"] = True
+            return False
+
+    factory = _Factory()
+    generic_runner = _GenericRunner()
+
+    def _build_factory(_database_url: str, *, task_event_publisher: object) -> _Factory:
+        """返回合成工厂并确认保留 TaskEvent publisher。"""
+        assert task_event_publisher is not None
+        return factory
+
+    async def _authoritative_kind(self: object, *, task_id: UUID) -> str:
+        """返回一个明确的 M1 legacy kind。"""
+        del self
+        assert task_id == expected_task_id
+        return "conversation.respond"
+
+    async def _skip_metrics(**_: object) -> None:
+        """路由测试不启动指标扫描。"""
+
+    monkeypatch.setattr(execute_task_module, "build_session_factory", _build_factory)
+    monkeypatch.setattr(execute_task_module, "SqlAlchemyApprovalStore", _Store)
+    monkeypatch.setattr(execute_task_module, "build_task_runner", lambda: generic_runner)
+    monkeypatch.setattr(execute_task_module, "refresh_stuck_task_metrics", _skip_metrics)
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionTaskExecutionStore,
+        "get_authoritative_task_kind",
+        _authoritative_kind,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        execute_task_module,
+        "DurableTaskRunner",
+        lambda **_: pytest.fail("明确 M1 kind 不应构造专用 Runner"),
+    )
+
+    await execute_task_module.execute_task.original_func(str(task_id))
+
+    assert captured["ran"] is True
     assert factory.disposed is True
 
 

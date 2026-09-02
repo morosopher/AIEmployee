@@ -20,6 +20,7 @@ from ai_employee.application.use_cases.task_execution import (
 )
 from ai_employee.config import Settings, get_settings
 from ai_employee.domain.errors import InternalInvariantError
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyApprovalStore
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
@@ -145,24 +146,58 @@ class _MissingTaskHandlerStep:
 
 
 class _TaskKindLookupFailureStep:
-    """把任务分类读取异常交给耐久执行边界收敛为安全失败。"""
+    """在任务分类不可确定时暂停执行，避免通用 Runner 伪造终态。"""
 
     name = "load_task_kind"
 
     async def execute(self, task: LeasedTask) -> None:
-        """拒绝把数据库异常伪装成未注册 handler。
+        """保留当前租约并等待后续恢复扫描重新读取权威任务类型。
 
         Args:
             task: 已获取租约的任务快照，仅用于保持统一节点接口。
 
         Raises:
-            InternalInvariantError: 分类读取边界发生未知持久化异常。
+            TaskWaitingApproval: 复用 Runner 的 no-finish 控制流，不能写通用失败审计。
         """
         del task
-        raise InternalInvariantError(
-            error_code="task_kind_lookup_failed",
-            message="task kind lookup failed",
-        )
+        raise TaskWaitingApproval
+
+
+class _ClassificationDeferredTaskExecutionStore(SqlAlchemyTrustedActionTaskExecutionStore):
+    """在任务类型未知时只允许租约等待，不允许任何任务终态写入。
+
+    首次分类查询和权威 ``TaskRun.kind`` 重查都失败时，调用方无法证明该任务属于
+    trusted action、fake-write 还是 M1 任务。此时仍使用持久租约 acquisition，使成功
+    获取的消息在租约到期后可由恢复扫描器重新投递；但覆盖 ``finish`` 与
+    ``fail_internal``，避免 Runner 在超时、获取异常或节点异常边界把潜在可信动作写成
+    通用 ``task.failed``。下一次投递会重新读取权威类型，再选择正确的专用 Runner。
+    """
+
+    async def finish(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        status: TaskStatus,
+        finished_at: datetime,
+        error_code: str | None,
+        retry_recovery_at: datetime | None = None,
+    ) -> bool:
+        """拒绝未知分类路径的一切终态或重试完成写入。"""
+        del task_id, lease_owner, status, finished_at, error_code, retry_recovery_at
+        return False
+
+    async def fail_internal(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        failed_at: datetime,
+        error_code: str,
+    ) -> bool:
+        """拒绝前置数据库异常的通用失败写入，等待后续恢复重读分类。"""
+        del task_id, lease_owner, failed_at, error_code
+        return False
 
 
 class _FakeWriteStep:
@@ -324,6 +359,48 @@ def build_task_runner_for_session(
     )
 
 
+def _build_trusted_action_task_runner(
+    *,
+    session_factory: ManagedAsyncSessionMaker,
+    settings: Settings,
+    approval_store: ApprovalProposalStore,
+    resume: str | None,
+) -> DurableTaskRunner:
+    """构造仅使用可信动作 Store 与 checkpoint step 的 Worker Runner。
+
+    Args:
+        session_factory: 当前消息持有并负责释放的数据库工厂。
+        settings: 当前 Worker 的租约、超时与 checkpoint 配置。
+        approval_store: 共享的审批分类/中断确认端口。
+        resume: 内容无关的审批唤醒值。
+
+    Returns:
+        绑定 ``SqlAlchemyTrustedActionTaskExecutionStore`` 的持久执行用例。
+
+    该组合函数被正常分类与异常后权威重查两条路径共用，确保 trusted action 永远不会
+    因一次分类读取异常退回通用失败 Store。
+    """
+    return DurableTaskRunner(
+        store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
+        clock=lambda: datetime.now(UTC),
+        lease_duration=timedelta(seconds=settings.task_lease_seconds),
+        task_timeout_seconds=settings.task_timeout_seconds,
+        task_step_timeout_seconds=settings.task_step_timeout_seconds,
+        max_transient_retries=DEFAULT_RETRY_COUNT,
+        metrics=_worker_metrics,
+        retry_jitter=_bounded_retry_jitter,
+        resolve_steps=lambda _task: (
+            build_trusted_action_task_step(
+                session_factory=session_factory,
+                settings=settings,
+                approval_store=approval_store,
+                resume=resume,
+                max_transient_retries=DEFAULT_RETRY_COUNT,
+            ),
+        ),
+    )
+
+
 @broker.task(retry_on_error=False)
 async def execute_task(
     task_id: str,
@@ -363,11 +440,27 @@ async def execute_task(
         )
         try:
             approval_store: ApprovalProposalStore = SqlAlchemyApprovalStore(session_factory)
+            classification_deferred = False
             try:
                 task = await approval_store.get_fake_write_task(task_id=parsed_task_id)
             except Exception:  # noqa: BLE001 - 由耐久 Runner 而非 Missing handler 收敛。
+                # 首次分类查询可能在提交/响应交界丢失；必须用新事务锁住 TaskRun
+                # 重读不可变 kind。若连权威重查也失败，只暂停本次 lease，不能让
+                # 通用 Runner 把潜在 trusted action 终结为孤立 task.failed。
+                try:
+                    task_kind = await SqlAlchemyTrustedActionTaskExecutionStore(
+                        session_factory
+                    ).get_authoritative_task_kind(task_id=parsed_task_id)
+                except Exception:  # noqa: BLE001 - 分类事实不可读时只允许延期。
+                    classification_deferred = True
+                    task_kind = None
+                task = None
+            else:
+                task_kind = getattr(task, "kind", None) if task is not None else None
+
+            if classification_deferred:
                 runner = DurableTaskRunner(
-                    store=SqlAlchemyTaskExecutionStore(session_factory),
+                    store=_ClassificationDeferredTaskExecutionStore(session_factory),
                     clock=lambda: datetime.now(UTC),
                     lease_duration=timedelta(seconds=settings.task_lease_seconds),
                     task_timeout_seconds=settings.task_timeout_seconds,
@@ -377,50 +470,35 @@ async def execute_task(
                     retry_jitter=_bounded_retry_jitter,
                     resolve_steps=lambda _task: (_TaskKindLookupFailureStep(),),
                 )
-            else:
-                runner = (
-                    DurableTaskRunner(
-                        store=SqlAlchemyTaskExecutionStore(session_factory),
-                        clock=lambda: datetime.now(UTC),
-                        lease_duration=timedelta(seconds=settings.task_lease_seconds),
-                        task_timeout_seconds=settings.task_timeout_seconds,
-                        task_step_timeout_seconds=settings.task_step_timeout_seconds,
-                        max_transient_retries=DEFAULT_RETRY_COUNT,
-                        metrics=_worker_metrics,
-                        retry_jitter=_bounded_retry_jitter,
-                        resolve_steps=lambda _task: (
-                            _FakeWriteStep(
-                                approval_store=approval_store,
-                                resume=resume,
-                                checkpoint_database_url=settings.checkpoint_database_url,
-                            ),
+            elif task_kind == "fake_write":
+                runner = DurableTaskRunner(
+                    store=SqlAlchemyTaskExecutionStore(session_factory),
+                    clock=lambda: datetime.now(UTC),
+                    lease_duration=timedelta(seconds=settings.task_lease_seconds),
+                    task_timeout_seconds=settings.task_timeout_seconds,
+                    task_step_timeout_seconds=settings.task_step_timeout_seconds,
+                    max_transient_retries=DEFAULT_RETRY_COUNT,
+                    metrics=_worker_metrics,
+                    retry_jitter=_bounded_retry_jitter,
+                    resolve_steps=lambda _task: (
+                        _FakeWriteStep(
+                            approval_store=approval_store,
+                            resume=resume,
+                            checkpoint_database_url=settings.checkpoint_database_url,
                         ),
-                    )
-                    if task is not None and task.kind == "fake_write"
-                    else (
-                        DurableTaskRunner(
-                            store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
-                            clock=lambda: datetime.now(UTC),
-                            lease_duration=timedelta(seconds=settings.task_lease_seconds),
-                            task_timeout_seconds=settings.task_timeout_seconds,
-                            task_step_timeout_seconds=settings.task_step_timeout_seconds,
-                            max_transient_retries=DEFAULT_RETRY_COUNT,
-                            metrics=_worker_metrics,
-                            retry_jitter=_bounded_retry_jitter,
-                            resolve_steps=lambda _task: (
-                                build_trusted_action_task_step(
-                                    session_factory=session_factory,
-                                    settings=settings,
-                                    approval_store=approval_store,
-                                    resume=resume,
-                                    max_transient_retries=DEFAULT_RETRY_COUNT,
-                                ),
-                            ),
-                        )
-                        if task is not None and task.kind == "trusted_action"
-                        else build_task_runner()
-                    )
+                    ),
                 )
+            elif task_kind == "trusted_action":
+                runner = _build_trusted_action_task_runner(
+                    session_factory=session_factory,
+                    settings=settings,
+                    approval_store=approval_store,
+                    resume=resume,
+                )
+            else:
+                # 明确读到非 trusted kind 时保留既有 M1 通用路由；None 也只会让
+                # acquire 无命中，不会凭空创建一个任务终态。
+                runner = build_task_runner()
             if _worker_metrics is not None:
                 await refresh_stuck_task_metrics(
                     session_factory=session_factory,
