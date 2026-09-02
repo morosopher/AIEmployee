@@ -2,12 +2,13 @@
 
 import asyncio
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from datetime import UTC, datetime, time, timedelta
 from time import sleep
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 
 from ai_employee.application.commands import parse_trusted_command, trusted_command_hash
 from ai_employee.application.ports.encryption import EncryptedValue
@@ -733,6 +734,33 @@ async def _load_dispatch_snapshot_for_test(
         await session_factory.dispose()
 
 
+async def _wait_for_postgres_lock_wait(database_url: str, pid: int) -> None:
+    """等待指定 PostgreSQL backend 确实阻塞在行锁上，避免竞态测试靠固定 sleep 猜测。"""
+    probe_factory = build_session_factory(database_url)
+    deadline = asyncio.get_running_loop().time() + 5
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            async with probe_factory() as session:
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT wait_event_type, wait_event
+                            FROM pg_stat_activity
+                            WHERE pid = :pid
+                            """
+                        ),
+                        {"pid": pid},
+                    )
+                ).one_or_none()
+            if row is not None and row[0] == "Lock":
+                return
+            await asyncio.sleep(0.01)
+    finally:
+        await probe_factory.dispose()
+    raise AssertionError("caller backend did not reach the PostgreSQL action-row lock")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["expired", "equal_completion", "owner_mismatch", "takeover"])
 async def test_fail_claimed_integrity_requires_live_lease(
@@ -816,6 +844,149 @@ async def test_fail_claimed_integrity_requires_live_lease(
     assert execution is not None and execution.status == ToolExecutionStatus.CLAIMED.value
     assert audit_count == outbox_count == 0
     assert payload_hash == snapshot.payload_hash
+
+
+@pytest.mark.asyncio
+async def test_fail_claimed_integrity_rechecks_lease_after_blocked_action_lock(
+    database_url: str,
+) -> None:
+    """action 行锁跨过截止时间后，旧 owner 必须 fail closed 且不改任何业务事实。"""
+    seed = _Seed()
+    initial_factory = build_session_factory(database_url)
+    try:
+        async with initial_factory() as session:
+            initial_now = await session.scalar(select(func.clock_timestamp()))
+    finally:
+        await initial_factory.dispose()
+    assert isinstance(initial_now, datetime)
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.CLAIMED,
+        lease_expires_at=initial_now + timedelta(minutes=1),
+    )
+    snapshot = await _load_dispatch_snapshot_for_test(database_url, seed)
+
+    blocker_factory = build_session_factory(database_url)
+    lease_factory = build_session_factory(database_url)
+    caller_factory = build_session_factory(database_url)
+    blocker_ready = asyncio.Event()
+    release_blocker = asyncio.Event()
+    caller_pid_ready = asyncio.Event()
+    caller_pid: list[int] = []
+    blocker_task: asyncio.Task[None] | None = None
+    caller_task: asyncio.Task[None] | None = None
+    try:
+
+        async def hold_action_lock() -> None:
+            """在独立事务中持有 MailDraft 行锁，直到调用方 lease 已过期。"""
+            async with blocker_factory.begin() as session:
+                draft = await session.scalar(
+                    select(MailDraftModel)
+                    .where(
+                        MailDraftModel.id == seed.draft_id,
+                        MailDraftModel.user_id == seed.user_id,
+                    )
+                    .with_for_update()
+                )
+                assert draft is not None
+                blocker_ready.set()
+                await release_blocker.wait()
+
+        blocker_task = asyncio.create_task(hold_action_lock())
+        await asyncio.wait_for(blocker_ready.wait(), timeout=5)
+
+        # 在 blocker 已持有 action 锁后才设置短租约，确保调用方先通过 live-lease
+        # 检查，再被 action 锁阻塞；否则旧实现可能在进入方法前就观察到过期租约。
+        async with lease_factory.begin() as session:
+            lease_now = await session.scalar(select(func.clock_timestamp()))
+            assert isinstance(lease_now, datetime)
+            lease_expires_at = lease_now + timedelta(seconds=2)
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == seed.task_id)
+                .values(lease_expires_at=lease_expires_at)
+            )
+
+        async def invoke_fail_claimed_integrity() -> None:
+            """在另一 backend 执行待测终态 mutation，并暴露其 PID 供锁等待探针观察。"""
+            async with caller_factory.begin() as session:
+                backend_pid = await session.scalar(select(func.pg_backend_pid()))
+                assert isinstance(backend_pid, int)
+                caller_pid.append(backend_pid)
+                caller_pid_ready.set()
+                repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+                await repository.fail_claimed_integrity(
+                    snapshot=snapshot,
+                    failed_at=lease_now,
+                    lease_owner=seed.owner,
+                )
+
+        caller_task = asyncio.create_task(invoke_fail_claimed_integrity())
+        await asyncio.wait_for(caller_pid_ready.wait(), timeout=5)
+        assert len(caller_pid) == 1
+        await _wait_for_postgres_lock_wait(database_url, caller_pid[0])
+
+        # 以数据库时间确认已跨过精确租约截止，而不是依赖宿主机时钟或固定延迟。
+        probe_factory = build_session_factory(database_url)
+        try:
+            async with probe_factory() as session:
+                probe_now = await session.scalar(select(func.clock_timestamp()))
+        finally:
+            await probe_factory.dispose()
+        assert isinstance(probe_now, datetime)
+        await asyncio.sleep(max((lease_expires_at - probe_now).total_seconds() + 0.2, 0.2))
+
+        release_blocker.set()
+        await blocker_task
+        blocker_task = None
+        with pytest.raises(StateConflictError):
+            await caller_task
+        caller_task = None
+
+        session_factory = build_session_factory(database_url)
+        try:
+            async with session_factory() as session:
+                task = await session.get(TaskRunModel, seed.task_id)
+                approval = await session.get(ApprovalRequestModel, seed.approval_id)
+                draft = await session.get(MailDraftModel, seed.draft_id)
+                execution = await session.get(ToolExecutionModel, seed.execution_id)
+                audit_count = await session.scalar(
+                    select(func.count())
+                    .select_from(AuditEventModel)
+                    .where(AuditEventModel.task_id == seed.task_id)
+                )
+                outbox_count = await session.scalar(
+                    select(func.count())
+                    .select_from(OutboxEventModel)
+                    .where(OutboxEventModel.aggregate_id == seed.task_id)
+                )
+        finally:
+            await session_factory.dispose()
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING.value
+        assert task.lease_owner == seed.owner
+        assert task.lease_expires_at == lease_expires_at
+        assert task.finished_at is None and task.error_code is None
+        assert approval is not None and approval.status == ApprovalStatus.APPROVED.value
+        assert draft is not None and draft.status == MailDraftStatus.EXECUTING.value
+        assert execution is not None
+        assert execution.status == ToolExecutionStatus.CLAIMED.value
+        assert execution.request_started_at is None
+        assert execution.completed_at is None and execution.result_summary is None
+        assert audit_count == outbox_count == 0
+    finally:
+        if caller_task is not None and not caller_task.done():
+            caller_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await caller_task
+        if blocker_task is not None and not blocker_task.done():
+            release_blocker.set()
+            with suppress(asyncio.CancelledError):
+                await blocker_task
+        await caller_factory.dispose()
+        await lease_factory.dispose()
+        await blocker_factory.dispose()
 
 
 @pytest.mark.asyncio

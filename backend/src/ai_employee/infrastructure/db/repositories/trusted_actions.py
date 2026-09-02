@@ -1624,13 +1624,81 @@ class SqlAlchemyTrustedActionRepository:
             raise _trusted_action_unavailable()
         if execution.request_started_at is not None:
             raise _trusted_action_unavailable()
+        locked_action = await self._lock_action_record(task=task, approval=approval)
+        if locked_action is None:
+            raise _trusted_action_unavailable()
+        action, action_connection_id, action_calendar_id, action_status = locked_action
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == action_connection_id,
+                OAuthConnectionModel.user_id == task.user_id,
+            )
+            .with_for_update()
+        )
+        calendar = None
+        if action_calendar_id is not None:
+            calendar = await self._session.scalar(
+                select(ProviderCalendarModel)
+                .where(
+                    ProviderCalendarModel.user_id == task.user_id,
+                    ProviderCalendarModel.connection_id == action_connection_id,
+                    ProviderCalendarModel.provider_calendar_id == action_calendar_id,
+                )
+                .with_for_update()
+            )
         database_now = await self._session.scalar(select(func.clock_timestamp()))
-        if database_now is None:
+        if database_now is None or connection is None:
             raise _trusted_action_unavailable()
         if (
             task.status != TaskStatus.RUNNING.value
             or task.lease_owner != lease_owner
             or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+            or task.lease_expires_at <= failed_at
+            or task.kind != "trusted_action"
+            or task.user_id != snapshot.user_id
+            or not _task_operation_matches(task, snapshot.operation_id)
+            or approval.step_id != snapshot.step_id
+            or approval.action != snapshot.action
+            or approval.schema_version != snapshot.schema_version
+            or approval.version != snapshot.approval_version
+            or approval.proposal_kind != snapshot.proposal_kind
+            or approval.proposal_id != snapshot.proposal_id
+            or approval.proposal_version != snapshot.proposal_version
+            or not compare_digest(approval.payload_hash, snapshot.payload_hash)
+            or action_connection_id != snapshot.connection_id
+            or action_calendar_id != snapshot.calendar_id
+            or action_status
+            not in {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            }
+            or connection.provider != snapshot.provider
+            or (action_calendar_id is not None and calendar is None)
+            or not trusted_execution_binding_matches(
+                execution_task_id=execution.task_id,
+                expected_task_id=snapshot.task_id,
+                execution_step_id=execution.step_id,
+                expected_step_id=snapshot.step_id,
+                execution_operation_id=execution.operation_id,
+                expected_operation_id=snapshot.operation_id,
+                execution_provider=execution.provider,
+                expected_provider=snapshot.provider,
+                execution_tool_name=execution.tool_name,
+                expected_action=snapshot.action,
+                execution_idempotency_key=execution.idempotency_key,
+                approval_id=snapshot.approval_id,
+                approval_version=snapshot.approval_version,
+                execution_payload_hash=execution.request_payload_hash,
+                expected_payload_hash=snapshot.payload_hash,
+            )
+        ):
+            raise _trusted_action_unavailable()
+        # 所有可能阻塞的关联行已在上方锁定；在任何 ORM mutation 前再次确认同一严格
+        # lease 谓词，保留 fail-closed 边界并使该检查与最终 flush 位于同一事务。
+        if (
+            task.lease_expires_at is None
             or task.lease_expires_at <= database_now
             or task.lease_expires_at <= failed_at
         ):
@@ -1656,6 +1724,7 @@ class SqlAlchemyTrustedActionRepository:
                 MailDraftStatus.EXECUTING.value,
                 CalendarProposalStatus.EXECUTING.value,
             },
+            locked_action=action,
         )
         task_audit = AuditEventModel(
             user_id=task.user_id,
@@ -1770,6 +1839,32 @@ class SqlAlchemyTrustedActionRepository:
         approval: ApprovalRequestModel,
     ) -> tuple[UUID, str | None, str] | None:
         """在 ToolExecution 后锁定本地动作并返回连接、日历和当前状态。"""
+        locked = await self._lock_action_record(task=task, approval=approval)
+        if locked is None:
+            return None
+        _, connection_id, calendar_id, status = locked
+        return connection_id, calendar_id, status
+
+    async def _lock_action_record(
+        self,
+        *,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+    ) -> (
+        tuple[
+            MailDraftModel | CalendarChangeProposalModel,
+            UUID,
+            str | None,
+            str,
+        ]
+        | None
+    ):
+        """按固定锁序锁定本地动作，并返回可复用的 ORM 行及其绑定投影。
+
+        返回的 action 已经由当前事务持有 ``FOR UPDATE`` 锁。需要在锁后采样数据库时间
+        的终态路径必须复用该对象，不能先采样再让状态 setter 重新等待同一行，否则旧
+        owner 可能在等待期间越过 lease 截止时间后仍提交可信终态。
+        """
         if (
             approval.proposal_id is None
             or approval.proposal_version is None
@@ -1787,7 +1882,7 @@ class SqlAlchemyTrustedActionRepository:
             )
             if draft is None or draft.current_version != approval.proposal_version:
                 return None
-            return draft.connection_id, None, draft.status
+            return draft, draft.connection_id, None, draft.status
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel)
             .where(
@@ -1798,7 +1893,7 @@ class SqlAlchemyTrustedActionRepository:
         )
         if proposal is None or proposal.current_version != approval.proposal_version:
             return None
-        return proposal.connection_id, proposal.calendar_id, proposal.status
+        return proposal, proposal.connection_id, proposal.calendar_id, proposal.status
 
     async def _action_connection_id(
         self,
@@ -1818,8 +1913,36 @@ class SqlAlchemyTrustedActionRepository:
         mail_status: MailDraftStatus,
         calendar_status: CalendarProposalStatus,
         allowed_current: set[str],
+        locked_action: MailDraftModel | CalendarChangeProposalModel | None = None,
     ) -> None:
-        """只改写仍绑定冻结版本且处于预期状态的本地动作头。"""
+        """只改写仍绑定冻结版本且处于预期状态的本地动作头。
+
+        ``locked_action`` 用于已经按 Task→Approval→ToolExecution→action 顺序锁定的
+        终态路径；传入时只做内存校验和 mutation，避免重新发出可能阻塞的 ``FOR UPDATE``
+        查询。未传入时保留原有查询行为，供 claim/其它生命周期路径使用。
+        """
+        if locked_action is not None:
+            if isinstance(locked_action, MailDraftModel):
+                if (
+                    approval.proposal_kind != "mail_draft"
+                    or approval.proposal_id != locked_action.id
+                    or locked_action.user_id != task.user_id
+                    or locked_action.current_version != approval.proposal_version
+                    or locked_action.status not in allowed_current
+                ):
+                    raise _trusted_action_unavailable()
+                locked_action.status = mail_status.value
+                return
+            if (
+                approval.proposal_kind != "calendar_proposal"
+                or approval.proposal_id != locked_action.id
+                or locked_action.user_id != task.user_id
+                or locked_action.current_version != approval.proposal_version
+                or locked_action.status not in allowed_current
+            ):
+                raise _trusted_action_unavailable()
+            locked_action.status = calendar_status.value
+            return
         if approval.proposal_kind == "mail_draft" and approval.proposal_id is not None:
             draft = await self._session.scalar(
                 select(MailDraftModel)
