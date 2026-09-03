@@ -1,0 +1,9 @@
+{
+  "messages": [
+    {
+      "id": "synthetic-sent-message-id",
+      "threadId": "synthetic-sent-thread-id"
+    }
+  ],
+  "resultSizeEstimate": 1
+}

@@ -212,17 +212,49 @@ class ProviderAdapterRegistry:
         )
         self._trusted_action_preflights = MappingProxyType(
             {
-                ("google", "mail.send"): google_mail_action or google_mail_preflight,
-                ("google", "calendar.create"): google_calendar_action or google_calendar_preflight,
-                ("google", "calendar.update"): google_calendar_action or google_calendar_preflight,
-                ("google", "calendar.restore"): google_calendar_action or google_calendar_preflight,
-                ("microsoft", "mail.send"): microsoft_mail_action or microsoft_mail_preflight,
-                ("microsoft", "calendar.create"): microsoft_calendar_action
-                or microsoft_calendar_preflight,
-                ("microsoft", "calendar.update"): microsoft_calendar_action
-                or microsoft_calendar_preflight,
-                ("microsoft", "calendar.restore"): microsoft_calendar_action
-                or microsoft_calendar_preflight,
+                # 不使用 ``or`` 选择 slot：adapter 可能定义业务意义上的 falsey
+                # ``__bool__``，但只要显式注入就必须保持真实动作优先级，不能悄然退回
+                # 仅 preflight 的兼容对象。
+                ("google", "mail.send"): (
+                    google_mail_action
+                    if google_mail_action is not None
+                    else google_mail_preflight
+                ),
+                ("google", "calendar.create"): (
+                    google_calendar_action
+                    if google_calendar_action is not None
+                    else google_calendar_preflight
+                ),
+                ("google", "calendar.update"): (
+                    google_calendar_action
+                    if google_calendar_action is not None
+                    else google_calendar_preflight
+                ),
+                ("google", "calendar.restore"): (
+                    google_calendar_action
+                    if google_calendar_action is not None
+                    else google_calendar_preflight
+                ),
+                ("microsoft", "mail.send"): (
+                    microsoft_mail_action
+                    if microsoft_mail_action is not None
+                    else microsoft_mail_preflight
+                ),
+                ("microsoft", "calendar.create"): (
+                    microsoft_calendar_action
+                    if microsoft_calendar_action is not None
+                    else microsoft_calendar_preflight
+                ),
+                ("microsoft", "calendar.update"): (
+                    microsoft_calendar_action
+                    if microsoft_calendar_action is not None
+                    else microsoft_calendar_preflight
+                ),
+                ("microsoft", "calendar.restore"): (
+                    microsoft_calendar_action
+                    if microsoft_calendar_action is not None
+                    else microsoft_calendar_preflight
+                ),
             }
         )
         self._trusted_action_adapters = MappingProxyType(

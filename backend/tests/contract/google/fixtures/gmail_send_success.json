@@ -1,0 +1,5 @@
+{
+  "id": "synthetic-sent-message-id",
+  "threadId": "synthetic-sent-thread-id",
+  "labelIds": ["SENT"]
+}
