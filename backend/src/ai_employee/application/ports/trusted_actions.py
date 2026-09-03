@@ -298,6 +298,7 @@ class ExecutionReference:
     provider_resource_id: str | None
     provider_request_id: str | None
     correlation_id: str | None
+    reconciliation_attempt_count: int = 0
 
 
 class TrustedActionAdapter(TrustedActionPreflight, Protocol):

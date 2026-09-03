@@ -46,6 +46,7 @@ from ai_employee.workers.prepare_calendar_restore import (
     build_prepare_calendar_restore_task_step,
 )
 from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_deletion_worker
+from ai_employee.workers.reconcile_actions import execute_reconciliation_task
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_mail import build_mail_sync_task_step
 from ai_employee.workers.trusted_actions import build_trusted_action_task_step
@@ -457,6 +458,62 @@ async def execute_task(
                 task = None
             else:
                 task_kind = getattr(task, "kind", None) if task is not None else None
+
+            # RECONCILING/NEEDS_ATTENTION 不能进入 DurableTaskRunner：通用 acquisition 会
+            # 把任务改成 running，并在节点返回后尝试写入 generic 终态。M2 专用入口只在
+            # PostgreSQL 已确认的 RECONCILING 状态取得只读 lease；needs_attention 则等待
+            # 用户手工确认或显式重开，不产生任何 provider 调用。
+            authoritative_status = None
+            if task_kind == "trusted_action":
+                status_store = SqlAlchemyTrustedActionTaskExecutionStore(session_factory)
+                status_reader = getattr(status_store, "get_authoritative_task_status", None)
+                if not callable(status_reader):
+                    # 状态端口缺失本身就是无法证明权威状态的协议错误；分类快照来自
+                    # 另一个非锁定事务，不能作为 fallback，否则可能把 reconciling
+                    # 任务误交给可写 Runner。
+                    return
+                else:
+                    try:
+                        authoritative_status = await status_reader(task_id=parsed_task_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - 权威状态不可读时必须 fail closed。
+                        # 状态读取失败不能落入 generic Runner：它可能正是一个
+                        # reconciling/needs_attention trusted action，继续 acquisition
+                        # 会把只读未决事实覆盖成普通 running/failed。
+                        return
+                if isinstance(authoritative_status, TaskStatus):
+                    authoritative_status = authoritative_status.value
+                elif type(authoritative_status) is not str:
+                    authoritative_status = None
+            if (
+                task_kind == "trusted_action"
+                and authoritative_status == TaskStatus.RECONCILING.value
+            ):
+                await execute_reconciliation_task(
+                    task_id=parsed_task_id,
+                    session_factory=session_factory,
+                    settings=settings,
+                )
+                return
+            if (
+                task_kind == "trusted_action"
+                and authoritative_status == TaskStatus.NEEDS_ATTENTION.value
+            ):
+                return
+            if task_kind == "trusted_action" and authoritative_status is None:
+                # 不能证明任务仍可进入普通 Runner；尤其不能把已删除/损坏的 trusted
+                # action 当作 M1 任务继续 acquisition。下一次 Outbox/人工请求再尝试读取。
+                return
+            if task_kind == "trusted_action" and authoritative_status not in {
+                TaskStatus.QUEUED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.RETRY_SCHEDULED.value,
+            }:
+                # 其他状态（包括未知字符串、created、waiting_approval 及旧终态）都不
+                # 能证明当前消息拥有可写的 trusted-action lease；让通用 Runner 处理它
+                # 会产生错误状态迁移或覆盖持久核对事实，因此统一 no-op。
+                return
 
             if classification_deferred:
                 runner = DurableTaskRunner(

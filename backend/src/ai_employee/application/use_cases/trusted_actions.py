@@ -7,11 +7,13 @@ provider preflight、规范化命令、计算哈希并加密；所有持久 muta
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest
 from typing import cast
+from urllib.parse import SplitResult, unquote_to_bytes, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -63,6 +65,133 @@ from ai_employee.infrastructure.security.action_payloads import ActionPayloadFor
 
 APPROVAL_COMMAND_CONTENT_KIND = "approval_command"
 APPROVAL_TTL = timedelta(minutes=10)
+
+# 未知结果只允许四次自动只读核对。列表而非指数公式是刻意的：它把协议边界写成
+# 可审计的有限集合，避免后续修改指数基数时悄然延长供应商不确定窗口。
+_RECONCILIATION_DELAYS: tuple[timedelta, ...] = (
+    timedelta(seconds=1),
+    timedelta(seconds=5),
+    timedelta(seconds=30),
+    timedelta(seconds=120),
+)
+MAX_RECONCILIATION_ATTEMPTS = len(_RECONCILIATION_DELAYS)
+_ADDRESS_IN_URL = re.compile(
+    r"(?i)(?<![A-Za-z0-9._%+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.[A-Za-z]{2,63}(?![A-Za-z0-9.-])"
+)
+_URL_CONTROL = re.compile(r"[\x00-\x20\x7f]")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_URL_SECRET_QUERY_KEY = re.compile(
+    r"(?i)(?:^|[?&;])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|"
+    r"authorization|bearer|token|password|passwd|client[_-]?secret|api[_-]?key|"
+    r"secret|credential|oauth[_-]?code|code|signature|sig|assertion|jwt|session|cookie)"
+    r"(?:$|[=&#;])"
+)
+
+
+def _strict_unquote(value: str) -> str | None:
+    """只接受合法 percent-encoding 和 UTF-8，避免扫描器把坏字节当作安全文本。"""
+    if _INVALID_PERCENT_ESCAPE.search(value) is not None:
+        return None
+    try:
+        return unquote_to_bytes(value).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _decoded_url_variants(value: str) -> tuple[str, ...] | None:
+    """生成有限次 URL 解码视图，捕获一次或双重编码的地址/控制字符。
+
+    供应商链接的 path/query 可以合法携带 opaque percent-encoding；这里不把解码结果
+    作为持久化文本，只把最多三层的视图用于安全扫描。固定上限避免恶意 ``%25`` 链接
+    造成无界 CPU 消耗，同时覆盖常见代理/供应商双重编码。
+    """
+    variants: list[str] = [value]
+    current = value
+    for _ in range(3):
+        decoded = _strict_unquote(current)
+        if decoded is None:
+            return None
+        if decoded == current:
+            break
+        variants.append(decoded)
+        current = decoded
+    return tuple(variants)
+
+
+def reconciliation_delay(attempt: int) -> timedelta:
+    """返回第 ``attempt`` 次自动核对的固定退避。
+
+    Args:
+        attempt: 从零开始的自动核对序号；初次 UNKNOWN 使用 ``0``。
+
+    Returns:
+        严格限定为 1、5、30 或 120 秒的 ``timedelta``。
+
+    Raises:
+        TypeError: 序号不是普通整数（布尔值也不接受）。
+        ValueError: 序号超出四次自动核对预算。
+    """
+    if type(attempt) is not int:
+        raise TypeError("reconciliation attempt must be an integer")
+    if attempt < 0 or attempt >= len(_RECONCILIATION_DELAYS):
+        raise ValueError("reconciliation attempt is outside the bounded policy")
+    return _RECONCILIATION_DELAYS[attempt]
+
+
+def validate_provider_url(value: object) -> str | None:
+    """验证可供用户打开的供应商链接，并拒绝地址或凭据泄漏。
+
+    ``ProviderWriteOutcome`` 允许 adapter 提供链接，但链接属于不可信供应商输入。这里只
+    保留绝对 HTTPS、无 userinfo/fragment/控制字符且不包含明文邮箱地址的 URL；任何不合规
+    值都被视为“无链接”，而不是把原始值写入结果、审计或 SSE。
+
+    Args:
+        value: adapter 返回的候选 URL。
+
+    Returns:
+        可安全持久化的规范 URL，或 ``None``。
+    """
+    if type(value) is not str or not value or len(value) > 2048:
+        return None
+    if (
+        value != value.strip()
+        or _URL_CONTROL.search(value) is not None
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    variants = _decoded_url_variants(value)
+    if variants is None:
+        return None
+    if any(
+        _URL_CONTROL.search(candidate) is not None
+        or _ADDRESS_IN_URL.search(candidate) is not None
+        or _URL_SECRET_QUERY_KEY.search(candidate) is not None
+        for candidate in variants
+    ):
+        return None
+    try:
+        parsed: SplitResult = urlsplit(value)
+        # 访问 hostname/port 可能触发 ValueError（例如坏端口或非法 IPv6），必须统一
+        # fail closed，不能让异常文本跨过 provider 边界。
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or "\\" in parsed.netloc
+        or "%" in parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        return None
+    # scheme/host 的大小写不是业务事实；保留 path/query 的供应商 opaque 语义，但用
+    # urlunsplit 去掉解析器可能接受的空组件，避免保存一个多种文本表示的同一链接。
+    normalized = urlunsplit(parsed)
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +345,7 @@ class TrustedActionExecutionUseCase:
         expected_payload_hash: str,
         lease_owner: str,
         may_retry_write: bool = True,
+        _reconcile_only: bool = False,
     ) -> None:
         """从持久 ToolExecution 选择首次写、明确安全重试、只读核对或终态复用。
 
@@ -310,13 +440,30 @@ class TrustedActionExecutionUseCase:
                 )
             raise
 
-        from_reconciliation = status in {
-            ToolExecutionStatus.EXECUTING,
-            ToolExecutionStatus.RECONCILING,
-        } or (
-            status is ToolExecutionStatus.CLAIMED
-            and snapshot.execution.request_started_at is not None
+        from_reconciliation = (
+            _reconcile_only
+            or status
+            in {
+                ToolExecutionStatus.EXECUTING,
+                ToolExecutionStatus.RECONCILING,
+            }
+            or (
+                status is ToolExecutionStatus.CLAIMED
+                and snapshot.execution.request_started_at is not None
+            )
         )
+        # 专用核对入口即使被错误地投递到一个 ``claimed`` 快照，也不能把它升级成新的
+        # 写请求；只有已有 request-start 的同一尝试才可被只读核对。正常 worker 通过
+        # ``claim_reconciliation`` 只会得到 RECONCILING，因此该防线主要覆盖 API/队列
+        # 重放形状被篡改的情况。
+        if _reconcile_only and (
+            status not in {ToolExecutionStatus.EXECUTING, ToolExecutionStatus.RECONCILING}
+            and not (
+                status is ToolExecutionStatus.CLAIMED
+                and snapshot.execution.request_started_at is not None
+            )
+        ):
+            raise TrustedActionAttemptAbandoned
         try:
             adapter = self._adapters.trusted_action_adapter(
                 provider=snapshot.provider,
@@ -410,6 +557,31 @@ class TrustedActionExecutionUseCase:
                 message="provider confirmed that the trusted action was not applied",
                 retry_after=outcome.retry_after_seconds,
             )
+
+    async def reconcile(
+        self,
+        *,
+        task_id: UUID,
+        approval_id: UUID,
+        operation_id: UUID,
+        expected_payload_hash: str,
+        lease_owner: str,
+    ) -> None:
+        """只执行一次只读供应商核对，绝不重新调用 ``adapter.execute``。
+
+        该窄入口供专用 reconciliation worker 和测试使用。它复用同一条命令解密、哈希
+        绑定与结果持久化路径，但把 ``_reconcile_only`` 固定为真并关闭安全写重试；即使
+        调用方误传入已终态或尚未 request-start 的 claim，也会 fail closed。
+        """
+        await self.execute_or_reconcile(
+            task_id=task_id,
+            approval_id=approval_id,
+            operation_id=operation_id,
+            expected_payload_hash=expected_payload_hash,
+            lease_owner=lease_owner,
+            may_retry_write=False,
+            _reconcile_only=True,
+        )
 
     async def finalize(
         self,
@@ -1417,9 +1589,12 @@ def _external_write_account_not_allowed() -> StateConflictError:
 
 
 __all__ = [
+    "MAX_RECONCILIATION_ATTEMPTS",
     "CalendarProposalSubmissionNotFoundError",
     "SubmitCalendarProposalUseCase",
     "SubmitMailDraftUseCase",
     "TrustedActionExecutionUseCase",
     "TrustedActionGraphFacts",
+    "reconciliation_delay",
+    "validate_provider_url",
 ]

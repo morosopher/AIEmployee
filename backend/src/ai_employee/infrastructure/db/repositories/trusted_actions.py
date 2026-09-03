@@ -7,9 +7,10 @@ from datetime import datetime
 from hashlib import sha256
 from hmac import compare_digest
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, text
+from sqlalchemy import exists, func, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.commands import canonical_command_json, trusted_command_hash
@@ -32,6 +33,11 @@ from ai_employee.application.ports.trusted_actions import (
 )
 from ai_employee.application.use_cases.calendar_proposals import CalendarProposalContent
 from ai_employee.application.use_cases.task_execution import utc_instant
+from ai_employee.application.use_cases.trusted_actions import (
+    MAX_RECONCILIATION_ATTEMPTS,
+    reconciliation_delay,
+    validate_provider_url,
+)
 from ai_employee.domain.actions import (
     CalendarProposalStatus,
     MailDraftStatus,
@@ -1305,16 +1311,35 @@ class SqlAlchemyTrustedActionRepository:
             if from_reconciliation
             else {ToolExecutionStatus.EXECUTING}
         )
+        task_status_allowed = (
+            {TaskStatus.RUNNING.value, TaskStatus.RECONCILING.value}
+            if from_reconciliation
+            else {TaskStatus.RUNNING.value}
+        )
+        action_status_allowed = (
+            {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+                MailDraftStatus.NEEDS_ATTENTION.value,
+                CalendarProposalStatus.NEEDS_ATTENTION.value,
+            }
+            if from_reconciliation
+            else {
+                MailDraftStatus.EXECUTING.value,
+                CalendarProposalStatus.EXECUTING.value,
+            }
+        )
         expected_write_attempt_count = (
             snapshot.execution.write_attempt_count
             if from_reconciliation
             else snapshot.execution.write_attempt_count + 1
         )
+        expected_reconciliation_attempt_count = snapshot.execution.reconciliation_attempt_count
         if (
             status not in allowed
             or task.kind != "trusted_action"
             or task.user_id != snapshot.user_id
-            or task.status != TaskStatus.RUNNING.value
+            or task.status not in task_status_allowed
             or task.lease_owner != lease_owner
             or task.lease_expires_at is None
             or task.lease_expires_at <= database_now
@@ -1330,15 +1355,12 @@ class SqlAlchemyTrustedActionRepository:
             or not compare_digest(approval.payload_hash, snapshot.payload_hash)
             or action_connection_id != snapshot.connection_id
             or action_calendar_id != snapshot.calendar_id
-            or action_status
-            not in {
-                MailDraftStatus.EXECUTING.value,
-                CalendarProposalStatus.EXECUTING.value,
-            }
+            or action_status not in action_status_allowed
             or connection.provider != snapshot.provider
             or (snapshot.calendar_id is not None and calendar is None)
             or execution.request_started_at is None
             or execution.write_attempt_count != expected_write_attempt_count
+            or execution.reconciliation_attempt_count != expected_reconciliation_attempt_count
             or not trusted_execution_binding_matches(
                 execution_task_id=execution.task_id,
                 expected_task_id=snapshot.task_id,
@@ -1358,18 +1380,106 @@ class SqlAlchemyTrustedActionRepository:
             )
         ):
             raise _trusted_action_unavailable()
-        execution.provider_resource_id = outcome.provider_resource_id
-        execution.provider_request_id = outcome.provider_request_id
-        execution.correlation_id = outcome.correlation_id
+        # 后续核对有时只返回其中一部分关联标识；已验证的旧值不能被一个空字段覆盖，
+        # 否则下一次只读核对会失去原始 request/resource 关联。
+        if outcome.provider_resource_id is not None:
+            execution.provider_resource_id = outcome.provider_resource_id
+        if outcome.provider_request_id is not None:
+            execution.provider_request_id = outcome.provider_request_id
+        # 只读核对可能只返回 resource/request 其中一部分；已持久化的关联 ID 不能被
+        # 一个空字段覆盖，否则后续 bounded reconcile 会丢失可审计的稳定关联。
+        if outcome.correlation_id is not None:
+            execution.correlation_id = outcome.correlation_id
         execution.error_code = outcome.error_code
         execution.result_summary = _outcome_summary(outcome)
+        if from_reconciliation:
+            execution.reconciliation_attempt_count += 1
+            execution.last_reconciled_at = database_now
         if outcome.kind is ProviderWriteOutcomeKind.UNKNOWN:
-            # UNKNOWN 只证明响应语义不明确，绝不能伪造 confirmed_not_applied。Task 19
-            # 保留 executing 三元组并立即释放租约，后续重复投递只会从持久 request-start
-            # 事实进入 adapter.reconcile；不创建 Task 20 的核对状态、事件或调度。
+            # UNKNOWN 只证明响应语义不明确，绝不能伪造 confirmed_not_applied。把任务和
+            # 本地动作一起推进到 needs-attention/reconciling，随后仅由专用只读 worker
+            # 按持久 scheduled_for 重新取得租约；write_attempt_count 永不递增。
+            reconciliation_count = execution.reconciliation_attempt_count
+            terminal_reconciliation = (
+                from_reconciliation and reconciliation_count >= MAX_RECONCILIATION_ATTEMPTS
+            )
+            execution.status = (
+                ToolExecutionStatus.NEEDS_ATTENTION.value
+                if terminal_reconciliation
+                else ToolExecutionStatus.RECONCILING.value
+            )
+            execution.error_code = (
+                "provider_reconciliation_failed"
+                if terminal_reconciliation
+                else "provider_write_outcome_unknown"
+            )
+            task.status = (
+                TaskStatus.NEEDS_ATTENTION.value
+                if terminal_reconciliation
+                else TaskStatus.RECONCILING.value
+            )
+            task.error_code = execution.error_code
+            task.finished_at = None
             task.lease_owner = None
-            task.lease_expires_at = database_now
+            task.lease_expires_at = None
+            task.retry_recovery_at = None
+            task.approval_checkpoint_recovery_at = None
+            if terminal_reconciliation:
+                task.scheduled_for = None
+            else:
+                # 初次 UNKNOWN 使用 delay(0)；每次只读 UNKNOWN 后使用下一槽位。显式
+                # 用户重开可能从计数 4 开始，下一轮仍由 terminal 分支收敛而不会无限自动排队。
+                delay_index = 0 if not from_reconciliation else reconciliation_count
+                task.scheduled_for = database_now + reconciliation_delay(delay_index)
+            await self._set_local_action_status(
+                task=task,
+                approval=approval,
+                mail_status=MailDraftStatus.NEEDS_ATTENTION,
+                calendar_status=CalendarProposalStatus.NEEDS_ATTENTION,
+                allowed_current=action_status_allowed,
+            )
+            audit = AuditEventModel(
+                user_id=task.user_id,
+                task_id=task.id,
+                event_type=(
+                    "tool.needs_attention" if terminal_reconciliation else "tool.reconciling"
+                ),
+                actor_type="worker",
+                actor_id=lease_owner,
+                event_metadata={
+                    "action": snapshot.action,
+                    "provider": snapshot.provider,
+                    "outcome": ProviderWriteOutcomeKind.UNKNOWN.value,
+                    "reconciliation_attempt_count": reconciliation_count,
+                },
+            )
+            self._session.add(audit)
             await self._session.flush()
+            lifecycle_topic = (
+                "tool.needs_attention" if terminal_reconciliation else "tool.reconciling"
+            )
+            events = [
+                OutboxEventModel(
+                    topic=lifecycle_topic,
+                    aggregate_id=task.id,
+                    deduplication_key=(f"{lifecycle_topic}:{execution.id}:{reconciliation_count}"),
+                    payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                    available_at=database_now,
+                )
+            ]
+            if not terminal_reconciliation and task.scheduled_for is not None:
+                events.append(
+                    OutboxEventModel(
+                        topic="task.execute",
+                        aggregate_id=task.id,
+                        deduplication_key=(
+                            f"task.execute:{task.id}:reconcile:{reconciliation_count}"
+                        ),
+                        payload={"task_id": str(task.id)},
+                        available_at=task.scheduled_for,
+                    )
+                )
+            self._session.add_all(events)
             return
         event_type: str
         outbox_topic: str
@@ -1405,11 +1515,22 @@ class SqlAlchemyTrustedActionRepository:
                     event_metadata={"reason": "trusted_action_confirmed_applied"},
                 )
             )
+            # 已确认应用的结果必须触发一次只读 source refresh；refresh 任务本身只读，
+            # 其稳定幂等键与 execution 绑定，重放该终态不会产生第二次 provider write。
+            await self._enqueue_source_refresh(
+                task=task,
+                approval=approval,
+                execution=execution,
+                connection=connection,
+                calendar_id=snapshot.calendar_id,
+                available_at=database_now,
+            )
             event_type = outbox_topic = "tool.succeeded"
         elif (
             outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
             and outcome.retryable
             and may_retry_write
+            and not from_reconciliation
         ):
             execution.status = ToolExecutionStatus.RETRYABLE_FAILED.value
             event_type = outbox_topic = "tool.retryable_failed"
@@ -1427,11 +1548,17 @@ class SqlAlchemyTrustedActionRepository:
             task.error_code = terminal_error_code
             task.finished_at = database_now
             _clear_task_scheduling(task)
+            calendar_target = (
+                CalendarProposalStatus.STALE
+                if snapshot.action == "calendar.update"
+                and outcome.error_code == "calendar_event_version_conflict"
+                else CalendarProposalStatus.EDITING
+            )
             await self._set_local_action_status(
                 task=task,
                 approval=approval,
                 mail_status=MailDraftStatus.EDITING,
-                calendar_status=CalendarProposalStatus.EDITING,
+                calendar_status=calendar_target,
                 allowed_current={
                     MailDraftStatus.EXECUTING.value,
                     CalendarProposalStatus.EXECUTING.value,
@@ -1474,6 +1601,225 @@ class SqlAlchemyTrustedActionRepository:
                 deduplication_key=f"{outbox_topic}:{execution.id}:{execution.write_attempt_count}",
                 payload={"task_id": str(task.id), "audit_event_id": audit.id},
                 available_at=database_now,
+            )
+        )
+
+    async def claim_reconciliation(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> TrustedActionDispatchSnapshot | None:
+        """为一轮只读核对取得专用租约，不把任务改回 ``running``。
+
+        自动核对不能复用通用 ``TaskExecutionStore.acquire``：后者会把任务推进到
+        ``running``，并可能让普通 Runner 在节点返回后写入成功。这里沿用
+        Task→Approval→ToolExecution→本地动作→Connection 的固定锁序，仅在
+        ``reconciling`` 状态且调度到期时设置 owner，随后由专用 worker 调用
+        ``TrustedActionExecutionUseCase.reconcile``。
+        """
+        now = utc_instant(now, field="now")
+        lease_expires_at = utc_instant(lease_expires_at, field="lease_expires_at")
+        if lease_expires_at <= now:
+            raise ValueError("lease_expires_at must be later than now")
+        if type(lease_owner) is not str or not lease_owner or lease_owner != lease_owner.strip():
+            raise ValueError("lease_owner is invalid")
+        task = await self._session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if (
+            task is None
+            or task.kind != "trusted_action"
+            or task.status != TaskStatus.RECONCILING.value
+            or task.scheduled_for is None
+            or task.scheduled_for > now
+            or (
+                task.lease_owner is not None
+                and (task.lease_expires_at is None or task.lease_expires_at > now)
+            )
+        ):
+            return None
+        raw_approval_id = task.input_payload.get("approval_id")
+        raw_operation_id = task.input_payload.get("operation_id")
+        if (
+            set(task.input_payload) != {"approval_id", "operation_id"}
+            or type(raw_approval_id) is not str
+            or type(raw_operation_id) is not str
+        ):
+            return None
+        try:
+            approval_id = UUID(raw_approval_id)
+            operation_id = UUID(raw_operation_id)
+        except ValueError:
+            return None
+        approval = await self._session.scalar(
+            select(ApprovalRequestModel)
+            .where(ApprovalRequestModel.id == approval_id, ApprovalRequestModel.task_id == task.id)
+            .with_for_update()
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(
+                ToolExecutionModel.task_id == task.id,
+                ToolExecutionModel.operation_id == operation_id,
+            )
+            .with_for_update()
+        )
+        if (
+            approval is None
+            or execution is None
+            or approval.status != ApprovalStatus.APPROVED.value
+            or execution.status != ToolExecutionStatus.RECONCILING.value
+            or execution.request_started_at is None
+            or execution.write_attempt_count <= 0
+            or approval.schema_version is None
+            or not _task_operation_matches(task, operation_id)
+        ):
+            return None
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        if binding is None:
+            return None
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == binding[0],
+                OAuthConnectionModel.user_id == task.user_id,
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            return None
+        if binding[1] is not None:
+            calendar = await self._session.scalar(
+                select(ProviderCalendarModel)
+                .where(
+                    ProviderCalendarModel.user_id == task.user_id,
+                    ProviderCalendarModel.connection_id == binding[0],
+                    ProviderCalendarModel.provider_calendar_id == binding[1],
+                )
+                .with_for_update()
+            )
+            if calendar is None:
+                return None
+        task.lease_owner = lease_owner
+        task.lease_expires_at = lease_expires_at
+        task.current_step = "reconcile"
+        await self._session.flush()
+        return await self.load_dispatch(
+            task_id=task.id,
+            approval_id=approval.id,
+            operation_id=operation_id,
+        )
+
+    async def release_reconciliation_lease(
+        self,
+        *,
+        task_id: UUID,
+        lease_owner: str,
+        now: datetime,
+    ) -> bool:
+        """在只读核对异常时安全释放专用租约并保留 ``reconciling`` 事实。
+
+        只有仍绑定同一 owner 的任务可以被释放；若另一个 Worker 已经接管，旧异常路径
+        不得清除新租约。调度时间被压到 ``now``，让下一次 PostgreSQL 恢复扫描能够重新
+        投递，而不会把未确定结果误写成成功或普通失败。
+        """
+        now = utc_instant(now, field="now")
+        task = await self._session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if (
+            task is None
+            or task.kind != "trusted_action"
+            or task.status != TaskStatus.RECONCILING.value
+            or task.lease_owner != lease_owner
+        ):
+            return False
+        task.lease_owner = None
+        task.lease_expires_at = None
+        if task.scheduled_for is None or task.scheduled_for > now:
+            task.scheduled_for = now
+        await self._session.flush()
+        return True
+
+    async def recover_due_reconciliations(self, *, now: datetime, limit: int) -> int:
+        """从 PostgreSQL 补建因 Redis 丢失而缺失的只读核对投递事实。
+
+        ``scheduled_for`` 是唯一到期来源；每个任务/计数使用确定性去重键，因此扫描器
+        重跑不会制造第二条 refresh 或第二次供应商写入。状态始终保持 ``reconciling``，
+        不会被普通任务恢复器伪装成可写的 ``queued``。
+        """
+        return await _recover_due_reconciliations_in_session(
+            self._session,
+            now=now,
+            limit=limit,
+        )
+
+    async def _enqueue_source_refresh(
+        self,
+        *,
+        task: TaskRunModel,
+        approval: ApprovalRequestModel,
+        execution: ToolExecutionModel,
+        connection: OAuthConnectionModel,
+        calendar_id: str | None,
+        available_at: datetime,
+    ) -> None:
+        """为已确认应用结果建立一次去重的只读同步意图。
+
+        这里只创建 ``sync_mail``/``sync_calendar`` 任务和其 Outbox，不写
+        ``EmailMessage`` 或 ``CalendarEvent``。实际 provider refresh 仍由现有只读同步
+        worker 规范化真实资源后更新来源表，避免从批准命令伪造供应商行。
+        """
+        if approval.proposal_kind == "mail_draft":
+            kind = "sync_mail"
+            scope_key = "sentitems" if connection.provider == "microsoft" else "mailbox"
+        elif approval.proposal_kind == "calendar_proposal" and calendar_id:
+            kind = "sync_calendar"
+            scope_key = calendar_id
+        else:
+            return
+        digest = sha256(scope_key.encode("utf-8")).hexdigest()[:16]
+        idempotency_key = f"action-refresh:{execution.id}:{kind}:{digest}"
+        refresh_id = uuid4()
+        result = await self._session.execute(
+            insert(TaskRunModel)
+            .values(
+                id=refresh_id,
+                user_id=task.user_id,
+                kind=kind,
+                status=TaskStatus.CREATED.value,
+                idempotency_key=idempotency_key,
+                input_payload={
+                    "connection_id": str(connection.id),
+                    "scope_key": scope_key,
+                },
+            )
+            .on_conflict_do_nothing(constraint="uq_task_runs_user_id_idempotency_key")
+            .returning(TaskRunModel.id)
+        )
+        inserted_id = result.scalar_one_or_none()
+        if inserted_id is None:
+            return
+        refresh_audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=inserted_id,
+            event_type="task.created",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": "trusted_action_source_refresh", "kind": kind},
+        )
+        self._session.add(refresh_audit)
+        await self._session.flush()
+        self._session.add(
+            OutboxEventModel(
+                topic="task.execute",
+                aggregate_id=inserted_id,
+                deduplication_key=f"task.execute:{inserted_id}:initial",
+                payload={"task_id": str(inserted_id)},
+                available_at=available_at,
             )
         )
 
@@ -2318,6 +2664,99 @@ class SqlAlchemyTrustedActionRepository:
         return canonical
 
 
+async def _recover_due_reconciliations_in_session(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int,
+) -> int:
+    """在调用方事务内补建到期核对 Outbox，且完全不需要命令解密密钥。
+
+    调度器只负责恢复 PostgreSQL 中已经存在的 ``reconciling`` 事实，并不读取冻结命令；
+    因此这段 SQL 与含 AEAD 的可信动作 repository 分离成共享 helper。任务状态、核对
+    次数和到期时间组成稳定去重边界，重复扫描只会看到已有未发布 ``task.execute`` 而跳过。
+    """
+    now = utc_instant(now, field="now")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    tasks = tuple(
+        (
+            await session.scalars(
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.kind == "trusted_action",
+                    TaskRunModel.status == TaskStatus.RECONCILING.value,
+                    TaskRunModel.scheduled_for.is_not(None),
+                    TaskRunModel.scheduled_for <= now,
+                    or_(
+                        TaskRunModel.lease_owner.is_(None),
+                        TaskRunModel.lease_expires_at <= now,
+                    ),
+                    ~exists(
+                        select(OutboxEventModel.id).where(
+                            OutboxEventModel.aggregate_id == TaskRunModel.id,
+                            OutboxEventModel.topic == "task.execute",
+                            OutboxEventModel.published_at.is_(None),
+                        )
+                    ),
+                )
+                .order_by(TaskRunModel.scheduled_for, TaskRunModel.id)
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).all()
+    )
+    recovered = 0
+    for task in tasks:
+        execution = await session.scalar(
+            select(ToolExecutionModel).where(ToolExecutionModel.task_id == task.id)
+        )
+        raw_count: object = execution.reconciliation_attempt_count if execution is not None else 0
+        scheduled_for = task.scheduled_for
+        if scheduled_for is None:
+            continue
+        deduplication_key = (
+            f"task.execute:{task.id}:reconcile-recovery:{raw_count}:{scheduled_for.isoformat()}"
+        )
+        result = await session.execute(
+            insert(OutboxEventModel)
+            .values(
+                topic="task.execute",
+                aggregate_id=task.id,
+                deduplication_key=deduplication_key,
+                payload={"task_id": str(task.id)},
+                available_at=scheduled_for,
+            )
+            .on_conflict_do_nothing(constraint="uq_outbox_events_deduplication_key")
+            .returning(OutboxEventModel.id)
+        )
+        if result.scalar_one_or_none() is not None:
+            recovered += 1
+    return recovered
+
+
+class SqlAlchemyTrustedActionReconciliationRecoveryStore:
+    """只依赖 PostgreSQL 的核对恢复适配器，不读取应用主密钥。
+
+    Scheduler 可能在密钥轮换、Secret 未挂载或 Worker 尚未启动时运行；恢复丢失的
+    ``task.execute`` Outbox 只需要状态/调度列，所以单独的 store 能让这条维护路径继续
+    工作，同时把任何 AEAD 解密严格留在实际 reconciliation Worker。
+    """
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存会话工厂；每次扫描使用一个短提交事务。"""
+        self._session_factory = session_factory
+
+    async def recover_due_reconciliations(self, *, now: datetime, limit: int) -> int:
+        """补建到期核对投递并返回本轮新增 Outbox 数量。"""
+        async with self._session_factory.begin() as session:
+            return await _recover_due_reconciliations_in_session(
+                session,
+                now=now,
+                limit=limit,
+            )
+
+
 class SqlAlchemyTrustedActionTaskExecutionStore(SqlAlchemyTaskExecutionStore):
     """复用通用租约实现，并为 request-start 前失败提供可信动作原子终态。
 
@@ -2349,6 +2788,17 @@ class SqlAlchemyTrustedActionTaskExecutionStore(SqlAlchemyTaskExecutionStore):
         async with self._trusted_session_factory.begin() as session:
             return await session.scalar(
                 select(TaskRunModel.kind).where(TaskRunModel.id == task_id).with_for_update()
+            )
+
+    async def get_authoritative_task_status(self, *, task_id: UUID) -> str | None:
+        """在独立短事务中读取权威任务状态，供 M2 专用路由 fail closed。
+
+        ``RECONCILING`` 不能经过通用 acquisition；该查询与 kind 查询分开保留窄接口，
+        方便消息分类替身只实现自己需要的最小能力，同时不把 ORM 行泄露到 Worker。
+        """
+        async with self._trusted_session_factory.begin() as session:
+            return await session.scalar(
+                select(TaskRunModel.status).where(TaskRunModel.id == task_id).with_for_update()
             )
 
     async def finish(
@@ -2693,6 +3143,7 @@ def _execution_reference(
         provider_resource_id=execution.provider_resource_id,
         provider_request_id=execution.provider_request_id,
         correlation_id=execution.correlation_id,
+        reconciliation_attempt_count=execution.reconciliation_attempt_count,
     )
 
 
@@ -2706,13 +3157,20 @@ def _clear_task_scheduling(task: TaskRunModel) -> None:
 
 
 def _outcome_summary(outcome: ProviderWriteOutcome) -> dict[str, JsonValue]:
-    """只保存规范分类与重试提示，不保留原始响应或供应商 URL。"""
+    """只保存规范分类、重试提示和已验证的无地址供应商 URL。
+
+    原始 adapter 响应永远不进入 JSONB。URL 也必须经过独立 HTTPS/地址检查；不安全候选
+    被静默丢弃，使历史结果仍可安全展示而不会把供应商输入变成 XSS、凭据或个人地址载体。
+    """
     summary: dict[str, JsonValue] = {
         "kind": outcome.kind.value,
         "retryable": outcome.retryable,
     }
     if outcome.retry_after_seconds is not None:
         summary["retry_after_seconds"] = outcome.retry_after_seconds
+    provider_url = validate_provider_url(outcome.provider_url)
+    if provider_url is not None:
+        summary["provider_url"] = provider_url
     return summary
 
 
@@ -2777,6 +3235,7 @@ def _trusted_action_unavailable() -> StateConflictError:
 
 __all__ = [
     "APPROVAL_COMMAND_CONTENT_KIND",
+    "SqlAlchemyTrustedActionReconciliationRecoveryStore",
     "SqlAlchemyTrustedActionRepository",
     "SqlAlchemyTrustedActionRepositoryFactory",
     "SqlAlchemyTrustedActionTaskExecutionStore",

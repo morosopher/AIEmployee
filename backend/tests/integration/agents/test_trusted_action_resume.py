@@ -51,6 +51,7 @@ from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyAppro
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemyTaskExecutionStore
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    SqlAlchemyTrustedActionRepository,
     SqlAlchemyTrustedActionRepositoryFactory,
     SqlAlchemyTrustedActionTaskExecutionStore,
 )
@@ -599,13 +600,26 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
                 )
             )
         assert unresolved_task is not None
-        assert unresolved_task.status == TaskStatus.RUNNING.value
+        expected_task_status = (
+            TaskStatus.RECONCILING.value if interruption == "unknown" else TaskStatus.RUNNING.value
+        )
+        assert unresolved_task.status == expected_task_status
         assert unresolved_task.lease_owner is None
         assert unresolved_task.finished_at is None
         assert unresolved_draft is not None
-        assert unresolved_draft.status == MailDraftStatus.EXECUTING.value
+        expected_draft_status = (
+            MailDraftStatus.NEEDS_ATTENTION.value
+            if interruption == "unknown"
+            else MailDraftStatus.EXECUTING.value
+        )
+        assert unresolved_draft.status == expected_draft_status
         assert unresolved_execution is not None
-        assert unresolved_execution.status == ToolExecutionStatus.EXECUTING.value
+        expected_execution_status = (
+            ToolExecutionStatus.RECONCILING.value
+            if interruption == "unknown"
+            else ToolExecutionStatus.EXECUTING.value
+        )
+        assert unresolved_execution.status == expected_execution_status
         assert unresolved_execution.request_started_at is not None
         assert unresolved_execution.write_attempt_count == 1
         assert failed_audits == 0
@@ -616,16 +630,46 @@ async def test_request_started_interruption_stays_unresolved_and_redelivery_only
             provider_release.set()
         adapter.execute_error = None
         clock.value = NOW + timedelta(seconds=3)
-        await _runner(
-            session_factory,
-            workflow=workflow,
-            clock=clock,
-            resume="approved",
-            checkpoint_database_url=database_url,
-        ).run(
-            submission.task_id,
-            lease_owner=f"{interruption}-recovery-worker",
-        )
+        if interruption == "unknown":
+            # UNKNOWN 已把 TaskRun 交给专用只读队列；普通 DurableTaskRunner 不能把
+            # reconciling 误升为 running。模拟一次到期 delivery 的 claim + reconcile。
+            async with session_factory.begin() as session:
+                task_for_reconcile = await session.get(TaskRunModel, submission.task_id)
+                assert task_for_reconcile is not None
+                assert task_for_reconcile.scheduled_for is not None
+                scheduled_for = task_for_reconcile.scheduled_for
+                repository = SqlAlchemyTrustedActionRepository(session, ACTION_CIPHER)
+                reconciliation_snapshot = await repository.claim_reconciliation(
+                    task_id=submission.task_id,
+                    lease_owner="unknown-recovery-worker",
+                    now=scheduled_for,
+                    lease_expires_at=scheduled_for + timedelta(minutes=1),
+                )
+                assert reconciliation_snapshot is not None
+            facts = await workflow.load_graph_facts(
+                task_id=submission.task_id,
+                approval_id=submission.approval_id,
+                operation_id=submission.operation_id,
+                expected_payload_hash="",
+            )
+            await workflow.reconcile(
+                task_id=submission.task_id,
+                approval_id=submission.approval_id,
+                operation_id=submission.operation_id,
+                expected_payload_hash=facts.payload_hash,
+                lease_owner="unknown-recovery-worker",
+            )
+        else:
+            await _runner(
+                session_factory,
+                workflow=workflow,
+                clock=clock,
+                resume="approved",
+                checkpoint_database_url=database_url,
+            ).run(
+                submission.task_id,
+                lease_owner=f"{interruption}-recovery-worker",
+            )
 
         async with session_factory() as session:
             final_task = await session.get(TaskRunModel, submission.task_id)
@@ -652,6 +696,7 @@ async def test_execute_task_routes_trusted_action_to_checkpoint_step(
 ) -> None:
     """Taskiq 入口必须把可信动作 resume 与消息级依赖交给专用 Graph step。"""
     task_id = uuid4()
+    expected_task_id = task_id
     captured: dict[str, object] = {}
 
     class _Factory:
@@ -743,6 +788,21 @@ async def test_execute_task_routes_trusted_action_to_checkpoint_step(
         execute_task_module,
         "build_task_runner",
         lambda: pytest.fail("trusted_action must not use the generic cached runner"),
+    )
+
+    async def _authoritative_status(
+        _self: object,
+        *,
+        task_id: UUID,
+    ) -> str:
+        """为路由组合测试提供明确的可执行状态，避免依赖合成数据库工厂。"""
+        assert task_id == expected_task_id
+        return TaskStatus.QUEUED.value
+
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionTaskExecutionStore,
+        "get_authoritative_task_status",
+        _authoritative_status,
     )
 
     await execute_task_module.execute_task.original_func(
@@ -883,6 +943,22 @@ async def test_execute_task_classification_failure_never_generic_finishes_truste
         _authoritative_kind,
         raising=False,
     )
+
+    async def _authoritative_status(
+        _self: object,
+        *,
+        task_id: UUID,
+    ) -> str:
+        """为可信动作兼容路由提供明确 queued 状态；其他 kind 不会调用此端口。"""
+        assert task_id == expected_task_id
+        return TaskStatus.QUEUED.value
+
+    if authoritative_kind == "trusted_action":
+        monkeypatch.setattr(
+            SqlAlchemyTrustedActionTaskExecutionStore,
+            "get_authoritative_task_status",
+            _authoritative_status,
+        )
     monkeypatch.setattr(
         execute_task_module,
         "build_task_runner",

@@ -51,7 +51,11 @@ class SqlAlchemyApprovalStore:
             task = await session.get(TaskRunModel, task_id)
             if task is None:
                 return None
-            return FakeWriteTask(kind=task.kind, input_payload=task.input_payload)
+            return FakeWriteTask(
+                kind=task.kind,
+                input_payload=task.input_payload,
+                status=task.status,
+            )
 
     async def create_or_get_pending(
         self,
@@ -274,8 +278,7 @@ class SqlAlchemyApprovalStore:
                         .where(
                             OutboxEventModel.aggregate_id == task.id,
                             OutboxEventModel.topic == "task.execute",
-                            OutboxEventModel.deduplication_key
-                            == f"task.execute:{task.id}:initial",
+                            OutboxEventModel.deduplication_key == f"task.execute:{task.id}:initial",
                             OutboxEventModel.published_at.is_(None),
                         )
                         .with_for_update()
@@ -333,9 +336,7 @@ class SqlAlchemyApprovalStore:
                             OutboxEventModel(
                                 topic="task.cancelled",
                                 aggregate_id=task.id,
-                                deduplication_key=(
-                                    f"task.cancelled:{task.id}:approval-expired"
-                                ),
+                                deduplication_key=(f"task.cancelled:{task.id}:approval-expired"),
                                 payload={
                                     "task_id": str(task.id),
                                     "audit_event_id": task_cancelled_audit.id,

@@ -21,6 +21,7 @@ from ai_employee.application.use_cases.schedules import (
     is_daily_brief_due,
     scheduled_daily_brief_instant,
 )
+from ai_employee.application.use_cases.task_execution import utc_instant
 from ai_employee.application.use_cases.task_retry_recovery import (
     RecoverScheduledTaskRetriesUseCase,
 )
@@ -42,6 +43,9 @@ from ai_employee.infrastructure.db.repositories.task_retry_recovery import (
     SqlAlchemyTaskRetryRecoveryStore,
 )
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
+from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    SqlAlchemyTrustedActionReconciliationRecoveryStore,
+)
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
@@ -60,6 +64,7 @@ __all__ = [
     "expire_sessions",
     "is_daily_brief_due",
     "recover_approval_checkpoints",
+    "recover_due_reconciliations",
     "recover_task_retries",
     "relay_outbox",
     "run_retention_cleanup",
@@ -132,6 +137,22 @@ async def recover_task_retries() -> None:
         store=SqlAlchemyTaskRetryRecoveryStore(session_factory)
     )
     await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
+    await recover_due_reconciliations(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
+
+
+async def recover_due_reconciliations(*, now: datetime, limit: int) -> int:
+    """补建到期可信动作只读核对 Outbox，不改变 ``reconciling`` 任务状态。
+
+    扫描器与普通 retry recovery 共用既有 ``recover-task-retries`` label，避免增加第二个
+    Scheduler job。数据库事务由本函数打开，repository 本身不提交；Redis 投递仍由下一个
+    ``outbox-relay`` tick 负责。
+    """
+    now = utc_instant(now, field="now")
+    # 该扫描只读 TaskRun/ToolExecution/Outbox 调度事实；它不能因为 Worker Secret 未挂载
+    # 或正在轮换而失败，也绝不需要解密冻结命令。实际命令解密仅发生在核对 Worker。
+    return await SqlAlchemyTrustedActionReconciliationRecoveryStore(
+        session_factory
+    ).recover_due_reconciliations(now=now, limit=limit)
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "due-daily-briefs"}])

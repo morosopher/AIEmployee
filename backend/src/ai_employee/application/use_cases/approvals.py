@@ -18,6 +18,8 @@ class FakeWriteTask:
 
     kind: str
     input_payload: dict[str, JsonValue]
+    # M2 reconciliation 路由需要读取权威状态；保留可选值以兼容 M1 的最小 fake fixture。
+    status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

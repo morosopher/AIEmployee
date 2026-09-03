@@ -3879,30 +3879,36 @@ async def test_unknown_outcome_preserves_task19_unresolved_fact_until_read_only_
                 )
         finally:
             await session_factory.dispose()
-        assert task is not None and task.status == TaskStatus.RUNNING.value
+        assert task is not None and task.status == TaskStatus.RECONCILING.value
         assert task.lease_owner is None and task.finished_at is None
-        assert draft is not None and draft.status == MailDraftStatus.EXECUTING.value
+        assert task.scheduled_for is not None
+        assert draft is not None and draft.status == MailDraftStatus.NEEDS_ATTENTION.value
         assert execution is not None
-        assert execution.status == ToolExecutionStatus.EXECUTING.value
-        assert execution.error_code == "synthetic_unknown"
+        assert execution.status == ToolExecutionStatus.RECONCILING.value
+        assert execution.error_code == "provider_write_outcome_unknown"
         assert execution.completed_at is None
         assert execution.result_summary == {
             "kind": ProviderWriteOutcomeKind.UNKNOWN.value,
             "retryable": False,
         }
         assert task_failed_count == tool_failed_count == 0
-        assert reconciling_audit_count == reconciling_outbox_count == retry_outbox_count == 0
+        assert reconciling_audit_count == reconciling_outbox_count == 1
+        assert retry_outbox_count == 0
         assert adapter.write_calls == 1
         assert adapter.reconcile_calls == 0
 
+        scheduled_for = task.scheduled_for
         session_factory = build_session_factory(database_url)
         try:
-            leased = await SqlAlchemyTaskExecutionStore(session_factory).acquire(
-                task_id=seed.task_id,
-                lease_owner="recovery-worker",
-                now=NOW,
-                lease_expires_at=NOW + timedelta(minutes=1),
-            )
+            async with session_factory.begin() as session:
+                leased = await SqlAlchemyTrustedActionRepository(
+                    session, ACTION_CIPHER
+                ).claim_reconciliation(
+                    task_id=seed.task_id,
+                    lease_owner="recovery-worker",
+                    now=scheduled_for,
+                    lease_expires_at=scheduled_for + timedelta(minutes=1),
+                )
         finally:
             await session_factory.dispose()
         assert leased is not None
@@ -3916,7 +3922,7 @@ async def test_unknown_outcome_preserves_task19_unresolved_fact_until_read_only_
             provider_url=None,
             error_code=None,
         )
-        await workflow.execute_or_reconcile(
+        await workflow.reconcile(
             task_id=seed.task_id,
             approval_id=seed.approval_id,
             operation_id=seed.operation_id,

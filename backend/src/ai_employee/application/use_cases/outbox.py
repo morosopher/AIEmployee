@@ -47,6 +47,9 @@ class OutboxTopic(StrEnum):
     TOOL_SUCCEEDED = "tool.succeeded"
     TOOL_RETRYABLE_FAILED = "tool.retryable_failed"
     TOOL_CONFIRMED_FAILED = "tool.confirmed_failed"
+    TOOL_RECONCILING = "tool.reconciling"
+    TOOL_NEEDS_ATTENTION = "tool.needs_attention"
+    TOOL_MANUALLY_RESOLVED = "tool.manually_resolved"
 
 
 @dataclass(frozen=True, slots=True)
