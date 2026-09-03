@@ -17,7 +17,11 @@ import respx
 from ai_employee.application.ports.trusted_actions import ExecutionReference
 from ai_employee.domain.actions import ProviderWriteOutcomeKind, ToolExecutionStatus
 from ai_employee.domain.mail_actions import MailMode, MailSendCommand, ReplyThreadHeaders
-from ai_employee.integrations.google.gmail_write import GMAIL_SEND_URL, GmailWriteAdapter
+from ai_employee.integrations.google.gmail_write import (
+    GMAIL_MESSAGES_URL,
+    GMAIL_SEND_URL,
+    GmailWriteAdapter,
+)
 from ai_employee.integrations.mail_mime import build_mail_mime, message_id_for
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -97,6 +101,57 @@ def test_reply_mime_contains_frozen_thread_headers_and_plain_text_only() -> None
     assert message.get_content().rstrip("\r\n") == "Synthetic body"
 
 
+def test_mime_is_byte_deterministic_for_the_same_frozen_command() -> None:
+    """同一冻结命令重复预检必须生成逐字相同的 RFC 2822 bytes。"""
+    command = _command(mode=MailMode.REPLY_ALL)
+
+    first = build_mail_mime(command, from_address="sender@example.test")
+    second = build_mail_mime(command, from_address="sender@example.test")
+
+    assert first == second
+
+
+def test_validate_for_approval_is_pure_and_does_not_call_gmail() -> None:
+    """审批预检只做本地表达能力检查，不应触发任何 Gmail HTTP 请求。"""
+    with respx.mock:
+        route = respx.route().mock(return_value=httpx.Response(500))
+        result = GmailWriteAdapter(
+            access_token="synthetic-access-token", account_email="sender@example.test"
+        ).validate_for_approval(_command())
+
+    assert result.warnings == ()
+    assert route.call_count == 0
+
+
+def test_adapter_rejects_header_injection_and_domain_recipient_limit() -> None:
+    """连接地址与领域收件人上限在供应商边界都必须 fail closed。"""
+    with pytest.raises(ValueError):
+        GmailWriteAdapter(
+            access_token="synthetic-access-token",
+            account_email="sender@example.test\r\nBcc: attacker@example.test",
+        )
+
+    with pytest.raises(ValueError):
+        MailSendCommand(
+            schema_version="mail_send.v1",
+            action="mail.send",
+            operation_id=OPERATION_ID,
+            connection_id=CONNECTION_ID,
+            draft_id=DRAFT_ID,
+            draft_version=1,
+            message_date=datetime(2026, 8, 6, 9, 30, tzinfo=UTC),
+            mode=MailMode.NEW,
+            source_thread_id=None,
+            source_message_id=None,
+            to=tuple(f"recipient-{index}@example.test" for index in range(51)),
+            cc=(),
+            bcc=(),
+            subject="Synthetic subject",
+            body_text="Synthetic body",
+            thread_headers=None,
+        )
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_send_uses_base64url_and_normalizes_success_response() -> None:
@@ -129,7 +184,10 @@ async def test_send_uses_base64url_and_normalizes_success_response() -> None:
 async def test_reply_sends_frozen_thread_id_and_never_calls_draft_api() -> None:
     """回复请求携带冻结 threadId，且不会触达 Gmail Draft API。"""
     route = respx.post(GMAIL_SEND_URL).mock(
-        return_value=httpx.Response(200, json=_fixture("gmail_send_success.json"))
+        return_value=httpx.Response(
+            200,
+            json={"id": "synthetic-sent-message-id", "threadId": "synthetic-thread-id"},
+        )
     )
     draft_route = respx.post(
         "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
@@ -146,9 +204,27 @@ async def test_reply_sends_frozen_thread_id_and_never_calls_draft_api() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize("returned_thread_id", ("different-thread-id", None))
+async def test_reply_success_requires_the_frozen_thread_id(returned_thread_id: str | None) -> None:
+    """回复 200 响应的 threadId 必须与冻结来源严格一致。"""
+    response: dict[str, object] = {"id": "synthetic-sent-message-id"}
+    if returned_thread_id is not None:
+        response["threadId"] = returned_thread_id
+    respx.post(GMAIL_SEND_URL).mock(return_value=httpx.Response(200, json=response))
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).execute(_command(mode=MailMode.REPLY))
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+    assert outcome.retryable is False
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_sent_reconciliation_searches_by_stable_message_id() -> None:
     """核对只读搜索 Sent 的稳定 Message-ID，并返回不含地址的链接。"""
-    search = respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
+    search = respx.get(GMAIL_MESSAGES_URL).mock(
         return_value=httpx.Response(200, json=_fixture("gmail_sent_search.json"))
     )
     outcome = await GmailWriteAdapter(
@@ -166,6 +242,97 @@ async def test_sent_reconciliation_searches_by_stable_message_id() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_sent_reconciliation_without_a_match_is_unknown() -> None:
+    """单轮 Sent 无匹配不能证明未发送，必须保留 unknown。"""
+    search = respx.get(GMAIL_MESSAGES_URL).mock(
+        return_value=httpx.Response(200, json={"messages": []})
+    )
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).reconcile(_command(), _execution())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+    assert outcome.retryable is False
+    assert search.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_sent_reconciliation_rejects_multiple_matching_messages() -> None:
+    """多个符合稳定关联条件的 Sent 消息不能被首个候选掩盖。"""
+    search = respx.get(GMAIL_MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {"id": "synthetic-message-one", "threadId": "synthetic-thread-one"},
+                    {"id": "synthetic-message-two", "threadId": "synthetic-thread-two"},
+                ]
+            },
+        )
+    )
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).reconcile(_command(), _execution())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+    assert outcome.retryable is False
+    assert search.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_sent_reconciliation_follows_pages_before_declaring_unique() -> None:
+    """有 nextPageToken 时必须读取后续有限页面，避免首个结果伪造唯一性。"""
+    search = respx.get(GMAIL_MESSAGES_URL)
+    search.side_effect = [
+        httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {"id": "synthetic-message-one", "threadId": "synthetic-thread-one"}
+                ],
+                "nextPageToken": "synthetic-page-two",
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {"id": "synthetic-message-two", "threadId": "synthetic-thread-two"}
+                ]
+            },
+        ),
+    ]
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).reconcile(_command(), _execution())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+    assert search.call_count == 2
+    assert search.calls[1].request.url.params["pageToken"] == "synthetic-page-two"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_sent_reconciliation_malformed_candidate_is_unknown() -> None:
+    """缺少供应商 ID/thread 事实的候选不能被当作已发送。"""
+    respx.get(GMAIL_MESSAGES_URL).mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "only-id"}]})
+    )
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).reconcile(_command(), _execution())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+
+
+@pytest.mark.asyncio
+@respx.mock
 @pytest.mark.parametrize("status_code", (400, 403, 429))
 async def test_documented_4xx_is_confirmed_not_applied(status_code: int) -> None:
     """供应商明确拒绝的 4xx 不得被误报为 unknown。"""
@@ -179,6 +346,21 @@ async def test_documented_4xx_is_confirmed_not_applied(status_code: int) -> None
 
     assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
     assert outcome.retryable is (status_code == 429)
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("status_code", (408, 425))
+async def test_undocumented_transient_4xx_is_not_safe_to_retry(status_code: int) -> None:
+    """没有 Gmail 未应用证明的 408/425 不能授权再次写入。"""
+    respx.post(GMAIL_SEND_URL).mock(return_value=httpx.Response(status_code))
+
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-access-token", account_email="sender@example.test"
+    ).execute(_command())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    assert outcome.retryable is False
 
 
 @pytest.mark.asyncio
@@ -265,3 +447,26 @@ async def test_401_is_not_retried_inside_adapter_and_coordinator_can_refresh_onc
     ).execute(_command())
     assert second_outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
     assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_401_never_calls_an_injected_refresh_callback() -> None:
+    """401 的 refresh/re-entry 只能由外部 coordinator 控制。"""
+    refresh_calls = 0
+
+    async def refresh() -> str:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return "synthetic-refreshed-token"
+
+    route = respx.post(GMAIL_SEND_URL).mock(return_value=httpx.Response(401))
+    outcome = await GmailWriteAdapter(
+        access_token="synthetic-expired-token",
+        account_email="sender@example.test",
+        refresh_access_token=refresh,
+    ).execute(_command())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    assert refresh_calls == 0
+    assert route.call_count == 1

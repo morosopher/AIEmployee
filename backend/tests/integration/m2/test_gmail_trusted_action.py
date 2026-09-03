@@ -83,6 +83,7 @@ async def test_registry_exposes_gmail_action_and_unknown_reentry_is_read_only() 
     second = await resolved.reconcile(_command(), _execution())
 
     assert first.kind is ProviderWriteOutcomeKind.UNKNOWN
-    assert second.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    # 单轮 Sent 无匹配不能证明请求未应用；上层必须继续有界只读核对或转人工关注。
+    assert second.kind is ProviderWriteOutcomeKind.UNKNOWN
     assert send.call_count == 1
     assert search.call_count == 1

@@ -24,7 +24,13 @@ from ai_employee.application.ports.trusted_actions import (
     ProviderWriteOutcome,
 )
 from ai_employee.domain.actions import ProviderWriteOutcomeKind
-from ai_employee.domain.mail_actions import MailMode, MailSendCommand, normalize_mailbox_address
+from ai_employee.domain.mail_actions import (
+    MailMode,
+    MailSendCommand,
+    ReplyThreadHeaders,
+    normalize_mail_recipients,
+    normalize_mailbox_address,
+)
 from ai_employee.integrations.mail_mime import build_mail_mime, message_id_for
 
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -42,6 +48,7 @@ GMAIL_UI_SENT_BASE_URL = "https://mail.google.com/mail/u/0/?view=sent&message_id
 GMAIL_WRITE_TIMEOUT_SECONDS = 15.0
 GMAIL_WRITE_CONNECT_TIMEOUT_SECONDS = 3.0
 GMAIL_RECONCILE_MAX_CANDIDATES = 10
+GMAIL_RECONCILE_MAX_PAGES = 4
 GMAIL_RETRY_AFTER_CAP_SECONDS = 300
 
 
@@ -104,16 +111,10 @@ class GmailWriteAdapter:
             TypeError: 命令不是邮件发送领域值。
             ValueError: 模式、来源绑定或 MIME Header 无法表达。
         """
-        if type(command) is not MailSendCommand:
-            raise TypeError("Google Gmail action requires MailSendCommand")
+        command = _validated_mail_command(command)
         # MailSendCommand 的构造器已检查 recipient/source limits；重新调用 MIME builder
         # 是最后一道供应商表达能力检查，且仍然只在内存中生成 bytes。
         build_mail_mime(command, from_address=self._account_email)
-        if command.mode is MailMode.NEW:
-            if command.source_thread_id is not None or command.source_message_id is not None:
-                raise ValueError("new mail source binding is invalid")
-        elif command.thread_headers is None:
-            raise ValueError("reply mail source binding is invalid")
         return ApprovalPreflightResult()
 
     async def execute(self, command: TrustedCommand) -> ProviderWriteOutcome:
@@ -129,8 +130,7 @@ class GmailWriteAdapter:
             TypeError: 命令不是 ``MailSendCommand``。
             ValueError: MIME 无法安全表达。
         """
-        if type(command) is not MailSendCommand:
-            raise TypeError("Google Gmail action requires MailSendCommand")
+        command = _validated_mail_command(command)
         raw = base64.urlsafe_b64encode(
             build_mail_mime(command, from_address=self._account_email)
         ).decode("ascii").rstrip("=")
@@ -142,6 +142,9 @@ class GmailWriteAdapter:
             "/messages/send",
             json=body,
             correlation_id=message_id_for(command.operation_id),
+            expected_thread_id=(
+                command.source_thread_id if command.mode is not MailMode.NEW else None
+            ),
         )
 
     async def reconcile(
@@ -156,15 +159,14 @@ class GmailWriteAdapter:
             execution: 已持久化的 ToolExecution 内容无关引用；其状态不会触发写请求。
 
         Returns:
-            Sent 中已验证资源的 ``confirmed_applied``、权威缺失的
-            ``confirmed_not_applied``，或暂时无法判断的 ``unknown``。
+            Sent 中唯一且已验证资源的 ``confirmed_applied``，或暂时无法判断的
+            ``unknown``；缺少匹配项也不能在单轮读取中证明 ``confirmed_not_applied``。
 
         Raises:
             TypeError: 命令或执行引用类型不符合可信动作边界。
             ValueError: execution 与 command 的稳定 operation 绑定不一致。
         """
-        if type(command) is not MailSendCommand:
-            raise TypeError("Google Gmail action requires MailSendCommand")
+        command = _validated_mail_command(command)
         if type(execution) is not ExecutionReference:
             raise TypeError("Gmail reconciliation requires ExecutionReference")
         if execution.operation_id != command.operation_id:
@@ -172,109 +174,174 @@ class GmailWriteAdapter:
 
         correlation_id = message_id_for(command.operation_id)
         query = f"in:sent rfc822msgid:{correlation_id}"
-        response, transport_error = await self._request_read(
-            GMAIL_MESSAGES_URL,
-            params={"q": query, "maxResults": str(GMAIL_RECONCILE_MAX_CANDIDATES)},
-        )
-        if transport_error is not None:
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                error_code=transport_error,
-            )
-        if response is None:
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                error_code="google_sent_reconciliation_unavailable",
-            )
-        if response.status_code == 401:
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                provider_request_id=_provider_request_id(response),
-                error_code="google_reauthorization_required",
-            )
-        if response.status_code == 429 or response.status_code >= 500:
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                provider_request_id=_provider_request_id(response),
-                error_code=(
-                    "google_rate_limited"
-                    if response.status_code == 429
-                    else "google_service_unavailable"
-                ),
-            )
-        if response.status_code >= 400:
-            # 查询被明确拒绝且没有写请求发生；这只能说明本轮核对没有可用证据，不能把
-            # 供应商拒绝伪装成“邮件未发送”，否则应用会错误地开放自动重发权限。
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                provider_request_id=_provider_request_id(response),
-                error_code="google_sent_reconciliation_rejected",
-            )
+        candidates: list[Mapping[str, object]] = []
+        page_token: str | None = None
+        seen_page_tokens: set[str] = set()
+        pages_fetched = 0
+        last_provider_request_id: str | None = None
 
-        payload = _json_object(response)
-        if payload is None:
+        while True:
+            if pages_fetched >= GMAIL_RECONCILE_MAX_PAGES:
+                # 分页边界本身就是未完成的供应商事实；不能把已经看到的首个候选当作
+                # 唯一发送结果，否则重复投递可能被错误标记为已收敛。
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_page_limit",
+                )
+            params = {
+                "q": query,
+                "maxResults": str(GMAIL_RECONCILE_MAX_CANDIDATES),
+            }
+            if page_token is not None:
+                params["pageToken"] = page_token
+            response, transport_error = await self._request_read(
+                GMAIL_MESSAGES_URL,
+                params=params,
+            )
+            pages_fetched += 1
+            if transport_error is not None:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code=transport_error,
+                )
+            if response is None:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_unavailable",
+                )
+            last_provider_request_id = _provider_request_id(response)
+            if response.status_code == 401:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_reauthorization_required",
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code=(
+                        "google_rate_limited"
+                        if response.status_code == 429
+                        else "google_service_unavailable"
+                    ),
+                )
+            if response.status_code >= 400:
+                # 查询被明确拒绝且没有写请求发生；这只能说明本轮核对没有可用证据，不能把
+                # 供应商拒绝伪装成“邮件未发送”，否则应用会错误地开放自动重发权限。
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_rejected",
+                )
+
+            payload = _json_object(response)
+            if payload is None:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_invalid_response",
+                )
+            raw_messages = payload.get("messages")
+            if not isinstance(raw_messages, list):
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_invalid_response",
+                )
+            if len(raw_messages) > GMAIL_RECONCILE_MAX_CANDIDATES:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_candidate_limit",
+                )
+            for raw_candidate in raw_messages:
+                if not isinstance(raw_candidate, Mapping):
+                    return _unknown_outcome(
+                        correlation_id=correlation_id,
+                        provider_request_id=last_provider_request_id,
+                        error_code="google_sent_reconciliation_invalid_response",
+                    )
+                candidates.append(cast(Mapping[str, object], raw_candidate))
+                if len(candidates) > GMAIL_RECONCILE_MAX_CANDIDATES:
+                    return _unknown_outcome(
+                        correlation_id=correlation_id,
+                        provider_request_id=last_provider_request_id,
+                        error_code="google_sent_reconciliation_candidate_limit",
+                    )
+
+            next_page_token = payload.get("nextPageToken")
+            if next_page_token is None:
+                break
+            normalized_page_token = _safe_page_token(next_page_token)
+            if normalized_page_token is None or normalized_page_token in seen_page_tokens:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_invalid_response",
+                )
+            seen_page_tokens.add(normalized_page_token)
+            page_token = normalized_page_token
+
+        if not candidates:
+            # Sent 查询的单次空结果只表示当前读取窗口没有证据，不能证明真实写入未发生；
+            # 由上层 bounded reconciliation 决定何时进入 needs_attention。
             return _unknown_outcome(
                 correlation_id=correlation_id,
-                provider_request_id=_provider_request_id(response),
-                error_code="google_sent_reconciliation_invalid_response",
-            )
-        raw_messages = payload.get("messages")
-        if not isinstance(raw_messages, list):
-            return _unknown_outcome(
-                correlation_id=correlation_id,
-                provider_request_id=_provider_request_id(response),
-                error_code="google_sent_reconciliation_invalid_response",
-            )
-        if not raw_messages:
-            return _not_applied_outcome(
-                correlation_id=correlation_id,
+                provider_request_id=last_provider_request_id,
                 error_code="google_sent_message_not_found",
             )
 
-        saw_candidate = False
-        saw_malformed_candidate = False
-        for raw_candidate in raw_messages[:GMAIL_RECONCILE_MAX_CANDIDATES]:
-            if not isinstance(raw_candidate, Mapping):
-                saw_malformed_candidate = True
-                continue
+        matching: list[tuple[str, str]] = []
+        saw_conflicting_candidate = False
+        for raw_candidate in candidates:
             candidate_id = _safe_provider_id(raw_candidate.get("id"))
             candidate_thread = _safe_provider_id(raw_candidate.get("threadId"))
             if candidate_id is None or candidate_thread is None:
-                saw_malformed_candidate = True
-                continue
-            saw_candidate = True
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=last_provider_request_id,
+                    error_code="google_sent_reconciliation_invalid_response",
+                )
             # Gmail messages.list 已返回 message ID 与 threadId；查询本身绑定了精确
             # ``rfc822msgid``，因此这两个字段就是核对所需的最小事实。避免再 GET 完整
             # message 可减少暴露正文的机会，也让未知结果重入保持严格只读且有界。
-            if command.mode is not MailMode.NEW and candidate_thread != command.source_thread_id:
-                continue
-            if not _message_id_matches(raw_candidate, correlation_id):
-                continue
             labels = raw_candidate.get("labelIds")
-            if isinstance(labels, list) and "SENT" not in labels:
-                continue
-            return _applied_outcome(
-                correlation_id=correlation_id,
-                provider_resource_id=candidate_id,
-                provider_request_id=_provider_request_id(response),
-            )
-
-        if not saw_candidate:
-            if saw_malformed_candidate:
+            if labels is not None and (
+                not isinstance(labels, list)
+                or any(not isinstance(label, str) for label in labels)
+            ):
                 return _unknown_outcome(
                     correlation_id=correlation_id,
-                    provider_request_id=_provider_request_id(response),
+                    provider_request_id=last_provider_request_id,
                     error_code="google_sent_reconciliation_invalid_response",
                 )
-            return _not_applied_outcome(
-                correlation_id=correlation_id,
-                error_code="google_sent_message_not_found",
+            candidate_matches = (
+                (command.mode is MailMode.NEW or candidate_thread == command.source_thread_id)
+                and _message_id_matches(raw_candidate, correlation_id)
+                and (labels is None or "SENT" in labels)
             )
-        # 有候选但其 thread/Message-ID 事实不匹配，保守地保留 unknown；自动重发会有重复
-        # 邮件风险，只有下一轮只读核对或人工确认可以收敛。
-        return _unknown_outcome(
+            if candidate_matches:
+                matching.append((candidate_id, candidate_thread))
+            else:
+                saw_conflicting_candidate = True
+
+        if saw_conflicting_candidate or len(matching) != 1:
+            # 有候选但其 thread/Message-ID/label 事实冲突，或出现多个匹配资源时，保守地
+            # 保留 unknown；自动重发会有重复风险，只有下一轮只读核对或人工确认可以收敛。
+            return _unknown_outcome(
+                correlation_id=correlation_id,
+                provider_request_id=last_provider_request_id,
+                error_code="google_sent_reconciliation_mismatch",
+            )
+        provider_id, _ = matching[0]
+        return _applied_outcome(
             correlation_id=correlation_id,
-            error_code="google_sent_reconciliation_mismatch",
+            provider_resource_id=provider_id,
+            provider_request_id=last_provider_request_id,
         )
 
     async def _send_with_classified_outcome(
@@ -283,6 +350,7 @@ class GmailWriteAdapter:
         *,
         json: Mapping[str, object],
         correlation_id: str,
+        expected_thread_id: str | None,
     ) -> ProviderWriteOutcome:
         """执行单次真实 POST，并按请求是否可能到达供应商分类结果。
 
@@ -326,6 +394,12 @@ class GmailWriteAdapter:
                     provider_request_id=request_id,
                     error_code="google_mail_send_malformed_response",
                 )
+            if expected_thread_id is not None and thread_id != expected_thread_id:
+                return _unknown_outcome(
+                    correlation_id=correlation_id,
+                    provider_request_id=request_id,
+                    error_code="google_mail_send_thread_mismatch",
+                )
             return _applied_outcome(
                 correlation_id=correlation_id,
                 provider_resource_id=provider_id,
@@ -337,7 +411,9 @@ class GmailWriteAdapter:
             # 401 明确表示当前 access token 无效，但再次 POST 之前必须由连接级
             # OAuthRefreshCoordinator 完成一次有审计的 refresh；不能把它标成普通安全
             # retry，否则通用 Taskiq 重试会用同一过期 token 盲目重放。
-            retryable = response.status_code in {408, 425, 429}
+            # Gmail 文档只给出 429 的明确限流重试语义；408/425 虽是通用 HTTP 暂态码，
+            # 不能在本适配器中推断资源确实未创建，故只作为不可自动重放的拒绝事实。
+            retryable = response.status_code == 429
             error_code = _send_error_code(response.status_code)
             return _not_applied_outcome(
                 correlation_id=correlation_id,
@@ -443,6 +519,61 @@ async def _client_request(
     raise ValueError("Gmail HTTP method is unsupported")
 
 
+def _validated_mail_command(command: TrustedCommand) -> MailSendCommand:
+    """在每个供应商入口重新确认邮件命令的冻结形状与规范化边界。
+
+    应用层通常已经从严格 Schema 构造 ``MailSendCommand``，但 adapter 不能把该假设当作
+    唯一防线：checkpoint、测试替身或未来调用方可能传入被篡改的 frozen object。这里不
+    修正任何值，只接受已经规范化且可无损表达的命令；所有失败都在 HTTP 之前结束。
+    """
+    if type(command) is not MailSendCommand:
+        raise TypeError("Google Gmail action requires MailSendCommand")
+    if type(command.mode) is not MailMode:
+        raise TypeError("mail mode must be MailMode")
+    if not all(type(addresses) is tuple for addresses in (command.to, command.cc, command.bcc)):
+        raise TypeError("mail recipient fields must be tuples")
+    normalized_recipients = normalize_mail_recipients(command.to, command.cc, command.bcc)
+    if normalized_recipients != (command.to, command.cc, command.bcc):
+        raise ValueError("mail recipients must be normalized")
+    recipient_count = sum(len(addresses) for addresses in normalized_recipients)
+    if not 1 <= recipient_count <= 50:
+        raise ValueError("mail command recipient limit is invalid")
+    if type(command.subject) is not str or len(command.subject) > 255:
+        raise ValueError("mail subject is invalid")
+    if "\r" in command.subject or "\n" in command.subject:
+        raise ValueError("mail subject must not contain CR or LF")
+    if type(command.body_text) is not str or len(command.body_text) > 100_000:
+        raise ValueError("mail body is invalid")
+    if command.mode is MailMode.NEW:
+        if any(
+            value is not None
+            for value in (
+                command.source_thread_id,
+                command.source_message_id,
+                command.thread_headers,
+            )
+        ):
+            raise ValueError("new mail source binding is invalid")
+    else:
+        if (
+            _safe_source_identifier(command.source_thread_id) is None
+            or _safe_source_identifier(command.source_message_id) is None
+        ):
+            raise ValueError("reply mail source binding is invalid")
+        if type(command.thread_headers) is not ReplyThreadHeaders:
+            raise ValueError("reply mail source binding is invalid")
+    return command
+
+
+def _safe_source_identifier(value: object) -> str | None:
+    """验证 Gmail thread/message opaque 标识，避免空白或控制字符进入请求。"""
+    if not isinstance(value, str) or not value or value != value.strip() or len(value) > 512:
+        return None
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return None
+    return value
+
+
 def _require_token(value: object) -> str:
     """验证受控 bearer token 的最小边界，不把其内容写入错误。"""
     if (
@@ -471,6 +602,15 @@ def _json_object(response: httpx.Response) -> Mapping[str, object] | None:
 def _safe_provider_id(value: object) -> str | None:
     """验证 Gmail opaque ID，可用于结果存储和 URL path 编码。"""
     if not isinstance(value, str) or not value or value != value.strip() or len(value) > 512:
+        return None
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return None
+    return value
+
+
+def _safe_page_token(value: object) -> str | None:
+    """验证 Gmail 分页 token，只允许有界且不含控制字符的 opaque 文本。"""
+    if not isinstance(value, str) or not value or value != value.strip() or len(value) > 1024:
         return None
     if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
         return None
@@ -512,19 +652,26 @@ def _send_error_code(status_code: int) -> str:
 def _message_id_matches(payload: Mapping[str, object], expected: str) -> bool:
     """若列表项含 Message-ID 头则要求其与稳定 operation Message-ID 完全一致。"""
     raw_payload = payload.get("payload")
+    if raw_payload is None:
+        # metadata 列表响应通常不含 payload；精确 rfc822msgid 查询本身已提供关联事实。
+        return True
     if not isinstance(raw_payload, Mapping):
-        # Gmail metadata 响应在测试/文档简化形式中可能没有 payload；搜索 query 本身已
-        # 是稳定关联条件，此时保留候选而不是凭缺失字段误判未发送。
-        return True
+        return False
     raw_headers = raw_payload.get("headers")
-    if not isinstance(raw_headers, list):
+    if raw_headers is None:
         return True
+    if not isinstance(raw_headers, list):
+        return False
     for item in raw_headers:
         if not isinstance(item, Mapping):
-            continue
+            return False
         name = item.get("name")
         value = item.get("value")
-        if isinstance(name, str) and name.casefold() == "message-id" and value != expected:
+        if not isinstance(name, str):
+            return False
+        if name.casefold() == "message-id" and (
+            not isinstance(value, str) or value != expected
+        ):
             return False
     # 能走到这里表示所有存在的 Message-ID 头都与 ``expected`` 相等；头缺失时仍可接受，
     # 因为 Sent 搜索的精确 rfc822msgid 条件本身已经提供稳定关联证明。
