@@ -9,7 +9,7 @@ from hmac import compare_digest
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import exists, func, or_, select, text
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2679,6 +2679,17 @@ async def _recover_due_reconciliations_in_session(
     now = utc_instant(now, field="now")
     if limit <= 0:
         raise ValueError("limit must be positive")
+    pending_task_execute = exists(
+        select(OutboxEventModel.id).where(
+            OutboxEventModel.aggregate_id == TaskRunModel.id,
+            OutboxEventModel.topic == "task.execute",
+            OutboxEventModel.published_at.is_(None),
+        )
+    )
+    malformed_lease = and_(
+        TaskRunModel.lease_owner.is_not(None),
+        TaskRunModel.lease_expires_at.is_(None),
+    )
     tasks = tuple(
         (
             await session.scalars(
@@ -2689,16 +2700,14 @@ async def _recover_due_reconciliations_in_session(
                     TaskRunModel.scheduled_for.is_not(None),
                     TaskRunModel.scheduled_for <= now,
                     or_(
+                        malformed_lease,
                         TaskRunModel.lease_owner.is_(None),
                         TaskRunModel.lease_expires_at <= now,
                     ),
-                    ~exists(
-                        select(OutboxEventModel.id).where(
-                            OutboxEventModel.aggregate_id == TaskRunModel.id,
-                            OutboxEventModel.topic == "task.execute",
-                            OutboxEventModel.published_at.is_(None),
-                        )
-                    ),
+                    # 损坏的 owner-without-expiry 即使已有未发布消息也必须先清理，
+                    # 否则 claim 会永久拒绝该任务；正常/过期租约仍沿用原有 pending
+                    # Outbox 去重条件。
+                    or_(malformed_lease, ~pending_task_execute),
                 )
                 .order_by(TaskRunModel.scheduled_for, TaskRunModel.id)
                 .limit(limit)
@@ -2708,6 +2717,25 @@ async def _recover_due_reconciliations_in_session(
     )
     recovered = 0
     for task in tasks:
+        is_malformed_lease = task.lease_owner is not None and task.lease_expires_at is None
+        if is_malformed_lease:
+            # 该形状无法证明任何 Worker 仍持有有效租约。清除 owner/expiry 只改变本地
+            # 协调事实，不会触发 provider 调用；随后由同事务的 Outbox 或下一次扫描
+            # 重新建立只读 claim。
+            task.lease_owner = None
+            task.lease_expires_at = None
+            await session.flush()
+            pending_event_id = await session.scalar(
+                select(OutboxEventModel.id)
+                .where(
+                    OutboxEventModel.aggregate_id == task.id,
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.published_at.is_(None),
+                )
+                .limit(1)
+            )
+            if pending_event_id is not None:
+                continue
         execution = await session.scalar(
             select(ToolExecutionModel).where(ToolExecutionModel.task_id == task.id)
         )

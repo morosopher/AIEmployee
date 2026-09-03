@@ -89,7 +89,8 @@ async def execute_reconciliation_task(
         task_id: Outbox 仅携带的可信 TaskRun UUID。
         session_factory: 当前 Worker 消息拥有的异步数据库工厂。
         settings: 提供主密钥、租约时长和已验证写策略；核对不会打开写开关。
-        adapters: 测试或组合根注入的固定 adapter registry；省略时使用空 registry。
+        adapters: 测试或组合根注入的固定 adapter registry；省略时使用空 registry，
+            以便尚未组装真实 provider adapter 的进程安全失败。
         lease_owner: 可替换的专用 owner，缺省生成随机短期值。
         now: 可替换的 UTC 当前时间，便于恢复测试确定调度边界。
 
@@ -126,7 +127,7 @@ async def execute_reconciliation_task(
 
     workflow = TrustedActionExecutionUseCase(
         transactions=transactions,
-        adapters=adapters or ProviderAdapterRegistry(),
+        adapters=adapters if adapters is not None else ProviderAdapterRegistry(),
         write_policy=settings,
         # 同一轮核对使用调用方注入的固定瞬间；持久结果时间仍由 repository 在锁内
         # 读取 PostgreSQL clock_timestamp() 决定。

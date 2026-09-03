@@ -12,6 +12,7 @@ from taskiq import Context, TaskiqDepends, TaskiqEvents
 
 from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
+from ai_employee.application.ports.trusted_actions import TrustedActionAdapterRegistry
 from ai_employee.application.use_cases.approvals import ApprovalProposalStore
 from ai_employee.application.use_cases.task_execution import (
     DurableTaskRunner,
@@ -49,7 +50,10 @@ from ai_employee.workers.privacy import AllDataDeletionCompleted, build_privacy_
 from ai_employee.workers.reconcile_actions import execute_reconciliation_task
 from ai_employee.workers.sync_calendar import build_calendar_sync_task_step
 from ai_employee.workers.sync_mail import build_mail_sync_task_step
-from ai_employee.workers.trusted_actions import build_trusted_action_task_step
+from ai_employee.workers.trusted_actions import (
+    build_trusted_action_task_step,
+    build_worker_trusted_action_registry,
+)
 
 RETRY_DELAY_SECONDS = 5
 _MAX_RETRY_JITTER_MICROSECONDS = 1_000_000
@@ -366,6 +370,7 @@ def _build_trusted_action_task_runner(
     settings: Settings,
     approval_store: ApprovalProposalStore,
     resume: str | None,
+    adapters: TrustedActionAdapterRegistry,
 ) -> DurableTaskRunner:
     """构造仅使用可信动作 Store 与 checkpoint step 的 Worker Runner。
 
@@ -374,6 +379,7 @@ def _build_trusted_action_task_runner(
         settings: 当前 Worker 的租约、超时与 checkpoint 配置。
         approval_store: 共享的审批分类/中断确认端口。
         resume: 内容无关的审批唤醒值。
+        adapters: 当前 Worker 组合根固定的可信动作 registry；不会从 Taskiq 载荷读取。
 
     Returns:
         绑定 ``SqlAlchemyTrustedActionTaskExecutionStore`` 的持久执行用例。
@@ -397,6 +403,7 @@ def _build_trusted_action_task_runner(
                 approval_store=approval_store,
                 resume=resume,
                 max_transient_retries=DEFAULT_RETRY_COUNT,
+                adapters=adapters,
             ),
         ),
     )
@@ -490,10 +497,17 @@ async def execute_task(
                 task_kind == "trusted_action"
                 and authoritative_status == TaskStatus.RECONCILING.value
             ):
+                # registry 只由 Worker 组合根构造并显式传入；不能让专用核对入口自行创建
+                # 空 registry，否则生产中的 reconciling 任务会永远看不到已组装 adapter。
+                trusted_action_adapters = build_worker_trusted_action_registry(
+                    session_factory=session_factory,
+                    settings=settings,
+                )
                 await execute_reconciliation_task(
                     task_id=parsed_task_id,
                     session_factory=session_factory,
                     settings=settings,
+                    adapters=trusted_action_adapters,
                 )
                 return
             if (
@@ -546,11 +560,16 @@ async def execute_task(
                     ),
                 )
             elif task_kind == "trusted_action":
+                trusted_action_adapters = build_worker_trusted_action_registry(
+                    session_factory=session_factory,
+                    settings=settings,
+                )
                 runner = _build_trusted_action_task_runner(
                     session_factory=session_factory,
                     settings=settings,
                     approval_store=approval_store,
                     resume=resume,
+                    adapters=trusted_action_adapters,
                 )
             else:
                 # 明确读到非 trusted kind 时保留既有 M1 通用路由；None 也只会让

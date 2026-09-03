@@ -167,6 +167,32 @@ class TrustedActionTaskStep:
         )
 
 
+def build_worker_trusted_action_registry(
+    *,
+    session_factory: ManagedAsyncSessionMaker,
+    settings: Settings,
+) -> TrustedActionAdapterRegistry:
+    """构造 Worker 进程使用的固定可信动作 registry 组合根。
+
+    Args:
+        session_factory: 当前消息拥有的数据库工厂；未来 provider adapter 可通过受控的
+            credential/session 端口使用它，但不得把连接或令牌放入 Taskiq 载荷。
+        settings: 当前进程已验证配置；真实写入开关仍由应用层 request-start 再次检查。
+
+    Returns:
+        当前已组装的、供应商无关的可信动作 registry。Task 21--24 的真实 Gmail、
+        Google Calendar、Microsoft mail/calendar adapter 应在本函数这一固定组合根接入。
+        在这些 adapter 尚未组装时返回空 registry，使 Worker 保持 fail-closed。
+
+    Notes:
+        这是显式的静态组合钩子，不提供运行时注册或队列级 adapter 注入。调用方按消息
+        生命周期构造它，并在同一消息 finally 中释放数据库工厂；registry 本身不得持有
+        未关闭的长生命周期资源。
+    """
+    del session_factory, settings
+    return ProviderAdapterRegistry()
+
+
 def build_trusted_action_task_step(
     *,
     session_factory: ManagedAsyncSessionMaker,
@@ -198,7 +224,7 @@ def build_trusted_action_task_step(
         构造发生在 Runner 已取得租约后的节点解析阶段，因此密钥读取或组合失败仍由
         当前 owner 的持久错误边界处理；本函数不会创建第二个 SQLAlchemy Engine。
     """
-    registry = adapters or ProviderAdapterRegistry()
+    registry = adapters if adapters is not None else ProviderAdapterRegistry()
     command_cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
     workflow = TrustedActionExecutionUseCase(
         transactions=SqlAlchemyTrustedActionRepositoryFactory(session_factory, command_cipher),
@@ -239,4 +265,8 @@ def _trusted_action_identifiers(payload: Mapping[str, JsonValue]) -> tuple[UUID,
         raise ValueError("trusted action task input is invalid") from None
 
 
-__all__ = ["TrustedActionTaskStep", "build_trusted_action_task_step"]
+__all__ = [
+    "TrustedActionTaskStep",
+    "build_trusted_action_task_step",
+    "build_worker_trusted_action_registry",
+]

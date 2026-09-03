@@ -1,5 +1,6 @@
 """在合成 PostgreSQL 上验证未知结果的有界只读核对与终态收敛。"""
 
+import base64
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,8 @@ from ai_employee.infrastructure.db.repositories.trusted_actions import (
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.integrations.registry import ProviderAdapterRegistry
+from ai_employee.workers import execute_task as execute_task_module
+from ai_employee.workers import reconcile_actions as reconcile_actions_module
 
 # 复用 Task 19 已验证的合成 seed/adapter；这些 helper 只生成合成账号和内容，绝不触达
 # Google/Microsoft。把 fixture 保持在既有测试模块可避免再次手工复制完整外键骨架。
@@ -118,6 +121,187 @@ async def _scheduled_for(database_url: str, seed: _Seed) -> datetime:
             return value.astimezone(UTC)
     finally:
         await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_injects_worker_registry_for_reconciliation(
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Taskiq 入口必须把固定 Worker registry 传给只读核对，不能退回空 registry。"""
+    seed = _Seed()
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.RECONCILING,
+        request_started_at=NOW,
+        task_status=TaskStatus.RECONCILING,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == seed.task_id)
+                .values(scheduled_for=NOW, lease_owner=None, lease_expires_at=None)
+            )
+    finally:
+        await session_factory.dispose()
+
+    adapter = _RecordingAdapter(_outcome(ProviderWriteOutcomeKind.CONFIRMED_APPLIED))
+    registry = ProviderAdapterRegistry(google_mail_action=adapter)
+    key_file = tmp_path / "worker-master-key"
+    key_file.write_text(
+        base64.urlsafe_b64encode(b"x" * 32).decode("ascii"),
+        encoding="utf-8",
+    )
+    worker_settings = Settings(
+        _env_file=None,
+        database_url=str(database_url),
+        checkpoint_database_url=str(database_url).replace("+asyncpg", ""),
+        app_master_key_file=key_file,
+    )
+    captured: dict[str, object] = {}
+
+    def build_registry(*, settings: Settings, session_factory: object) -> ProviderAdapterRegistry:
+        """测试组合根注入固定 fake registry；不把它放进 Taskiq 消息。"""
+        captured["settings"] = settings
+        captured["session_factory"] = session_factory
+        return registry
+
+    monkeypatch.setattr(execute_task_module, "get_settings", lambda: worker_settings)
+
+    class FixedDateTime(datetime):
+        """让 Taskiq 入口与专用核对 worker 共享固定的到期瞬间。"""
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            """返回合成数据库中使用的固定 UTC 时间。"""
+            del tz
+            return NOW
+
+    monkeypatch.setattr(execute_task_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(reconcile_actions_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        execute_task_module,
+        "build_worker_trusted_action_registry",
+        build_registry,
+        raising=False,
+    )
+
+    await execute_task_module.execute_task.original_func(str(seed.task_id))
+
+    assert captured["settings"] is worker_settings
+    assert captured["session_factory"] is not None
+    assert adapter.reconcile_calls == 1
+    assert adapter.write_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_reconciliation_lease_is_recovered_without_provider_write(
+    database_url: str,
+) -> None:
+    """owner 非空但 expiry 为空的损坏租约必须清理并重新建立只读投递。"""
+    seed = _Seed()
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.RECONCILING,
+        request_started_at=NOW,
+        task_status=TaskStatus.RECONCILING,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == seed.task_id)
+                .values(
+                    scheduled_for=NOW,
+                    lease_owner="orphaned-reconciliation-owner",
+                    lease_expires_at=None,
+                )
+            )
+        store = SqlAlchemyTrustedActionReconciliationRecoveryStore(session_factory)
+        recovered = await store.recover_due_reconciliations(now=NOW, limit=10)
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+            events = (
+                await session.scalars(
+                    select(OutboxEventModel).where(
+                        OutboxEventModel.aggregate_id == seed.task_id,
+                        OutboxEventModel.topic == "task.execute",
+                    )
+                )
+            ).all()
+        async with session_factory.begin() as session:
+            claimed = await SqlAlchemyTrustedActionRepository(
+                session, ACTION_CIPHER
+            ).claim_reconciliation(
+                task_id=seed.task_id,
+                lease_owner="recovered-reconciliation-owner",
+                now=NOW,
+                lease_expires_at=NOW + timedelta(minutes=1),
+            )
+    finally:
+        await session_factory.dispose()
+
+    assert recovered == 1
+    assert task is not None
+    assert task.status == TaskStatus.RECONCILING.value
+    assert task.lease_owner is None
+    assert task.lease_expires_at is None
+    assert len(events) == 1
+    assert claimed is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lease_expires_at", "expected_recovered"),
+    [
+        (NOW + timedelta(minutes=1), 0),
+        (NOW - timedelta(seconds=1), 1),
+    ],
+)
+async def test_reconciliation_recovery_preserves_active_and_expired_lease_rules(
+    database_url: str,
+    lease_expires_at: datetime,
+    expected_recovered: int,
+) -> None:
+    """正常活动租约仍受保护，已过期租约仍可被既有恢复路径接管。"""
+    seed = _Seed()
+    await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.RECONCILING,
+        request_started_at=NOW,
+        task_status=TaskStatus.RECONCILING,
+    )
+    session_factory = build_session_factory(database_url)
+    try:
+        async with session_factory.begin() as session:
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == seed.task_id)
+                .values(
+                    scheduled_for=NOW,
+                    lease_owner="existing-reconciliation-owner",
+                    lease_expires_at=lease_expires_at,
+                )
+            )
+        recovered = await SqlAlchemyTrustedActionReconciliationRecoveryStore(
+            session_factory
+        ).recover_due_reconciliations(now=NOW, limit=10)
+        async with session_factory() as session:
+            task = await session.get(TaskRunModel, seed.task_id)
+    finally:
+        await session_factory.dispose()
+
+    assert recovered == expected_recovered
+    assert task is not None
+    assert task.lease_owner == "existing-reconciliation-owner"
+    assert task.lease_expires_at == lease_expires_at
 
 
 @pytest.mark.asyncio
