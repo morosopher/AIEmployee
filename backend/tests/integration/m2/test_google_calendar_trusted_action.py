@@ -91,6 +91,8 @@ async def test_registry_exposes_calendar_action_and_reconciliation_is_read_only(
     second = await adapter.reconcile(_command(), _execution())
 
     assert first.kind is ProviderWriteOutcomeKind.UNKNOWN
-    assert second.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    # 写请求已可能到达供应商；随后精确 GET 的 404 不能排除事件写入后又被删除，
+    # 因此只能保留 unknown 并交给有界核对/人工确认，不能伪造“从未应用”。
+    assert second.kind is ProviderWriteOutcomeKind.UNKNOWN
     assert post.call_count == 1
     assert get.call_count == 1

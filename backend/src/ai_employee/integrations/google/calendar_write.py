@@ -49,6 +49,9 @@ GOOGLE_CALENDAR_WRITE_CONNECT_TIMEOUT_SECONDS = 3.0
 GOOGLE_CALENDAR_RETRY_AFTER_CAP_SECONDS = 300
 """持久化 Retry-After 允许的最大秒数。"""
 
+_GOOGLE_EVENT_STATUSES = frozenset({"confirmed", "tentative", "cancelled"})
+"""Google Event ``status`` 文档允许的完整枚举。"""
+
 _RefreshAccessToken = Callable[[], Awaitable[str]]
 
 
@@ -144,7 +147,8 @@ class GoogleCalendarWriteAdapter:
 
         Returns:
             事件与 operation/期望状态及版本均匹配时为 ``confirmed_applied``；明确的
-            404 返回 ``confirmed_not_applied``，其它缺少证据或冲突情况为 ``unknown``。
+            404 或其它缺少证据、冲突情况均为 ``unknown``。写请求开始后的“不存在”
+            不能排除资源曾被写入后又删除，因此绝不据此证明本次操作未应用。
 
         Raises:
             TypeError: command 或 execution 不是可信领域类型。
@@ -172,9 +176,9 @@ class GoogleCalendarWriteAdapter:
             )
         request_id = _provider_request_id(response)
         if response.status_code == 404:
-            # 精确 resource GET 的 404 是供应商明确证明目标不存在；上层仍会保留审计事实，
-            # 不会据此自动创建替代事件。
-            return _not_applied_outcome(
+            # reconcile 只会发生在写请求已经可能离开进程之后。当前资源不存在无法证明
+            # 历史写入从未生效（事件可能随后被删除），所以只能等待后续核对或人工结论。
+            return _unknown_outcome(
                 correlation_id=correlation_id,
                 provider_request_id=request_id,
                 error_code="google_calendar_event_not_found",
@@ -440,6 +444,14 @@ class GoogleCalendarWriteAdapter:
                 provider_request_id=read_request_id,
                 error_code="google_calendar_reconciliation_mismatch",
             )
+        if not _version_is_confirmed(payload, command):
+            # 409 只说明稳定 ID 已存在；缺少安全 ETag 时无法证明读到的是一个可审计的
+            # 供应商版本，不能仅凭字段相似就把未知外部副作用提升为成功。
+            return _unknown_outcome(
+                correlation_id=correlation_id,
+                provider_request_id=read_request_id,
+                error_code="google_calendar_version_unconfirmed",
+            )
         provider_id = _safe_identifier(payload.get("id"))
         if provider_id != command.client_event_id:
             return _unknown_outcome(
@@ -650,7 +662,7 @@ def _current_event_precondition_error(
     payload: Mapping[str, object],
     command: CalendarCommand,
 ) -> str | None:
-    """检查更新前供应商事件的删除、重复、权限和 ETag 事实。"""
+    """严格检查更新前供应商事件的删除、重复、权限和 ETag 事实。"""
     if not isinstance(command, (CalendarUpdateCommand, CalendarRestoreCommand)):
         raise TypeError("calendar.create cannot use update precondition")
     # 与执行入口保持同一精确类型约束，同时让类型检查器收窄公开 CalendarCommand alias。
@@ -659,16 +671,9 @@ def _current_event_precondition_error(
     event_id = _safe_identifier(payload.get("id"))
     if event_id != command.provider_event_id:
         return "google_calendar_current_event_mismatch"
-    if payload.get("deleted") is True or payload.get("status") == "cancelled":
-        return "google_calendar_event_deleted"
-    recurrence = payload.get("recurrence")
-    recurring_id = payload.get("recurringEventId")
-    if (isinstance(recurrence, list) and len(recurrence) > 0) or (
-        isinstance(recurring_id, str) and recurring_id != ""
-    ):
-        return "google_calendar_recurring_event_unsupported"
-    if payload.get("locked") is True or payload.get("canEdit") is False:
-        return "google_calendar_event_not_editable"
+    fact_error = _provider_event_fact_error(payload)
+    if fact_error is not None:
+        return fact_error
     current_etag = _safe_identifier(payload.get("etag"))
     if current_etag is None:
         return "google_calendar_event_version_missing"
@@ -678,7 +683,11 @@ def _current_event_precondition_error(
 
 
 def _event_matches_command(payload: Mapping[str, object], command: CalendarCommand) -> bool:
-    """验证核对事件的 operation 关联与所有冻结可写字段。"""
+    """验证核对事件的严格供应商事实、operation 关联与全部冻结可写字段。"""
+    if _provider_event_fact_error(payload) is not None:
+        # 核对阶段没有再次写入的机会；任何畸形、矛盾或 M2 不支持的事件事实都必须
+        # 保持 unknown，不能让 Python 的真值/equality 规则把 ``0`` 等值当作布尔事实。
+        return False
     expected_id = _target_event_id(command)
     if _safe_identifier(payload.get("id")) != expected_id:
         return False
@@ -702,13 +711,69 @@ def _event_matches_command(payload: Mapping[str, object], command: CalendarComma
         return False
     if not _time_matches(payload.get("end"), command.ends_at, command.timezone, command.all_day):
         return False
-    if not _attendees_match(payload.get("attendees"), command.attendees):
-        return False
-    if payload.get("deleted") is True or payload.get("status") == "cancelled":
-        return False
-    if payload.get("recurrence") not in (None, [], ()):
-        return False
-    return payload.get("recurringEventId") in (None, "")
+    return _attendees_match(payload.get("attendees"), command.attendees)
+
+
+def _provider_event_fact_error(payload: Mapping[str, object]) -> str | None:
+    """收窄 Google Event 可写性事实并返回稳定的 fail-closed 错误码。
+
+    Google 的这些字段均可在普通非重复事件上省略；一旦出现，就必须严格符合 JSON
+    schema。先验证全部形状再解释语义，可避免 ``0 == False``、字符串 ``"false"`` 或
+    畸形 recurrence 被当成安全缺省。有效但已删除、重复或不可编辑的事件继续使用既有
+    领域错误；无法解释的第三方响应统一返回不含原值的固定错误。
+
+    Args:
+        payload: 已确认顶层为 JSON object 的未信任供应商事件。
+
+    Returns:
+        ``None`` 表示这些事实可安全解释为普通可编辑事件；否则返回稳定错误码。
+    """
+    for field_name in ("deleted", "locked", "canEdit"):
+        if field_name in payload and type(payload[field_name]) is not bool:
+            return "google_calendar_malformed_response"
+
+    status: str | None = None
+    if "status" in payload:
+        raw_status = payload["status"]
+        if type(raw_status) is not str or raw_status not in _GOOGLE_EVENT_STATUSES:
+            return "google_calendar_malformed_response"
+        status = raw_status
+
+    recurrence: list[object] | None = None
+    if "recurrence" in payload:
+        raw_recurrence = payload["recurrence"]
+        if type(raw_recurrence) is not list:
+            return "google_calendar_malformed_response"
+        recurrence = cast(list[object], raw_recurrence)
+        if any(
+            type(rule) is not str
+            or not rule
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in rule)
+            for rule in recurrence
+        ):
+            return "google_calendar_malformed_response"
+
+    recurring_id: str | None = None
+    if "recurringEventId" in payload:
+        raw_recurring_id = payload["recurringEventId"]
+        if raw_recurring_id is None:
+            recurring_id = None
+        elif type(raw_recurring_id) is not str:
+            return "google_calendar_malformed_response"
+        elif raw_recurring_id == "":
+            recurring_id = ""
+        else:
+            recurring_id = _safe_identifier(raw_recurring_id)
+            if recurring_id is None:
+                return "google_calendar_malformed_response"
+
+    if payload.get("deleted") is True or status == "cancelled":
+        return "google_calendar_event_deleted"
+    if recurrence or recurring_id:
+        return "google_calendar_recurring_event_unsupported"
+    if payload.get("locked") is True or payload.get("canEdit") is False:
+        return "google_calendar_event_not_editable"
+    return None
 
 
 def _version_is_confirmed(payload: Mapping[str, object], command: CalendarCommand) -> bool:

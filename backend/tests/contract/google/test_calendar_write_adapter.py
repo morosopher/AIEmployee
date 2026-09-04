@@ -316,6 +316,41 @@ async def test_create_409_reconciles_exact_event_without_second_post() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    "etag_value",
+    (
+        None,
+        "",
+        "   ",
+        42,
+    ),
+)
+async def test_create_409_requires_safe_etag_before_confirming_duplicate(
+    etag_value: object,
+) -> None:
+    """409 后的重复事件必须有安全、非空 ETag 才能确认已应用。"""
+    create_route = respx.post(
+        f"{GOOGLE_CALENDAR_API_BASE_URL}/calendars/{CALENDAR_ID}/events"
+    ).mock(return_value=httpx.Response(409))
+    reconcile_route = respx.get(
+        f"{GOOGLE_CALENDAR_API_BASE_URL}/calendars/{CALENDAR_ID}/events/{calendar_client_event_id(OPERATION_ID)}"
+    )
+    payload = _fixture()
+    if etag_value is None:
+        payload.pop("etag", None)
+    else:
+        payload["etag"] = etag_value
+    reconcile_route.mock(return_value=httpx.Response(200, json=payload))
+
+    outcome = await _adapter().execute(_create())
+
+    assert create_route.call_count == 1
+    assert reconcile_route.call_count == 1
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_reconcile_gets_exact_event_and_never_writes() -> None:
     """只读核对验证 operation 关联和期望字段，且不会发出 POST/PUT。"""
     get_route = respx.get(GOOGLE_EVENT_URL).mock(
@@ -330,6 +365,88 @@ async def test_reconcile_gets_exact_event_and_never_writes() -> None:
     assert get_route.call_count == 1
     assert post_route.call_count == 0
     assert put_route.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reconcile_404_is_unknown_after_write_may_have_been_sent() -> None:
+    """写请求后的 404 只能说明当前不存在，不能证明本次写入未应用。"""
+    get_route = respx.get(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(404))
+
+    outcome = await _adapter().reconcile(_update(), _execution(_update()))
+
+    assert get_route.call_count == 1
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_preflight_404_remains_confirmed_not_applied() -> None:
+    """尚未发送 PUT 的初始 GET 404 仍可安全确认未应用。"""
+    get_route = respx.get(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(404))
+    put_route = respx.put(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+
+    outcome = await _adapter().execute(_update())
+
+    assert get_route.call_count == 1
+    assert put_route.call_count == 0
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("recurrence", "RRULE:FREQ=DAILY"),
+        ("recurrence", {"rule": "RRULE:FREQ=DAILY"}),
+        ("recurringEventId", 42),
+        ("recurringEventId", ["series-1"]),
+        ("locked", "false"),
+        ("locked", 0),
+        ("canEdit", "true"),
+        ("canEdit", 1),
+        ("deleted", "false"),
+        ("deleted", 0),
+        ("status", "not-a-google-event-status"),
+        ("status", False),
+    ),
+)
+async def test_update_rejects_malformed_provider_event_facts_before_put(
+    field: str,
+    value: object,
+) -> None:
+    """当前事件事实畸形时必须 fail closed，绝不能进入 PUT。"""
+    current = {"id": EVENT_ID, "etag": '"etag-1"', field: value}
+    respx.get(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(200, json=current))
+    put_route = respx.put(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+
+    outcome = await _adapter().execute(_update())
+
+    assert outcome.kind in {
+        ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED,
+        ProviderWriteOutcomeKind.UNKNOWN,
+    }
+    assert put_route.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("status", "not-a-google-event-status"), ("deleted", "false"), ("locked", 0)),
+)
+async def test_reconcile_rejects_malformed_provider_event_facts(
+    field: str,
+    value: object,
+) -> None:
+    """核对路径遇到畸形布尔或状态事实时不能误报已应用。"""
+    payload = {**_fixture(), "id": EVENT_ID, field: value}
+    respx.get(GOOGLE_EVENT_URL).mock(return_value=httpx.Response(200, json=payload))
+
+    outcome = await _adapter().reconcile(_update(), _execution(_update()))
+
+    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
 
 
 @pytest.mark.asyncio
