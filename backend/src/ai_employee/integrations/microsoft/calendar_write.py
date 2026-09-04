@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import parse_qsl, quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -71,12 +72,27 @@ _SAFE_OUTLOOK_HOSTS = frozenset(
         "outlook.office365.com",
     }
 )
-_RECONCILE_SELECT = (
+_EVENT_RESPONSE_SELECT = (
     "id,transactionId,subject,body,location,start,end,isAllDay,attendees,type,"
     "seriesMasterId,recurrence,isCancelled,isOrganizer,changeKey,webLink"
 )
+"""严格确认事件状态所需的最小 Graph 属性集合；ETag 由 OData metadata 单独返回。"""
 
 _RefreshAccessToken = Callable[[], Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _GraphVersion:
+    """保存可比较的 canonical token 与可直接发送的当前条件 token。
+
+    Attributes:
+        canonical: 去掉合法 ETag wrapper 后的精确 opaque token，只用于恒等比较。
+        conditional: 当前 Graph 响应提供且经严格校验的原始 ETag/changeKey，用于
+            ``If-Match``；永不从冻结 base 重新拼装。
+    """
+
+    canonical: str
+    conditional: str
 
 
 def validate_graph_notification_policy(
@@ -113,6 +129,8 @@ class MicrosoftCalendarWriteAdapter:
     """执行 Graph 日历创建、条件更新/恢复及只读结果核对。
 
     Args:
+        connection_id: bearer token 所属的精确 Microsoft 连接；所有命令入口都必须与其
+            恒等匹配，防止多连接场景把一个账户的凭据用于另一个账户的冻结命令。
         access_token: 已由外层 OAuth coordinator 解密并校验的短期 bearer token。
         client: 可选注入的 HTTPX client，主要供完全合成的契约测试使用。
         refresh_access_token: 统一组合签名保留项；adapter 绝不隐式调用它，以免 401 或
@@ -124,11 +142,15 @@ class MicrosoftCalendarWriteAdapter:
     def __init__(
         self,
         *,
+        connection_id: UUID,
         access_token: str,
         client: httpx.AsyncClient | None = None,
         refresh_access_token: _RefreshAccessToken | None = None,
     ) -> None:
         """保存受控连接事实，不触发网络或 OAuth 刷新。"""
+        if type(connection_id) is not UUID:
+            raise TypeError("Microsoft Calendar connection_id must be UUID")
+        self._connection_id = connection_id
         self._access_token = _require_token(access_token)
         self._client = client
         self._refresh_access_token = refresh_access_token
@@ -151,7 +173,7 @@ class MicrosoftCalendarWriteAdapter:
             TypeError: 命令不是精确日历命令类型。
             ValueError: 供应商标识或时间字段不能安全表达。
         """
-        normalized = _validated_calendar_command(command)
+        normalized = self._validated_bound_command(command)
         validate_graph_notification_policy(
             attendees=normalized.attendees,
             policy=normalized.notification_policy,
@@ -175,7 +197,7 @@ class MicrosoftCalendarWriteAdapter:
             TypeError: 命令不是精确日历类型。
             ValueError: 冻结字段不能安全映射到 Graph。
         """
-        normalized = _validated_calendar_command(command)
+        normalized = self._validated_bound_command(command)
         validate_graph_notification_policy(
             attendees=normalized.attendees,
             policy=normalized.notification_policy,
@@ -194,7 +216,7 @@ class MicrosoftCalendarWriteAdapter:
         execution: ExecutionReference,
     ) -> ProviderWriteOutcome:
         """只读核对精确事件或创建窗口，绝不重放任何日历写请求。"""
-        normalized = _validated_calendar_command(command)
+        normalized = self._validated_bound_command(command)
         validate_graph_notification_policy(
             attendees=normalized.attendees,
             policy=normalized.notification_policy,
@@ -227,6 +249,28 @@ class MicrosoftCalendarWriteAdapter:
         update = cast(CalendarUpdateCommand | CalendarRestoreCommand, normalized)
         return await self._reconcile_exact_event(update, update.provider_event_id)
 
+    def _validated_bound_command(self, command: TrustedCommand) -> CalendarCommand:
+        """验证冻结命令完整且属于当前 bearer token 的精确连接。
+
+        Args:
+            command: 由审批或执行用例提供的冻结可信命令。
+
+        Returns:
+            已通过供应商字段和连接归属校验的日历命令。
+
+        Raises:
+            TypeError: 命令类型或字段类型不满足供应商边界。
+            ValueError: 命令连接与当前凭据连接不一致，或命令字段不合法。
+
+        Notes:
+            三个公开入口都必须先经过本方法，确保连接不匹配时不会构造或发送任何
+            Graph 请求；registry 即使按 provider/action 返回了错误实例也会在这里闭锁。
+        """
+        normalized = _validated_calendar_command(command)
+        if normalized.connection_id != self._connection_id:
+            raise ValueError("Microsoft Calendar command connection binding is invalid")
+        return normalized
+
     async def _reconcile_exact_event(
         self,
         command: CalendarCommand,
@@ -235,7 +279,9 @@ class MicrosoftCalendarWriteAdapter:
         """读取单个已绑定事件，并要求完整状态与版本证明本次写入。"""
         correlation_id = str(command.operation_id)
         response, transport_error = await self._request_read(
-            _event_url(command.calendar_id, event_id)
+            _event_url(command.calendar_id, event_id),
+            params={"$select": _EVENT_RESPONSE_SELECT},
+            headers=_event_response_headers(command),
         )
         if transport_error is not None or response is None:
             return _unknown_outcome(
@@ -274,7 +320,7 @@ class MicrosoftCalendarWriteAdapter:
         params: Mapping[str, str] | None = {
             "startDateTime": start,
             "endDateTime": end,
-            "$select": _RECONCILE_SELECT,
+            "$select": _EVENT_RESPONSE_SELECT,
         }
         seen_urls: set[str] = set()
         candidates: list[Mapping[str, object]] = []
@@ -393,6 +439,7 @@ class MicrosoftCalendarWriteAdapter:
                 "POST",
                 _events_url(command.calendar_id),
                 json=_event_body(command, include_transaction_id=True),
+                headers=_event_response_headers(command),
             )
         except (httpx.ConnectTimeout, httpx.ConnectError):
             # 建连阶段失败能证明请求字节没有到达 Graph，是唯一可直接安全重试的传输失败。
@@ -435,10 +482,17 @@ class MicrosoftCalendarWriteAdapter:
         """读取精确当前事件并只发送一次带版本条件的完整 PATCH。"""
         correlation_id = str(command.operation_id)
         event_url = _event_url(command.calendar_id, command.provider_event_id)
-        current, transport_error = await self._request_read(event_url)
+        current, transport_error = await self._request_read(
+            event_url,
+            params={"$select": _EVENT_RESPONSE_SELECT},
+            headers=_event_response_headers(command),
+        )
         if transport_error is not None or current is None:
-            return _unknown_outcome(
+            # 这里只是 PATCH 前的只读版本检查；无论 GET 是否已经到达 Graph，写请求都
+            # 尚未发送，因此可以证明本次外部写未应用并安全地交给持久重试策略。
+            return _not_applied_outcome(
                 correlation_id=correlation_id,
+                retryable=True,
                 error_code=transport_error or "microsoft_calendar_current_event_unavailable",
             )
         request_id = _provider_request_id(current)
@@ -458,6 +512,23 @@ class MicrosoftCalendarWriteAdapter:
                     else "microsoft_calendar_permission_required"
                 ),
             )
+        if current.status_code == 429:
+            return _not_applied_outcome(
+                correlation_id=correlation_id,
+                provider_request_id=request_id,
+                retryable=True,
+                retry_after_seconds=_retry_after(current),
+                error_code="microsoft_calendar_rate_limited",
+            )
+        if current.status_code >= 500:
+            # 供应商只拒绝或未完成前置 GET；PATCH 仍为零调用，所以服务恢复后可安全
+            # 重试整个动作，但 5xx 的语义不用于推断任何事件事实。
+            return _not_applied_outcome(
+                correlation_id=correlation_id,
+                provider_request_id=request_id,
+                retryable=True,
+                error_code="microsoft_calendar_current_event_unavailable",
+            )
         if current.status_code != 200:
             return _unknown_outcome(
                 correlation_id=correlation_id,
@@ -471,12 +542,12 @@ class MicrosoftCalendarWriteAdapter:
                 provider_request_id=request_id,
                 error_code="microsoft_calendar_malformed_response",
             )
-        precondition_error = _current_event_precondition_error(payload, command)
-        if precondition_error is not None:
+        precondition_error, current_version = _current_event_precondition(payload, command)
+        if precondition_error is not None or current_version is None:
             return _not_applied_outcome(
                 correlation_id=correlation_id,
                 provider_request_id=request_id,
-                error_code=precondition_error,
+                error_code=(precondition_error or "microsoft_calendar_event_version_invalid"),
             )
 
         try:
@@ -484,7 +555,10 @@ class MicrosoftCalendarWriteAdapter:
                 "PATCH",
                 event_url,
                 json=_event_body(command, include_transaction_id=False),
-                headers={"If-Match": command.base_etag},
+                headers={
+                    **_event_response_headers(command),
+                    "If-Match": current_version.conditional,
+                },
             )
         except (httpx.ConnectTimeout, httpx.ConnectError):
             return _not_applied_outcome(
@@ -677,8 +751,8 @@ def graph_event_time(
     """把冻结日历时间映射为 Graph ``dateTimeTimeZone``。
 
     全天事件直接把领域 ``date`` 拼成目标时区的本地午夜，不先转 UTC；定时事件按明确
-    IANA 区域转换为本地墙上时间后移除 offset，因为 Graph 通过独立 Windows ``timeZone``
-    字段解释该值。
+    IANA 区域转换为本地墙上时间。Graph 的 ``dateTimeTimeZone`` 写入形状不携带 fold，
+    因此回拨重叠小时会在移除 offset 前被拒绝，不能让两个冻结瞬间压缩成相同载荷。
 
     Args:
         value: 全天纯 ``date`` 或带 offset 的 ``datetime``。
@@ -689,7 +763,8 @@ def graph_event_time(
         可直接发送给 Graph 的 ``dateTime``/``timeZone`` 对象。
 
     Raises:
-        PermanentProviderError: IANA/Windows 映射未知或不能无损往返。
+        PermanentProviderError: IANA/Windows 映射未知、不能无损往返，或本地时刻有多个
+            DST fold 而 Graph 无法唯一表达。
         TypeError: 时间值与 ``all_day`` 表示不匹配。
         ValueError: 定时值没有明确瞬间或无法转换。
     """
@@ -709,9 +784,19 @@ def graph_event_time(
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timed calendar time must be timezone-aware")
     try:
-        local = value.astimezone(ZoneInfo(canonical_iana)).replace(tzinfo=None)
+        zone = ZoneInfo(canonical_iana)
+        expected_utc = value.astimezone(UTC)
+        local = value.astimezone(zone).replace(tzinfo=None)
+        candidates = _valid_local_candidates(local, zone)
     except (OverflowError, ValueError, ZoneInfoNotFoundError):
         raise ValueError("timed calendar time cannot be represented") from None
+    # Graph 写入只保留墙上时间和 Windows 区域，不保留 offset/fold。只有唯一候选且能
+    # 原样恢复冻结 UTC 瞬间时才可批准；回拨小时的两个 fold 均必须 fail closed。
+    if len(candidates) != 1 or candidates[0].astimezone(UTC) != expected_utc:
+        raise PermanentProviderError(
+            error_code="calendar_timezone_mapping_unsupported",
+            message="Calendar timezone mapping is unsupported",
+        )
     timespec = "microseconds" if local.microsecond else "seconds"
     return {
         "dateTime": local.isoformat(timespec=timespec),
@@ -827,29 +912,105 @@ def _reconciliation_read_error(status_code: int) -> str:
     return "microsoft_calendar_reconciliation_rejected"
 
 
-def _current_event_precondition_error(
+def _current_event_precondition(
     payload: Mapping[str, object],
     command: CalendarUpdateCommand | CalendarRestoreCommand,
-) -> str | None:
-    """检查条件 PATCH 前的精确身份、可写事实和冻结版本。"""
+) -> tuple[str | None, _GraphVersion | None]:
+    """检查条件 PATCH 前的身份、可写事实与 canonical 版本绑定。
+
+    Returns:
+        ``(error_code, current_version)``；只有 error 为空且版本存在时调用方才可
+        使用 provider 原始条件 token 发送 PATCH。
+    """
     if _safe_identifier(payload.get("id"), maximum=512) != command.provider_event_id:
-        return "microsoft_calendar_current_event_mismatch"
+        return "microsoft_calendar_current_event_mismatch", None
     fact_error = _provider_event_fact_error(payload)
     if fact_error is not None:
-        return fact_error
-    current_version = _provider_version(payload)
-    if current_version is None:
-        return "microsoft_calendar_event_version_missing"
-    if current_version != command.base_etag:
-        return "calendar_event_version_conflict"
-    return None
+        return fact_error, None
+    current_version, version_error = _provider_version(payload)
+    if version_error is not None or current_version is None:
+        return version_error or "microsoft_calendar_event_version_invalid", None
+    base_version = _normalize_graph_version(command.base_etag, source="base")
+    if base_version is None:
+        return "microsoft_calendar_event_version_invalid", None
+    if current_version.canonical != base_version.canonical:
+        return "calendar_event_version_conflict", None
+    return None, current_version
 
 
-def _provider_version(payload: Mapping[str, object]) -> str | None:
-    """优先读取 Graph ETag，仅在其缺席时退回同一事件的 changeKey。"""
-    if "@odata.etag" in payload:
-        return _safe_identifier(payload.get("@odata.etag"), maximum=255)
-    return _safe_identifier(payload.get("changeKey"), maximum=255)
+def _normalize_graph_version(
+    value: object,
+    *,
+    source: Literal["etag", "change_key", "base"],
+) -> _GraphVersion | None:
+    """严格解析 Graph ETag wrapper、裸 changeKey 或冻结 base version。
+
+    Args:
+        value: 未信任的 provider 字段或已解密冻结 base。
+        source: ``etag`` 只接受强/弱 quoted ETag，``change_key`` 只接受裸 token，
+            ``base`` 接受这两种已冻结表示。
+
+    Returns:
+        可安全比较及用于条件 Header 的版本；空、超长、非 ASCII、控制字符、通配符、
+        多值逗号、畸形 wrapper 或嵌套引号均返回 ``None``。
+    """
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > 255
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+    ):
+        return None
+    raw = cast(str, value)
+    if source == "change_key":
+        if '"' in raw or raw.startswith("W/"):
+            return None
+        canonical = raw
+    elif raw.startswith('W/"'):
+        if len(raw) < 5 or not raw.endswith('"'):
+            return None
+        canonical = raw[3:-1]
+    elif raw.startswith('"'):
+        if len(raw) < 3 or not raw.endswith('"'):
+            return None
+        canonical = raw[1:-1]
+    else:
+        if source == "etag" or raw.startswith("W/"):
+            return None
+        canonical = raw
+    # DQUOTE 会把一个 validator 改写成嵌套/多段语法；逗号和通配符也不能从版本
+    # 字段升级为 If-Match 的多值或任意匹配语义。
+    if not canonical or canonical == "*" or '"' in canonical or "," in canonical:
+        return None
+    return _GraphVersion(canonical=canonical, conditional=raw)
+
+
+def _provider_version(
+    payload: Mapping[str, object],
+) -> tuple[_GraphVersion | None, str | None]:
+    """交叉验证同一 Graph event 的 ETag 与 changeKey，不允许择一掩盖冲突。
+
+    Returns:
+        ``(version, error_code)``。两个字段均缺失返回稳定 missing；任一存在字段
+        畸形或 canonical 不同返回稳定 invalid；等价时优先保留文档化 ETag wrapper
+        作为条件 token，仅有 changeKey 时保留其裸值。
+    """
+    raw_etag = payload.get("@odata.etag")
+    raw_change_key = payload.get("changeKey")
+    has_etag = raw_etag is not None
+    has_change_key = raw_change_key is not None
+    if not has_etag and not has_change_key:
+        return None, "microsoft_calendar_event_version_missing"
+
+    etag = _normalize_graph_version(raw_etag, source="etag") if has_etag else None
+    change_key = (
+        _normalize_graph_version(raw_change_key, source="change_key") if has_change_key else None
+    )
+    if (has_etag and etag is None) or (has_change_key and change_key is None):
+        return None, "microsoft_calendar_event_version_invalid"
+    if etag is not None and change_key is not None and etag.canonical != change_key.canonical:
+        return None, "microsoft_calendar_event_version_invalid"
+    return etag or change_key, None
 
 
 def _success_from_response(
@@ -911,6 +1072,7 @@ def _confirmed_event_outcome(
     """共享成功/核对确认规则，只有完整字段、关联和版本事实才提升为 applied。"""
     correlation_id = str(command.operation_id)
     provider_id = _safe_identifier(payload.get("id"), maximum=512)
+    provider_version, provider_version_error = _provider_version(payload)
     error_code: str | None = None
     if provider_id is None or not _event_matches_command(payload, command):
         error_code = mismatch_error
@@ -918,11 +1080,12 @@ def _confirmed_event_outcome(
         error_code = "microsoft_calendar_resource_mismatch"
     elif type(command) is CalendarCreateCommand and payload.get("transactionId") != correlation_id:
         error_code = "microsoft_calendar_correlation_mismatch"
-    elif not _has_safe_version(payload):
+    elif provider_version_error is not None or provider_version is None:
         error_code = "microsoft_calendar_version_unconfirmed"
     elif require_new_version:
         update = cast(CalendarUpdateCommand | CalendarRestoreCommand, command)
-        if _provider_version(payload) == update.base_etag:
+        base_version = _normalize_graph_version(update.base_etag, source="base")
+        if base_version is None or provider_version.canonical == base_version.canonical:
             error_code = "microsoft_calendar_version_unconfirmed"
     if error_code is not None:
         return _unknown_outcome(
@@ -1117,18 +1280,6 @@ def _attendees_match(value: object, expected: tuple[str, ...]) -> bool:
 def _optional_text_matches(value: object, expected: str | None) -> bool:
     """把冻结 None 与 Graph 空字符串视为同一显式清空状态。"""
     return value == expected if expected is not None else value in {None, ""}
-
-
-def _has_safe_version(payload: Mapping[str, object]) -> bool:
-    """要求 @odata.etag 或 changeKey 至少提供一个安全非空版本。"""
-    found = False
-    for field_name in ("@odata.etag", "changeKey"):
-        if field_name not in payload or payload[field_name] is None:
-            continue
-        found = True
-        if _safe_identifier(payload[field_name], maximum=255) is None:
-            return False
-    return found
 
 
 def _json_object(response: httpx.Response) -> Mapping[str, object] | None:

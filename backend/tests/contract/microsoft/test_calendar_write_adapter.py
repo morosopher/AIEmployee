@@ -23,7 +23,7 @@ from ai_employee.domain.calendar_actions import (
     NotificationPolicy,
     calendar_client_event_id,
 )
-from ai_employee.domain.errors import StateConflictError
+from ai_employee.domain.errors import PermanentProviderError, StateConflictError
 from ai_employee.integrations.microsoft.calendar_write import (
     MICROSOFT_GRAPH_BASE_URL,
     MicrosoftCalendarWriteAdapter,
@@ -33,12 +33,22 @@ from ai_employee.integrations.microsoft.calendar_write import (
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 OPERATION_ID = UUID("00000000-0000-0000-0000-000000000001")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000002")
+OTHER_CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000008")
 SNAPSHOT_ID = UUID("00000000-0000-0000-0000-000000000003")
 CALENDAR_ID = "calendar-primary"
 EVENT_ID = "event-1"
 EVENTS_URL = f"{MICROSOFT_GRAPH_BASE_URL}/me/calendars/{CALENDAR_ID}/events"
 EVENT_URL = f"{EVENTS_URL}/{EVENT_ID}"
 CALENDAR_VIEW_URL = f"{MICROSOFT_GRAPH_BASE_URL}/me/calendars/{CALENDAR_ID}/calendarView"
+EVENT_RESPONSE_PREFER = 'outlook.timezone="China Standard Time", outlook.body-content-type="text"'
+EXACT_EVENT_SELECT = (
+    "id,transactionId,subject,body,location,start,end,isAllDay,attendees,type,"
+    "seriesMasterId,recurrence,isCancelled,isOrganizer,changeKey,webLink"
+)
+EXACT_EVENT_QUERY = (
+    "%24select=id%2CtransactionId%2Csubject%2Cbody%2Clocation%2Cstart%2Cend%2CisAllDay%2C"
+    "attendees%2Ctype%2CseriesMasterId%2Crecurrence%2CisCancelled%2CisOrganizer%2CchangeKey%2CwebLink"
+)
 
 
 def _fixture() -> dict[str, object]:
@@ -195,7 +205,10 @@ def _execution(
 
 def _adapter() -> MicrosoftCalendarWriteAdapter:
     """构造只使用合成 bearer token 的写入 adapter。"""
-    return MicrosoftCalendarWriteAdapter(access_token="synthetic-access-token")
+    return MicrosoftCalendarWriteAdapter(
+        connection_id=CONNECTION_ID,
+        access_token="synthetic-access-token",
+    )
 
 
 def test_graph_rejects_notification_none_when_attendees_exist() -> None:
@@ -207,6 +220,56 @@ def test_graph_rejects_notification_none_when_attendees_exist() -> None:
         )
 
     assert raised.value.error_code == "calendar_notification_mapping_unsupported"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_rejects_command_from_another_connection_before_http() -> None:
+    """bearer token 与冻结命令连接不一致时必须在任何 Graph I/O 前拒绝。"""
+    route = respx.route().mock(return_value=httpx.Response(500))
+
+    with pytest.raises(
+        ValueError,
+        match="Microsoft Calendar command connection binding is invalid",
+    ):
+        await _adapter().execute(replace(_create(), connection_id=OTHER_CONNECTION_ID))
+
+    assert route.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("starts_at", "expected_utc"),
+    (
+        (
+            datetime.fromisoformat("2030-11-03T01:30:00-07:00"),
+            "2030-11-03T08:30:00+00:00",
+        ),
+        (
+            datetime.fromisoformat("2030-11-03T01:30:00-08:00"),
+            "2030-11-03T09:30:00+00:00",
+        ),
+    ),
+    ids=("first-fold", "second-fold"),
+)
+def test_approval_rejects_each_ambiguous_dst_fold(
+    starts_at: datetime,
+    expected_utc: str,
+) -> None:
+    """Graph 墙上时间无法区分回拨小时的两个真实瞬间，审批必须逐个拒绝。"""
+    # 两个期望 UTC 值由固定 offset 手工换算，不能借待测映射函数生成，否则相同缺陷
+    # 可能同时污染输入与断言并掩盖冻结瞬间碰撞。
+    assert starts_at.astimezone(UTC).isoformat() == expected_utc
+    command = replace(
+        _create(),
+        starts_at=starts_at,
+        ends_at=datetime.fromisoformat("2030-11-03T03:00:00-08:00"),
+        timezone="America/Los_Angeles",
+    )
+
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter().validate_for_approval(command)
+
+    assert raised.value.error_code == "calendar_timezone_mapping_unsupported"
 
 
 def test_validate_for_approval_is_pure_and_accepts_only_lossless_policies() -> None:
@@ -237,6 +300,9 @@ async def test_create_posts_transaction_id_to_exact_calendar_with_graph_timezone
     assert outcome.provider_resource_id == EVENT_ID
     request = route.calls[0].request
     assert dict(request.url.params) == {}
+    assert request.headers["Prefer"] == EVENT_RESPONSE_PREFER
+    assert "Synthetic calendar event" not in str(request.headers)
+    assert "attendee@example.test" not in str(request.headers)
     payload = json.loads(request.content)
     assert payload["transactionId"] == str(OPERATION_ID)
     assert payload["start"] == {
@@ -290,8 +356,27 @@ async def test_update_gets_exact_event_then_patches_complete_state_with_if_match
 
     assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
     assert get_route.call_count == 1
+    get_request = get_route.calls[0].request
     request = patch_route.calls[0].request
+    assert {
+        "prewrite_path": get_request.url.path,
+        "prewrite_params": dict(get_request.url.params),
+        "prewrite_query": get_request.url.query.decode("ascii"),
+        "prewrite_prefer": get_request.headers.get("Prefer"),
+        "patch_params": dict(request.url.params),
+        "patch_prefer": request.headers.get("Prefer"),
+    } == {
+        "prewrite_path": "/v1.0/me/calendars/calendar-primary/events/event-1",
+        "prewrite_params": {"$select": EXACT_EVENT_SELECT},
+        "prewrite_query": EXACT_EVENT_QUERY,
+        "prewrite_prefer": EVENT_RESPONSE_PREFER,
+        "patch_params": {},
+        "patch_prefer": EVENT_RESPONSE_PREFER,
+    }
     assert request.headers["If-Match"] == 'W/"etag-1"'
+    request_metadata = f"{get_request.url}\n{get_request.headers}\n{request.url}\n{request.headers}"
+    assert "Synthetic calendar event" not in request_metadata
+    assert "attendee@example.test" not in request_metadata
     payload = json.loads(request.content)
     assert set(payload) == {
         "subject",
@@ -309,17 +394,80 @@ async def test_update_gets_exact_event_then_patches_complete_state_with_if_match
 @pytest.mark.asyncio
 @respx.mock
 async def test_update_accepts_change_key_when_odata_etag_is_absent() -> None:
-    """Graph 仅返回 changeKey 时也必须规范为可比较版本并原样用于 If-Match。"""
+    """Graph 仅返回裸 changeKey 时须与弱 ETag base 等价并原样用于 If-Match。"""
     current = _current_event()
     current.pop("@odata.etag")
-    current["changeKey"] = "change-key-1"
+    current["changeKey"] = "etag-1"
     respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=current))
     patch_route = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
 
-    outcome = await _adapter().execute(_update(base_etag="change-key-1"))
+    outcome = await _adapter().execute(_update(base_etag='W/"etag-1"'))
 
     assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
-    assert patch_route.calls[0].request.headers["If-Match"] == "change-key-1"
+    assert patch_route.calls[0].request.headers["If-Match"] == "etag-1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_accepts_equivalent_strong_etag_and_change_key() -> None:
+    """强 ETag wrapper、裸 changeKey 与裸 base 的 canonical token 相同即可更新。"""
+    current = _current_event(etag='"etag-1"')
+    respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=current))
+    patch_route = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+
+    outcome = await _adapter().execute(_update(base_etag="etag-1"))
+
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
+    assert patch_route.calls[0].request.headers["If-Match"] == '"etag-1"'
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_rejects_conflicting_etag_and_change_key_before_patch() -> None:
+    """同一响应的 ETag/changeKey canonical token 冲突时不得择一覆盖并发事实。"""
+    current = _current_event()
+    current["changeKey"] = "etag-conflicting"
+    respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=current))
+    patch_route = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+
+    outcome = await _adapter().execute(_update())
+
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    assert outcome.retryable is False
+    assert outcome.error_code == "microsoft_calendar_event_version_invalid"
+    assert patch_route.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    ("version_fields", "base_etag"),
+    (
+        ({"@odata.etag": ""}, "etag-1"),
+        ({"@odata.etag": 'W/""'}, 'W/""'),
+        ({"@odata.etag": '"etag-1"nested"'}, '"etag-1"nested"'),
+        ({"changeKey": "etag-\x00"}, "etag-1"),
+    ),
+    ids=("empty", "empty-wrapper", "nested-quote", "control-character"),
+)
+async def test_update_rejects_malformed_provider_version_before_patch(
+    version_fields: dict[str, object],
+    base_etag: str,
+) -> None:
+    """空 token、空 wrapper、嵌套引号或控制字符均不得进入 If-Match。"""
+    current = _current_event()
+    current.pop("@odata.etag")
+    current.pop("changeKey")
+    current.update(version_fields)
+    respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=current))
+    patch_route = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+
+    outcome = await _adapter().execute(_update(base_etag=base_etag))
+
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+    assert outcome.retryable is False
+    assert outcome.error_code == "microsoft_calendar_event_version_invalid"
+    assert patch_route.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -381,6 +529,72 @@ async def test_restore_uses_same_current_get_and_conditional_patch_path() -> Non
     assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
     assert get_route.call_count == 1
     assert patch_route.calls[0].request.headers["If-Match"] == 'W/"etag-1"'
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    ("action", "read_result", "retryable", "retry_after", "error_code"),
+    (
+        ("update", "connect", True, None, "microsoft_connect_failed"),
+        ("restore", "timeout", True, None, "microsoft_timeout"),
+        ("update", 429, True, 12, "microsoft_calendar_rate_limited"),
+        ("restore", 503, True, None, "microsoft_calendar_current_event_unavailable"),
+        ("update", 401, False, None, "microsoft_reauthorization_required"),
+        ("restore", 403, False, None, "microsoft_calendar_permission_required"),
+    ),
+)
+async def test_prewrite_read_failure_proves_patch_not_applied(
+    action: str,
+    read_result: str | int,
+    retryable: bool,
+    retry_after: int | None,
+    error_code: str,
+) -> None:
+    """执行前只读失败只能描述读取不确定性，尚未调用的 PATCH 必定未应用。"""
+    get_route = respx.get(EVENT_URL)
+    if read_result == "connect":
+        get_route.mock(
+            side_effect=httpx.ConnectError(
+                "synthetic-sensitive-connect-error",
+                request=httpx.Request("GET", EVENT_URL),
+            )
+        )
+    elif read_result == "timeout":
+        get_route.mock(
+            side_effect=httpx.ReadTimeout(
+                "synthetic-sensitive-read-timeout",
+                request=httpx.Request("GET", EVENT_URL),
+            )
+        )
+    else:
+        headers = {"Retry-After": "12"} if read_result == 429 else None
+        get_route.mock(
+            return_value=httpx.Response(
+                read_result,
+                headers=headers,
+                text="synthetic-sensitive-read-response",
+            )
+        )
+    patch_route = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=_fixture()))
+    command = _update() if action == "update" else _restore()
+
+    outcome = await _adapter().execute(command)
+
+    assert get_route.call_count == 1
+    assert patch_route.call_count == 0
+    assert (
+        outcome.kind,
+        outcome.retryable,
+        outcome.retry_after_seconds,
+        outcome.error_code,
+    ) == (
+        ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED,
+        retryable,
+        retry_after,
+        error_code,
+    )
+    assert "synthetic-sensitive" not in str(outcome)
 
 
 @pytest.mark.asyncio
@@ -514,6 +728,14 @@ async def test_reconcile_prefers_persisted_resource_id_and_never_writes() -> Non
 
     assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
     assert get_route.call_count == 1
+    request = get_route.calls[0].request
+    assert request.url.path == "/v1.0/me/calendars/calendar-primary/events/event-1"
+    assert dict(request.url.params) == {"$select": EXACT_EVENT_SELECT}
+    assert request.url.query.decode("ascii") == EXACT_EVENT_QUERY
+    assert request.headers["Prefer"] == EVENT_RESPONSE_PREFER
+    request_metadata = f"{request.url}\n{request.headers}"
+    assert "Synthetic calendar event" not in request_metadata
+    assert "attendee@example.test" not in request_metadata
     assert post_route.call_count == 0
     assert patch_route.call_count == 0
 
@@ -585,9 +807,42 @@ async def test_reconcile_update_requires_new_version_and_complete_desired_state(
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_reconcile_same_update_version_remains_unknown() -> None:
-    """字段碰巧相同但版本仍是 base 不能证明本次 PATCH 已应用。"""
+@pytest.mark.parametrize(
+    ("etag", "change_key", "expected_kind"),
+    (
+        ('W/"etag-2"', "etag-2", ProviderWriteOutcomeKind.CONFIRMED_APPLIED),
+        ('W/"etag-2"', "etag-conflicting", ProviderWriteOutcomeKind.UNKNOWN),
+        ('W/"etag-2"nested"', None, ProviderWriteOutcomeKind.UNKNOWN),
+    ),
+    ids=("equivalent", "conflicting", "malformed"),
+)
+async def test_reconcile_cross_checks_all_provider_version_facts(
+    etag: str,
+    change_key: str | None,
+    expected_kind: ProviderWriteOutcomeKind,
+) -> None:
+    """核对只接受一致且严格的 provider version，不能忽略冲突或畸形备用字段。"""
+    payload = _fixture()
+    payload["@odata.etag"] = etag
+    if change_key is None:
+        payload.pop("changeKey")
+    else:
+        payload["changeKey"] = change_key
     command = _update()
+    respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=payload))
+
+    outcome = await _adapter().reconcile(command, _execution(command))
+
+    assert outcome.kind is expected_kind
+    if expected_kind is ProviderWriteOutcomeKind.UNKNOWN:
+        assert outcome.error_code == "microsoft_calendar_version_unconfirmed"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_reconcile_same_update_version_remains_unknown() -> None:
+    """字段碰巧相同且 provider wrapper 与裸 base 等价时不能证明 PATCH 已应用。"""
+    command = _update(base_etag="etag-1")
     respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=_current_event()))
 
     outcome = await _adapter().reconcile(command, _execution(command))
