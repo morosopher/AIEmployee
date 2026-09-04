@@ -5,6 +5,7 @@ import importlib.resources
 import importlib.util
 import io
 import zoneinfo
+from types import MappingProxyType
 
 import pytest
 
@@ -29,6 +30,36 @@ def test_bidirectional_mapping_is_deterministic(iana: str, windows: str) -> None
     module = _module()
     assert module.to_windows_timezone(iana) == windows
     assert module.to_iana_timezone(windows) == iana
+
+
+def test_iana_timezone_maps_to_graph_windows_zone() -> None:
+    """写入边界必须为常用 IANA 名称选择稳定的 Graph Windows 名称。"""
+    module = _module()
+
+    assert module.to_windows_timezone("Asia/Shanghai") == "China Standard Time"
+    assert module.to_windows_timezone("America/Los_Angeles") == "Pacific Standard Time"
+
+
+def test_write_mapping_rejects_non_round_tripping_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IANA 到 Windows 的选择若不能原样映回 canonical IANA，审批前必须拒绝。"""
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "IANA_TO_WINDOWS",
+        MappingProxyType({"Asia/Shanghai": "Synthetic Windows Zone"}),
+    )
+    monkeypatch.setattr(
+        module,
+        "WINDOWS_TO_IANA",
+        MappingProxyType({"Synthetic Windows Zone": "America/Los_Angeles"}),
+    )
+
+    with pytest.raises(PermanentProviderError) as raised:
+        module.to_windows_timezone("Asia/Shanghai")
+
+    assert raised.value.error_code == "calendar_timezone_mapping_unsupported"
 
 
 def test_canonical_iana_alias_is_normalized() -> None:

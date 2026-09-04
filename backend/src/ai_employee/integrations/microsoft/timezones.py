@@ -173,7 +173,9 @@ def to_windows_timezone(value: object) -> str:
     """
     canonical = _canonical_iana(value)
     result = IANA_TO_WINDOWS.get(canonical)
-    if result is None:
+    if result is None or WINDOWS_TO_IANA.get(result) != canonical:
+        # 写入会把 IANA 名称压缩成 Windows 名称。只有该选择能由同一锁定映射原样
+        # 还原时，冻结载荷的时区语义才没有丢失；不能按相同 offset 猜测或回退宿主时区。
         raise _unsupported()
     return result
 

@@ -1,0 +1,38 @@
+{
+  "id": "event-1",
+  "transactionId": "00000000-0000-0000-0000-000000000001",
+  "subject": "Synthetic calendar event",
+  "body": {
+    "contentType": "text",
+    "content": "Synthetic description"
+  },
+  "location": {
+    "displayName": "Synthetic room"
+  },
+  "start": {
+    "dateTime": "2030-01-02T09:00:00",
+    "timeZone": "China Standard Time"
+  },
+  "end": {
+    "dateTime": "2030-01-02T10:00:00",
+    "timeZone": "China Standard Time"
+  },
+  "isAllDay": false,
+  "attendees": [
+    {
+      "type": "required",
+      "emailAddress": {
+        "address": "attendee@example.test"
+      }
+    }
+  ],
+  "type": "singleInstance",
+  "seriesMasterId": null,
+  "recurrence": null,
+  "isCancelled": false,
+  "isOrganizer": true,
+  "canEdit": true,
+  "@odata.etag": "W/\"etag-2\"",
+  "changeKey": "etag-2",
+  "webLink": "https://outlook.example.test/event-1"
+}

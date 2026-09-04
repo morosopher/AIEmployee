@@ -164,9 +164,10 @@ class _GoogleCalendarCompatibilityAdapter:
 class ProviderAdapterRegistry:
     """保存固定 Google/Microsoft 读适配器与四类可信动作，不提供动态注册。
 
-    Google Calendar 的同一个显式 action adapter 绑定到 ``calendar.create``、
-    ``calendar.update`` 和 ``calendar.restore`` 三个固定键；未注入 action slot 时，
-    preflight 兼容对象仍不能被 ``trusted_action_adapter`` 当作真实写入 adapter 返回。
+    Google 与 Microsoft Calendar 各自的同一个显式 action adapter 都绑定到
+    ``calendar.create``、``calendar.update`` 和 ``calendar.restore`` 三个固定键；未注入
+    action slot 时，preflight 兼容对象仍不能被 ``trusted_action_adapter`` 当作真实写入
+    adapter 返回。
     """
 
     __slots__ = (
