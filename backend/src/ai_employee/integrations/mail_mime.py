@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 from email import policy
 from email.message import EmailMessage
@@ -89,6 +90,28 @@ def build_mail_mime(command: MailSendCommand, *, from_address: str) -> bytes:
     return message.as_bytes(policy=policy.SMTP)
 
 
+def build_mail_mime_base64(command: MailSendCommand, *, from_address: str) -> bytes:
+    """构建 Microsoft Graph 直接 MIME 请求所需的标准 Base64 字节。
+
+    Graph 的 ``text/plain`` MIME 端点要求请求体是标准 RFC 4648 Base64 文本；它与
+    Gmail 的 Base64URL JSON ``raw`` 字段不是同一种传输编码。编码函数放在共享 MIME
+    边界内，确保两家供应商使用完全相同的冻结 RFC 2822 字节，同时避免 Microsoft
+    adapter 自行重新渲染正文或 Header。
+
+    Args:
+        command: 已通过领域验证的冻结邮件命令。
+        from_address: 由连接事实提供的唯一可信发件地址。
+
+    Returns:
+        仅包含 ASCII Base64 字符和必要 ``=`` 填充的请求体字节。
+
+    Raises:
+        TypeError: ``command`` 不是 ``MailSendCommand``。
+        ValueError: MIME 不能安全表达发件地址或冻结 Header。
+    """
+    return base64.b64encode(build_mail_mime(command, from_address=from_address))
+
+
 def _format_date(value: datetime) -> str:
     """把冻结 aware datetime 格式化为稳定 RFC 2822 Date Header。"""
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
@@ -104,4 +127,9 @@ def _validate_header_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not contain CR or LF")
 
 
-__all__ = ["MESSAGE_ID_DOMAIN", "build_mail_mime", "message_id_for"]
+__all__ = [
+    "MESSAGE_ID_DOMAIN",
+    "build_mail_mime",
+    "build_mail_mime_base64",
+    "message_id_for",
+]

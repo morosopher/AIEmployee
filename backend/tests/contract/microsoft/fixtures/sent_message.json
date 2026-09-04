@@ -1,0 +1,12 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('synthetic-user')/mailFolders('sentitems')/messages",
+  "value": [
+    {
+      "id": "synthetic-sent-message-id",
+      "conversationId": "synthetic-conversation-id",
+      "internetMessageId": "<00000000-0000-0000-0000-000000000601@ai-employee.invalid>",
+      "sentDateTime": "2030-01-01T00:00:01Z",
+      "webLink": "https://outlook.office.example.test/mail/synthetic-sent-message-id"
+    }
+  ]
+}
