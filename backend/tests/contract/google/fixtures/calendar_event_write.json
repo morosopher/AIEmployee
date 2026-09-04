@@ -1,0 +1,27 @@
+{
+  "id": "a00000000000000000000000004",
+  "etag": "\"etag-2\"",
+  "status": "confirmed",
+  "summary": "Synthetic calendar event",
+  "description": "Synthetic description",
+  "location": "Synthetic room",
+  "start": {
+    "dateTime": "2030-01-02T09:00:00+00:00",
+    "timeZone": "UTC"
+  },
+  "end": {
+    "dateTime": "2030-01-02T10:00:00+00:00",
+    "timeZone": "UTC"
+  },
+  "attendees": [
+    {
+      "email": "attendee@example.test"
+    }
+  ],
+  "extendedProperties": {
+    "private": {
+      "ai_employee_operation_id": "00000000-0000-0000-0000-000000000001"
+    }
+  },
+  "htmlLink": "https://calendar.google.test/event/synthetic"
+}

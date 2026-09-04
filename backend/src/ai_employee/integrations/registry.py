@@ -1,4 +1,8 @@
-"""提供固定 Google/Microsoft 键的读取适配器注册表与 M1 兼容包装。"""
+"""提供固定 Google/Microsoft 读取与可信写动作注册表及 M1 兼容包装。
+
+真实日历/邮件 adapter 必须由组合根按连接 token 显式注入 ``*_action`` slot；注册表不
+会自行创建带凭据的供应商 client，也不会把仅有 preflight 的对象提升为真实写权限。
+"""
 
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -158,7 +162,12 @@ class _GoogleCalendarCompatibilityAdapter:
 
 
 class ProviderAdapterRegistry:
-    """保存固定 Google/Microsoft 读适配器与可信动作预检，不提供动态注册。"""
+    """保存固定 Google/Microsoft 读适配器与四类可信动作，不提供动态注册。
+
+    Google Calendar 的同一个显式 action adapter 绑定到 ``calendar.create``、
+    ``calendar.update`` 和 ``calendar.restore`` 三个固定键；未注入 action slot 时，
+    preflight 兼容对象仍不能被 ``trusted_action_adapter`` 当作真实写入 adapter 返回。
+    """
 
     __slots__ = (
         "_calendar_readers",
@@ -216,9 +225,7 @@ class ProviderAdapterRegistry:
                 # ``__bool__``，但只要显式注入就必须保持真实动作优先级，不能悄然退回
                 # 仅 preflight 的兼容对象。
                 ("google", "mail.send"): (
-                    google_mail_action
-                    if google_mail_action is not None
-                    else google_mail_preflight
+                    google_mail_action if google_mail_action is not None else google_mail_preflight
                 ),
                 ("google", "calendar.create"): (
                     google_calendar_action
