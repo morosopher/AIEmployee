@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 from typing import cast
 from urllib.parse import quote, unquote_to_bytes, urlsplit
+from uuid import UUID
 
 import httpx
 
@@ -96,6 +98,62 @@ _RFC3339_SENT_DATETIME = re.compile(
 )
 _RefreshAccessToken = Callable[[], Awaitable[str]]
 type RecipientTriple = tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+type ReplyBindingKey = tuple[UUID, str, str, MailMode]
+
+
+@dataclass(frozen=True, slots=True)
+class MicrosoftReplyRecipientFact:
+    """冻结一封 Graph 来源邮件可直接回复的精确收件人事实。
+
+    该供应商边界值同时绑定连接、来源会话、来源消息与回复模式；To/CC/BCC 只作为这
+    一个来源动作的结果事实使用，不能被同模式的另一封邮件复用。构造后不可变，适配器
+    还会复制到只读映射中，避免审批与执行之间由调用方替换事实。
+
+    Attributes:
+        connection_id: 持有来源邮件并提供发送 token 的精确连接。
+        source_thread_id: Graph 来源 ``conversationId``。
+        source_message_id: Graph 来源不可变消息 ID。
+        mode: 仅允许 ``reply`` 或 ``reply_all``。
+        to: 供应商直接动作会采用的规范 To 地址。
+        cc: 供应商直接动作会采用的规范 CC 地址。
+        bcc: 供应商直接动作会采用的规范 BCC 地址。
+
+    Raises:
+        TypeError: 标识、模式或收件人容器不是精确领域类型。
+        ValueError: 来源标识、模式或收件人集合不满足冻结边界。
+    """
+
+    connection_id: UUID
+    source_thread_id: str
+    source_message_id: str
+    mode: MailMode
+    to: tuple[str, ...]
+    cc: tuple[str, ...]
+    bcc: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """验证事实完整、规范且属于单个可直接回复动作。"""
+        if type(self.connection_id) is not UUID:
+            raise TypeError("reply recipient fact connection_id must be UUID")
+        if type(self.mode) is not MailMode:
+            raise TypeError("reply recipient fact mode must be MailMode")
+        if self.mode is MailMode.NEW:
+            raise ValueError("new mail does not accept reply recipient facts")
+        if (
+            _safe_identifier(self.source_thread_id) is None
+            or _safe_identifier(self.source_message_id) is None
+        ):
+            raise ValueError("reply recipient fact source binding is invalid")
+        if not all(type(field) is tuple for field in (self.to, self.cc, self.bcc)):
+            raise TypeError("reply recipient fact recipients must be tuples")
+        try:
+            normalized = normalize_mail_recipients(self.to, self.cc, self.bcc)
+        except (TypeError, ValueError):
+            raise ValueError("reply recipient fact recipients are invalid") from None
+        if normalized != (self.to, self.cc, self.bcc):
+            raise ValueError("reply recipient fact recipients must be normalized")
+        if not 1 <= sum(len(field) for field in normalized) <= 50:
+            raise ValueError("reply recipient fact recipient limit is invalid")
 
 
 class MicrosoftMailWriteAdapter:
@@ -106,9 +164,10 @@ class MicrosoftMailWriteAdapter:
         account_email: 当前连接的主账户地址，作为唯一可信 From 来源。
         client: 可选注入的 HTTPX client，主要供测试和组合根使用。
         refresh_access_token: 仅为统一构造签名保留；本适配器永不调用该 callback。
-        reply_recipient_sets: 已由同步源事实计算的 ``(To, Cc, Bcc)`` 集合。Graph 的
-            直接 MIME 回复会自行采用源邮件收件人，因此缺少或不匹配该事实时必须在
-            审批前拒绝，不能通过隐藏草稿绕过冻结载荷。
+        reply_recipient_facts: 已由同步源事实计算的精确不可变回复事实；每项同时绑定
+            connection、source thread/message、mode 与 ``(To, Cc, Bcc)``。Graph 的直接
+            MIME 回复会自行采用源邮件收件人，因此任一绑定缺失或不匹配时必须在审批前
+            拒绝，不能借用另一封邮件的事实或通过隐藏草稿绕过冻结载荷。
 
     Notes:
         Graph 的直接 MIME ``/reply`` 与 ``/replyAll`` 返回 202 且通常没有响应体；这
@@ -125,7 +184,7 @@ class MicrosoftMailWriteAdapter:
         account_email: str,
         client: httpx.AsyncClient | None = None,
         refresh_access_token: _RefreshAccessToken | None = None,
-        reply_recipient_sets: Mapping[MailMode | str, RecipientTriple] | None = None,
+        reply_recipient_facts: tuple[MicrosoftReplyRecipientFact, ...] = (),
     ) -> None:
         """保存受控连接事实，不触发网络或 token 刷新。"""
         self._access_token = _require_token(access_token)
@@ -134,7 +193,7 @@ class MicrosoftMailWriteAdapter:
         # 保留 callback 只是为了让组合根能共享读/写 adapter 工厂；调用路径刻意不引用，
         # 防止 401 或未知结果在 adapter 内产生第二次 provider call。
         self._refresh_access_token = refresh_access_token
-        self._reply_recipient_sets = _normalize_reply_recipient_sets(reply_recipient_sets)
+        self._reply_recipient_facts = _index_reply_recipient_facts(reply_recipient_facts)
 
     def update_access_token(self, access_token: str) -> None:
         """在外层 coordinator 已完成一次 CAS refresh 后替换内存 token。"""
@@ -400,16 +459,30 @@ class MicrosoftMailWriteAdapter:
         )
 
     def _ensure_reply_recipient_compatibility(self, command: MailSendCommand) -> None:
-        """把冻结 To/CC/BCC 与 Graph 源收件人事实做无序集合比较。"""
+        """按完整来源键读取事实，再与冻结 To/CC/BCC 做无序集合比较。"""
         if command.mode is MailMode.NEW:
             return
-        expected = self._reply_recipient_sets.get(command.mode)
+        source_thread_id = _safe_identifier(command.source_thread_id)
+        source_message_id = _safe_identifier(command.source_message_id)
+        if (
+            type(command.connection_id) is not UUID
+            or source_thread_id is None
+            or source_message_id is None
+        ):
+            raise _mail_thread_binding_conflict()
+        # mode-wide 的 recipient cache 会让邮件 A 的事实授权邮件 B。精确四元键确保只有
+        # 同一连接、会话、消息和动作的供应商事实，才能证明这次直接回复无损。
+        expected = self._reply_recipient_facts.get(
+            (
+                command.connection_id,
+                source_thread_id,
+                source_message_id,
+                command.mode,
+            )
+        )
         actual: RecipientTriple = (command.to, command.cc, command.bcc)
         if expected is None or _recipient_sets_key(expected) != _recipient_sets_key(actual):
-            raise StateConflictError(
-                error_code="mail_thread_binding_conflict",
-                message="Microsoft reply recipients cannot be represented safely",
-            )
+            raise _mail_thread_binding_conflict()
 
     async def _send_once(
         self,
@@ -563,34 +636,37 @@ async def _client_request(
     raise ValueError("Microsoft mail HTTP method is unsupported")
 
 
-def _normalize_reply_recipient_sets(
-    values: Mapping[MailMode | str, RecipientTriple] | None,
-) -> Mapping[MailMode, RecipientTriple]:
-    """复制并严格规范外层提供的源收件人事实，避免共享可变 mapping。"""
-    if values is None:
-        return MappingProxyType({})
-    normalized: dict[MailMode, RecipientTriple] = {}
-    for raw_mode, raw_set in values.items():
-        try:
-            mode = raw_mode if isinstance(raw_mode, MailMode) else MailMode(raw_mode)
-        except (TypeError, ValueError):
-            raise ValueError("reply recipient mode is invalid") from None
-        if mode is MailMode.NEW:
-            raise ValueError("new mail does not accept reply recipient facts")
-        if (
-            type(raw_set) is not tuple
-            or len(raw_set) != 3
-            or any(type(field) is not tuple for field in raw_set)
-        ):
-            raise ValueError("reply recipient facts are invalid")
-        try:
-            candidate = normalize_mail_recipients(*cast(RecipientTriple, raw_set))
-        except (TypeError, ValueError):
-            raise ValueError("reply recipient facts are invalid") from None
-        if candidate != raw_set:
-            raise ValueError("reply recipient facts must be normalized")
-        normalized[mode] = candidate
-    return MappingProxyType(normalized)
+def _index_reply_recipient_facts(
+    values: tuple[MicrosoftReplyRecipientFact, ...],
+) -> Mapping[ReplyBindingKey, RecipientTriple]:
+    """复制精确回复事实到只读索引，并拒绝重复来源动作。
+
+    Args:
+        values: 调用方提供的不可变事实 tuple。
+
+    Returns:
+        以 connection/thread/message/mode 四元组索引的只读收件人映射。
+
+    Raises:
+        TypeError: 容器或任一成员不是精确不可变事实类型。
+        ValueError: 同一来源动作出现重复事实，无法证明哪一项应被审批。
+    """
+    if type(values) is not tuple:
+        raise TypeError("reply_recipient_facts must be a tuple")
+    indexed: dict[ReplyBindingKey, RecipientTriple] = {}
+    for fact in values:
+        if type(fact) is not MicrosoftReplyRecipientFact:
+            raise TypeError("reply_recipient_facts contains an invalid fact")
+        key: ReplyBindingKey = (
+            fact.connection_id,
+            fact.source_thread_id,
+            fact.source_message_id,
+            fact.mode,
+        )
+        if key in indexed:
+            raise ValueError("reply_recipient_facts contains a duplicate source binding")
+        indexed[key] = (fact.to, fact.cc, fact.bcc)
+    return MappingProxyType(indexed)
 
 
 def _recipient_sets_key(value: RecipientTriple) -> tuple[frozenset[str], ...]:
@@ -844,17 +920,14 @@ def _candidate_values(
     *,
     expected_conversation_id: str | None,
 ) -> tuple[str, str | None] | None:
-    """读取并返回已验证的 provider ID 与可选 webLink。"""
+    """读取已验证的 provider ID，并把不可用或不可信 webLink 收窄为空。"""
     provider_id = _safe_identifier(candidate.get("id"))
     conversation_id = _safe_identifier(candidate.get("conversationId"))
     internet_id = candidate.get("internetMessageId")
     sent_value = candidate.get("sentDateTime")
-    if "webLink" not in candidate or candidate.get("webLink") is None:
-        provider_url: str | None = None
-    else:
-        provider_url = _safe_provider_link(candidate.get("webLink"))
-        if provider_url is None:
-            return None
+    # webLink 只是便捷展示链接，不是发送事实。供应商缺失、空值或返回任何不可信 URL
+    # 时一律丢弃原值；不能因此推翻由 message/conversation/time 共同证明的唯一 Sent 项。
+    provider_url = _safe_provider_link(candidate.get("webLink"))
     if (
         provider_id is None
         or conversation_id is None
@@ -1002,4 +1075,5 @@ __all__ = [
     "MICROSOFT_SENT_MESSAGES_URL",
     "MicrosoftMailAdapter",
     "MicrosoftMailWriteAdapter",
+    "MicrosoftReplyRecipientFact",
 ]

@@ -26,6 +26,7 @@ from ai_employee.integrations.microsoft.mail_write import (
     MICROSOFT_SEND_MAIL_URL,
     MICROSOFT_SENT_MESSAGES_URL,
     MicrosoftMailWriteAdapter,
+    MicrosoftReplyRecipientFact,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -71,20 +72,20 @@ def _command(*, mode: MailMode = MailMode.NEW) -> MailSendCommand:
     )
 
 
-def _reply_sets() -> dict[MailMode, tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]]:
-    """提供已由同步事实得到的 Graph reply/replyAll 收件人集合。"""
-    return {
-        MailMode.REPLY: (
-            ("recipient@example.test",),
-            ("copy@example.test",),
-            ("blind@example.test",),
-        ),
-        MailMode.REPLY_ALL: (
-            ("recipient@example.test",),
-            ("copy@example.test",),
-            ("blind@example.test",),
-        ),
-    }
+def _reply_facts() -> tuple[MicrosoftReplyRecipientFact, ...]:
+    """提供同时绑定连接、线程、消息和模式的 Graph 回复收件人事实。"""
+    return tuple(
+        MicrosoftReplyRecipientFact(
+            connection_id=CONNECTION_ID,
+            source_thread_id="synthetic-thread-1",
+            source_message_id="synthetic-message-1",
+            mode=mode,
+            to=("recipient@example.test",),
+            cc=("copy@example.test",),
+            bcc=("blind@example.test",),
+        )
+        for mode in (MailMode.REPLY, MailMode.REPLY_ALL)
+    )
 
 
 def _adapter(**kwargs: object) -> MicrosoftMailWriteAdapter:
@@ -92,7 +93,7 @@ def _adapter(**kwargs: object) -> MicrosoftMailWriteAdapter:
     return MicrosoftMailWriteAdapter(
         access_token="synthetic-access-token",
         account_email="sender@example.test",
-        reply_recipient_sets=_reply_sets(),
+        reply_recipient_facts=_reply_facts(),
         **kwargs,
     )
 
@@ -199,10 +200,17 @@ def test_preflight_is_pure_and_rejects_adjusted_reply_recipients() -> None:
     adapter = MicrosoftMailWriteAdapter(
         access_token="synthetic-access-token",
         account_email="sender@example.test",
-        reply_recipient_sets={
-            MailMode.REPLY: (("source@example.test",), (), ()),
-            MailMode.REPLY_ALL: (("source@example.test",), ("copy@example.test",), ()),
-        },
+        reply_recipient_facts=(
+            MicrosoftReplyRecipientFact(
+                connection_id=CONNECTION_ID,
+                source_thread_id="synthetic-thread-1",
+                source_message_id="synthetic-message-1",
+                mode=MailMode.REPLY,
+                to=("source@example.test",),
+                cc=(),
+                bcc=(),
+            ),
+        ),
     )
     command = _command(mode=MailMode.REPLY)
 
@@ -217,6 +225,54 @@ def test_preflight_accepts_a_proven_provider_recipient_set() -> None:
     """同步事实与冻结收件人完全一致时，直接回复可以进入审批。"""
     result = _adapter().validate_for_approval(_command(mode=MailMode.REPLY_ALL))
     assert result.warnings == ()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"connection_id": UUID("00000000-0000-0000-0000-000000000203")},
+        {"source_thread_id": "synthetic-thread-2"},
+        {"source_message_id": "synthetic-message-2"},
+    ),
+)
+def test_preflight_rejects_reply_recipient_fact_from_another_source(
+    updates: dict[str, object],
+) -> None:
+    """邮件 A 的收件人事实不能授权连接、线程或消息不同的邮件 B。"""
+    command = replace(_command(mode=MailMode.REPLY), **updates)
+
+    with pytest.raises(StateConflictError) as raised:
+        _adapter().validate_for_approval(command)
+
+    assert type(raised.value) is StateConflictError
+    assert raised.value.error_code == "mail_thread_binding_conflict"
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"connection_id": UUID("00000000-0000-0000-0000-000000000203")},
+        {"source_thread_id": "synthetic-thread-2"},
+        {"source_message_id": "synthetic-message-2"},
+    ),
+)
+async def test_execute_rechecks_exact_reply_recipient_fact_binding(
+    updates: dict[str, object],
+) -> None:
+    """即使调用方绕过审批预检，来源绑定不匹配也不得触发 Graph POST。"""
+    command = replace(_command(mode=MailMode.REPLY), **updates)
+    route = respx.post(
+        f"{MICROSOFT_GRAPH_BASE_URL}/me/messages/{command.source_message_id}/reply"
+    ).mock(return_value=httpx.Response(202))
+
+    with pytest.raises(StateConflictError) as raised:
+        await _adapter().execute(command)
+
+    assert type(raised.value) is StateConflictError
+    assert raised.value.error_code == "mail_thread_binding_conflict"
+    assert route.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -350,6 +406,9 @@ async def test_sent_reconciliation_accepts_missing_optional_web_link() -> None:
 @pytest.mark.parametrize(
     "web_link",
     (
+        None,
+        "",
+        17,
         "https://evil.example.test/mail/synthetic-sent-message-id",
         "https://evil.office.com/mail/synthetic-sent-message-id",
         "https://outlook.office.com.evil.example.test/mail/synthetic-sent-message-id",
@@ -365,17 +424,18 @@ async def test_sent_reconciliation_accepts_missing_optional_web_link() -> None:
         "https://outlook.office.example.test/mail/synthetic-sent-message-id%00",
     ),
 )
-async def test_sent_reconciliation_rejects_unsafe_or_spoofed_web_links(
-    web_link: str,
+async def test_sent_reconciliation_omits_unsafe_or_unavailable_web_links(
+    web_link: object,
 ) -> None:
-    """webLink 只允许精确 Outlook 主机和安全 URL 形状。"""
+    """不可用或不可信 webLink 只被丢弃，不能推翻其余完整 Sent 事实。"""
     respx.get(MICROSOFT_SENT_MESSAGES_URL).mock(
         return_value=httpx.Response(200, json=_sent_payload(webLink=web_link))
     )
 
     outcome = await _adapter().reconcile(_command(), _execution())
 
-    assert outcome.kind is ProviderWriteOutcomeKind.UNKNOWN
+    assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
+    assert outcome.provider_resource_id == "synthetic-sent-message-id"
     assert outcome.provider_url is None
 
 
