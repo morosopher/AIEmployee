@@ -4,9 +4,10 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import String, cast, delete, exists, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ai_employee.application.ports.encryption import EncryptedValue
 from ai_employee.application.use_cases.connections import (
@@ -18,6 +19,7 @@ from ai_employee.application.use_cases.connections import (
     ConsumedOAuthAttempt,
     OAuthAttemptInvalidatedError,
     OAuthAuthorizationScopeConflictError,
+    OAuthRevokeBacklog,
     StoredCapability,
     StoredConnection,
     StoredProviderCalendar,
@@ -25,7 +27,9 @@ from ai_employee.application.use_cases.connections import (
 from ai_employee.domain.connections import (
     CapabilityStatus,
     ConnectionCapability,
+    ConnectionCapabilityDependencyConflict,
     ConnectionStatus,
+    validate_capability_disable,
 )
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
@@ -34,6 +38,10 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     ProviderCalendarModel,
     SyncCursorModel,
+)
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    invalidate_unclaimed_actions_for_connection,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
@@ -691,6 +699,20 @@ class SqlAlchemyConnectionStore:
         capability: ConnectionCapability,
     ) -> None:
         """本地关闭能力并保留实际 scope 事实，供界面说明仍需重连才能缩权。"""
+        affected_actions = (
+            frozenset({"mail.send"})
+            if capability in {ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND}
+            else frozenset({"calendar.create", "calendar.update", "calendar.restore"})
+        )
+        # 必须先沿可信动作固定锁序处理任务，再锁 Connection；claim 若已取得任务锁可先
+        # 完成认领，反之会在审批失效后稳定失败，双方不会互相持有反向行锁。
+        await invalidate_unclaimed_actions_for_connection(
+            self._session,
+            user_id=user_id,
+            connection_id=connection_id,
+            actions=affected_actions,
+            reason="connection_capability_disabled",
+        )
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -701,6 +723,16 @@ class SqlAlchemyConnectionStore:
         )
         if connection is None:
             raise ConnectionCredentialOwnershipError
+        # scanner 已按 Task→Approval→ToolExecution→本地动作锁定并完成候选状态变更；
+        # 现在才在同一事务取得 Connection 锁后的能力快照。渐进 callback 必须先通过
+        # 这把锁，因而不会在读取依赖与关闭能力之间提交新的写能力。
+        enabled = await self.get_enabled_capabilities(
+            user_id=user_id,
+            connection_id=connection_id,
+        )
+        if enabled is None:
+            raise ConnectionCredentialOwnershipError
+        validate_capability_disable(capability, enabled)
         connection.authorization_generation += 1
         statement = insert(ConnectionCapabilityModel).values(
             user_id=user_id,
@@ -734,21 +766,29 @@ class SqlAlchemyConnectionStore:
                 OAuthConnectionModel.id == connection_id,
                 OAuthConnectionModel.user_id == user_id,
             )
+            # 能力快照是关闭事务的授权输入；保留连接行锁语义，使直接调用该仓储端口
+            # 也不会在渐进 callback 修改 capability 的窗口内读取过时 enabled 集合。
             .with_for_update()
         )
         if connection_exists is None:
             return None
         rows = await self._session.scalars(
-            select(ConnectionCapabilityModel.capability).where(
+            select(ConnectionCapabilityModel)
+            .where(
                 ConnectionCapabilityModel.user_id == user_id,
                 ConnectionCapabilityModel.connection_id == connection_id,
-                ConnectionCapabilityModel.status == CapabilityStatus.ENABLED.value,
             )
+            .order_by(ConnectionCapabilityModel.capability)
+            .with_for_update()
         )
         try:
-            return frozenset(ConnectionCapability(value) for value in rows)
+            return frozenset(
+                ConnectionCapability(row.capability)
+                for row in rows
+                if row.status == CapabilityStatus.ENABLED.value
+            )
         except ValueError as error:
-            raise RuntimeError("connection capability row contains an unknown value") from error
+            raise ConnectionCapabilityDependencyConflict from error
 
     async def get_capability_snapshot(
         self,
@@ -872,6 +912,26 @@ class SqlAlchemyConnectionStore:
         )
         if provider is None:
             return (False, None)
+        # 断开连接会同时切断四种真实写动作；沿可信动作既有 Task→Approval→
+        # ToolExecution→本地对象锁序先失效尚未认领的工作，避免已排队消息在连接状态
+        # 改变后继续进入 provider。已形成 ToolExecution 的动作由 scanner 保留并交给
+        # reconciliation，不在这里伪造取消或结果。
+        await invalidate_unclaimed_actions_for_connection(
+            self._session,
+            user_id=user_id,
+            connection_id=connection_id,
+            actions=frozenset(
+                {
+                    "mail.send",
+                    "calendar.create",
+                    "calendar.update",
+                    "calendar.restore",
+                }
+            ),
+            # 已认领动作失去连接凭据后必须进入只读核对并显示统一的能力缺失原因；同一
+            # reason 也会写入未认领生命周期审计，便于操作中心按一个稳定码聚合。
+            reason="connection_scope_missing",
+        )
         # 同一用户/供应商的所有首次 state（包括已消费但尚未保存结果的 state）都必须
         # 原子标记；渐进授权 target_connection_id 非 NULL，交由授权代际单独控制。
         await self._session.execute(
@@ -894,6 +954,21 @@ class SqlAlchemyConnectionStore:
         )
         if connection is None:
             return (False, None)
+        # 断开后本地能力即使原先已启用也不能继续被读取或写入；保留 actual_scopes 与
+        # last_verified_at 作为供应商历史投影，只把当前可用状态收敛为 revoked。这样
+        # Microsoft 没有窄 revoke 端点或远端失败时，数据库仍不会伪造“scope 已删除”的
+        # 事实，同时所有后续能力检查都会 fail closed。
+        await self._session.execute(
+            update(ConnectionCapabilityModel)
+            .where(
+                ConnectionCapabilityModel.user_id == user_id,
+                ConnectionCapabilityModel.connection_id == connection_id,
+            )
+            .values(
+                status=CapabilityStatus.REVOKED.value,
+                last_error_code=None,
+            )
+        )
         refresh_row = await self._session.scalar(
             select(EncryptedCredentialModel).where(
                 EncryptedCredentialModel.user_id == user_id,
@@ -921,6 +996,165 @@ class SqlAlchemyConnectionStore:
         connection.last_error_code = None
         await self._session.flush()
         return (True, refresh)
+
+    async def record_oauth_revoke_unresolved(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        provider: str,
+        error_code: str,
+        occurred_at: datetime,
+    ) -> None:
+        """追加一次 token-free 的撤销未决维护事实。
+
+        该方法只在本地断开事务已经提交、供应商调用失败或明确没有窄撤销端点后执行。
+        它使用独立短事务写入 ``AuditEvent``，metadata 仅包含供应商、稳定错误码与连接
+        标识；不会把 refresh token、供应商响应或异常正文转移到 PostgreSQL，也不创建
+        Outbox/TaskRun，因此后续调度无法重建已删除凭据。
+
+        Args:
+            user_id: 连接所属用户，用于第二层归属校验。
+            connection_id: 已断开连接的稳定标识。
+            provider: 断开前读取的固定供应商名称。
+            error_code: 已脱敏的稳定机器错误码。
+            occurred_at: 调用方注入的带时区 UTC 事实时间。
+
+        Raises:
+            ValueError: 输入不是稳定、非空的审计边界值。
+            ConnectionCredentialOwnershipError: 连接缺失、跨用户或供应商身份已变化。
+        """
+        if type(provider) is not str or not provider or provider != provider.strip():
+            raise ValueError("provider must be a stable non-empty name")
+        if type(error_code) is not str or not error_code or error_code != error_code.strip():
+            raise ValueError("error_code must be a stable non-empty code")
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if connection is None or connection.provider != provider:
+            raise ConnectionCredentialOwnershipError
+        self._session.add(
+            AuditEventModel(
+                user_id=user_id,
+                task_id=None,
+                event_type="oauth.revoke_unresolved",
+                actor_type="system",
+                actor_id=None,
+                event_metadata={
+                    "provider": provider,
+                    "error_code": error_code,
+                    "connection_id": str(connection_id),
+                },
+                created_at=occurred_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_oauth_revoke_backlog(self) -> tuple[OAuthRevokeBacklog, ...]:
+        """只聚合未决审计，不读取凭据，也不构造任何可重放 revoke 的 Task/Outbox。
+
+        系统维护可跨用户聚合，但返回仅有两种固定 provider 与计数。补救事实必须同时
+        匹配原事件用户、连接和审计游标，其他用户的确认不能降低该用户的积压数量。
+        """
+        remediation = aliased(AuditEventModel)
+        provider = AuditEventModel.event_metadata["provider"].astext
+        resolved = exists(
+            select(remediation.id).where(
+                remediation.event_type == "oauth.revoke_remediated",
+                remediation.user_id == AuditEventModel.user_id,
+                remediation.event_metadata["connection_id"].astext
+                == AuditEventModel.event_metadata["connection_id"].astext,
+                remediation.event_metadata["unresolved_event_id"].astext
+                == cast(AuditEventModel.id, String),
+            )
+        )
+        rows = (
+            await self._session.execute(
+                select(provider, func.count(AuditEventModel.id))
+                .where(
+                    AuditEventModel.event_type == "oauth.revoke_unresolved",
+                    provider.in_(("google", "microsoft")),
+                    ~resolved,
+                )
+                .group_by(provider)
+                .order_by(provider)
+            )
+        ).all()
+        return tuple(OAuthRevokeBacklog(provider=row[0], unresolved_count=row[1]) for row in rows)
+
+    async def record_oauth_revoke_remediation(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        unresolved_event_id: int,
+        occurred_at: datetime,
+    ) -> bool:
+        """锁定精确连接后追加操作者补救事实，不更新/删除原始 append-only 审计。
+
+        连接行锁让并发确认串行；审计角色无需获得 UPDATE 权限或 AuditEvent 行锁。
+        重复、跨用户、连接不匹配和不存在的事件都返回 False，不泄露其他用户的事实。
+        """
+        if type(unresolved_event_id) is not int or unresolved_event_id <= 0:
+            raise ValueError("unresolved_event_id must be positive")
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if connection is None:
+            return False
+        original = await self._session.scalar(
+            select(AuditEventModel.id).where(
+                AuditEventModel.id == unresolved_event_id,
+                AuditEventModel.user_id == user_id,
+                AuditEventModel.event_type == "oauth.revoke_unresolved",
+                AuditEventModel.event_metadata["connection_id"].astext == str(connection_id),
+                AuditEventModel.event_metadata["provider"].astext == connection.provider,
+            )
+        )
+        if original is None:
+            return False
+        resolved = await self._session.scalar(
+            select(AuditEventModel.id).where(
+                AuditEventModel.user_id == user_id,
+                AuditEventModel.event_type == "oauth.revoke_remediated",
+                AuditEventModel.event_metadata["connection_id"].astext == str(connection_id),
+                AuditEventModel.event_metadata["unresolved_event_id"].astext
+                == str(unresolved_event_id),
+            )
+        )
+        if resolved is not None:
+            return False
+        self._session.add(
+            AuditEventModel(
+                user_id=user_id,
+                task_id=None,
+                event_type="oauth.revoke_remediated",
+                actor_type="user",
+                actor_id=str(user_id),
+                created_at=occurred_at,
+                event_metadata={
+                    "provider": connection.provider,
+                    "connection_id": str(connection_id),
+                    "unresolved_event_id": str(unresolved_event_id),
+                },
+            )
+        )
+        await self._session.flush()
+        return True
 
 
 class SqlAlchemyConnectionStoreFactory:

@@ -1477,9 +1477,10 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
 ) -> None:
     """关闭读能力与渐进回调交错时，回调必须因授权代际变化而失效。
 
-    测试先让 disable 用例读到当前快照并暂停，再让真实 PostgreSQL callback 尝试保存写/读
-    能力。若快照读取没有锁住连接行，callback 会在暂停窗口提交，随后 disable 把 mail.read
-    置为 disabled，形成 ``mail.send=enabled`` 却缺少依赖的非法终态。
+    测试先让 disable 仓储沿 Task→Approval→ToolExecution→本地动作锁序完成扫描，再在
+    Connection 行锁之后读取 enabled 快照并暂停；随后让真实 PostgreSQL callback 尝试保存
+    写/读能力。若快照读取没有复用该连接锁，callback 会在窗口内提交，随后 disable 把
+    ``mail.read`` 置为 disabled，形成 ``mail.send=enabled`` 却缺少依赖的非法终态。
     """
     session_factory = build_session_factory(database_url)
     cipher = AeadCipher(b"p" * 32)
@@ -1534,7 +1535,7 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
             user_id: UUID,
             connection_id: UUID,
         ) -> frozenset[ConnectionCapability] | None:
-            """在真实查询返回后暂停，保留 disable 事务对连接行的当前锁状态。"""
+            """在连接行锁取得后暂停，保持 callback 必须等待的真实事务屏障。"""
             enabled = await original_get_enabled(
                 store,
                 user_id=user_id,

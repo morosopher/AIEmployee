@@ -902,4 +902,25 @@ stderr、JSON logs 中三个值零命中，同时从 PostgreSQL 读取脱敏 cal
 
 所有生产 Secret 由部署平台创建为 Docker Secret，再以 `/run/secrets/*` 文件挂载。不得把值写进 Compose、环境文件、日志、镜像层、备份名或 CI 输出。数据库、Grafana 管理员密码和备份口令轮换时，先创建新版本、滚动重启依赖服务、验证健康和恢复演练，最后撤销旧版本。M2 的 `APP_MASTER_KEY_FILE` root key 与 `AeadCipher.key_version` 固定，禁止按普通 Secret 流程轮换；未来变更必须先有新的 ADR/里程碑，覆盖现有 ciphertext 重加密、refresh identity 重算和 durable fence 迁移。
 
-Google 连接撤销时，先在 Google 帐号安全页面撤销 AI Employee 的 OAuth 授权，再在应用连接页断开并执行对应的数据删除流程。模型 API Key 轮换时，更新 Secret、滚动 API/Worker/Scheduler，并确认结构化模型调用仍使用预期供应商与数据最小披露策略。
+在应用中断开 Google 或 Microsoft 连接时，系统先提交本地凭据密文删除、连接断开、能力 revoked
+和未认领审批失效，再尽力调用供应商窄撤销端点。远端失败不能恢复本地 Token，也不会产生持有
+Token 的重试任务。Microsoft 没有可用的窄撤销端点时同样记录 `oauth.revoke_unresolved`；其元数据
+只有 provider、稳定错误码和 connection ID，时间由审计事件保存。
+
+Scheduler 复用每分钟 `expire-approvals` 入口，扫描已关闭全局/供应商写开关下仍未认领的审批，
+并统计未被补救的 OAuth 撤销事实。调整部署开关后应使 API、Worker、Scheduler 使用同一份新配置。
+积压通过 `ai_employee.oauth.revoke_backlog` JSON 告警公开 provider、`oauth_revoke_unresolved`
+错误码和整数 `unresolved_count`，不会访问供应商或重建已删 Token。管理员须在对应供应商的账号
+安全页面移除 AI Employee 授权；完成后可通过应用维护用例
+`OAuthRevokeMaintenanceUseCase.record_remediation(user_id=..., connection_id=..., unresolved_event_id=...)`
+记录精确审计事件的补救确认。该入口校验连接归属、拒绝自由文本和重复确认，仅追加
+`oauth.revoke_remediated`，不修改原始审计或执行网络请求。
+
+能力关闭或连接断开只把没有 ToolExecution 的动作取消并退回编辑态。已认领动作保留 approved
+审批和冻结命令，进入只读核对；后续核对可根据零 request-start 事实确认未应用。已有 request-start
+但断开后无法取得只读 Token 的动作进入 `needs_attention/connection_scope_missing`，提供供应商
+检查入口和人工确认，不能把删除凭据解释成未执行或自动重发。Worker 已在内存持有短期 Token
+时可以完成当前只读核对。
+
+模型 API Key 轮换时，更新 Secret、滚动 API/Worker/Scheduler，并确认结构化模型调用仍使用预期
+供应商与数据最小披露策略。

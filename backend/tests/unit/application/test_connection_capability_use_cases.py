@@ -30,6 +30,7 @@ from ai_employee.domain.connections import (
     CapabilityStatus,
     ConnectionCapability,
     ConnectionCapabilityDependencyConflict,
+    validate_capability_disable,
 )
 from ai_employee.domain.errors import StateConflictError, TransientProviderError
 from ai_employee.infrastructure.security.encryption import AeadCipher
@@ -164,6 +165,7 @@ class FakeConnectionStore:
     ) -> None:
         """记录通过依赖校验后的本地关闭请求。"""
         assert user_id == self.user_id and connection_id == self.connection_id
+        validate_capability_disable(capability, self.enabled)
         self.disabled = capability
 
     async def create_attempt(self, **values: Any) -> UUID:
@@ -181,6 +183,12 @@ class FakeConnectionStore:
         assert values["connection_id"] == self.connection_id
         self.disconnected = True
         return True, None
+
+    async def record_oauth_revoke_unresolved(self, **values: Any) -> None:
+        """断开端口现在必须记录未决维护事实，且只能在本地状态关闭后调用。"""
+        assert self.disconnected
+        assert values["user_id"] == self.user_id
+        assert values["connection_id"] == self.connection_id
 
 
 @pytest.mark.asyncio

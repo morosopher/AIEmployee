@@ -53,6 +53,7 @@ from ai_employee.workers.sync_mail import build_mail_sync_task_step
 from ai_employee.workers.trusted_actions import (
     build_trusted_action_task_step,
     build_worker_trusted_action_registry,
+    converge_revoked_pre_request_action,
 )
 
 RETRY_DELAY_SECONDS = 5
@@ -497,6 +498,10 @@ async def execute_task(
                 task_kind == "trusted_action"
                 and authoritative_status == TaskStatus.RECONCILING.value
             ):
+                if await converge_revoked_pre_request_action(
+                    task_id=parsed_task_id, session_factory=session_factory
+                ):
+                    return
                 # registry 只由 Worker 组合根构造并显式传入；不能让专用核对入口自行创建
                 # 空 registry，否则生产中的 reconciling 任务会永远看不到已组装 adapter。
                 trusted_action_adapters = build_worker_trusted_action_registry(

@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import UUID
@@ -12,6 +13,10 @@ from ai_employee.application.use_cases.approval_checkpoint_recovery import (
     RecoverApprovalCheckpointsUseCase,
 )
 from ai_employee.application.use_cases.approvals import ExpireApprovalsUseCase
+from ai_employee.application.use_cases.connections import (
+    OAuthRevokeBacklog,
+    OAuthRevokeMaintenanceUseCase,
+)
 from ai_employee.application.use_cases.diagnostics import DispatchOverdueBriefDiagnosticsUseCase
 from ai_employee.application.use_cases.maintenance import ExpireSessionsUseCase
 from ai_employee.application.use_cases.outbox import OutboxRelay
@@ -26,6 +31,9 @@ from ai_employee.application.use_cases.task_retry_recovery import (
     RecoverScheduledTaskRetriesUseCase,
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
+from ai_employee.application.use_cases.trusted_actions import (
+    InvalidateDisabledTrustedActionsUseCase,
+)
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.repositories.approval_checkpoint_recovery import (
     SqlAlchemyApprovalCheckpointRecoveryStore,
@@ -34,6 +42,7 @@ from ai_employee.infrastructure.db.repositories.approvals import SqlAlchemyAppro
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyEnabledSyncScopeReader,
 )
+from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStoreFactory
 from ai_employee.infrastructure.db.repositories.diagnostics import SqlAlchemyOverdueBriefReader
 from ai_employee.infrastructure.db.repositories.identity import (
     SqlAlchemyActiveUserScheduleReader,
@@ -45,6 +54,7 @@ from ai_employee.infrastructure.db.repositories.task_retry_recovery import (
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepositoryFactory
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionReconciliationRecoveryStore,
+    SqlAlchemyTrustedActionRevocationStore,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
@@ -63,6 +73,7 @@ __all__ = [
     "expire_approvals",
     "expire_sessions",
     "is_daily_brief_due",
+    "monitor_oauth_revoke_backlog",
     "recover_approval_checkpoints",
     "recover_due_reconciliations",
     "recover_task_retries",
@@ -230,9 +241,43 @@ async def expire_sessions() -> None:
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "expire-approvals"}])
 async def expire_approvals() -> None:
-    """每分钟锁定有界过期待审批并原子写入失败及无内容审计。"""
+    """每分钟先处理停机开关，再清理过期待审批并统计 token-free 撤销积压。"""
+    await InvalidateDisabledTrustedActionsUseCase(
+        store=SqlAlchemyTrustedActionRevocationStore(session_factory), write_policy=settings
+    ).execute(limit=settings.outbox_relay_batch_size)
     use_case = ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory))
     await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
+    await monitor_oauth_revoke_backlog()
+
+
+class _MaintenanceClock:
+    """向维护用例提供 UTC 时间，不依赖宿主机本地业务日期。"""
+
+    def now(self) -> datetime:
+        """返回带时区的 UTC 当前时刻。"""
+        return datetime.now(UTC)
+
+
+async def monitor_oauth_revoke_backlog() -> tuple[OAuthRevokeBacklog, ...]:
+    """按供应商计数并发出内容无关告警；绝不恢复 token 或安排远端 revoke 重试。
+
+    本函数复用既有分钟维护入口，不新增携带连接/token 的队列消息。返回类型化聚合，
+    供可观测性消费者读取；日志仅携带固定供应商、错误码和整数计数。
+    """
+    backlog = await OAuthRevokeMaintenanceUseCase(
+        SqlAlchemyConnectionStoreFactory(session_factory), _MaintenanceClock()
+    ).scan()
+    for item in backlog:
+        if item.unresolved_count > 0:
+            logging.getLogger("ai_employee.oauth.revoke_backlog").warning(
+                "oauth revocation requires operator remediation",
+                extra={
+                    "provider": item.provider,
+                    "error_code": "oauth_revoke_unresolved",
+                    "unresolved_count": item.unresolved_count,
+                },
+            )
+    return backlog
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "brief-overdue-diagnostics"}])

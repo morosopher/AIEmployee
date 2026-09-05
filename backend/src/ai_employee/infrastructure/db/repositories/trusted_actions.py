@@ -9,7 +9,7 @@ from hmac import compare_digest
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, exists, func, or_, select, text
+from sqlalchemy import and_, delete, exists, func, or_, select, text, true
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,6 +67,7 @@ from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     EmailMessageModel,
     EmailThreadModel,
+    EncryptedCredentialModel,
     OAuthConnectionModel,
     ProviderCalendarModel,
 )
@@ -89,6 +90,17 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
 APPROVAL_COMMAND_CONTENT_KIND = "approval_command"
+
+# 撤权屏障在已认领但尚未 request-start 的动作上只留下这些固定机器原因。只有命中
+# 该白名单时，专用核对入口才可以把零请求事实收敛为 confirmed_not_applied；任意其他
+# reconciling 形状仍需保守地等待只读供应商核对，避免把未知副作用伪装成未应用。
+_PRE_REQUEST_RECONCILIATION_REASONS = frozenset(
+    {
+        "connection_capability_disabled",
+        "connection_scope_missing",
+        "external_writes_disabled",
+    }
+)
 
 
 class SqlAlchemyTrustedActionRepository:
@@ -910,6 +922,50 @@ class SqlAlchemyTrustedActionRepository:
             execution=reference,
         )
 
+    async def reconciliation_connection_missing(
+        self, *, snapshot: TrustedActionDispatchSnapshot
+    ) -> bool:
+        """确认当前消息无法从精确连接重新取得只读 Token，不尝试其他账户或刷新。
+
+        仅当 registry 未能提供已有内存凭据的 adapter 时调用。已在内存持有短期 Token
+        的只读 adapter 可完成其当前核对；这里从不延长本地 Token 保留时间。
+        """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel).where(
+                OAuthConnectionModel.id == snapshot.connection_id,
+                OAuthConnectionModel.user_id == snapshot.user_id,
+            )
+        )
+        if connection is None or connection.status != "connected":
+            return True
+        capability = (
+            ConnectionCapability.MAIL_READ
+            if snapshot.action == "mail.send"
+            else ConnectionCapability.CALENDAR_READ
+        )
+        status = await self._session.scalar(
+            select(ConnectionCapabilityModel.status).where(
+                ConnectionCapabilityModel.user_id == snapshot.user_id,
+                ConnectionCapabilityModel.connection_id == snapshot.connection_id,
+                ConnectionCapabilityModel.capability == capability.value,
+            )
+        )
+        if status != CapabilityStatus.ENABLED.value:
+            return True
+        return not await self._session.scalar(
+            select(
+                exists(
+                    select(EncryptedCredentialModel.id).where(
+                        EncryptedCredentialModel.user_id == snapshot.user_id,
+                        EncryptedCredentialModel.connection_id == snapshot.connection_id,
+                        EncryptedCredentialModel.credential_kind.in_(
+                            ("access_token", "refresh_token")
+                        ),
+                    )
+                )
+            )
+        )
+
     async def mark_request_started(
         self,
         *,
@@ -1400,8 +1456,9 @@ class SqlAlchemyTrustedActionRepository:
             # 本地动作一起推进到 needs-attention/reconciling，随后仅由专用只读 worker
             # 按持久 scheduled_for 重新取得租约；write_attempt_count 永不递增。
             reconciliation_count = execution.reconciliation_attempt_count
-            terminal_reconciliation = (
-                from_reconciliation and reconciliation_count >= MAX_RECONCILIATION_ATTEMPTS
+            terminal_reconciliation = from_reconciliation and (
+                reconciliation_count >= MAX_RECONCILIATION_ATTEMPTS
+                or outcome.error_code == "connection_scope_missing"
             )
             execution.status = (
                 ToolExecutionStatus.NEEDS_ATTENTION.value
@@ -1409,7 +1466,9 @@ class SqlAlchemyTrustedActionRepository:
                 else ToolExecutionStatus.RECONCILING.value
             )
             execution.error_code = (
-                "provider_reconciliation_failed"
+                "connection_scope_missing"
+                if outcome.error_code == "connection_scope_missing"
+                else "provider_reconciliation_failed"
                 if terminal_reconciliation
                 else "provider_write_outcome_unknown"
             )
@@ -1603,6 +1662,10 @@ class SqlAlchemyTrustedActionRepository:
                 available_at=database_now,
             )
         )
+
+    async def converge_pre_request_reconciliation(self, *, task_id: UUID) -> bool:
+        """在独立核对阶段确认撤权动作从未发出请求；保留不可变审批事实。"""
+        return await _converge_pre_request_reconciliation_in_session(self._session, task_id=task_id)
 
     async def claim_reconciliation(
         self,
@@ -2763,6 +2826,562 @@ async def _recover_due_reconciliations_in_session(
     return recovered
 
 
+async def _converge_pre_request_reconciliation_in_session(
+    session: AsyncSession, *, task_id: UUID
+) -> bool:
+    """仅凭可信持久绑定安全终结撤权后零请求的核对分支。
+
+    本方法属于后续只读核对，不属于 disable/disconnect 事务。它沿既有锁序重读
+    Task、Approval、ToolExecution、本地动作和 Connection，只有固定撤权原因、零请求、
+    零写次数且无在途核对租约时才确认未应用；不读取 Secret、命令明文或 OAuth token。
+    损坏绑定、已有请求、终态和重复投递均返回 False，不覆盖历史结论。
+
+    Args:
+        session: 调用方控制提交的短事务。
+        task_id: 队列提供的唯一持久任务标识。
+
+    Returns:
+        本事务首次完成明确未应用收敛时为 True。
+    """
+    task = await session.scalar(
+        select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+    )
+    if task is None or task.kind != "trusted_action" or task.status != "reconciling":
+        return False
+    raw_approval = task.input_payload.get("approval_id")
+    raw_operation = task.input_payload.get("operation_id")
+    if (
+        set(task.input_payload) != {"approval_id", "operation_id"}
+        or type(raw_approval) is not str
+        or type(raw_operation) is not str
+    ):
+        return False
+    try:
+        approval_id, operation_id = UUID(raw_approval), UUID(raw_operation)
+    except ValueError:
+        return False
+    approval = await session.scalar(
+        select(ApprovalRequestModel)
+        .where(ApprovalRequestModel.id == approval_id, ApprovalRequestModel.task_id == task.id)
+        .with_for_update()
+    )
+    execution = await session.scalar(
+        select(ToolExecutionModel).where(ToolExecutionModel.task_id == task.id).with_for_update()
+    )
+    if (
+        approval is None
+        or execution is None
+        or approval.status != ApprovalStatus.APPROVED.value
+        or execution.status != ToolExecutionStatus.RECONCILING.value
+        or execution.error_code not in _PRE_REQUEST_RECONCILIATION_REASONS
+        or task.error_code != execution.error_code
+        or execution.request_started_at is not None
+        or execution.write_attempt_count != 0
+        or execution.result_summary is not None
+    ):
+        return False
+    local: MailDraftModel | CalendarChangeProposalModel | None = None
+    if approval.proposal_kind == "mail_draft":
+        local = await session.scalar(
+            select(MailDraftModel)
+            .where(
+                MailDraftModel.id == approval.proposal_id, MailDraftModel.user_id == task.user_id
+            )
+            .with_for_update()
+        )
+    elif approval.proposal_kind == "calendar_proposal":
+        local = await session.scalar(
+            select(CalendarChangeProposalModel)
+            .where(
+                CalendarChangeProposalModel.id == approval.proposal_id,
+                CalendarChangeProposalModel.user_id == task.user_id,
+            )
+            .with_for_update()
+        )
+    if local is None or local.current_version != approval.proposal_version:
+        return False
+    connection = await session.scalar(
+        select(OAuthConnectionModel)
+        .where(
+            OAuthConnectionModel.id == local.connection_id,
+            OAuthConnectionModel.user_id == task.user_id,
+        )
+        .with_for_update()
+    )
+    database_now = await session.scalar(select(func.clock_timestamp()))
+    if (
+        connection is None
+        or database_now is None
+        or local.status != "needs_attention"
+        or (
+            task.lease_owner is not None
+            and (task.lease_expires_at is None or task.lease_expires_at > database_now)
+        )
+        or not trusted_execution_binding_matches(
+            execution_task_id=execution.task_id,
+            expected_task_id=task.id,
+            execution_step_id=execution.step_id,
+            expected_step_id=approval.step_id,
+            execution_operation_id=execution.operation_id,
+            expected_operation_id=operation_id,
+            execution_provider=execution.provider,
+            expected_provider=connection.provider,
+            execution_tool_name=execution.tool_name,
+            expected_action=approval.action,
+            execution_idempotency_key=execution.idempotency_key,
+            approval_id=approval.id,
+            approval_version=approval.version,
+            execution_payload_hash=execution.request_payload_hash,
+            expected_payload_hash=approval.payload_hash,
+        )
+    ):
+        return False
+    execution.status = ToolExecutionStatus.CONFIRMED_FAILED.value
+    execution.completed_at = database_now
+    execution.result_summary = {"kind": "confirmed_not_applied", "retryable": False}
+    task.status = TaskStatus.FAILED.value
+    task.finished_at = database_now
+    _clear_task_scheduling(task)
+    local.status = "editing"
+    # 未发出请求的证据来自 request-start CAS，而不是“凭据已删”。审批仍为 approved，
+    # 旧不可变版本已消费，用户必须保存新版本并重新审批才能再次尝试。
+    for event_type in ("tool.confirmed_failed", "task.failed"):
+        audit = AuditEventModel(
+            user_id=task.user_id,
+            task_id=task.id,
+            event_type=event_type,
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": execution.error_code},
+        )
+        session.add(audit)
+        await session.flush()
+        session.add(
+            OutboxEventModel(
+                topic=event_type,
+                aggregate_id=task.id,
+                deduplication_key=f"{event_type}:{execution.id}:pre-request-reconciliation",
+                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                available_at=database_now,
+            )
+        )
+    await session.execute(
+        delete(OutboxEventModel).where(
+            OutboxEventModel.aggregate_id == task.id,
+            OutboxEventModel.topic == "task.execute",
+            OutboxEventModel.published_at.is_(None),
+        )
+    )
+    return True
+
+
+async def invalidate_unclaimed_actions_for_connection(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    connection_id: UUID,
+    actions: frozenset[str],
+    reason: str,
+    only_task_id: UUID | None = None,
+    unclaimed_only: bool = False,
+) -> int:
+    """原子失效连接的未认领可信动作，并将已认领动作移交只读核对。
+
+    查询候选只用于缩小锁集合，任何 mutation 前都会按 Task→Approval→ToolExecution→
+    本地对象的既有可信锁序重读。修改连接状态的调用方必须在本函数返回后、同一事务内
+    再锁 Connection 与 capability 行；这样 claim 与撤权只会有一个有效赢家，也不会
+    形成 Connection→Task 的反向等待。开关扫描不修改连接行，只处理未认领动作。
+
+    Args:
+        session: 调用方拥有且尚未提交的异步会话。
+        user_id: 连接及任务的用户归属。
+        connection_id: 被关闭能力所属的精确连接。
+        actions: 本次能力变化影响的固定动作集合。
+        reason: 不含用户内容的稳定机器原因。
+        only_task_id: Scheduler 已锁定的精确候选；连接撤权省略以覆盖全部相关动作。
+        unclaimed_only: 开关扫描只处理零 execution 动作，锁内再次检查以拒绝竞态 claim。
+
+    Returns:
+        本事务实际失效或移交核对的动作数量；同原因重复调用返回零。
+
+    Raises:
+        ValueError: 动作集合或机器原因为空。
+    """
+    if not actions or any(type(action) is not str or not action for action in actions):
+        raise ValueError("actions must be a non-empty set of stable names")
+    if type(reason) is not str or not reason or reason != reason.strip():
+        raise ValueError("reason must be a stable non-empty code")
+
+    candidate_ids = tuple(
+        await session.scalars(
+            select(TaskRunModel.id)
+            .join(ApprovalRequestModel, ApprovalRequestModel.task_id == TaskRunModel.id)
+            .outerjoin(
+                MailDraftModel,
+                and_(
+                    ApprovalRequestModel.proposal_kind == "mail_draft",
+                    ApprovalRequestModel.proposal_id == MailDraftModel.id,
+                    MailDraftModel.user_id == TaskRunModel.user_id,
+                ),
+            )
+            .outerjoin(
+                CalendarChangeProposalModel,
+                and_(
+                    ApprovalRequestModel.proposal_kind == "calendar_proposal",
+                    ApprovalRequestModel.proposal_id == CalendarChangeProposalModel.id,
+                    CalendarChangeProposalModel.user_id == TaskRunModel.user_id,
+                ),
+            )
+            .where(
+                TaskRunModel.user_id == user_id,
+                TaskRunModel.id == only_task_id if only_task_id is not None else true(),
+                TaskRunModel.kind == "trusted_action",
+                ApprovalRequestModel.action.in_(tuple(sorted(actions))),
+                ApprovalRequestModel.status.in_(
+                    (ApprovalStatus.PENDING.value, ApprovalStatus.APPROVED.value)
+                ),
+                # Worker 先取得通用 TaskRun lease 后才进入可信动作 claim；此窗口内任务
+                # 已是 ``running``，仍属于“尚未认领”的动作，不能因状态过滤而漏过撤权屏障。
+                TaskRunModel.status.in_(
+                    (
+                        TaskStatus.WAITING_APPROVAL.value,
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.RECONCILING.value,
+                        TaskStatus.NEEDS_ATTENTION.value,
+                    )
+                ),
+                or_(
+                    MailDraftModel.connection_id == connection_id,
+                    CalendarChangeProposalModel.connection_id == connection_id,
+                ),
+            )
+            .order_by(TaskRunModel.id)
+        )
+    )
+    invalidated = 0
+    for task_id in candidate_ids:
+        task = await session.scalar(
+            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+        )
+        if task is None or task.user_id != user_id or task.kind != "trusted_action":
+            continue
+        approval = await session.scalar(
+            select(ApprovalRequestModel)
+            .where(
+                ApprovalRequestModel.task_id == task.id,
+                ApprovalRequestModel.action.in_(tuple(sorted(actions))),
+            )
+            .with_for_update()
+        )
+        if (
+            approval is None
+            or approval.status not in {ApprovalStatus.PENDING.value, ApprovalStatus.APPROVED.value}
+            or task.status
+            not in {
+                TaskStatus.WAITING_APPROVAL.value,
+                TaskStatus.QUEUED.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.RECONCILING.value,
+                TaskStatus.NEEDS_ATTENTION.value,
+            }
+        ):
+            continue
+        execution = await session.scalar(
+            select(ToolExecutionModel)
+            .where(ToolExecutionModel.task_id == task.id)
+            .with_for_update()
+        )
+        if unclaimed_only and execution is not None:
+            continue
+        local: MailDraftModel | CalendarChangeProposalModel | None
+        if approval.proposal_kind == "mail_draft" and approval.proposal_id is not None:
+            local = await session.scalar(
+                select(MailDraftModel)
+                .where(
+                    MailDraftModel.id == approval.proposal_id,
+                    MailDraftModel.user_id == user_id,
+                    MailDraftModel.connection_id == connection_id,
+                )
+                .with_for_update()
+            )
+        elif approval.proposal_kind == "calendar_proposal" and approval.proposal_id is not None:
+            local = await session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == approval.proposal_id,
+                    CalendarChangeProposalModel.user_id == user_id,
+                    CalendarChangeProposalModel.connection_id == connection_id,
+                )
+                .with_for_update()
+            )
+        else:
+            local = None
+        if local is None or local.current_version != approval.proposal_version:
+            # 绑定损坏时 fail closed，不能凭连接字段猜测另一个动作并改写其状态。
+            continue
+
+        database_now = await session.scalar(select(func.clock_timestamp()))
+        if database_now is None:
+            raise RuntimeError("database clock is unavailable")
+        # 已认领动作的审批与冻结命令不可失效。能力撤回只把它移交给只读核对；命令本体和
+        # ToolExecution 的身份/哈希字段完全不变，避免把可能已经发出的供应商写入伪装为取消。
+        if execution is not None:
+            try:
+                execution_status = ToolExecutionStatus(execution.status)
+            except ValueError:
+                continue
+            if (
+                execution_status
+                not in {
+                    ToolExecutionStatus.CLAIMED,
+                    ToolExecutionStatus.EXECUTING,
+                    ToolExecutionStatus.RECONCILING,
+                }
+                or approval.status != ApprovalStatus.APPROVED.value
+            ):
+                continue
+            if local.status not in {
+                MailDraftStatus.EXECUTING.value,
+                MailDraftStatus.NEEDS_ATTENTION.value,
+                CalendarProposalStatus.EXECUTING.value,
+                CalendarProposalStatus.NEEDS_ATTENTION.value,
+            }:
+                continue
+
+            if (
+                execution_status is ToolExecutionStatus.RECONCILING
+                and execution.error_code == reason
+                and task.status == TaskStatus.RECONCILING.value
+                and local.status == "needs_attention"
+            ):
+                # 重复撤权不能重置在途核对租约、重排退避或追加相同去重键；原持久事实
+                # 已足以禁止写入，丢失投递由既有 PostgreSQL reconciliation recovery 恢复。
+                continue
+
+            execution.status = ToolExecutionStatus.RECONCILING.value
+            execution.error_code = reason
+            execution.completed_at = None
+            task.status = TaskStatus.RECONCILING.value
+            task.error_code = reason
+            task.finished_at = None
+            task.lease_owner = None
+            task.lease_expires_at = None
+            task.retry_recovery_at = None
+            task.approval_checkpoint_recovery_at = None
+            task.scheduled_for = database_now
+            if isinstance(local, MailDraftModel):
+                local.status = MailDraftStatus.NEEDS_ATTENTION.value
+            else:
+                local.status = CalendarProposalStatus.NEEDS_ATTENTION.value
+            # 初始 task.execute 尚未发布时删除它，避免普通可信动作 Runner 抢到这条消息；
+            # 已发布历史保留，新的消息只表达专用核对意图。
+            await session.execute(
+                delete(OutboxEventModel).where(
+                    OutboxEventModel.aggregate_id == task.id,
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.published_at.is_(None),
+                )
+            )
+            audit = AuditEventModel(
+                user_id=user_id,
+                task_id=task.id,
+                event_type="tool.reconciling",
+                actor_type="system",
+                actor_id=None,
+                event_metadata={"reason": reason},
+            )
+            session.add(audit)
+            await session.flush()
+            session.add_all(
+                (
+                    OutboxEventModel(
+                        topic="tool.reconciling",
+                        aggregate_id=task.id,
+                        deduplication_key=f"tool.reconciling:{execution.id}:revoked:{audit.id}",
+                        payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                        available_at=database_now,
+                    ),
+                    OutboxEventModel(
+                        topic="task.execute",
+                        aggregate_id=task.id,
+                        deduplication_key=f"task.execute:{task.id}:reconcile:revoked:{audit.id}",
+                        payload={"task_id": str(task.id)},
+                        available_at=database_now,
+                    ),
+                )
+            )
+            invalidated += 1
+            continue
+
+        # 尚未认领的动作只允许从等待审批/执行队列/已取得通用租约的 running 进入取消；
+        # 本地对象必须仍绑定 awaiting_approval，才可安全恢复编辑态。
+        if local.status not in {
+            MailDraftStatus.AWAITING_APPROVAL.value,
+            CalendarProposalStatus.AWAITING_APPROVAL.value,
+        } or task.status not in {
+            TaskStatus.WAITING_APPROVAL.value,
+            TaskStatus.QUEUED.value,
+            TaskStatus.RUNNING.value,
+        }:
+            continue
+        local.status = (
+            MailDraftStatus.EDITING.value
+            if isinstance(local, MailDraftModel)
+            else CalendarProposalStatus.EDITING.value
+        )
+        approval.status = ApprovalStatus.INVALIDATED.value
+        task.status = TaskStatus.CANCELLED.value
+        task.error_code = None
+        task.finished_at = database_now
+        _clear_task_scheduling(task)
+        # 未发布执行消息尚未形成外部事实，可以安全删除；已发布消息保持历史且会因
+        # cancelled 权威状态 no-op，不能通过删除历史伪装从未投递。
+        await session.execute(
+            delete(OutboxEventModel).where(
+                OutboxEventModel.aggregate_id == task.id,
+                OutboxEventModel.topic == "task.execute",
+                OutboxEventModel.published_at.is_(None),
+            )
+        )
+        approval_audit = AuditEventModel(
+            user_id=user_id,
+            task_id=task.id,
+            event_type="approval.invalidated",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": reason},
+        )
+        task_audit = AuditEventModel(
+            user_id=user_id,
+            task_id=task.id,
+            event_type="task.cancelled",
+            actor_type="system",
+            actor_id=None,
+            event_metadata={"reason": reason},
+        )
+        session.add_all((approval_audit, task_audit))
+        await session.flush()
+        session.add_all(
+            (
+                OutboxEventModel(
+                    topic="approval.invalidated",
+                    aggregate_id=task.id,
+                    deduplication_key=(
+                        f"approval.invalidated:{approval.id}:{approval.version}:revoked"
+                    ),
+                    payload={"task_id": str(task.id), "audit_event_id": approval_audit.id},
+                    available_at=database_now,
+                ),
+                OutboxEventModel(
+                    topic="task.cancelled",
+                    aggregate_id=task.id,
+                    deduplication_key=f"task.cancelled:{task.id}:revoked",
+                    payload={"task_id": str(task.id), "audit_event_id": task_audit.id},
+                    available_at=database_now,
+                ),
+            )
+        )
+        invalidated += 1
+    return invalidated
+
+
+class SqlAlchemyTrustedActionRevocationStore:
+    """按停机开关扫描未认领审批，不需要凭据、命令密文或 Worker Secret。"""
+
+    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+        """保存有界扫描所用的短事务工厂。"""
+        self._session_factory = session_factory
+
+    async def invalidate_disabled_provider_actions(
+        self, *, providers: frozenset[str], limit: int
+    ) -> int:
+        """先过滤可行动候选再应用 limit，并沿可信锁序重读每个用户/连接绑定。
+
+        所有候选 TaskRun 先按固定 UUID 顺序锁定；已形成 ToolExecution 的任务从候选中
+        排除，锁内仍会二次校验。返回实际失效数量，重复扫描自然成为 no-op。
+        """
+        if not providers or not providers <= {"google", "microsoft"}:
+            raise ValueError("providers must contain supported names")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self._session_factory.begin() as session:
+            connection_id = func.coalesce(
+                MailDraftModel.connection_id, CalendarChangeProposalModel.connection_id
+            )
+            rows = (
+                await session.execute(
+                    select(
+                        TaskRunModel.id, TaskRunModel.user_id, connection_id.label("connection_id")
+                    )
+                    .join(ApprovalRequestModel, ApprovalRequestModel.task_id == TaskRunModel.id)
+                    .outerjoin(
+                        MailDraftModel,
+                        and_(
+                            ApprovalRequestModel.proposal_kind == "mail_draft",
+                            ApprovalRequestModel.proposal_id == MailDraftModel.id,
+                            MailDraftModel.user_id == TaskRunModel.user_id,
+                        ),
+                    )
+                    .outerjoin(
+                        CalendarChangeProposalModel,
+                        and_(
+                            ApprovalRequestModel.proposal_kind == "calendar_proposal",
+                            ApprovalRequestModel.proposal_id == CalendarChangeProposalModel.id,
+                            CalendarChangeProposalModel.user_id == TaskRunModel.user_id,
+                        ),
+                    )
+                    .join(
+                        OAuthConnectionModel,
+                        and_(
+                            OAuthConnectionModel.id == connection_id,
+                            OAuthConnectionModel.user_id == TaskRunModel.user_id,
+                        ),
+                    )
+                    .where(
+                        TaskRunModel.kind == "trusted_action",
+                        TaskRunModel.status.in_(("waiting_approval", "queued", "running")),
+                        ApprovalRequestModel.status.in_(("pending", "approved")),
+                        ApprovalRequestModel.action.in_(
+                            ("mail.send", "calendar.create", "calendar.update", "calendar.restore")
+                        ),
+                        OAuthConnectionModel.provider.in_(tuple(sorted(providers))),
+                        # 损坏或已离开待审批版本的本地动作不可执行失效；必须在 limit 前排除，
+                        # 避免永久占用第一批次而饿死后续有效审批。
+                        func.coalesce(
+                            MailDraftModel.current_version,
+                            CalendarChangeProposalModel.current_version,
+                        )
+                        == ApprovalRequestModel.proposal_version,
+                        func.coalesce(MailDraftModel.status, CalendarChangeProposalModel.status)
+                        == MailDraftStatus.AWAITING_APPROVAL.value,
+                        ~exists(
+                            select(ToolExecutionModel.id).where(
+                                ToolExecutionModel.task_id == TaskRunModel.id
+                            )
+                        ),
+                    )
+                    .order_by(TaskRunModel.id)
+                    .limit(limit)
+                    .with_for_update(of=TaskRunModel, skip_locked=True)
+                )
+            ).all()
+            invalidated = 0
+            for row in rows:
+                invalidated += await invalidate_unclaimed_actions_for_connection(
+                    session,
+                    user_id=row.user_id,
+                    connection_id=row.connection_id,
+                    only_task_id=row.id,
+                    unclaimed_only=True,
+                    actions=frozenset(
+                        {"mail.send", "calendar.create", "calendar.update", "calendar.restore"}
+                    ),
+                    reason="external_writes_disabled",
+                )
+            return invalidated
+
+
 class SqlAlchemyTrustedActionReconciliationRecoveryStore:
     """只依赖 PostgreSQL 的核对恢复适配器，不读取应用主密钥。
 
@@ -2774,6 +3393,11 @@ class SqlAlchemyTrustedActionReconciliationRecoveryStore:
     def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
         """保存会话工厂；每次扫描使用一个短提交事务。"""
         self._session_factory = session_factory
+
+    async def converge_pre_request_reconciliation(self, *, task_id: UUID) -> bool:
+        """在 Worker 加载任何 Secret/adapter 前消费零请求撤权事实。"""
+        async with self._session_factory.begin() as session:
+            return await _converge_pre_request_reconciliation_in_session(session, task_id=task_id)
 
     async def recover_due_reconciliations(self, *, now: datetime, limit: int) -> int:
         """补建到期核对投递并返回本轮新增 Outbox 数量。"""

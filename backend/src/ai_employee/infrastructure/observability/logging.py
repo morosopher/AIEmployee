@@ -438,6 +438,14 @@ class _JsonFormatter(logging.Formatter):
             "provider": getattr(record, "provider", None),
             "error_code": getattr(record, "error_code", None),
         }
+        # 撤销维护仅公开供应商级整数计数，不能让任意 extra 字符串绕过日志最小披露边界。
+        unresolved_count = getattr(record, "unresolved_count", None)
+        if (
+            record.name == "ai_employee.oauth.revoke_backlog"
+            and type(unresolved_count) is int
+            and unresolved_count >= 0
+        ):
+            payload["unresolved_count"] = unresolved_count
         if record.exc_info is not None:
             # 只记录代码位置，刻意不调用 formatException：异常消息和 locals 可能包含请求正文、
             # Cookie、授权头或供应商响应。函数名与行号足以让 trace_id 关联到受控源码版本。

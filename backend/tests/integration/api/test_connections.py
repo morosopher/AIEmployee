@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from sqlalchemy import func, select
 
 from ai_employee.config import get_settings
 from ai_employee.domain.connections import ConnectionCapability
@@ -15,6 +16,12 @@ from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     OAuthConnectionModel,
     ProviderCalendarModel,
+)
+from ai_employee.infrastructure.db.models.tasks import (
+    ApprovalRequestModel,
+    AuditEventModel,
+    OutboxEventModel,
+    TaskRunModel,
 )
 from ai_employee.infrastructure.db.session import (
     ManagedAsyncSessionMaker,
@@ -33,6 +40,7 @@ class AuthenticatedApiClients:
     session_factory: ManagedAsyncSessionMaker
     owner_id: UUID
     other_id: UUID
+    oauth_adapter: "FakeOAuthAdapter"
 
 
 @dataclass(slots=True)
@@ -40,9 +48,12 @@ class FakeOAuthAdapter:
     """为能力 API 返回确定性授权 URL，绝不访问真实供应商。"""
 
     provider: str = "google"
+    scope_calls: int = 0
+    revoke_calls: int = 0
 
     def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
         """把四种内部能力映射到只用于测试的合成 scope。"""
+        self.scope_calls += 1
         return frozenset(f"scope:{capability.value}" for capability in capabilities)
 
     def build_authorization_url(self, request: object) -> str:
@@ -68,6 +79,7 @@ class FakeOAuthAdapter:
     async def revoke(self, token: str) -> object:
         """能力 API 不撤销 token。"""
         del token
+        self.revoke_calls += 1
         raise AssertionError("revoke must not be called")
 
 
@@ -123,7 +135,8 @@ async def authenticated_api_clients(
 
     app = create_app()
     # 固定 mapping 只在组合根注入；用例没有运行时注册入口，也不会读取真实 OAuth secret。
-    app.state.oauth_adapters = {"google": FakeOAuthAdapter()}
+    oauth_adapter = FakeOAuthAdapter()
+    app.state.oauth_adapters = {"google": oauth_adapter}
     transport = httpx.ASGITransport(app=app)
     async with (
         httpx.AsyncClient(transport=transport, base_url="https://testserver") as owner,
@@ -138,15 +151,38 @@ async def authenticated_api_clients(
                 json={"email": email, "password": password},
             )
             assert response.status_code == 200
-        yield AuthenticatedApiClients(owner, other, session_factory, owner_id, other_id)
+        yield AuthenticatedApiClients(
+            owner,
+            other,
+            session_factory,
+            owner_id,
+            other_id,
+            oauth_adapter,
+        )
 
     await session_factory.dispose()
     await app.state.auth_session_factory.dispose()
     get_settings.cache_clear()
 
 
-async def _seed_connection(clients: AuthenticatedApiClients) -> UUID:
-    """写入四项能力与一个日历目录项，所有文本均为合成数据。"""
+async def _seed_connection(
+    clients: AuthenticatedApiClients,
+    *,
+    enabled_capabilities: frozenset[ConnectionCapability] | None = None,
+) -> UUID:
+    """写入四项能力与一个日历目录项，所有文本均为合成数据。
+
+    ``enabled_capabilities`` 只用于构造依赖闭包完整的合成连接，默认保持既有测试的
+    ``mail.read`` 初始状态；调用方不得借此绕过应用层的能力依赖校验。
+    """
+    enabled = (
+        frozenset({ConnectionCapability.MAIL_READ})
+        if enabled_capabilities is None
+        else enabled_capabilities
+    )
+    scopes = [
+        f"scope:{capability.value}" for capability in sorted(enabled, key=lambda item: item.value)
+    ]
     async with clients.session_factory.begin() as session:
         connection = OAuthConnectionModel(
             user_id=clients.owner_id,
@@ -155,7 +191,7 @@ async def _seed_connection(clients: AuthenticatedApiClients) -> UUID:
             provider_tenant_id="",
             account_type="google",
             account_email="task8-calendar@example.test",
-            scopes=["scope:mail.read"],
+            scopes=scopes,
             status="connected",
             last_error_code=None,
         )
@@ -166,14 +202,10 @@ async def _seed_connection(clients: AuthenticatedApiClients) -> UUID:
                 user_id=clients.owner_id,
                 connection_id=connection.id,
                 capability=capability.value,
-                status=("enabled" if capability is ConnectionCapability.MAIL_READ else "disabled"),
-                actual_scopes=(
-                    ["scope:mail.read"] if capability is ConnectionCapability.MAIL_READ else []
-                ),
+                status=("enabled" if capability in enabled else "disabled"),
+                actual_scopes=([f"scope:{capability.value}"] if capability in enabled else []),
                 last_verified_at=(
-                    datetime(2030, 1, 1, tzinfo=UTC)
-                    if capability is ConnectionCapability.MAIL_READ
-                    else None
+                    datetime(2030, 1, 1, tzinfo=UTC) if capability in enabled else None
                 ),
                 last_error_code=None,
             )
@@ -193,6 +225,46 @@ async def _seed_connection(clients: AuthenticatedApiClients) -> UUID:
             )
         )
         return connection.id
+
+
+async def _connection_disable_invariants(
+    clients: AuthenticatedApiClients,
+    connection_id: UUID,
+) -> tuple[tuple[tuple[str, str], ...], tuple[int, int, int, int]]:
+    """读取禁用请求前后必须保持不变的能力与可信动作事实。
+
+    测试连接没有预置真实动作，因此四个全表计数足以证明拒绝路径没有偷偷创建或失效
+    Task/Approval/Audit/Outbox；能力状态则按该连接和用户显式限定，避免依赖 ORM 默认排序。
+    """
+    async with clients.session_factory() as session:
+        capabilities = tuple(
+            (
+                row.capability,
+                row.status,
+            )
+            for row in (
+                await session.scalars(
+                    select(ConnectionCapabilityModel)
+                    .where(
+                        ConnectionCapabilityModel.user_id == clients.owner_id,
+                        ConnectionCapabilityModel.connection_id == connection_id,
+                    )
+                    .order_by(ConnectionCapabilityModel.capability)
+                )
+            ).all()
+        )
+        count_values: list[int] = []
+        for model in (
+            TaskRunModel,
+            ApprovalRequestModel,
+            AuditEventModel,
+            OutboxEventModel,
+        ):
+            count_values.append(
+                int(await session.scalar(select(func.count()).select_from(model)) or 0)
+            )
+        counts = tuple(count_values)
+    return capabilities, counts
 
 
 @pytest.mark.asyncio
@@ -270,6 +342,68 @@ async def test_enable_mail_send_requires_csrf_and_hides_foreign_connections(
         "authorization_url": "https://provider.example.test/authorize",
         "requested_capabilities": ["mail.read", "mail.send"],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read_capability", "write_capability"),
+    (
+        (ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND),
+        (ConnectionCapability.CALENDAR_READ, ConnectionCapability.CALENDAR_WRITE),
+    ),
+)
+async def test_disable_read_capability_rejects_enabled_write_dependency_without_mutation(
+    authenticated_api_clients: AuthenticatedApiClients,
+    read_capability: ConnectionCapability,
+    write_capability: ConnectionCapability,
+) -> None:
+    """只读能力被写能力依赖时返回稳定 409，且不触发任何持久化或供应商调用。
+
+    第二段先关闭写能力，再关闭读取能力，作为同一 HTTP 契约中的正例；这也证明拒绝
+    路径没有把 capability/action/task/audit/outbox 的事实部分提交后再回滚不完整。
+    """
+    clients = authenticated_api_clients
+    connection_id = await _seed_connection(
+        clients,
+        enabled_capabilities=frozenset({read_capability, write_capability}),
+    )
+    path = f"/api/v1/connections/{connection_id}/capabilities/{read_capability.value}/disable"
+    csrf = clients.owner.cookies.get("ai_employee_csrf") or ""
+    before = await _connection_disable_invariants(clients, connection_id)
+    provider_calls_before = (clients.oauth_adapter.scope_calls, clients.oauth_adapter.revoke_calls)
+
+    rejected = await clients.owner.post(path, headers={"X-CSRF-Token": csrf})
+
+    assert rejected.status_code == 409
+    assert rejected.json()["error_code"] == "connection_capability_dependency_conflict"
+    assert rejected.json()["detail"] == "The request conflicts with current state."
+    assert await _connection_disable_invariants(clients, connection_id) == before
+    assert (clients.oauth_adapter.scope_calls, clients.oauth_adapter.revoke_calls) == (
+        provider_calls_before
+    )
+
+    disable_write = await clients.owner.post(
+        f"/api/v1/connections/{connection_id}/capabilities/{write_capability.value}/disable",
+        headers={"X-CSRF-Token": csrf},
+    )
+    disable_read = await clients.owner.post(path, headers={"X-CSRF-Token": csrf})
+
+    assert disable_write.status_code == 200
+    assert disable_write.json() == {
+        "capability": write_capability.value,
+        "status": "disabled",
+    }
+    assert disable_read.status_code == 200
+    assert disable_read.json() == {
+        "capability": read_capability.value,
+        "status": "disabled",
+    }
+    final_capabilities, _ = await _connection_disable_invariants(clients, connection_id)
+    assert dict(final_capabilities)[read_capability.value] == "disabled"
+    assert dict(final_capabilities)[write_capability.value] == "disabled"
+    assert (clients.oauth_adapter.scope_calls, clients.oauth_adapter.revoke_calls) == (
+        provider_calls_before
+    )
 
 
 @pytest.mark.asyncio

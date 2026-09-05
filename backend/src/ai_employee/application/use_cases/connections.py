@@ -28,7 +28,6 @@ from ai_employee.domain.connections import (
     ConnectionCapability,
     ConnectionCapabilityDependencyConflict,
     ConnectionStatus,
-    validate_capability_disable,
     validate_capability_enable,
 )
 from ai_employee.domain.errors import DomainError, StateConflictError
@@ -73,6 +72,14 @@ class StoredCapability:
     actual_scopes: tuple[str, ...]
     last_verified_at: datetime | None
     last_error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRevokeBacklog:
+    """供应商级未决撤销计数；不暴露连接、用户或任何令牌材料。"""
+
+    provider: str
+    unresolved_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +319,33 @@ class ConnectionStore(Protocol):
         """标记首次 state 失效、删除本地凭据并返回待尽力撤销的 refresh token 密文。"""
         ...
 
+    async def record_oauth_revoke_unresolved(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        provider: str,
+        error_code: str,
+        occurred_at: datetime,
+    ) -> None:
+        """在本地凭据已删除后追加无内容的供应商撤销未决事实。"""
+        ...
+
+    async def get_oauth_revoke_backlog(self) -> tuple[OAuthRevokeBacklog, ...]:
+        """聚合仍未被操作者补救的撤销维护事实，不创建网络重试任务。"""
+        ...
+
+    async def record_oauth_revoke_remediation(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        unresolved_event_id: int,
+        occurred_at: datetime,
+    ) -> bool:
+        """追加当前用户对精确未决撤销的补救事实；跨用户、缺失或重复确认返回 False。"""
+        ...
+
 
 class ConnectionStoreFactory(Protocol):
     """为一次连接用例提供事务边界，不让路由或用例接触 ORM。"""
@@ -319,6 +353,47 @@ class ConnectionStoreFactory(Protocol):
     def __call__(self) -> AbstractAsyncContextManager[ConnectionStore]:
         """创建自动提交或回滚的存储上下文。"""
         ...
+
+
+class OAuthRevokeMaintenanceUseCase:
+    """为 Scheduler 和操作者提供无令牌的撤销维护能力。
+
+    本用例没有 OAuth adapter 或 Encryption 依赖。扫描只能计数，人工补救只能追加当前
+    用户对精确审计事件的确认；无法构造恢复 token 或再次调用 revoke 的任务。
+    """
+
+    def __init__(self, stores: ConnectionStoreFactory, clock: Clock) -> None:
+        """保存短事务工厂与事实时间来源。"""
+        self._stores = stores
+        self._clock = clock
+
+    async def scan(self) -> tuple[OAuthRevokeBacklog, ...]:
+        """返回各供应商仍未处理的撤销数量，供周期告警使用。"""
+        async with self._stores() as store:
+            return await store.get_oauth_revoke_backlog()
+
+    async def record_remediation(
+        self, *, user_id: UUID, connection_id: UUID, unresolved_event_id: int
+    ) -> bool:
+        """记录操作者已在供应商侧完成补救的确认，不接受自由文本或外部凭据。
+
+        Args:
+            user_id: 当前已认证操作者，同时作为连接归属条件。
+            connection_id: 需要补救的精确连接。
+            unresolved_event_id: ``oauth.revoke_unresolved`` 的正整数审计游标。
+
+        Returns:
+            首次追加确认时为 True；无权限、事实不存在或已确认时为 False。
+        """
+        if type(unresolved_event_id) is not int or unresolved_event_id <= 0:
+            raise ValueError("unresolved_event_id must be positive")
+        async with self._stores() as store:
+            return await store.record_oauth_revoke_remediation(
+                user_id=user_id,
+                connection_id=connection_id,
+                unresolved_event_id=unresolved_event_id,
+                occurred_at=_utc_now(self._clock),
+            )
 
 
 class TaskCreator(Protocol):
@@ -931,20 +1006,25 @@ class ConnectionsUseCase:
         connection_id: UUID,
         capability: ConnectionCapability,
     ) -> CapabilityDisableResult:
-        """验证依赖后只修改本地状态，不提前实现 Task 25 动作取消。"""
+        """委托仓储在固定可信锁序内校验依赖并原子关闭能力。
+
+        Task 19 规定动作撤权沿 ``TaskRun → ApprovalRequest → ToolExecution → 本地动作 →
+        Connection → capability`` 顺序取得行锁；enabled 快照与依赖校验必须发生在同一事务、
+        同一连接锁之后。这样渐进 OAuth callback 不能在快照与关闭之间提交写能力，且 claim
+        与撤权不会形成 Connection→Task 的反向等待。仓储抛出的依赖冲突会回滚此前扫描的
+        生命周期写入，路由仍只看到稳定领域错误。
+        """
         async with self._stores() as store:
-            enabled = await store.get_enabled_capabilities(
-                user_id=user_id,
-                connection_id=connection_id,
-            )
-            if enabled is None:
-                raise ConnectionNotFoundError
-            validate_capability_disable(capability, enabled)
-            await store.disable_capability(
-                user_id=user_id,
-                connection_id=connection_id,
-                capability=capability,
-            )
+            try:
+                await store.disable_capability(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    capability=capability,
+                )
+            except ConnectionCredentialOwnershipError:
+                # 仓储在扫描候选后锁定连接；缺失、跨用户和已删除连接都不能暴露
+                # ownership 细节，统一保持既有 404 资源隐藏契约。
+                raise ConnectionNotFoundError from None
         return CapabilityDisableResult(capability, CapabilityStatus.DISABLED)
 
     async def disconnect(
@@ -959,6 +1039,7 @@ class ConnectionsUseCase:
         不会回滚恢复凭据。供应商明确不支持窄撤销时返回 ``UNSUPPORTED`` 供后续审计使用。
         """
         now = _utc_now(self._clock)
+        raw_refresh: str | None = None
         async with self._stores() as store:
             connection = await store.get_connection(
                 user_id=user_id,
@@ -971,6 +1052,14 @@ class ConnectionsUseCase:
                 connection_id=connection_id,
                 invalidated_at=now,
             )
+            if refresh is not None:
+                # refresh token 必须在本地删除事务仍持有精确连接事实时解密到受控内存；
+                # 随后先提交密文删除，再允许任何供应商网络调用。这样提交后即使进程崩溃，
+                # 也不会为“稍后重试撤销”把凭据重新持久化或塞入队列。
+                raw_refresh = self._cipher.decrypt(
+                    refresh,
+                    self._aad(user_id, connection_id, "refresh_token"),
+                ).decode("utf-8")
         if not found:
             raise ConnectionNotFoundError
 
@@ -978,17 +1067,59 @@ class ConnectionsUseCase:
         try:
             adapter = self._adapter_for(connection.provider)
         except UnsupportedConnectionProviderError as error:
+            async with self._stores() as store:
+                await store.record_oauth_revoke_unresolved(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider=connection.provider,
+                    error_code=error.error_code,
+                    occurred_at=_utc_now(self._clock),
+                )
             return OAuthRevocationResult(
                 OAuthRevocationStatus.UNSUPPORTED,
                 error.error_code,
             )
-        if refresh is None:
+        if raw_refresh is None:
             return None
-        raw = self._cipher.decrypt(
-            refresh,
-            self._aad(user_id, connection_id, "refresh_token"),
-        ).decode("utf-8")
-        return await adapter.revoke(raw)
+        try:
+            result = await adapter.revoke(raw_refresh)
+        except DomainError as error:
+            # 供应商错误码已经在 adapter 边界完成脱敏；只把稳定 code 写入独立短事务，
+            # 不保存异常文本、请求正文或仍在受控内存中的 token。原始领域错误仍按端口
+            # 语义向上抛出，调用方不能把失败伪装成撤销成功。
+            async with self._stores() as store:
+                await store.record_oauth_revoke_unresolved(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider=connection.provider,
+                    error_code=error.error_code,
+                    occurred_at=_utc_now(self._clock),
+                )
+            raise
+        except Exception:
+            # 适配器若在未来遗漏分类，仍只记录固定机器码；绝不把未知异常的字符串
+            # 或 traceback 放入审计，且不创建任何能够重新取得已删除 token 的工作。
+            async with self._stores() as store:
+                await store.record_oauth_revoke_unresolved(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider=connection.provider,
+                    error_code="oauth_revoke_failed",
+                    occurred_at=_utc_now(self._clock),
+                )
+            raise
+        if result.status is OAuthRevocationStatus.UNSUPPORTED:
+            # 没有安全窄撤销端点与网络失败同样需要可观测的未决事实；token 已在本地
+            # 事务中销毁，因此只追加审计，不排入 retry/outbox。
+            async with self._stores() as store:
+                await store.record_oauth_revoke_unresolved(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    provider=connection.provider,
+                    error_code=result.error_code or "oauth_revoke_unsupported",
+                    occurred_at=_utc_now(self._clock),
+                )
+        return result
 
     async def start_manual_sync(
         self,

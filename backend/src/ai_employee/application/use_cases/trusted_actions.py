@@ -41,6 +41,7 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionExecutionSnapshot,
     TrustedActionPreflightRegistry,
     TrustedActionRequestStartAuthorization,
+    TrustedActionRevocationStore,
     TrustedActionRisk,
     TrustedActionSubmission,
     TrustedActionSubmissionResult,
@@ -212,6 +213,64 @@ class _TrustedActionIntegrityError(Exception):
 
 class TrustedActionAttemptAbandoned(Exception):
     """表示当前 Worker 不得完成任务，后续投递只能从持久事实恢复。"""
+
+
+def _connection_scope_missing_outcome(
+    snapshot: TrustedActionDispatchSnapshot,
+) -> ProviderWriteOutcome:
+    """构造只读凭据缺失的未知结论，保留关联标识和可安全公开的供应商检查入口。"""
+    summary = snapshot.execution.result_summary
+    provider_url = (
+        validate_provider_url(summary.get("provider_url")) if summary is not None else None
+    )
+    if provider_url is None:
+        # 通用供应商入口仅帮助人工检查；不含账户、日历或用户正文，也不授权切换发送目标。
+        provider_url = {
+            ("google", True): "https://mail.google.com/mail/#sent",
+            ("google", False): "https://calendar.google.com/calendar/",
+            ("microsoft", True): "https://outlook.office.com/mail/sentitems",
+            ("microsoft", False): "https://outlook.office.com/calendar/",
+        }.get((snapshot.provider, snapshot.action == "mail.send"))
+    return ProviderWriteOutcome(
+        kind=ProviderWriteOutcomeKind.UNKNOWN,
+        retryable=False,
+        retry_after_seconds=None,
+        provider_resource_id=snapshot.execution.provider_resource_id,
+        provider_request_id=snapshot.execution.provider_request_id,
+        correlation_id=snapshot.execution.correlation_id or str(snapshot.operation_id),
+        provider_url=provider_url,
+        error_code="connection_scope_missing",
+    )
+
+
+class InvalidateDisabledTrustedActionsUseCase:
+    """让运行时全局/供应商停机开关覆盖仍在等待审批或排队的未认领动作。
+
+    扫描只针对两个已批准供应商，不读取账户默认值、不切换日历、不解密命令；仓储在
+    行锁下确认 ToolExecution 仍不存在后才改变生命周期事实。
+    """
+
+    def __init__(
+        self, *, store: TrustedActionRevocationStore, write_policy: TrustedActionWritePolicy
+    ) -> None:
+        """注入事务端口与当前进程的固定写策略。"""
+        self._store = store
+        self._write_policy = write_policy
+
+    async def execute(self, *, limit: int) -> int:
+        """在有界批次中取消被开关阻断的审批；全部开启时不访问数据库。"""
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be positive")
+        disabled = frozenset(
+            provider
+            for provider in ("google", "microsoft")
+            if not self._write_policy.provider_writes_enabled(provider)
+        )
+        if not disabled:
+            return 0
+        return await self._store.invalidate_disabled_provider_actions(
+            providers=disabled, limit=limit
+        )
 
 
 class TrustedActionExecutionUseCase:
@@ -469,6 +528,27 @@ class TrustedActionExecutionUseCase:
                 provider=snapshot.provider,
                 action=snapshot.action,
             )
+        except StateConflictError as error:
+            missing_access = error.error_code == "connection_scope_missing"
+            if from_reconciliation and error.error_code == "provider_action_unavailable":
+                async with self._transactions() as transaction:
+                    missing_access = await transaction.reconciliation_connection_missing(
+                        snapshot=snapshot
+                    )
+            if from_reconciliation and missing_access:
+                async with self._transactions() as transaction:
+                    await transaction.persist_provider_outcome(
+                        snapshot=snapshot,
+                        outcome=_connection_scope_missing_outcome(snapshot),
+                        completed_at=_utc_now(self._clock()),
+                        from_reconciliation=True,
+                        may_retry_write=False,
+                        lease_owner=lease_owner,
+                    )
+                raise TrustedActionAttemptAbandoned from None
+            if snapshot.execution.request_started_at is not None:
+                await self._preserve_started_attempt(snapshot=snapshot, lease_owner=lease_owner)
+            raise
         except BaseException:
             if snapshot.execution.request_started_at is not None:
                 await self._preserve_started_attempt(
@@ -516,11 +596,18 @@ class TrustedActionExecutionUseCase:
             raise _trusted_action_unavailable()
 
         try:
-            outcome = (
-                await adapter.reconcile(command, snapshot.execution)
-                if from_reconciliation
-                else await adapter.execute(command)
-            )
+            try:
+                outcome = (
+                    await adapter.reconcile(command, snapshot.execution)
+                    if from_reconciliation
+                    else await adapter.execute(command)
+                )
+            except StateConflictError as error:
+                if not from_reconciliation or error.error_code != "connection_scope_missing":
+                    raise
+                # 连接 coordinator 明确无法提供只读凭据时停止自动核对；不能把本地权限
+                # 缺失转成 confirmed-not-applied，也不能安排写重试或恢复已销毁 Token。
+                outcome = _connection_scope_missing_outcome(snapshot)
             if type(outcome) is not ProviderWriteOutcome:
                 raise TypeError("trusted action adapter returned an invalid outcome")
             completed_at = _utc_now(self._clock())

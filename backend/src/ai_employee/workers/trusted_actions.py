@@ -22,6 +22,7 @@ from ai_employee.application.use_cases.trusted_actions import (
 from ai_employee.config import Settings
 from ai_employee.domain.tasks import JsonValue
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
+    SqlAlchemyTrustedActionReconciliationRecoveryStore,
     SqlAlchemyTrustedActionRepositoryFactory,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
@@ -167,6 +168,19 @@ class TrustedActionTaskStep:
         )
 
 
+async def converge_revoked_pre_request_action(
+    *, task_id: UUID, session_factory: ManagedAsyncSessionMaker
+) -> bool:
+    """先消费撤权后零请求的核对事实，避免不必要的密钥、Token 或 registry 装配。
+
+    这是普通 Taskiq 路由和专用核对 Worker 共用的持久边界。终态与损坏绑定返回 False，
+    已开始请求永远不会在此方法中被判定为未应用。
+    """
+    return await SqlAlchemyTrustedActionReconciliationRecoveryStore(
+        session_factory
+    ).converge_pre_request_reconciliation(task_id=task_id)
+
+
 def build_worker_trusted_action_registry(
     *,
     session_factory: ManagedAsyncSessionMaker,
@@ -269,4 +283,5 @@ __all__ = [
     "TrustedActionTaskStep",
     "build_trusted_action_task_step",
     "build_worker_trusted_action_registry",
+    "converge_revoked_pre_request_action",
 ]

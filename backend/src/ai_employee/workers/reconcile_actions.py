@@ -13,13 +13,16 @@ from ai_employee.application.use_cases.trusted_actions import (
     TrustedActionExecutionUseCase,
 )
 from ai_employee.config import Settings
+from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
+    SqlAlchemyTrustedActionTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
+from ai_employee.workers.trusted_actions import converge_revoked_pre_request_action
 
 
 def _reconciliation_owner() -> str:
@@ -113,6 +116,16 @@ async def execute_reconciliation_task(
     if current.tzinfo is None or current.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     current = current.astimezone(UTC)
+    if await converge_revoked_pre_request_action(task_id=task_id, session_factory=session_factory):
+        return True
+    if (
+        await SqlAlchemyTrustedActionTaskExecutionStore(
+            session_factory
+        ).get_authoritative_task_status(task_id=task_id)
+        != TaskStatus.RECONCILING.value
+    ):
+        # 重复投递已收敛的任务无需 Secret，保留即使已清理内容仍可复用的终态。
+        return False
     cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
     transactions = SqlAlchemyTrustedActionRepositoryFactory(session_factory, cipher)
     async with transactions() as transaction:

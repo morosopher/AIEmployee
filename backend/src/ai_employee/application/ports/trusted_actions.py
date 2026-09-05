@@ -349,6 +349,15 @@ class TrustedActionWritePolicy(Protocol):
         """判断精确 provider identity 是否通过当前环境账户限制。"""
 
 
+class TrustedActionRevocationStore(Protocol):
+    """提供不需要 Secret 或凭据的有界审批撤权事务。"""
+
+    async def invalidate_disabled_provider_actions(
+        self, *, providers: frozenset[str], limit: int
+    ) -> int:
+        """锁内重读精确供应商的未认领动作，并原子失效审批、任务与本地状态。"""
+
+
 class TrustedActionCommandCipher(Protocol):
     """把标准 JSON 命令加密为记录绑定 AEAD 三元组的窄端口。"""
 
@@ -616,6 +625,18 @@ class TrustedActionSubmissionTransaction(Protocol):
         operation_id: UUID,
     ) -> TrustedActionDispatchSnapshot | None:
         """读取已认领执行和加密命令绑定，不在此方法内解密。"""
+
+    async def converge_pre_request_reconciliation(
+        self,
+        *,
+        task_id: UUID,
+    ) -> bool:
+        """把撤权屏障留下的零请求核对事实安全收敛为明确未应用。"""
+
+    async def reconciliation_connection_missing(
+        self, *, snapshot: TrustedActionDispatchSnapshot
+    ) -> bool:
+        """只读确认精确连接已断开、只读能力不可用或本地凭据已不存在。"""
 
     async def load_command(
         self,
