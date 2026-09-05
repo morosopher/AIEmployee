@@ -103,6 +103,35 @@ _PRE_REQUEST_RECONCILIATION_REASONS = frozenset(
 )
 
 
+async def lock_connection_submission_scope(
+    session: AsyncSession, *, user_id: UUID, connection_id: UUID
+) -> None:
+    """串行化精确连接的审批提交与撤权，覆盖 Task 尚不存在的候选窗口。
+
+    Args:
+        session: 调用方控制提交/回滚的短事务；本锁自动保持到事务结束。
+        user_id: 连接归属用户，参与锁键和调用方后续完整归属校验。
+        connection_id: 不加行锁定位的连接，锁住本地对象时必须重新校验该绑定。
+
+    本锁必须先于 Task/Approval/Tool/本地对象行锁取得；提交只在此后读取授权，撤权只在
+    此后扫描候选。已有 claim 不取得本锁，Connection/capability 行锁仍位于可信行锁序
+    末尾，因此不会引入 Connection→Task 或 Task→本锁的反向等待。
+
+    使用 PostgreSQL 双 integer advisory keyspace，和现有 bigint 提交幂等键锁隔离；
+    域分离摘要碰撞最多让无关连接额外等待，后续查询仍检查完整用户与连接 ID。
+    """
+    digest = sha256(
+        b"trusted-action-connection-submission-v1\0" + user_id.bytes + connection_id.bytes
+    ).digest()
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:scope_namespace, :scope_key)"),
+        {
+            "scope_namespace": 0x54414353,
+            "scope_key": int.from_bytes(digest[:4], "big", signed=True),
+        },
+    )
+
+
 class SqlAlchemyTrustedActionRepository:
     """在调用方事务内写入和读取 ApprovalRequest 的真实 M2 命令。
 
@@ -192,10 +221,28 @@ class SqlAlchemyTrustedActionRepository:
         user_id: UUID,
         draft_id: UUID,
     ) -> MailDraftSubmissionSnapshot | None:
-        """锁草稿头并组合解密版本、连接、能力与回复 Header 投影。"""
+        """先与精确连接撤权串行，再锁草稿头并读取当前授权与解密版本。
+
+        不加锁预定位只决定 advisory key；随后按用户、草稿及连接重新锁行。若等待期间
+        绑定变化，返回缺失信号使提交整体拒绝，不能持有旧连接锁去冻结新连接命令。
+        """
+        connection_id = await self._session.scalar(
+            select(MailDraftModel.connection_id).where(
+                MailDraftModel.id == draft_id, MailDraftModel.user_id == user_id
+            )
+        )
+        if connection_id is None:
+            return None
+        await lock_connection_submission_scope(
+            self._session, user_id=user_id, connection_id=connection_id
+        )
         draft = await self._session.scalar(
             select(MailDraftModel)
-            .where(MailDraftModel.id == draft_id, MailDraftModel.user_id == user_id)
+            .where(
+                MailDraftModel.id == draft_id,
+                MailDraftModel.user_id == user_id,
+                MailDraftModel.connection_id == connection_id,
+            )
             .with_for_update()
         )
         if draft is None:
@@ -266,12 +313,28 @@ class SqlAlchemyTrustedActionRepository:
         user_id: UUID,
         proposal_id: UUID,
     ) -> CalendarProposalSubmissionSnapshot | None:
-        """锁提案并组合 desired 内容、连接能力、目录与目标事件版本事实。"""
+        """先与精确连接撤权串行，再锁提案并读取当前授权、目录与目标版本。
+
+        和邮件提交使用同一连接级屏障；预定位不持有本地行锁，锁行时重新匹配完整绑定，
+        连接在等待期间变化时拒绝提交，不能把其他连接的授权当作旧连接的事实。
+        """
+        connection_id = await self._session.scalar(
+            select(CalendarChangeProposalModel.connection_id).where(
+                CalendarChangeProposalModel.id == proposal_id,
+                CalendarChangeProposalModel.user_id == user_id,
+            )
+        )
+        if connection_id is None:
+            return None
+        await lock_connection_submission_scope(
+            self._session, user_id=user_id, connection_id=connection_id
+        )
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel)
             .where(
                 CalendarChangeProposalModel.id == proposal_id,
                 CalendarChangeProposalModel.user_id == user_id,
+                CalendarChangeProposalModel.connection_id == connection_id,
             )
             .with_for_update()
         )
@@ -387,7 +450,11 @@ class SqlAlchemyTrustedActionRepository:
         return bool(count)
 
     async def create_submission(self, submission: TrustedActionSubmission) -> None:
-        """在当前事务写入 task/step/approval/audit/outbox 并锁定本地对象。"""
+        """在已锁定提交快照的同一事务写入 task/step/approval/audit/outbox。
+
+        调用方必须先经 lock_mail_draft/lock_calendar_proposal 取得本地对象及连接提交锁，
+        并验证授权快照；该事务结束前撤权不能扫描空候选后抢先返回成功。
+        """
         task = TaskRunModel(
             id=submission.task_id,
             user_id=submission.user_id,

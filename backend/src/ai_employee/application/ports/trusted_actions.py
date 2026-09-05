@@ -557,7 +557,7 @@ class TrustedActionSubmissionTransaction(Protocol):
         user_id: UUID,
         draft_id: UUID,
     ) -> MailDraftSubmissionSnapshot | None:
-        """锁定当前用户草稿并返回命令所需完整投影。"""
+        """与精确连接撤权串行后锁定用户草稿，并返回当前授权及命令完整投影。"""
 
     async def lock_calendar_proposal(
         self,
@@ -565,7 +565,7 @@ class TrustedActionSubmissionTransaction(Protocol):
         user_id: UUID,
         proposal_id: UUID,
     ) -> CalendarProposalSubmissionSnapshot | None:
-        """锁定当前用户日历提案并返回提交投影。"""
+        """与精确连接撤权串行后锁定用户日历提案，并返回当前授权及提交投影。"""
 
     async def proposal_version_is_consumed(
         self,

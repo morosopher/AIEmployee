@@ -42,6 +42,7 @@ from ai_employee.infrastructure.db.models.sources import (
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     invalidate_unclaimed_actions_for_connection,
+    lock_connection_submission_scope,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
@@ -699,6 +700,10 @@ class SqlAlchemyConnectionStore:
         capability: ConnectionCapability,
     ) -> None:
         """本地关闭能力并保留实际 scope 事实，供界面说明仍需重连才能缩权。"""
+        # 先覆盖尚未创建 Task 的并发提交；行锁仍从 Task 开始，不能提前锁 Connection。
+        await lock_connection_submission_scope(
+            self._session, user_id=user_id, connection_id=connection_id
+        )
         affected_actions = (
             frozenset({"mail.send"})
             if capability in {ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND}
@@ -904,6 +909,10 @@ class SqlAlchemyConnectionStore:
         target connection 并校验 ``authorization_generation``；断开时的 targetless UPDATE
         不会命中它，代际变化仍会使旧渐进 callback fail closed。
         """
+        # 共享提交屏障必须位于候选扫描和所有行锁之前，避免授权旧快照在断开后落库。
+        await lock_connection_submission_scope(
+            self._session, user_id=user_id, connection_id=connection_id
+        )
         provider = await self._session.scalar(
             select(OAuthConnectionModel.provider).where(
                 OAuthConnectionModel.id == connection_id,

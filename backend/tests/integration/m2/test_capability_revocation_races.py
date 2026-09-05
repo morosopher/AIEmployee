@@ -1,4 +1,4 @@
-"""验证连接撤权与可信动作认领共享 PostgreSQL 原子边界。"""
+"""验证审批提交、连接撤权与可信动作认领共享 PostgreSQL 原子边界。"""
 
 import asyncio
 import base64
@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -20,12 +20,18 @@ from ai_employee.application.ports.oauth import OAuthRevocationResult, OAuthRevo
 from ai_employee.application.ports.trusted_actions import (
     ApprovalPreflightResult,
     ProviderWriteOutcome,
+    TrustedActionSubmissionResult,
 )
 from ai_employee.application.use_cases.connections import (
     ConnectionNotFoundError,
     ConnectionsUseCase,
 )
-from ai_employee.application.use_cases.trusted_actions import TrustedActionExecutionUseCase
+from ai_employee.application.use_cases.trusted_actions import (
+    CalendarProposalSubmissionNotFoundError,
+    SubmitCalendarProposalUseCase,
+    SubmitMailDraftUseCase,
+    TrustedActionExecutionUseCase,
+)
 from ai_employee.config import Settings
 from ai_employee.domain.actions import MailDraftStatus, ToolExecutionStatus
 from ai_employee.domain.connections import (
@@ -44,6 +50,7 @@ from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     EncryptedCredentialModel,
     OAuthConnectionModel,
+    ProviderCalendarModel,
 )
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
@@ -68,6 +75,7 @@ from ai_employee.integrations.google.oauth import GOOGLE_REVOKE_URL, GoogleOAuth
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.reconcile_actions import execute_reconciliation_task
+from tests.integration.m2 import test_encrypted_approval_submission as submission_fixtures
 
 NOW = datetime(2030, 1, 2, 3, 4, tzinfo=UTC)
 
@@ -117,13 +125,13 @@ class _ActionSeed:
 
 @dataclass(slots=True)
 class _ClaimAdapter:
-    """仅用于 claim 竞态的合成 adapter；任何分支都不得触达 provider。"""
+    """用于提交与 claim 竞态的合成 adapter；任何分支都不得触达 provider。"""
 
     provider: str = "google"
     write_calls: int = 0
 
     def validate_for_approval(self, command: object) -> ApprovalPreflightResult:
-        """返回空预检结果；本组测试不提交新审批。"""
+        """返回无网络预检结果，让提交与认领竞态共用零供应商调用的边界。"""
         del command
         return ApprovalPreflightResult()
 
@@ -313,6 +321,505 @@ async def _seed_mail_action(
     return seed
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingSubmissionSeed:
+    """保存尚无 Task/Approval 的真实编辑态资源，覆盖撤权扫描的空候选窗口。"""
+
+    resource_kind: Literal["mail", "calendar"]
+    resource_id: UUID
+    user_id: UUID = submission_fixtures.USER_ID
+    connection_id: UUID = submission_fixtures.GOOGLE_CONNECTION_ID
+
+
+async def _seed_pending_submission(
+    database_url: str, resource_kind: Literal["mail", "calendar"]
+) -> _PendingSubmissionSeed:
+    """复用审批提交契约的完整加密 fixture，不手造缺少内容的本地对象。"""
+    resource_id = (
+        await submission_fixtures._seed_mail_draft(database_url)
+        if resource_kind == "mail"
+        else await submission_fixtures._seed_calendar_proposal(
+            database_url, operation_kind="create"
+        )
+    )
+    return _PendingSubmissionSeed(resource_kind, resource_id)
+
+
+async def _add_submission_connection(
+    sessions: ManagedAsyncSessionMaker, seed: _PendingSubmissionSeed
+) -> UUID:
+    """为同一用户创建另一套完整合成连接事实，证明连接级隔离与绑定变化拒绝。"""
+    connection_id = uuid4()
+    capabilities = (
+        (ConnectionCapability.MAIL_READ, ConnectionCapability.MAIL_SEND)
+        if seed.resource_kind == "mail"
+        else (ConnectionCapability.CALENDAR_READ, ConnectionCapability.CALENDAR_WRITE)
+    )
+    async with sessions.begin() as session:
+        session.add(
+            OAuthConnectionModel(
+                id=connection_id,
+                user_id=seed.user_id,
+                provider="google",
+                provider_account_id="synthetic-other-submission-account",
+                provider_tenant_id="",
+                account_type="google",
+                account_email="other-submit@example.test",
+                scopes=[],
+                status="connected",
+            )
+        )
+        await session.flush()
+        session.add_all(
+            ConnectionCapabilityModel(
+                user_id=seed.user_id,
+                connection_id=connection_id,
+                capability=capability.value,
+                status=CapabilityStatus.ENABLED.value,
+                actual_scopes=[],
+            )
+            for capability in capabilities
+        )
+        if seed.resource_kind == "calendar":
+            session.add(
+                ProviderCalendarModel(
+                    user_id=seed.user_id,
+                    connection_id=connection_id,
+                    provider_calendar_id=submission_fixtures.CALENDAR_ID,
+                    name="Synthetic other calendar",
+                    timezone="UTC",
+                    is_primary=True,
+                    access_role="owner",
+                    can_write=True,
+                    provider_url="https://calendar.example.test/synthetic-other",
+                )
+            )
+    return connection_id
+
+
+async def _submit_pending_resource(
+    sessions: ManagedAsyncSessionMaker,
+    seed: _PendingSubmissionSeed,
+    adapter: _ClaimAdapter,
+) -> TrustedActionSubmissionResult:
+    """经真实提交用例冻结当前版本；Fake adapter 的写入口是失败探针。"""
+    transactions = SqlAlchemyTrustedActionRepositoryFactory(
+        sessions, submission_fixtures.ACTION_CIPHER
+    )
+    preflights = ProviderAdapterRegistry(
+        google_mail_preflight=adapter, google_calendar_preflight=adapter
+    )
+    policy = submission_fixtures._EnabledWritePolicy()
+    if seed.resource_kind == "mail":
+        return await SubmitMailDraftUseCase(
+            transactions=transactions,
+            preflights=preflights,
+            write_policy=policy,
+            command_cipher=submission_fixtures.ACTION_CIPHER,
+        ).execute(
+            user_id=seed.user_id,
+            draft_id=seed.resource_id,
+            expected_version=1,
+            idempotency_key="synthetic-revocation-submit-race",
+            now=NOW,
+        )
+    return await SubmitCalendarProposalUseCase(
+        transactions=transactions,
+        preflights=preflights,
+        write_policy=policy,
+        command_cipher=submission_fixtures.ACTION_CIPHER,
+    ).execute(
+        user_id=seed.user_id,
+        proposal_id=seed.resource_id,
+        expected_version=1,
+        idempotency_key="synthetic-revocation-submit-race",
+        now=NOW,
+    )
+
+
+async def _revoke_pending_resource(
+    sessions: ManagedAsyncSessionMaker,
+    seed: _PendingSubmissionSeed,
+    revocation: Literal["disable", "disconnect"],
+    *,
+    connection_id: UUID | None = None,
+) -> None:
+    """使用真实连接事务关闭精确目标；fixture 无 Token，不执行供应商 revoke。"""
+    use_case = ConnectionsUseCase(
+        SqlAlchemyConnectionStoreFactory(sessions),
+        AeadCipher(b"r" * 32),
+        {},
+        _FixedClock(),
+    )
+    target = seed.connection_id if connection_id is None else connection_id
+    if revocation == "disconnect":
+        await use_case.disconnect(user_id=seed.user_id, connection_id=target)
+    else:
+        await use_case.disable_capability(
+            user_id=seed.user_id,
+            connection_id=target,
+            capability=(
+                ConnectionCapability.MAIL_SEND
+                if seed.resource_kind == "mail"
+                else ConnectionCapability.CALENDAR_WRITE
+            ),
+        )
+
+
+async def _blockers_or_finished(
+    sessions: ManagedAsyncSessionMaker, *, waiting_pid: int, task: asyncio.Task[Any]
+) -> tuple[int, ...]:
+    """等待 PostgreSQL 真阻塞或旧实现提前完成，避免用 sleep 猜测提交顺序。
+
+    旧实现会在未持有共同屏障时直接完成；允许观察这一事实后释放赢家，才能让 RED
+    断言落在最终遗留审批上，而不是把固定等待超时当作业务失败。
+    """
+    async with asyncio.timeout(5):
+        async with sessions() as observer:
+            while not task.done():
+                blockers = await observer.scalar(
+                    text("SELECT pg_blocking_pids(:waiting_pid)"),
+                    {"waiting_pid": waiting_pid},
+                )
+                if blockers:
+                    return tuple(int(pid) for pid in blockers)
+                await asyncio.sleep(0)
+    return ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_kind", ["mail", "calendar"])
+@pytest.mark.parametrize("revocation", ["disable", "disconnect"])
+@pytest.mark.parametrize("winner", ["submission", "revocation"])
+async def test_submission_and_revocation_serialize_before_task_exists(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_kind: Literal["mail", "calendar"],
+    revocation: Literal["disable", "disconnect"],
+    winner: Literal["submission", "revocation"],
+) -> None:
+    """两个独立事务必须串行：先提交则随后取消，先撤权则提交整体回滚。
+
+    submission 顺序精确暂停在授权读取和冻结完成、Task/Approval 尚不存在时；
+    revocation 顺序暂停在空候选扫描及能力/连接修改之后、撤权提交之前。
+    两者都通过 pg_blocking_pids 验证真实等待，最终无未认领的可审批遗留或供应商写入。
+    """
+    seed = await _seed_pending_submission(database_url, resource_kind)
+    sessions = build_session_factory(database_url)
+    adapter = _ClaimAdapter()
+    loop = asyncio.get_running_loop()
+    submission_pid: asyncio.Future[int] = loop.create_future()
+    revocation_pid: asyncio.Future[int] = loop.create_future()
+    submission_paused, revocation_paused = asyncio.Event(), asyncio.Event()
+    release_submission, release_revocation = asyncio.Event(), asyncio.Event()
+    snapshot_method = "lock_mail_draft" if resource_kind == "mail" else "lock_calendar_proposal"
+    revoke_method = "disable_capability" if revocation == "disable" else "disconnect"
+    original_snapshot = getattr(SqlAlchemyTrustedActionRepository, snapshot_method)
+    original_create = SqlAlchemyTrustedActionRepository.create_submission
+    original_revoke = getattr(SqlAlchemyConnectionStore, revoke_method)
+
+    async def observe_submission_entry(
+        self: SqlAlchemyTrustedActionRepository, **values: Any
+    ) -> Any:
+        """在任何资源/授权锁之前记录独立 Session PID，不替代真实授权读取。"""
+        submission_pid.set_result(await _postgres_backend_pid(self._session))
+        return await original_snapshot(self, **values)
+
+    async def pause_after_authorization(
+        self: SqlAlchemyTrustedActionRepository, submission: Any
+    ) -> None:
+        """只暂停已验证授权的提交；尚未调用 create_submission，候选 Task 确实为空。"""
+        if winner == "submission":
+            submission_paused.set()
+            await release_submission.wait()
+        await original_create(self, submission)
+
+    async def pause_revocation(self: SqlAlchemyConnectionStore, **values: Any) -> Any:
+        """记录撤权 Session，并按测试顺序暂停在真实状态变更之后、事务提交之前。"""
+        revocation_pid.set_result(await _postgres_backend_pid(self._session))
+        result = await original_revoke(self, **values)
+        if winner == "revocation":
+            revocation_paused.set()
+            await release_revocation.wait()
+        return result
+
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionRepository, snapshot_method, observe_submission_entry
+    )
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionRepository, "create_submission", pause_after_authorization
+    )
+    monkeypatch.setattr(SqlAlchemyConnectionStore, revoke_method, pause_revocation)
+    submission_task: asyncio.Task[TrustedActionSubmissionResult] | None = None
+    revocation_task: asyncio.Task[None] | None = None
+    try:
+        if winner == "submission":
+            submission_task = asyncio.create_task(_submit_pending_resource(sessions, seed, adapter))
+            await asyncio.wait_for(submission_paused.wait(), timeout=5)
+            revocation_task = asyncio.create_task(
+                _revoke_pending_resource(sessions, seed, revocation)
+            )
+            waiting_pid = await asyncio.wait_for(asyncio.shield(revocation_pid), timeout=5)
+            holding_pid = await asyncio.wait_for(asyncio.shield(submission_pid), timeout=5)
+            blockers = await _blockers_or_finished(
+                sessions, waiting_pid=waiting_pid, task=revocation_task
+            )
+            release_submission.set()
+        else:
+            revocation_task = asyncio.create_task(
+                _revoke_pending_resource(sessions, seed, revocation)
+            )
+            await asyncio.wait_for(revocation_paused.wait(), timeout=5)
+            submission_task = asyncio.create_task(_submit_pending_resource(sessions, seed, adapter))
+            waiting_pid = await asyncio.wait_for(asyncio.shield(submission_pid), timeout=5)
+            holding_pid = await asyncio.wait_for(asyncio.shield(revocation_pid), timeout=5)
+            blockers = await _blockers_or_finished(
+                sessions, waiting_pid=waiting_pid, task=submission_task
+            )
+            release_revocation.set()
+        result, revoked = await asyncio.wait_for(
+            asyncio.gather(submission_task, revocation_task, return_exceptions=True), timeout=5
+        )
+        assert revoked is None
+        async with sessions() as session:
+            local = (
+                await session.get(MailDraftModel, seed.resource_id)
+                if resource_kind == "mail"
+                else await session.get(CalendarChangeProposalModel, seed.resource_id)
+            )
+            rows = (
+                await session.execute(
+                    select(TaskRunModel, ApprovalRequestModel)
+                    .join(ApprovalRequestModel, ApprovalRequestModel.task_id == TaskRunModel.id)
+                    .where(
+                        TaskRunModel.user_id == seed.user_id,
+                        ApprovalRequestModel.proposal_id == seed.resource_id,
+                    )
+                )
+            ).all()
+            task_audits = tuple(
+                await session.scalars(
+                    select(AuditEventModel.event_type).where(
+                        AuditEventModel.user_id == seed.user_id,
+                        AuditEventModel.task_id.is_not(None),
+                    )
+                )
+            )
+            pending_execution_messages = await session.scalar(
+                select(func.count())
+                .select_from(OutboxEventModel)
+                .where(
+                    OutboxEventModel.topic == "task.execute",
+                    OutboxEventModel.published_at.is_(None),
+                )
+            )
+            executions = await session.scalar(select(func.count()).select_from(ToolExecutionModel))
+        assert local is not None and local.status == "editing"
+        assert all(
+            task.status == "cancelled" and approval.status == "invalidated"
+            for task, approval in rows
+        )
+        if winner == "submission":
+            assert isinstance(result, TrustedActionSubmissionResult)
+            assert len(rows) == 1
+            assert set(task_audits) == {
+                "approval.requested",
+                "approval.invalidated",
+                "task.cancelled",
+            }
+        else:
+            assert isinstance(result, StateConflictError)
+            assert result.error_code == (
+                "connection_capability_disabled"
+                if revocation == "disable"
+                else "connection_scope_missing"
+            )
+            assert rows == [] and task_audits == ()
+        assert pending_execution_messages == 0 and executions == 0
+        assert adapter.write_calls == 0
+        assert waiting_pid != holding_pid and holding_pid in blockers
+    finally:
+        release_submission.set()
+        release_revocation.set()
+        remaining = [task for task in (submission_task, revocation_task) if task is not None]
+        for task in remaining:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_kind", ["mail", "calendar"])
+@pytest.mark.parametrize("revocation", ["disable", "disconnect"])
+async def test_submission_revocation_boundary_is_scoped_to_exact_connection(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_kind: Literal["mail", "calendar"],
+    revocation: Literal["disable", "disconnect"],
+) -> None:
+    """同用户其他连接的撤权可以完成，不能阻塞或取消当前连接正在冻结的资源。"""
+    seed = await _seed_pending_submission(database_url, resource_kind)
+    sessions = build_session_factory(database_url)
+    adapter = _ClaimAdapter()
+    submission_paused, release_submission = asyncio.Event(), asyncio.Event()
+    original_create = SqlAlchemyTrustedActionRepository.create_submission
+    write_capability = (
+        ConnectionCapability.MAIL_SEND
+        if resource_kind == "mail"
+        else ConnectionCapability.CALENDAR_WRITE
+    )
+
+    async def pause_submission(self: SqlAlchemyTrustedActionRepository, submission: Any) -> None:
+        """保持当前连接的冻结事务打开，确保其他连接撤权不依赖其提交。"""
+        submission_paused.set()
+        await release_submission.wait()
+        await original_create(self, submission)
+
+    monkeypatch.setattr(SqlAlchemyTrustedActionRepository, "create_submission", pause_submission)
+    submission_task: asyncio.Task[TrustedActionSubmissionResult] | None = None
+    try:
+        other_connection_id = await _add_submission_connection(sessions, seed)
+        submission_task = asyncio.create_task(_submit_pending_resource(sessions, seed, adapter))
+        await asyncio.wait_for(submission_paused.wait(), timeout=5)
+        await asyncio.wait_for(
+            _revoke_pending_resource(sessions, seed, revocation, connection_id=other_connection_id),
+            timeout=5,
+        )
+        release_submission.set()
+        result = await asyncio.wait_for(submission_task, timeout=5)
+        async with sessions() as session:
+            approval = await session.get(ApprovalRequestModel, result.approval_id)
+            task = await session.get(TaskRunModel, result.task_id)
+            connection = await session.get(OAuthConnectionModel, seed.connection_id)
+            capability = await session.scalar(
+                select(ConnectionCapabilityModel.status).where(
+                    ConnectionCapabilityModel.user_id == seed.user_id,
+                    ConnectionCapabilityModel.connection_id == seed.connection_id,
+                    ConnectionCapabilityModel.capability == write_capability.value,
+                )
+            )
+            local = (
+                await session.get(MailDraftModel, seed.resource_id)
+                if resource_kind == "mail"
+                else await session.get(CalendarChangeProposalModel, seed.resource_id)
+            )
+        assert approval is not None and approval.status == "pending"
+        assert task is not None and task.status == "queued"
+        assert local is not None and local.status == "awaiting_approval"
+        assert connection is not None and connection.status == "connected"
+        assert capability == CapabilityStatus.ENABLED.value
+        assert adapter.write_calls == 0
+    finally:
+        release_submission.set()
+        if submission_task is not None:
+            if not submission_task.done():
+                submission_task.cancel()
+            await asyncio.gather(submission_task, return_exceptions=True)
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource_kind", ["mail", "calendar"])
+async def test_submission_rejects_connection_binding_changed_while_waiting(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_kind: Literal["mail", "calendar"],
+) -> None:
+    """本地行等待期间换连接，不能持旧 advisory key 冻结新连接的命令。
+
+    修改事务先更新绑定但不提交，提交事务只能预定位到旧 connection_id；两者在本地行上
+    形成真实阻塞后才提交绑定变化。新连接本身能力完整且允许写，拒绝必须来自精确绑定
+    漂移，不能借用 write-gate/目录缺失偶然挡住错误提交。
+    """
+    seed = await _seed_pending_submission(database_url, resource_kind)
+    sessions = build_session_factory(database_url)
+    adapter = _ClaimAdapter()
+    local_model = MailDraftModel if resource_kind == "mail" else CalendarChangeProposalModel
+    snapshot_method = "lock_mail_draft" if resource_kind == "mail" else "lock_calendar_proposal"
+    original_snapshot = getattr(SqlAlchemyTrustedActionRepository, snapshot_method)
+    loop = asyncio.get_running_loop()
+    submission_pid: asyncio.Future[int] = loop.create_future()
+    mutation_pid: asyncio.Future[int] = loop.create_future()
+    mutation_ready, release_mutation = asyncio.Event(), asyncio.Event()
+
+    async def observe_submission_entry(
+        self: SqlAlchemyTrustedActionRepository, **values: Any
+    ) -> Any:
+        """在真实读取/行锁之前记录提交事务，不替代或篡改任何数据库快照。"""
+        submission_pid.set_result(await _postgres_backend_pid(self._session))
+        return await original_snapshot(self, **values)
+
+    def allow_synthetic_accounts(
+        self: submission_fixtures._EnabledWritePolicy, provider_identity_key: str
+    ) -> bool:
+        """明确允许两个合成账户，让连接绑定检查成为唯一预期拒绝原因。"""
+        return provider_identity_key in {
+            "google::synthetic-account",
+            "google::synthetic-other-submission-account",
+        }
+
+    async def mutate_binding(other_connection_id: UUID) -> None:
+        """独立事务模拟等待期间的本地绑定漂移，不创建任何任务或审批。"""
+        async with sessions.begin() as session:
+            local = await session.get(local_model, seed.resource_id, with_for_update=True)
+            assert local is not None
+            local.connection_id = other_connection_id
+            await session.flush()
+            mutation_pid.set_result(await _postgres_backend_pid(session))
+            mutation_ready.set()
+            await release_mutation.wait()
+
+    monkeypatch.setattr(
+        SqlAlchemyTrustedActionRepository, snapshot_method, observe_submission_entry
+    )
+    monkeypatch.setattr(
+        submission_fixtures._EnabledWritePolicy, "write_account_allowed", allow_synthetic_accounts
+    )
+    mutation_task: asyncio.Task[None] | None = None
+    submission_task: asyncio.Task[TrustedActionSubmissionResult] | None = None
+    try:
+        other_connection_id = await _add_submission_connection(sessions, seed)
+        mutation_task = asyncio.create_task(mutate_binding(other_connection_id))
+        await asyncio.wait_for(mutation_ready.wait(), timeout=5)
+        submission_task = asyncio.create_task(_submit_pending_resource(sessions, seed, adapter))
+        waiting_pid = await asyncio.wait_for(asyncio.shield(submission_pid), timeout=5)
+        holding_pid = await asyncio.wait_for(asyncio.shield(mutation_pid), timeout=5)
+        blockers = await _wait_for_postgres_blockers(sessions, waiting_pid=waiting_pid)
+        assert waiting_pid != holding_pid and holding_pid in blockers
+        release_mutation.set()
+        result, mutation_result = await asyncio.wait_for(
+            asyncio.gather(submission_task, mutation_task, return_exceptions=True), timeout=5
+        )
+        assert mutation_result is None
+        if resource_kind == "mail":
+            assert isinstance(result, StateConflictError)
+            assert result.error_code == "draft_version_conflict"
+        else:
+            assert isinstance(result, CalendarProposalSubmissionNotFoundError)
+        async with sessions() as session:
+            local = await session.get(local_model, seed.resource_id)
+            tasks = await session.scalar(
+                select(func.count())
+                .select_from(TaskRunModel)
+                .where(TaskRunModel.user_id == seed.user_id)
+            )
+            approvals = await session.scalar(select(func.count()).select_from(ApprovalRequestModel))
+            outbox = await session.scalar(select(func.count()).select_from(OutboxEventModel))
+        assert local is not None and local.connection_id == other_connection_id
+        assert local.status == "editing"
+        assert tasks == 0 and approvals == 0 and outbox == 0
+        assert adapter.write_calls == 0
+    finally:
+        release_mutation.set()
+        remaining = [task for task in (mutation_task, submission_task) if task is not None]
+        for task in remaining:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+        await sessions.dispose()
+
+
 async def _install_execution_state(
     database_url: str,
     seed: _ActionSeed,
@@ -400,7 +907,7 @@ def _claim_workflow(
 
 
 async def _postgres_backend_pid(session: AsyncSession) -> int:
-    """读取事务 backend PID，供竞态测试证明等待发生在 PostgreSQL 行锁上。"""
+    """读取事务 backend PID，供竞态测试证明等待发生在 PostgreSQL 锁上。"""
     value = await session.scalar(text("SELECT pg_backend_pid()"))
     assert isinstance(value, int)
     return value
