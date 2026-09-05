@@ -477,9 +477,14 @@ class MicrosoftCalendarWriteAdapter:
 
     async def _execute_conditional_update(
         self,
-        command: CalendarUpdateCommand | CalendarRestoreCommand,
+        command: CalendarCommand,
     ) -> ProviderWriteOutcome:
         """读取精确当前事件并只发送一次带版本条件的完整 PATCH。"""
+        if not isinstance(command, (CalendarUpdateCommand, CalendarRestoreCommand)):
+            raise TypeError("calendar.create cannot use conditional update")
+        # 使用公共命令 alias 并保留精确类型约束，避免 helper 绕过领域入口接受子类。
+        if type(command) not in (CalendarUpdateCommand, CalendarRestoreCommand):
+            raise TypeError("calendar conditional update command type is unsupported")
         correlation_id = str(command.operation_id)
         event_url = _event_url(command.calendar_id, command.provider_event_id)
         current, transport_error = await self._request_read(
@@ -914,7 +919,7 @@ def _reconciliation_read_error(status_code: int) -> str:
 
 def _current_event_precondition(
     payload: Mapping[str, object],
-    command: CalendarUpdateCommand | CalendarRestoreCommand,
+    command: CalendarCommand,
 ) -> tuple[str | None, _GraphVersion | None]:
     """检查条件 PATCH 前的身份、可写事实与 canonical 版本绑定。
 
@@ -922,6 +927,11 @@ def _current_event_precondition(
         ``(error_code, current_version)``；只有 error 为空且版本存在时调用方才可
         使用 provider 原始条件 token 发送 PATCH。
     """
+    if not isinstance(command, (CalendarUpdateCommand, CalendarRestoreCommand)):
+        raise TypeError("calendar.create cannot use update precondition")
+    # 与执行入口保持同一精确类型约束，同时让类型检查器收窄公开 CalendarCommand alias。
+    if type(command) not in (CalendarUpdateCommand, CalendarRestoreCommand):
+        raise TypeError("calendar conditional update command type is unsupported")
     if _safe_identifier(payload.get("id"), maximum=512) != command.provider_event_id:
         return "microsoft_calendar_current_event_mismatch", None
     fact_error = _provider_event_fact_error(payload)
