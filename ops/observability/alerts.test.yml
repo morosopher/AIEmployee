@@ -1,0 +1,31 @@
+# 用合成时序验证真实规则的首次观测和恢复；通过 Compose 固定版本的 promtool 执行。
+rule_files:
+  - alerts.yml
+evaluation_interval: 30s
+tests:
+  - name: duplicate_attempt_first_sample_and_recovery
+    interval: 30s
+    input_series:
+      - series: 'ai_employee_provider_errors_total{provider="google",error_code="duplicate_provider_call_attempt"}'
+        values: 1+0x12
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: M2DuplicateProviderCallAttempt
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 请求开始 CAS 已阻断重复供应商写企图
+              description: 检查执行时间线和重复投递原因；不要绕过幂等认领重放请求。
+      - eval_time: 6m
+        alertname: M2DuplicateProviderCallAttempt
+        exp_alerts: []
+  - name: duplicate_attempt_zero_is_healthy
+    interval: 30s
+    input_series:
+      - series: 'ai_employee_provider_errors_total{provider="google",error_code="duplicate_provider_call_attempt"}'
+        values: 0+0x12
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: M2DuplicateProviderCallAttempt
+        exp_alerts: []

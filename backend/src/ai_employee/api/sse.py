@@ -15,6 +15,7 @@ from redis.exceptions import RedisError
 from sqlalchemy import func, select, text
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
+from ai_employee.application.use_cases.action_views import public_action_event_payload
 from ai_employee.application.use_cases.task_views import TaskSnapshot
 from ai_employee.domain.tasks import JsonValue
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
@@ -232,14 +233,14 @@ def _public_event_type(audit_event_type: str) -> str:
 
 
 def _public_event_payload(event: DurableTaskEvent) -> dict[str, JsonValue]:
-    """复制审计元数据并补齐旧事件映射需要的公开语义，不改写历史审计记录。"""
+    """只复制内容白名单，并保留旧审批过期的公开语义；未知事件仍可推动游标。"""
     if event.event == "approval.expired":
         return {
-            **event.payload,
+            **public_action_event_payload(event.payload),
             "status": "expired",
             "reason": "approval_expired",
         }
-    return event.payload
+    return public_action_event_payload(event.payload)
 
 
 def _event(event: DurableTaskEvent) -> ServerSentEvent:
@@ -385,7 +386,12 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                             "sequence": step.sequence,
                             "name": step.name,
                             "status": step.status,
-                            "output_summary": step.output_summary,
+                            "output_summary": (
+                                public_action_event_payload(step.output_summary)
+                                if snapshot.kind == "trusted_action"
+                                and step.output_summary is not None
+                                else step.output_summary
+                            ),
                             "error_code": step.error_code,
                             "started_at": step.started_at.isoformat() if step.started_at else None,
                             "finished_at": step.finished_at.isoformat() if step.finished_at else None,

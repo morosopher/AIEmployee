@@ -1,18 +1,22 @@
 """定义统一操作视图及未知结果的人工/用户核对用例。
 
-本模块只暴露稳定的标识、状态和枚举；邮件正文、地址、日程描述以及供应商原始响应均
-不经过这些接口。具体锁序、CAS、审计和 Outbox 原子写入由基础设施层的 action-view
-repository 完成。
+列表、时间线与 SSE 只暴露稳定标识和枚举；完整内容仅允许进入当前认证用户的类型化
+审批预览。人工 CAS 的锁序、审计与 Outbox 原子写入仍由原 repository 完成。
 """
 
 import re
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Protocol
+from datetime import UTC, date, datetime, time
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from ai_employee.application.use_cases.calendar_proposals import CalendarAvailabilityContext
 from ai_employee.application.use_cases.task_execution import utc_instant
+from ai_employee.domain.tasks import JsonValue
 
 POSTGRESQL_BIGINT_MAX = 2**63 - 1
 _CANONICAL_CURSOR = re.compile(r"^(0|[1-9][0-9]*)$")
@@ -58,13 +62,186 @@ def canonical_cursor(value: object, *, field: str = "task_version") -> str:
 validate_task_version = canonical_cursor
 parse_task_version = parse_canonical_cursor
 
+type ActionKind = Literal["mail.send", "calendar.create", "calendar.update", "calendar.restore"]
+type ActionProvider = Literal["google", "microsoft"]
+type ActionItemKind = Literal["mail_draft", "calendar_proposal", "trusted_task"]
+
+
+class MailApprovalPreview(BaseModel):
+    """认证响应专用的冻结邮件预览；列表、审计、SSE 和日志不可序列化此类型。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["mail"] = "mail"
+    provider: ActionProvider
+    account_email: str
+    mode: Literal["new", "reply", "reply_all"]
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
+    subject: str
+    body_text: str
+    irreversible: Literal[True] = True
+
+
+class CalendarPreviewFields(BaseModel):
+    """日程审批前后值的统一字段形状，保留全天日期与定时时刻的精确线格式。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    title: str
+    description: str | None
+    location: str | None
+    starts_at: str
+    ends_at: str
+    timezone: str
+    all_day: bool
+    attendees: list[str]
+
+
+class CalendarConflictPreview(BaseModel):
+    """只表达本人日历冲突的区间或缺失连接，绝不包含其他事件内容。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["overlap", "outside_working_hours", "partial_sources"]
+    starts_at: str | None = None
+    ends_at: str | None = None
+    missing_connection_ids: list[UUID] = Field(default_factory=list)
+
+
+class CalendarApprovalPreview(BaseModel):
+    """日程冻结命令、前快照和只读冲突组成的认证预览，不赋予任何写授权。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    kind: Literal["calendar"] = "calendar"
+    provider: ActionProvider
+    account_email: str
+    calendar_name: str
+    operation: Literal["create", "update", "restore"]
+    before: CalendarPreviewFields | None
+    after: CalendarPreviewFields
+    conflicts: list[CalendarConflictPreview]
+    notification_policy: Literal["all", "none"]
+    base_etag: str | None
+    compensation_available: bool
+    provider_warnings: list[Literal["google_send_updates_none_external_sync"]] = Field(
+        default_factory=list
+    )
+
+
+type ApprovalPreview = Annotated[
+    MailApprovalPreview | CalendarApprovalPreview, Field(discriminator="kind")
+]
+
+
+class ActionLocalSummary(BaseModel):
+    """绑定精确本地编辑对象，当前版本与审批冻结版本分别表达。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    item_kind: Literal["mail_draft", "calendar_proposal"]
+    status: str
+    version: int
+    editor_url: str
+
+
+class ActionApprovalView(BaseModel):
+    """审批决定所需版本、哈希和有效期；内容清除时只保留审计骨架。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    status: str
+    version: int
+    payload_hash: str
+    proposal_version: int
+    risk_level: Literal["high", "medium"]
+    expires_at: datetime
+    decided_at: datetime | None
+    content_status: Literal["available", "redacted"]
+    preview: ApprovalPreview | None
+
+
+class ActionExecutionView(BaseModel):
+    """只暴露执行状态和尝试次数，供应商原始结果始终留在适配器边界。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    status: str
+    write_attempt_count: int
+    reconciliation_attempt_count: int
+    error_code: str | None
+    claimed_at: datetime | None
+    request_started_at: datetime | None
+    completed_at: datetime | None
+    manual_resolution: Literal["confirmed_executed", "confirmed_not_executed"] | None
+
+
+class ActionTimelineEvent(BaseModel):
+    """动作快照中的持久时间线；payload 通过与 SSE 相同的内容白名单。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: str
+    event: str
+    occurred_at: datetime
+    payload: dict[str, JsonValue]
+
+
+class _ActionListBase(BaseModel):
+    """统一列表的无内容公共列；每个变体都保持原始状态来源。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: UUID
+    status: str
+    action: ActionKind
+    provider: ActionProvider
+    risk_level: Literal["high", "medium"] | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MailDraftListItem(_ActionListBase):
+    """尚可本地编辑的草稿以自身 UUID 导航，不能发明 TaskRun 身份。"""
+
+    item_kind: Literal["mail_draft"] = "mail_draft"
+    task_id: None = None
+    editor_url: str
+
+
+class CalendarProposalListItem(_ActionListBase):
+    """尚可本地编辑的日程提案以自身 UUID 导航。"""
+
+    item_kind: Literal["calendar_proposal"] = "calendar_proposal"
+    task_id: None = None
+    editor_url: str
+
+
+class TrustedTaskListItem(_ActionListBase):
+    """已冻结可信任务必须携带权威 TaskRun UUID。"""
+
+    item_kind: Literal["trusted_task"] = "trusted_task"
+    task_id: UUID
+    editor_url: None = None
+
+
+type ActionListItem = Annotated[
+    MailDraftListItem | CalendarProposalListItem | TrustedTaskListItem,
+    Field(discriminator="item_kind"),
+]
+
+
+class ActionListPage(BaseModel):
+    """稳定排序后的分页结果，无需解密草稿、提案或审批。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    items: list[ActionListItem]
+    limit: int
+    offset: int
+
 
 @dataclass(frozen=True, slots=True)
 class ActionSnapshot:
-    """统一操作视图的最小稳定投影。
+    """同一可重复读事务中的可信状态、精确预览和审计游标。
 
-    这是 Task 26 API 的前向兼容 DTO：当前任务只需要返回状态、错误、尝试次数和同一
-    审计游标，后续可在不改变人工 CAS 契约的情况下扩展脱敏 provider link。
+    后续字段保留默认值以兼容 M2 人工 CAS 内部的最小读取调用。公开 API 由完整只读
+    store 填充这些字段；数据库不添加第二个 TaskRun.version 状态来源。
     """
 
     task_id: UUID
@@ -74,6 +251,14 @@ class ActionSnapshot:
     task_version: str
     reconciliation_attempt_count: int = 0
     provider_url: str | None = None
+    action: ActionKind | None = None
+    provider: ActionProvider | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    local_action: ActionLocalSummary | None = None
+    approval: ActionApprovalView | None = None
+    execution: ActionExecutionView | None = None
+    timeline: tuple[ActionTimelineEvent, ...] = ()
 
     def __post_init__(self) -> None:
         """要求两个公开游标均为同一规范字符串。"""
@@ -88,6 +273,195 @@ class ActionSnapshot:
             raise ValueError("reconciliation_attempt_count must be non-negative")
         object.__setattr__(self, "event_cursor", event_cursor)
         object.__setattr__(self, "task_version", task_version)
+
+
+class ActionReadStore(Protocol):
+    """动作读取端口把多查询限定在同一可重复读事务，mutation 使用独立短事务。"""
+
+    async def get(self, *, user_id: UUID, task_id: UUID) -> ActionSnapshot | None:
+        """返回当前用户的完整动作快照或空。"""
+
+    async def exists(self, *, user_id: UUID, task_id: UUID) -> bool:
+        """不解密内容地检查任务归属，供人工控制的 404 边界使用。"""
+
+    async def list_actions(
+        self,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+        status: str | None,
+        item_kind: ActionItemKind | None,
+        provider: ActionProvider | None,
+        action: ActionKind | None,
+    ) -> ActionListPage:
+        """按显式用户与封闭筛选项返回稳定分页。"""
+
+
+class ActionViewUseCase:
+    """读取统一操作中心；不复制草稿、审批或执行状态机。"""
+
+    def __init__(self, store: ActionReadStore) -> None:
+        """注入负责隔离与一致性读取的端口。"""
+        self._store = store
+
+    async def get(self, *, user_id: UUID, task_id: UUID) -> ActionSnapshot | None:
+        """读取含敏感预览的认证快照，由 API 设置 no-store。"""
+        return await self._store.get(user_id=user_id, task_id=task_id)
+
+    async def exists(self, *, user_id: UUID, task_id: UUID) -> bool:
+        """只检查归属，不为 mutation 提前解密内容或锁定业务行。"""
+        return await self._store.exists(user_id=user_id, task_id=task_id)
+
+    async def list_actions(
+        self,
+        *,
+        user_id: UUID,
+        limit: int = 50,
+        offset: int = 0,
+        status: str | None = None,
+        item_kind: ActionItemKind | None = None,
+        provider: ActionProvider | None = None,
+        action: ActionKind | None = None,
+    ) -> ActionListPage:
+        """验证有界分页并返回原始本地/任务状态的只读联合投影。"""
+        if not 1 <= limit <= 100 or offset < 0:
+            raise ValueError("action pagination is invalid")
+        return await self._store.list_actions(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            status=status,
+            item_kind=item_kind,
+            provider=provider,
+            action=action,
+        )
+
+
+def public_action_event_payload(metadata: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """为时间线与现有任务 SSE 复制封闭的标量投影，不透传嵌套供应商内容。
+
+    UUID、版本和计数分别校验；文本仅允许有限长度的稳定代码。地址、自由文本、URL、
+    原始 command 和未知键即使出现在历史审计里也不能越过此响应边界。M1 的 kind、
+    reason 和 retry_of_task_id 保留以支持旧客户端重放。
+    """
+    identifiers = {
+        "task_id",
+        "step_id",
+        "approval_id",
+        "operation_id",
+        "tool_execution_id",
+        "connection_id",
+        "proposal_id",
+        "draft_id",
+        "retry_of_task_id",
+    }
+    counts = {
+        "version",
+        "proposal_version",
+        "approval_version",
+        "attempt_count",
+        "write_attempt_count",
+        "reconciliation_attempt_count",
+    }
+    codes = {"status", "state", "error_code", "kind", "reason", "source", "decision", "resolution"}
+    timestamps = {
+        "created_at",
+        "updated_at",
+        "expires_at",
+        "resolved_at",
+        "claimed_at",
+        "request_started_at",
+        "completed_at",
+        "scheduled_for",
+    }
+    result: dict[str, JsonValue] = {}
+    for key, value in metadata.items():
+        if key in identifiers and isinstance(value, str):
+            try:
+                result[key] = str(UUID(value))
+            except ValueError:
+                continue
+        elif key in counts and type(value) is int and value >= 0:
+            result[key] = value
+        elif key in {"task_version", "event_cursor"}:
+            try:
+                result[key] = canonical_cursor(value)
+            except (ValueError, TypeError):
+                continue
+        elif (
+            key in codes
+            and isinstance(value, str)
+            and re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", value)
+            or key == "provider"
+            and value in ("google", "microsoft")
+            or key == "action"
+            and value
+            in ("mail.send", "calendar.create", "calendar.update", "calendar.restore", "fake.write")
+        ):
+            result[key] = value
+        elif key in timestamps and isinstance(value, str):
+            try:
+                instant = datetime.fromisoformat(value)
+                if instant.tzinfo is not None:
+                    result[key] = instant.isoformat()
+            except ValueError:
+                continue
+    return result
+
+
+def calendar_conflict_previews(
+    fields: CalendarPreviewFields,
+    context: CalendarAvailabilityContext,
+) -> list[CalendarConflictPreview]:
+    """以同一读取快照中的本人忙碌区间、工作时间和缓冲产生确定性警告。
+
+    输入已经过命令时间校验；全天日期显式使用命令 IANA 时区。返回值只含区间和缺失
+    连接，不查询参会人 Free/Busy，也不把缺失来源解释为无冲突。
+    """
+    zone = ZoneInfo(fields.timezone)
+    if fields.all_day:
+        start = datetime.combine(date.fromisoformat(fields.starts_at), time(), zone)
+        end = datetime.combine(date.fromisoformat(fields.ends_at), time(), zone)
+    else:
+        start = datetime.fromisoformat(fields.starts_at)
+        end = datetime.fromisoformat(fields.ends_at)
+    start, end = start.astimezone(UTC), end.astimezone(UTC)
+    result: list[CalendarConflictPreview] = []
+    for event in sorted(context.events, key=lambda item: (item.starts_at, item.ends_at)):
+        if event.status.casefold() == "cancelled" or event.transparency.casefold() in {
+            "transparent",
+            "free",
+        }:
+            continue
+        busy_start = event.starts_at - context.meeting_buffer
+        busy_end = event.ends_at + context.meeting_buffer
+        if busy_start < end and busy_end > start:
+            result.append(
+                CalendarConflictPreview(
+                    kind="overlap",
+                    starts_at=busy_start.isoformat(),
+                    ends_at=busy_end.isoformat(),
+                )
+            )
+    local_start, local_end = (
+        start.astimezone(ZoneInfo(context.timezone)),
+        end.astimezone(ZoneInfo(context.timezone)),
+    )
+    fits = local_start.date() == local_end.date() and any(
+        interval.start <= local_start.time() and local_end.time() <= interval.end
+        for interval in context.working_hours.days[local_start.weekday()]
+    )
+    if not fits:
+        result.append(CalendarConflictPreview(kind="outside_working_hours"))
+    if context.missing_connection_ids:
+        result.append(
+            CalendarConflictPreview(
+                kind="partial_sources",
+                missing_connection_ids=list(context.missing_connection_ids),
+            )
+        )
+    return result
 
 
 class ActionViewTransaction(Protocol):

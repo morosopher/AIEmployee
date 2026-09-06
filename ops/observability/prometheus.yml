@@ -3,6 +3,10 @@ global:
   scrape_interval: 30s
   evaluation_interval: 30s
 
+# 规则文件由 Compose 以只读挂载提供，避免本地存在而部署时不可见。
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: api
     metrics_path: /metrics

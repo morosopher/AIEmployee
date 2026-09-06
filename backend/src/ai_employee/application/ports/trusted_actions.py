@@ -207,6 +207,22 @@ class ApprovalPreflightResult:
     warnings: tuple[ApprovalWarningCode, ...] = ()
 
 
+class TrustedActionObserver(Protocol):
+    """只接收封闭的供应商/动作/结果，不允许观察器访问命令、用户或执行 ID。"""
+
+    def record_provider_write(self, *, provider: str, action: str, outcome: str) -> None:
+        """记录一次实际供应商写调用的结果；抛出异常时由调用方报告 unknown。"""
+
+    def record_reconciliation(self, *, provider: str, action: str, outcome: str) -> None:
+        """记录一次实际只读核对，不计入写调用。"""
+
+    def record_calendar_version_conflict(self, *, provider: str) -> None:
+        """记录已经规范化的日历版本冲突。"""
+
+    def record_duplicate_provider_call_attempt(self, *, provider: str) -> None:
+        """记录被请求开始 CAS 阻止的重复写企图。"""
+
+
 class TrustedActionPreflight(Protocol):
     """验证供应商能否无损表达一条冻结命令的无副作用端口。"""
 

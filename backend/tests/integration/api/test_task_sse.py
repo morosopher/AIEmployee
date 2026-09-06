@@ -478,3 +478,101 @@ async def test_heartbeat_is_ephemeral_and_not_persisted(
 
     assert heartbeat.event == "heartbeat"
     assert before == after == ()
+
+
+@pytest.mark.asyncio
+async def test_m2_events_replay_ordered_content_free_and_ignore_duplicate_notifications(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+) -> None:
+    """六个 M2 持久事件和未知扩展都保留顺序；只允许封闭的无内容字段进入 SSE。"""
+    session_factory, user_id, build_stream = sse_store
+    task_id = await _create_task(session_factory, user_id)
+    names = (
+        "action.submitted",
+        "approval.invalidated",
+        "tool.claimed",
+        "tool.reconciling",
+        "tool.needs_attention",
+        "tool.manually_resolved",
+        "future.extension",
+    )
+    ids = []
+    async with session_factory.begin() as session:
+        for name in names:
+            row = AuditEventModel(
+                user_id=user_id,
+                task_id=task_id,
+                event_type=name,
+                actor_type="system",
+                actor_id=None,
+                event_metadata={
+                    "provider": "google",
+                    "action": "mail.send",
+                    "version": 1,
+                    "status": "needs_attention",
+                    "reconciliation_attempt_count": 4,
+                    "subject": "synthetic private subject",
+                    "body": "synthetic private body",
+                    "attendees": ["person@example.test"],
+                    "unexpected": {"nested": "synthetic private body"},
+                    "provider_url": "https://provider.example.test/private",
+                    "prompt": "private",
+                },
+            )
+            session.add(row)
+            await session.flush()
+            ids.append(row.id)
+    events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=None)
+    replayed = [_event_payload(await anext(events)) for _ in names]
+    assert (await anext(events)).event == "heartbeat"
+    await events.aclose()
+    assert [item["event"] for item in replayed] == list(names)
+    assert [item["sequence"] for item in replayed] == [str(value) for value in ids]
+    for item in replayed:
+        assert item["payload"] == {
+            "provider": "google",
+            "action": "mail.send",
+            "version": 1,
+            "status": "needs_attention",
+            "reconciliation_attempt_count": 4,
+        }
+    resumed = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=ids[-2])
+    assert _event_payload(await anext(resumed))["sequence"] == str(ids[-1])
+    assert (await anext(resumed)).event == "heartbeat"
+    await resumed.aclose()
+
+
+@pytest.mark.asyncio
+async def test_m2_snapshot_fallback_filters_step_summary_content(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+) -> None:
+    """游标缺口恢复的可信任务快照也必须过滤历史 step summary，不能绕过事件白名单。"""
+    factory, user_id, build_stream = sse_store
+    earlier_task = await _create_task(factory, user_id, status="failed")
+    await _append_event(factory, user_id, earlier_task, "task.queued")
+    task_id = await _create_task(factory, user_id)
+    event_id = await _append_event(factory, user_id, task_id, "tool.needs_attention")
+    async with factory.begin() as session:
+        await session.execute(
+            update(TaskRunModel).where(TaskRunModel.id == task_id).values(kind="trusted_action")
+        )
+        session.add(
+            TaskStepModel(
+                task_id=task_id,
+                sequence=1,
+                name="trusted_action_graph",
+                kind="trusted_action",
+                status="running",
+                input_summary={},
+                output_summary={
+                    "status": "needs_attention",
+                    "subject": "synthetic-private-subject",
+                    "body_text": "synthetic-private-body",
+                },
+            )
+        )
+    events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=0)
+    payload = _event_payload(await anext(events))
+    await events.aclose()
+    assert payload["event"] == "task.snapshot" and payload["id"] == str(event_id)
+    assert payload["payload"]["steps"][0]["output_summary"] == {"status": "needs_attention"}

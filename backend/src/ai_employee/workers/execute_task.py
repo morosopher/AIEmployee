@@ -41,7 +41,9 @@ from ai_employee.workers.generate_mail_draft import build_generate_mail_draft_ta
 from ai_employee.workers.observability import (
     build_process_session_factory,
     initialize_process_observability,
+    observe_write_runtime,
     refresh_stuck_task_metrics,
+    refresh_trusted_action_metrics,
 )
 from ai_employee.workers.prepare_calendar_restore import (
     build_prepare_calendar_restore_task_step,
@@ -97,6 +99,13 @@ async def initialize_worker_observability(_: object) -> None:
         settings=settings, session_factory=factory, process="worker"
     )
     if _worker_metrics is not None:
+        observe_write_runtime(
+            metrics=_worker_metrics,
+            settings=settings,
+            adapters=build_worker_trusted_action_registry(
+                session_factory=factory, settings=settings
+            ),
+        )
 
         async def refresh_worker_health() -> None:
             """在空闲时继续扫描过期租约，保持 Gauge 与数据库事实一致。"""
@@ -106,12 +115,20 @@ async def initialize_worker_observability(_: object) -> None:
             await refresh_sync_age_metrics(
                 session_factory=factory, metrics=_worker_metrics, now=datetime.now(UTC)
             )
+            await refresh_trusted_action_metrics(
+                session_factory=factory, metrics=_worker_metrics, now=datetime.now(UTC)
+            )
 
         _worker_heartbeat_task = asyncio.create_task(
             run_periodic_heartbeat(
                 metrics=_worker_metrics, process="worker", on_tick=refresh_worker_health
             )
         )
+
+
+def get_worker_metrics() -> Metrics | None:
+    """向同一 Worker 中执行的定时维护任务提供进程唯一 registry。"""
+    return _worker_metrics
 
 
 @broker.on_event(TaskiqEvents.WORKER_SHUTDOWN)
@@ -405,6 +422,7 @@ def _build_trusted_action_task_runner(
                 resume=resume,
                 max_transient_retries=DEFAULT_RETRY_COUNT,
                 adapters=adapters,
+                metrics=_worker_metrics,
             ),
         ),
     )
@@ -513,6 +531,7 @@ async def execute_task(
                     session_factory=session_factory,
                     settings=settings,
                     adapters=trusted_action_adapters,
+                    metrics=_worker_metrics,
                 )
                 return
             if (

@@ -3,6 +3,28 @@
 from ai_employee.infrastructure.observability.redaction import redact_value
 
 
+def test_redaction_removes_m2_content_fields_at_any_depth() -> None:
+    """地址、主题、日程字段和完整命令不能通过嵌套或大小写变体进入日志。"""
+    sensitive = {
+        "Account_Address": "synthetic address",
+        "subject": "synthetic subject",
+        "event_title": "synthetic title",
+        "description": "synthetic description",
+        "Location": "synthetic room",
+        "attendees": ["synthetic attendee"],
+        "frozen_command": {"safe_looking_key": "synthetic payload"},
+        "body_text": "synthetic body",
+        "email": "person@example.test",
+        "to": ["person@example.test"],
+        "cc": [],
+        "bcc": [],
+    }
+    result = redact_value({"provider": "google", "nested": sensitive})
+    assert result == {"provider": "google", "nested": {}}
+    assert redact_value("subject=synthetic private subject") == "[redacted]"
+    assert redact_value("upstream: person@example.test") == "[redacted]"
+
+
 def test_redact_value_removes_known_secret_and_content_fields() -> None:
     """递归脱敏认证、令牌、邮件正文与配置命中值，保留安全诊断字段。"""
     payload = {

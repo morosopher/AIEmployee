@@ -20,6 +20,11 @@ from ai_employee.application.ports.oauth import (
     OAuthRevocationStatus,
     OAuthTokenSet,
 )
+from ai_employee.application.use_cases.action_views import (
+    ActionViewUseCase,
+    ManualResolutionUseCase,
+    RequestActionReconciliationUseCase,
+)
 from ai_employee.application.use_cases.auth import (
     AuthenticateSessionUseCase,
     AuthenticationRequiredError,
@@ -233,9 +238,9 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
         route_path = getattr(route, "path", request.url.path)
         metrics.api_errors.labels(route=route_path, error_code=problem_error.error_code).inc()
     headers: dict[str, str] = {}
-    # 日历响应可能包含标题、地点、时间或历史错误上下文；即使由统一异常处理器
+    # 日历/动作响应可能包含标题、地点、时间或历史错误上下文；即使由统一异常处理器
     # 重新构造 Problem Details，也必须继承路由成功响应的 no-store 隔离策略。
-    if request.url.path.startswith("/api/v1/calendar/"):
+    if request.url.path.startswith(("/api/v1/calendar/", "/api/v1/actions")):
         headers["Cache-Control"] = "no-store"
     if isinstance(problem_error, _TransientApiProblem) and problem_error.retry_after is not None:
         headers["Retry-After"] = str(int(problem_error.retry_after))
@@ -723,6 +728,46 @@ def get_retry_task_use_case(request: Request):
 def get_approval_decision_use_case(request: Request):
     """从组合根取得冻结审批决定用例。"""
     return request.app.state.approval_decision_use_case
+
+
+def get_action_view_use_case(request: Request) -> ActionViewUseCase:
+    """仅完整且归属正确的预览读取才加载 Secret；列表和人工控制无需解密。"""
+    from ai_employee.infrastructure.db.repositories.action_views import (
+        SqlAlchemyActionViewRepositoryFactory,
+    )
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = request.app.state.auth_settings
+    return ActionViewUseCase(
+        SqlAlchemyActionViewRepositoryFactory(
+            request.app.state.auth_session_factory,
+            encryption_factory=lambda: AeadCipher.from_file(settings.app_master_key_file),
+        )
+    )
+
+
+def get_manual_resolution_use_case(request: Request) -> ManualResolutionUseCase:
+    """保留原 READ COMMITTED 行锁/CAS 事务，不复用可重复读快照。"""
+    from ai_employee.infrastructure.db.repositories.action_views import (
+        SqlAlchemyActionViewRepositoryFactory,
+    )
+
+    return ManualResolutionUseCase(
+        SqlAlchemyActionViewRepositoryFactory(request.app.state.auth_session_factory)
+    )
+
+
+def get_request_action_reconciliation_use_case(
+    request: Request,
+) -> RequestActionReconciliationUseCase:
+    """组装原只读核对重开用例，API 不构造或调用供应商 adapter。"""
+    from ai_employee.infrastructure.db.repositories.action_views import (
+        SqlAlchemyActionViewRepositoryFactory,
+    )
+
+    return RequestActionReconciliationUseCase(
+        SqlAlchemyActionViewRepositoryFactory(request.app.state.auth_session_factory)
+    )
 
 
 def get_daily_brief_alerts_use_case(request: Request):

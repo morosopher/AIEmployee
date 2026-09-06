@@ -1,15 +1,31 @@
 """为 Worker 与 Scheduler 组合根启动内部指标和追踪。"""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from ai_employee.application.ports.trusted_actions import TrustedActionAdapterRegistry
 from ai_employee.config import Settings
-from ai_employee.infrastructure.db.models.tasks import TaskRunModel
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
+from ai_employee.domain.errors import StateConflictError
+from ai_employee.infrastructure.db.models.sources import (
+    ConnectionCapabilityModel,
+    OAuthConnectionModel,
+)
+from ai_employee.infrastructure.db.models.tasks import (
+    AuditEventModel,
+    TaskRunModel,
+    ToolExecutionModel,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.observability.logging import configure_json_logging
-from ai_employee.infrastructure.observability.metrics import Metrics, create_metrics
+from ai_employee.infrastructure.observability.metrics import (
+    M2_ACTIONS,
+    M2_PROVIDERS,
+    Metrics,
+    create_metrics,
+)
 from ai_employee.infrastructure.observability.tracing import initialize_tracing
 
 
@@ -101,3 +117,143 @@ async def refresh_stuck_task_metrics(
     metrics.clear_stuck_tasks(active_kinds=active_kinds)
     for kind, count in rows:
         metrics.record_stuck_tasks(kind=kind, count=int(count))
+
+
+def observe_write_runtime(
+    *, metrics: Metrics, settings: Settings, adapters: TrustedActionAdapterRegistry
+) -> None:
+    """比较进程有效开关与固定 registry 的可用性；只检查本地组合，不调用供应商。
+
+    开关关闭时已注册 adapter 仍被应用门禁保护，属于正常就绪状态；开关开启但四个
+    M2 动作未完整组装时报告 mismatch。不同进程的开关漂移由 Prometheus 聚合比较。
+    """
+    for provider in M2_PROVIDERS:
+        enabled = settings.provider_writes_enabled(provider)
+        metrics.record_write_kill_switch(provider=provider, enabled=enabled)
+        ready = True
+        if enabled:
+            for action in M2_ACTIONS:
+                try:
+                    adapters.trusted_action_adapter(provider=provider, action=action)
+                except StateConflictError:
+                    ready = False
+        metrics.record_dependency_health(
+            dependency=f"{provider}_write_adapter_policy", healthy=ready
+        )
+
+
+async def refresh_trusted_action_metrics(
+    *,
+    session_factory: ManagedAsyncSessionMaker,
+    metrics: Metrics,
+    now: datetime,
+) -> None:
+    """从持久事实恢复 M2 状态 Gauge；只查询有限组数，不读取身份或内容。
+
+    这是跨用户的进程级维护聚合，结果只有固定 provider/action/capability/state。查询
+    不 materialize 用户、命令或供应商对象。数据库失败时保留旧样本，不谎报恢复；心跳
+    的独立年龄继续增长，后续成功扫描会显式清零已经消失的分组。
+    """
+    try:
+        async with session_factory() as session:
+            entered = (
+                select(
+                    AuditEventModel.task_id,
+                    func.max(AuditEventModel.created_at).label("entered_at"),
+                )
+                .where(
+                    AuditEventModel.event_type == "tool.needs_attention",
+                )
+                .group_by(AuditEventModel.task_id)
+                .subquery()
+            )
+            rows = (
+                await session.execute(
+                    select(
+                        ToolExecutionModel.provider,
+                        ToolExecutionModel.tool_name,
+                        func.count().label("unresolved"),
+                        func.count()
+                        .filter(TaskRunModel.status == "needs_attention")
+                        .label("attention"),
+                        func.min(
+                            func.coalesce(
+                                ToolExecutionModel.request_started_at,
+                                ToolExecutionModel.claimed_at,
+                                TaskRunModel.updated_at,
+                            )
+                        ).label("oldest"),
+                        func.count()
+                        .filter(
+                            (TaskRunModel.status == "needs_attention")
+                            & (
+                                func.coalesce(entered.c.entered_at, TaskRunModel.updated_at)
+                                <= now - timedelta(minutes=15)
+                            )
+                        )
+                        .label("overdue"),
+                    )
+                    .join(TaskRunModel, TaskRunModel.id == ToolExecutionModel.task_id)
+                    .outerjoin(
+                        entered,
+                        entered.c.task_id == TaskRunModel.id,
+                    )
+                    .where(
+                        TaskRunModel.kind == "trusted_action",
+                        TaskRunModel.status.in_(("reconciling", "needs_attention")),
+                        ToolExecutionModel.provider.in_(M2_PROVIDERS),
+                        ToolExecutionModel.tool_name.in_(M2_ACTIONS),
+                    )
+                    .group_by(ToolExecutionModel.provider, ToolExecutionModel.tool_name)
+                )
+            ).all()
+            capabilities = (
+                await session.execute(
+                    select(
+                        OAuthConnectionModel.provider,
+                        ConnectionCapabilityModel.capability,
+                        ConnectionCapabilityModel.status,
+                        func.count(),
+                    )
+                    .join(
+                        OAuthConnectionModel,
+                        (OAuthConnectionModel.id == ConnectionCapabilityModel.connection_id)
+                        & (OAuthConnectionModel.user_id == ConnectionCapabilityModel.user_id),
+                    )
+                    .where(OAuthConnectionModel.provider.in_(M2_PROVIDERS))
+                    .group_by(
+                        OAuthConnectionModel.provider,
+                        ConnectionCapabilityModel.capability,
+                        ConnectionCapabilityModel.status,
+                    )
+                )
+            ).all()
+    except SQLAlchemyError:
+        return
+    groups = {(row.provider, row.tool_name): row for row in rows}
+    for provider in M2_PROVIDERS:
+        for action in M2_ACTIONS:
+            row = groups.get((provider, action))
+            metrics.record_action_state(
+                provider=provider,
+                action=action,
+                needs_attention=0 if row is None else row.attention,
+                age_seconds=0 if row is None else max((now - row.oldest).total_seconds(), 0),
+                unresolved=row is not None,
+            )
+    counts = {
+        (provider, capability, state): count for provider, capability, state, count in capabilities
+    }
+    for provider in M2_PROVIDERS:
+        for capability in ConnectionCapability:
+            for state in CapabilityStatus:
+                metrics.record_capability_state(
+                    provider=provider,
+                    capability=capability.value,
+                    state=state.value,
+                    count=counts.get((provider, capability.value, state.value), 0),
+                )
+    # 此 maintenance kind 不加入普通 RUNNING 租约扫描的清零集合，避免周期交错抹掉告警。
+    metrics.stuck_tasks.labels(kind="trusted_action_needs_attention_overdue").set(
+        sum(row.overdue for row in rows)
+    )

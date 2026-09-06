@@ -20,12 +20,22 @@ _SENSITIVE_FIELD_TERMS = frozenset(
         "content_markdown",
         "ciphertext",
         "nonce",
+        "address",
+        "email",
+        "subject",
+        "title",
+        "description",
+        "location",
+        "attendees",
+        "command",
     }
 )
 
 # 字符串没有字段名时仍可能来自异常文本或插值日志；只允许记录不带敏感标签的诊断值。
 _SENSITIVE_VALUE_PATTERN = re.compile(
-    r"(?:authorization|cookie|token|api[_ -]?key|secret|password|body|prompt)\s*[:=]",
+    r"(?:authorization|cookie|token|api[_ -]?key|secret|password|address|email|subject|"
+    r"title|description|location|attendees|command|body|prompt)\s*[:=]|"
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,63}",
     re.IGNORECASE,
 )
 
@@ -88,6 +98,8 @@ def _redact(value: object, patterns: tuple[re.Pattern[str], ...]) -> RedactedVal
 def _is_sensitive_field(key: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
     """判断字段名是否属于固定或运维配置的敏感集合。"""
     normalized = key.casefold().replace("-", "_")
-    return any(term in normalized for term in _SENSITIVE_FIELD_TERMS) or any(
-        pattern.search(key) is not None for pattern in patterns
+    return (
+        normalized in {"to", "cc", "bcc"}
+        or any(term in normalized for term in _SENSITIVE_FIELD_TERMS)
+        or any(pattern.search(key) is not None for pattern in patterns)
     )

@@ -26,6 +26,7 @@ from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionRepositoryFactory,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
@@ -215,6 +216,7 @@ def build_trusted_action_task_step(
     resume: str | None,
     max_transient_retries: int,
     adapters: TrustedActionAdapterRegistry | None = None,
+    metrics: Metrics | None = None,
 ) -> TrustedActionTaskStep:
     """用消息级数据库工厂和主密钥构造可信动作 Graph step。
 
@@ -245,6 +247,7 @@ def build_trusted_action_task_step(
         adapters=registry,
         write_policy=settings,
         clock=lambda: datetime.now(UTC),
+        observer=metrics,
     )
     return TrustedActionTaskStep(
         workflow=workflow,

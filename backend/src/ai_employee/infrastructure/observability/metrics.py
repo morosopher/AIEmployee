@@ -15,12 +15,17 @@ from prometheus_client import (
 )
 from starlette.responses import Response
 
+from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
+
 METRIC_NAMESPACE = "ai_employee"
 HEARTBEAT_INTERVAL_SECONDS = 30
+M2_PROVIDERS = ("google", "microsoft")
+M2_ACTIONS = ("mail.send", "calendar.create", "calendar.update", "calendar.restore")
+M2_OUTCOMES = ("confirmed_applied", "confirmed_not_applied", "unknown")
 
 
 class Metrics:
-    """拥有 M1 所有稳定指标，禁止在业务模块临时创建名称或用户维度。
+    """拥有 M1 与 M2 所有稳定指标，禁止在业务模块临时创建名称或用户维度。
 
     Args:
         registry: 可注入 registry 以供测试隔离；生产为每个应用实例创建独立 registry，
@@ -35,7 +40,6 @@ class Metrics:
         self._registry = target_registry
         self._monotonic_clock = monotonic_clock or monotonic
         self._heartbeat_at: dict[str, float] = {}
-        self._sync_completed_at: dict[tuple[str, str], float] = {}
         self._stuck_kinds: set[str] = set()
         self.tasks_total = Counter("ai_employee_tasks_total", "任务终态计数", ["kind", "status"], registry=target_registry)
         self.task_duration = Histogram("ai_employee_task_duration_seconds", "任务耗时", ["kind", "status"], registry=target_registry)
@@ -52,11 +56,138 @@ class Metrics:
         self.sse_connections = Gauge("ai_employee_sse_connections", "SSE 连接数", ["state"], registry=target_registry)
         self.heartbeat_age = Gauge("ai_employee_process_heartbeat_age_seconds", "进程心跳年龄", ["process"], registry=target_registry)
         self.dependency_health = Gauge("ai_employee_dependency_health", "依赖健康状态", ["dependency"], registry=target_registry)
+        self.provider_writes = Counter(
+            "ai_employee_provider_write_requests_total",
+            "实际供应商写请求结果",
+            ["provider", "action", "outcome"],
+            registry=target_registry,
+        )
+        self.approval_decisions = Counter(
+            "ai_employee_approval_decisions_total",
+            "已提交审批决定",
+            ["action", "decision"],
+            registry=target_registry,
+        )
+        self.approval_expired = Counter(
+            "ai_employee_approval_expired_total",
+            "已提交审批到期",
+            ["action"],
+            registry=target_registry,
+        )
+        self.reconciliations = Counter(
+            "ai_employee_tool_reconciliation_total",
+            "实际只读核对结果",
+            ["provider", "action", "outcome"],
+            registry=target_registry,
+        )
+        self.reconciliation_age = Gauge(
+            "ai_employee_tool_reconciliation_age_seconds",
+            "最老未决写入的年龄",
+            ["provider", "action"],
+            registry=target_registry,
+        )
+        self.needs_attention = Gauge(
+            "ai_employee_needs_attention_tasks",
+            "等待人工确认的任务数",
+            ["provider", "action"],
+            registry=target_registry,
+        )
+        self.calendar_conflicts = Counter(
+            "ai_employee_calendar_version_conflicts_total",
+            "供应商日历版本冲突",
+            ["provider"],
+            registry=target_registry,
+        )
+        self.capability_state = Gauge(
+            "ai_employee_connection_capability_state",
+            "各能力状态的连接数",
+            ["provider", "capability", "state"],
+            registry=target_registry,
+        )
+        self.write_kill_switch = Gauge(
+            "ai_employee_write_kill_switch_state",
+            "有效供应商写入开关，1为允许",
+            ["provider"],
+            registry=target_registry,
+        )
+
+    def record_provider_write(self, *, provider: str, action: str, outcome: str) -> None:
+        """只在 request-start CAS 赢家实际调用 adapter 后计数；标签严格封闭。"""
+        _bounded(provider, M2_PROVIDERS)
+        _bounded(action, M2_ACTIONS)
+        _bounded(outcome, M2_OUTCOMES)
+        self.provider_writes.labels(provider=provider, action=action, outcome=outcome).inc()
+
+    def record_reconciliation(self, *, provider: str, action: str, outcome: str) -> None:
+        """记录只读调用结果；与供应商写请求使用不同计数器。"""
+        _bounded(provider, M2_PROVIDERS)
+        _bounded(action, M2_ACTIONS)
+        _bounded(outcome, M2_OUTCOMES)
+        self.reconciliations.labels(provider=provider, action=action, outcome=outcome).inc()
+
+    def record_approval_decision(self, *, action: str, decision: str) -> None:
+        """在决定事务成功提交后记录一次批准或拒绝，不记录无效重复请求。"""
+        _bounded(action, M2_ACTIONS)
+        _bounded(decision, ("approved", "rejected"))
+        self.approval_decisions.labels(action=action, decision=decision).inc()
+
+    def record_approval_expired(self, *, action: str) -> None:
+        """记录已提交的 M2 过期状态；M1 fake.write 不进入该指标。"""
+        _bounded(action, M2_ACTIONS)
+        self.approval_expired.labels(action=action).inc()
+
+    def record_calendar_version_conflict(self, *, provider: str) -> None:
+        """记录规范化的 ETag 冲突，不保存日历 ID 或供应商错误原文。"""
+        _bounded(provider, M2_PROVIDERS)
+        self.calendar_conflicts.labels(provider=provider).inc()
+
+    def record_duplicate_provider_call_attempt(self, *, provider: str) -> None:
+        """用既有错误族记录被 request-start CAS 阻断的重复写企图。"""
+        _bounded(provider, M2_PROVIDERS)
+        self.record_provider_error(provider=provider, error_code="duplicate_provider_call_attempt")
+
+    def record_action_state(
+        self,
+        *,
+        provider: str,
+        action: str,
+        needs_attention: int,
+        age_seconds: float,
+        unresolved: bool = True,
+    ) -> None:
+        """设置数据库聚合，并让直曝 registry 的每次 scrape 计算未决年龄。
+
+        Gauge 的回调只读单调时钟，绝不在 Prometheus 线程执行数据库 I/O。扫描重启后
+        重新读取持久 request-start，终态时显式清零且停止年龄增长。
+        """
+        _bounded(provider, M2_PROVIDERS)
+        _bounded(action, M2_ACTIONS)
+        self.needs_attention.labels(provider=provider, action=action).set(max(needs_attention, 0))
+        observed_at = self._monotonic_clock()
+        age = max(age_seconds, 0)
+        self.reconciliation_age.labels(provider=provider, action=action).set_function(
+            lambda: max(age + self._monotonic_clock() - observed_at, 0) if unresolved else 0
+        )
+
+    def record_capability_state(
+        self, *, provider: str, capability: str, state: str, count: int
+    ) -> None:
+        """仅按两供应商、四能力及固定状态聚合，禁止连接或账户标签。"""
+        _bounded(provider, M2_PROVIDERS)
+        _bounded(capability, tuple(item.value for item in ConnectionCapability))
+        _bounded(state, tuple(item.value for item in CapabilityStatus))
+        self.capability_state.labels(provider=provider, capability=capability, state=state).set(
+            max(count, 0)
+        )
+
+    def record_write_kill_switch(self, *, provider: str, enabled: bool) -> None:
+        """只表达当前进程配置的全局×供应商有效开关，不更改策略。"""
+        _bounded(provider, M2_PROVIDERS)
+        self.write_kill_switch.labels(provider=provider).set(int(enabled))
 
     def render(self) -> Response:
         """返回 Prometheus 文本，指标从不按用户或内容添加标签。"""
         self._refresh_heartbeat_ages()
-        self._refresh_sync_ages()
         return Response(generate_latest(self._registry), media_type=CONTENT_TYPE_LATEST)
 
     def record_task_outcome(self, *, kind: str, status: str, duration_seconds: float) -> None:
@@ -89,12 +220,18 @@ class Metrics:
             self.stuck_tasks.labels(kind=kind).set(0)
 
     def record_sync_age(self, *, provider: str, resource: str, seconds: float) -> None:
-        """设置脱敏同步新鲜度年龄。"""
-        self.sync_age.labels(provider=provider, resource=resource).set(max(seconds, 0.0))
+        """用最新数据库聚合或成功观测替换年龄基准，直曝 registry 同样持续增长。
+
+        单次同步成功不能永久遮住数据库中另一来源的更旧时间；每次持久聚合都替换
+        回调闭包中的基准，不再由 API render 的进程内成功记录反向覆盖。
+        """
+        completed_at = self._monotonic_clock() - max(seconds, 0.0)
+        self.sync_age.labels(provider=provider, resource=resource).set_function(
+            lambda: max(self._monotonic_clock() - completed_at, 0)
+        )
 
     def record_sync_success(self, *, provider: str, resource: str) -> None:
         """记录最近一次同步成功的单调时刻，供后续 scrape 计算实际年龄。"""
-        self._sync_completed_at[(provider, resource)] = self._monotonic_clock()
         self.record_sync_age(provider=provider, resource=resource, seconds=0.0)
 
     def record_provider_error(self, *, provider: str, error_code: str) -> None:
@@ -128,6 +265,10 @@ class Metrics:
         """更新进程心跳年龄，正常运行路径应持续写入零。"""
         self._heartbeat_at[process] = self._monotonic_clock() - max(age_seconds, 0.0)
         self._refresh_heartbeat_ages()
+        recorded_at = self._heartbeat_at[process]
+        self.heartbeat_age.labels(process=process).set_function(
+            lambda: max(self._monotonic_clock() - recorded_at, 0)
+        )
 
     def record_dependency_health(self, *, dependency: str, healthy: bool) -> None:
         """把依赖探测结果映射为 1 或 0，不输出 DSN 或连接错误原文。"""
@@ -147,11 +288,11 @@ class Metrics:
         for process, recorded_at in self._heartbeat_at.items():
             self.heartbeat_age.labels(process=process).set(max(now - recorded_at, 0.0))
 
-    def _refresh_sync_ages(self) -> None:
-        """按单调时钟刷新所有已成功同步资源的实际年龄。"""
-        now = self._monotonic_clock()
-        for (provider, resource), completed_at in self._sync_completed_at.items():
-            self.record_sync_age(provider=provider, resource=resource, seconds=now - completed_at)
+
+def _bounded(value: str, allowed: tuple[str, ...]) -> None:
+    """在创建标签前拒绝任意用户文本，错误消息也不回显传入值。"""
+    if value not in allowed:
+        raise ValueError("metric label is outside the bounded vocabulary")
 
 
 def create_metrics() -> Metrics:

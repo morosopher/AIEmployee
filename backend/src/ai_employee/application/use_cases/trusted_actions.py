@@ -39,6 +39,7 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionCommandCipher,
     TrustedActionDispatchSnapshot,
     TrustedActionExecutionSnapshot,
+    TrustedActionObserver,
     TrustedActionPreflightRegistry,
     TrustedActionRequestStartAuthorization,
     TrustedActionRevocationStore,
@@ -104,8 +105,8 @@ def _decoded_url_variants(value: str) -> tuple[str, ...] | None:
     """生成有限次 URL 解码视图，捕获一次或双重编码的地址/控制字符。
 
     供应商链接的 path/query 可以合法携带 opaque percent-encoding；这里不把解码结果
-    作为持久化文本，只把最多三层的视图用于安全扫描。固定上限避免恶意 ``%25`` 链接
-    造成无界 CPU 消耗，同时覆盖常见代理/供应商双重编码。
+    作为持久化文本，只把最多三层的视图用于安全扫描。达到预算后仍存在可解码层时
+    fail closed：不能把“尚未检查到敏感文本”误当成“已证明安全”。
     """
     variants: list[str] = [value]
     current = value
@@ -117,6 +118,8 @@ def _decoded_url_variants(value: str) -> tuple[str, ...] | None:
             break
         variants.append(decoded)
         current = decoded
+    if re.search(r"%[0-9a-fA-F]{2}", current) is not None:
+        return None
     return tuple(variants)
 
 
@@ -291,6 +294,7 @@ class TrustedActionExecutionUseCase:
         clock: Callable[[], datetime],
         id_factory: Callable[[], UUID] = uuid4,
         dispose: Callable[[], Awaitable[None]] | None = None,
+        observer: TrustedActionObserver | None = None,
     ) -> None:
         """保存短事务工厂、固定 adapter、写门禁与可替换时钟/ID 来源。"""
         self._transactions = transactions
@@ -299,6 +303,7 @@ class TrustedActionExecutionUseCase:
         self._clock = clock
         self._id_factory = id_factory
         self._dispose = dispose
+        self._observer = observer
 
     async def load_graph_facts(
         self,
@@ -591,11 +596,19 @@ class TrustedActionExecutionUseCase:
             if request_start.disposition is not RequestStartDisposition.STARTED:
                 # 租约已丢失或另一调用已经提交 request-start 时，本调用绝不能释放赢家
                 # 的 live lease，也不能让 Graph/Runner 把 loser 当作成功完成。
+                if (
+                    self._observer is not None
+                    and request_start.disposition is RequestStartDisposition.RECONCILE
+                ):
+                    self._observer.record_duplicate_provider_call_attempt(
+                        provider=snapshot.provider
+                    )
                 raise TrustedActionAttemptAbandoned
         elif not from_reconciliation:
             raise _trusted_action_unavailable()
 
         try:
+            observed_outcome = "unknown"
             try:
                 outcome = (
                     await adapter.reconcile(command, snapshot.execution)
@@ -608,8 +621,27 @@ class TrustedActionExecutionUseCase:
                 # 连接 coordinator 明确无法提供只读凭据时停止自动核对；不能把本地权限
                 # 缺失转成 confirmed-not-applied，也不能安排写重试或恢复已销毁 Token。
                 outcome = _connection_scope_missing_outcome(snapshot)
-            if type(outcome) is not ProviderWriteOutcome:
-                raise TypeError("trusted action adapter returned an invalid outcome")
+            else:
+                if type(outcome) is not ProviderWriteOutcome:
+                    raise TypeError("trusted action adapter returned an invalid outcome")
+                observed_outcome = outcome.kind.value
+                if (
+                    self._observer is not None
+                    and outcome.error_code == "calendar_event_version_conflict"
+                ):
+                    self._observer.record_calendar_version_conflict(provider=snapshot.provider)
+            finally:
+                # 观测实际 adapter 调用边界，不把调用前的门禁拒绝计为请求；结果提交失败也不抹掉
+                # 已发生的一次调用。只读调用和写调用始终使用不同指标族。
+                if self._observer is not None:
+                    record = (
+                        self._observer.record_reconciliation
+                        if from_reconciliation
+                        else self._observer.record_provider_write
+                    )
+                    record(
+                        provider=snapshot.provider, action=snapshot.action, outcome=observed_outcome
+                    )
             completed_at = _utc_now(self._clock())
             async with self._transactions() as transaction:
                 await transaction.persist_provider_outcome(

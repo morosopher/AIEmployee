@@ -58,9 +58,13 @@ from ai_employee.infrastructure.db.repositories.trusted_actions import (
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
-from ai_employee.infrastructure.observability.metrics import Metrics, run_periodic_heartbeat
+from ai_employee.infrastructure.observability.metrics import (
+    M2_PROVIDERS,
+    Metrics,
+    run_periodic_heartbeat,
+)
 from ai_employee.infrastructure.queue.broker import broker
-from ai_employee.workers.execute_task import execute_task
+from ai_employee.workers.execute_task import execute_task, get_worker_metrics
 from ai_employee.workers.observability import initialize_process_observability
 from ai_employee.workers.outbox import build_outbox_relay
 from ai_employee.workers.retention import build_retention_cleanup_worker
@@ -105,6 +109,10 @@ async def initialize_scheduler_observability(_: object) -> None:
         settings=settings, session_factory=session_factory, process="scheduler"
     )
     if _scheduler_metrics is not None:
+        for provider in M2_PROVIDERS:
+            _scheduler_metrics.record_write_kill_switch(
+                provider=provider, enabled=settings.provider_writes_enabled(provider)
+            )
         _scheduler_heartbeat_task = asyncio.create_task(
             run_periodic_heartbeat(metrics=_scheduler_metrics, process="scheduler")
         )
@@ -133,12 +141,18 @@ def _build_outbox_relay() -> OutboxRelay:
     )
 
 
+def _maintenance_metrics() -> Metrics | None:
+    """Taskiq cron 消息实际由 Worker 执行；仅在 Scheduler 内运行时使用其 registry。"""
+    return _scheduler_metrics if _scheduler_metrics is not None else get_worker_metrics()
+
+
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "outbox-relay"}])
 async def relay_outbox() -> None:
     """每分钟 claim 并投递一批到期未发布 Outbox 事件。"""
-    if _scheduler_metrics is not None:
-        _scheduler_metrics.record_heartbeat(process="scheduler", age_seconds=0)
     await _build_outbox_relay().relay_once(limit=settings.outbox_relay_batch_size)
+    metrics = _maintenance_metrics()
+    if metrics is not None:
+        metrics.record_heartbeat(process="outbox_relay", age_seconds=0)
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "recover-task-retries"}])
@@ -161,9 +175,13 @@ async def recover_due_reconciliations(*, now: datetime, limit: int) -> int:
     now = utc_instant(now, field="now")
     # 该扫描只读 TaskRun/ToolExecution/Outbox 调度事实；它不能因为 Worker Secret 未挂载
     # 或正在轮换而失败，也绝不需要解密冻结命令。实际命令解密仅发生在核对 Worker。
-    return await SqlAlchemyTrustedActionReconciliationRecoveryStore(
+    recovered = await SqlAlchemyTrustedActionReconciliationRecoveryStore(
         session_factory
     ).recover_due_reconciliations(now=now, limit=limit)
+    metrics = _maintenance_metrics()
+    if metrics is not None:
+        metrics.record_heartbeat(process="reconciliation_scanner", age_seconds=0)
+    return recovered
 
 
 @broker.task(schedule=[{"cron": "* * * * *", "schedule_id": "due-daily-briefs"}])
@@ -245,7 +263,9 @@ async def expire_approvals() -> None:
     await InvalidateDisabledTrustedActionsUseCase(
         store=SqlAlchemyTrustedActionRevocationStore(session_factory), write_policy=settings
     ).execute(limit=settings.outbox_relay_batch_size)
-    use_case = ExpireApprovalsUseCase(SqlAlchemyApprovalStore(session_factory))
+    use_case = ExpireApprovalsUseCase(
+        SqlAlchemyApprovalStore(session_factory, metrics=_maintenance_metrics())
+    )
     await use_case.execute(now=datetime.now(UTC), limit=settings.outbox_relay_batch_size)
     await monitor_oauth_revoke_backlog()
 
@@ -267,6 +287,12 @@ async def monitor_oauth_revoke_backlog() -> tuple[OAuthRevokeBacklog, ...]:
     backlog = await OAuthRevokeMaintenanceUseCase(
         SqlAlchemyConnectionStoreFactory(session_factory), _MaintenanceClock()
     ).scan()
+    metrics = _maintenance_metrics()
+    if metrics is not None:
+        counts = {item.provider: item.unresolved_count for item in backlog}
+        for provider in M2_PROVIDERS:
+            # 复用既有维护积压 Gauge；不加入普通 RUNNING 租约扫描的清零集合。
+            metrics.stuck_tasks.labels(kind=f"oauth_revoke_{provider}").set(counts.get(provider, 0))
     for item in backlog:
         if item.unresolved_count > 0:
             logging.getLogger("ai_employee.oauth.revoke_backlog").warning(

@@ -19,6 +19,7 @@ from ai_employee.infrastructure.db.repositories.trusted_actions import (
     SqlAlchemyTrustedActionTaskExecutionStore,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.registry import ProviderAdapterRegistry
@@ -85,6 +86,7 @@ async def execute_reconciliation_task(
     adapters: TrustedActionAdapterRegistry | None = None,
     lease_owner: str | None = None,
     now: datetime | None = None,
+    metrics: Metrics | None = None,
 ) -> bool:
     """认领并执行一轮持久只读核对。
 
@@ -145,6 +147,7 @@ async def execute_reconciliation_task(
         # 同一轮核对使用调用方注入的固定瞬间；持久结果时间仍由 repository 在锁内
         # 读取 PostgreSQL clock_timestamp() 决定。
         clock=lambda: current,
+        observer=metrics,
     )
     step = ReconcileActionsTaskStep(workflow)
     leased = LeasedTask(

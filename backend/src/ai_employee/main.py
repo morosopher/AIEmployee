@@ -20,6 +20,7 @@ from ai_employee.api.deps import (
     handle_request_validation_error,
     handle_unexpected_error,
 )
+from ai_employee.api.routers.actions import build_actions_router
 from ai_employee.api.routers.approvals import build_approvals_router
 from ai_employee.api.routers.auth import build_auth_router
 from ai_employee.api.routers.briefs import build_briefs_router
@@ -56,7 +57,11 @@ from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepos
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.events.publisher import TaskEventPublisher
 from ai_employee.infrastructure.observability.logging import configure_json_logging
-from ai_employee.infrastructure.observability.metrics import create_metrics, run_periodic_heartbeat
+from ai_employee.infrastructure.observability.metrics import (
+    M2_PROVIDERS,
+    create_metrics,
+    run_periodic_heartbeat,
+)
 from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
 from ai_employee.infrastructure.observability.tracing import initialize_tracing
 from ai_employee.infrastructure.security.passwords import PasswordHasher
@@ -120,6 +125,11 @@ def create_app(
 
     app = FastAPI(title="AI Employee API", version="0.1.0", lifespan=lifespan)
     app.state.metrics = create_metrics() if settings.metrics_enabled else None
+    if app.state.metrics is not None:
+        for provider in M2_PROVIDERS:
+            app.state.metrics.record_write_kill_switch(
+                provider=provider, enabled=settings.provider_writes_enabled(provider)
+            )
     configure_json_logging(tuple(settings.model_redaction_patterns))
     initialize_tracing(
         app=app,
@@ -153,7 +163,7 @@ def create_app(
     app.state.cancel_task_use_case = CancelTaskUseCase(task_store)
     app.state.retry_task_use_case = RetryTaskUseCase(task_store)
     app.state.approval_decision_use_case = ApprovalDecisionUseCase(
-        SqlAlchemyApprovalStore(session_factory)
+        SqlAlchemyApprovalStore(session_factory, metrics=app.state.metrics)
     )
     app.state.daily_brief_alerts_use_case = GetDailyBriefOverdueAlertUseCase(
         reader=SqlAlchemyOverdueBriefReader(session_factory)
@@ -206,6 +216,7 @@ def create_app(
     app.include_router(build_settings_router())
     app.include_router(build_tasks_router())
     app.include_router(build_approvals_router())
+    app.include_router(build_actions_router())
     app.include_router(build_mail_router())
     # 故障注入只能在两个显式测试开关同时打开后注册；生产路由表中完全不存在该入口。
     if settings.app_env == "test" and settings.app_test_mode:

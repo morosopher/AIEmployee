@@ -8,7 +8,7 @@ from typing import Literal
 from uuid import UUID
 
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, true, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -350,11 +350,14 @@ class SqlAlchemyCalendarSyncRepository:
         observed_at: datetime,
         search_start: datetime,
         horizon_days: int,
+        excluded_event_id: UUID | None = None,
     ) -> CalendarAvailabilityContext | None:
         """以固定五条集合查询读取最小本人可用性投影。
 
         ``observed_at`` 是 freshness 的独立观测时刻，``search_start`` 只决定候选窗口；
         两者必须由调用方分别提供，避免把未来或过去的搜索窗口误当成数据新鲜度时钟。
+        ``excluded_event_id`` 由动作快照按用户+连接+日历+供应商事件定位，防止修改
+        提案把目标本身误报为冲突；不传时保持原候选算法读取全部本人事件的行为。
         查询只投影设置、连接/能力、目录、游标和五个事件状态字段，不 materialize
         ``CalendarEventModel``，也不按连接循环发 SQL。
         """
@@ -515,6 +518,9 @@ class SqlAlchemyCalendarSyncRepository:
                     .where(
                         CalendarEventModel.user_id == user_id,
                         CalendarEventModel.connection_id.in_(available_connections),
+                        true()
+                        if excluded_event_id is None
+                        else CalendarEventModel.id != excluded_event_id,
                         CalendarEventModel.starts_at.is_not(None),
                         CalendarEventModel.ends_at.is_not(None),
                         CalendarEventModel.starts_at < window_end,

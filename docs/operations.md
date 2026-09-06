@@ -924,3 +924,67 @@ Scheduler 复用每分钟 `expire-approvals` 入口，扫描已关闭全局/供�
 
 模型 API Key 轮换时，更新 Secret、滚动 API/Worker/Scheduler，并确认结构化模型调用仍使用预期
 供应商与数据最小披露策略。
+
+## M2 操作快照与监控
+
+`GET /api/v1/actions` 按 `limit`（1～100）、`offset`、`status`、`item_kind`、`provider`、
+`action` 筛选当前用户的统一操作列表，按更新时间倒序及种类/本地 ID 稳定排序。
+`mail_draft`、`calendar_proposal` 项使用自身编辑 ID，`task_id` 为 null；冻结后的
+`trusted_task` 项携带真实 TaskRun ID。列表不读取正文、地址或日程标题。
+
+`GET /api/v1/actions/{task_id}` 在同一 PostgreSQL 可重复读视图中返回本地对象摘要、冻结
+审批、执行记录和有序时间线。`task_version` 与 `event_cursor` 都是相同的规范十进制字符串；
+客户端不得先转换为 JavaScript number。`approval.preview.kind` 为 `mail` 或 `calendar`，
+分别包含精确冻结的邮件字段或日程前后字段、通知策略与本人日历冲突。内容 AEAD 清除后返回
+`content_status=redacted`、`preview=null`，没有旧明文回退。成功和错误响应均使用 `no-store`。
+冲突查询覆盖冻结日程的完整时间范围及会议缓冲；修改和恢复排除目标事件自身。该读取不改变
+候选时间建议的原有窗口，也不会查询参会人的 Free/Busy。
+
+未知结果只能使用以下两个受 Cookie 会话和 CSRF 保护的入口：
+
+- `POST /api/v1/actions/{task_id}/reconcile` 返回 202 与原 TaskRun ID，通过 Outbox 重开只读核对。
+- `POST /api/v1/actions/{task_id}/manual-resolution` 只接收 `resolution` 和 `task_version`。
+  resolution 仅允许 `confirmed_executed`、`confirmed_not_executed`；成功返回 200、新审计版本和
+  TaskRun ID。旧版本或并发收敛返回 `409/manual_resolution_conflict`。人工确认不会调用供应商，
+  确认未执行也不会自动重发；再次写入需要新草稿/提案版本和新的精确审批。
+
+现有 `/api/v1/tasks/{task_id}/events` 是唯一任务 SSE。六种 M2 事件及可信任务缺口快照都过滤
+敏感元数据；未知事件仍保留游标，客户端忽略其业务载荷并重读动作快照。未提交草稿、提案和
+连接能力继续以 REST 为准，在页面聚焦或重新连接后刷新列表。
+
+九个 M2 Prometheus 指标使用 `ai_employee_` 前缀，标签分别为：
+
+| 指标 | 标签 |
+| --- | --- |
+| `provider_write_requests_total` | provider、action、outcome |
+| `approval_decisions_total` | action、decision |
+| `approval_expired_total` | action |
+| `tool_reconciliation_total` | provider、action、outcome |
+| `tool_reconciliation_age_seconds` | provider、action |
+| `needs_attention_tasks` | provider、action |
+| `calendar_version_conflicts_total` | provider |
+| `connection_capability_state` | provider、capability、state |
+| `write_kill_switch_state` | provider |
+
+写与只读核对计数来自通过可信门禁后的 adapter 调用边界，异常结果计为 unknown；审批计数只在
+事务提交后增加。状态 Gauge 由 Worker 每三十秒从 PostgreSQL 聚合恢复，能力 Gauge 表达各状态
+的连接数量。核对年龄从最老未决请求开始计算；心跳与年龄在 Worker/Scheduler 直接抓取 registry
+时也会随单调时钟增长。计数器是进程内观测，重启后归零，不能代替持久审计证明执行次数。
+
+`ops/observability/alerts.yml` 已通过 Compose 只读挂载并由 Prometheus 加载。五类告警为：人工
+确认等待超过十五分钟、被 request-start CAS 阻止的重复写企图、有效写开关与适配器缺失或各进程
+配置漂移、撤销失败持续十五分钟积压、核对扫描器或 Outbox relay 缺失/停止心跳。后两项复用既有
+`stuck_tasks` 和 `process_heartbeat_age_seconds` 指标，使用固定维护标签，不含账户或任务 ID。
+cron 消息由 Worker 实际执行，只有工作完成后才刷新 `reconciliation_scanner`/`outbox_relay`
+心跳；普通 Scheduler/Worker 进程心跳不表示维护任务正常。告警规则只产生 Prometheus 告警状态，
+外部通知渠道仍由部署环境配置。
+
+重复写企图的规则覆盖首次抓取即为非零的计数器，避免新进程的第一条异常因缺少零基线而漏报。
+在仓库根目录、已安装 Docker 且可取得 Compose 使用的 Prometheus 镜像时，可运行以下无网络、
+只读挂载的合成规则验证；命令只创建退出后自动删除的测试容器，不访问业务数据库或供应商：
+
+```sh
+docker run --rm --network none --entrypoint /bin/promtool \
+  -v "$PWD/ops/observability:/etc/prometheus:ro" \
+  prom/prometheus:v3.3.1 test rules /etc/prometheus/alerts.test.yml
+```

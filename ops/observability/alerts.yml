@@ -1,0 +1,43 @@
+# M2 告警只使用封闭标签；运行手册说明人工核对与停机处置，不含账户或内容。
+groups:
+  - name: trusted_actions
+    rules:
+      - alert: M2NeedsAttentionOverdue
+        expr: max(ai_employee_stuck_tasks{kind="trusted_action_needs_attention_overdue"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 可信动作等待人工确认已超过十五分钟
+          description: 在操作中心打开供应商检查入口；只能核对或人工确认，禁止直接重发。
+      - alert: M2DuplicateProviderCallAttempt
+        # 新进程可能在首次 scrape 前已阻断重复企图；首次非零样本也必须进入五分钟告警窗口。
+        expr: sum(increase(ai_employee_provider_errors_total{error_code="duplicate_provider_call_attempt"}[5m])) > 0 or sum(ai_employee_provider_errors_total{error_code="duplicate_provider_call_attempt"} unless ai_employee_provider_errors_total{error_code="duplicate_provider_call_attempt"} offset 5m) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: 请求开始 CAS 已阻断重复供应商写企图
+          description: 检查执行时间线和重复投递原因；不要绕过幂等认领重放请求。
+      - alert: M2WriteKillSwitchMismatch
+        expr: min(ai_employee_dependency_health{dependency=~"(google|microsoft)_write_adapter_policy"}) < 1 or (max by (provider) (ai_employee_write_kill_switch_state) != min by (provider) (ai_employee_write_kill_switch_state))
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 写开关与运行时组合不一致
+          description: 统一 API、Worker、Scheduler 配置；开启写入但缺少固定适配器时应保持停机。
+      - alert: M2OAuthRevokeBacklog
+        expr: max(ai_employee_stuck_tasks{kind=~"oauth_revoke_(google|microsoft)"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: OAuth 远端撤销失败持续积压
+          description: 按运行手册完成供应商端人工撤销，并通过维护用例记录对应 unresolved 事件的补救。
+      - alert: M2MaintenanceHeartbeatMissing
+        expr: min(ai_employee_process_heartbeat_age_seconds{process="reconciliation_scanner"}) > 180 or absent(ai_employee_process_heartbeat_age_seconds{process="reconciliation_scanner"}) or min(ai_employee_process_heartbeat_age_seconds{process="outbox_relay"}) > 180 or absent(ai_employee_process_heartbeat_age_seconds{process="outbox_relay"})
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: 核对扫描器或 Outbox relay 停止完成工作
+          description: 检查 Scheduler 投递、Worker 消费与 PostgreSQL/Redis；普通进程心跳不能代替维护任务心跳。

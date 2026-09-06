@@ -33,14 +33,18 @@ from ai_employee.infrastructure.db.models.tasks import (
     ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.observability.metrics import M2_ACTIONS, Metrics
 
 
 class SqlAlchemyApprovalStore:
     """在短事务内锁定审批并同步写入任务、审计与恢复事件。"""
 
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
+    def __init__(
+        self, session_factory: ManagedAsyncSessionMaker, *, metrics: Metrics | None = None
+    ) -> None:
         """保存进程级会话工厂而不提前占用数据库连接。"""
         self._session_factory = session_factory
+        self._metrics = metrics
 
     async def get_fake_write_task(self, *, task_id: UUID) -> FakeWriteTask | None:
         """读取恢复 LangGraph 所需的最小任务快照。
@@ -216,6 +220,7 @@ class SqlAlchemyApprovalStore:
         取得任务锁后仍逐项锁定并重检精确审批，保证候选扫描与实际状态迁移之间的并发
         决定、撤回或数据损坏不会被当作本轮到期事实。
         """
+        expired_actions: list[str] = []
         async with self._session_factory.begin() as session:
             candidates = tuple(
                 (
@@ -369,7 +374,13 @@ class SqlAlchemyApprovalStore:
                         )
                     )
                 expired_count += 1
-            return expired_count
+                if approval.action in M2_ACTIONS:
+                    expired_actions.append(approval.action)
+        # 指标只消费已提交状态；回滚及并发 loser 不得产生过期计数。
+        if self._metrics is not None:
+            for action in expired_actions:
+                self._metrics.record_approval_expired(action=action)
+        return expired_count
 
     async def finish_fake_write(
         self, *, task_id: UUID, lease_owner: str, decision: str, payload_hash: str, now: datetime
@@ -653,6 +664,9 @@ class SqlAlchemyApprovalStore:
                     available_at=now,
                 )
             )
+
+        if self._metrics is not None and approval.action in M2_ACTIONS:
+            self._metrics.record_approval_decision(action=approval.action, decision=decision)
 
     async def _validate_trusted_approval_current(
         self,
