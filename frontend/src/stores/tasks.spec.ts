@@ -1,6 +1,14 @@
+/// <reference types="node" />
+
+// 契约测试通过 Node 读取跨目录共享 fixture，因此显式引用已安装的 Node 类型。
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it } from 'vitest'
 
+import { parseTaskEvent } from '../api/types'
 import type { TaskEvent } from '../api/types'
 import { useTasksStore } from './tasks'
 
@@ -26,6 +34,54 @@ function event(
 
 describe('tasks store', () => {
   beforeEach(() => setActivePinia(createPinia()))
+
+  it('shows the first step and its completion from the shared server SSE contract', () => {
+    // 与真实 PostgreSQL/SSE 测试共用线上信封，不能用 reducer 编造名称掩盖服务端字段丢失。
+    // 测试进程直接读取 fixture，避免把后端测试目录加入 Vite 的浏览器资源边界。
+    const fixturePath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      '../../../backend/tests/contract/fixtures/task_step_events.json',
+    )
+    const input: unknown = JSON.parse(readFileSync(fixturePath, 'utf8'))
+    if (!Array.isArray(input)) throw new Error('invalid synthetic step fixture')
+    const [started, completed] = input.map((value: unknown) =>
+      parseTaskEvent(JSON.stringify(value)),
+    )
+    if (!started || !completed) throw new Error('invalid synthetic step events')
+    const store = useTasksStore()
+    store.setTask({
+      id: started.task_id,
+      kind: 'daily_brief',
+      status: 'running',
+      retry_of_task_id: null,
+      error_code: null,
+      event_cursor: '0',
+      steps: [],
+    })
+
+    store.applyEvent(started)
+    expect(store.tasks[started.task_id]?.steps).toHaveLength(1)
+    expect(store.tasks[started.task_id]?.steps[0]).toMatchObject({
+      id: started.step_id,
+      name: 'load_sources',
+      sequence: 7,
+      status: 'started',
+      output_summary: null,
+      started_at: started.occurred_at,
+    })
+
+    store.applyEvent(completed)
+    expect(store.tasks[started.task_id]?.steps).toHaveLength(1)
+    expect(store.tasks[started.task_id]?.steps[0]).toMatchObject({
+      id: started.step_id,
+      name: 'load_sources',
+      sequence: 7,
+      status: 'completed',
+      output_summary: { status: 'succeeded', attempt_count: 1 },
+      started_at: started.occurred_at,
+      finished_at: completed.occurred_at,
+    })
+  })
 
   it('deduplicates events, orders durable steps, and follows status events', () => {
     const store = useTasksStore()

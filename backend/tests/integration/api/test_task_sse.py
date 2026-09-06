@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -481,6 +482,54 @@ async def test_heartbeat_is_ephemeral_and_not_persisted(
 
 
 @pytest.mark.asyncio
+async def test_m1_step_events_preserve_legacy_step_fields(
+    sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
+) -> None:
+    """真实持久步骤经线上 SSE 保留旧 reducer 所需字段，同时移除内容与任意嵌套元数据。
+
+    与前端共用合成线上契约；仅将数据库实际分配的 task/audit ID 代入期望，步骤自己的
+    sequence 固定为 7，证明不能用信封中的审计游标替代步骤排序。
+    """
+    fixture = Path(__file__).parents[2] / "contract/fixtures/task_step_events.json"
+    expected = json.loads(fixture.read_text(encoding="utf-8"))
+    session_factory, user_id, build_stream = sse_store
+    task_id = await _create_task(session_factory, user_id, status="running")
+    async with session_factory.begin() as session:
+        for item in expected:
+            metadata = {
+                **item["payload"],
+                "subject": "synthetic-private-subject",
+                "unexpected": {"body_text": "synthetic-private-body"},
+            }
+            summary = metadata["output_summary"]
+            if summary is not None:
+                metadata["output_summary"] = {
+                    **summary,
+                    "body_text": "synthetic-private-body",
+                    "attendees": ["person@example.test"],
+                    "unexpected": {"subject": "synthetic-private-subject"},
+                }
+            row = AuditEventModel(
+                user_id=user_id,
+                task_id=task_id,
+                event_type=item["event"],
+                actor_type="system",
+                actor_id=None,
+                created_at=datetime.fromisoformat(item["occurred_at"]),
+                event_metadata=metadata,
+            )
+            session.add(row)
+            await session.flush()
+            item.update(id=str(row.id), sequence=str(row.id), task_id=str(task_id))
+    events = build_stream().events(task_id=task_id, user_id=user_id, last_event_id=None)
+    try:
+        actual = [_event_payload(await anext(events)) for _ in expected]
+    finally:
+        await events.aclose()
+    assert actual == expected
+
+
+@pytest.mark.asyncio
 async def test_m2_events_replay_ordered_content_free_and_ignore_duplicate_notifications(
     sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
 ) -> None:
@@ -511,6 +560,9 @@ async def test_m2_events_replay_ordered_content_free_and_ignore_duplicate_notifi
                     "version": 1,
                     "status": "needs_attention",
                     "reconciliation_attempt_count": 4,
+                    "name": "load_sources",
+                    "sequence": 7,
+                    "output_summary": {"status": "succeeded", "attempt_count": 1},
                     "subject": "synthetic private subject",
                     "body": "synthetic private body",
                     "attendees": ["person@example.test"],

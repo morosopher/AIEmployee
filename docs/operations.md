@@ -952,6 +952,10 @@ Scheduler 复用每分钟 `expire-approvals` 入口，扫描已关闭全局/供�
 敏感元数据；未知事件仍保留游标，客户端忽略其业务载荷并重读动作快照。未提交草稿、提案和
 连接能力继续以 REST 为准，在页面聚焦或重新连接后刷新列表。
 
+M1 的 `step.started`、`step.completed`、`step.failed` 保留受限英文步骤标识 `name`、非负
+32 位步骤 `sequence`，以及显式 null 或经过同一标量白名单过滤的 `output_summary`。
+步骤序号与信封中的审计游标含义不同；名称、摘要和步骤序号不会因该兼容规则进入 M2 或未知事件。
+
 九个 M2 Prometheus 指标使用 `ai_employee_` 前缀，标签分别为：
 
 | 指标 | 标签 |

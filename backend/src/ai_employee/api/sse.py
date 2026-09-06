@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -233,14 +234,32 @@ def _public_event_type(audit_event_type: str) -> str:
 
 
 def _public_event_payload(event: DurableTaskEvent) -> dict[str, JsonValue]:
-    """只复制内容白名单，并保留旧审批过期的公开语义；未知事件仍可推动游标。"""
+    """在无内容投影上保留 M1 步骤契约与旧审批过期语义。
+
+    Args:
+        event: 已从当前用户审计记录读取的持久事件；元数据仍需经过公开字段校验。
+
+    Returns:
+        独立载荷副本。仅三种已知步骤事件增加受限名称、步骤序号和已过滤摘要；
+        M2 与未知事件沿用封闭标量白名单，不能借旧事件兼容恢复任意内容透传。
+    """
+    payload = public_action_event_payload(event.payload)
     if event.event == "approval.expired":
-        return {
-            **public_action_event_payload(event.payload),
-            "status": "expired",
-            "reason": "approval_expired",
-        }
-    return public_action_event_payload(event.payload)
+        payload.update(status="expired", reason="approval_expired")
+    elif event.event in {"step.started", "step.completed", "step.failed"}:
+        name = event.payload.get("name")
+        if isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", name):
+            payload["name"] = name
+        sequence = event.payload.get("sequence")
+        # 步骤排序来自 TaskStep 的 INTEGER 字段，不可用信封中的 BIGINT 审计游标替代。
+        if type(sequence) is int and 0 <= sequence <= 2**31 - 1:
+            payload["sequence"] = sequence
+        summary = event.payload.get("output_summary")
+        if isinstance(summary, dict):
+            payload["output_summary"] = public_action_event_payload(summary)
+        elif summary is None and "output_summary" in event.payload:
+            payload["output_summary"] = None
+    return payload
 
 
 def _event(event: DurableTaskEvent) -> ServerSentEvent:

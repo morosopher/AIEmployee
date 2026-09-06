@@ -1,0 +1,35 @@
+[
+  {
+    "id": "901",
+    "task_id": "00000000-0000-0000-0000-000000000401",
+    "sequence": "901",
+    "event": "step.started",
+    "occurred_at": "2030-01-01T00:00:00+00:00",
+    "step_id": "00000000-0000-0000-0000-000000000402",
+    "payload": {
+      "step_id": "00000000-0000-0000-0000-000000000402",
+      "name": "load_sources",
+      "sequence": 7,
+      "status": "started",
+      "output_summary": null
+    }
+  },
+  {
+    "id": "902",
+    "task_id": "00000000-0000-0000-0000-000000000401",
+    "sequence": "902",
+    "event": "step.completed",
+    "occurred_at": "2030-01-01T00:00:02+00:00",
+    "step_id": "00000000-0000-0000-0000-000000000402",
+    "payload": {
+      "step_id": "00000000-0000-0000-0000-000000000402",
+      "name": "load_sources",
+      "sequence": 7,
+      "status": "completed",
+      "output_summary": {
+        "status": "succeeded",
+        "attempt_count": 1
+      }
+    }
+  }
+]
