@@ -3058,6 +3058,8 @@ async def invalidate_unclaimed_actions_for_connection(
     本地对象的既有可信锁序重读。修改连接状态的调用方必须在本函数返回后、同一事务内
     再锁 Connection 与 capability 行；这样 claim 与撤权只会有一个有效赢家，也不会
     形成 Connection→Task 的反向等待。开关扫描不修改连接行，只处理未认领动作。
+    已由专用 claim 取得且在锁后数据库时间仍有效的只读租约保持不变，允许在途核对
+    提交精确结果；其他已认领动作仍撤销原租约并调度核对，不能继续原写请求。
 
     Args:
         session: 调用方拥有且尚未提交的异步会话。
@@ -3226,30 +3228,48 @@ async def invalidate_unclaimed_actions_for_connection(
                 # 已足以禁止写入，丢失投递由既有 PostgreSQL reconciliation recovery 恢复。
                 continue
 
+            # 只有专用 claim_reconciliation 留下的持久形状可以保留 owner。普通
+            # running/写请求租约即使尚未过期也必须撤销；request-start 和写次数同时
+            # 存在，才有可核对的既有请求。有效性使用全部业务行锁之后的数据库时间，
+            # 不延长原 expiry，也不改变本轮 scheduled_for/attempt，崩溃后仍由既有
+            # 到期恢复接管。结果提交继续执行原来的完整绑定与 live-lease CAS。
+            preserve_read_lease = (
+                execution_status is ToolExecutionStatus.RECONCILING
+                and task.status == TaskStatus.RECONCILING.value
+                and task.current_step == "reconcile"
+                and execution.request_started_at is not None
+                and execution.write_attempt_count > 0
+                and task.scheduled_for is not None
+                and task.lease_owner is not None
+                and task.lease_expires_at is not None
+                and task.lease_expires_at > database_now
+            )
             execution.status = ToolExecutionStatus.RECONCILING.value
             execution.error_code = reason
             execution.completed_at = None
             task.status = TaskStatus.RECONCILING.value
             task.error_code = reason
             task.finished_at = None
-            task.lease_owner = None
-            task.lease_expires_at = None
-            task.retry_recovery_at = None
-            task.approval_checkpoint_recovery_at = None
-            task.scheduled_for = database_now
+            if not preserve_read_lease:
+                task.lease_owner = None
+                task.lease_expires_at = None
+                task.retry_recovery_at = None
+                task.approval_checkpoint_recovery_at = None
+                task.scheduled_for = database_now
             if isinstance(local, MailDraftModel):
                 local.status = MailDraftStatus.NEEDS_ATTENTION.value
             else:
                 local.status = CalendarProposalStatus.NEEDS_ATTENTION.value
-            # 初始 task.execute 尚未发布时删除它，避免普通可信动作 Runner 抢到这条消息；
-            # 已发布历史保留，新的消息只表达专用核对意图。
-            await session.execute(
-                delete(OutboxEventModel).where(
-                    OutboxEventModel.aggregate_id == task.id,
-                    OutboxEventModel.topic == "task.execute",
-                    OutboxEventModel.published_at.is_(None),
+            if not preserve_read_lease:
+                # 移交原写请求时替换尚未发布的 task.execute，已发布历史保留。有效只读
+                # owner 已在运行，本轮消息和调度均保持原样，不能抢先安排另一轮接管。
+                await session.execute(
+                    delete(OutboxEventModel).where(
+                        OutboxEventModel.aggregate_id == task.id,
+                        OutboxEventModel.topic == "task.execute",
+                        OutboxEventModel.published_at.is_(None),
+                    )
                 )
-            )
             audit = AuditEventModel(
                 user_id=user_id,
                 task_id=task.id,
@@ -3260,24 +3280,25 @@ async def invalidate_unclaimed_actions_for_connection(
             )
             session.add(audit)
             await session.flush()
-            session.add_all(
-                (
-                    OutboxEventModel(
-                        topic="tool.reconciling",
-                        aggregate_id=task.id,
-                        deduplication_key=f"tool.reconciling:{execution.id}:revoked:{audit.id}",
-                        payload={"task_id": str(task.id), "audit_event_id": audit.id},
-                        available_at=database_now,
-                    ),
+            session.add(
+                OutboxEventModel(
+                    topic="tool.reconciling",
+                    aggregate_id=task.id,
+                    deduplication_key=f"tool.reconciling:{execution.id}:revoked:{audit.id}",
+                    payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                    available_at=database_now,
+                )
+            )
+            if not preserve_read_lease:
+                session.add(
                     OutboxEventModel(
                         topic="task.execute",
                         aggregate_id=task.id,
                         deduplication_key=f"task.execute:{task.id}:reconcile:revoked:{audit.id}",
                         payload={"task_id": str(task.id)},
                         available_at=database_now,
-                    ),
+                    )
                 )
-            )
             invalidated += 1
             continue
 
