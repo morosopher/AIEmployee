@@ -533,13 +533,15 @@ async def test_m1_step_events_preserve_legacy_step_fields(
 async def test_m2_events_replay_ordered_content_free_and_ignore_duplicate_notifications(
     sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
 ) -> None:
-    """六个 M2 持久事件和未知扩展都保留顺序；只允许封闭的无内容字段进入 SSE。"""
+    """M2 与 OAuth 恢复事件保留顺序；未知扩展也只能携带封闭的无内容字段。"""
     session_factory, user_id, build_stream = sse_store
     task_id = await _create_task(session_factory, user_id)
     names = (
         "action.submitted",
         "approval.invalidated",
         "tool.claimed",
+        "tool.oauth_refresh_required",
+        "tool.oauth_refresh_confirmed",
         "tool.reconciling",
         "tool.needs_attention",
         "tool.manually_resolved",

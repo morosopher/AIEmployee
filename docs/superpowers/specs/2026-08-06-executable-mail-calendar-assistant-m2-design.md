@@ -1090,12 +1090,24 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 - `action.submitted`
 - `approval.invalidated`
 - `tool.claimed`
+- `tool.oauth_refresh_required`
+- `tool.oauth_refresh_confirmed`
 - `tool.reconciling`
 - `tool.needs_attention`
 - `tool.manually_resolved`
 
 事件 payload 只包含 ID、状态、版本、错误码和脱敏摘要，不包含地址、主题、正文、日程标题、
 描述或完整参会人列表。旧前端遇到未知事件必须忽略并回退任务快照。
+
+资源写接口明确返回 401 且证明未应用时，`tool.oauth_refresh_required` 表示已持久化
+`retryable=false` 的拒绝事实；它不授予重试资格。只有 matching OAuth result、当前完整凭据
+snapshot 和 live lease 均核对成功，才追加 `tool.oauth_refresh_confirmed` 并授予原受控重试；
+取得全部凭据锁并读取 matching proof 后、改变状态前，必须重新采样 PostgreSQL 时间，
+复核 TaskRun 租约和当前 access expiry；锁等待跨过任一截止点时不得提交重试资格。
+未知刷新或凭据冲突则追加 `tool.needs_attention`，同时收敛任务、工具执行和本地动作。
+这些状态变化、审计与幂等 Outbox 必须在同一事务提交。两个 OAuth topic 属于 relay 的固定
+类型集合，通知只携带 `task_id` 与对应 `audit_event_id`；发布响应丢失时仅重投同一审计 ID，
+SSE 继续从 PostgreSQL 按游标重放，不携带凭据或重发供应商操作。
 
 草稿、提案和连接能力在创建任务前没有 `task_id`，因此不为它们新增第二套用户级 SSE。它们的
 创建、编辑和能力变更以 REST 响应为准，操作中心在重新聚焦或恢复连接时重新拉取列表。

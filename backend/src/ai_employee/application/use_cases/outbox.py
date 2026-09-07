@@ -46,6 +46,9 @@ class OutboxTopic(StrEnum):
     TOOL_CLAIMED = "tool.claimed"
     TOOL_SUCCEEDED = "tool.succeeded"
     TOOL_RETRYABLE_FAILED = "tool.retryable_failed"
+    # required 仅记录 401 未应用事实；confirmed 才表示原安全重试资格已持久化。
+    TOOL_OAUTH_REFRESH_REQUIRED = "tool.oauth_refresh_required"
+    TOOL_OAUTH_REFRESH_CONFIRMED = "tool.oauth_refresh_confirmed"
     TOOL_CONFIRMED_FAILED = "tool.confirmed_failed"
     TOOL_RECONCILING = "tool.reconciling"
     TOOL_NEEDS_ATTENTION = "tool.needs_attention"
@@ -213,7 +216,7 @@ class OutboxRelay:
     async def _deliver(self, claims: tuple[ClaimedOutboxEvent, ...]) -> int:
         """在 claim 事务外执行类型化 I/O，并为每条结果开启独立短确认事务。
 
-        ``task.execute`` 只进入 Taskiq；三个生命周期 topic 只进入任务事件发布端口，且
+        ``task.execute`` 只进入 Taskiq；固定生命周期 topic 只进入任务事件发布端口，且
         仅携带 ``task_id`` 与已提交 ``audit_event_id``。任何外部异常都保留未发布行，
         由同一指数退避路径安排重试。
         """

@@ -266,7 +266,13 @@ async def _seed_lifecycle_outbox(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "topic",
-    ("approval.invalidated", "approval.expired", "task.cancelled"),
+    (
+        "approval.invalidated",
+        "approval.expired",
+        "task.cancelled",
+        "tool.oauth_refresh_required",
+        "tool.oauth_refresh_confirmed",
+    ),
 )
 async def test_minute_relay_publishes_fixed_lifecycle_audit_event_then_marks_outbox(
     database_url: str,

@@ -59,7 +59,7 @@ class SqlAlchemyOutboxStore:
             claim_until: claim 提交后再次允许扫描的 UTC 瞬间。
             limit: 本事务最多锁定的行数，必须为正。
             task_id: 提交后立即投递时限定的任务；此模式只认领 ``task.execute``。
-                minute relay 省略，并认领固定的执行与三个生命周期 topic。
+                minute relay 省略，并只认领固定类型集合中的执行与生命周期 topic。
 
         Returns:
             提交后可安全进行外部 I/O 的不可变事件快照。

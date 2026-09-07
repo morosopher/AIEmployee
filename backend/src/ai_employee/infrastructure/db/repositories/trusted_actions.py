@@ -1764,7 +1764,8 @@ class SqlAlchemyTrustedActionRepository:
         未应用证明先由 persist_provider_outcome 提交；本事务按 Task→Approval→Execution
         →本地动作→Connection→access→refresh 取锁，重读 matching OAuth result 与当前完整
         credentials。仅 proof、current snapshot、live lease 均匹配时设置 retryable=true；
-        下一次真实写仍必须通过原 mark_request_started 及撤权屏障。
+        状态、审计与幂等 Outbox 同事务提交，下一次真实写仍必须通过原
+        mark_request_started 及撤权屏障。
         """
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id, approval_id=snapshot.approval_id
@@ -1847,6 +1848,17 @@ class SqlAlchemyTrustedActionRepository:
             )
             if proof is None:
                 raise _trusted_action_unavailable()
+            # 凭据行锁与 proof 读取可能等待到租约或 access 过期；即使完整 snapshot
+            # 未变，先前采样的时间也不能授权 mutation。全部读取结束后再次以数据库
+            # 时间核对两条截止线，失败让调用方回滚，禁止过期 owner 写入重试资格。
+            database_now = await self._session.scalar(select(func.clock_timestamp()))
+            if (
+                database_now is None
+                or task.lease_expires_at is None
+                or task.lease_expires_at <= database_now
+                or current_credentials.access.token_expires_at <= database_now
+            ):
+                raise _trusted_action_unavailable()
             execution.result_summary = {"kind": "confirmed_not_applied", "retryable": True}
             event_type = "tool.oauth_refresh_confirmed"
         else:
@@ -1871,22 +1883,34 @@ class SqlAlchemyTrustedActionRepository:
                 allowed_current={"executing"},
             )
             event_type = "tool.needs_attention"
+        audit = AuditEventModel(
+            user_id=snapshot.user_id,
+            task_id=snapshot.task_id,
+            event_type=event_type,
+            actor_type="worker",
+            actor_id=None,
+            event_metadata={
+                "action": snapshot.action,
+                "provider": snapshot.provider,
+                "write_attempt_count": execution.write_attempt_count,
+                "error_code": error_code,
+            },
+        )
+        self._session.add(audit)
+        await self._session.flush()
+        # OAuth 结果与只读核对都可能产生 needs_attention，幂等键必须区分两类 attempt。
+        # 此处只保存已分配的审计 ID；外部发布在提交后由 relay 执行，失败不影响业务事实。
         self._session.add(
-            AuditEventModel(
-                user_id=snapshot.user_id,
-                task_id=snapshot.task_id,
-                event_type=event_type,
-                actor_type="worker",
-                actor_id=None,
-                event_metadata={
-                    "action": snapshot.action,
-                    "provider": snapshot.provider,
-                    "write_attempt_count": execution.write_attempt_count,
-                    "error_code": error_code,
-                },
+            OutboxEventModel(
+                topic=event_type,
+                aggregate_id=task.id,
+                deduplication_key=(
+                    f"{event_type}:{execution.id}:oauth_refresh:{execution.write_attempt_count}"
+                ),
+                payload={"task_id": str(task.id), "audit_event_id": audit.id},
+                available_at=database_now,
             )
         )
-        await self._session.flush()
 
     async def converge_pre_request_reconciliation(self, *, task_id: UUID) -> bool:
         """在独立核对阶段确认撤权动作从未发出请求；保留不可变审批事实。"""

@@ -4745,6 +4745,9 @@ git commit -m "feat: expose trusted action status"
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/email.py`
 - Modify: `backend/src/ai_employee/integrations/registry.py`
 - Modify: `backend/src/ai_employee/api/deps.py`
+- Modify: `backend/src/ai_employee/application/use_cases/outbox.py`
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/outbox.py`
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/trusted_actions.py`
 - Modify: `backend/src/ai_employee/workers/sync_mail.py`
 - Modify: `backend/src/ai_employee/workers/sync_calendar.py`
 - Create: `backend/tests/unit/application/test_calendar_aad_digests.py`
@@ -4752,6 +4755,9 @@ git commit -m "feat: expose trusted action status"
 - Create: `backend/tests/unit/application/test_oauth_refresh_coordinator.py`
 - Create: `backend/tests/integration/m2/test_credential_rotation_repository.py`
 - Create: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py`
+- Modify: `backend/tests/integration/m2/test_gmail_trusted_action.py`
+- Modify: `backend/tests/integration/workers/test_outbox_dispatch.py`
+- Modify: `backend/tests/integration/api/test_task_sse.py`
 - Modify: `backend/tests/integration/google/test_gmail_sync.py`
 - Modify: `backend/tests/integration/google/test_calendar_sync.py`
 - Modify: `backend/tests/integration/microsoft/test_mail_sync.py`
@@ -4771,6 +4777,15 @@ consumption, and zero provider calls after lock loss, network unknown, CAS miss,
 `TransientProviderError`. Add fresh-session result-union reconcile tests for confirmed actual commit/rollback and
 closure/current-readiness separation, including changed=false access-only/same-plaintext re-encryption and
 changed=true A→B→A conflict.
+
+For the production resource-write 401 path, exercise the real Outbox relay and notification publisher against
+the committed audit IDs for `tool.oauth_refresh_required`, `tool.oauth_refresh_confirmed`, and unknown-result
+`tool.needs_attention`. Cover lost publish responses, recovery with the same audit ID, duplicate delivery without
+new facts or provider calls, and rollback of the resolution state/audit/Outbox transaction. Extend the existing
+SSE replay contract while retaining its content-free payload whitelist and unknown-event compatibility.
+Add two PostgreSQL lock-barrier cases: hold a credential row without modifying it until the TaskRun lease or
+access expiry passes. Confirm the resolver is blocked by that backend before the cutoff; after release it must
+leave retry eligibility unchanged, without an extra grant/write call or a new resolution audit/Outbox.
 
 Statically scan all four real API launch entries—`compose.yaml`, `compose.dev.yaml`,
 `justfiles/dev.just`, and `scripts/run-e2e-backend.sh`—and require `--no-access-log` or equivalent
@@ -4813,6 +4828,12 @@ Secret, or introduce a keyring. Make the coordinator the only existing-connectio
 and the credential-rotation repository the only writer. Preserve all detailed fence, G/G/G, digest,
 disposition/flag/equality, ACK-loss, current-readiness, lock-order, and no-replay rules in the reference section
 below.
+
+Keep both OAuth lifecycle topics in the closed relay type set. Persist each resolution audit and its idempotent
+Outbox together with the exact execution/task/local-action transition; use a distinct OAuth resolution key from
+the reconciliation-attempt key. A notification failure must never trigger another grant or resource write.
+After credential locks and matching-proof reads complete, sample PostgreSQL time again before granting retry
+eligibility and recheck both the owner lease and persisted access expiry. An expired owner cannot mutate state.
 
 Disable Uvicorn access logs in all four launch entries and keep application JSON logs on the existing stable-field
 allowlist with no raw URL/query/request target. Do not suppress the sanitized application audit needed to diagnose a
