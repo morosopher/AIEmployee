@@ -30,7 +30,8 @@ services:
       APP_BASE_URL: http://localhost:5173
       DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
       CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
-    command: ["uvicorn", "ai_employee.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # 开发环境也不允许把 OAuth code/state 的原始 query 写入 access log。
+    command: ["uvicorn", "ai_employee.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log"]
     volumes:
       - ./backend:/app/backend
 

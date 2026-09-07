@@ -102,7 +102,7 @@ async def test_initial_delta_uses_explicit_utc_lower_bound_and_final_delta_link(
         INBOX_DELTA_URL,
         params={
             "$filter": "receivedDateTime ge 2030-01-01T08:15:00Z",
-            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
+            "$select": "id,conversationId,internetMessageId,from,replyTo,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
         },
     ).respond(200, json=_fixture("mail_delta_initial.json"))
     second = respx.get(NEXT_URL).respond(200, json=_fixture("mail_delta_incremental.json"))
@@ -422,7 +422,7 @@ async def test_delta_chain_budget_fails_before_cursor_pages_are_returned(monkeyp
         params={
             "$filter": "receivedDateTime ge 2030-01-01T00:00:00Z",
             "$select": (
-                "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,"
+                "id,conversationId,internetMessageId,from,replyTo,toRecipients,ccRecipients,"
                 "bccRecipients,subject,body,receivedDateTime,sentDateTime,"
                 "lastModifiedDateTime,categories,webLink"
             ),
@@ -453,7 +453,7 @@ async def test_delta_pagination_cycle_is_rejected_without_logging_opaque_url(cap
         INBOX_DELTA_URL,
         params={
             "$filter": "receivedDateTime ge 2030-01-01T00:00:00Z",
-            "$select": "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
+            "$select": "id,conversationId,internetMessageId,from,replyTo,toRecipients,ccRecipients,bccRecipients,subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink",
         },
     ).respond(200, json=first_payload)
     cyclic = respx.get(NEXT_URL).respond(200, json=cyclic_payload)

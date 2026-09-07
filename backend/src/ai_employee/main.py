@@ -66,7 +66,7 @@ from ai_employee.infrastructure.observability.sync import refresh_sync_age_metri
 from ai_employee.infrastructure.observability.tracing import initialize_tracing
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
-from ai_employee.integrations.registry import ProviderAdapterRegistry
+from ai_employee.integrations.registry import build_trusted_action_registry
 
 
 def create_app(
@@ -150,10 +150,12 @@ def create_app(
     # APP_TEST_MODE 的契约测试可在请求前一次性注入受 HTTP mock 保护的 mapping。测试
     # 模式会忽略该 state 并固定使用内置 fake；用例构造后复制冻结，不暴露运行时注册入口。
     app.state.oauth_adapters = None
-    # Task 21–24 落地真实写适配器前，API 仅持有不含任何 preflight 的冻结 registry；
-    # SubmitMailDraftUseCase 会先执行三层写入门禁，默认关闭时不触达该 registry。测试可在
-    # 首个请求前替换整个不可变对象以注入无网络 preflight，但不存在动态注册或扩展入口。
-    app.state.trusted_action_preflight_registry = ProviderAdapterRegistry()
+    # API 与 Worker 共用固定 registry；这里只声明两家供应商的四种动作，不读取 Secret
+    # 或访问网络。提交通过三层门禁后，按认证用户与冻结连接惰性加载凭据/来源事实。
+    # 测试可在首个请求前替换整个不可变对象，没有动态注册或扩展动作入口。
+    app.state.trusted_action_preflight_registry = build_trusted_action_registry(
+        session_factory=session_factory, settings=settings
+    )
     task_store = SqlAlchemyTaskViewStore(session_factory)
     app.state.create_task_use_case = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory),

@@ -29,8 +29,10 @@ from ai_employee.application.ports.encryption import (
     EncryptionBoundaryError,
     EncryptionKeyVersionError,
 )
+from ai_employee.application.ports.oauth_refresh import OAuthRefreshError
 from ai_employee.application.ports.trusted_actions import (
     CalendarProposalSubmissionSnapshot,
+    ConnectionBoundTrustedActionRegistry,
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
     ProviderWriteOutcome,
@@ -49,6 +51,8 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionSubmissionTransactionFactory,
     TrustedActionWritePolicy,
     durable_retry_summary_is_valid,
+    oauth_rejection_is_valid,
+    oauth_retry_pending_is_valid,
     trusted_action_idempotency_key,
     trusted_execution_binding_matches,
 )
@@ -380,16 +384,37 @@ class TrustedActionExecutionUseCase:
                         provider=snapshot.provider,
                         action=snapshot.action,
                     )
+                    if isinstance(self._adapters, ConnectionBoundTrustedActionRegistry):
+                        await self._adapters.validate_trusted_action_connection(
+                            user_id=snapshot.user_id,
+                            provider=snapshot.provider,
+                            connection_id=snapshot.connection_id,
+                            action=snapshot.action,
+                        )
                 except StateConflictError as error:
                     deferred_error = error
                 else:
-                    await transaction.create_tool_claim(
-                        snapshot=snapshot,
-                        execution_id=self._id_factory(),
-                        idempotency_key=_tool_idempotency_key(snapshot),
-                        claimed_at=now,
-                    )
-                    return
+                    if isinstance(self._adapters, ConnectionBoundTrustedActionRegistry):
+                        # 本地凭据读取也是 await 边界。既有行锁保持审批/连接事实稳定，但
+                        # 等待可能跨过租约或五分钟审批截止，必须再次读取 PostgreSQL 时间。
+                        current = await transaction.lock_execution(
+                            task_id=task_id, approval_id=approval_id, operation_id=operation_id
+                        )
+                        if current is None:
+                            raise _trusted_action_unavailable()
+                        snapshot = current
+                        now = _utc_now(snapshot.database_now)
+                        if not _current_task_lease(snapshot, lease_owner=lease_owner, now=now):
+                            raise _trusted_action_unavailable()
+                        deferred_error = self._new_claim_error(snapshot, now=now)
+                    if deferred_error is None:
+                        await transaction.create_tool_claim(
+                            snapshot=snapshot,
+                            execution_id=self._id_factory(),
+                            idempotency_key=_tool_idempotency_key(snapshot),
+                            claimed_at=now,
+                        )
+                        return
 
             await transaction.fail_unclaimed_action(
                 snapshot=snapshot,
@@ -443,7 +468,10 @@ class TrustedActionExecutionUseCase:
         if status is ToolExecutionStatus.RETRYABLE_FAILED and not (
             snapshot.execution.request_started_at is not None
             and snapshot.execution.write_attempt_count > 0
-            and durable_retry_summary_is_valid(snapshot.execution.result_summary)
+            and (
+                durable_retry_summary_is_valid(snapshot.execution.result_summary)
+                or oauth_retry_pending_is_valid(snapshot.execution)
+            )
         ):
             raise _trusted_action_unavailable()
         try:
@@ -528,10 +556,35 @@ class TrustedActionExecutionUseCase:
             )
         ):
             raise TrustedActionAttemptAbandoned
+        if not from_reconciliation and status is ToolExecutionStatus.RETRYABLE_FAILED:
+            if oauth_retry_pending_is_valid(snapshot.execution):
+                await self._resolve_pending_oauth_retry(snapshot=snapshot, lease_owner=lease_owner)
+            elif snapshot.execution.error_code == f"{snapshot.provider}_reauthorization_required":
+                # 已获准重试的 401 仍先只读匹配历史 grant/current readiness，再取得新 token。
+                try:
+                    if not isinstance(self._adapters, ConnectionBoundTrustedActionRegistry):
+                        raise OAuthRefreshError("oauth_credential_state_conflict")
+                    await self._adapters.refresh_after_rejection(snapshot)
+                except OAuthRefreshError as error:
+                    async with self._transactions() as transaction:
+                        await transaction.resolve_oauth_write_retry(
+                            snapshot=snapshot,
+                            lease_owner=lease_owner,
+                            ready=None,
+                            error_code=error.error_code,
+                        )
+                    raise TrustedActionAttemptAbandoned from None
         try:
-            adapter = self._adapters.trusted_action_adapter(
-                provider=snapshot.provider,
-                action=snapshot.action,
+            adapter = (
+                await self._adapters.resolve_trusted_action_adapter(
+                    user_id=snapshot.user_id,
+                    provider=snapshot.provider,
+                    command=command,
+                )
+                if isinstance(self._adapters, ConnectionBoundTrustedActionRegistry)
+                else self._adapters.trusted_action_adapter(
+                    provider=snapshot.provider, action=snapshot.action
+                )
             )
         except StateConflictError as error:
             missing_access = error.error_code == "connection_scope_missing"
@@ -643,6 +696,12 @@ class TrustedActionExecutionUseCase:
                         provider=snapshot.provider, action=snapshot.action, outcome=observed_outcome
                     )
             completed_at = _utc_now(self._clock())
+            oauth_pending = (
+                not from_reconciliation
+                and may_retry_write
+                and isinstance(self._adapters, ConnectionBoundTrustedActionRegistry)
+                and oauth_rejection_is_valid(outcome, provider=snapshot.provider)
+            )
             async with self._transactions() as transaction:
                 await transaction.persist_provider_outcome(
                     snapshot=snapshot,
@@ -651,6 +710,7 @@ class TrustedActionExecutionUseCase:
                     from_reconciliation=from_reconciliation,
                     may_retry_write=may_retry_write,
                     lease_owner=lease_owner,
+                    oauth_refresh_pending=oauth_pending,
                 )
         except BaseException:
             # 只有本调用已赢得 request-start 或正持有恢复租约时才走到这里；provider、
@@ -660,6 +720,14 @@ class TrustedActionExecutionUseCase:
                 lease_owner=lease_owner,
             )
             raise
+        if oauth_pending:
+            async with self._transactions() as transaction:
+                pending = await transaction.load_dispatch(
+                    task_id=task_id, approval_id=approval_id, operation_id=operation_id
+                )
+            if pending is None:
+                raise TrustedActionAttemptAbandoned
+            await self._resolve_pending_oauth_retry(snapshot=pending, lease_owner=lease_owner)
         if outcome.kind is ProviderWriteOutcomeKind.UNKNOWN:
             # Repository 已保留 request-start 与 UNKNOWN 摘要并释放租约；专属 TaskStep
             # 将该控制流映射为 Runner no-finish，禁止通用成功/失败终态覆盖未决事实。
@@ -676,6 +744,42 @@ class TrustedActionExecutionUseCase:
                 message="provider confirmed that the trusted action was not applied",
                 retry_after=outcome.retry_after_seconds,
             )
+
+    async def _resolve_pending_oauth_retry(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+    ) -> None:
+        """先恢复稳定 grant，再原子核对 proof/current CAS；不在这里发送第二次真实写。
+
+        retryable=false 的已持久 401 不能通过 request-start。仅 matching confirmed/replacement
+        和 current-ready 均成立时，专用仓储边界才把它改为既有安全重试状态。未知则保留
+        原写未应用事实、把任务收敛人工关注；任何终态都不能在此复活。
+        """
+        try:
+            if not isinstance(self._adapters, ConnectionBoundTrustedActionRegistry):
+                raise OAuthRefreshError("oauth_credential_state_conflict")
+            ready = await self._adapters.refresh_after_rejection(snapshot)
+        except OAuthRefreshError as error:
+            async with self._transactions() as transaction:
+                await transaction.resolve_oauth_write_retry(
+                    snapshot=snapshot,
+                    lease_owner=lease_owner,
+                    ready=None,
+                    error_code=error.error_code,
+                )
+            raise TrustedActionAttemptAbandoned from None
+        async with self._transactions() as transaction:
+            await transaction.resolve_oauth_write_retry(
+                snapshot=snapshot, lease_owner=lease_owner, ready=ready
+            )
+        # 原 DurableTaskRunner 仍唯一负责 retry_scheduled/Outbox 与预算；第二次调用必须
+        # 重新取得 live lease、再次检查三层写开关与撤权屏障，然后经过 request-start CAS。
+        raise TransientProviderError(
+            error_code="oauth_write_retry_ready",
+            message="OAuth credentials are ready for a proved unapplied write",
+        )
 
     async def reconcile(
         self,
@@ -1025,7 +1129,7 @@ class SubmitMailDraftUseCase:
                 operation_id=operation_id,
                 now=checked_now,
             )
-            submission = self._freeze(
+            submission = await self._freeze(
                 user_id=user_id,
                 task_id=task_id,
                 step_id=step_id,
@@ -1052,7 +1156,7 @@ class SubmitMailDraftUseCase:
             self._id_factory(),
         )
 
-    def _freeze(
+    async def _freeze(
         self,
         *,
         user_id: UUID,
@@ -1074,9 +1178,12 @@ class SubmitMailDraftUseCase:
         command = parse_trusted_command(canonical)
         action = _command_text(canonical, "action")
         schema_version = _command_text(canonical, "schema_version")
-        preflight = self._preflights.trusted_action_preflight(
-            provider=provider,
-            action=action,
+        preflight = (
+            await self._preflights.resolve_trusted_action_adapter(
+                user_id=user_id, provider=provider, command=command
+            )
+            if isinstance(self._preflights, ConnectionBoundTrustedActionRegistry)
+            else self._preflights.trusted_action_preflight(provider=provider, action=action)
         )
         if preflight.provider != provider:
             raise _provider_action_unavailable()
@@ -1186,7 +1293,7 @@ class SubmitCalendarProposalUseCase:
                 and snapshot.notification_policy is NotificationPolicy.NONE
                 else TrustedActionRisk.HIGH
             )
-            submission = self._submission_support._freeze(
+            submission = await self._submission_support._freeze(
                 user_id=user_id,
                 task_id=task_id,
                 step_id=step_id,

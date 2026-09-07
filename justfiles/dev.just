@@ -23,7 +23,8 @@ web:
 
 [group('development')]
 api:
-    uv run --project backend uvicorn ai_employee.main:app --reload --host 0.0.0.0 --port 8000
+    # callback query 含一次性授权值，所有运行模式只保留固定字段的应用日志。
+    uv run --project backend uvicorn ai_employee.main:app --reload --host 0.0.0.0 --port 8000 --no-access-log
 
 [group('development')]
 worker:

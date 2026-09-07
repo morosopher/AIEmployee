@@ -1,10 +1,11 @@
-"""提供供应商中立邮件线程、消息、分 scope 游标与凭据旋转事务仓储。"""
+"""提供供应商中立邮件线程、消息、分 scope 游标与只读凭据投影仓储。"""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from uuid import UUID
 
 from sqlalchemy import and_, case, cast, delete, func, or_, select, text
@@ -12,6 +13,7 @@ from sqlalchemy.dialects.postgresql import JSONPATH, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
+from ai_employee.application.calendar_aad_digests import CredentialSnapshot
 from ai_employee.application.ports.encryption import EncryptedValue as ApplicationEncryptedValue
 from ai_employee.application.ports.mail import (
     MailConnectionState,
@@ -34,6 +36,7 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories.credential_rotation import credential_snapshot
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 
@@ -45,6 +48,21 @@ class MailConnectionCredentials:
     provider: str
     access_token: EncryptedValue
     refresh_token: EncryptedValue | None
+    access_snapshot: CredentialSnapshot
+    account_email: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class MailReplySourceHeaders:
+    """只读复制精确来源绑定与规范邮件头；不携带正文、ORM 或供应商 SDK 类型。
+
+    headers 保留字段是否存在，调用方必须区分缺失来源事实与已知空值。
+    """
+
+    connection_id: UUID
+    thread_id: str
+    message_id: str
+    headers: Mapping[str, str] = field(repr=False)
 
 
 class _MailMessageConflictTarget(StrEnum):
@@ -275,7 +293,12 @@ class SqlAlchemyMailSyncRepository:
         )
 
     async def get_credentials(
-        self, *, user_id: UUID, connection_id: UUID
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        expected_provider: str | None = None,
+        required_capability: str | None = None,
     ) -> MailConnectionCredentials | None:
         """读取当前连接 provider 与密文 token，不让明文或 ORM 行离开基础设施边界。"""
         connection = await self._session.scalar(
@@ -285,8 +308,21 @@ class SqlAlchemyMailSyncRepository:
                 OAuthConnectionModel.status == "connected",
             )
         )
-        if connection is None:
+        if connection is None or (
+            expected_provider is not None and connection.provider != expected_provider
+        ):
             return None
+        if required_capability is not None:
+            permitted = await self._session.scalar(
+                select(ConnectionCapabilityModel.id).where(
+                    ConnectionCapabilityModel.user_id == user_id,
+                    ConnectionCapabilityModel.connection_id == connection_id,
+                    ConnectionCapabilityModel.capability == required_capability,
+                    ConnectionCapabilityModel.status == "enabled",
+                )
+            )
+            if permitted is None:
+                return None
         credentials = tuple(
             (
                 await self._session.scalars(
@@ -307,12 +343,81 @@ class SqlAlchemyMailSyncRepository:
         refresh = by_kind.get("refresh_token")
         return MailConnectionCredentials(
             provider=connection.provider,
+            account_email=connection.account_email,
+            access_snapshot=credential_snapshot(access),
             access_token=EncryptedValue(access.ciphertext, access.nonce, access.key_version),
             refresh_token=(
                 EncryptedValue(refresh.ciphertext, refresh.nonce, refresh.key_version)
                 if refresh is not None
                 else None
             ),
+        )
+
+    async def get_reply_source_headers(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        provider: str,
+        source_thread_id: str,
+        source_message_id: str,
+    ) -> MailReplySourceHeaders | None:
+        """按用户、连接、供应商线程和消息四重绑定读取已同步的不可变头快照。
+
+        不按 UUID 外观猜测 provider ID，也不退回最新邮件。只读能力撤销、线程错配、
+        会话投影不一致或持久头结构损坏统一返回无事实；集成层再做供应商语义计算。
+        """
+        row = await self._session.scalar(
+            select(EmailMessageModel)
+            .join(
+                EmailThreadModel,
+                and_(
+                    EmailThreadModel.id == EmailMessageModel.thread_id,
+                    EmailThreadModel.connection_id == EmailMessageModel.connection_id,
+                    EmailThreadModel.user_id == EmailMessageModel.user_id,
+                ),
+            )
+            .join(
+                OAuthConnectionModel,
+                and_(
+                    OAuthConnectionModel.id == EmailMessageModel.connection_id,
+                    OAuthConnectionModel.user_id == EmailMessageModel.user_id,
+                ),
+            )
+            .join(
+                ConnectionCapabilityModel,
+                and_(
+                    ConnectionCapabilityModel.connection_id == OAuthConnectionModel.id,
+                    ConnectionCapabilityModel.user_id == OAuthConnectionModel.user_id,
+                ),
+            )
+            .where(
+                EmailMessageModel.user_id == user_id,
+                EmailMessageModel.connection_id == connection_id,
+                EmailMessageModel.provider_message_id == source_message_id,
+                EmailMessageModel.provider_conversation_id == source_thread_id,
+                EmailThreadModel.user_id == user_id,
+                EmailThreadModel.provider_thread_id == source_thread_id,
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.provider == provider,
+                OAuthConnectionModel.status == "connected",
+                ConnectionCapabilityModel.capability == "mail.read",
+                ConnectionCapabilityModel.status == "enabled",
+            )
+        )
+        if (
+            row is None
+            or type(row.headers) is not dict
+            or any(
+                type(key) is not str or type(value) is not str for key, value in row.headers.items()
+            )
+        ):
+            return None
+        return MailReplySourceHeaders(
+            connection_id=UUID(str(row.connection_id)),
+            thread_id=source_thread_id,
+            message_id=source_message_id,
+            headers=MappingProxyType(dict(row.headers)),
         )
 
     async def get_user_timezone(self, *, user_id: UUID) -> str | None:
@@ -1170,32 +1275,6 @@ class SqlAlchemyMailSyncRepository:
             )
         )
 
-    async def rotate_access_token(
-        self,
-        *,
-        user_id: UUID,
-        connection_id: UUID,
-        access_token: EncryptedValue,
-        expires_at: datetime,
-        refresh_token: EncryptedValue | None,
-    ) -> None:
-        """原子写入新 access 密文和过期时间，仅在轮换时覆盖 refresh credential。"""
-        await self._upsert_credential(
-            user_id=user_id,
-            connection_id=connection_id,
-            kind="access_token",
-            encrypted=access_token,
-            expires_at=expires_at,
-        )
-        if refresh_token is not None:
-            await self._upsert_credential(
-                user_id=user_id,
-                connection_id=connection_id,
-                kind="refresh_token",
-                encrypted=refresh_token,
-                expires_at=None,
-            )
-
     async def mark_expired(self, *, user_id: UUID, connection_id: UUID) -> None:
         """把撤销授权持久化为可见的降级状态，阻止后续 Worker 继续读取供应商。
 
@@ -1245,37 +1324,6 @@ class SqlAlchemyMailSyncRepository:
         if capability is not None:
             capability.status = "action_required"
             capability.last_error_code = error_code
-
-    async def _upsert_credential(
-        self,
-        *,
-        user_id: UUID,
-        connection_id: UUID,
-        kind: str,
-        encrypted: EncryptedValue,
-        expires_at: datetime | None,
-    ) -> None:
-        """按连接和凭据种类覆写唯一行，不创建多份可用 token。"""
-        statement = insert(EncryptedCredentialModel).values(
-            user_id=user_id,
-            connection_id=connection_id,
-            credential_kind=kind,
-            ciphertext=encrypted.ciphertext,
-            nonce=encrypted.nonce,
-            key_version=encrypted.key_version,
-            token_expires_at=expires_at,
-        )
-        await self._session.execute(
-            statement.on_conflict_do_update(
-                constraint="uq_encrypted_credentials_connection_kind",
-                set_={
-                    "ciphertext": statement.excluded.ciphertext,
-                    "nonce": statement.excluded.nonce,
-                    "key_version": statement.excluded.key_version,
-                    "token_expires_at": statement.excluded.token_expires_at,
-                },
-            )
-        )
 
     @staticmethod
     def _participants(message: MailMessage) -> list[dict[str, str]]:

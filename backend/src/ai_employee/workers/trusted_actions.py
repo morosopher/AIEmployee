@@ -28,8 +28,10 @@ from ai_employee.infrastructure.db.repositories.trusted_actions import (
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
-from ai_employee.infrastructure.security.encryption import AeadCipher
-from ai_employee.integrations.registry import ProviderAdapterRegistry
+from ai_employee.integrations.registry import (
+    build_oauth_security_services,
+    build_trusted_action_registry,
+)
 
 
 class TrustedActionTaskStep:
@@ -190,22 +192,20 @@ def build_worker_trusted_action_registry(
     """构造 Worker 进程使用的固定可信动作 registry 组合根。
 
     Args:
-        session_factory: 当前消息拥有的数据库工厂；未来 provider adapter 可通过受控的
-            credential/session 端口使用它，但不得把连接或令牌放入 Taskiq 载荷。
+        session_factory: 当前消息拥有的数据库工厂；registry 按显式用户和冻结连接在短
+            session 内读取凭据及来源事实，不得把连接或令牌放入 Taskiq 载荷。
         settings: 当前进程已验证配置；真实写入开关仍由应用层 request-start 再次检查。
 
     Returns:
-        当前已组装的、供应商无关的可信动作 registry。Task 21--24 的真实 Gmail、
-        Google Calendar、Microsoft mail/calendar adapter 应在本函数这一固定组合根接入。
-        在这些 adapter 尚未组装时返回空 registry，使 Worker 保持 fail-closed。
+        两家供应商四种固定动作的共享惰性 registry。构造和 slot 检查不加载 Secret
+        或访问供应商；实际执行仍须通过调用方门禁和 connection-bound 凭据解析。
 
     Notes:
         这是显式的静态组合钩子，不提供运行时注册或队列级 adapter 注入。调用方按消息
         生命周期构造它，并在同一消息 finally 中释放数据库工厂；registry 本身不得持有
         未关闭的长生命周期资源。
     """
-    del session_factory, settings
-    return ProviderAdapterRegistry()
+    return build_trusted_action_registry(session_factory=session_factory, settings=settings)
 
 
 def build_trusted_action_task_step(
@@ -226,8 +226,8 @@ def build_trusted_action_task_step(
         approval_store: 与分类查询共享的审批 checkpoint 端口。
         resume: 内容无关的审批唤醒值；授权决定仍由 Graph 重读 PostgreSQL。
         max_transient_retries: 与外层 DurableTaskRunner 相同的耐久临时重试上限。
-        adapters: 测试或后续供应商任务显式注入的固定真实动作注册表。省略时使用
-            空注册表，使尚未组装真实 adapter 的进程在 claim 前安全失败。
+        adapters: 测试显式注入的固定动作注册表。省略时使用 API/Worker 共享的固定
+            惰性 registry；按原用户和冻结连接解析凭据，缺少凭据时在 claim 前安全失败。
 
     Returns:
         复用调用方连接池、只在受控内存解密命令的可信动作步骤。
@@ -240,8 +240,17 @@ def build_trusted_action_task_step(
         构造发生在 Runner 已取得租约后的节点解析阶段，因此密钥读取或组合失败仍由
         当前 owner 的持久错误边界处理；本函数不会创建第二个 SQLAlchemy Engine。
     """
-    registry = adapters if adapters is not None else ProviderAdapterRegistry()
-    command_cipher = ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
+    registry = (
+        adapters
+        if adapters is not None
+        else build_worker_trusted_action_registry(
+            session_factory=session_factory, settings=settings
+        )
+    )
+    security = build_oauth_security_services(
+        session_factory=session_factory, master_key_file=settings.app_master_key_file
+    )
+    command_cipher = ActionPayloadCipher(security.cipher)
     workflow = TrustedActionExecutionUseCase(
         transactions=SqlAlchemyTrustedActionRepositoryFactory(session_factory, command_cipher),
         adapters=registry,

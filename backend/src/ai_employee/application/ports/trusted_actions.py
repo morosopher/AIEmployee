@@ -11,11 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from hmac import compare_digest
-from typing import Final, Protocol, TypeGuard
-from uuid import UUID
+from typing import Final, Protocol, TypeGuard, runtime_checkable
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_employee.application.commands import TrustedCommand
 from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.oauth_refresh import OAuthRefreshReady
 from ai_employee.domain.actions import (
     CalendarProposalStatus,
     MailDraftStatus,
@@ -315,6 +316,42 @@ class ExecutionReference:
     provider_request_id: str | None
     correlation_id: str | None
     reconciliation_attempt_count: int = 0
+    error_code: str | None = None
+
+
+def oauth_rejection_is_valid(outcome: ProviderWriteOutcome, *, provider: str) -> bool:
+    """仅精确资源 401 的未应用结果可进入 OAuth 恢复；未知/限流/通用错误均不提升。"""
+    return (
+        outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+        and not outcome.retryable
+        and outcome.retry_after_seconds is None
+        and outcome.provider_resource_id is None
+        and provider in {"google", "microsoft"}
+        and outcome.error_code == f"{provider}_reauthorization_required"
+    )
+
+
+def oauth_retry_pending_is_valid(execution: ExecutionReference) -> bool:
+    """读取严格持久 401 证明；retryable=false 尚不能通过原 request-start 授权。"""
+    return (
+        execution.status is ToolExecutionStatus.RETRYABLE_FAILED
+        and execution.request_started_at is not None
+        and execution.write_attempt_count > 0
+        and execution.result_summary == {"kind": "confirmed_not_applied", "retryable": False}
+        and execution.provider in {"google", "microsoft"}
+        and execution.error_code == f"{execution.provider}_reauthorization_required"
+        and execution.provider_resource_id is None
+    )
+
+
+def oauth_write_refresh_attempt_id(execution: ExecutionReference) -> UUID:
+    """把一次已持久写尝试绑定到同一个 automatic refresh attempt，崩溃重入不另建 grant。"""
+    if execution.write_attempt_count <= 0:
+        raise ValueError("OAuth write recovery requires a started attempt")
+    return uuid5(
+        NAMESPACE_URL,
+        f"AIEMPLOYEE/oauth/write-refresh/v1/{execution.execution_id}/{execution.write_attempt_count}",
+    )
 
 
 class TrustedActionAdapter(TrustedActionPreflight, Protocol):
@@ -556,6 +593,35 @@ class TrustedActionDispatchSnapshot:
     execution: ExecutionReference
 
 
+@runtime_checkable
+class ConnectionBoundTrustedActionRegistry(Protocol):
+    """生产固定 registry 的显式用户解析端口；测试静态 adapter 无需持有凭据工厂。"""
+
+    async def validate_trusted_action_connection(
+        self,
+        *,
+        user_id: UUID,
+        provider: str,
+        connection_id: UUID,
+        action: str,
+    ) -> None:
+        """首次 claim 前只核对本地连接/凭据事实，不读取 Secret、命令明文或供应商。"""
+
+    async def resolve_trusted_action_adapter(
+        self,
+        *,
+        user_id: UUID,
+        provider: str,
+        command: TrustedCommand,
+    ) -> TrustedActionAdapter:
+        """在短只读边界加载精确连接凭据；返回实例不拥有长生命周期 session/client。"""
+
+    async def refresh_after_rejection(
+        self, snapshot: TrustedActionDispatchSnapshot
+    ) -> OAuthRefreshReady:
+        """仅针对持久未应用的精确写尝试执行/恢复唯一 coordinator attempt。"""
+
+
 class TrustedActionSubmissionTransaction(Protocol):
     """协调一次提交所需的短事务端口。"""
 
@@ -680,8 +746,19 @@ class TrustedActionSubmissionTransaction(Protocol):
         from_reconciliation: bool,
         may_retry_write: bool,
         lease_owner: str,
+        oauth_refresh_pending: bool = False,
     ) -> None:
         """按本轮持久重试预算原子保存结果、任务及本地对象状态。"""
+
+    async def resolve_oauth_write_retry(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+        ready: OAuthRefreshReady | None,
+        error_code: str | None = None,
+    ) -> None:
+        """只在 matching refresh-result/current CAS 后授予重试；未知时原子收敛人工关注。"""
 
     async def abandon_started_attempt(
         self,

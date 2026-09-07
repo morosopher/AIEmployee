@@ -138,7 +138,8 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec uvicorn ai_employee.main:app --host 0.0.0.0 --port 8000"]
+    # OAuth callback 查询含一次性凭据；原始 Uvicorn access log 必须关闭，保留应用脱敏日志。
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec uvicorn ai_employee.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://localhost:8000/api/v1/system/readiness >/dev/null"]
       interval: 15s

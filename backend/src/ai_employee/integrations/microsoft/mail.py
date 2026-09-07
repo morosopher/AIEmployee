@@ -12,6 +12,7 @@ import html
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email.headerregistry import Address
 from types import MappingProxyType
 from urllib.parse import quote, urlsplit
 
@@ -47,7 +48,7 @@ MICROSOFT_MAIL_MAX_ID_LENGTH = 512
 MICROSOFT_MAIL_MAX_PERSISTED_ID_LENGTH = 255
 
 _MAIL_SELECT = (
-    "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,"
+    "id,conversationId,internetMessageId,from,replyTo,toRecipients,ccRecipients,bccRecipients,"
     "subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink"
 )
 _MESSAGE_SELECT = _MAIL_SELECT
@@ -521,9 +522,14 @@ class MicrosoftMailAdapter(MailReader):
             **{
                 key: ", ".join(cls._format_address(address) for address in addresses)
                 for key, addresses in recipients_by_kind.items()
-                if addresses
             },
         }
+        # 已知空数组与旧 Delta/cached 行缺失字段的含义不同。显式空值证明 Graph 会回退
+        # From；缺失 Reply-To 不能授权直接回复，必须等下一次只读同步取得完整来源事实。
+        if "replyTo" in item:
+            headers["reply-to"] = ", ".join(
+                cls._format_address(address) for address in cls._addresses(item["replyTo"])
+            )
         if internet_id:
             headers["message-id"] = internet_id
         return MailMessage(
@@ -690,10 +696,10 @@ class MicrosoftMailAdapter(MailReader):
 
     @staticmethod
     def _format_address(address: Mapping[str, str]) -> str:
-        """生成仅用于规范 reply header 的安全地址文本。"""
+        """用标准 MIME 编码保留显示名边界，避免名字内逗号被误解析为另一收件人。"""
         name = address.get("name", "")
         email_address = address.get("email", "")
-        return f"{name} <{email_address}>" if name else email_address
+        return str(Address(display_name=name, addr_spec=email_address))
 
     @staticmethod
     def _optional_string(payload: Mapping[str, object], key: str) -> str | None:

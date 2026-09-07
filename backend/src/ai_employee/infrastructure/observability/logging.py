@@ -3,6 +3,7 @@
 import hashlib
 import json
 import logging
+import re
 import traceback
 from collections.abc import Callable
 from threading import RLock
@@ -10,6 +11,22 @@ from typing import Final
 from weakref import WeakKeyDictionary
 
 from ai_employee.infrastructure.observability.redaction import redact_value
+
+# 固定诊断字段只能携带短标识符，不能把字典或 URL/request-target 放入合法键绕过 allowlist。
+_DIAGNOSTIC_VALUE = re.compile(r"[A-Za-z0-9_.:-]{1,128}\Z")
+_DIAGNOSTIC_FIELDS: Final[tuple[str, ...]] = (
+    "trace_id",
+    "task_id",
+    "step_id",
+    "provider",
+    "error_code",
+)
+
+
+def _stable_diagnostic_value(value: object) -> str | None:
+    """仅保留标识符标量；query、路径、任意对象及嵌套 URL 字段统一省略为 NULL。"""
+    return value if type(value) is str and _DIAGNOSTIC_VALUE.fullmatch(value) else None
+
 
 # HTTPX/HTTPCore 的请求日志模板由第三方版本控制，可能把完整 URL query、Authorization
 # header 或异常对象拼入 message。记录创建时统一收窄为固定事件，后续无论记录传播到哪个
@@ -431,12 +448,16 @@ class _JsonFormatter(logging.Formatter):
             "level": record.levelname.lower(),
             # 标准 logging 的 message 可能是异常插值或任意调用方字符串；使用 logger 名称
             # 作为稳定事件，而非读取 ``getMessage`` 或 exception 文本。
-            "event": record.name if record.name.startswith("ai_employee.") else "application.log",
-            "trace_id": getattr(record, "trace_id", None),
-            "task_id": getattr(record, "task_id", None),
-            "step_id": getattr(record, "step_id", None),
-            "provider": getattr(record, "provider", None),
-            "error_code": getattr(record, "error_code", None),
+            "event": (
+                record.name
+                if _stable_diagnostic_value(record.name) is not None
+                and record.name.startswith("ai_employee.")
+                else "application.log"
+            ),
+            **{
+                field: _stable_diagnostic_value(getattr(record, field, None))
+                for field in _DIAGNOSTIC_FIELDS
+            },
         }
         # 撤销维护仅公开供应商级整数计数，不能让任意 extra 字符串绕过日志最小披露边界。
         unresolved_count = getattr(record, "unresolved_count", None)

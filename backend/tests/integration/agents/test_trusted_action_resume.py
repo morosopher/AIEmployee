@@ -1194,11 +1194,11 @@ async def test_rejected_database_decision_overrides_approved_resume_value(
 
 
 @pytest.mark.asyncio
-async def test_default_worker_registry_fails_before_claim_when_no_write_adapter_is_composed(
+async def test_default_worker_registry_rejects_missing_credentials_before_claim(
     database_url: str,
     tmp_path: object,
 ) -> None:
-    """真实 builder 默认空 registry 时必须在 claim 前安全失败且不解密后调用供应商。"""
+    """真实 builder 已组装固定动作，但缺少连接凭据仍须在 claim 前失败且零供应商请求。"""
     from pathlib import Path
 
     assert isinstance(tmp_path, Path)
@@ -1229,7 +1229,7 @@ async def test_default_worker_registry_fails_before_claim_when_no_write_adapter_
         resume: str | None,
         adapters: ProviderAdapterRegistry | None,
     ) -> DurableTaskRunner:
-        """让测试显式选择提交用 fake adapter 或生产默认空 registry。"""
+        """让测试显式选择提交用 fake adapter 或生产默认的固定惰性 registry。"""
         return DurableTaskRunner(
             store=SqlAlchemyTrustedActionTaskExecutionStore(session_factory),
             clock=clock,
@@ -1299,7 +1299,7 @@ async def test_default_worker_registry_fails_before_claim_when_no_write_adapter_
                 .where(ToolExecutionModel.task_id == submission.task_id)
             )
         assert task is not None and task.status == TaskStatus.FAILED.value
-        assert task.error_code == "provider_action_unavailable"
+        assert task.error_code == "connection_scope_missing"
         assert invalidated is not None and invalidated.status == ApprovalStatus.INVALIDATED.value
         assert draft is not None and draft.status == MailDraftStatus.EDITING.value
         assert execution_count == 0

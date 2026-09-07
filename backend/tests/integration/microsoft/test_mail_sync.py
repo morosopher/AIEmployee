@@ -23,6 +23,7 @@ import pytest
 import respx
 from sqlalchemy import func, select
 
+from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
 from ai_employee.application.ports.mail import MailMessage, MailRemoval, MailScope, MailSyncPage
 from ai_employee.application.use_cases.sync_mail import (
     MailConnectionNotFoundError,
@@ -45,6 +46,9 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+    SqlAlchemyOAuthRefreshCoordinator,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
@@ -60,7 +64,7 @@ INBOX_DELTA_URL = f"{GRAPH_BASE_URL}/me/mailFolders/synthetic-folder-inbox/messa
 INBOX_NEXT_URL = f"{INBOX_DELTA_URL}?$skiptoken=synthetic-next-1"
 INBOX_DELTA_LINK = f"{INBOX_DELTA_URL}?$deltatoken=synthetic-delta-2"
 MAIL_SELECT = (
-    "id,conversationId,internetMessageId,from,toRecipients,ccRecipients,bccRecipients,"
+    "id,conversationId,internetMessageId,from,replyTo,toRecipients,ccRecipients,bccRecipients,"
     "subject,body,receivedDateTime,sentDateTime,lastModifiedDateTime,categories,webLink"
 )
 INITIAL_PARAMS = {
@@ -1912,6 +1916,11 @@ async def test_worker_refreshes_microsoft_token_once_and_persists_rotation(
         step = MailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"r" * 32, key_version=cipher.key_version),
+            ),
             oauth=object(),
             microsoft_oauth=MicrosoftOAuthAdapter(
                 client_id="synthetic-client",
@@ -1955,3 +1964,26 @@ async def test_worker_refreshes_microsoft_token_once_and_persists_rotation(
         )
     finally:
         await sessions.dispose()
+
+
+def test_microsoft_reply_to_presence_is_preserved_as_local_source_fact() -> None:
+    """生产 normalizer 区分缺失与已知空 Reply-To；只允许合法数组成为后续回复证明。"""
+    MicrosoftMailAdapter = _mail_module().MicrosoftMailAdapter
+    message = deepcopy(_fixture("mail_delta_initial.json")["value"][0])
+    message["replyTo"] = []
+    known_empty = MicrosoftMailAdapter._normalize_message(
+        message, scope_key="synthetic-folder-inbox"
+    )
+    assert "reply-to" in known_empty.normalized_reply_headers
+    assert known_empty.normalized_reply_headers["reply-to"] == ""
+    message["replyTo"] = [
+        {"emailAddress": {"name": "Synthetic Reply", "address": "reply@example.test"}}
+    ]
+    known = MicrosoftMailAdapter._normalize_message(message, scope_key="synthetic-folder-inbox")
+    assert "reply@example.test" in known.normalized_reply_headers["reply-to"]
+    del message["replyTo"]
+    missing = MicrosoftMailAdapter._normalize_message(message, scope_key="synthetic-folder-inbox")
+    assert "reply-to" not in missing.normalized_reply_headers
+    message["replyTo"] = None
+    with pytest.raises((TypeError, ValueError)):
+        MicrosoftMailAdapter._normalize_message(message, scope_key="synthetic-folder-inbox")

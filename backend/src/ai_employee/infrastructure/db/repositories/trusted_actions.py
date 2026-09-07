@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.commands import canonical_command_json, trusted_command_hash
 from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.ports.oauth_refresh import OAuthRefreshReady, OAuthRefreshRequest
 from ai_employee.application.ports.trusted_actions import (
     CalendarProposalSubmissionSnapshot,
     ExecutionReference,
@@ -29,6 +30,9 @@ from ai_employee.application.ports.trusted_actions import (
     TrustedActionRequestStartAuthorization,
     TrustedActionSubmission,
     durable_retry_summary_is_valid,
+    oauth_rejection_is_valid,
+    oauth_retry_pending_is_valid,
+    oauth_write_refresh_attempt_id,
     trusted_execution_binding_matches,
 )
 from ai_employee.application.use_cases.calendar_proposals import CalendarProposalContent
@@ -82,7 +86,12 @@ from ai_employee.infrastructure.db.models.tasks import (
 from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
+from ai_employee.infrastructure.db.repositories.credential_rotation import load_refresh_snapshot
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+    find_refresh_result,
+    read_refresh_events,
+)
 from ai_employee.infrastructure.db.repositories.task_execution import (
     SqlAlchemyTaskExecutionStore,
 )
@@ -1367,6 +1376,7 @@ class SqlAlchemyTrustedActionRepository:
         from_reconciliation: bool,
         may_retry_write: bool,
         lease_owner: str,
+        oauth_refresh_pending: bool = False,
     ) -> None:
         """以锁后数据库时间、live lease 与完整冻结绑定 CAS 提交 provider 结果。
 
@@ -1377,6 +1387,12 @@ class SqlAlchemyTrustedActionRepository:
         撤销或目录 ``can_write`` 变化不会抹掉真实结果，因为本边界只核对目标身份，不重跑
         request-start 写授权策略。
         """
+        if oauth_refresh_pending and (
+            from_reconciliation
+            or not may_retry_write
+            or not oauth_rejection_is_valid(outcome, provider=snapshot.provider)
+        ):
+            raise _trusted_action_unavailable()
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
@@ -1652,6 +1668,11 @@ class SqlAlchemyTrustedActionRepository:
                 available_at=database_now,
             )
             event_type = outbox_topic = "tool.succeeded"
+        elif oauth_refresh_pending:
+            # 此状态保留严格 retryable=false 的未应用证明，原 request-start 会拒绝它。
+            # 只有 resolve_oauth_write_retry 的 matching grant/current CAS 才能授予重试。
+            execution.status = ToolExecutionStatus.RETRYABLE_FAILED.value
+            event_type = outbox_topic = "tool.oauth_refresh_required"
         elif (
             outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
             and outcome.retryable
@@ -1729,6 +1750,143 @@ class SqlAlchemyTrustedActionRepository:
                 available_at=database_now,
             )
         )
+
+    async def resolve_oauth_write_retry(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+        lease_owner: str,
+        ready: OAuthRefreshReady | None,
+        error_code: str | None = None,
+    ) -> None:
+        """在唯一原请求绑定上完成 401 恢复 CAS，不改变任何既有终态。
+
+        未应用证明先由 persist_provider_outcome 提交；本事务按 Task→Approval→Execution
+        →本地动作→Connection→access→refresh 取锁，重读 matching OAuth result 与当前完整
+        credentials。仅 proof、current snapshot、live lease 均匹配时设置 retryable=true；
+        下一次真实写仍必须通过原 mark_request_started 及撤权屏障。
+        """
+        task, approval = await self._locked_task_approval(
+            task_id=snapshot.task_id, approval_id=snapshot.approval_id
+        )
+        execution = await self._session.scalar(
+            select(ToolExecutionModel)
+            .where(
+                ToolExecutionModel.id == snapshot.execution.execution_id,
+                ToolExecutionModel.task_id == snapshot.task_id,
+            )
+            .with_for_update()
+        )
+        if task is None or approval is None or execution is None:
+            raise _trusted_action_unavailable()
+        current = _execution_reference(execution=execution, approval_id=approval.id)
+        if (
+            current != snapshot.execution
+            or current.status is not ToolExecutionStatus.RETRYABLE_FAILED
+            or not (
+                oauth_retry_pending_is_valid(current)
+                or durable_retry_summary_is_valid(current.result_summary)
+            )
+            or current.error_code != f"{snapshot.provider}_reauthorization_required"
+            or task.user_id != snapshot.user_id
+            or task.status != TaskStatus.RUNNING.value
+            or task.lease_owner != lease_owner
+            or approval.status != ApprovalStatus.APPROVED.value
+            or approval.version != snapshot.approval_version
+            or approval.step_id != snapshot.step_id
+            or approval.action != snapshot.action
+            or approval.schema_version != snapshot.schema_version
+            or not compare_digest(approval.payload_hash, snapshot.payload_hash)
+            or not _task_operation_matches(task, snapshot.operation_id)
+        ):
+            raise _trusted_action_unavailable()
+        binding = await self._lock_action_binding(task=task, approval=approval)
+        if (
+            binding is None
+            or binding[:2] != (snapshot.connection_id, snapshot.calendar_id)
+            or binding[2] != "executing"
+        ):
+            raise _trusted_action_unavailable()
+        database_now = await self._session.scalar(select(func.clock_timestamp()))
+        if (
+            database_now is None
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= database_now
+        ):
+            raise _trusted_action_unavailable()
+        if ready is not None:
+            if snapshot.connection_id is None or ready.attempt_id != oauth_write_refresh_attempt_id(
+                current
+            ):
+                raise _trusted_action_unavailable()
+            request = OAuthRefreshRequest(
+                user_id=snapshot.user_id,
+                connection_id=snapshot.connection_id,
+                capability=ConnectionCapability.MAIL_SEND
+                if snapshot.action == "mail.send"
+                else ConnectionCapability.CALENDAR_WRITE,
+            )
+            current_credentials, _, _ = await load_refresh_snapshot(
+                self._session, request, lock=True
+            )
+            if (
+                current_credentials != ready.snapshot
+                or current_credentials.access.token_expires_at is None
+                or current_credentials.access.token_expires_at <= database_now
+            ):
+                raise _trusted_action_unavailable()
+            records = await read_refresh_events(
+                self._session, user_id=snapshot.user_id, connection_id=snapshot.connection_id
+            )
+            proof = find_refresh_result(
+                records,
+                user_id=snapshot.user_id,
+                connection_id=snapshot.connection_id,
+                attempt_id=ready.attempt_id,
+                key_version=ready.snapshot.refresh.key_version,
+            )
+            if proof is None:
+                raise _trusted_action_unavailable()
+            execution.result_summary = {"kind": "confirmed_not_applied", "retryable": True}
+            event_type = "tool.oauth_refresh_confirmed"
+        else:
+            if error_code not in {
+                "oauth_refresh_result_unknown",
+                "oauth_credential_state_conflict",
+                "oauth_refresh_locked",
+            }:
+                raise _trusted_action_unavailable()
+            # refresh unknown 不抹掉原写未应用事实；它只撤销自动重入资格并进入人工关注。
+            execution.status = ToolExecutionStatus.NEEDS_ATTENTION.value
+            execution.error_code = error_code
+            task.status = TaskStatus.NEEDS_ATTENTION.value
+            task.error_code = error_code
+            task.finished_at = None
+            _clear_task_scheduling(task)
+            await self._set_local_action_status(
+                task=task,
+                approval=approval,
+                mail_status=MailDraftStatus.NEEDS_ATTENTION,
+                calendar_status=CalendarProposalStatus.NEEDS_ATTENTION,
+                allowed_current={"executing"},
+            )
+            event_type = "tool.needs_attention"
+        self._session.add(
+            AuditEventModel(
+                user_id=snapshot.user_id,
+                task_id=snapshot.task_id,
+                event_type=event_type,
+                actor_type="worker",
+                actor_id=None,
+                event_metadata={
+                    "action": snapshot.action,
+                    "provider": snapshot.provider,
+                    "write_attempt_count": execution.write_attempt_count,
+                    "error_code": error_code,
+                },
+            )
+        )
+        await self._session.flush()
 
     async def converge_pre_request_reconciliation(self, *, task_id: UUID) -> bool:
         """在独立核对阶段确认撤权动作从未发出请求；保留不可变审批事实。"""
@@ -3884,6 +4042,7 @@ def _execution_reference(
         provider_request_id=execution.provider_request_id,
         correlation_id=execution.correlation_id,
         reconciliation_attempt_count=execution.reconciliation_attempt_count,
+        error_code=execution.error_code,
     )
 
 

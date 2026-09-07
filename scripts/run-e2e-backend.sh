@@ -64,7 +64,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 # E2E 保持与生产相同的单子进程模型，避免默认两个子进程争抢内部指标端口。
 uv run --project backend taskiq worker --workers 1 --ack-type when_executed ai_employee.infrastructure.queue.broker:broker & worker_pid=$!
-uv run --project backend uvicorn ai_employee.main:app --host 127.0.0.1 --port 8000 & api_pid=$!
+# E2E 与生产共用 OAuth 日志边界，不把浏览器 callback query 写入原始 access log。
+uv run --project backend uvicorn ai_employee.main:app --host 127.0.0.1 --port 8000 --no-access-log & api_pid=$!
 set +e
 wait "$api_pid"
 api_status=$?

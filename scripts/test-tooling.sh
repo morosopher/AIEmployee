@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 四个真实 API 启动命令均必须关闭原始 request-target 日志；注释中的 flag 不算证据。
+for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just scripts/run-e2e-backend.sh; do
+  if ! grep -Eq -- '^[[:space:]]*(command:|uv run).*uvicorn.*--no-access-log' "${api_entry}"; then
+    printf 'OAuth access-log boundary missing: %s\n' "${api_entry}" >&2
+    exit 1
+  fi
+done
+
 # 独立指标 listener 只允许每个 Worker 容器/进程组拥有一个 Taskiq 子进程；开发入口必须
 # 与生产及 E2E 保持同一约束，横向并发由多个容器提供。
 grep -Fq 'taskiq worker --workers 1 --ack-type when_executed' justfiles/dev.just

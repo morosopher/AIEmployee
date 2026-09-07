@@ -2,6 +2,14 @@
 # 验证生产编排、数据库权限和可观测性入口的最小部署契约，不连接外部账号或生产资源。
 set -euo pipefail
 
+# 四个真实 API 启动命令均必须关闭原始 request-target 日志；注释中的 flag 不算证据。
+for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just scripts/run-e2e-backend.sh; do
+  if ! grep -Eq -- '^[[:space:]]*(command:|uv run).*uvicorn.*--no-access-log' "${api_entry}"; then
+    printf 'OAuth access-log boundary missing: %s\n' "${api_entry}" >&2
+    exit 1
+  fi
+done
+
 [[ "${APP_IMAGE_TAG:-}" != latest ]] || { printf '%s\n' 'APP_IMAGE_TAG must not be latest' >&2; exit 1; }
 
 # 验收仅解析配置，不拉取或运行镜像；提供合成不可变标签和本地域名以通过生产必填变量校验。
@@ -104,6 +112,11 @@ render_overridden_compose() (
 # 同时展开生产、开发覆盖层和可选可观测性 profile；解析失败表示配置合并或依赖契约无效。
 production_config="$(render_default_compose -f compose.yaml)"
 development_config="$(render_default_compose -f compose.yaml -f compose.dev.yaml)"
+# Compose 会裁掉未启用 profile 的服务及其专属 Secret；完整 file-secret 契约需显式启用
+# 所有 profile，默认服务/开关断言仍使用上面的默认渲染，避免改变生产启动语义。
+development_all_profiles_config="$(
+  render_default_compose -f compose.yaml -f compose.dev.yaml --profile '*'
+)"
 overridden_production_config="$(render_overridden_compose -f compose.yaml)"
 overridden_development_config="$(
   render_overridden_compose -f compose.yaml -f compose.dev.yaml
@@ -221,7 +234,9 @@ assert_development_file_secret() {
   local secret_name="$1"
   local expected_file="$2"
   local secret_config
-  secret_config="$(rendered_secret_config "${secret_name}" "${development_config}" | tr -d "\"'")"
+  secret_config="$(
+    rendered_secret_config "${secret_name}" "${development_all_profiles_config}" | tr -d "\"'"
+  )"
   assert_file_secret_contract development "${secret_name}" "${expected_file}" "${secret_config}"
 }
 

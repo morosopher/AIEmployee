@@ -2,12 +2,9 @@
 
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 from uuid import UUID
-
-import httpx
 
 from ai_employee.application.ports.calendar import (
     CalendarDirectoryPage,
@@ -16,16 +13,22 @@ from ai_employee.application.ports.calendar import (
     CalendarSyncPage,
 )
 from ai_employee.application.ports.oauth import OAuthProviderAdapter
+from ai_employee.application.ports.oauth_refresh import (
+    OAuthRefreshCoordinator,
+    OAuthRefreshProvider,
+    OAuthRefreshRequest,
+)
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarConnectionNotFoundError,
     CalendarSyncStoreFactory,
     SyncCalendarUseCase,
 )
+from ai_employee.application.use_cases.sync_mail import CoordinatedAccessTokenRefresh
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import (
     PermanentProviderError,
-    TransientProviderError,
     UserActionRequiredError,
 )
 from ai_employee.infrastructure.db.repositories.calendar import (
@@ -42,12 +45,13 @@ from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.google.calendar import GoogleCalendarAdapter
 from ai_employee.integrations.google.fake import FakeCalendarReader, FakeGoogleOAuthClient
-from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.integrations.google.oauth import GoogleOAuthAdapter, GoogleOAuthClient
 from ai_employee.integrations.microsoft.calendar import MicrosoftCalendarAdapter
 from ai_employee.integrations.microsoft.fake import FakeMicrosoftOAuthAdapter
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 from ai_employee.integrations.registry import (
     ProviderAdapterRegistry,
+    build_oauth_security_services,
 )
 
 
@@ -179,19 +183,6 @@ class _FakeMicrosoftCalendarReader:
         return value
 
 
-class _RefreshedTokens(Protocol):
-    """收窄 Google/Microsoft token response 的共同安全字段。"""
-
-    @property
-    def access_token(self) -> str: ...
-
-    @property
-    def refresh_token(self) -> str | None: ...
-
-    @property
-    def expires_in(self) -> int: ...
-
-
 class CalendarSyncTaskStep:
     """在 DurableTaskRunner 租约内读取凭据并执行 Calendar 同步。"""
 
@@ -202,9 +193,10 @@ class CalendarSyncTaskStep:
         *,
         session_factory: ManagedAsyncSessionMaker,
         cipher: AeadCipher,
-        oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
+        oauth: OAuthRefreshProvider | GoogleOAuthClient | FakeGoogleOAuthClient,
         reader: CalendarReader | FakeCalendarReader | None = None,
         metrics: Metrics | None = None,
+        refresh_coordinator: OAuthRefreshCoordinator | None = None,
         microsoft_oauth: OAuthProviderAdapter | None = None,
         microsoft_reader: CalendarReader | _FakeMicrosoftCalendarReader | None = None,
     ) -> None:
@@ -212,6 +204,7 @@ class CalendarSyncTaskStep:
         self._credential_stores = SqlAlchemyMailSyncRepositoryFactory(session_factory)
         self._stores = SqlAlchemyCalendarSyncRepositoryFactory(session_factory)
         self._cipher, self._oauth = cipher, oauth
+        self._refresh_coordinator = refresh_coordinator
         self._reader = reader
         self._metrics = metrics
         self._microsoft_oauth = microsoft_oauth
@@ -234,133 +227,31 @@ class CalendarSyncTaskStep:
         access = self._cipher.decrypt(
             credentials.access_token, self._credential_aad(user_id, connection_id, "access_token")
         ).decode()
-        refresh = (
-            self._cipher.decrypt(
-                credentials.refresh_token,
-                self._credential_aad(user_id, connection_id, "refresh_token"),
-            ).decode()
-            if credentials.refresh_token
-            else None
+        # 每个 CalendarView 的 401 都绑定当时 access 快照；不能在闭包缓存旧 refresh。
+        provider = (
+            self._microsoft_oauth
+            if credentials.provider == "microsoft"
+            else (
+                None
+                if isinstance(self._oauth, (GoogleOAuthClient, FakeGoogleOAuthClient))
+                else self._oauth
+            )
         )
-        current_microsoft_refresh_token = refresh
-
-        async def refresh_access_token() -> str:
-            """严格对齐 Gmail：一次 refresh 后 AEAD 轮换，按状态分类失败。"""
-            if refresh is None:
-                raise CalendarConnectionNotFoundError
-            try:
-                refreshed = await self._oauth.refresh_token(refresh)
-            except httpx.HTTPStatusError as error:
-                if error.response.status_code in {400, 401}:
-                    await mark_expired()
-                    raise UserActionRequiredError(
-                        error_code="google_reauthorization_required",
-                        message="Google Calendar authorization requires user action",
-                    ) from error
-                if error.response.status_code == 429 or error.response.status_code >= 500:
-                    raise TransientProviderError(
-                        error_code="google_rate_limited"
-                        if error.response.status_code == 429
-                        else "google_service_unavailable",
-                        message="Google token refresh is temporarily unavailable",
-                    ) from error
-                raise UserActionRequiredError(
-                    error_code="google_reauthorization_required",
-                    message="Google Calendar authorization requires user action",
-                ) from error
-            except httpx.RequestError as error:
-                raise TransientProviderError(
-                    error_code="google_request_failed",
-                    message="Google token refresh request failed",
-                ) from error
-            async with self._credential_stores() as store:
-                await store.rotate_access_token(
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    access_token=self._cipher.encrypt(
-                        refreshed.access_token.encode(),
-                        self._credential_aad(user_id, connection_id, "access_token"),
-                    ),
-                    expires_at=datetime.now(UTC) + timedelta(seconds=refreshed.expires_in),
-                    refresh_token=self._cipher.encrypt(
-                        refreshed.refresh_token.encode(),
-                        self._credential_aad(user_id, connection_id, "refresh_token"),
-                    )
-                    if refreshed.refresh_token
-                    else None,
-                )
-            return refreshed.access_token
+        refresh_access_token = CoordinatedAccessTokenRefresh(
+            coordinator=self._refresh_coordinator,
+            provider=provider,
+            request=OAuthRefreshRequest(
+                user_id=user_id,
+                connection_id=connection_id,
+                capability=ConnectionCapability.CALENDAR_READ,
+                expected_access=credentials.access_snapshot,
+            ),
+        )
 
         async def mark_expired() -> None:
             """第二次资源 401 或 refresh 授权失效均独立提交 expired。"""
             async with self._credential_stores() as store:
                 await store.mark_expired(user_id=user_id, connection_id=connection_id)
-
-        async def refresh_microsoft_access_token() -> str:
-            """使用进程内最新 Microsoft refresh token，并原子轮换 AEAD 密文。
-
-            同一次目录任务可能在不同 CalendarView 资源链分别遇到 401。Graph 首次刷新若
-            轮换了 refresh token，后续资源必须使用新值；若响应省略轮换值，则数据库密文
-            与闭包中的当前值都继续保留，不能退回任务启动时解密出的旧 token。
-            """
-            nonlocal current_microsoft_refresh_token
-            if current_microsoft_refresh_token is None or self._microsoft_oauth is None:
-                raise UserActionRequiredError(
-                    error_code="microsoft_reauthorization_required",
-                    message="Microsoft authorization requires user action",
-                )
-            try:
-                refreshed: _RefreshedTokens = await self._microsoft_oauth.refresh(
-                    current_microsoft_refresh_token
-                )
-            except TransientProviderError:
-                raise
-            except PermanentProviderError as error:
-                if error.error_code != "microsoft_oauth_rejected":
-                    raise
-                await mark_expired()
-                raise UserActionRequiredError(
-                    error_code="microsoft_reauthorization_required",
-                    message="Microsoft authorization requires user action",
-                ) from error
-            if (
-                not isinstance(refreshed.access_token, str)
-                or refreshed.access_token == ""
-                or type(refreshed.expires_in) is not int
-                or refreshed.expires_in <= 0
-                or (
-                    refreshed.refresh_token is not None
-                    and (
-                        not isinstance(refreshed.refresh_token, str)
-                        or refreshed.refresh_token == ""
-                    )
-                )
-            ):
-                raise PermanentProviderError(
-                    error_code="calendar_token_refresh_invalid",
-                    message="Calendar token refresh response is invalid",
-                )
-            async with self._credential_stores() as store:
-                await store.rotate_access_token(
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    access_token=self._cipher.encrypt(
-                        refreshed.access_token.encode("utf-8"),
-                        self._credential_aad(user_id, connection_id, "access_token"),
-                    ),
-                    expires_at=datetime.now(UTC) + timedelta(seconds=refreshed.expires_in),
-                    refresh_token=(
-                        self._cipher.encrypt(
-                            refreshed.refresh_token.encode("utf-8"),
-                            self._credential_aad(user_id, connection_id, "refresh_token"),
-                        )
-                        if refreshed.refresh_token is not None
-                        else None
-                    ),
-                )
-            if refreshed.refresh_token is not None:
-                current_microsoft_refresh_token = refreshed.refresh_token
-            return refreshed.access_token
 
         async def mark_calendar_permission_required(error_code: str) -> None:
             """只降级 calendar.read，避免 Graph 403 误断开整个连接。"""
@@ -384,9 +275,7 @@ class CalendarSyncTaskStep:
             ) or MicrosoftCalendarAdapter(
                 access_token=access,
                 user_timezone=timezone,
-                refresh_access_token=(
-                    refresh_microsoft_access_token if refresh is not None else None
-                ),
+                refresh_access_token=(refresh_access_token),
                 mark_expired=mark_expired,
             )
             registry = ProviderAdapterRegistry(
@@ -425,7 +314,7 @@ class CalendarSyncTaskStep:
             or GoogleCalendarAdapter(
                 access_token=access,
                 user_timezone=timezone,
-                refresh_access_token=refresh_access_token if refresh else None,
+                refresh_access_token=refresh_access_token,
                 mark_expired=mark_expired,
             ),
         )
@@ -469,7 +358,10 @@ def build_calendar_sync_task_step(
     *, session_factory: ManagedAsyncSessionMaker, settings: Settings, metrics: Metrics | None = None
 ) -> CalendarSyncTaskStep:
     """从受控配置构造日历任务步骤，不把 secret 放入队列输入。"""
-    cipher = AeadCipher.from_file(settings.app_master_key_file)
+    security = build_oauth_security_services(
+        session_factory=session_factory, master_key_file=settings.app_master_key_file
+    )
+    cipher = security.cipher
     if settings.app_test_mode:
         fixture = (
             Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "calendar_initial.json"
@@ -480,6 +372,7 @@ def build_calendar_sync_task_step(
         return CalendarSyncTaskStep(
             session_factory=session_factory,
             cipher=cipher,
+            refresh_coordinator=security.coordinator,
             oauth=FakeGoogleOAuthClient(),
             reader=FakeCalendarReader(
                 fixture,
@@ -498,7 +391,7 @@ def build_calendar_sync_task_step(
                 microsoft_fixture_dir / "calendar_view_delta_initial.json",
             ),
         )
-    oauth = GoogleOAuthClient(
+    oauth = GoogleOAuthAdapter(
         settings.google_client_id,
         settings.read_secret_file(settings.google_client_secret_file).get_secret_value(),
         settings.google_redirect_uri,
@@ -516,6 +409,7 @@ def build_calendar_sync_task_step(
     return CalendarSyncTaskStep(
         session_factory=session_factory,
         cipher=cipher,
+        refresh_coordinator=security.coordinator,
         oauth=oauth,
         metrics=metrics,
         microsoft_oauth=microsoft_oauth,

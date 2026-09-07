@@ -57,6 +57,35 @@ def test_health_returns_process_status() -> None:
     assert response.json() == {"status": "ok", "service": "api"}
 
 
+def test_api_and_worker_register_fixed_actions_without_loading_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """API 默认审批入口与 Worker readiness 都有固定 slot，启动不能读取 Secret 或联网。"""
+    from ai_employee.domain.errors import StateConflictError
+    from ai_employee.integrations import registry as registry_module
+    from ai_employee.workers.trusted_actions import build_worker_trusted_action_registry
+
+    def forbid_secret_access(*args: object, **kwargs: object) -> None:
+        """若构造 registry 错误地提前取凭据，直接报告安全边界错误。"""
+        del args, kwargs
+        pytest.fail("registry construction must not load credentials")
+
+    monkeypatch.setattr(registry_module, "build_oauth_security_services", forbid_secret_access)
+    app = create_app()
+    api_registry = app.state.trusted_action_preflight_registry
+    worker_registry = build_worker_trusted_action_registry(
+        session_factory=app.state.auth_session_factory,
+        settings=Settings(app_master_key_file=tmp_path / "absent-master"),
+    )
+    for registry in (api_registry, worker_registry):
+        for provider in ("google", "microsoft"):
+            for action in ("mail.send", "calendar.create", "calendar.update", "calendar.restore"):
+                assert registry.trusted_action_preflight(provider=provider, action=action).provider == provider
+                assert registry.trusted_action_adapter(provider=provider, action=action).provider == provider
+        with pytest.raises(StateConflictError):
+            registry.trusted_action_adapter(provider="google", action="calendar.delete")
+
+
 def test_alerts_requires_authentication() -> None:
     """逾期告警是用户范围派生视图，匿名请求必须得到稳定的认证失败。"""
     client = TestClient(create_app())

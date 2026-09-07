@@ -649,10 +649,14 @@ def get_connections_use_case(request: Request):
     没有运行时注册或替换入口。真实 client secret 仍只在非测试模式从 Secret 文件读取。
     """
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
-    from ai_employee.infrastructure.security.encryption import AeadCipher
 
     settings = get_auth_settings(request)
-    cipher = AeadCipher.from_file(settings.app_master_key_file)
+    from ai_employee.integrations.registry import build_oauth_security_services
+
+    cipher = build_oauth_security_services(
+        session_factory=request.app.state.auth_session_factory,
+        master_key_file=settings.app_master_key_file,
+    ).cipher
     injected = getattr(request.app.state, "oauth_adapters", None)
     if settings.app_test_mode:
         # APP_TEST_MODE 是优先于 app.state 注入的不可绕过隔离边界。这里不尝试通过

@@ -1,21 +1,27 @@
 """把 durable ``sync_mail`` 与 legacy ``sync_gmail`` 组合为受控邮件读取任务。"""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import cast
 from uuid import UUID
-
-import httpx
 
 from ai_employee.application.ports.mail import MailReader
 from ai_employee.application.ports.oauth import OAuthProviderAdapter
+from ai_employee.application.ports.oauth_refresh import (
+    OAuthRefreshCoordinator,
+    OAuthRefreshError,
+    OAuthRefreshProvider,
+    OAuthRefreshRequest,
+)
 from ai_employee.application.use_cases.sync_mail import (
+    CoordinatedAccessTokenRefresh,
     MailConnectionNotFoundError,
     MailSyncStoreFactory,
     SyncMailUseCase,
 )
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.config import Settings
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import (
     PermanentProviderError,
     TransientProviderError,
@@ -31,33 +37,18 @@ from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.infrastructure.testing.scenarios import consume_test_scenario
 from ai_employee.integrations.google.fake import FakeGmailReader, FakeGoogleOAuthClient
 from ai_employee.integrations.google.gmail import GmailAdapter
-from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.integrations.google.oauth import GoogleOAuthAdapter, GoogleOAuthClient
 from ai_employee.integrations.microsoft.fake import (
     FakeMicrosoftMailReader,
     FakeMicrosoftOAuthAdapter,
 )
 from ai_employee.integrations.microsoft.mail import MicrosoftMailAdapter
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
-from ai_employee.integrations.registry import LegacyGoogleMailReader, ProviderAdapterRegistry
-
-
-class _RefreshedTokens(Protocol):
-    """收窄 Google 旧 token 值对象与 provider-neutral OAuthTokenSet 的共同字段。"""
-
-    @property
-    def access_token(self) -> str:
-        """返回已在供应商边界验证的短期 access token。"""
-        ...
-
-    @property
-    def refresh_token(self) -> str | None:
-        """返回可选轮换 refresh token；缺失表示保留既有密文。"""
-        ...
-
-    @property
-    def expires_in(self) -> int:
-        """返回已验证的正整数有效期秒数。"""
-        ...
+from ai_employee.integrations.registry import (
+    LegacyGoogleMailReader,
+    ProviderAdapterRegistry,
+    build_oauth_security_services,
+)
 
 
 class MailSyncTaskStep:
@@ -70,9 +61,10 @@ class MailSyncTaskStep:
         *,
         session_factory: ManagedAsyncSessionMaker,
         cipher: AeadCipher,
-        oauth: GoogleOAuthClient | FakeGoogleOAuthClient,
+        oauth: OAuthRefreshProvider | GoogleOAuthClient | FakeGoogleOAuthClient,
         reader: LegacyGoogleMailReader | FakeGmailReader | None = None,
         metrics: Metrics | None = None,
+        refresh_coordinator: OAuthRefreshCoordinator | None = None,
         microsoft_oauth: OAuthProviderAdapter | None = None,
         microsoft_reader: MailReader | None = None,
     ) -> None:
@@ -85,6 +77,7 @@ class MailSyncTaskStep:
         self._stores = SqlAlchemyMailSyncRepositoryFactory(session_factory)
         self._cipher = cipher
         self._oauth = oauth
+        self._refresh_coordinator = refresh_coordinator
         self._reader = reader
         self._metrics = metrics
         self._microsoft_oauth = microsoft_oauth
@@ -124,13 +117,25 @@ class MailSyncTaskStep:
             credentials.access_token,
             self._credential_aad(user_id, connection_id, "access_token"),
         ).decode("utf-8")
-        refresh_token = (
-            self._cipher.decrypt(
-                credentials.refresh_token,
-                self._credential_aad(user_id, connection_id, "refresh_token"),
-            ).decode("utf-8")
-            if credentials.refresh_token is not None
-            else None
+        # 资源 adapter 只接收 access；refresh plaintext 仅在 coordinator 的受控内存解密。
+        provider = (
+            self._microsoft_oauth
+            if credentials.provider == "microsoft"
+            else (
+                None
+                if isinstance(self._oauth, (GoogleOAuthClient, FakeGoogleOAuthClient))
+                else self._oauth
+            )
+        )
+        refresh_access_token = CoordinatedAccessTokenRefresh(
+            coordinator=self._refresh_coordinator,
+            provider=provider,
+            request=OAuthRefreshRequest(
+                user_id=user_id,
+                connection_id=connection_id,
+                capability=ConnectionCapability.MAIL_READ,
+                expected_access=credentials.access_snapshot,
+            ),
         )
 
         async def mark_expired() -> None:
@@ -147,98 +152,6 @@ class MailSyncTaskStep:
                     error_code=error_code,
                 )
 
-        async def rotate_tokens(refreshed: _RefreshedTokens) -> str:
-            """保存任一供应商刷新结果，并在缺失 refresh token 时保留旧密文。"""
-            access = refreshed.access_token
-            expires_in = refreshed.expires_in
-            rotated_refresh = refreshed.refresh_token
-            if not isinstance(access, str) or type(expires_in) is not int:
-                raise PermanentProviderError(
-                    error_code="mail_token_refresh_invalid",
-                    message="Mail token refresh response is invalid",
-                )
-            if rotated_refresh is not None and not isinstance(rotated_refresh, str):
-                raise PermanentProviderError(
-                    error_code="mail_token_refresh_invalid",
-                    message="Mail token refresh response is invalid",
-                )
-            encrypted_access = self._cipher.encrypt(
-                access.encode("utf-8"),
-                self._credential_aad(user_id, connection_id, "access_token"),
-            )
-            encrypted_refresh = (
-                self._cipher.encrypt(
-                    rotated_refresh.encode("utf-8"),
-                    self._credential_aad(user_id, connection_id, "refresh_token"),
-                )
-                if rotated_refresh is not None
-                else None
-            )
-            async with self._stores() as store:
-                await store.rotate_access_token(
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    access_token=encrypted_access,
-                    expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
-                    refresh_token=encrypted_refresh,
-                )
-            return access
-
-        async def refresh_google_access_token() -> str:
-            """刷新 Google token 并原子轮换密文，按状态分类失败。"""
-            if refresh_token is None:
-                raise MailConnectionNotFoundError
-            try:
-                refreshed = await self._oauth.refresh_token(refresh_token)
-            except httpx.HTTPStatusError as error:
-                status_code = error.response.status_code
-                if status_code in {400, 401}:
-                    await mark_expired()
-                    raise UserActionRequiredError(
-                        error_code="google_reauthorization_required",
-                        message="Google Gmail authorization requires user action",
-                    ) from error
-                if status_code == 429 or status_code >= 500:
-                    raise TransientProviderError(
-                        error_code=(
-                            "google_rate_limited"
-                            if status_code == 429
-                            else "google_service_unavailable"
-                        ),
-                        message="Google token refresh is temporarily unavailable",
-                        retry_after=self._retry_after(error.response),
-                    ) from error
-                raise UserActionRequiredError(
-                    error_code="google_reauthorization_required",
-                    message="Google Gmail authorization requires user action",
-                ) from error
-            except httpx.RequestError as error:
-                raise TransientProviderError(
-                    error_code="google_request_failed",
-                    message="Google token refresh request failed",
-                ) from error
-            return await rotate_tokens(refreshed)
-
-        async def refresh_microsoft_access_token() -> str:
-            """刷新 Microsoft delegated token，并把无新 refresh token 解释为保留旧密文。"""
-            if refresh_token is None or self._microsoft_oauth is None:
-                raise UserActionRequiredError(
-                    error_code="microsoft_reauthorization_required",
-                    message="Microsoft authorization requires user action",
-                )
-            try:
-                refreshed = await self._microsoft_oauth.refresh(refresh_token)
-            except TransientProviderError:
-                raise
-            except PermanentProviderError as error:
-                if error.error_code != "microsoft_oauth_rejected":
-                    raise
-                raise UserActionRequiredError(
-                    error_code="microsoft_reauthorization_required",
-                    message="Microsoft authorization requires user action",
-                ) from error
-            return await rotate_tokens(refreshed)
-
         if credentials.provider == "microsoft":
             if self._microsoft_oauth is None:
                 raise PermanentProviderError(
@@ -247,9 +160,7 @@ class MailSyncTaskStep:
                 )
             microsoft_reader = self._microsoft_reader or MicrosoftMailAdapter(
                 access_token=access_token,
-                refresh_access_token=(
-                    refresh_microsoft_access_token if refresh_token is not None else None
-                ),
+                refresh_access_token=(refresh_access_token),
             )
             registry = ProviderAdapterRegistry(microsoft_mail=microsoft_reader)
             sync_case = SyncMailUseCase(
@@ -339,9 +250,7 @@ class MailSyncTaskStep:
             else self._reader
         ) or GmailAdapter(
             access_token=access_token,
-            refresh_access_token=(
-                refresh_google_access_token if refresh_token is not None else None
-            ),
+            refresh_access_token=(refresh_access_token),
             mark_expired=mark_expired,
         )
         registry = ProviderAdapterRegistry(google_mail=google_reader)
@@ -360,6 +269,9 @@ class MailSyncTaskStep:
                     scope_key=scope_key,
                 ),
             )
+        except OAuthRefreshError:
+            # unknown fence 保持 connected，后续只能由显式授权恢复，不能伪装为撤销。
+            raise
         except UserActionRequiredError:
             # Fake 与真实适配器都经同一撤销事实入口，避免测试路径绕过持久化语义。
             await mark_expired()
@@ -370,15 +282,6 @@ class MailSyncTaskStep:
         """保持与 OAuth callback 一致的 token AAD，阻止跨连接密文替换。"""
         return f"{user_id}:{connection_id}:{kind}".encode("ascii")
 
-    @staticmethod
-    def _retry_after(response: httpx.Response) -> int | None:
-        """解析 OAuth 响应的非负 Retry-After 秒数，畸形值返回 ``None``。"""
-        try:
-            retry_after = int(response.headers.get("Retry-After", ""))
-        except ValueError:
-            return None
-        return retry_after if retry_after >= 0 else None
-
 
 def build_mail_sync_task_step(
     *,
@@ -387,7 +290,10 @@ def build_mail_sync_task_step(
     metrics: Metrics | None = None,
 ) -> MailSyncTaskStep:
     """从进程配置构造邮件 durable task step，不向任务载荷泄露 Secret。"""
-    cipher = AeadCipher.from_file(settings.app_master_key_file)
+    security = build_oauth_security_services(
+        session_factory=session_factory, master_key_file=settings.app_master_key_file
+    )
+    cipher = security.cipher
     if settings.app_test_mode:
         fixture = (
             Path(__file__).parents[3] / "tests" / "contract" / "fixtures" / "gmail_initial.json"
@@ -395,6 +301,7 @@ def build_mail_sync_task_step(
         return MailSyncTaskStep(
             session_factory=session_factory,
             cipher=cipher,
+            refresh_coordinator=security.coordinator,
             oauth=FakeGoogleOAuthClient(),
             reader=FakeGmailReader(
                 fixture,
@@ -412,7 +319,7 @@ def build_mail_sync_task_step(
             microsoft_reader=FakeMicrosoftMailReader(),
         )
     client_secret = settings.read_secret_file(settings.google_client_secret_file).get_secret_value()
-    oauth = GoogleOAuthClient(
+    oauth = GoogleOAuthAdapter(
         settings.google_client_id,
         client_secret,
         settings.google_redirect_uri,
@@ -430,6 +337,7 @@ def build_mail_sync_task_step(
     return MailSyncTaskStep(
         session_factory=session_factory,
         cipher=cipher,
+        refresh_coordinator=security.coordinator,
         oauth=oauth,
         metrics=metrics,
         microsoft_oauth=microsoft_oauth,

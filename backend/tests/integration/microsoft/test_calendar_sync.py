@@ -16,6 +16,7 @@ from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 
 from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
+from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
 from ai_employee.application.ports.calendar import (
     CalendarDirectoryPage,
     CalendarEvent,
@@ -23,7 +24,7 @@ from ai_employee.application.ports.calendar import (
     ProviderCalendar,
 )
 from ai_employee.application.ports.encryption import EncryptedValue
-from ai_employee.application.ports.oauth import OAuthTokenSet
+from ai_employee.application.ports.oauth import OAuthProvider, OAuthTokenSet
 from ai_employee.application.use_cases.sync_calendar import SyncCalendarUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
 from ai_employee.domain.errors import (
@@ -49,11 +50,15 @@ from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepository,
     SqlAlchemyEnabledSyncScopeReader,
 )
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+    SqlAlchemyOAuthRefreshCoordinator,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.observability.metrics import create_metrics
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.integrations.google.fake import FakeGoogleOAuthClient
 from ai_employee.integrations.microsoft.calendar import MicrosoftCalendarAdapter
+from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.sync_calendar import CalendarSyncTaskStep
 
@@ -397,6 +402,13 @@ class _SequenceMicrosoftOAuth:
 
     responses: list[OAuthTokenSet | Exception]
     refresh_calls: list[str] = field(default_factory=list)
+    provider = OAuthProvider.MICROSOFT
+
+    def scopes_for(self, capabilities):
+        """复用固定 Microsoft scope 映射，响应必须覆盖全部既有授权事实。"""
+        return MicrosoftOAuthAdapter(
+            "synthetic-client", "synthetic-secret", "https://app.example.test/callback"
+        ).scopes_for(capabilities)
 
     async def refresh(self, refresh_token: str) -> OAuthTokenSet:
         """消费一个预设结果；异常用于验证授权拒绝和暂态分类。"""
@@ -1211,13 +1223,13 @@ async def test_worker_uses_rotated_refresh_token_for_later_401_and_preserves_on_
                 access_token="refreshed-access-1",
                 refresh_token="rotated-refresh-1",
                 expires_in=3600,
-                granted_scopes=frozenset({"Calendars.Read"}),
+                granted_scopes=frozenset({"Calendars.Read", "Mail.Read", "offline_access"}),
             ),
             OAuthTokenSet(
                 access_token="refreshed-access-2",
                 refresh_token=None,
                 expires_in=3600,
-                granted_scopes=frozenset({"Calendars.Read"}),
+                granted_scopes=frozenset({"Calendars.Read", "Mail.Read", "offline_access"}),
             ),
         ]
     )
@@ -1247,6 +1259,11 @@ async def test_worker_uses_rotated_refresh_token_for_later_401_and_preserves_on_
     await CalendarSyncTaskStep(
         session_factory=sessions,
         cipher=cipher,
+        refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+            session_factory=sessions,
+            cipher=cipher,
+            identity=OAuthRefreshIdentity(b"w" * 32, key_version=cipher.key_version),
+        ),
         oauth=FakeGoogleOAuthClient(),
         microsoft_oauth=oauth,  # type: ignore[arg-type]
         metrics=metrics,
@@ -1294,7 +1311,7 @@ async def test_worker_uses_rotated_refresh_token_for_later_401_and_preserves_on_
 async def test_worker_refresh_rejection_marks_connection_expired(
     database_url: str,
 ) -> None:
-    """OAuth refresh 明确拒绝时必须停止 Graph 链并持久化连接级重新授权状态。"""
+    """OAuth grant 拒绝保留未知 fence，停止 Graph 链且保留 connected 供显式恢复。"""
     sessions, cipher, user_id, connection_id = await _seed_microsoft_worker_connection(database_url)
     oauth = _SequenceMicrosoftOAuth(
         responses=[
@@ -1310,6 +1327,11 @@ async def test_worker_refresh_rejection_marks_connection_expired(
         await CalendarSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"w" * 32, key_version=cipher.key_version),
+            ),
             oauth=FakeGoogleOAuthClient(),
             microsoft_oauth=oauth,  # type: ignore[arg-type]
             metrics=create_metrics(),
@@ -1317,11 +1339,11 @@ async def test_worker_refresh_rejection_marks_connection_expired(
 
     async with sessions() as session:
         connection = await session.get(OAuthConnectionModel, connection_id)
-    assert raised.value.error_code == "microsoft_reauthorization_required"
+    assert raised.value.error_code == "oauth_refresh_result_unknown"
     assert oauth.refresh_calls == ["initial-refresh"]
     assert directory.call_count == 1
-    assert connection is not None and connection.status == "degraded"
-    assert connection.last_error_code == "oauth_revoked"
+    assert connection is not None and connection.status == "connected"
+    assert connection.last_error_code is None
     await sessions.dispose()
 
 
@@ -1338,7 +1360,7 @@ async def test_worker_second_resource_401_marks_connection_expired(
                 access_token="refreshed-access",
                 refresh_token=None,
                 expires_in=3600,
-                granted_scopes=frozenset({"Calendars.Read"}),
+                granted_scopes=frozenset({"Calendars.Read", "Mail.Read", "offline_access"}),
             )
         ]
     )
@@ -1353,6 +1375,11 @@ async def test_worker_second_resource_401_marks_connection_expired(
         await CalendarSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"w" * 32, key_version=cipher.key_version),
+            ),
             oauth=FakeGoogleOAuthClient(),
             microsoft_oauth=oauth,  # type: ignore[arg-type]
             metrics=create_metrics(),
@@ -1395,6 +1422,11 @@ async def test_worker_calendar_403_stops_remaining_reads_and_isolates_capability
         await CalendarSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"w" * 32, key_version=cipher.key_version),
+            ),
             oauth=FakeGoogleOAuthClient(),
             microsoft_oauth=oauth,  # type: ignore[arg-type]
             metrics=create_metrics(),

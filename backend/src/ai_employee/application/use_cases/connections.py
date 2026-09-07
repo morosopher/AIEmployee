@@ -3,6 +3,7 @@
 import base64
 import binascii
 import hashlib
+import logging
 import secrets
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
@@ -34,6 +35,7 @@ from ai_employee.domain.errors import DomainError, StateConflictError
 
 OAUTH_ATTEMPT_TTL = timedelta(minutes=10)
 OAUTH_AUTHORIZATION_FAILED_ERROR_CODE = "oauth_authorization_failed"
+_AUTHORIZATION_FAILURE_LOGGER = logging.getLogger("ai_employee.oauth.authorization_failed")
 _READ_CAPABILITIES = frozenset({ConnectionCapability.MAIL_READ, ConnectionCapability.CALENDAR_READ})
 
 
@@ -147,6 +149,17 @@ class ConnectionStore(Protocol):
         now: datetime,
     ) -> ConsumedOAuthAttempt | None:
         """锁定并一次性消费有效 state。"""
+        ...
+
+    async def record_authorization_failed(
+        self,
+        *,
+        user_id: UUID,
+        attempt_id: UUID,
+        provider: str,
+        occurred_at: datetime,
+    ) -> None:
+        """在消费 state 的同一事务追加固定失败事实，不接受供应商原始错误或描述。"""
         ...
 
     async def validate_unbound_attempt_for_callback(
@@ -815,7 +828,9 @@ class ConnectionsUseCase:
 
         OAuth provider 在用户拒绝或管理员同意缺失时不会返回授权码；若直接把错误映射为
         Problem 而不消费 state，攻击者或浏览器重试可重复触发同一一次性回调。此方法复用
-        正常 callback 的原子 state 消费与失败收敛边界，调用方随后只抛出脱敏错误。
+        正常 callback 的 state 绑定。消费、目标能力收敛及内容无关失败审计在一个短事务
+        提交，任一写入失败全部回滚；本路径没有 provider/code 调用。调用方随后只抛出
+        脱敏错误，日志也只在事务成功后记录固定供应商与错误码。
 
         Args:
             provider: 预期供应商，防止一个供应商的 callback 误消费另一供应商 state。
@@ -829,9 +844,33 @@ class ConnectionsUseCase:
         normalized_provider = OAuthProvider(provider).value
         async with self._stores() as store:
             consumed = await store.consume_attempt(state_hash=state_hash, now=now)
-        if consumed is None or consumed.provider != normalized_provider:
-            raise OAuthStateRejectedError
-        await self._converge_failed_progressive_authorization(consumed)
+            if consumed is None or consumed.provider != normalized_provider:
+                # 检查必须在事务内，错误供应商不能提前提交另一 callback 的 state 消费。
+                raise OAuthStateRejectedError
+            if (
+                consumed.target_connection_id is not None
+                and consumed.target_authorization_generation is not None
+            ):
+                await store.mark_progressive_authorization_failed(
+                    user_id=consumed.user_id,
+                    connection_id=consumed.target_connection_id,
+                    authorization_generation=consumed.target_authorization_generation,
+                    capabilities=consumed.requested_capabilities,
+                    error_code=OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                )
+            await store.record_authorization_failed(
+                user_id=consumed.user_id,
+                attempt_id=consumed.id,
+                provider=normalized_provider,
+                occurred_at=now,
+            )
+        _AUTHORIZATION_FAILURE_LOGGER.info(
+            "OAuth authorization failed",
+            extra={
+                "provider": normalized_provider,
+                "error_code": OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+            },
+        )
 
     async def _converge_failed_progressive_authorization(
         self,

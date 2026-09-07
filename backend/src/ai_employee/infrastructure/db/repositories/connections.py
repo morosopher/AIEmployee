@@ -192,6 +192,51 @@ class SqlAlchemyConnectionStore:
             target_authorization_generation=attempt.target_authorization_generation,
         )
 
+    async def record_authorization_failed(
+        self,
+        *,
+        user_id: UUID,
+        attempt_id: UUID,
+        provider: str,
+        occurred_at: datetime,
+    ) -> None:
+        """追加本事务已消费 attempt 的固定失败审计，保留原用户归属且不接收 raw error。
+
+        Args:
+            user_id: state 解析出的所属用户，不能由 callback query 另行指定。
+            attempt_id: 当前事务已锁定并消费的一次性 OAuthAttempt。
+            provider: 已与 attempt 匹配的固定供应商名。
+            occurred_at: 用例注入的 UTC 消费时刻。
+
+        该方法不提交事务；审计 INSERT 失败必须连同消费和能力收敛一起回滚。
+        """
+        owned = await self._session.scalar(
+            select(OAuthAttemptModel.id).where(
+                OAuthAttemptModel.id == attempt_id,
+                OAuthAttemptModel.user_id == user_id,
+                OAuthAttemptModel.provider == provider,
+                OAuthAttemptModel.consumed_at == occurred_at,
+            )
+        )
+        if owned is None or provider not in {"google", "microsoft"}:
+            raise ValueError("OAuth failure audit requires a matching consumed attempt")
+        self._session.add(
+            AuditEventModel(
+                user_id=user_id,
+                task_id=None,
+                actor_type="system",
+                actor_id=None,
+                event_type="oauth.authorization_failed",
+                created_at=occurred_at,
+                event_metadata={
+                    "provider": provider,
+                    "oauth_attempt_id": str(attempt_id),
+                    "error_code": OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                },
+            )
+        )
+        await self._session.flush()
+
     async def validate_unbound_attempt_for_callback(
         self,
         *,

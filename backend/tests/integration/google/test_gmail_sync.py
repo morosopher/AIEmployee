@@ -12,6 +12,7 @@ import pytest
 import respx
 from sqlalchemy import func, select
 
+from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
 from ai_employee.application.ports.gmail import (
     GmailMessage,
     GmailSyncPage,
@@ -20,8 +21,10 @@ from ai_employee.application.ports.gmail import (
     UserActionRequiredError,
 )
 from ai_employee.application.ports.mail import MailMessageUpsertResult
+from ai_employee.application.ports.oauth_refresh import OAuthRefreshError, OAuthRefreshRequest
 from ai_employee.application.use_cases.sync_gmail import SyncGmailUseCase
 from ai_employee.application.use_cases.task_execution import LeasedTask
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import InternalInvariantError, StateConflictError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
@@ -34,9 +37,12 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyGmailSyncRepository
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+    SqlAlchemyOAuthRefreshCoordinator,
+)
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
-from ai_employee.integrations.google.oauth import GoogleOAuthClient
+from ai_employee.integrations.google.oauth import GoogleOAuthAdapter
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from ai_employee.workers.sync_gmail import GmailSyncTaskStep
 
@@ -529,6 +535,7 @@ async def test_concurrent_sync_cannot_roll_back_a_newer_history_cursor(database_
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitted(
     database_url: str,
 ) -> None:
@@ -537,17 +544,30 @@ async def test_access_token_rotation_is_atomic_and_preserves_refresh_when_omitte
     cipher = AeadCipher(b"c" * 32)
     try:
         user_id, connection_id = await _seed_connection(sessions, cipher)
-        rotated = cipher.encrypt(
-            b"rotated-access", f"{user_id}:{connection_id}:access_token".encode()
+        coordinator = SqlAlchemyOAuthRefreshCoordinator(
+            session_factory=sessions,
+            cipher=cipher,
+            identity=OAuthRefreshIdentity(b"c" * 32, key_version=cipher.key_version),
+            clock=lambda: datetime(2030, 1, 1, 23, tzinfo=UTC),
         )
-        async with _repository_factory(sessions) as repository:
-            await repository.rotate_access_token(
+        respx.post("https://oauth2.googleapis.com/token").respond(
+            200,
+            json={
+                "access_token": "rotated-access",
+                "expires_in": 3600,
+                "scope": "https://www.googleapis.com/auth/gmail.readonly",
+            },
+        )
+        await coordinator.refresh(
+            OAuthRefreshRequest(
                 user_id=user_id,
                 connection_id=connection_id,
-                access_token=rotated,
-                expires_at=datetime(2030, 1, 2, tzinfo=UTC),
-                refresh_token=None,
-            )
+                capability=ConnectionCapability.MAIL_READ,
+            ),
+            GoogleOAuthAdapter(
+                "synthetic-client", "synthetic-secret", "https://app.example.test/callback"
+            ),
+        )
         async with sessions() as session:
             credentials = tuple((await session.scalars(select(EncryptedCredentialModel))).all())
         access = next(item for item in credentials if item.credential_kind == "access_token")
@@ -583,7 +603,12 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
         user_id, connection_id = await _seed_connection(sessions, cipher)
         token_route = respx.post("https://oauth2.googleapis.com/token").mock(
             return_value=httpx.Response(
-                200, json={"access_token": "rotated-access", "expires_in": 3600}
+                200,
+                json={
+                    "access_token": "rotated-access",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/gmail.readonly",
+                },
             )
         )
         gmail_route = respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").mock(
@@ -592,7 +617,12 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient(
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"f" * 32, key_version=cipher.key_version),
+            ),
+            oauth=GoogleOAuthAdapter(
                 "synthetic-client", "synthetic-secret", "https://example.test/callback"
             ),
         )
@@ -638,7 +668,7 @@ async def test_worker_refreshes_once_then_marks_connection_expired_after_second_
 async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
     database_url: str,
 ) -> None:
-    """refresh token 的 400/invalid_grant 是可修复授权错误，不得作为内部 Worker 错误。"""
+    """invalid_grant 留下未知 fence；连接保持 connected 供显式 recovery，不能自动重放。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"h" * 32)
     try:
@@ -652,7 +682,12 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient(
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"h" * 32, key_version=cipher.key_version),
+            ),
+            oauth=GoogleOAuthAdapter(
                 "synthetic-client", "synthetic-secret", "https://example.test/callback"
             ),
         )
@@ -672,10 +707,10 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
             )
         async with sessions() as session:
             connection = await session.scalar(select(OAuthConnectionModel))
-        assert raised.value.error_code == "google_reauthorization_required"
+        assert raised.value.error_code == "oauth_refresh_result_unknown"
         assert connection is not None
-        assert connection.status == "degraded"
-        assert connection.last_error_code == "oauth_revoked"
+        assert connection.status == "connected"
+        assert connection.last_error_code is None
     finally:
         await sessions.dispose()
 
@@ -685,7 +720,7 @@ async def test_worker_marks_connection_expired_when_refresh_token_is_invalid(
 async def test_worker_preserves_connected_state_when_refresh_is_rate_limited(
     database_url: str,
 ) -> None:
-    """refresh token 的 429 必须保留 Retry-After 供耐久重试，且不能错误过期连接。"""
+    """grant 已调用后即使返回 429 也保持 fence，不授予耐久刷新重放许可。"""
     sessions = build_session_factory(database_url)
     cipher = AeadCipher(b"i" * 32)
     try:
@@ -699,12 +734,17 @@ async def test_worker_preserves_connected_state_when_refresh_is_rate_limited(
         step = GmailSyncTaskStep(
             session_factory=sessions,
             cipher=cipher,
-            oauth=GoogleOAuthClient(
+            refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"i" * 32, key_version=cipher.key_version),
+            ),
+            oauth=GoogleOAuthAdapter(
                 "synthetic-client", "synthetic-secret", "https://example.test/callback"
             ),
         )
 
-        with pytest.raises(TransientProviderError) as raised:
+        with pytest.raises(OAuthRefreshError) as raised:
             await step.execute(
                 LeasedTask(
                     task_id=UUID("00000000-0000-0000-0000-000000000003"),
@@ -719,8 +759,58 @@ async def test_worker_preserves_connected_state_when_refresh_is_rate_limited(
             )
         async with sessions() as session:
             status = await session.scalar(select(OAuthConnectionModel.status))
-        assert raised.value.error_code == "google_rate_limited"
-        assert raised.value.retry_after == 41
+        assert raised.value.error_code == "oauth_refresh_result_unknown"
         assert status == "connected"
+    finally:
+        await sessions.dispose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_worker_unknown_refresh_fences_duplicate_delivery_before_second_grant(
+    database_url: str,
+) -> None:
+    """令牌端点结果未知后，重复任务必须读取 durable fence，不能再次发送 refresh grant。"""
+    sessions = build_session_factory(database_url)
+    cipher = AeadCipher(b"u" * 32)
+    try:
+        user_id, connection_id = await _seed_connection(sessions, cipher)
+        respx.get("https://gmail.googleapis.com/gmail/v1/users/me/messages").respond(401)
+        token_route = respx.post("https://oauth2.googleapis.com/token").mock(
+            side_effect=httpx.ReadTimeout("synthetic unknown refresh")
+        )
+        task = LeasedTask(
+            task_id=UUID("00000000-0000-0000-0000-000000000401"),
+            kind="sync_mail",
+            input_payload={"connection_id": str(connection_id), "scope_key": "mailbox"},
+            started_at=datetime(2030, 1, 1, tzinfo=UTC),
+            user_id=user_id,
+        )
+        for _ in range(2):
+            step = GmailSyncTaskStep(
+                session_factory=sessions,
+                cipher=cipher,
+                refresh_coordinator=SqlAlchemyOAuthRefreshCoordinator(
+                    session_factory=sessions,
+                    cipher=cipher,
+                    identity=OAuthRefreshIdentity(b"u" * 32, key_version=cipher.key_version),
+                ),
+                oauth=GoogleOAuthAdapter(
+                    "synthetic-client", "synthetic-secret", "https://app.example.test/callback"
+                ),
+            )
+            with pytest.raises((TransientProviderError, UserActionRequiredError)):
+                await step.execute(task)
+        assert token_route.call_count == 1
+        async with sessions() as session:
+            started_count = await session.scalar(
+                select(func.count())
+                .select_from(AuditEventModel)
+                .where(
+                    AuditEventModel.user_id == user_id,
+                    AuditEventModel.event_type == "oauth.refresh_started",
+                )
+            )
+        assert started_count == 1
     finally:
         await sessions.dispose()

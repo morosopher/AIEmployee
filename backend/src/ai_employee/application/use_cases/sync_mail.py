@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
@@ -16,6 +16,12 @@ from ai_employee.application.ports.mail import (
     MailReader,
     MailRemoval,
     MailSyncPage,
+)
+from ai_employee.application.ports.oauth_refresh import (
+    OAuthRefreshCoordinator,
+    OAuthRefreshError,
+    OAuthRefreshProvider,
+    OAuthRefreshRequest,
 )
 from ai_employee.domain.errors import InternalInvariantError
 
@@ -121,6 +127,32 @@ class MailSyncResult:
 
 class MailConnectionNotFoundError(Exception):
     """表示连接不存在、归属不符、能力关闭或 scope 不可同步。"""
+
+
+class CoordinatedAccessTokenRefresh:
+    """为一个只读资源任务绑定共享 coordinator，不缓存或写入 refresh plaintext。
+
+    每次资源 401 都携带实际被拒绝的 access 完整快照；另一个任务已合法轮换时复用
+    当前事实。一个任务内多个资源依次 401 时更新该快照，保证后续 admission 仍准确。
+    """
+
+    def __init__(
+        self,
+        *,
+        coordinator: OAuthRefreshCoordinator | None,
+        provider: OAuthRefreshProvider | None,
+        request: OAuthRefreshRequest,
+    ) -> None:
+        """保存显式用户、连接、能力与旧 access 快照；构造阶段不调用供应商。"""
+        self._coordinator, self._provider, self._request = coordinator, provider, request
+
+    async def __call__(self) -> str:
+        """只委托唯一 grant admission；未知 fence 原样抛出不可重试的稳定错误。"""
+        if self._coordinator is None or self._provider is None:
+            raise OAuthRefreshError("oauth_credential_state_conflict")
+        ready = await self._coordinator.refresh(self._request, self._provider)
+        self._request = replace(self._request, expected_access=ready.snapshot.access)
+        return ready.access_token
 
 
 class SyncMailUseCase:
