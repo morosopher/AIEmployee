@@ -220,6 +220,7 @@ async def test_connection_readiness_wait_rechecks_database_deadline_before_claim
     "fault",
     [
         "none",
+        "concurrent_refresh",
         "unknown",
         "cas_miss",
         "proof_crash",
@@ -245,6 +246,7 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
 
     from sqlalchemy import func, select
 
+    from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
     from ai_employee.application.ports.oauth_refresh import OAuthRefreshReady, OAuthRefreshRequest
     from ai_employee.application.ports.trusted_actions import TrustedActionDispatchSnapshot
     from ai_employee.application.use_cases.trusted_actions import (
@@ -266,6 +268,9 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
         ToolExecutionModel,
     )
     from ai_employee.infrastructure.db.repositories.credential_rotation import load_refresh_snapshot
+    from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+        SqlAlchemyOAuthRefreshCoordinator,
+    )
     from ai_employee.infrastructure.db.repositories.trusted_actions import (
         SqlAlchemyTrustedActionRepository,
         SqlAlchemyTrustedActionRepositoryFactory,
@@ -273,7 +278,9 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
     from ai_employee.infrastructure.db.session import build_session_factory
     from ai_employee.infrastructure.security.encryption import AeadCipher
     from ai_employee.integrations import registry as registry_module
+    from ai_employee.integrations.google.oauth import GoogleOAuthAdapter
     from ai_employee.workers.trusted_actions import build_worker_trusted_action_registry
+    from tests.integration.m2.test_oauth_refresh_coordinator import read_across_committed_refresh
     from tests.integration.m2.test_tool_execution_claim import (
         ACTION_CIPHER,
         NOW,
@@ -687,14 +694,106 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
             await workflow.execute_or_reconcile(**arguments)
             assert send.call_count == refresh.call_count == 1
             return
+        if fault == "concurrent_refresh":
+
+            async def concurrent_grant(request: httpx.Request) -> httpx.Response:
+                """第二个真实 grant 只旋转连接凭据，原写仍持有已批准的未应用重试事实。"""
+                del request
+                async with sessions() as session:
+                    execution = await session.scalar(
+                        select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+                    )
+                    assert execution.status == "retryable_failed"
+                    assert execution.result_summary == {
+                        "kind": "confirmed_not_applied",
+                        "retryable": True,
+                    }
+                    assert execution.write_attempt_count == 1
+                    assert (
+                        await session.scalar(
+                            select(func.count())
+                            .select_from(AuditEventModel)
+                            .where(AuditEventModel.event_type == "oauth.refresh_started")
+                        )
+                        == 2
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "access_token": "synthetic-concurrent-access",
+                        "refresh_token": "synthetic-concurrent-refresh",
+                        "expires_in": 3600,
+                        "scope": " ".join(scopes),
+                    },
+                )
+
+            refresh.mock(side_effect=concurrent_grant)
+            concurrent = SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"x" * 32, key_version=cipher.key_version),
+                clock=lambda: coordinator_now,
+            )
+            concurrent_provider = GoogleOAuthAdapter(
+                settings.google_client_id,
+                "synthetic-client-secret",
+                settings.google_redirect_uri,
+            )
+            try:
+                await read_across_committed_refresh(
+                    read=lambda: workflow.execute_or_reconcile(**arguments),
+                    rotate=lambda: concurrent.refresh(
+                        OAuthRefreshRequest(
+                            user_id=seed.user_id,
+                            connection_id=seed.connection_id,
+                            capability=ConnectionCapability.MAIL_SEND,
+                        ),
+                        concurrent_provider,
+                    ),
+                )
+            except TrustedActionAttemptAbandoned:
+                # 保留真实持久错误，让下面的业务终态断言直接暴露误转 needs_attention。
+                pass
+        else:
+            await workflow.execute_or_reconcile(**arguments)
         await workflow.execute_or_reconcile(**arguments)
-        await workflow.execute_or_reconcile(**arguments)
-        assert send.call_count == 2 and refresh.call_count == 1
         async with sessions() as session:
             execution = await session.scalar(
                 select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
             )
             assert execution.status == "succeeded" and execution.write_attempt_count == 2
+            if fault == "concurrent_refresh":
+                task = await session.get(TaskRunModel, seed.task_id)
+                draft = await session.get(MailDraftModel, seed.draft_id)
+                assert task.status == "succeeded" and task.error_code is None
+                assert draft.status == "sent"
+                assert (
+                    await session.scalar(
+                        select(AuditEventModel.id).where(
+                            AuditEventModel.task_id == seed.task_id,
+                            AuditEventModel.event_type == "tool.needs_attention",
+                        )
+                    )
+                    is None
+                )
+                assert (
+                    await session.scalar(
+                        select(OutboxEventModel.id).where(
+                            OutboxEventModel.aggregate_id == seed.task_id,
+                            OutboxEventModel.topic == "tool.needs_attention",
+                        )
+                    )
+                    is None
+                )
+        assert send.call_count == 2 and refresh.call_count == (
+            2 if fault == "concurrent_refresh" else 1
+        )
+        if fault == "concurrent_refresh":
+            # 实际 adapter 必须重新取当前 access；read_current 的一致旧快照不授权旧 token。
+            assert bool(
+                send.calls[1].request.headers["Authorization"]
+                == "Bearer synthetic-concurrent-access"
+            )
     finally:
         await sessions.dispose()
 

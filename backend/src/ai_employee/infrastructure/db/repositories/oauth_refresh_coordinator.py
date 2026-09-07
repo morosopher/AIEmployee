@@ -88,11 +88,16 @@ class PostgreSQLOAuthRefreshLease:
         self._unsigned_key = int.from_bytes(digest[:8], "big")
         self._key = int.from_bytes(digest[:8], "big", signed=True)
         self._backend_pid: int | None = None
+        self._acquire_result_unknown = False
 
     async def acquire(self) -> None:
-        """执行一次非阻塞 session try-lock；失败不写 fence、不等待或读取 Secret。"""
-        if self._backend_pid is not None:
+        """执行一次非阻塞 session try-lock；失败不写 fence、不等待或读取 Secret。
+
+        发出 SELECT 前登记结果未知；异常或取消不能被误解为未取锁，外层必须丢弃该会话。
+        """
+        if self._backend_pid is not None or self._acquire_result_unknown:
             raise OAuthRefreshError("oauth_refresh_locked")
+        self._acquire_result_unknown = True
         result = (
             await self.connection.execute(
                 text("SELECT pg_backend_pid(), pg_try_advisory_lock(:key)"), {"key": self._key}
@@ -102,6 +107,7 @@ class PostgreSQLOAuthRefreshLease:
             # session lock 已在 SELECT 返回时生效，不能等 commit ACK 才登记 owner。
             # ACK 丢失仍须让外层 finally 解锁，避免把持锁会话归还连接池。
             self._backend_pid = int(result[0])
+        self._acquire_result_unknown = False
         await self.connection.commit()
         if result[1] is not True:
             raise OAuthRefreshError("oauth_refresh_locked")
@@ -131,8 +137,15 @@ class PostgreSQLOAuthRefreshLease:
             raise OAuthRefreshError()
 
     async def release(self) -> None:
-        """归还池连接前显式 unlock；异常则关闭底层会话，避免 session lock 留在池内。"""
-        if self.connection.closed or self.connection.invalidated or self._backend_pid is None:
+        """已知持锁时显式 unlock；取锁结果未知或解锁异常时丢弃底层物理会话。"""
+        if self.connection.closed or self.connection.invalidated:
+            return
+        if self._acquire_result_unknown:
+            # SELECT 可能已在服务器取得 session lock，但客户端尚未收到 PID/结果。
+            # rollback 不释放此类锁；不能因没有登记 owner 就把活连接归池。
+            await self.connection.invalidate()
+            return
+        if self._backend_pid is None:
             return
         try:
             await self.connection.execute(
@@ -347,9 +360,15 @@ class SqlAlchemyOAuthRefreshCoordinator:
                 raise OAuthRefreshError("oauth_credential_state_conflict")
 
     async def read_current(self, request: OAuthRefreshRequest) -> OAuthRefreshReady:
-        """从新短只读事务校验当前 facts，expiry 交由使用方当前时间/rollout deadline 判断。"""
+        """从同一短只读快照校验 credentials 与历史，expiry 仍由使用方判断。
+
+        无 lease 的读取可能与合法 refresh 提交交错；固定事务快照，避免把旧凭据
+        与新 confirmed 拼成虚假的 A→B→A。返回快照不替代使用方的当前状态准入检查。
+        """
         async with self._sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION READ ONLY"))
+            await session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
             snapshot, _, _ = await load_refresh_snapshot(session, request, lock=False)
             records = await read_refresh_events(
                 session, user_id=request.user_id, connection_id=request.connection_id

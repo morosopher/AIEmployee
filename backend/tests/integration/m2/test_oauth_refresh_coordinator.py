@@ -1,16 +1,22 @@
 """真实 session lease、unknown fence、ACK-loss 联合核对与 current readiness 的集成回归。"""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import timedelta
 from uuid import UUID
 
 import pytest
 from sqlalchemy import event, select, text
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
-from ai_employee.application.ports.oauth_refresh import OAuthRefreshError
+from ai_employee.application.ports.oauth_refresh import (
+    OAuthRefreshError,
+    OAuthRefreshRequest,
+    OAuthRefreshSnapshot,
+)
 from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import TransientProviderError
 from ai_employee.infrastructure.db.models.sources import (
@@ -18,6 +24,7 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories import oauth_refresh_coordinator
 from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
     SqlAlchemyOAuthRefreshCoordinator,
 )
@@ -33,6 +40,81 @@ from tests.integration.m2.test_credential_rotation_repository import (
 from tests.integration.m2.test_credential_rotation_repository import (
     oauth_state as oauth_state,  # noqa: PLC0414 - 显式 re-export 让 pytest 在本模块发现 fixture。
 )
+
+
+async def read_across_committed_refresh[T](
+    *, read: Callable[[], Awaitable[T]], rotate: Callable[[], Awaitable[object]]
+) -> T:
+    """固定真实读取凭据→另一会话提交刷新→读取历史的交错，不替换查询或返回事实。
+
+    只暂停指定 reader 的无锁快照查询；writer 的 lease、CAS 和结果读取保持原样。
+    超时或断言失败时释放屏障并回收 reader，避免测试留下事务或后台任务。
+    """
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_load = oauth_refresh_coordinator.load_refresh_snapshot
+
+    async def after_credentials(
+        session: AsyncSession, request: OAuthRefreshRequest, *, lock: bool
+    ) -> tuple[OAuthRefreshSnapshot, EncryptedCredentialModel, EncryptedCredentialModel]:
+        """真实读取完成后暂停目标任务，确保后续历史查询尚未开始。"""
+        snapshot = await original_load(session, request, lock=lock)
+        if not lock and asyncio.current_task() is reader_task:
+            entered.set()
+            await release.wait()
+        return snapshot
+
+    async def invoke_read() -> T:
+        """让普通 Awaitable 回调在可识别的独立 asyncio Task 中运行。"""
+        return await read()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(oauth_refresh_coordinator, "load_refresh_snapshot", after_credentials)
+        reader_task = asyncio.create_task(invoke_read())
+        try:
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+            except TimeoutError:
+                if reader_task.done():
+                    await reader_task
+                raise
+            await rotate()
+            release.set()
+            return await asyncio.wait_for(reader_task, timeout=5)
+        finally:
+            release.set()
+            if not reader_task.done():
+                reader_task.cancel()
+            await asyncio.gather(reader_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_read_current_uses_one_snapshot_across_a_concurrent_committed_refresh(
+    oauth_state,
+) -> None:
+    """合法 A→B 提交不能把旧凭据与新历史混读为回滚；旧 readiness 仍受当前 admission 约束。"""
+    sessions, cipher, coordinator = oauth_state
+    request = refresh_request()
+    before = await coordinator.read_current(request)
+    concurrent = SqlAlchemyOAuthRefreshCoordinator(
+        session_factory=sessions,
+        cipher=cipher,
+        identity=OAuthRefreshIdentity(bytes(range(32)), key_version=7),
+        clock=lambda: NOW,
+    )
+    provider = FakeRefreshProvider(token_response("synthetic-rotated-refresh"))
+    during = await read_across_committed_refresh(
+        read=lambda: coordinator.read_current(request),
+        rotate=lambda: concurrent.refresh(request, provider),
+    )
+    assert during == before
+    after = await coordinator.read_current(request)
+    assert after.snapshot.access != before.snapshot.access
+    assert after.snapshot.refresh != before.snapshot.refresh
+    reused = await coordinator.refresh(
+        replace(request, expected_access=during.snapshot.access), provider
+    )
+    assert reused == after
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio
@@ -64,6 +146,63 @@ async def test_two_workers_share_one_session_lease_and_only_one_refresh_grant(oa
     finally:
         release.set()
         await task
+
+
+@pytest.mark.asyncio
+async def test_lease_acquire_unknown_select_result_discards_the_locked_session(
+    oauth_state,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服务器已取锁但客户端未获得 SELECT 结果时，必须丢弃会话，不能带锁归池。"""
+    sessions, cipher, coordinator = oauth_state
+    original_execute = AsyncConnection.execute
+    acquiring_pid: int | None = None
+
+    async def lose_first_result(connection: AsyncConnection, statement, *args, **kwargs):
+        """真实执行取锁 SQL 后抛非 disconnect 异常，保留活连接来暴露 session 锁泄漏。"""
+        nonlocal acquiring_pid
+        result = await original_execute(connection, statement, *args, **kwargs)
+        if acquiring_pid is None and str(statement) == (
+            "SELECT pg_backend_pid(), pg_try_advisory_lock(:key)"
+        ):
+            pid, acquired = result.one()
+            assert acquired is True
+            acquiring_pid = int(pid)
+            assert not connection.closed and not connection.invalidated
+            raise OperationalError(
+                "synthetic lease acquire result lost",
+                {},
+                OSError("synthetic recoverable transport failure"),
+                connection_invalidated=False,
+            )
+        return result
+
+    monkeypatch.setattr(AsyncConnection, "execute", lose_first_result)
+    provider = FakeRefreshProvider(token_response())
+    # 提前占用另一个物理会话作为观察者，残锁查询不能复用失败后归池的连接。
+    async with sessions() as observer:
+        observer_pid = await observer.scalar(text("SELECT pg_backend_pid()"))
+        with pytest.raises(OperationalError) as failure:
+            await coordinator.refresh(refresh_request(), provider)
+        assert failure.value.connection_invalidated is False
+        assert acquiring_pid is not None and acquiring_pid != observer_pid
+        assert provider.calls == 0
+        lingering = await observer.scalar(
+            text("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=:pid AND locktype='advisory')"),
+            {"pid": acquiring_pid},
+        )
+        assert lingering is False, "OAuth session lease survived unknown acquire SELECT result"
+        assert (await observer.scalars(select(AuditEventModel))).all() == []
+    assert sessions.engine.pool.checkedout() == 0
+    restarted = SqlAlchemyOAuthRefreshCoordinator(
+        session_factory=sessions,
+        cipher=cipher,
+        identity=OAuthRefreshIdentity(bytes(range(32)), key_version=7),
+        clock=lambda: NOW,
+    )
+    await restarted.refresh(refresh_request(), provider)
+    assert provider.calls == 1
+    assert sessions.engine.pool.checkedout() == 0
 
 
 @pytest.mark.asyncio
