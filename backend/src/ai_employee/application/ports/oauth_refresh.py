@@ -12,6 +12,7 @@ from uuid import UUID
 from ai_employee.application.calendar_aad_digests import CredentialSnapshot
 from ai_employee.application.ports.credential_rotation import (
     AutomaticRefreshSource,
+    OAuthRecoveryStartedV1,
     OAuthRefreshAuditRecord,
     OAuthRefreshResultV1,
     OAuthRefreshStartedV1,
@@ -30,6 +31,7 @@ class OAuthRefreshError(UserActionRequiredError):
             "oauth_refresh_result_unknown",
             "oauth_credential_state_conflict",
             "oauth_refresh_locked",
+            "oauth_refresh_recovery_unsatisfied",
         }:
             raise ValueError("OAuth refresh error code is invalid")
         super().__init__(
@@ -118,6 +120,63 @@ class OAuthRefreshClosedResult:
     recovery: OAuthRefreshAuditRecord | None
     result: OAuthRefreshAuditRecord
     metadata: OAuthRefreshResultV1 = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRecoveryRequest:
+    """定位显式恢复的当前凭据，不要求已置为 authorizing 的能力仍 enabled。
+
+    Attributes:
+        user_id: 已消费或正在创建的 OAuthAttempt 所属用户。
+        connection_id: 显式选择的既有连接；恢复不能推断默认账户或创建第二连接。
+    """
+
+    user_id: UUID
+    connection_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRecoveryCandidate:
+    """保存 start 事务持锁验证的原 fence 与当前物理快照。
+
+    snapshot 的 generation 是 S；fence 的摘要和 generation 属于原 automatic F。
+    合法同明文重加密不消费 fence。refresh_plaintext 只供受控内存比较，排除 repr，
+    不能持久化、进入日志或替代 callback 网络前另行冻结的物理 CAS 快照。
+    """
+
+    snapshot: OAuthRefreshSnapshot
+    automatic: OAuthRefreshAuditRecord
+    fence: OAuthRefreshStartedV1 = field(repr=False)
+    refresh_plaintext: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRecoveryAuthorization:
+    """只在内存传递一次 OAuthAttempt 与两个不可变 started 的精确关联。
+
+    user_id/connection_id 限定查询归属；metadata 经共享 parser 校验 F/S/T、固定身份、
+    原 pre-digest 和严格时序。该值不授予 code 重放权，也不单独证明当前凭据已就绪。
+    """
+
+    user_id: UUID
+    connection_id: UUID
+    automatic: OAuthRefreshAuditRecord
+    started: OAuthRefreshAuditRecord
+    metadata: OAuthRecoveryStartedV1 = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthRecoveryClaim:
+    """在共享连接 lease 下、交换 code 前冻结 T 与完整双行。
+
+    snapshot 是响应事务必须精确比较的当前物理状态；authorization 继续绑定原 fence
+    的不可变 pre-digest。refresh_plaintext 排除 repr，仅用于不同 token 的常量时间比较。
+    网络期间任一物理字段改变即 CAS 失败，不能重新冻结或将响应当成已持久成功。
+    """
+
+    authorization: OAuthRecoveryAuthorization
+    snapshot: OAuthRefreshSnapshot
+    refresh_plaintext: bytes = field(repr=False)
 
 
 class OAuthRefreshProvider(Protocol):

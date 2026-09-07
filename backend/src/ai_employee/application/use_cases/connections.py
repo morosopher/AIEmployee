@@ -10,9 +10,18 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, cast, get_args
 from uuid import UUID, uuid4
 
+from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
+from ai_employee.application.ports.credential_rotation import (
+    CredentialReplacedV1,
+    CredentialRotationRepository,
+    OAuthRefreshAuditRecord,
+    RecoveryCapabilityTransition,
+    RecoveryFailureCode,
+    RecoveryUnsatisfiedV1,
+)
 from ai_employee.application.ports.encryption import EncryptedValue, Encryption
 from ai_employee.application.ports.oauth import (
     OAuthAccount,
@@ -23,6 +32,15 @@ from ai_employee.application.ports.oauth import (
     OAuthRevocationStatus,
     OAuthTokenSet,
 )
+from ai_employee.application.ports.oauth_refresh import (
+    OAuthRecoveryAuthorization,
+    OAuthRecoveryCandidate,
+    OAuthRecoveryClaim,
+    OAuthRefreshCoordinator,
+    OAuthRefreshError,
+    OAuthRefreshLease,
+    OAuthRefreshRequest,
+)
 from ai_employee.application.use_cases.tasks import CreateTaskBatchItem
 from ai_employee.domain.connections import (
     CapabilityStatus,
@@ -31,10 +49,14 @@ from ai_employee.domain.connections import (
     ConnectionStatus,
     validate_capability_enable,
 )
-from ai_employee.domain.errors import DomainError, StateConflictError
+from ai_employee.domain.errors import (
+    DomainError,
+    StateConflictError,
+    TransientProviderError,
+)
 
 OAUTH_ATTEMPT_TTL = timedelta(minutes=10)
-OAUTH_AUTHORIZATION_FAILED_ERROR_CODE = "oauth_authorization_failed"
+OAUTH_AUTHORIZATION_FAILED_ERROR_CODE: RecoveryFailureCode = "oauth_authorization_failed"
 _AUTHORIZATION_FAILURE_LOGGER = logging.getLogger("ai_employee.oauth.authorization_failed")
 _READ_CAPABILITIES = frozenset({ConnectionCapability.MAIL_READ, ConnectionCapability.CALENDAR_READ})
 
@@ -158,8 +180,21 @@ class ConnectionStore(Protocol):
         attempt_id: UUID,
         provider: str,
         occurred_at: datetime,
+        error_code: RecoveryFailureCode = OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
     ) -> None:
         """在消费 state 的同一事务追加固定失败事实，不接受供应商原始错误或描述。"""
+        ...
+
+    async def get_refresh_events(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> tuple[OAuthRefreshAuditRecord, ...]:
+        """读取共享 refresh 协议事实，未装配恢复服务的旧调用方也不能忽略已有 fence。"""
+        ...
+
+    def credential_rotation(
+        self, *, cipher: Encryption, identity: OAuthRefreshIdentity
+    ) -> CredentialRotationRepository:
+        """返回绑定当前同一短事务的唯一 credential CAS writer，不拥有独立 session。"""
         ...
 
     async def validate_unbound_attempt_for_callback(
@@ -191,12 +226,34 @@ class ConnectionStore(Protocol):
         account_type: str,
         account_email: str,
         scopes: frozenset[str],
+        identity_key_version: int | None = None,
     ) -> UUID:
         """按规范账户键建立或合并连接，并确保四项能力行存在。
 
         同一用户的 connected 同身份 callback 只有在新 token scope 覆盖当前 scope 时才
         原样替换并保留未请求能力；新建或非 connected 连接从本次 token 事实精确重置，
         tenant/type 或 scope 单调性不满足时拒绝。
+        """
+        ...
+
+    async def validate_unfenced_identity_for_callback(
+        self,
+        *,
+        user_id: UUID,
+        provider: str,
+        provider_account_id: str,
+        identity_key_version: int,
+    ) -> None:
+        """在无目标 callback 进入合并流程前锁定规范身份并检查自动刷新 fence。
+
+        Args:
+            user_id: 从已消费 OAuthAttempt 取得的归属用户。
+            provider: 当前 attempt 绑定的规范供应商。
+            provider_account_id: adapter 验证后的稳定账户键。
+            identity_key_version: 当前共享身份服务的固定根密钥版本。
+
+        Raises:
+            OAuthRefreshError: 身份命中有未关闭 fence 的 connected 连接，或审计不合法。
         """
         ...
 
@@ -263,8 +320,8 @@ class ConnectionStore(Protocol):
         authorization_generation: int,
         capabilities: frozenset[ConnectionCapability],
         error_code: str,
-    ) -> None:
-        """在连接仍处于同一代际时，把本次 authorizing 能力收敛为 action_required。"""
+    ) -> RecoveryCapabilityTransition:
+        """同代际只更新本次 authorizing 状态；返回真实 action_required 或 stale_target_noop。"""
         ...
 
     async def ensure_bound_connection_for_callback(
@@ -277,6 +334,7 @@ class ConnectionStore(Protocol):
         provider_account_id: str,
         provider_tenant_id: str,
         account_type: str,
+        identity_key_version: int | None = None,
     ) -> UUID:
         """锁定并核对渐进 OAuth 的冻结目标，失败时不得产生任何 token 写入。"""
         ...
@@ -592,6 +650,9 @@ class ConnectionsUseCase:
         cipher: Encryption,
         adapters: Mapping[str, OAuthProviderAdapter],
         clock: Clock,
+        *,
+        identity: OAuthRefreshIdentity | None = None,
+        coordinator: OAuthRefreshCoordinator | None = None,
     ) -> None:
         """复制并冻结 adapter mapping，阻止运行时注册新供应商或替换数据流向。
 
@@ -600,6 +661,8 @@ class ConnectionsUseCase:
             cipher: 对 PKCE verifier 与 OAuth token 执行记录绑定 AEAD 的端口。
             adapters: 组合根一次性提供的受支持供应商 mapping。
             clock: 返回显式 UTC 的可替换时钟。
+            identity: 与 cipher 同次 Secret 构造的固定 keyed identity；有 refresh 历史时必需。
+            coordinator: Task27A 的共享 lease/只读 result 联合端口，不创建第二个 OAuth 服务。
 
         Raises:
             ValueError: mapping 含未知供应商、键值不一致或重复规范化键。
@@ -620,6 +683,53 @@ class ConnectionsUseCase:
         self._cipher = cipher
         self._adapters = MappingProxyType(normalized)
         self._clock = clock
+        if (identity is None) != (coordinator is None) or (
+            identity is not None and identity.key_version != cipher.key_version
+        ):
+            raise ValueError("OAuth recovery services require the same cipher identity version")
+        self._identity = identity
+        self._coordinator = coordinator
+
+    def _rotation(self, store: ConnectionStore) -> CredentialRotationRepository:
+        """取得当前短事务内的唯一 writer；缺少组合根注入时有 fence 必须失败关闭。"""
+        if self._identity is None or self._coordinator is None:
+            raise OAuthRefreshError("oauth_credential_state_conflict")
+        return store.credential_rotation(cipher=self._cipher, identity=self._identity)
+
+    async def _recovery_authorization(
+        self,
+        store: ConnectionStore,
+        consumed: ConsumedOAuthAttempt,
+    ) -> OAuthRecoveryAuthorization | None:
+        """消费阶段按 attempt 查询恢复关系；旧普通 callback 遇到新 fence 也不得继续保存。"""
+        if consumed.target_connection_id is None:
+            return None
+        records = await store.get_refresh_events(
+            user_id=consumed.user_id, connection_id=consumed.target_connection_id
+        )
+        if not records:
+            return None
+        rotation = self._rotation(store)
+        authorization = await rotation.recovery_authorization(
+            user_id=consumed.user_id,
+            connection_id=consumed.target_connection_id,
+            attempt_id=consumed.id,
+        )
+        if (
+            authorization is None
+            and await rotation.recovery_candidate(
+                user_id=consumed.user_id,
+                connection_id=consumed.target_connection_id,
+            )
+            is not None
+        ):
+            raise OAuthRefreshError()
+        if (
+            authorization is not None
+            and authorization.metadata.target_generation != consumed.target_authorization_generation
+        ):
+            raise OAuthRefreshError("oauth_credential_state_conflict")
+        return authorization
 
     def _adapter_for(self, provider: str | OAuthProvider) -> OAuthProviderAdapter:
         """解析固定 adapter；未知或未装配供应商始终拒绝。"""
@@ -686,8 +796,8 @@ class ConnectionsUseCase:
         now: datetime,
         target_connection_id: UUID | None = None,
         target_authorization_generation: int | None = None,
-    ) -> str:
-        """在调用方事务内持久化授权尝试并返回适配器生成的 URL。"""
+    ) -> tuple[str, UUID]:
+        """在调用方事务内持久化授权尝试，返回 URL 与恢复关联需要的原 attempt ID。"""
         (
             attempt_id,
             verifier,
@@ -716,7 +826,7 @@ class ConnectionsUseCase:
             target_connection_id=target_connection_id,
             target_authorization_generation=target_authorization_generation,
         )
-        return adapter.build_authorization_url(request)
+        return adapter.build_authorization_url(request), attempt_id
 
     async def start(
         self,
@@ -730,7 +840,7 @@ class ConnectionsUseCase:
             raise ConnectionCapabilityDependencyConflict
         now = _utc_now(self._clock)
         async with self._stores() as store:
-            authorization_url = await self._persist_attempt(
+            authorization_url, _ = await self._persist_attempt(
                 store=store,
                 user_id=user_id,
                 provider=provider,
@@ -746,7 +856,21 @@ class ConnectionsUseCase:
         connection_id: UUID,
         capability: ConnectionCapability,
     ) -> CapabilityEnableResult:
-        """发起单项能力渐进授权，并请求依赖闭包与全部当前 enabled 能力。"""
+        """发起单项能力渐进授权，并在存在原 fence 时原子建立显式恢复关系。
+
+        Args:
+            user_id: 当前已认证用户，所有连接和凭据读取均限定该归属。
+            connection_id: 用户选择的既有 connected 连接。
+            capability: 本次请求的单项能力；请求范围包含依赖闭包和当前 enabled 能力。
+
+        Returns:
+            授权 URL 与实际请求的规范能力集合。S→T、OAuthAttempt 和恢复 started
+            在同一事务提交；普通无 fence 的渐进授权继续沿用既有流程。
+
+        Raises:
+            ConnectionNotFoundError: 目标不存在、跨用户或已经断开。
+            OAuthRefreshError: 未决 fence 不唯一、固定旧身份不符或当前凭据无效。
+        """
         now = _utc_now(self._clock)
         async with self._stores() as store:
             # 先锁连接再读取 enabled 快照；否则断开/关闭与授权发起可能观察到不同代际。
@@ -765,12 +889,18 @@ class ConnectionsUseCase:
             ):
                 raise ConnectionNotFoundError
             requested = validate_capability_enable(capability, enabled)
+            candidate: OAuthRecoveryCandidate | None = None
+            if await store.get_refresh_events(user_id=user_id, connection_id=connection_id):
+                candidate = await self._rotation(store).recovery_candidate(
+                    user_id=user_id,
+                    connection_id=connection_id,
+                )
             generation = await store.set_capabilities_authorizing(
                 user_id=user_id,
                 connection_id=connection_id,
                 capabilities=requested,
             )
-            authorization_url = await self._persist_attempt(
+            authorization_url, attempt_id = await self._persist_attempt(
                 store=store,
                 user_id=user_id,
                 provider=connection.provider,
@@ -779,22 +909,57 @@ class ConnectionsUseCase:
                 target_connection_id=connection.id,
                 target_authorization_generation=generation,
             )
+            if candidate is not None:
+                await self._rotation(store).start_recovery(
+                    candidate,
+                    attempt_id=attempt_id,
+                    target_generation=generation,
+                    occurred_at=now,
+                )
         return CapabilityEnableResult(authorization_url, _sorted_capabilities(requested))
 
-    async def callback(self, *, code: str, state: str) -> UUID:
-        """一次性消费 state，按尝试记录选择 adapter，并保存实际 scope 与能力状态。"""
+    async def callback(
+        self,
+        *,
+        code: str,
+        state: str,
+        provider: str | OAuthProvider | None = None,
+    ) -> UUID:
+        """持久消费一次 state，再按普通授权或显式恢复执行一次 code exchange。
+
+        Args:
+            code: 路由已验证的非空供应商授权码，只在内存使用且不能重试。
+            state: 规范 Base64URL 一次性 state，持久层只使用其摘要。
+            provider: API 路由绑定的供应商；兼容既有内部调用时可省略。
+
+        Returns:
+            当前凭据满足 requested 能力的原连接 ID；恢复响应必须先完成双行 CAS、
+            scope/能力/replacement 原子提交，再独立读取当前就绪状态。
+
+        Raises:
+            OAuthStateRejectedError: state 非法、已消费、过期或供应商不匹配。
+            OAuthRefreshError: 恢复未满足、CAS/lease 失败或只能只读核对的未知结果。
+            DomainError: 已安全分类的供应商拒绝或本地授权冲突。
+        """
         now = _utc_now(self._clock)
         state_hash = _oauth_state_hash(state)
         async with self._stores() as store:
             consumed = await store.consume_attempt(state_hash=state_hash, now=now)
-        if consumed is None:
-            raise OAuthStateRejectedError
+            if consumed is None or (
+                provider is not None and consumed.provider != OAuthProvider(provider).value
+            ):
+                raise OAuthStateRejectedError
+            recovery = await self._recovery_authorization(store, consumed)
 
         adapter = self._adapter_for(consumed.provider)
         verifier = self._cipher.decrypt(
             consumed.verifier,
             self._aad(consumed.user_id, consumed.id, "pkce_verifier"),
         ).decode("ascii")
+        if recovery is not None:
+            return await self._callback_recovery(
+                consumed, recovery, adapter, code=code, verifier=verifier
+            )
         try:
             token = await adapter.exchange_code(code=code, verifier=verifier)
             account = await adapter.fetch_account(
@@ -808,7 +973,9 @@ class ConnectionsUseCase:
                 raise
             # 网络交换、token-info、userinfo 或 nonce 校验失败后，只有 target-bound
             # 渐进授权需要收敛状态；targetless 首次失败不能创建连接，也没有本地能力行可更新。
-            await self._converge_failed_progressive_authorization(consumed)
+            await self._converge_failed_progressive_authorization(
+                consumed, error_code=self._safe_failure_code(error.error_code)
+            )
             raise
         return await self._save_tokens_and_capabilities(
             user_id=consumed.user_id,
@@ -823,23 +990,32 @@ class ConnectionsUseCase:
             adapter=adapter,
         )
 
-    async def callback_error(self, *, provider: str | OAuthProvider, state: str) -> None:
+    async def callback_error(
+        self,
+        *,
+        provider: str | OAuthProvider,
+        state: str,
+        error_code: RecoveryFailureCode = "oauth_authorization_failed",
+    ) -> None:
         """消费供应商拒绝回调的 state，并收敛目标渐进能力。
 
         OAuth provider 在用户拒绝或管理员同意缺失时不会返回授权码；若直接把错误映射为
         Problem 而不消费 state，攻击者或浏览器重试可重复触发同一一次性回调。此方法复用
-        正常 callback 的 state 绑定。消费、目标能力收敛及内容无关失败审计在一个短事务
-        提交，任一写入失败全部回滚；本路径没有 provider/code 调用。调用方随后只抛出
-        脱敏错误，日志也只在事务成功后记录固定供应商与错误码。
+        正常 callback 的 state 绑定。普通错误的消费、能力收敛与审计仍原子提交；恢复
+        错误先原子提交消费与普通失败审计，再在另一短事务提交能力/unsatisfied。结果
+        事务回滚或 ACK 丢失不能重新使用 state；本路径没有 provider/code 调用。
 
         Args:
             provider: 预期供应商，防止一个供应商的 callback 误消费另一供应商 state。
             state: 浏览器回传的一次性 OAuth state 原文。
+            error_code: API 已安全分类的固定码，raw error/description/codes 不得进入本端口。
 
         Raises:
             OAuthStateRejectedError: state 非法、已消费、过期或供应商不匹配。
         """
         now = _utc_now(self._clock)
+        if error_code not in get_args(RecoveryFailureCode):
+            raise ValueError("OAuth authorization error code is invalid")
         state_hash = _oauth_state_hash(state)
         normalized_provider = OAuthProvider(provider).value
         async with self._stores() as store:
@@ -847,8 +1023,10 @@ class ConnectionsUseCase:
             if consumed is None or consumed.provider != normalized_provider:
                 # 检查必须在事务内，错误供应商不能提前提交另一 callback 的 state 消费。
                 raise OAuthStateRejectedError
+            recovery = await self._recovery_authorization(store, consumed)
             if (
-                consumed.target_connection_id is not None
+                recovery is None
+                and consumed.target_connection_id is not None
                 and consumed.target_authorization_generation is not None
             ):
                 await store.mark_progressive_authorization_failed(
@@ -856,25 +1034,30 @@ class ConnectionsUseCase:
                     connection_id=consumed.target_connection_id,
                     authorization_generation=consumed.target_authorization_generation,
                     capabilities=consumed.requested_capabilities,
-                    error_code=OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                    error_code=error_code,
                 )
             await store.record_authorization_failed(
                 user_id=consumed.user_id,
                 attempt_id=consumed.id,
                 provider=normalized_provider,
                 occurred_at=now,
+                error_code=error_code,
             )
+        if recovery is not None:
+            await self._persist_recovery_unsatisfied(consumed, recovery, error_code=error_code)
         _AUTHORIZATION_FAILURE_LOGGER.info(
             "OAuth authorization failed",
             extra={
                 "provider": normalized_provider,
-                "error_code": OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                "error_code": error_code,
             },
         )
 
     async def _converge_failed_progressive_authorization(
         self,
         consumed: ConsumedOAuthAttempt,
+        *,
+        error_code: RecoveryFailureCode = "oauth_authorization_failed",
     ) -> None:
         """按冻结连接与授权代际安全收敛失败的渐进能力。
 
@@ -893,8 +1076,267 @@ class ConnectionsUseCase:
                 connection_id=consumed.target_connection_id,
                 authorization_generation=consumed.target_authorization_generation,
                 capabilities=consumed.requested_capabilities,
-                error_code=OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                error_code=error_code,
             )
+
+    @staticmethod
+    def _safe_failure_code(error_code: str) -> RecoveryFailureCode:
+        """保留既有安全分类；供应商未知内部码只能收敛为固定通用授权失败。"""
+        return (
+            cast(RecoveryFailureCode, error_code)
+            if error_code in get_args(RecoveryFailureCode)
+            else "oauth_authorization_failed"
+        )
+
+    async def _persist_recovery_unsatisfied(
+        self,
+        consumed: ConsumedOAuthAttempt,
+        authorization: OAuthRecoveryAuthorization,
+        *,
+        error_code: RecoveryFailureCode,
+        lease: OAuthRefreshLease | None = None,
+    ) -> RecoveryUnsatisfiedV1:
+        """同事务收敛 requested 能力/追加 unsatisfied；未知提交只用新 session 的 union 核对。
+
+        error callback 没有网络，直接使用事务行锁和两个共享 audit mutex；code callback
+        还必须在写前/提交前证明已有 shared session lease。任何结果回滚都不能回滚先前
+        已提交的 state 消费，更不能补写猜测结果或发送第二次 code。
+        """
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise OAuthRefreshError("oauth_credential_state_conflict")
+        try:
+            if lease is not None:
+                await lease.assert_owned()
+            async with self._stores() as store:
+                transition = await store.mark_progressive_authorization_failed(
+                    user_id=consumed.user_id,
+                    connection_id=authorization.connection_id,
+                    authorization_generation=authorization.metadata.target_generation,
+                    capabilities=consumed.requested_capabilities,
+                    error_code=error_code,
+                )
+                result = await self._rotation(store).unsatisfied(
+                    authorization,
+                    requested_capabilities=consumed.requested_capabilities,
+                    capability_transition=transition,
+                    error_code=error_code,
+                    completed_at=_utc_now(self._clock),
+                )
+                if lease is not None:
+                    await lease.assert_owned()
+            return result
+        except Exception:  # noqa: BLE001 - state 已持久消费；未知 commit 只能核对 append-only 结果。
+            closed = await coordinator.read_result(
+                user_id=consumed.user_id,
+                connection_id=authorization.connection_id,
+                attempt_id=consumed.id,
+                recovery=True,
+            )
+            if closed is None or not isinstance(closed.metadata, RecoveryUnsatisfiedV1):
+                raise OAuthRefreshError() from None
+            # 历史关闭不依赖 current T；只读取当前能力投影，不把后来合法授权当成 rollback。
+            async with self._stores() as store:
+                await store.get_capability_snapshot(
+                    user_id=consumed.user_id, connection_id=authorization.connection_id
+                )
+            return closed.metadata
+
+    async def _callback_recovery(
+        self,
+        consumed: ConsumedOAuthAttempt,
+        authorization: OAuthRecoveryAuthorization,
+        adapter: OAuthProviderAdapter,
+        *,
+        code: str,
+        verifier: str,
+    ) -> UUID:
+        """一次 code exchange 贯穿共享连接 lease，结果只能由真实事务证明。
+
+        Args:
+            consumed: 已在前一短事务持久消费的 OAuthAttempt。
+            authorization: 共享 parser 验证的原 fence、本次恢复 started 与 F/S/T。
+            adapter: 组合根固定的当前供应商 adapter，不允许切换账户或供应商。
+            code: 本次唯一授权码；任何未知结果、回滚或丢锁都不允许重发。
+            verifier: 已用精确 attempt AAD 解密的 PKCE verifier，只在内存使用。
+
+        Returns:
+            replacement 已提交且当前 requested 能力可用的原连接 ID。
+
+        Raises:
+            OAuthRefreshError: 未取得不同有效 refresh，或只读核对无法证明事务提交。
+            DomainError: 目标 T 过时或已安全分类的供应商拒绝。
+
+        网络前短事务冻结当前完整双行；网络后禁止重新冻结。未知 exchange、CAS miss、
+        lease loss 与 commit ACK loss 都只读核对共享 result union，不猜写 unsatisfied。
+        """
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise OAuthRefreshError("oauth_credential_state_conflict")
+        failure: DomainError | None = None
+        try:
+            async with coordinator.explicit_recovery_lease(
+                user_id=consumed.user_id, connection_id=authorization.connection_id
+            ) as lease:
+                await lease.assert_owned()
+                async with self._stores() as store:
+                    connection = await store.get_connection_for_update(
+                        user_id=consumed.user_id, connection_id=authorization.connection_id
+                    )
+                    stale = (
+                        connection is None
+                        or connection.status != "connected"
+                        or connection.authorization_generation
+                        != authorization.metadata.target_generation
+                    )
+                    claim = (
+                        None
+                        if stale
+                        else await self._rotation(store).freeze_recovery(authorization)
+                    )
+                if stale or claim is None:
+                    await self._persist_recovery_unsatisfied(
+                        consumed,
+                        authorization,
+                        error_code="oauth_authorization_failed",
+                        lease=lease,
+                    )
+                    failure = OAuthAttemptInvalidatedError()
+                else:
+                    await lease.assert_owned()
+                    exchange_completed = False
+                    try:
+                        token = await adapter.exchange_code(code=code, verifier=verifier)
+                        exchange_completed = True
+                        await lease.assert_owned()
+                        account = await adapter.fetch_account(
+                            token, expected_nonce_hash=consumed.oidc_nonce_hash
+                        )
+                        await lease.assert_owned()
+                    except DomainError as error:
+                        # adapter 把 timeout/request-failed/不确定 5xx 都归入 Transient；
+                        # 尚未拿到 token 响应时无法证明 exchange 结果，不能猜写 unsatisfied。
+                        # 成功 exchange 后的只读账户验证失败不再有授权码结果歧义。
+                        if isinstance(error, (StateConflictError, OAuthRefreshError)) or (
+                            isinstance(error, TransientProviderError) and not exchange_completed
+                        ):
+                            raise
+                        await self._persist_recovery_unsatisfied(
+                            consumed,
+                            authorization,
+                            error_code=self._safe_failure_code(error.error_code),
+                            lease=lease,
+                        )
+                        failure = error
+                    else:
+                        if connection is None:
+                            raise OAuthRefreshError("oauth_credential_state_conflict")
+                        valid = self._recovery_response_valid(
+                            claim,
+                            connection,
+                            account,
+                            token,
+                            adapter,
+                            consumed.requested_capabilities,
+                        )
+                        if not valid:
+                            await self._persist_recovery_unsatisfied(
+                                consumed,
+                                authorization,
+                                error_code="oauth_refresh_recovery_unsatisfied",
+                                lease=lease,
+                            )
+                            failure = OAuthRefreshError("oauth_refresh_recovery_unsatisfied")
+                        else:
+                            async with self._stores() as store:
+                                await lease.assert_owned()
+                                await self._rotation(store).replace(
+                                    claim, token, completed_at=_utc_now(self._clock)
+                                )
+                                await store.update_connection_scopes(
+                                    user_id=consumed.user_id,
+                                    connection_id=authorization.connection_id,
+                                    scopes=token.granted_scopes,
+                                )
+                                await self._save_actual_capabilities(
+                                    store,
+                                    user_id=consumed.user_id,
+                                    connection_id=authorization.connection_id,
+                                    requested_capabilities=consumed.requested_capabilities,
+                                    adapter=adapter,
+                                    token=token,
+                                    now=_utc_now(self._clock),
+                                )
+                                await lease.assert_owned()
+        except Exception:  # noqa: BLE001 - 已持久 started/state 后禁止重放 code，包含真实 commit ACK 丢失。
+            closed = await coordinator.read_result(
+                user_id=consumed.user_id,
+                connection_id=authorization.connection_id,
+                attempt_id=consumed.id,
+                recovery=True,
+            )
+            if closed is None:
+                raise OAuthRefreshError() from None
+            if isinstance(closed.metadata, RecoveryUnsatisfiedV1):
+                raise OAuthRefreshError("oauth_refresh_recovery_unsatisfied") from None
+            if not isinstance(closed.metadata, CredentialReplacedV1):
+                raise OAuthRefreshError("oauth_credential_state_conflict") from None
+        if failure is not None:
+            raise failure
+        # append-only closure 与 current readiness 分开；更晚合法 generation/refresh 不重开本次。
+        for capability in _sorted_capabilities(consumed.requested_capabilities):
+            await coordinator.read_current(
+                OAuthRefreshRequest(
+                    user_id=consumed.user_id,
+                    connection_id=authorization.connection_id,
+                    capability=capability,
+                )
+            )
+        return authorization.connection_id
+
+    @staticmethod
+    def _recovery_response_valid(
+        claim: OAuthRecoveryClaim,
+        connection: StoredConnection,
+        account: OAuthAccount,
+        token: OAuthTokenSet,
+        adapter: OAuthProviderAdapter,
+        requested_capabilities: frozenset[ConnectionCapability],
+    ) -> bool:
+        """在受控内存校验规范响应，并以 compare_digest 比较 refresh 明文。
+
+        Args:
+            claim: 网络前冻结的当前双行和旧 refresh 明文。
+            connection: 同次冻结的规范账户身份，不接受响应更换目标。
+            account: adapter 规范化的账户，仍再次验证其边界。
+            token: adapter 规范化的响应，仍再次验证非空文本、scope 与有界 expiry。
+            adapter: 用于计算 requested 能力的固定供应商 scope 映射。
+            requested_capabilities: OAuthAttempt 实际冻结的能力请求。
+
+        Returns:
+            仅在身份不变、scope 覆盖旧事实和请求、明确返回不同非空 refresh 时为 True。
+        """
+        if type(account) is not OAuthAccount or type(token) is not OAuthTokenSet:
+            return False
+        try:
+            account.__post_init__()
+            token.__post_init__()
+        except (ValueError, TypeError):
+            return False
+        return (
+            (account.provider_account_id, account.provider_tenant_id, account.account_type)
+            == (
+                connection.provider_account_id,
+                connection.provider_tenant_id,
+                connection.account_type,
+            )
+            and claim.snapshot.scopes.issubset(token.granted_scopes)
+            and adapter.scopes_for(requested_capabilities).issubset(token.granted_scopes)
+            and token.refresh_token is not None
+            and not secrets.compare_digest(
+                claim.refresh_plaintext, token.refresh_token.encode("utf-8")
+            )
+        )
 
     async def _save_tokens_and_capabilities(
         self,
@@ -923,6 +1365,14 @@ class ConnectionsUseCase:
                     user_id=user_id,
                     provider=provider,
                 )
+                # 已有 fenced 身份必须在进入任何 bootstrap/合并写入方法前拒绝；
+                # 仓储在唯一键竞争后仍会复查，覆盖这里尚不存在连接的插入竞态。
+                await store.validate_unfenced_identity_for_callback(
+                    user_id=user_id,
+                    provider=provider,
+                    provider_account_id=account.provider_account_id,
+                    identity_key_version=self._cipher.key_version,
+                )
                 connection_id = await store.ensure_connection(
                     user_id=user_id,
                     provider=provider,
@@ -931,6 +1381,7 @@ class ConnectionsUseCase:
                     account_type=account.account_type,
                     account_email=account.account_email,
                     scopes=token.granted_scopes,
+                    identity_key_version=self._cipher.key_version,
                 )
             else:
                 if target_authorization_generation is None:
@@ -943,6 +1394,7 @@ class ConnectionsUseCase:
                     provider_account_id=account.provider_account_id,
                     provider_tenant_id=account.provider_tenant_id,
                     account_type=account.account_type,
+                    identity_key_version=self._cipher.key_version,
                 )
                 # 渐进 callback 的目标连接已通过代际与身份锁定；此处才替换实际 scope，
                 # 避免旧 state 在网络调用期间覆盖更新后的连接权限事实。
@@ -970,24 +1422,42 @@ class ConnectionsUseCase:
                 refresh_token=refresh,
                 expires_at=now + timedelta(seconds=token.expires_in),
             )
-            for capability in _sorted_capabilities(requested_capabilities):
-                # 回调核对必须复用领域依赖闭包；仅有粗粒度写 scope 不能证明回复读取或
-                # 日程 ETag/写后核对所需的读取能力仍然存在。
-                required_capabilities = validate_capability_enable(capability, frozenset())
-                required_scopes = adapter.scopes_for(required_capabilities)
-                enabled = required_scopes.issubset(token.granted_scopes)
-                await store.save_capability_state(
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    capability=capability,
-                    status=(
-                        CapabilityStatus.ENABLED if enabled else CapabilityStatus.ACTION_REQUIRED
-                    ),
-                    actual_scopes=token.granted_scopes,
-                    last_verified_at=now,
-                    last_error_code=None if enabled else "connection_scope_missing",
-                )
+            await self._save_actual_capabilities(
+                store,
+                user_id=user_id,
+                connection_id=connection_id,
+                requested_capabilities=requested_capabilities,
+                adapter=adapter,
+                token=token,
+                now=now,
+            )
         return connection_id
+
+    async def _save_actual_capabilities(
+        self,
+        store: ConnectionStore,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        requested_capabilities: frozenset[ConnectionCapability],
+        adapter: OAuthProviderAdapter,
+        token: OAuthTokenSet,
+        now: datetime,
+    ) -> None:
+        """普通与恢复 callback 共用 scope/依赖闭包映射，所有写入仍属于调用方同一短事务。"""
+        for capability in _sorted_capabilities(requested_capabilities):
+            # 写 scope 不能单独证明回复读取、ETag 或结果核对所依赖的读取权限。
+            required_capabilities = validate_capability_enable(capability, frozenset())
+            enabled = adapter.scopes_for(required_capabilities).issubset(token.granted_scopes)
+            await store.save_capability_state(
+                user_id=user_id,
+                connection_id=connection_id,
+                capability=capability,
+                status=CapabilityStatus.ENABLED if enabled else CapabilityStatus.ACTION_REQUIRED,
+                actual_scopes=token.granted_scopes,
+                last_verified_at=now,
+                last_error_code=None if enabled else "connection_scope_missing",
+            )
 
     async def list(self, *, user_id: UUID) -> tuple[ConnectionSummary, ...]:
         """返回当前用户的连接列表，绝不加载或公开 credential 行。"""

@@ -32,7 +32,11 @@ from ai_employee.domain.connections import (
     ConnectionCapabilityDependencyConflict,
     validate_capability_disable,
 )
-from ai_employee.domain.errors import StateConflictError, TransientProviderError
+from ai_employee.domain.errors import (
+    StateConflictError,
+    TransientProviderError,
+    UserActionRequiredError,
+)
 from ai_employee.infrastructure.security.encryption import AeadCipher
 
 _VALID_OAUTH_STATE = base64.urlsafe_b64encode(b"s" * 32).rstrip(b"=").decode("ascii")
@@ -104,6 +108,11 @@ class FakeConnectionStore:
     disabled: ConnectionCapability | None = None
     attempt: dict[str, Any] = field(default_factory=dict)
     disconnected: bool = False
+
+    async def get_refresh_events(self, **values: Any) -> tuple[()]:
+        """本组领域编排 fixture 没有 refresh 历史；真实 fence/CAS 使用数据库测试覆盖。"""
+        assert values["user_id"] == self.user_id
+        return ()
 
     async def get_connection(
         self,
@@ -690,6 +699,11 @@ class CallbackConnectionStore:
         str,
     ] | None = None
 
+    async def get_refresh_events(self, **values: Any) -> tuple[()]:
+        """普通 callback fixture 没有自动 refresh 历史，不伪造恢复事件。"""
+        assert values["user_id"] == self.attempt.user_id
+        return ()
+
     async def consume_attempt(
         self,
         *,
@@ -712,6 +726,10 @@ class CallbackConnectionStore:
         """记录实际 granted scopes 并返回稳定连接。"""
         self.saved_scopes = values["scopes"]
         return self.connection_id
+
+    async def validate_unfenced_identity_for_callback(self, **values: Any) -> None:
+        """该普通 callback fixture 没有历史 fence，仍校验调用方限定了当前用户。"""
+        assert values["user_id"] == self.attempt.user_id
 
     async def save_connection_tokens(self, **values: Any) -> None:
         """记录 callback 是否错误制造了 refresh 密文。"""
@@ -1028,6 +1046,59 @@ async def test_progressive_callback_failure_converges_authorizing_capabilities()
         requested,
         "oauth_authorization_failed",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stable_code",
+    (
+        "google_reauthorization_required",
+        "microsoft_admin_consent_required",
+        "microsoft_reauthorization_required",
+    ),
+)
+async def test_progressive_known_failure_preserves_safe_classification(stable_code: str) -> None:
+    """已由适配器分类的交互/同意失败必须同步持久状态，不能被通用错误抹平。"""
+    user_id, attempt_id, connection_id = uuid4(), uuid4(), uuid4()
+    cipher = AeadCipher(b"f" * 32)
+    provider = "microsoft" if stable_code.startswith("microsoft_") else "google"
+    requested = frozenset({ConnectionCapability.MAIL_READ})
+    store = CallbackConnectionStore(
+        ConsumedOAuthAttempt(
+            id=attempt_id,
+            user_id=user_id,
+            provider=provider,
+            requested_capabilities=requested,
+            verifier=cipher.encrypt(
+                b"synthetic-verifier", f"{user_id}:{attempt_id}:pkce_verifier".encode("ascii")
+            ),
+            oidc_nonce_hash=None,
+            target_connection_id=connection_id,
+            target_authorization_generation=7,
+        ),
+        connection_id,
+    )
+
+    @asynccontextmanager
+    async def stores():
+        """只替代持久端口；实际分类与用例异常路径保持真实。"""
+        yield store
+
+    failure = UserActionRequiredError(error_code=stable_code, message="Safe synthetic failure")
+    adapter = CallbackOAuthAdapter(
+        OAuthTokenSet("synthetic-access", None, 3600, frozenset({"scope:mail.read"})),
+        provider=OAuthProvider(provider),
+        failure_stage="exchange",
+        failure=failure,
+    )
+    use_case = ConnectionsUseCase(stores, cipher, {provider: adapter}, FixedClock())
+
+    with pytest.raises(UserActionRequiredError) as raised:
+        await use_case.callback(code="synthetic-code", state=_VALID_OAUTH_STATE)
+
+    assert raised.value is failure
+    assert store.failed_authorization == (connection_id, 7, requested, stable_code)
+    assert store.saved_scopes == frozenset()
 
 
 @pytest.mark.asyncio

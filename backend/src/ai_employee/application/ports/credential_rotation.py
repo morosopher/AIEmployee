@@ -25,17 +25,32 @@ from pydantic import (
 )
 
 from ai_employee.application.calendar_aad_digests import canonical_utc, connection_digest_v1
+from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.tasks import JsonValue
 
 if TYPE_CHECKING:
     from ai_employee.application.ports.oauth import OAuthTokenSet
-    from ai_employee.application.ports.oauth_refresh import OAuthRefreshClaim
+    from ai_employee.application.ports.oauth_refresh import (
+        OAuthRecoveryAuthorization,
+        OAuthRecoveryCandidate,
+        OAuthRecoveryClaim,
+        OAuthRefreshClaim,
+    )
 
 AutomaticRefreshSource = Literal["calendar_aad_preflight", "provider_refresh"]
 RefreshTokenDisposition = Literal["missing", "same", "different"]
 HexDigest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Generation = Annotated[int, Field(ge=0)]
 KeyVersion = Annotated[int, Field(gt=0)]
+RecoveryCapabilityTransition = Literal["action_required", "stale_target_noop"]
+RecoveryFailureCode = Literal[
+    "oauth_authorization_failed",
+    "microsoft_admin_consent_required",
+    "microsoft_reauthorization_required",
+    "google_reauthorization_required",
+    "oauth_credential_state_conflict",
+    "oauth_refresh_recovery_unsatisfied",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,15 +245,8 @@ class RecoveryUnsatisfiedV1(_RecoveryResultBinding):
     requested_capabilities: list[
         Literal["calendar.read", "calendar.write", "mail.read", "mail.send"]
     ]
-    capability_transition: Literal["action_required", "stale_target_noop"]
-    error_code: Literal[
-        "oauth_authorization_failed",
-        "microsoft_admin_consent_required",
-        "microsoft_reauthorization_required",
-        "google_reauthorization_required",
-        "oauth_credential_state_conflict",
-        "oauth_refresh_recovery_unsatisfied",
-    ]
+    capability_transition: RecoveryCapabilityTransition
+    error_code: RecoveryFailureCode
     result_code: Literal["oauth_refresh_recovery_unsatisfied"]
 
     @model_validator(mode="after")
@@ -454,14 +462,133 @@ def parse_oauth_refresh_result(
 
 
 class CredentialRotationRepository(Protocol):
-    """在调用方短事务内执行完整 snapshot CAS 和 matching confirmed 追加。
+    """在调用方短事务内执行自动/显式恢复的同一 snapshot CAS 和关闭事实追加。
 
     自动 repository 不提交事务、不执行 provider I/O，也不提供无条件 upsert。
-    显式恢复将在同一个 CAS helper 上扩展；它不能复用自动 grant 创建第二个 started。
+    显式恢复复用同一个 credential writer；它不能复用自动 grant 创建第二个 started。
     """
 
     async def confirm(
         self, claim: OAuthRefreshClaim, tokens: OAuthTokenSet, *, completed_at: datetime
     ) -> ConfirmedV1:
         """重检连接→access→refresh→started，并原子更新密文与本次 confirmed。"""
+        ...
+
+    async def recovery_candidate(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> OAuthRecoveryCandidate | None:
+        """在 start 事务内锁定当前凭据并核对唯一原 fence。
+
+        Args:
+            user_id: 发起显式渐进授权的用户，必须是连接归属用户。
+            connection_id: 已存在且仍 connected 的精确连接 ID。
+
+        Returns:
+            当前完整快照、受控旧明文和原 fence；没有未决 fence 时返回 None。
+
+        Raises:
+            OAuthRefreshError: 凭据不完整、固定身份不匹配、S<F 或 fence 不唯一。
+        """
+        ...
+
+    async def start_recovery(
+        self,
+        candidate: OAuthRecoveryCandidate,
+        *,
+        attempt_id: UUID,
+        target_generation: int,
+        occurred_at: datetime,
+    ) -> OAuthRecoveryAuthorization:
+        """在既有 S→T 与 OAuthAttempt 同一事务追加恢复 started，不递增第二次。
+
+        Args:
+            candidate: 同一事务持锁取得的当前 S 与原 fence，不能跨网络复用。
+            attempt_id: 已在本事务创建的 connection-bound OAuthAttempt。
+            target_generation: 既有能力授权流程唯一一次递增得到的 T=S+1。
+            occurred_at: 显式 UTC 时间；持久 started 必须严格晚于原 automatic started。
+
+        Returns:
+            原 automatic 与本次恢复 started 的精确内存关联。
+
+        Raises:
+            OAuthRefreshError: 代际、attempt 归属或持久关系不满足固定恢复协议。
+        """
+        ...
+
+    async def recovery_authorization(
+        self, *, user_id: UUID, connection_id: UUID, attempt_id: UUID
+    ) -> OAuthRecoveryAuthorization | None:
+        """按已消费 OAuthAttempt.id 解析唯一恢复关联。
+
+        Args:
+            user_id: 已消费 state 对应的用户。
+            connection_id: attempt 冻结的目标连接。
+            attempt_id: 一次性 OAuthAttempt ID，不能用供应商 code 推断关联。
+
+        Returns:
+            经共享严格 parser 验证的关联；普通 attempt 返回 None。
+
+        Raises:
+            OAuthRefreshError: 已有恢复记录损坏、重复或与原 fence/attempt 矛盾。
+        """
+        ...
+
+    async def freeze_recovery(
+        self, authorization: OAuthRecoveryAuthorization
+    ) -> OAuthRecoveryClaim:
+        """在 code exchange 前冻结当前 T 和完整双行，调用方必须持共享连接 lease。
+
+        Args:
+            authorization: 已消费 attempt 与两个 immutable started 的精确关联。
+
+        Returns:
+            当前物理 CAS 快照；历史 pre-digest 仍精确引用原 automatic fence。
+
+        Raises:
+            OAuthRefreshError: T 已失效、旧身份改变、原 fence 已关闭或凭据无效。
+        """
+        ...
+
+    async def replace(
+        self, claim: OAuthRecoveryClaim, tokens: OAuthTokenSet, *, completed_at: datetime
+    ) -> CredentialReplacedV1:
+        """CAS code 前冻结的双行并追加不同-token proof；scope/能力由同事务用例更新。
+
+        Args:
+            claim: 网络前冻结的 T/双行/旧明文，网络后禁止重新选取快照。
+            tokens: 已通过规范身份、scope 与 expiry 校验的供应商响应。
+            completed_at: 本次持久化的显式 UTC 时间。
+
+        Returns:
+            严格 replacement 元数据；只有整个调用方事务提交后才关闭两个 started。
+
+        Raises:
+            OAuthRefreshError: CAS、两条 started、旧身份或不同 refresh 明文证明失败。
+        """
+        ...
+
+    async def unsatisfied(
+        self,
+        authorization: OAuthRecoveryAuthorization,
+        *,
+        requested_capabilities: frozenset[ConnectionCapability],
+        capability_transition: RecoveryCapabilityTransition,
+        error_code: RecoveryFailureCode,
+        completed_at: datetime,
+    ) -> RecoveryUnsatisfiedV1:
+        """重查 requested 状态及两条 started，只关闭恢复 attempt，绝不写 credential。
+
+        Args:
+            authorization: 原 fence 与本次已消费 OAuthAttempt 的严格关联。
+            requested_capabilities: attempt 实际冻结的非空规范能力集合。
+            capability_transition: 同事务能力更新返回的 action_required 或 stale_target_noop。
+            error_code: 固定稳定失败码，不能传入供应商原文。
+            completed_at: 显式 UTC 时间；结果严格晚于恢复 started。
+
+        Returns:
+            不含 post 快照、新 identity 或 expiry 的 unsatisfied 元数据。
+
+        Raises:
+            OAuthRefreshError: attempt、当前能力变化或已有关闭事实相互矛盾。
+        """
         ...

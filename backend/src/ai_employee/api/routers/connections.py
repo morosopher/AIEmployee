@@ -1,13 +1,14 @@
 """暴露经 Cookie 会话与 CSRF 保护的连接及渐进能力 API。"""
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession
+from ai_employee.application.ports.credential_rotation import RecoveryFailureCode
 from ai_employee.application.ports.oauth import OAuthProvider
 from ai_employee.application.use_cases.connections import (
     CapabilityEnableResult,
@@ -195,6 +196,79 @@ def _not_found_problem() -> ApiProblem:
     )
 
 
+async def _complete_oauth_callback(
+    *,
+    provider: OAuthProvider,
+    use_case: ConnectionsUseCase,
+    state_value: str,
+    code: str | None,
+    error: str | None,
+    error_description: str | None,
+    error_codes: str | None,
+) -> dict[str, str]:
+    """两家 callback 共用互斥结果联合，shape 错误在消费 state 前失败。
+
+    合法未知 error 也消费一次 state；raw 值只在本地 Microsoft 安全分类器短暂使用，
+    应用端口/审计/Problem 只接收固定分类码。两家都不能通过错误分支到达凭据保存。
+
+    Args:
+        provider: 当前固定路由绑定的供应商。
+        use_case: 组合根注入的连接用例，拥有消费/恢复/事务边界。
+        state_value: 路由已检查非空和有界长度的一次性 state。
+        code: 有界非空授权码，与 error 必须恰好提供一个。
+        error: 有界非空供应商错误，只在本函数短暂分类。
+        error_description: 有界原始说明，只提供给安全分类器，禁止透传。
+        error_codes: 有界原始分类提示，只提供给安全分类器，禁止透传。
+
+    Returns:
+        成功 callback 的原连接 ID，不能携带 token 或供应商正文。
+
+    Raises:
+        ApiProblem: 输入联合不合法或 state 验证失败。
+        DomainError: 已持久消费的安全失败分类或恢复结果异常。
+    """
+    if (code is None) == (error is None) or (error is not None and not error.strip()):
+        raise ApiProblem(
+            422,
+            "request_validation_failed",
+            "Request validation failed",
+            "The request did not match the required schema.",
+        )
+    try:
+        if error is not None:
+            classified = (
+                classify_microsoft_callback_error(
+                    error=error,
+                    error_description=error_description,
+                    error_codes=error_codes,
+                )
+                if provider is OAuthProvider.MICROSOFT
+                else None
+            )
+            if classified is None:
+                classified = PermanentProviderError(
+                    error_code="oauth_authorization_failed",
+                    message="OAuth authorization failed",
+                )
+            await use_case.callback_error(
+                provider=provider,
+                state=state_value,
+                error_code=cast(RecoveryFailureCode, classified.error_code),
+            )
+            raise classified
+        if code is None:
+            raise AssertionError("validated OAuth callback lacks a code")
+        connection_id = await use_case.callback(code=code, state=state_value, provider=provider)
+    except OAuthStateRejectedError:
+        raise ApiProblem(
+            400,
+            "oauth_state_rejected",
+            "OAuth state rejected",
+            "The OAuth state is invalid or expired.",
+        ) from None
+    return {"connection_id": str(connection_id)}
+
+
 def build_connections_router() -> APIRouter:
     """构建连接路由；固定 ``/google/*`` 必须先于动态连接路径注册。"""
     from ai_employee.api.deps import get_connections_use_case, get_create_task_use_case
@@ -232,21 +306,23 @@ def build_connections_router() -> APIRouter:
 
     @router.get("/google/callback")
     async def complete_google_connection(
-        code: Annotated[str, Query(min_length=1, max_length=4096)],
         state_value: Annotated[str, Query(alias="state", min_length=1, max_length=512)],
         use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+        code: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
+        error: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+        error_description: Annotated[str | None, Query(max_length=4096)] = None,
+        error_codes: Annotated[str | None, Query(max_length=256)] = None,
     ) -> dict[str, str]:
-        """消费一次性 state 并完成 callback；state 本身提供 OAuth CSRF 绑定。"""
-        try:
-            connection_id = await use_case.callback(code=code, state=state_value)
-        except OAuthStateRejectedError:
-            raise ApiProblem(
-                400,
-                "oauth_state_rejected",
-                "OAuth state rejected",
-                "The OAuth state is invalid or expired.",
-            ) from None
-        return {"connection_id": str(connection_id)}
+        """Google 通过同一 shape/一次性消费边界处理 code 或安全分类的 error。"""
+        return await _complete_oauth_callback(
+            provider=OAuthProvider.GOOGLE,
+            use_case=use_case,
+            state_value=state_value,
+            code=code,
+            error=error,
+            error_description=error_description,
+            error_codes=error_codes,
+        )
 
     @router.post("/microsoft/start", response_model=StartConnectionResponse)
     async def start_microsoft_connection(
@@ -307,45 +383,15 @@ def build_connections_router() -> APIRouter:
         ``error_description`` 仅作为分类输入，绝不进入异常消息、审计或响应；未知错误
         统一收敛为不含供应商正文的永久失败。
         """
-        if error is not None:
-            classified = classify_microsoft_callback_error(
-                error=error,
-                error_description=error_description,
-                error_codes=error_codes,
-            )
-            try:
-                await use_case.callback_error(
-                    provider=OAuthProvider.MICROSOFT,
-                    state=state_value,
-                )
-            except OAuthStateRejectedError:
-                raise ApiProblem(
-                    400,
-                    "oauth_state_rejected",
-                    "OAuth state rejected",
-                    "The OAuth state is invalid or expired.",
-                ) from None
-            if classified is not None:
-                raise classified
-            raise PermanentProviderError(
-                error_code="microsoft_oauth_rejected",
-                message="Microsoft OAuth request was rejected",
-            )
-        if code is None:
-            raise PermanentProviderError(
-                error_code="microsoft_oauth_invalid_response",
-                message="Microsoft OAuth response is invalid",
-            )
-        try:
-            connection_id = await use_case.callback(code=code, state=state_value)
-        except OAuthStateRejectedError:
-            raise ApiProblem(
-                400,
-                "oauth_state_rejected",
-                "OAuth state rejected",
-                "The OAuth state is invalid or expired.",
-            ) from None
-        return {"connection_id": str(connection_id)}
+        return await _complete_oauth_callback(
+            provider=OAuthProvider.MICROSOFT,
+            use_case=use_case,
+            state_value=state_value,
+            code=code,
+            error=error,
+            error_description=error_description,
+            error_codes=error_codes,
+        )
 
     @router.get(
         "/{connection_id}/capabilities",

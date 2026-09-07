@@ -9,9 +9,17 @@ import pytest
 from sqlalchemy import select, text
 
 from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
-from ai_employee.application.ports.oauth import OAuthProvider, OAuthTokenSet
+from ai_employee.application.ports.oauth import (
+    OAuthAccount,
+    OAuthAuthorizationRequest,
+    OAuthProvider,
+    OAuthRevocationResult,
+    OAuthTokenSet,
+)
 from ai_employee.application.ports.oauth_refresh import OAuthRefreshError, OAuthRefreshRequest
+from ai_employee.application.use_cases.connections import ConnectionsUseCase
 from ai_employee.domain.connections import ConnectionCapability
+from ai_employee.domain.errors import TransientProviderError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
@@ -19,6 +27,7 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStoreFactory
 from ai_employee.infrastructure.db.repositories.credential_rotation import (
     SqlAlchemyCredentialRotationRepository,
     credential_snapshot,
@@ -179,6 +188,105 @@ async def persisted_credentials(sessions: ManagedAsyncSessionMaker):
             )
         ).all()
         return {row.credential_kind: credential_snapshot(row) for row in rows}
+
+
+@dataclass
+class RecoveryOAuthAdapter:
+    """仅替代 OAuth HTTP；真实用例、session lease、双行 CAS 和审计保持不变。"""
+
+    response: OAuthTokenSet
+    before_response: Callable[[], Awaitable[None]] | None = None
+    request: OAuthAuthorizationRequest | None = None
+    calls: int = 0
+    failure: Exception | None = None
+    account_id: str = "synthetic-account-1"
+    provider = OAuthProvider.GOOGLE
+
+    def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
+        """使用完整 Gmail/Calendar 能力映射，使 scope 覆盖仍由生产用例判定。"""
+        mapping = {
+            ConnectionCapability.MAIL_READ: "https://www.googleapis.com/auth/gmail.readonly",
+            ConnectionCapability.MAIL_SEND: "https://www.googleapis.com/auth/gmail.send",
+            ConnectionCapability.CALENDAR_READ: "https://www.googleapis.com/auth/calendar.readonly",
+            ConnectionCapability.CALENDAR_WRITE: "https://www.googleapis.com/auth/calendar.events",
+        }
+        return frozenset(mapping[value] for value in capabilities)
+
+    def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
+        """仅在内存保存 state，不把一次性随机值写入日志或证据。"""
+        self.request = request
+        return "https://provider.example.test/authorize"
+
+    async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
+        """记录一次网络交换，并允许精确注入供应商故障或数据库交错。"""
+        assert bool(code) and bool(verifier)
+        self.calls += 1
+        if self.before_response is not None:
+            await self.before_response()
+        if self.failure is not None:
+            raise self.failure
+        return self.response
+
+    async def fetch_account(
+        self, token: OAuthTokenSet, *, expected_nonce_hash: bytes | None
+    ) -> OAuthAccount:
+        """供应商返回完整规范化身份，身份不匹配测试只替换稳定账户键。"""
+        del token, expected_nonce_hash
+        return OAuthAccount(self.account_id, "owner@example.test", "", "google")
+
+    async def refresh(self, refresh_token: str) -> OAuthTokenSet:
+        """恢复回调不得借此发送第二个自动 refresh grant。"""
+        del refresh_token
+        raise AssertionError("recovery must not use automatic grant")
+
+    async def revoke(self, token: str) -> OAuthRevocationResult:
+        """本 fixture 不执行供应商撤销。"""
+        del token
+        raise AssertionError("recovery must not revoke")
+
+
+@dataclass(frozen=True)
+class RecoveryClock:
+    """同一固定时刻也必须靠微秒顺序生成严格 started/result 时间戳。"""
+
+    def now(self) -> datetime:
+        """返回测试 UTC 时钟，不依赖真实墙钟。"""
+        return NOW
+
+
+def recovery_use_case(oauth_state, adapter: RecoveryOAuthAdapter) -> ConnectionsUseCase:
+    """为真实数据库恢复构造现有连接用例，供应商网络是唯一 fake 边界。"""
+    sessions, cipher, coordinator = oauth_state
+    return ConnectionsUseCase(
+        SqlAlchemyConnectionStoreFactory(sessions),
+        cipher,
+        {"google": adapter},
+        RecoveryClock(),
+        identity=OAuthRefreshIdentity(bytes(range(32)), key_version=cipher.key_version),
+        coordinator=coordinator,
+    )
+
+
+async def make_unknown_fence(coordinator: SqlAlchemyOAuthRefreshCoordinator) -> None:
+    """通过真实自动 grant admission 加一次已分类传输失败留下原始 durable fence。"""
+
+    async def failed_response() -> None:
+        """未知网络结果不能被当成可安全重发的自动刷新。"""
+        raise TransientProviderError(error_code="synthetic_oauth_timeout", message="Safe failure")
+
+    provider = FakeRefreshProvider(token_response(), before_response=failed_response)
+    with pytest.raises(OAuthRefreshError):
+        await coordinator.refresh(refresh_request(), provider)
+    assert provider.calls == 1
+
+
+async def begin_recovery(use_case: ConnectionsUseCase, adapter: RecoveryOAuthAdapter) -> str:
+    """显式在原连接发起 mail.send 依赖闭包，并返回只供本次 callback 使用的 state。"""
+    await use_case.start_capability_enable(
+        user_id=USER_ID, connection_id=CONNECTION_ID, capability=ConnectionCapability.MAIL_SEND
+    )
+    assert adapter.request is not None
+    return adapter.request.state
 
 
 @pytest.mark.asyncio
@@ -404,4 +512,99 @@ async def test_automatic_coordinator_app_role_preserves_append_only_audit_permis
                 await session.execute(text("SELECT id FROM audit_events FOR UPDATE"))
     finally:
         event.remove(app_sessions.engine.sync_engine, "handle_error", capture_safe_sqlstate)
+        await app_sessions.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recovery_app_role_can_start_close_unsatisfied_and_replace_without_audit_update(
+    oauth_state,
+    database_url: str,
+) -> None:
+    """真正 app 登录复用两个 audit mutex，拒绝/缺少 refresh/替换均只需 SELECT 与 INSERT。"""
+    from sqlalchemy.engine import make_url
+
+    from ai_employee.application.ports.credential_rotation import (
+        CredentialReplacedV1,
+        RecoveryUnsatisfiedV1,
+    )
+    from ai_employee.infrastructure.db.models.sources import OAuthAttemptModel
+
+    _, cipher, _ = oauth_state
+    app_url = make_url(database_url).set(
+        username="ai_employee_app", password="app-role-integration-password"
+    )
+    app_sessions = build_session_factory(app_url.render_as_string(hide_password=False))
+    coordinator = SqlAlchemyOAuthRefreshCoordinator(
+        session_factory=app_sessions,
+        cipher=cipher,
+        identity=OAuthRefreshIdentity(bytes(range(32)), key_version=7),
+        clock=lambda: NOW,
+    )
+    adapter = RecoveryOAuthAdapter(
+        OAuthTokenSet(
+            "synthetic-recovery-access",
+            None,
+            3600,
+            SCOPES | {"https://www.googleapis.com/auth/gmail.send"},
+        )
+    )
+    use_case = recovery_use_case((app_sessions, cipher, coordinator), adapter)
+    try:
+        async with app_sessions() as session:
+            assert await session.scalar(text("SELECT current_user")) == "ai_employee_app"
+            for privilege, expected in (
+                ("SELECT", True),
+                ("INSERT", True),
+                ("UPDATE", False),
+                ("DELETE", False),
+            ):
+                assert (
+                    await session.scalar(
+                        text(
+                            "SELECT has_table_privilege(current_user, 'audit_events', :privilege)"
+                        ),
+                        {"privilege": privilege},
+                    )
+                    is expected
+                )
+        await make_unknown_fence(coordinator)
+        for outcome in ("denial", "missing", "replacement"):
+            if outcome == "replacement":
+                adapter.response = OAuthTokenSet(
+                    "synthetic-recovery-access",
+                    "synthetic-different-refresh",
+                    3600,
+                    SCOPES | {"https://www.googleapis.com/auth/gmail.send"},
+                )
+            state = await begin_recovery(use_case, adapter)
+            if outcome == "denial":
+                await use_case.callback_error(provider="google", state=state)
+            elif outcome == "missing":
+                with pytest.raises(OAuthRefreshError):
+                    await use_case.callback(code="synthetic-code", state=state)
+            else:
+                assert await use_case.callback(code="synthetic-code", state=state) == CONNECTION_ID
+            async with app_sessions() as session:
+                attempt = await session.scalar(
+                    select(OAuthAttemptModel)
+                    .where(
+                        OAuthAttemptModel.user_id == USER_ID,
+                        OAuthAttemptModel.target_connection_id == CONNECTION_ID,
+                    )
+                    .order_by(OAuthAttemptModel.target_authorization_generation.desc())
+                )
+                assert attempt is not None and attempt.consumed_at is not None
+            result = await coordinator.read_result(
+                user_id=USER_ID,
+                connection_id=CONNECTION_ID,
+                attempt_id=attempt.id,
+                recovery=True,
+            )
+            assert result is not None
+            assert isinstance(
+                result.metadata,
+                CredentialReplacedV1 if outcome == "replacement" else RecoveryUnsatisfiedV1,
+            )
+        assert adapter.calls == 2 and app_sessions.engine.pool.checkedout() == 0
+    finally:
         await app_sessions.dispose()

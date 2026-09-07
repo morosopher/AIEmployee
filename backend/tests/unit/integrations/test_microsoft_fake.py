@@ -49,6 +49,10 @@ class _CallbackStore:
         assert values["attempt_id"] == self.attempt.id
         assert values["user_id"] == self.attempt.user_id
 
+    async def validate_unfenced_identity_for_callback(self, **values: object) -> None:
+        """test-mode fixture 只含未建连接的身份；前置检查仍须携带 attempt 用户。"""
+        assert values["user_id"] == self.attempt.user_id
+
     async def ensure_connection(self, **values: object) -> UUID:
         """返回稳定合成连接 ID。"""
         del values

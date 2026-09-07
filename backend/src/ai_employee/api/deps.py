@@ -66,6 +66,7 @@ if TYPE_CHECKING:
         CalendarProposalUseCase,
         CalendarRestoreEnqueueUseCase,
     )
+    from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
     from ai_employee.application.use_cases.settings import UpdateUserSettings
     from ai_employee.application.use_cases.trusted_actions import (
@@ -639,7 +640,7 @@ def get_create_task_use_case(request: Request):
     return request.app.state.create_task_use_case
 
 
-def get_connections_use_case(request: Request):
+def get_connections_use_case(request: Request) -> "ConnectionsUseCase":
     """在组合边界构造固定 adapter mapping 的供应商中立连接用例。
 
     非 ``APP_TEST_MODE`` 的契约/集成测试可在 ``app.state.oauth_adapters`` 一次性放入
@@ -647,16 +648,23 @@ def get_connections_use_case(request: Request):
     Task 10 的 ``MicrosoftOAuthAdapter``。``APP_TEST_MODE`` 的优先级最高，会完全忽略
     外部 mapping，并为两个供应商固定装配绝不联网的合成 fake。mapping 会由用例复制冻结，
     没有运行时注册或替换入口。真实 client secret 仍只在非测试模式从 Secret 文件读取。
+
+    Args:
+        request: 当前 API 请求；应用状态拥有 session/store 生命周期及固定 adapter mapping。
+
+    Returns:
+        由一次 Secret 读取构造的 cipher、固定 identity 和共享 coordinator 共同注入的
+        连接用例，确保 API 恢复与 Worker 自动刷新使用同一 credential/lease 协议。
     """
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
 
     settings = get_auth_settings(request)
     from ai_employee.integrations.registry import build_oauth_security_services
 
-    cipher = build_oauth_security_services(
+    security = build_oauth_security_services(
         session_factory=request.app.state.auth_session_factory,
         master_key_file=settings.app_master_key_file,
-    ).cipher
+    )
     injected = getattr(request.app.state, "oauth_adapters", None)
     if settings.app_test_mode:
         # APP_TEST_MODE 是优先于 app.state 注入的不可绕过隔离边界。这里不尝试通过
@@ -708,9 +716,11 @@ def get_connections_use_case(request: Request):
             )
     return ConnectionsUseCase(
         request.app.state.connections_store_factory,
-        cipher,
+        security.cipher,
         adapters,
         get_auth_clock(request),
+        identity=security.identity,
+        coordinator=security.coordinator,
     )
 
 

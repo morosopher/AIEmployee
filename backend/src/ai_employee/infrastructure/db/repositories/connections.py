@@ -1,7 +1,9 @@
 """提供供应商中立连接与能力用例所需的 SQLAlchemy 事务存储适配器。"""
 
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from datetime import datetime
+from types import TracebackType
+from typing import get_args
 from uuid import UUID
 
 from sqlalchemy import String, cast, delete, exists, func, select, update
@@ -9,9 +11,15 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from ai_employee.application.ports.encryption import EncryptedValue
+from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
+from ai_employee.application.ports.credential_rotation import (
+    CredentialRotationRepository,
+    OAuthRefreshAuditRecord,
+    RecoveryCapabilityTransition,
+    RecoveryFailureCode,
+)
+from ai_employee.application.ports.encryption import EncryptedValue, Encryption
 from ai_employee.application.use_cases.connections import (
-    OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
     ConnectionCapabilitySnapshot,
     ConnectionCredentialOwnershipError,
     ConnectionIdentityConflictError,
@@ -40,6 +48,11 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories.credential_rotation import (
+    SqlAlchemyCredentialRotationRepository,
+    assert_connection_unfenced,
+)
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import read_refresh_events
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
     invalidate_unclaimed_actions_for_connection,
     lock_connection_submission_scope,
@@ -199,6 +212,7 @@ class SqlAlchemyConnectionStore:
         attempt_id: UUID,
         provider: str,
         occurred_at: datetime,
+        error_code: RecoveryFailureCode = "oauth_authorization_failed",
     ) -> None:
         """追加本事务已消费 attempt 的固定失败审计，保留原用户归属且不接收 raw error。
 
@@ -218,7 +232,11 @@ class SqlAlchemyConnectionStore:
                 OAuthAttemptModel.consumed_at == occurred_at,
             )
         )
-        if owned is None or provider not in {"google", "microsoft"}:
+        if (
+            owned is None
+            or provider not in {"google", "microsoft"}
+            or error_code not in get_args(RecoveryFailureCode)
+        ):
             raise ValueError("OAuth failure audit requires a matching consumed attempt")
         self._session.add(
             AuditEventModel(
@@ -231,11 +249,27 @@ class SqlAlchemyConnectionStore:
                 event_metadata={
                     "provider": provider,
                     "oauth_attempt_id": str(attempt_id),
-                    "error_code": OAUTH_AUTHORIZATION_FAILED_ERROR_CODE,
+                    "error_code": error_code,
                 },
             )
         )
         await self._session.flush()
+
+    async def get_refresh_events(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> tuple[OAuthRefreshAuditRecord, ...]:
+        """复用 coordinator 的用户/连接过滤查询，不复制结果联合解析规则。"""
+        return await read_refresh_events(
+            self._session, user_id=user_id, connection_id=connection_id
+        )
+
+    def credential_rotation(
+        self, *, cipher: Encryption, identity: OAuthRefreshIdentity
+    ) -> CredentialRotationRepository:
+        """向应用层暴露同一事务的 Task27A writer，scope/能力/result 因此共同提交或回滚。"""
+        return SqlAlchemyCredentialRotationRepository(
+            self._session, cipher=cipher, identity=identity
+        )
 
     async def validate_unbound_attempt_for_callback(
         self,
@@ -280,6 +314,46 @@ class SqlAlchemyConnectionStore:
         )
         return None if row is None else _stored_connection(row)
 
+    async def validate_unfenced_identity_for_callback(
+        self,
+        *,
+        user_id: UUID,
+        provider: str,
+        provider_account_id: str,
+        identity_key_version: int,
+    ) -> None:
+        """在无目标 callback 调用 ensure 前，以规范身份锁定既有连接并拒绝 fence。
+
+        Args:
+            user_id: 已验证 OAuthAttempt 的用户；查询始终显式限定归属。
+            provider: 已由 attempt 绑定并由 adapter 规范化的供应商名。
+            provider_account_id: 不含可变邮箱语义的规范账户键。
+            identity_key_version: 与共享 refresh identity 服务一致的根密钥版本。
+
+        不存在或已断开的身份沿用既有 bootstrap/reset 规则；此检查不创建连接、不
+        改变 scope/能力/凭据，也不把重新连接解释为原 fence 的 replacement proof。
+        已存在行的锁持续到 callback 事务结束；并发插入仍由 ensure 内部复查兜底。
+
+        Raises:
+            OAuthRefreshError: connected 身份有未关闭的自动 fence，或审计验证失败。
+        """
+        connection = await self._session.scalar(
+            select(OAuthConnectionModel)
+            .where(
+                OAuthConnectionModel.user_id == user_id,
+                OAuthConnectionModel.provider == provider,
+                OAuthConnectionModel.provider_account_id == provider_account_id,
+            )
+            .with_for_update()
+        )
+        if connection is not None and connection.status == ConnectionStatus.CONNECTED.value:
+            await assert_connection_unfenced(
+                self._session,
+                user_id=user_id,
+                connection_id=connection.id,
+                key_version=identity_key_version,
+            )
+
     async def ensure_connection(
         self,
         *,
@@ -290,6 +364,7 @@ class SqlAlchemyConnectionStore:
         account_type: str,
         account_email: str,
         scopes: frozenset[str],
+        identity_key_version: int | None = None,
     ) -> UUID:
         """按规范账户键安全建立或合并连接，并初始化/保留能力行。
 
@@ -366,6 +441,15 @@ class SqlAlchemyConnectionStore:
         preserve_connected_state = (
             not inserted and connection.status == ConnectionStatus.CONNECTED.value
         )
+        if preserve_connected_state:
+            # 必须在 account/scope/capability 的任何赋值之前检查；唯一键竞争后重新
+            # 读出的既有连接也经过此门禁，无 target 的 code 不能成为恢复 fence 的捷径。
+            await assert_connection_unfenced(
+                self._session,
+                user_id=user_id,
+                connection_id=connection.id,
+                key_version=identity_key_version,
+            )
         if preserve_connected_state and not frozenset(connection.scopes).issubset(scopes):
             # 一个连接只持久化一组 access/refresh token。若 incoming token 不覆盖当前
             # scope，合并 JSON scope 或保留双 enabled 能力都会制造无法由最终凭据证明的
@@ -521,6 +605,13 @@ class SqlAlchemyConnectionStore:
         if owned_connection_id is None:
             raise ConnectionCredentialOwnershipError
 
+        await assert_connection_unfenced(
+            self._session,
+            user_id=user_id,
+            connection_id=connection_id,
+            key_version=access_token.key_version,
+        )
+
         await self._upsert_credential(
             connection_id,
             user_id,
@@ -664,7 +755,7 @@ class SqlAlchemyConnectionStore:
         authorization_generation: int,
         capabilities: frozenset[ConnectionCapability],
         error_code: str,
-    ) -> None:
+    ) -> RecoveryCapabilityTransition:
         """在连接行锁与授权代际仍匹配时收敛失败能力，过时回调安全 no-op。
 
         失败 callback 可能与新一轮授权、能力关闭或断开并发。先锁定连接并检查
@@ -672,8 +763,8 @@ class SqlAlchemyConnectionStore:
         因而旧失败不能覆盖新状态，也不会抹掉既有实际 scope 快照。
         """
         if not capabilities:
-            return
-        if error_code != OAUTH_AUTHORIZATION_FAILED_ERROR_CODE:
+            return "stale_target_noop"
+        if error_code not in get_args(RecoveryFailureCode):
             raise ValueError("progressive authorization failure code is invalid")
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
@@ -688,7 +779,7 @@ class SqlAlchemyConnectionStore:
             or connection.status != ConnectionStatus.CONNECTED.value
             or connection.authorization_generation != authorization_generation
         ):
-            return
+            return "stale_target_noop"
         capability_values = tuple(capability.value for capability in capabilities)
         await self._session.execute(
             update(ConnectionCapabilityModel)
@@ -704,6 +795,7 @@ class SqlAlchemyConnectionStore:
             )
         )
         await self._session.flush()
+        return "action_required"
 
     async def ensure_bound_connection_for_callback(
         self,
@@ -715,6 +807,7 @@ class SqlAlchemyConnectionStore:
         provider_account_id: str,
         provider_tenant_id: str,
         account_type: str,
+        identity_key_version: int | None = None,
     ) -> UUID:
         """锁定并核对冻结连接身份与授权代际，任何不一致都 fail closed。"""
         connection = await self._session.scalar(
@@ -735,6 +828,12 @@ class SqlAlchemyConnectionStore:
             or connection.account_type != account_type
         ):
             raise OAuthAttemptInvalidatedError
+        await assert_connection_unfenced(
+            self._session,
+            user_id=user_id,
+            connection_id=connection_id,
+            key_version=identity_key_version,
+        )
         return connection.id
 
     async def disable_capability(
@@ -1227,19 +1326,25 @@ class _ConnectionStoreContext(AbstractAsyncContextManager[ConnectionStore]):
     """把 SQLAlchemy session factory 的事务语义收窄为应用层端口。"""
 
     def __init__(self, factory: ManagedAsyncSessionMaker) -> None:
-        """保存尚未进入的 SQLAlchemy ``begin`` 上下文。"""
-        self._context = factory.begin()
+        """分别拥有 session 与短事务；commit ACK 异常仍必须关闭/归还原连接。"""
+        self._session = factory()
+        self._stack = AsyncExitStack()
 
     async def __aenter__(self) -> ConnectionStore:
         """进入事务并向应用层返回窄存储接口。"""
-        return SqlAlchemyConnectionStore(await self._context.__aenter__())
+        session = await self._stack.enter_async_context(self._session)
+        try:
+            await self._stack.enter_async_context(session.begin())
+        except BaseException:
+            await self._stack.aclose()
+            raise
+        return SqlAlchemyConnectionStore(session)
 
     async def __aexit__(
         self,
-        exc_type: object,
-        exc_value: object,
-        traceback: object,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
     ) -> bool | None:
         """委托 SQLAlchemy 执行原子提交或异常回滚。"""
-        await self._context.__aexit__(exc_type, exc_value, traceback)
-        return None
+        return await self._stack.__aexit__(exc_type, exc_value, traceback)

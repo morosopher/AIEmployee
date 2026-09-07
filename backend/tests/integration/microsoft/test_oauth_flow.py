@@ -17,6 +17,7 @@ from sqlalchemy import select
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.integrations.microsoft.oauth import (
@@ -443,6 +444,10 @@ async def test_microsoft_admin_consent_callback_never_echoes_raw_description(
     assert response.status_code == 409
     assert response.json()["error_code"] == "microsoft_admin_consent_required"
     assert raw_description not in response.text
+    async with context.queries() as session:
+        audit = (await session.scalars(select(AuditEventModel))).one()
+        assert set(audit.event_metadata) == {"provider", "oauth_attempt_id", "error_code"}
+        assert audit.event_metadata["error_code"] == "microsoft_admin_consent_required"
     replay = await context.client.get(
         "/api/v1/connections/microsoft/callback",
         params={
@@ -485,6 +490,10 @@ async def test_microsoft_interaction_required_maps_to_reauthorization_and_consum
     assert response.status_code == 403
     assert response.json()["error_code"] == "microsoft_reauthorization_required"
     assert raw_description not in response.text
+    async with context.queries() as session:
+        audit = (await session.scalars(select(AuditEventModel))).one()
+        assert set(audit.event_metadata) == {"provider", "oauth_attempt_id", "error_code"}
+        assert audit.event_metadata["error_code"] == "microsoft_reauthorization_required"
     replay = await context.client.get(
         "/api/v1/connections/microsoft/callback",
         params={
