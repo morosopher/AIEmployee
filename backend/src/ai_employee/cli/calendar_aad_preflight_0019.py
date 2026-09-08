@@ -23,6 +23,7 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
 )
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
@@ -102,7 +103,10 @@ async def run_preflight(
         async_calendar_aad_rollout_lease(sessions.engine.url) as lease,
     ):
         artifact_file = CalendarAadArtifactFile(backup_directory, binding)
-        existing = await asyncio.to_thread(artifact_file.read_optional)
+        # artifact 同步读取也属于当前 lease；超时必须先收完线程，不能提前退出并复用连接。
+        existing = await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(artifact_file.read_optional))
+        )
         repository = SqlAlchemyCalendarAadPreflightRepository(sessions)
         artifact = await CalendarAadPreflightUseCase(
             store=repository,

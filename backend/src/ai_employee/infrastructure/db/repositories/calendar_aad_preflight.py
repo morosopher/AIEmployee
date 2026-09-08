@@ -36,6 +36,7 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
     serialize_rollout_artifact,
     verify_rollout,
 )
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
@@ -223,15 +224,10 @@ class PostgreSQLCalendarAadRolloutLease:
             raise OAuthRefreshError("oauth_refresh_claim_lost")
 
     async def assert_owned(self) -> None:
-        """异步应用在独立线程使用同一同步 session；provider I/O 期间没有开放业务事务。"""
+        """收完同一同步 session 的校验线程后才允许关闭/复用连接，重复取消也不提前解锁。"""
         async with self._verification_lock:
             pending = asyncio.create_task(asyncio.to_thread(self.verify_owned))
-            try:
-                await asyncio.shield(pending)
-            except asyncio.CancelledError:
-                # psycopg 同步 I/O 不因 coroutine 取消停止；等它结束再关闭/复用原 session。
-                await pending
-                raise
+            await await_calendar_aad_resource(pending)
 
 
 @contextmanager
@@ -253,25 +249,27 @@ def calendar_aad_rollout_lease(database_url: URL) -> Iterator[PostgreSQLCalendar
 async def async_calendar_aad_rollout_lease(
     database_url: URL,
 ) -> AsyncIterator[PostgreSQLCalendarAadRolloutLease]:
-    """让异步 preflight/resync 使用同一固定同步 lease adapter，不阻塞 event loop。"""
+    """持有 acquire 到 exit 的全部线程结果，重复取消时也先完成同一 session 的收尾。"""
     context = calendar_aad_rollout_lease(database_url)
     acquisition = asyncio.create_task(asyncio.to_thread(context.__enter__))
+    cancellation: asyncio.CancelledError | None = None
     try:
-        lease = await asyncio.shield(acquisition)
-    except asyncio.CancelledError:
-        # 即使取消发生在线程 acquire 返回之前，也必须取回结果并显式结束 session。
-        await acquisition
-        await asyncio.to_thread(context.__exit__, None, None, None)
-        raise
-    try:
+        lease = await await_calendar_aad_resource(acquisition)
         yield lease
+    except asyncio.CancelledError as error:
+        cancellation = error
+        raise
     finally:
-        cleanup = asyncio.create_task(asyncio.to_thread(context.__exit__, None, None, None))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await cleanup
-            raise
+        # helper 保证 acquisition 已终结。成功结果即表示本次拥有 context，哪怕赋值被取消
+        # 跳过也必须显式 exit；enter 本身失败则由同步 context 的 finally 收尾。
+        if not acquisition.cancelled() and acquisition.exception() is None:
+            cleanup = asyncio.create_task(asyncio.to_thread(context.__exit__, None, None, None))
+            try:
+                await await_calendar_aad_resource(cleanup)
+            except asyncio.CancelledError:
+                if cancellation is not None:
+                    raise cancellation
+                raise
 
 
 class CalendarAadArtifactFile:
@@ -283,22 +281,29 @@ class CalendarAadArtifactFile:
         self.path = directory / f"{binding.basename}.calendar-aad-preflight.json"
 
     def read_optional(self) -> CalendarAadArtifact | None:
-        """以 no-follow 读取 bounded regular 0600 文件并重证闭合 schema 与当前 image。"""
+        """非阻塞 no-follow 打开，并在同一 fd 验证 regular/0600/大小后读取闭合 artifact。
+
+        FIFO 无 writer 时必须立即到达类型拒绝；路径预检查无法替代打开后同 fd 的事实。
+        fd 始终由此作用域显式关闭，目录等非法类型不会在 fdopen 前丢失描述符所有权。
+        """
         try:
-            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             return None
         except OSError:
             raise CalendarAadRolloutError("calendar_aad_artifact_invalid") from None
-        with os.fdopen(descriptor, "rb") as stream:
-            info = os.fstat(stream.fileno())
+        try:
+            info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(info.st_mode)
                 or stat.S_IMODE(info.st_mode) != 0o600
                 or info.st_size > 1_048_576
             ):
                 raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
-            return parse_rollout_artifact(stream.read(1_048_577), self.binding)
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                return parse_rollout_artifact(stream.read(1_048_577), self.binding)
+        finally:
+            os.close(descriptor)
 
     def read(self) -> CalendarAadArtifact:
         """后续操作必须已有成功 artifact，缺失不能被解读为 zero/bootstrap 豁免。"""
@@ -342,25 +347,53 @@ class CalendarAadArtifactFile:
         return True
 
     async def publish(self, artifact: CalendarAadArtifact, guard: CalendarAadGuard) -> None:
-        """完成文件 fsync 后重证有效截止线和同一 lease，再原子发布；失败清理本例临时文件。"""
+        """在当前 guard 下发布；任意阶段取消都先收完线程，再清理临时文件并撤回新发布。
+
+        staging/publication Task 保留真实结果所有权。临时清理收到新的取消也必须继续
+        撤回本次新文件；既有成功 artifact 的 publication 结果为 False，始终保留。
+        """
         staging = asyncio.create_task(asyncio.to_thread(self._stage, artifact))
-        temporary: Path | None = None
+        publication: asyncio.Task[bool] | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
-            temporary = await asyncio.shield(staging)
-            await guard.verify()
-            publication = asyncio.create_task(asyncio.to_thread(self._publish, temporary, artifact))
             try:
-                await asyncio.shield(publication)
-            except asyncio.CancelledError:
-                # 同步 rename 不可取消。先等线程结束，且只撤掉本次新发布，保留既有成功工件。
-                if await publication:
-                    await asyncio.to_thread(self.path.unlink, missing_ok=True)
+                temporary = await await_calendar_aad_resource(staging)
+                await guard.verify()
+                publication = asyncio.create_task(
+                    asyncio.to_thread(self._publish, temporary, artifact)
+                )
+                await await_calendar_aad_resource(publication)
+            except asyncio.CancelledError as error:
+                cancellation = error
                 raise
-        finally:
-            if temporary is None:
-                # 文件可能已在线程中创建但 Path 尚未返回；取消也不能绕过这次明确清理。
-                temporary = await staging
-            await asyncio.to_thread(temporary.unlink, missing_ok=True)
+            finally:
+                if not staging.cancelled() and staging.exception() is None:
+                    temporary = staging.result()
+                    cleanup = asyncio.create_task(
+                        asyncio.to_thread(temporary.unlink, missing_ok=True)
+                    )
+                    try:
+                        await await_calendar_aad_resource(cleanup)
+                    except asyncio.CancelledError:
+                        if cancellation is not None:
+                            raise cancellation
+                        raise
+        except BaseException as failure:
+            # 此分支也覆盖临时文件清理自身失败/取消，不能因上一项 cleanup 抛错而跳过补偿。
+            if (
+                publication is not None
+                and not publication.cancelled()
+                and publication.exception() is None
+                and publication.result()
+            ):
+                rollback = asyncio.create_task(asyncio.to_thread(self.path.unlink, missing_ok=True))
+                try:
+                    await await_calendar_aad_resource(rollback)
+                except asyncio.CancelledError:
+                    if isinstance(failure, asyncio.CancelledError):
+                        raise failure
+                    raise
+            raise
 
 
 class CalendarAadCurrentGuard:
@@ -389,7 +422,9 @@ class CalendarAadCurrentGuard:
     async def verify(self) -> datetime | None:
         """以新 current expiry 收紧窗口，并在事实读取后再检查 lease，不能跨等待复用旧证明。"""
         await self._lease.assert_owned()
-        artifact = await asyncio.to_thread(self._file.read_optional)
+        artifact = await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(self._file.read_optional))
+        )
         if artifact != self._artifact and not (artifact is None and self._allow_missing):
             raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
         facts = await self._repository.read_facts(expected_revision=self._revision)

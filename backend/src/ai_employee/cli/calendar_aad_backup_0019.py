@@ -29,6 +29,7 @@ from ai_employee.cli.calendar_aad_preflight_0019 import (
 )
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
@@ -87,16 +88,19 @@ async def run_backup_shell(operation: Literal["produce", "finish"], artifact: Pa
             start_new_session=True,
         )
     )
-    process: asyncio.subprocess.Process | None = None
     try:
-        process = await asyncio.shield(creation)
+        process = await await_calendar_aad_resource(creation)
         if await process.wait() != 0:
             raise CalendarAadRolloutError("calendar_aad_backup_failed")
-    except asyncio.CancelledError:
-        if process is None:
-            process = await creation
-        cleanup = asyncio.create_task(_stop_process(process))
-        await asyncio.shield(cleanup)
+    except asyncio.CancelledError as cancellation:
+        # spawn 结果在 helper 返回/抛出前已确定；即使赋值被取消也必须接回并停止自身进程组。
+        if not creation.cancelled() and creation.exception() is None:
+            process = creation.result()
+            cleanup = asyncio.create_task(_stop_process(process))
+            try:
+                await await_calendar_aad_resource(cleanup)
+            except asyncio.CancelledError:
+                raise cancellation
         raise
 
 
@@ -107,15 +111,18 @@ def _check_collision(artifact: Path) -> None:
 
 
 def _prepare_checksum(artifact: Path) -> None:
-    """在私有目录校验 producer 的非空 regular 文件、固定0600并生成无绝对路径 checksum。"""
-    descriptor = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as stream:
-        info = os.fstat(stream.fileno())
+    """非阻塞打开并校验 producer 的同一 regular fd，固定0600并生成无绝对路径 checksum。"""
+    descriptor = os.open(artifact, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
             raise CalendarAadRolloutError("calendar_aad_backup_failed")
-        os.fchmod(stream.fileno(), 0o600)
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        os.fsync(stream.fileno())
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     descriptor = os.open(
         artifact.with_suffix(".enc.sha256"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
     )
@@ -168,12 +175,16 @@ async def run_guarded_backup(
     """持同一 lease 验证原 artifact、调用 producer，再重读当前期限后发布精确 basename。
 
     producer 只能接收一个私有输出路径；调用方拥有数据库工厂和可取消进程。
-    任一 guard/producer 失败均清除自身暂存文件，既有成功备份从不覆盖或删除。
+    每个本地线程均须收回结果后才能退出 lease。任一 guard/producer/cleanup 失败或取消
+    都清除自身暂存文件并撤回本次新发布；cleanup 的后续取消不得跳过下一项补偿。
+    既有成功备份或 no-clobber 碰撞文件从不覆盖或删除。
     """
     binding = CalendarAadBinding(basename, immutable_image_id)
     async with async_calendar_aad_rollout_lease(sessions.engine.url) as lease:
         artifact_file = CalendarAadArtifactFile(backup_directory, binding)
-        artifact = await asyncio.to_thread(artifact_file.read)
+        artifact = await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(artifact_file.read))
+        )
         guard = CalendarAadCurrentGuard(
             repository=SqlAlchemyCalendarAadPreflightRepository(sessions),
             artifact_file=artifact_file,
@@ -184,36 +195,58 @@ async def run_guarded_backup(
         )
         await guard.verify()
         target = backup_directory / f"{basename}.dump.enc"
-        await asyncio.to_thread(_check_collision, target)
+        await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(_check_collision, target))
+        )
         creation = asyncio.create_task(
             asyncio.to_thread(
                 tempfile.TemporaryDirectory, prefix=".calendar-aad-backup-", dir=backup_directory
             )
         )
-        directory: tempfile.TemporaryDirectory[str] | None = None
+        publication: asyncio.Task[None] | None = None
+        cancellation: asyncio.CancelledError | None = None
         try:
-            directory = await asyncio.shield(creation)
-            staged = Path(directory.name) / target.name
-            await producer(staged)
-            preparation = asyncio.create_task(asyncio.to_thread(_prepare_checksum, staged))
             try:
-                await asyncio.shield(preparation)
-            except asyncio.CancelledError:
-                await preparation
+                directory = await await_calendar_aad_resource(creation)
+                staged = Path(directory.name) / target.name
+                await producer(staged)
+                preparation = asyncio.create_task(asyncio.to_thread(_prepare_checksum, staged))
+                await await_calendar_aad_resource(preparation)
+                await guard.verify()
+                publication = asyncio.create_task(
+                    asyncio.to_thread(_publish_backup, staged, target)
+                )
+                await await_calendar_aad_resource(publication)
+            except asyncio.CancelledError as error:
+                cancellation = error
                 raise
-            await guard.verify()
-            publication = asyncio.create_task(asyncio.to_thread(_publish_backup, staged, target))
-            try:
-                await asyncio.shield(publication)
-            except asyncio.CancelledError:
-                await publication
-                await asyncio.to_thread(_remove_published, target)
-                raise
-        finally:
-            if directory is None:
-                directory = await creation
-            cleanup = asyncio.create_task(asyncio.to_thread(directory.cleanup))
-            await asyncio.shield(cleanup)
+            finally:
+                # 创建结果可能在取消后才返回，只有从已完成的 Task 接回目录才能完整清理。
+                if not creation.cancelled() and creation.exception() is None:
+                    directory = creation.result()
+                    cleanup = asyncio.create_task(asyncio.to_thread(directory.cleanup))
+                    try:
+                        await await_calendar_aad_resource(cleanup)
+                    except asyncio.CancelledError:
+                        if cancellation is not None:
+                            raise cancellation
+                        raise
+        except BaseException as failure:
+            # 目录清理自身收到取消也属于失败发布；只有本次成功发布的两个成员需要撤回。
+            # _publish_backup 自身失败时已经撤回部分新成员，不能删除导致碰撞的既有文件。
+            if (
+                publication is not None
+                and not publication.cancelled()
+                and publication.exception() is None
+            ):
+                rollback = asyncio.create_task(asyncio.to_thread(_remove_published, target))
+                try:
+                    await await_calendar_aad_resource(rollback)
+                except asyncio.CancelledError:
+                    if isinstance(failure, asyncio.CancelledError):
+                        raise failure
+                    raise
+            raise
         return target
 
 

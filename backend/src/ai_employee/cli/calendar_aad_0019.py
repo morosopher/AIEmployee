@@ -35,6 +35,7 @@ from ai_employee.cli.calendar_aad_preflight_0019 import (
 )
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
@@ -99,7 +100,10 @@ async def run_recovery(
         async_calendar_aad_rollout_lease(sessions.engine.url) as lease,
     ):
         artifact_file = CalendarAadArtifactFile(backup_directory, binding)
-        artifact = await asyncio.to_thread(artifact_file.read)
+        # 与 preflight 共用同一受保护读取，取消后先收回文件线程再释放 revision lease。
+        artifact = await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(artifact_file.read))
+        )
         guard = CalendarAadCurrentGuard(
             repository=SqlAlchemyCalendarAadPreflightRepository(sessions),
             artifact_file=artifact_file,
