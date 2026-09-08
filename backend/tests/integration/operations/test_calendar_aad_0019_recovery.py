@@ -19,7 +19,11 @@ from ai_employee.infrastructure.db.repositories.calendar import (
 )
 from ai_employee.integrations.registry import ProviderAdapterRegistry
 from tests.integration.alembic_commands import run_alembic_upgrade
-from tests.integration.m2.test_credential_rotation_repository import CONNECTION_ID, USER_ID
+from tests.integration.m2.test_credential_rotation_repository import (
+    CONNECTION_ID,
+    OTHER_USER_ID,
+    USER_ID,
+)
 from tests.integration.operations.test_calendar_aad_0019_preflight import (
     BASENAME,
     IMAGE,
@@ -53,11 +57,100 @@ PAYLOAD = {
     "recovery_attempt_ordinal": 1,
 }
 KEY = f"calendar-aad-0019:{PAIR_DIGEST}:attempt:1"
+OTHER_CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000202")
+SECOND_SCOPE = "synthetic-second-marked-calendar"
+
+
+async def seed_recovery_isolation(sessions, cipher):
+    """补齐两用户/两连接同 ID 与第二 marked pair，保持 0018 来源及真实 credential AAD。
+
+    第二用户的同 ID 事件只有全空字段，因此真实 0019 migration 不应标记其 cursor；
+    两个 directory cursor 和普通任务用各自持久事实证明 exact recovery 的零影响边界。
+    """
+    from ai_employee.infrastructure.db.models.sources import (
+        ConnectionCapabilityModel,
+        EncryptedCredentialModel,
+        OAuthConnectionModel,
+        SyncCursorModel,
+    )
+    from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
+
+    scopes = ["Calendars.Read", "User.Read", "offline_access"]
+    async with sessions.begin() as session:
+        session.add(
+            OAuthConnectionModel(
+                id=OTHER_CONNECTION_ID,
+                user_id=OTHER_USER_ID,
+                provider="microsoft",
+                provider_account_id="synthetic-isolation-account",
+                account_email="isolation@example.test",
+                provider_tenant_id="synthetic-isolation-tenant",
+                account_type="work_school",
+                scopes=scopes,
+                status="connected",
+                authorization_generation=2,
+            )
+        )
+        await session.flush()
+        session.add(
+            ConnectionCapabilityModel(
+                user_id=OTHER_USER_ID,
+                connection_id=OTHER_CONNECTION_ID,
+                capability="calendar.read",
+                status="enabled",
+                actual_scopes=scopes,
+                last_verified_at=NOW,
+            )
+        )
+        for kind in ("access_token", "refresh_token"):
+            encrypted = cipher.encrypt(
+                f"synthetic-isolation-{kind}".encode(),
+                f"{OTHER_USER_ID}:{OTHER_CONNECTION_ID}:{kind}".encode(),
+            )
+            session.add(
+                EncryptedCredentialModel(
+                    user_id=OTHER_USER_ID,
+                    connection_id=OTHER_CONNECTION_ID,
+                    credential_kind=kind,
+                    ciphertext=encrypted.ciphertext,
+                    nonce=encrypted.nonce,
+                    key_version=encrypted.key_version,
+                    token_expires_at=NOW + timedelta(hours=2) if kind == "access_token" else None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        for connection_id in (CONNECTION_ID, OTHER_CONNECTION_ID):
+            session.add(
+                SyncCursorModel(
+                    connection_id=connection_id,
+                    resource_kind="calendar",
+                    scope_key="directory",
+                    cursor="synthetic-directory-cursor",
+                    last_success_at=NOW - timedelta(hours=1),
+                    last_attempt_at=NOW - timedelta(minutes=30),
+                    last_error_code="synthetic-directory-unchanged",
+                )
+            )
+        await SqlAlchemyTaskRepository(session).create_with_outbox(
+            user_id=OTHER_USER_ID,
+            kind="sync_calendar",
+            input_payload={"connection_id": str(OTHER_CONNECTION_ID), "scope_key": "directory"},
+            idempotency_key="synthetic-unrelated-isolation-task",
+        )
+    await seed_pair(sessions, scope=SECOND_SCOPE)
+    await seed_pair(
+        sessions, connection_id=OTHER_CONNECTION_ID, user_id=OTHER_USER_ID, complete=False
+    )
 
 
 @pytest.fixture
-async def aad_recovery(aad_oauth, tmp_path):
-    """经真实 active preflight 与注入式 guard 完成0018→0019，不手工 stamp/清 marker。"""
+async def aad_recovery(aad_oauth, tmp_path, request):
+    """经真实 active preflight 与注入式 guard 完成0018→0019，不手工 stamp/清 marker。
+
+    isolation 参数只扩充本例的合成布局；所有路径继续经过同一官方 lifecycle fixture，
+    不替换 guard、仓储或最终 CAS，也不改变已有单 pair 测试的数据。
+    """
     from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadBinding
     from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
         CalendarAadArtifactFile,
@@ -65,9 +158,11 @@ async def aad_recovery(aad_oauth, tmp_path):
         calendar_aad_rollout_lease,
     )
 
-    sessions, _, _, config = aad_oauth
+    sessions, cipher, _, config = aad_oauth
     await seed_pair(sessions)
     await seed_pair(sessions, scope="synthetic-unmarked-calendar", complete=False)
+    if getattr(request, "param", None) == "isolation":
+        await seed_recovery_isolation(sessions, cipher)
     artifact = await run_fixture(aad_oauth, tmp_path)
 
     def migrate():
@@ -375,6 +470,185 @@ async def run_recovery_fixture(aad_recovery, adapters, *, clock=lambda: NOW):
         clock=clock,
         settings=Settings(app_env="test", app_test_mode=True),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("aad_recovery", ["isolation"], indirect=True)
+async def test_calendar_aad_recovery_isolates_shared_id_and_multiple_marked_pairs(aad_recovery):
+    """真实 planner/Outbox/Runner 逐对恢复，两用户同 ID、目录及无关任务保持逐字段不变。
+
+    仅 Fake provider I/O；先检查两个独立 ordinal 及原子事实，再执行实际恢复并检查 v2
+    解密、精确 marker/freshness 和重放零调用，避免单 pair 用例掩盖错误的 calendar-only 更新。
+    """
+    from ai_employee.application.calendar_aad_digests import calendar_pair_digest_v1
+    from ai_employee.application.calendar_event_aad import calendar_event_field_aad_v2
+    from ai_employee.application.ports.encryption import EncryptedValue
+
+    state, _, artifact = aad_recovery
+    sessions, cipher, _, _ = state
+    marked_scopes = (SCOPE, SECOND_SCOPE)
+    expected_pairs = {(CONNECTION_ID, scope) for scope in marked_scopes}
+    expected_digests = {calendar_pair_digest_v1(*pair) for pair in expected_pairs}
+    assert artifact.affected_connection_count == 1 and artifact.affected_pair_count == 2
+
+    async def unaffected_facts():
+        """只读完整持久列；排除唯一允许改变的两个事件/cursor，保留全部隔离对象和凭据。"""
+        queries = {
+            "connections": "SELECT row_to_json(t)::text FROM oauth_connections t ORDER BY id",
+            "capabilities": "SELECT row_to_json(t)::text FROM connection_capabilities t ORDER BY id",
+            "credentials": "SELECT row_to_json(t)::text FROM encrypted_credentials t ORDER BY id",
+            "calendars": "SELECT row_to_json(t)::text FROM provider_calendars t ORDER BY id",
+            "cursors": "SELECT row_to_json(t)::text FROM sync_cursors t WHERE NOT (connection_id=:connection AND resource_kind='calendar' AND scope_key IN (:first,:second)) ORDER BY id",
+            "events": "SELECT row_to_json(t)::text FROM calendar_events t WHERE NOT (connection_id=:connection AND calendar_id IN (:first,:second)) ORDER BY id",
+            "tasks": "SELECT row_to_json(t)::text FROM task_runs t WHERE kind='sync_calendar' ORDER BY id",
+            "outbox": "SELECT row_to_json(t)::text FROM outbox_events t WHERE aggregate_id IN (SELECT id FROM task_runs WHERE kind='sync_calendar') ORDER BY id",
+            "audit": "SELECT row_to_json(t)::text FROM audit_events t WHERE task_id IN (SELECT id FROM task_runs WHERE kind='sync_calendar') ORDER BY id",
+        }
+        async with sessions() as session:
+            return {
+                name: tuple(
+                    (
+                        await session.execute(
+                            text(query),
+                            {"connection": CONNECTION_ID, "first": SCOPE, "second": SECOND_SCOPE},
+                        )
+                    ).scalars()
+                )
+                for name, query in queries.items()
+            }
+
+    before = await unaffected_facts()
+    assert len(before["connections"]) == 2
+    assert len(before["cursors"]) == 4  # 两个 directory、同 ID 的另一个连接和 unmarked calendar。
+    assert len(before["events"]) == 2 and len(before["tasks"]) == 1
+    assert len(before["outbox"]) == 1 and len(before["audit"]) == 1
+    first = await plan_fixture(aad_recovery)
+    assert len(first) == 2 and {item.pair_digest for item in first} == expected_digests
+    assert {item.recovery_attempt_ordinal for item in first} == {1}
+    assert await plan_fixture(aad_recovery) == first
+    async with sessions() as session:
+        for item in first:
+            task = await session.get(TaskRunModel, item.task_id)
+            assert task.user_id == USER_ID and task.status == "created"
+            payload = task.input_payload
+            assert set(payload) == set(PAYLOAD)
+            assert payload["connection_id"] == str(CONNECTION_ID)
+            assert payload["scope_key"] in marked_scopes
+            assert payload["recovery_revision"] == "20260809_0019"
+            assert payload["pair_digest"] == item.pair_digest
+            assert payload["recovery_attempt_ordinal"] == 1
+            assert task.idempotency_key == f"calendar-aad-0019:{item.pair_digest}:attempt:1"
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM audit_events WHERE task_id=:id AND event_type='task.created'"
+                    ),
+                    {"id": item.task_id},
+                )
+                == 1
+            )
+            assert (
+                await session.scalar(
+                    text(
+                        "SELECT count(*) FROM outbox_events WHERE aggregate_id=:id AND topic='task.execute'"
+                    ),
+                    {"id": item.task_id},
+                )
+                == 1
+            )
+        markers = (
+            await session.execute(
+                text(
+                    "SELECT connection_id,scope_key FROM sync_cursors WHERE last_error_code='calendar_event_resync_required'"
+                )
+            )
+        ).all()
+        assert set(markers) == expected_pairs
+    assert await unaffected_facts() == before
+
+    class PairReaders:
+        """每个 exact pair 使用独立网络 Fake，任何其它连接/日历与 OAuth 调用都会失败。"""
+
+        def __init__(self):
+            """为两个允许 pair 分配独立 reader 与调用账本。"""
+            self.calls = []
+            self.readers = {pair: RecordingReader() for pair in expected_pairs}
+
+        def oauth(self, provider):
+            """恢复只消费当前持久凭据，任何 refresh resolver 调用都是错误。"""
+            raise AssertionError("recovery must not refresh")
+
+        def calendar_reader(self, pair, access_token):
+            """只允许 owning user 的 exact pair；未知 pair 无法取得网络 Fake。"""
+            assert pair.user_id == USER_ID and pair.provider == "google"
+            key = (pair.connection_id, pair.calendar_id)
+            self.calls.append(key)
+            return self.readers[key]
+
+    adapters = PairReaders()
+    result = await run_recovery_fixture(aad_recovery, adapters)
+    assert result.planned == first and result.remaining_markers == 0
+    assert len(adapters.calls) == 2 and set(adapters.calls) == expected_pairs
+    assert all(reader.scopes == [pair[1]] for pair, reader in adapters.readers.items())
+    assert await unaffected_facts() == before
+    async with sessions() as session:
+        for scope in marked_scopes:
+            cursor = (
+                await session.execute(
+                    text(
+                        "SELECT cursor,last_success_at,last_error_code FROM sync_cursors WHERE connection_id=:connection AND resource_kind='calendar' AND scope_key=:scope"
+                    ),
+                    {"connection": CONNECTION_ID, "scope": scope},
+                )
+            ).one()
+            assert cursor == ("synthetic-new-cursor", NOW, None)
+            event = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM calendar_events WHERE connection_id=:connection AND calendar_id=:scope"
+                        ),
+                        {"connection": CONNECTION_ID, "scope": scope},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            for field, expected in (
+                ("description", b"Synthetic Description"),
+                ("location", b"Synthetic Location"),
+            ):
+                assert event[f"{field}_aad_version"] == 2
+                assert (
+                    cipher.decrypt(
+                        EncryptedValue(
+                            event[f"{field}_ciphertext"],
+                            event[f"{field}_nonce"],
+                            event[f"{field}_key_version"],
+                        ),
+                        calendar_event_field_aad_v2(
+                            user_id=str(USER_ID),
+                            connection_id=str(CONNECTION_ID),
+                            calendar_id=scope,
+                            provider_event_id=event["provider_event_id"],
+                            field=field,
+                        ),
+                    )
+                    == expected
+                )
+        for item in first:
+            task = await session.get(TaskRunModel, item.task_id)
+            assert task.status == "succeeded" and task.attempt_count == 1
+        assert await session.scalar(text("SELECT count(*) FROM task_runs")) == 3
+        assert await session.scalar(text("SELECT count(*) FROM approval_requests")) == 0
+        assert await session.scalar(text("SELECT count(*) FROM tool_executions")) == 0
+        audit = "".join(
+            (await session.execute(text("SELECT metadata::text FROM audit_events"))).scalars()
+        )
+        assert all(scope not in audit for scope in (*marked_scopes, "synthetic-unmarked-calendar"))
+    replay = await run_recovery_fixture(aad_recovery, adapters)
+    assert replay.planned == () and replay.remaining_markers == 0
+    assert len(adapters.calls) == 2 and await unaffected_facts() == before
 
 
 @pytest.mark.asyncio

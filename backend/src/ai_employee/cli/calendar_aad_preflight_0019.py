@@ -41,14 +41,32 @@ def require_no_rollout_arguments(arguments: Sequence[str] | None) -> None:
 
 
 def rollout_environment() -> tuple[Path, CalendarAadBinding]:
-    """只解析安全路径形状与内部 image ID；文件存在/碰撞检查必须在 revision lease 之后。"""
-    directory = Path(os.environ.get("BACKUP_DIR", ""))
-    if not directory.is_absolute() or directory == Path("/"):
+    """从固定 state 路径派生绑定；显式旧字段不得选择另一个 artifact。
+
+    migration/resync 的批准 invocation 只提供 state 与实际 image ID。这里仅解析
+    `/backups/<safe-basename>.calendar-aad-preflight.json` 并冻结非根物理目录；不检查
+    artifact 存在性、碰撞或内容，这些事实仍必须在取得 revision lease 后读取。
+    """
+    state = os.environ.get("CALENDAR_AAD_ROLLOUT_STATE", "")
+    suffix = ".calendar-aad-preflight.json"
+    basename = Path(state).name.removesuffix(suffix)
+    binding = CalendarAadBinding(basename, os.environ.get("CALENDAR_AAD_IMMUTABLE_IMAGE_ID", ""))
+    if state != f"/backups/{binding.basename}{suffix}":
         raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
-    return directory, CalendarAadBinding(
-        os.environ.get("BACKUP_ARTIFACT_BASENAME", ""),
-        os.environ.get("CALENDAR_AAD_IMMUTABLE_IMAGE_ID", ""),
-    )
+    directory = Path("/backups")
+    explicit_directory = os.environ.get("BACKUP_DIR")
+    explicit_basename = os.environ.get("BACKUP_ARTIFACT_BASENAME")
+    if (explicit_directory is not None and Path(explicit_directory) != directory) or (
+        explicit_basename is not None and explicit_basename != binding.basename
+    ):
+        raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
+    try:
+        directory = directory.resolve()
+    except (OSError, RuntimeError) as error:
+        raise CalendarAadRolloutError("calendar_aad_artifact_invalid") from error
+    if directory == Path("/"):
+        raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
+    return directory, binding
 
 
 def require_sealed_settings(settings: Settings) -> None:

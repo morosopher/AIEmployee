@@ -291,6 +291,24 @@ just health
 
 `calendar-aad-preflight-0019`、`calendar-aad-migrate-0019` 与 `calendar-aad-resync-0019` 都不接受 user、connection 或 calendar 参数，避免运维输入把范围改写为任意对象；三者都要求预先设置安全 basename `BACKUP_ARTIFACT_BASENAME`，并使用 `${BACKUP_DIR}/${BACKUP_ARTIFACT_BASENAME}.calendar-aad-preflight.json` 作为同一 rollout state。`BACKUP_DIR`必须是已有、非根的绝对目录，basename使用`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`。recipe 在启动 one-off 容器前检查 Compose 状态；`caddy`、`api`、`worker`、`scheduler`、`migration`或`backup`仍为running/paused/restarting时都fail closed，同时拒绝已开启的三层写开关。宿主从Compose实际worker/migration镜像执行本地`docker image inspect`，要求内容ID一致，并固定one-off的`image=sha256:...`和`--pull never`；不会build/pull。所选service不得带覆盖镜像代码的额外挂载；迁移与resync的`/backups`只读。该ID通过内部环境变量传给固定程序，运维不得另行输入。preflight artifact 绑定该内容 ID，后续 backup、audit、migration、resync 与 restored-0018 verifier 都必须重新解析并拒绝镜像不匹配。宿主 recipe 只能验证 basename/path 形状和挂载边界，不能在 lease 之外检查 preflight artifact 是否存在；碰撞/存在性检查必须由 CLI 在成功取得 revision-global advisory lock 后完成。preflight 还要求数据库精确位于 0018，复用选定不可变镜像、`worker` 服务的 Secret/数据库配置和现有 Calendar credential/adapter resolver，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019`。它只输出 affected/connection count、locally hashed pair/connection digest、earliest UTC deadline 和稳定结果码；不得输出 token、scope 原文、正文、描述/地点或 raw `calendar_id`。
 
+宿主在任何 Docker 查询前解析并冻结 `BACKUP_DIR` 的实际物理目录，再检查存在性与非根边界；
+`/tmp/..` 或指向根目录的符号链接会被拒绝，挂载复用同一个已验证的物理路径。
+三个正式 invocation 都传入固定
+`CALENDAR_AAD_ROLLOUT_STATE=/backups/<basename>.calendar-aad-preflight.json` 与实际 image ID。
+CLI 从该路径派生目录和 basename；migration/resync 不要求额外的 `BACKUP_DIR` 或
+`BACKUP_ARTIFACT_BASENAME` 环境字段，显式提供时必须与固定 state 绑定一致。
+
+在正式 preflight、migration、resync 或维护窗口 backup 容器启动前，宿主先用同一已 pin 的
+`migration` 镜像与既有 owner Secret 运行无参数 `ai_employee.cli.calendar_aad_revision_0019`。
+这个短 screening 容器没有 backup/source 挂载，只以单个目标连接、固定超时和只读事务读取
+当前发布版本；preflight/migration/backup 要求 0018，resync 要求 0019。筛查成功后再次检查
+停服状态和实际镜像，再启动正式命令。筛查不读取 artifact、不创建维护事实，正式命令仍独立
+执行当前 revision、revision lease、artifact guard 和冻结迁移 lifecycle 的全部检查。
+Migration 的固定 wrapper 为
+`export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019`；
+目标连接继续由既有安全 Secret 文件读取器与 typed endpoint 构造。Revision body 成功后的
+policy/grant delta 在同一个 Task16A 外层迁移事务内应用并核对，然后才允许最终提交。
+
 显式设置`BACKUP_ARTIFACT_BASENAME`时，`just backup`使用相同宿主校验，并由
 `calendar_aad_backup_0019`持同一revision session lease完成入口guard、既有shell dump/encrypt
 producer、当前期限重读和最终发布。两次guard绑定同一原artifact；暂存目录为0700，发布文件为0600，

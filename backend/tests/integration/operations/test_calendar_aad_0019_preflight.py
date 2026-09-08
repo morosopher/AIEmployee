@@ -381,6 +381,105 @@ async def aad_oauth(aad_source):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("revision", ["20260809_0018", "20260809_0019"])
+async def test_calendar_aad_revision_screen_is_read_only_and_preserves_facts(
+    aad_oauth, monkeypatch, revision
+):
+    """真实 PostgreSQL 筛查仅打开一个只读目标快照，0018/0019 都不改变任何持久事实。
+
+    用已有 lifecycle 准备版本；仅附加 SQL/transaction 观察器，原 published reader 照常
+    执行。artifact、凭据刷新、业务写入、maintenance/grant 和供应商路径均不参与筛查。
+    """
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.pool import NullPool
+
+    from ai_employee.cli import calendar_aad_revision_0019 as module
+
+    sessions, _, _, config = aad_oauth
+    await seed_pair(sessions, complete=False)
+    if revision == "20260809_0019":
+        await asyncio.to_thread(run_alembic_upgrade, config, revision)
+
+    async def persisted_facts():
+        """比较所有有关业务表和版本表的完整列，不把无副作用简化为行数不变。"""
+        result = {}
+        async with sessions() as session:
+            for table in (
+                "alembic_version",
+                "oauth_connections",
+                "connection_capabilities",
+                "encrypted_credentials",
+                "provider_calendars",
+                "sync_cursors",
+                "calendar_events",
+                "task_runs",
+                "audit_events",
+                "outbox_events",
+            ):
+                result[table] = tuple(
+                    (
+                        await session.execute(
+                            text(
+                                f"SELECT row_to_json(t)::text AS fact FROM {table} t ORDER BY fact"
+                            )
+                        )
+                    ).scalars()
+                )
+        return result
+
+    before = await persisted_facts()
+    authority = module.load_published_alembic_authority(config)
+    engine = create_engine(
+        sessions.engine.url.set(drivername="postgresql+psycopg"),
+        poolclass=NullPool,
+        hide_parameters=True,
+        connect_args={"connect_timeout": 10, "options": "-c statement_timeout=10000"},
+    )
+    statements = []
+    transactions = []
+    checkouts = []
+
+    def observe_statement(connection, cursor, statement, parameters, context, executemany):
+        """只记录语句类别；不记录绑定参数、凭据、scope 或业务内容。"""
+        statements.append(statement.lstrip().split(None, 1)[0].upper())
+
+    def observe_checkout(connection, record, proxy):
+        """精确计数本次 screen 使用的目标物理连接。"""
+        checkouts.append(1)
+
+    event.listen(engine, "before_cursor_execute", observe_statement)
+    event.listen(engine, "checkout", observe_checkout)
+    event.listen(engine, "commit", lambda connection: transactions.append("commit"))
+    event.listen(engine, "rollback", lambda connection: transactions.append("rollback"))
+    original_reader = module.read_current_alembic_revision
+    observations = []
+
+    def observed_reader(connection, *, authority):
+        """观察真正服务器事务属性后继续调用原只读 reader，不替换版本或 catalog 结果。"""
+        observations.append(
+            (
+                connection.scalar(text("SHOW transaction_read_only")),
+                connection.scalar(text("SHOW transaction_isolation")),
+                connection.scalar(text("SHOW statement_timeout")),
+            )
+        )
+        return original_reader(connection, authority=authority)
+
+    monkeypatch.setattr(module, "read_current_alembic_revision", observed_reader)
+    try:
+        assert (
+            await asyncio.to_thread(module.read_rollout_revision, engine, authority=authority)
+            == revision
+        )
+    finally:
+        engine.dispose()
+    assert observations == [("on", "repeatable read", "10s")]
+    assert checkouts == [1] and transactions == ["rollback"]
+    assert statements.count("SELECT") == 2 and set(statements) <= {"SELECT", "SHOW"}
+    assert await persisted_facts() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("loss_boundary", ["started", "confirmed"])
 async def test_calendar_aad_outer_lease_loss_after_lock_wait_rolls_back(
     aad_oauth, monkeypatch, loss_boundary: str

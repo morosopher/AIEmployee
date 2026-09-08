@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""封闭 0019 窗口的宿主 Compose 入口，只解析本地镜像并执行固定 one-off。
+"""封闭 0019 窗口的宿主 Compose 入口，先只读筛查再执行固定 one-off。
 
-公开 just recipe 无参数；本脚本的 operation 仅由 recipe 固定传入。宿主只检查路径形状、
-停止状态和实际镜像，不读取或判断 artifact 存在性；文件 admission 归持数据库 lease 的 CLI。
+公开 just recipe 无参数；本脚本的 operation 仅由 recipe 固定传入。宿主只检查目录边界、
+停止状态、实际镜像和当前版本；artifact 文件 admission 归持数据库 lease 的正式 CLI。
 """
 
+import copy
 import json
 import os
 import re
@@ -28,10 +29,11 @@ _SERVICES = {
 }
 _COMMANDS = {
     "preflight": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019',
-    "migrate": "exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019",
+    "migrate": 'export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019',
     "resync": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_0019',
     "backup": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/backup-postgres.sh',
 }
+_SCREEN_COMMAND = 'export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_revision_0019'
 
 
 class RolloutHostError(ValueError):
@@ -93,76 +95,18 @@ def _require_stopped() -> None:
             raise RolloutHostError("calendar_aad_services_running")
 
 
-def run(operation: str) -> None:
-    """解析真实 Compose 配置、冻结同一 image ID，然后仅运行固定 service 和 Secret wrapper。
+def _oneoff(
+    config: dict[str, object],
+    service: str,
+    command: str,
+    *,
+    timeout: float | None = None,
+) -> str:
+    """以 0600 临时 Compose 执行一个内部固定命令，只返回成功 stdout 或稳定错误码。
 
-    生成的临时 Compose 文件保持原项目网络/Secret 定义，只有 one-off 的 image、备份挂载
-    与内部绑定环境被固定。它为 0600 且随操作删除；不在宿主输出渲染配置或 operator 输入。
+    临时文件与 stdout/stderr 都不写持久日志；screen 使用有界超时，正式命令继续由
+    自己的任务/步骤预算管理。service/command 只能来自本模块的固定 composition。
     """
-    if operation not in _SERVICES:
-        raise RolloutHostError("calendar_aad_arguments_invalid")
-    tag = os.environ.get("APP_IMAGE_TAG", "")
-    basename = os.environ.get("BACKUP_ARTIFACT_BASENAME", "")
-    directory = Path(os.environ.get("BACKUP_DIR", ""))
-    if not tag or tag.lower() == "latest" or _BASENAME.fullmatch(tag) is None:
-        raise RolloutHostError("calendar_aad_image_invalid")
-    if "CALENDAR_AAD_IMMUTABLE_IMAGE_ID" in os.environ:
-        raise RolloutHostError("calendar_aad_image_override_forbidden")
-    if _BASENAME.fullmatch(basename) is None:
-        raise RolloutHostError("calendar_aad_basename_invalid")
-    if not directory.is_absolute() or directory == Path("/") or not directory.is_dir():
-        raise RolloutHostError("calendar_aad_backup_directory_invalid")
-    config = _mapping(json.loads(_docker("compose", "config", "--format", "json")))
-    services = _mapping(config.get("services"))
-    worker = _mapping(services.get("worker"))
-    migration = _mapping(services.get("migration"))
-    _require_stopped()
-    for name in ("api", "worker", "scheduler", _SERVICES[operation]):
-        environment = _mapping(_mapping(services.get(name)).get("environment", {}))
-        if any(
-            str(environment.get(flag, "false")).lower() not in {"false", "0"}
-            for flag in _FLAGS
-        ):
-            raise RolloutHostError("calendar_aad_write_switch_enabled")
-    image_id = _image_id(worker)
-    if _image_id(migration) != image_id:
-        raise RolloutHostError("calendar_aad_image_mismatch")
-    service_name = _SERVICES[operation]
-    selected = _mapping(services.get(service_name))
-    if operation == "backup" and _image_id(selected) != image_id:
-        raise RolloutHostError("calendar_aad_image_mismatch")
-    selected["image"] = image_id
-    selected["pull_policy"] = "never"
-    selected.pop("build", None)
-    environment = _mapping(selected.get("environment", {}))
-    environment.update({flag: "false" for flag in _FLAGS})
-    environment.update(
-        {
-            "BACKUP_DIR": "/backups",
-            "BACKUP_ARTIFACT_BASENAME": basename,
-            "CALENDAR_AAD_IMMUTABLE_IMAGE_ID": image_id,
-        }
-    )
-    if operation == "backup":
-        environment["DATABASE_URL"] = _mapping(worker.get("environment")).get(
-            "DATABASE_URL"
-        )
-    selected["environment"] = environment
-    volumes = selected.get("volumes", [])
-    if not isinstance(volumes, list):
-        raise RolloutHostError("calendar_aad_compose_invalid")
-    # sealed one-off 的可执行代码必须来自已 inspect 的镜像；源码 bind 或其它覆盖挂载会
-    # 使内容 ID 失去实际运行身份。Secret 仍走 Compose 原有独立 secrets 定义。
-    if any(_mapping(value).get("target") != "/backups" for value in volumes):
-        raise RolloutHostError("calendar_aad_image_mount_invalid")
-    selected["volumes"] = [
-        {
-            "type": "bind",
-            "source": str(directory.resolve()),
-            "target": "/backups",
-            "read_only": operation in {"migrate", "resync"},
-        },
-    ]
     with tempfile.TemporaryDirectory(prefix="calendar-aad-compose-") as temporary:
         path = Path(temporary) / "compose.json"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -185,13 +129,14 @@ def run(operation: str) -> None:
                 "never",
                 "--entrypoint",
                 "/bin/sh",
-                service_name,
+                service,
                 "-ec",
-                _COMMANDS[operation],
+                command,
             ],
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
     if result.returncode:
         lines = result.stderr.strip().splitlines()
@@ -199,7 +144,126 @@ def run(operation: str) -> None:
         if re.fullmatch(r"(?:calendar_aad|oauth)_[a-z0-9_]{1,90}", code) is None:
             code = "calendar_aad_oneoff_failed"
         raise RolloutHostError(code)
-    print(result.stdout, end="")
+    return result.stdout
+
+
+def _screen_revision(
+    config: dict[str, object], image_id: str, expected_revision: str
+) -> None:
+    """正式容器前只读筛查，不挂载 backup/source，不读取或判断 artifact/guard。
+
+    复制配置防止 image pin 改写随后再次 inspect 的原引用。固定短容器只保留 migration
+    原有 owner Secret；筛查结果只用于当前顺序检查，不能替代正式命令里的事务授权。
+    """
+    screen_config = copy.deepcopy(config)
+    migration = _mapping(_mapping(screen_config.get("services")).get("migration"))
+    migration["image"] = image_id
+    migration["pull_policy"] = "never"
+    migration.pop("build", None)
+    migration["volumes"] = []
+    environment = _mapping(migration.get("environment", {}))
+    for key in ("CALENDAR_AAD_ROLLOUT_STATE", "BACKUP_DIR", "BACKUP_ARTIFACT_BASENAME"):
+        environment.pop(key, None)
+    environment.update({flag: "false" for flag in _FLAGS})
+    migration["environment"] = environment
+    try:
+        revision = _oneoff(
+            screen_config, "migration", _SCREEN_COMMAND, timeout=30
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RolloutHostError("calendar_aad_revision_screen_failed") from error
+    if revision != expected_revision:
+        raise RolloutHostError("calendar_aad_revision_mismatch")
+
+
+def run(operation: str) -> None:
+    """冻结目录/镜像，先只读筛查版本并重查停服/镜像，再执行固定正式命令。
+
+    生成的临时 Compose 文件保持原项目网络/Secret 定义，只有 one-off 的 image、备份挂载
+    与内部绑定环境被固定。它为 0600 且随操作删除；不在宿主输出渲染配置或 operator 输入。
+    """
+    if operation not in _SERVICES:
+        raise RolloutHostError("calendar_aad_arguments_invalid")
+    tag = os.environ.get("APP_IMAGE_TAG", "")
+    basename = os.environ.get("BACKUP_ARTIFACT_BASENAME", "")
+    directory = Path(os.environ.get("BACKUP_DIR", ""))
+    if not tag or tag.lower() == "latest" or _BASENAME.fullmatch(tag) is None:
+        raise RolloutHostError("calendar_aad_image_invalid")
+    if "CALENDAR_AAD_IMMUTABLE_IMAGE_ID" in os.environ:
+        raise RolloutHostError("calendar_aad_image_override_forbidden")
+    if _BASENAME.fullmatch(basename) is None:
+        raise RolloutHostError("calendar_aad_basename_invalid")
+    if not directory.is_absolute():
+        raise RolloutHostError("calendar_aad_backup_directory_invalid")
+    try:
+        directory = directory.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise RolloutHostError("calendar_aad_backup_directory_invalid") from error
+    if directory == Path("/") or not directory.is_dir():
+        raise RolloutHostError("calendar_aad_backup_directory_invalid")
+    # 后续 mount 必须复用此物理路径；若在 Docker 查询后重新解析 operator symlink，
+    # 校验与挂载之间的替换会绕过非根目录约束。
+    config = _mapping(json.loads(_docker("compose", "config", "--format", "json")))
+    services = _mapping(config.get("services"))
+    worker = _mapping(services.get("worker"))
+    migration = _mapping(services.get("migration"))
+    _require_stopped()
+    for name in ("api", "worker", "scheduler", _SERVICES[operation]):
+        environment = _mapping(_mapping(services.get(name)).get("environment", {}))
+        if any(
+            str(environment.get(flag, "false")).lower() not in {"false", "0"}
+            for flag in _FLAGS
+        ):
+            raise RolloutHostError("calendar_aad_write_switch_enabled")
+    image_id = _image_id(worker)
+    if _image_id(migration) != image_id:
+        raise RolloutHostError("calendar_aad_image_mismatch")
+    service_name = _SERVICES[operation]
+    selected = _mapping(services.get(service_name))
+    if operation == "backup" and _image_id(selected) != image_id:
+        raise RolloutHostError("calendar_aad_image_mismatch")
+    volumes = selected.get("volumes", [])
+    if not isinstance(volumes, list):
+        raise RolloutHostError("calendar_aad_compose_invalid")
+    # sealed one-off 的可执行代码必须来自已 inspect 的镜像；源码 bind 或其它覆盖挂载会
+    # 使内容 ID 失去实际运行身份。Secret 仍走 Compose 原有独立 secrets 定义。
+    if any(_mapping(value).get("target") != "/backups" for value in volumes):
+        raise RolloutHostError("calendar_aad_image_mount_invalid")
+    _screen_revision(
+        config, image_id, "20260809_0019" if operation == "resync" else "20260809_0018"
+    )
+    _require_stopped()
+    if _image_id(worker) != image_id or _image_id(migration) != image_id:
+        raise RolloutHostError("calendar_aad_image_mismatch")
+    if operation == "backup" and _image_id(selected) != image_id:
+        raise RolloutHostError("calendar_aad_image_mismatch")
+    selected["image"] = image_id
+    selected["pull_policy"] = "never"
+    selected.pop("build", None)
+    environment = _mapping(selected.get("environment", {}))
+    environment.update({flag: "false" for flag in _FLAGS})
+    environment.update(
+        {
+            "BACKUP_DIR": "/backups",
+            "BACKUP_ARTIFACT_BASENAME": basename,
+            "CALENDAR_AAD_ROLLOUT_STATE": f"/backups/{basename}.calendar-aad-preflight.json",
+            "CALENDAR_AAD_IMMUTABLE_IMAGE_ID": image_id,
+        }
+    )
+    if operation == "backup":
+        environment["DATABASE_URL"] = _mapping(worker.get("environment")).get(
+            "DATABASE_URL"
+        )
+    selected["environment"] = environment
+    selected["volumes"] = [
+        {
+            "type": "bind",
+            "source": str(directory),
+            "target": "/backups",
+            "read_only": operation in {"migrate", "resync"},
+        },
+    ]
+    print(_oneoff(config, service_name, _COMMANDS[operation]), end="")
 
 
 def main() -> int:
