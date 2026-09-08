@@ -23,14 +23,19 @@ from ai_employee.domain.errors import UserActionRequiredError
 
 
 class OAuthRefreshError(UserActionRequiredError):
-    """稳定、不可自动重放的凭据或 fence 失败，不携带 token/供应商异常原文。"""
+    """稳定、不可自动重放的凭据或 fence 失败，不携带 token/供应商异常原文。
+
+    claim_locked/credential conflict 表示非重试安全失败；claim_lost/unknown 要求人工
+    关注。实际已提交的合法 result 始终优先于这些失败分类，禁止错误码重新打开历史。
+    """
 
     def __init__(self, error_code: str = "oauth_refresh_result_unknown") -> None:
         """只接受固定稳定码；状态未知不能包装为普通 TransientProviderError。"""
         if error_code not in {
             "oauth_refresh_result_unknown",
             "oauth_credential_state_conflict",
-            "oauth_refresh_locked",
+            "oauth_refresh_claim_locked",
+            "oauth_refresh_claim_lost",
             "oauth_refresh_recovery_unsatisfied",
         }:
             raise ValueError("OAuth refresh error code is invalid")

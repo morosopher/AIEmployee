@@ -223,6 +223,8 @@ async def test_connection_readiness_wait_rechecks_database_deadline_before_claim
         "concurrent_refresh",
         "unknown",
         "cas_miss",
+        "claim_locked",
+        "claim_lost",
         "proof_crash",
         "ready_rollback",
         "unknown_rollback",
@@ -241,10 +243,11 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
 ) -> None:
     """实际 Worker registry 的 401 必须先持久未应用和 refresh-confirmed，再重新走 request-start。"""
     import base64
+    from contextlib import nullcontext
     from datetime import timedelta
     from functools import partial
 
-    from sqlalchemy import func, select
+    from sqlalchemy import func, select, text
 
     from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
     from ai_employee.application.ports.oauth_refresh import OAuthRefreshReady, OAuthRefreshRequest
@@ -269,6 +272,7 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
     )
     from ai_employee.infrastructure.db.repositories.credential_rotation import load_refresh_snapshot
     from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+        PostgreSQLOAuthRefreshLease,
         SqlAlchemyOAuthRefreshCoordinator,
     )
     from ai_employee.infrastructure.db.repositories.trusted_actions import (
@@ -359,6 +363,16 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
                 httpx.Response(200, json={"id": "synthetic-sent", "threadId": "synthetic-thread"}),
             ]
         )
+        leases: list[PostgreSQLOAuthRefreshLease] = []
+        if fault == "claim_lost":
+            original_assert = PostgreSQLOAuthRefreshLease.assert_owned
+
+            async def capture_owned_lease(lease: PostgreSQLOAuthRefreshLease) -> None:
+                """保留真实 ownership 查询，让 HTTP 故障点能解锁实际物理会话。"""
+                await original_assert(lease)
+                leases.append(lease)
+
+            monkeypatch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", capture_owned_lease)
 
         async def inspect_durable_rejection(request):
             """grant 开始时前一次写请求已有明确未应用事实，且 coordinator started 已提交。"""
@@ -388,6 +402,10 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
                 async with sessions.begin() as session:
                     connection = await session.get(OAuthConnectionModel, seed.connection_id)
                     connection.authorization_generation += 1
+            if fault == "claim_lost":
+                assert leases
+                await leases[-1].connection.execute(text("SELECT pg_advisory_unlock_all()"))
+                await leases[-1].connection.commit()
             return httpx.Response(
                 200,
                 json={
@@ -624,7 +642,74 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
                     )
                     is not None
                 )
-        if fault in {"unknown", "unknown_rollback", "cas_miss"}:
+        if fault in {"claim_locked", "cas_miss"}:
+            holder = SqlAlchemyOAuthRefreshCoordinator(
+                session_factory=sessions,
+                cipher=cipher,
+                identity=OAuthRefreshIdentity(b"x" * 32, key_version=cipher.key_version),
+                clock=lambda: coordinator_now,
+            )
+            # 另一个真实 session 已持锁时，401 恢复不得调用 refresh；CAS 冲突则在
+            # 已收到一次 refresh 后安全失败。两者都保留原写明确未应用、禁止自动重试。
+            async with (
+                holder.explicit_recovery_lease(
+                    user_id=seed.user_id, connection_id=seed.connection_id
+                )
+                if fault == "claim_locked"
+                else nullcontext()
+            ):
+                with pytest.raises(TrustedActionAttemptAbandoned):
+                    await workflow.execute_or_reconcile(**arguments)
+            for _ in range(2):
+                await workflow.execute_or_reconcile(**arguments)
+            assert send.call_count == 1
+            assert refresh.call_count == (0 if fault == "claim_locked" else 1)
+            expected_error = (
+                "oauth_refresh_claim_locked"
+                if fault == "claim_locked"
+                else "oauth_credential_state_conflict"
+            )
+            async with sessions() as session:
+                execution = await session.scalar(
+                    select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
+                )
+                task = await session.get(TaskRunModel, seed.task_id)
+                draft = await session.get(MailDraftModel, seed.draft_id)
+                assert execution.status == "confirmed_failed" and execution.write_attempt_count == 1
+                assert execution.error_code == task.error_code == expected_error
+                assert execution.result_summary == {
+                    "kind": "confirmed_not_applied",
+                    "retryable": False,
+                }
+                assert execution.completed_at is not None
+                assert task.status == "failed" and task.finished_at is not None
+                assert task.lease_owner is None and task.lease_expires_at is None
+                assert draft.status == "editing"
+                audits = tuple(
+                    await session.scalars(
+                        select(AuditEventModel)
+                        .where(AuditEventModel.task_id == seed.task_id)
+                        .order_by(AuditEventModel.id)
+                    )
+                )
+                assert [item.event_type for item in audits] == [
+                    "tool.claimed",
+                    "tool.oauth_refresh_required",
+                    "task.failed",
+                    "tool.confirmed_failed",
+                ]
+                notice = await session.scalar(
+                    select(OutboxEventModel).where(
+                        OutboxEventModel.aggregate_id == seed.task_id,
+                        OutboxEventModel.topic == "tool.confirmed_failed",
+                    )
+                )
+                assert notice is not None and notice.payload == {
+                    "task_id": str(seed.task_id),
+                    "audit_event_id": audits[-1].id,
+                }
+            return
+        if fault in {"unknown", "unknown_rollback", "claim_lost"}:
             with pytest.raises(TrustedActionAttemptAbandoned):
                 await workflow.execute_or_reconcile(**arguments)
             for _ in range(2):
@@ -635,6 +720,17 @@ async def test_production_registry_401_commits_oauth_proof_before_second_write(
                     select(ToolExecutionModel).where(ToolExecutionModel.task_id == seed.task_id)
                 )
                 assert execution.status == "needs_attention" and execution.write_attempt_count == 1
+                expected_error = (
+                    "oauth_refresh_claim_lost"
+                    if fault == "claim_lost"
+                    else "oauth_refresh_result_unknown"
+                )
+                task = await session.get(TaskRunModel, seed.task_id)
+                draft = await session.get(MailDraftModel, seed.draft_id)
+                assert execution.error_code == task.error_code == expected_error
+                assert task.status == "needs_attention" and task.finished_at is None
+                assert task.lease_owner is None and task.lease_expires_at is None
+                assert draft.status == "needs_attention"
                 assert execution.result_summary == {
                     "kind": "confirmed_not_applied",
                     "retryable": False,

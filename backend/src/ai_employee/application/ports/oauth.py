@@ -9,6 +9,7 @@ from ai_employee.domain.connections import (
     MAX_PROVIDER_IDENTITY_PART_LENGTH,
     ConnectionCapability,
 )
+from ai_employee.domain.errors import TransientProviderError
 
 MAX_OAUTH_TOKEN_LENGTH = 8192
 """单个 OAuth opaque token 的最大字符数，避免 malformed 响应放大内存/密文。"""
@@ -65,6 +66,28 @@ class OAuthProvider(StrEnum):
 
     GOOGLE = "google"
     MICROSOFT = "microsoft"
+
+
+class OAuthPostExchangeVerificationError(TransientProviderError):
+    """token 响应已收到，但随后只读验证临时失败，不表示 authorization-code POST 结果未知。
+
+    适配器只能在成功收到 token 响应后使用此标记；恢复用例据此提交 unsatisfied，
+    仍不得重放 code 或持久化未验证 token。保留临时错误的公开分类与重试提示，
+    不改变普通 OAuth 调用的 HTTP 语义，也不适用于 automatic refresh grant。
+    """
+
+    def __init__(self, *, error_code: str, retry_after: float | None = None) -> None:
+        """构造不含 token、响应或原始异常上下文的固定消息。
+
+        Args:
+            error_code: 供应商适配器已分类的稳定安全错误码。
+            retry_after: 原只读失败的可选规范重试秒数，不授予 code 重放权。
+        """
+        super().__init__(
+            error_code=error_code,
+            message="OAuth token response verification failed",
+            retry_after=retry_after,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +218,12 @@ class OAuthProviderAdapter(Protocol):
         ...
 
     async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
-        """交换一次性授权码并返回规范化 token。"""
+        """交换一次性授权码并返回规范化 token。
+
+        Raises:
+            OAuthPostExchangeVerificationError: token 响应已收到，后续只读验证临时失败。
+            TransientProviderError: 尚未确认收到 token 响应，调用方不得重放授权码。
+        """
         ...
 
     async def fetch_account(

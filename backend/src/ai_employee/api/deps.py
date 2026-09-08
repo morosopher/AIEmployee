@@ -288,6 +288,14 @@ def _domain_problem(error: DomainError) -> ApiProblem:
             "Connection scope missing",
             "Reconnect the provider to grant the required access.",
         )
+    if error.error_code in {"oauth_refresh_claim_locked", "oauth_credential_state_conflict"}:
+        # 这两种失败已有明确的连接状态冲突语义；须先于通用 UserActionRequired 的 403。
+        return ApiProblem(
+            409,
+            error.error_code,
+            "OAuth credential conflict",
+            "The authorization operation conflicts with the current connection state.",
+        )
     if error.error_code == "mail_recipient_limit_exceeded":
         # 收件人数超限是用户可修改的请求内容，而不是资源状态竞争；虽然领域用例
         # 复用 StateConflictError 携带稳定码，HTTP 语义仍按 M2 契约固定为 422。

@@ -26,6 +26,7 @@ from ai_employee.application.ports.encryption import EncryptedValue, Encryption
 from ai_employee.application.ports.oauth import (
     OAuthAccount,
     OAuthAuthorizationRequest,
+    OAuthPostExchangeVerificationError,
     OAuthProvider,
     OAuthProviderAdapter,
     OAuthRevocationResult,
@@ -1126,14 +1127,22 @@ class ConnectionsUseCase:
                 if lease is not None:
                     await lease.assert_owned()
             return result
-        except Exception:  # noqa: BLE001 - state 已持久消费；未知 commit 只能核对 append-only 结果。
+        except Exception as error:  # state 已消费；commit 异常只核对 append-only 结果。
             closed = await coordinator.read_result(
                 user_id=consumed.user_id,
                 connection_id=authorization.connection_id,
                 attempt_id=consumed.id,
                 recovery=True,
             )
-            if closed is None or not isinstance(closed.metadata, RecoveryUnsatisfiedV1):
+            if closed is None:
+                if isinstance(error, OAuthRefreshError) and error.error_code in {
+                    "oauth_refresh_claim_locked",
+                    "oauth_refresh_claim_lost",
+                    "oauth_credential_state_conflict",
+                }:
+                    raise error from None
+                raise OAuthRefreshError() from None
+            if not isinstance(closed.metadata, RecoveryUnsatisfiedV1):
                 raise OAuthRefreshError() from None
             # 历史关闭不依赖 current T；只读取当前能力投影，不把后来合法授权当成 rollback。
             async with self._stores() as store:
@@ -1164,8 +1173,8 @@ class ConnectionsUseCase:
             replacement 已提交且当前 requested 能力可用的原连接 ID。
 
         Raises:
-            OAuthRefreshError: 未取得不同有效 refresh，或只读核对无法证明事务提交。
-            DomainError: 目标 T 过时或已安全分类的供应商拒绝。
+            OAuthRefreshError: lease 竞争/丢失、凭据冲突、恢复未满足或结果仍无法核实。
+            DomainError: 目标 T 过时、供应商已知拒绝或 token 响应后的只读验证失败。
 
         网络前短事务冻结当前完整双行；网络后禁止重新冻结。未知 exchange、CAS miss、
         lease loss 与 commit ACK loss 都只读核对共享 result union，不猜写 unsatisfied。
@@ -1216,9 +1225,12 @@ class ConnectionsUseCase:
                     except DomainError as error:
                         # adapter 把 timeout/request-failed/不确定 5xx 都归入 Transient；
                         # 尚未拿到 token 响应时无法证明 exchange 结果，不能猜写 unsatisfied。
-                        # 成功 exchange 后的只读账户验证失败不再有授权码结果歧义。
+                        # adapter 内部的 post-exchange scope 核验与外部只读账户验证
+                        # 都不再有授权码结果歧义；它们的已知失败可以原子收敛能力。
                         if isinstance(error, (StateConflictError, OAuthRefreshError)) or (
-                            isinstance(error, TransientProviderError) and not exchange_completed
+                            isinstance(error, TransientProviderError)
+                            and not exchange_completed
+                            and not isinstance(error, OAuthPostExchangeVerificationError)
                         ):
                             raise
                         await self._persist_recovery_unsatisfied(
@@ -1268,7 +1280,7 @@ class ConnectionsUseCase:
                                     now=_utc_now(self._clock),
                                 )
                                 await lease.assert_owned()
-        except Exception:  # noqa: BLE001 - 已持久 started/state 后禁止重放 code，包含真实 commit ACK 丢失。
+        except Exception as error:  # started/state 已持久；commit ACK 丢失只读核对。
             closed = await coordinator.read_result(
                 user_id=consumed.user_id,
                 connection_id=authorization.connection_id,
@@ -1276,6 +1288,13 @@ class ConnectionsUseCase:
                 recovery=True,
             )
             if closed is None:
+                if isinstance(error, OAuthRefreshError) and error.error_code in {
+                    "oauth_refresh_claim_locked",
+                    "oauth_refresh_claim_lost",
+                    "oauth_credential_state_conflict",
+                }:
+                    # 新 session 的合法历史结果优先；不存在结果时不能抹掉明确 lease/CAS 原因。
+                    raise error from None
                 raise OAuthRefreshError() from None
             if isinstance(closed.metadata, RecoveryUnsatisfiedV1):
                 raise OAuthRefreshError("oauth_refresh_recovery_unsatisfied") from None

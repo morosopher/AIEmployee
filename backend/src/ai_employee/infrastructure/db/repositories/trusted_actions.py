@@ -1765,7 +1765,8 @@ class SqlAlchemyTrustedActionRepository:
         →本地动作→Connection→access→refresh 取锁，重读 matching OAuth result 与当前完整
         credentials。仅 proof、current snapshot、live lease 均匹配时设置 retryable=true；
         状态、审计与幂等 Outbox 同事务提交，下一次真实写仍必须通过原
-        mark_request_started 及撤权屏障。
+        mark_request_started 及撤权屏障。lease 竞争/凭据冲突结束为不可重试失败；
+        lease 丢失/结果未知保留原写未应用事实，进入人工关注且禁止新增 provider 调用。
         """
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id, approval_id=snapshot.approval_id
@@ -1865,24 +1866,57 @@ class SqlAlchemyTrustedActionRepository:
             if error_code not in {
                 "oauth_refresh_result_unknown",
                 "oauth_credential_state_conflict",
-                "oauth_refresh_locked",
+                "oauth_refresh_claim_locked",
+                "oauth_refresh_claim_lost",
             }:
                 raise _trusted_action_unavailable()
-            # refresh unknown 不抹掉原写未应用事实；它只撤销自动重入资格并进入人工关注。
-            execution.status = ToolExecutionStatus.NEEDS_ATTENTION.value
+            safely_failed = error_code in {
+                "oauth_refresh_claim_locked",
+                "oauth_credential_state_conflict",
+            }
+            # 原写已明确未应用；所有 OAuth 失败都撤销自动重入资格。已知竞争/CAS 冲突
+            # 是非重试终态，只有无法确认 grant 的丢锁/未知结果仍需人工关注。
+            execution.result_summary = {"kind": "confirmed_not_applied", "retryable": False}
+            execution.status = (
+                ToolExecutionStatus.CONFIRMED_FAILED.value
+                if safely_failed
+                else ToolExecutionStatus.NEEDS_ATTENTION.value
+            )
             execution.error_code = error_code
-            task.status = TaskStatus.NEEDS_ATTENTION.value
+            execution.completed_at = database_now if safely_failed else None
+            task.status = (
+                TaskStatus.FAILED.value if safely_failed else TaskStatus.NEEDS_ATTENTION.value
+            )
             task.error_code = error_code
-            task.finished_at = None
+            task.finished_at = database_now if safely_failed else None
             _clear_task_scheduling(task)
             await self._set_local_action_status(
                 task=task,
                 approval=approval,
-                mail_status=MailDraftStatus.NEEDS_ATTENTION,
-                calendar_status=CalendarProposalStatus.NEEDS_ATTENTION,
+                mail_status=MailDraftStatus.EDITING
+                if safely_failed
+                else MailDraftStatus.NEEDS_ATTENTION,
+                calendar_status=(
+                    CalendarProposalStatus.EDITING
+                    if safely_failed
+                    else CalendarProposalStatus.NEEDS_ATTENTION
+                ),
                 allowed_current={"executing"},
             )
-            event_type = "tool.needs_attention"
+            if safely_failed:
+                # 与现有 confirmed_failed 路径一致：本事务清租约后 Runner 不再写任务终态，
+                # 因此必须在工具结果前同时追加 task.failed，保持完整审计时间线。
+                self._session.add(
+                    AuditEventModel(
+                        user_id=task.user_id,
+                        task_id=task.id,
+                        event_type="task.failed",
+                        actor_type="worker",
+                        actor_id=lease_owner,
+                        event_metadata={"error_code": error_code},
+                    )
+                )
+            event_type = "tool.confirmed_failed" if safely_failed else "tool.needs_attention"
         audit = AuditEventModel(
             user_id=snapshot.user_id,
             task_id=snapshot.task_id,

@@ -19,6 +19,7 @@ from ai_employee.application.ports.oauth import (
     MAX_PROVIDER_ACCOUNT_ID_LENGTH,
     OAuthAccount,
     OAuthAuthorizationRequest,
+    OAuthPostExchangeVerificationError,
     OAuthProvider,
     OAuthProviderAdapter,
     OAuthRevocationResult,
@@ -454,7 +455,11 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
         )
 
     async def exchange_code(self, *, code: str, verifier: str) -> OAuthTokenSet:
-        """交换授权码并核验实际授予 scope；缺省 scope 走 token-info 边界。"""
+        """一次交换授权码并核验实际 scope，缺省 scope 时只读查询 token-info。
+
+        POST 结果未知保留原临时失败；已收到 token 响应后的只读临时失败使用
+        OAuthPostExchangeVerificationError，供恢复用例安全收敛且不重放 code。
+        """
         normalized_code = _require_google_text(code, "authorization code")
         normalized_verifier = _require_google_text(verifier, "PKCE verifier")
         async with httpx.AsyncClient(timeout=_google_timeout()) as client:
@@ -473,7 +478,15 @@ class GoogleOAuthAdapter(OAuthProviderAdapter):
                 },
             )
             payload = _read_google_json_object_safe(response, "token")
-            return await self._token_set_from_payload(payload, client=client)
+            try:
+                return await self._token_set_from_payload(payload, client=client)
+            except TransientProviderError as error:
+                # token POST 已明确成功；缺 scope 时的 token-info GET 只是只读验证。
+                # 在 except 外创建端口标记，避免附带可能含请求上下文的原始异常链。
+                verification_code, retry_after = error.error_code, error.retry_after
+            raise OAuthPostExchangeVerificationError(
+                error_code=verification_code, retry_after=retry_after
+            )
 
     async def fetch_account(
         self,

@@ -300,8 +300,9 @@ async def test_explicit_session_lock_loss_is_fail_closed_and_never_reacquired(
 
     monkeypatch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", lose_lock)
     provider = FakeRefreshProvider(token_response())
-    with pytest.raises(OAuthRefreshError):
+    with pytest.raises(OAuthRefreshError) as lost:
         await coordinator.refresh(refresh_request(), provider)
+    assert lost.value.error_code == "oauth_refresh_claim_lost"
     expected_calls = 0 if stage == "before_network" else 1
     assert provider.calls == expected_calls
     with pytest.raises(OAuthRefreshError):
@@ -352,7 +353,7 @@ async def test_explicit_recovery_lease_shares_automatic_mutex_without_starting_g
     async with coordinator.explicit_recovery_lease(user_id=USER_ID, connection_id=CONNECTION_ID):
         with pytest.raises(OAuthRefreshError) as error:
             await coordinator.refresh(refresh_request(), provider)
-        assert error.value.error_code == "oauth_refresh_locked"
+        assert error.value.error_code == "oauth_refresh_claim_locked"
         assert provider.calls == 0
         async with sessions() as session:
             assert (await session.scalars(select(AuditEventModel))).all() == []
@@ -429,10 +430,11 @@ async def test_local_credential_validation_precedes_started_and_provider(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("actual_commit", [True, False])
+@pytest.mark.parametrize("lose_lease", (False, True))
 async def test_confirmed_commit_ack_loss_uses_fresh_session_without_provider_replay(
-    oauth_state, actual_commit: bool
+    oauth_state, actual_commit: bool, lose_lease: bool
 ) -> None:
-    """真实 commit 后 ACK 异常与 commit 前 rollback 必须由新 session 的结果读取区分。"""
+    """真实 commit/rollback 由新 session 区分；物理 lease 丢失不能否定已提交 closure。"""
     sessions, _, coordinator = oauth_state
     attached: list = []
 
@@ -440,8 +442,18 @@ async def test_confirmed_commit_ack_loss_uses_fresh_session_without_provider_rep
     from ai_employee.infrastructure.db.repositories.credential_rotation import (
         SqlAlchemyCredentialRotationRepository,
     )
+    from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+        PostgreSQLOAuthRefreshLease,
+    )
 
     original = SqlAlchemyCredentialRotationRepository.confirm
+    original_assert = PostgreSQLOAuthRefreshLease.assert_owned
+    leases: list[PostgreSQLOAuthRefreshLease] = []
+
+    async def capture_owned_lease(lease: PostgreSQLOAuthRefreshLease) -> None:
+        """使用真实 ownership 检查，只记录注入故障所需的实际持锁连接。"""
+        await original_assert(lease)
+        leases.append(lease)
 
     async def with_ack_loss(self, *args, **kwargs):
         """执行真实 writer 后让底层 commit 边界产生受控异常。"""
@@ -449,7 +461,12 @@ async def test_confirmed_commit_ack_loss_uses_fresh_session_without_provider_rep
         name = "after_commit" if actual_commit else "before_commit"
 
         def lost_ack(session):
+            """在 SQLAlchemy 真实 commit greenlet 内丢弃 lease 物理连接，再报告稳定丢锁。"""
             del session
+            if lose_lease:
+                leases[-1].connection.sync_connection.invalidate()
+                assert leases[-1].connection.invalidated
+                raise OAuthRefreshError("oauth_refresh_claim_lost")
             raise RuntimeError("synthetic commit acknowledgement lost")
 
         event.listen(self.session.sync_session, name, lost_ack, once=True)
@@ -458,13 +475,17 @@ async def test_confirmed_commit_ack_loss_uses_fresh_session_without_provider_rep
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(SqlAlchemyCredentialRotationRepository, "confirm", with_ack_loss)
+        patch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", capture_owned_lease)
         provider = FakeRefreshProvider(token_response())
         if actual_commit:
             result = await coordinator.refresh(refresh_request(), provider)
             assert result.refreshed
         else:
-            with pytest.raises(OAuthRefreshError):
+            with pytest.raises(OAuthRefreshError) as error:
                 await coordinator.refresh(refresh_request(), provider)
+            assert error.value.error_code == (
+                "oauth_refresh_claim_lost" if lose_lease else "oauth_refresh_result_unknown"
+            )
     assert provider.calls == 1
     async with sessions() as session:
         events = (await session.scalars(select(AuditEventModel).order_by(AuditEventModel.id))).all()
@@ -850,7 +871,7 @@ async def test_recovery_network_holds_shared_lease_but_no_business_row_locks(oau
             assert consumed is not None
         with pytest.raises(OAuthRefreshError) as locked:
             await coordinator.refresh(refresh_request(), automatic)
-        assert locked.value.error_code == "oauth_refresh_locked"
+        assert locked.value.error_code == "oauth_refresh_claim_locked"
         with pytest.raises(OAuthStateRejectedError):
             await use_case.callback(code="synthetic-code", state=state)
         with pytest.raises(OAuthStateRejectedError):
@@ -868,6 +889,32 @@ async def test_recovery_network_holds_shared_lease_but_no_business_row_locks(oau
         "oauth.refresh_credential_replaced",
     ]
     assert sessions.engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_callback_competing_lease_is_locked_before_exchange(oauth_state) -> None:
+    """真实共享 lease 竞争保留规范 locked；已消费 state 不能因未调用 provider 而重用。"""
+    sessions, _, coordinator = oauth_state
+    await make_unknown_fence(coordinator)
+    adapter = RecoveryOAuthAdapter(recovery_tokens("synthetic-different-refresh"))
+    use_case = recovery_use_case(oauth_state, adapter)
+    state = await begin_recovery(use_case, adapter)
+
+    async with coordinator.explicit_recovery_lease(user_id=USER_ID, connection_id=CONNECTION_ID):
+        with pytest.raises(OAuthRefreshError) as locked:
+            await use_case.callback(code="synthetic-code", state=state)
+        assert locked.value.error_code == "oauth_refresh_claim_locked"
+        assert adapter.calls == 0
+    _, attempts, records, capabilities = await recovery_facts(sessions)
+    assert attempts[0].consumed_at is not None
+    assert [record.event_type for record in records] == [
+        "oauth.refresh_started",
+        "oauth.refresh_recovery_authorization_started",
+    ]
+    assert all(item.status == "authorizing" for item in capabilities)
+    with pytest.raises(OAuthStateRejectedError):
+        await use_case.callback(code="synthetic-code", state=state)
+    assert adapter.calls == 0
 
 
 @pytest.mark.asyncio
@@ -909,9 +956,9 @@ async def test_recovery_exchange_after_real_lease_loss_leaves_no_guessed_result(
     )
     use_case = recovery_use_case(oauth_state, adapter)
     state = await begin_recovery(use_case, adapter)
-    with pytest.raises(OAuthRefreshError) as unknown:
+    with pytest.raises(OAuthRefreshError) as lost:
         await use_case.callback(code="synthetic-code", state=state)
-    assert unknown.value.error_code == "oauth_refresh_result_unknown"
+    assert lost.value.error_code == "oauth_refresh_claim_lost"
     _, attempts, records, capabilities = await recovery_facts(sessions)
     assert attempts[0].consumed_at is not None
     assert [item.event_type for item in records] == [
@@ -1156,6 +1203,105 @@ async def test_recovery_http_exchange_unknown_never_guesses_unsatisfied_or_repla
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("network_failure", ("timeout", "request_failed"))
+@pytest.mark.parametrize("has_new_refresh", (False, True))
+async def test_recovery_google_post_exchange_read_failure_commits_unsatisfied(
+    oauth_state,
+    network_failure: str,
+    has_new_refresh: bool,
+) -> None:
+    """真实 Google POST 已返回后的 token-info 失败关闭恢复，但不改凭据或重放授权码。
+
+    有无新 refresh 都必须完成实际 scope 验证才能 replacement；只读验证的临时失败
+    已不同于 POST ACK 未知，current T 的 requested 能力与 unsatisfied 应原子收敛。
+    """
+    sessions, cipher, coordinator = oauth_state
+    await make_unknown_fence(coordinator)
+    before = await persisted_credentials(sessions)
+    adapter = GoogleOAuthAdapter(
+        "synthetic-client", "synthetic-secret", "https://app.example.test/callback"
+    )
+    use_case = ConnectionsUseCase(
+        SqlAlchemyConnectionStoreFactory(sessions),
+        cipher,
+        {"google": adapter},
+        RecoveryClock(),
+        identity=OAuthRefreshIdentity(bytes(range(32)), key_version=cipher.key_version),
+        coordinator=coordinator,
+    )
+    started = await use_case.start_capability_enable(
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        capability=ConnectionCapability.MAIL_SEND,
+    )
+    state = parse_qs(urlparse(started.authorization_url).query)["state"][0]
+    _, _, _, previous_capabilities = await recovery_facts(sessions)
+    previous_verified = {
+        item.capability: (tuple(item.actual_scopes), item.last_verified_at)
+        for item in previous_capabilities
+    }
+    token_payload: dict[str, object] = {
+        "access_token": "synthetic-recovery-access",
+        "expires_in": 3600,
+    }
+    if has_new_refresh:
+        token_payload["refresh_token"] = "synthetic-different-refresh"
+    with respx.mock(assert_all_called=True) as mocked:
+        post = mocked.post("https://oauth2.googleapis.com/token").respond(200, json=token_payload)
+        token_info = mocked.get("https://oauth2.googleapis.com/tokeninfo").mock(
+            side_effect=(
+                httpx.ReadTimeout("synthetic read response unavailable")
+                if network_failure == "timeout"
+                else httpx.ConnectError("synthetic read request unavailable")
+            )
+        )
+        with pytest.raises(DomainError) as failure:
+            await use_case.callback(code="synthetic-code", state=state)
+        assert post.call_count == token_info.call_count == 1
+        connection, attempts, records, capabilities = await recovery_facts(sessions)
+        assert all(item.status == "action_required" for item in capabilities)
+        result = await coordinator.read_result(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            attempt_id=attempts[0].id,
+            recovery=True,
+        )
+        assert result is not None and isinstance(result.metadata, RecoveryUnsatisfiedV1)
+        assert result.metadata.capability_transition == "action_required"
+        assert result.metadata.requested_capabilities == ["calendar.read", "mail.read", "mail.send"]
+        assert all(item.last_error_code == result.metadata.error_code for item in capabilities)
+        assert failure.value.error_code == f"google_oauth_{network_failure}"
+        assert isinstance(failure.value, TransientProviderError)
+        assert failure.value.__context__ is None
+        assert {
+            item.capability: (tuple(item.actual_scopes), item.last_verified_at)
+            for item in capabilities
+        } == previous_verified
+        assert attempts[0].consumed_at is not None
+        assert connection.authorization_generation == 3 and frozenset(connection.scopes) == SCOPES
+        assert await persisted_credentials(sessions) == before
+        assert [item.event_type for item in records] == [
+            "oauth.refresh_started",
+            "oauth.refresh_recovery_authorization_started",
+            "oauth.refresh_recovery_unsatisfied",
+        ]
+        assert (
+            await coordinator.read_result(
+                user_id=USER_ID,
+                connection_id=CONNECTION_ID,
+                attempt_id=UUID(records[0].metadata["refresh_attempt_id"]),
+            )
+            is None
+        )
+        with pytest.raises(OAuthStateRejectedError):
+            await use_case.callback(code="synthetic-code", state=state)
+        with pytest.raises(OAuthStateRejectedError):
+            await use_case.callback_error(provider="google", state=state)
+        assert post.call_count == token_info.call_count == 1
+    assert sessions.engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
 async def test_recovery_targetless_identity_is_blocked_before_any_save(
     oauth_state, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1292,6 +1438,180 @@ async def test_recovery_result_commit_ack_loss_uses_fresh_union_and_keeps_state_
         await use_case.callback(code="synthetic-code", state=state)
     assert adapter.calls == (0 if outcome == "denial" else 1)
     assert sessions.engine.pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_commit", (False, True))
+@pytest.mark.parametrize("outcome", ("missing", "replacement"))
+@pytest.mark.parametrize("lose_lease", (False, True))
+async def test_recovery_ack_loss_later_authorization_commits_before_fresh_reconcile(
+    oauth_state,
+    monkeypatch: pytest.MonkeyPatch,
+    actual_commit: bool,
+    outcome: str,
+    lose_lease: bool,
+) -> None:
+    """结果 ACK 丢失后，较新合法授权先改变 generation/能力，历史关闭仍独立于当前就绪。
+
+    故障发生在真实 result INSERT 后的 commit/rollback；仅暂停旧 callback 的
+    fresh-session read_result，后续授权必须通过现有 start_capability_enable 提交。
+    不能直接篡改 ORM generation/capability，也不能替换历史 matcher 的结果。
+    """
+    sessions, _, coordinator = oauth_state
+    await make_unknown_fence(coordinator)
+    before = await persisted_credentials(sessions)
+    adapter = RecoveryOAuthAdapter(
+        recovery_tokens("synthetic-different-refresh" if outcome == "replacement" else None)
+    )
+    use_case = recovery_use_case(oauth_state, adapter)
+    state = await begin_recovery(use_case, adapter)
+    _, original_attempts, original_records, _ = await recovery_facts(sessions)
+    old_attempt_id = original_attempts[0].id
+    entered, release = asyncio.Event(), asyncio.Event()
+    injected = []
+    original_read = SqlAlchemyOAuthRefreshCoordinator.read_result
+    reconcile_reads = 0
+    from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
+        PostgreSQLOAuthRefreshLease,
+    )
+
+    leases: list[PostgreSQLOAuthRefreshLease] = []
+    original_assert = PostgreSQLOAuthRefreshLease.assert_owned
+
+    async def capture_owned_lease(lease: PostgreSQLOAuthRefreshLease) -> None:
+        """只记录真实持锁会话；lease 丢失时仍由生产代码核对 result union。"""
+        await original_assert(lease)
+        leases.append(lease)
+
+    async def pause_old_reconcile(self, **arguments):
+        """仅拦住旧 callback 的读取时机；屏障放行后仍查询真实新 session 与严格 union。"""
+        nonlocal reconcile_reads
+        if asyncio.current_task() is callback_task and arguments["attempt_id"] == old_attempt_id:
+            reconcile_reads += 1
+            entered.set()
+            await release.wait()
+        return await original_read(self, **arguments)
+
+    def attach_ack_loss(mapper, connection, target):
+        """结果已真实 INSERT 后，分别让数据库 commit 成功丢 ACK 或实际回滚。"""
+        del mapper, connection
+        if target.event_type not in {
+            "oauth.refresh_recovery_unsatisfied",
+            "oauth.refresh_credential_replaced",
+        }:
+            return
+        sync_session = object_session(target)
+        assert sync_session is not None
+
+        def lose_ack(session):
+            """只丢弃本次事务的返回，不伪造数据库事实或再次发送 provider 请求。"""
+            del session
+            if lose_lease:
+                leases[-1].connection.sync_connection.invalidate()
+                assert leases[-1].connection.invalidated
+                raise OAuthRefreshError("oauth_refresh_claim_lost")
+            raise RuntimeError("synthetic recovery acknowledgement lost before later authorization")
+
+        event.listen(
+            sync_session, "after_commit" if actual_commit else "before_commit", lose_ack, once=True
+        )
+        injected.append(sync_session)
+
+    monkeypatch.setattr(SqlAlchemyOAuthRefreshCoordinator, "read_result", pause_old_reconcile)
+    monkeypatch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", capture_owned_lease)
+    event.listen(AuditEventModel, "after_insert", attach_ack_loss)
+    callback_task = asyncio.create_task(use_case.callback(code="synthetic-code", state=state))
+    try:
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+        except TimeoutError:
+            if callback_task.done():
+                await callback_task
+            raise
+        assert len(injected) == 1 and not callback_task.done()
+        await use_case.start_capability_enable(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            capability=ConnectionCapability.CALENDAR_WRITE,
+        )
+        newer_connection, attempts, _, newer_capabilities = await recovery_facts(sessions)
+        assert newer_connection.authorization_generation == 4
+        assert [item.target_authorization_generation for item in attempts] == [3, 4]
+        assert attempts[0].consumed_at is not None and attempts[1].consumed_at is None
+        expected_capabilities = {
+            item.capability: (
+                item.status,
+                tuple(item.actual_scopes),
+                item.last_verified_at,
+                item.last_error_code,
+            )
+            for item in newer_capabilities
+        }
+        assert expected_capabilities["calendar.write"][0] == "authorizing"
+        assert "calendar.write" not in original_attempts[0].requested_capabilities
+        release.set()
+        with pytest.raises(OAuthRefreshError) as callback_error:
+            await asyncio.wait_for(callback_task, timeout=5)
+        assert callback_error.value.error_code == (
+            "oauth_credential_state_conflict"
+            if actual_commit and outcome == "replacement"
+            else "oauth_refresh_recovery_unsatisfied"
+            if actual_commit
+            else "oauth_refresh_claim_lost"
+            if lose_lease
+            else "oauth_refresh_result_unknown"
+        )
+    finally:
+        release.set()
+        if not callback_task.done():
+            callback_task.cancel()
+        await asyncio.gather(callback_task, return_exceptions=True)
+        event.remove(AuditEventModel, "after_insert", attach_ack_loss)
+
+    assert reconcile_reads >= 1
+    for _ in range(2):
+        closed = await coordinator.read_result(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            attempt_id=old_attempt_id,
+            recovery=True,
+        )
+        assert (closed is not None) is actual_commit
+        if closed is not None:
+            assert isinstance(
+                closed.metadata,
+                CredentialReplacedV1 if outcome == "replacement" else RecoveryUnsatisfiedV1,
+            )
+        original_closed = await coordinator.read_result(
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            attempt_id=UUID(original_records[0].metadata["refresh_attempt_id"]),
+        )
+        assert (original_closed is not None) is (actual_commit and outcome == "replacement")
+    connection, _, _, capabilities = await recovery_facts(sessions)
+    assert connection.authorization_generation == 4
+    assert {
+        item.capability: (
+            item.status,
+            tuple(item.actual_scopes),
+            item.last_verified_at,
+            item.last_error_code,
+        )
+        for item in capabilities
+    } == expected_capabilities
+    with pytest.raises(OAuthRefreshError) as readiness:
+        await coordinator.read_current(
+            replace(refresh_request(), capability=ConnectionCapability.CALENDAR_WRITE)
+        )
+    assert readiness.value.error_code == "oauth_credential_state_conflict"
+    assert (await persisted_credentials(sessions) != before) is (
+        actual_commit and outcome == "replacement"
+    )
+    with pytest.raises(OAuthStateRejectedError):
+        await use_case.callback(code="synthetic-code", state=state)
+    with pytest.raises(OAuthStateRejectedError):
+        await use_case.callback_error(provider="google", state=state)
+    assert adapter.calls == 1 and sessions.engine.pool.checkedout() == 0
 
 
 @pytest.mark.asyncio

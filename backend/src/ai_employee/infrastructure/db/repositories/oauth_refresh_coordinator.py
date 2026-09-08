@@ -96,7 +96,7 @@ class PostgreSQLOAuthRefreshLease:
         发出 SELECT 前登记结果未知；异常或取消不能被误解为未取锁，外层必须丢弃该会话。
         """
         if self._backend_pid is not None or self._acquire_result_unknown:
-            raise OAuthRefreshError("oauth_refresh_locked")
+            raise OAuthRefreshError("oauth_refresh_claim_locked")
         self._acquire_result_unknown = True
         result = (
             await self.connection.execute(
@@ -110,12 +110,15 @@ class PostgreSQLOAuthRefreshLease:
         self._acquire_result_unknown = False
         await self.connection.commit()
         if result[1] is not True:
-            raise OAuthRefreshError("oauth_refresh_locked")
+            raise OAuthRefreshError("oauth_refresh_claim_locked")
 
     async def assert_owned(self) -> None:
-        """重读 pg_locks 的实际 owner；没有 reentrant acquire，丢锁或断线均失败关闭。"""
+        """重读 pg_locks 的实际 owner；无法证明原 session 持锁时返回规范 claim_lost。
+
+        不允许重入 acquire 或断线重连掩盖租约丢失；调用方只能核对持久 result。
+        """
         if self.connection.closed or self.connection.invalidated or self._backend_pid is None:
-            raise OAuthRefreshError()
+            raise OAuthRefreshError("oauth_refresh_claim_lost")
         try:
             owned = await self.connection.scalar(
                 text(
@@ -132,9 +135,9 @@ class PostgreSQLOAuthRefreshLease:
             )
             await self.connection.commit()
         except (SQLAlchemyError, OSError):
-            raise OAuthRefreshError() from None
+            raise OAuthRefreshError("oauth_refresh_claim_lost") from None
         if owned is not True:
-            raise OAuthRefreshError()
+            raise OAuthRefreshError("oauth_refresh_claim_lost")
 
     async def release(self) -> None:
         """已知持锁时显式 unlock；取锁结果未知或解锁异常时丢弃底层物理会话。"""
@@ -400,8 +403,8 @@ class SqlAlchemyOAuthRefreshCoordinator:
     ) -> OAuthRefreshReady:
         """唯一 automatic grant 路径：已提交 started→一次网络→完整 CAS/confirmed。
 
-        started 之后所有异常均保守进入只读核对；实际 commit 可恢复，rollback/无合法结果
-        保持 unknown。即使 provider 报 TransientProviderError，也不能重新发送旧 refresh。
+        started 之后所有异常均先只读核对；实际 commit 可恢复。无合法结果时只保留已知
+        lease/CAS 分类，其余 rollback/未知结果保持 unknown，不能重新发送旧 refresh。
         """
         async with self._lease(request.connection_id) as lease:
             await lease.assert_owned()
@@ -496,13 +499,20 @@ class SqlAlchemyOAuthRefreshCoordinator:
                         session, cipher=self._cipher, identity=self._identity
                     ).confirm(claim, tokens, completed_at=self._now())
                     await lease.assert_owned()
-            except Exception:  # noqa: BLE001 - started 后任何异常都只能查询持久结果，不能重放。
+            except Exception as error:  # started 后只能查询持久结果，不能重放。
                 closed = await self.read_result(
                     user_id=request.user_id,
                     connection_id=request.connection_id,
                     attempt_id=attempt_id,
                 )
                 if closed is None:
+                    if isinstance(error, OAuthRefreshError) and error.error_code in {
+                        "oauth_refresh_claim_locked",
+                        "oauth_refresh_claim_lost",
+                        "oauth_credential_state_conflict",
+                    }:
+                        # 已提交 result 优先；只有不存在合法 closure 时才保留已证实的原因。
+                        raise error from None
                     raise OAuthRefreshError() from None
                 # 查询永远使用新 session；原 lease 丢失不会使已提交结果复活或阻止 ACK 核对。
                 ready = await self.read_current(request)
