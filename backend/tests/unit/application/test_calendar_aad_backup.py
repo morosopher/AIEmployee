@@ -205,7 +205,7 @@ async def test_calendar_aad_backup_repeated_cancellation_settles_owned_files_bef
     def publish(staged, destination):
         """保留真实 no-clobber 发布及失败回滚，在线程交付结果前暂停。"""
         try:
-            original_publish(staged, destination)
+            return original_publish(staged, destination)
         finally:
             if boundary == "publication":
                 gate.pause()
@@ -355,13 +355,14 @@ async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
     original_publish, original_remove = backup._publish_backup, backup._remove_published
 
     def publish(staged, target):
-        """保持真实 no-clobber/fsync，在发布完成后注入首次取消。"""
-        original_publish(staged, target)
+        """保持真实 no-clobber/fsync 及归属结果，在发布完成后注入首次取消。"""
+        result = original_publish(staged, target)
         publication_gate.pause()
+        return result
 
-    def remove(target):
+    def remove(target, identities):
         """真实撤回两个本次成员后暂停，使第二次取消落在补偿自身的等待边界。"""
-        original_remove(target)
+        original_remove(target, identities)
         rollback_gate.pause()
 
     async def producer(path):
@@ -392,3 +393,111 @@ async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
     assert cancellation.value.args == ("first backup publication cancellation",)
     assert fixture.closed == [True]
     assert set(tmp_path.iterdir()) == {fixture.artifact_file.path}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancellation", "exit_error"])
+@pytest.mark.parametrize(
+    ("initial", "cancel_rollback"),
+    [
+        ("new", False),
+        ("dump_collision", False),
+        ("checksum_collision", False),
+        ("replacement", False),
+        ("checksum_replacement", False),
+        ("new", True),
+    ],
+)
+async def test_calendar_aad_backup_final_exit_failure_keeps_publication_ownership(
+    tmp_path, monkeypatch, guarded_backup_resources, failure, initial, cancel_rollback
+):
+    """真实备份父入口发布及私有目录清理完成后，最终 exit 失败只补偿本次仍拥有的成员。"""
+    gate, rollback_gate = ThreadBoundary(), ThreadBoundary()
+    exited, produced = [], []
+    exit_error = OSError("synthetic final backup lease exit failure")
+
+    def on_close():
+        """仅在最终同步 context exit 暂停，取消不会提前落入内部 publication/cleanup。"""
+        gate.pause()
+        exited.append(True)
+        if failure == "exit_error":
+            raise exit_error
+        return True
+
+    fixture = guarded_backup_resources(tmp_path, on_close)
+    target = tmp_path / f"{BINDING.basename}.dump.enc"
+    checksum = target.with_suffix(".enc.sha256")
+    original_unlink = Path.unlink
+    previous = set()
+    if initial in {"dump_collision", "checksum_collision"}:
+        collision = target if initial == "dump_collision" else checksum
+        collision.write_bytes(b"synthetic-existing-collision")
+        previous.add(collision)
+
+    async def producer(path):
+        """只写合成加密字节，真实 checksum、no-clobber 发布与目录清理由父调用完成。"""
+        produced.append(path)
+        path.write_bytes(b"synthetic-encrypted-dump")
+
+    def unlink(path, *args, **kwargs):
+        """第一个真实成员撤回后暂停；后续取消仍必须完成另一个成员的条件补偿。"""
+        result = original_unlink(path, *args, **kwargs)
+        if cancel_rollback and path == target:
+            rollback_gate.pause()
+        return result
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    task = asyncio.create_task(backup.run_guarded_backup(**fixture.arguments, producer=producer))
+    returned_early = False
+    try:
+        await gate.reached()
+        published = {target, checksum} if not previous else previous
+        assert set(tmp_path.iterdir()) == {fixture.artifact_file.path, *published}
+        assert task.cancelling() == 0
+        assert not task.done()
+        if "replacement" in initial:
+            replaced = target if initial == "replacement" else checksum
+            previous_inode = replaced.stat().st_ino
+            replacement = tmp_path / "synthetic-replacement"
+            replacement.write_bytes(b"synthetic-replacement-member")
+            os.replace(replacement, replaced)
+            assert replaced.stat().st_ino != previous_inode
+            previous.add(replaced)
+        if failure == "cancellation":
+            returned_early = await cancel_twice_while_pending(task)
+        if cancel_rollback:
+            gate.release.set()
+            assert await asyncio.to_thread(rollback_gate.entered.wait, 0.2), (
+                "final-exit failure did not enter owned backup rollback"
+            )
+            task.cancel("later backup rollback cancellation")
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            returned_early = returned_early or bool(done)
+    finally:
+        gate.release.set()
+        rollback_gate.release.set()
+        try:
+            with pytest.raises(
+                asyncio.CancelledError if failure == "cancellation" else OSError
+            ) as raised:
+                await task
+        finally:
+            await gate.settle()
+            if rollback_gate.entered.is_set():
+                await rollback_gate.settle()
+    assert not returned_early, "backup returned before the final lease exit thread settled"
+    assert exited == [True]
+    if failure == "cancellation":
+        assert raised.value.args == ("first resource cancellation",)
+    else:
+        assert raised.value is exit_error
+    assert len(produced) == (0 if "collision" in initial else 1)
+    expected = {fixture.artifact_file.path, *previous}
+    assert set(tmp_path.iterdir()) == expected, "failed parent left its new dump/checksum"
+    assert fixture.artifact_file.path.read_bytes() == zero_bytes()
+    for path in previous:
+        assert path.read_bytes() == (
+            b"synthetic-replacement-member"
+            if "replacement" in initial
+            else b"synthetic-existing-collision"
+        )

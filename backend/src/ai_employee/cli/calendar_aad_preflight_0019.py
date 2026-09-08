@@ -95,39 +95,53 @@ async def run_preflight(
     """取得固定 lease 后才读取 artifact，组合应用用例并在当前 guard 下原子发布。
 
     调用方拥有 sessions；本入口不创建通用 Worker、Taskiq、Redis consumer 或目录任务。
-    整个调用（含最终文件发布）和单 provider 步骤各有独立预算。
+    整个调用（含最终 lease exit）和单 provider 步骤各有独立预算。发布的内部失败
+    仍在 lease 内补偿；仅最终 exit 首次失败时，收完 exit 后按本次文件身份条件撤回。
     """
     binding = CalendarAadBinding(basename, immutable_image_id)
-    async with (
-        asyncio.timeout(task_timeout_seconds),
-        async_calendar_aad_rollout_lease(sessions.engine.url) as lease,
-    ):
-        artifact_file = CalendarAadArtifactFile(backup_directory, binding)
-        # artifact 同步读取也属于当前 lease；超时必须先收完线程，不能提前退出并复用连接。
-        existing = await await_calendar_aad_resource(
-            asyncio.create_task(asyncio.to_thread(artifact_file.read_optional))
-        )
-        repository = SqlAlchemyCalendarAadPreflightRepository(sessions)
-        artifact = await CalendarAadPreflightUseCase(
-            store=repository,
-            coordinator=coordinator,
-            adapters=adapters,
-            lease=lease,
-            clock=clock,
-            step_timeout_seconds=step_timeout_seconds,
-            task_timeout_seconds=task_timeout_seconds,
-        ).execute(binding=binding, existing=existing)
-        guard = CalendarAadCurrentGuard(
-            repository=repository,
-            artifact_file=artifact_file,
-            artifact=artifact,
-            lease=lease,
-            clock=clock,
-            expected_revision="20260809_0018",
-            allow_missing=True,
-        )
-        await artifact_file.publish(artifact, guard)
-        return artifact
+    # 构造只形成固定路径；首次文件检查仍严格位于取得同一 revision lease 之后。
+    artifact_file = CalendarAadArtifactFile(backup_directory, binding)
+    published = False
+    try:
+        async with (
+            asyncio.timeout(task_timeout_seconds),
+            async_calendar_aad_rollout_lease(sessions.engine.url) as lease,
+        ):
+            # artifact 同步读取也属于当前 lease；超时必须先收完线程，不能提前退出并复用连接。
+            existing = await await_calendar_aad_resource(
+                asyncio.create_task(asyncio.to_thread(artifact_file.read_optional))
+            )
+            repository = SqlAlchemyCalendarAadPreflightRepository(sessions)
+            artifact = await CalendarAadPreflightUseCase(
+                store=repository,
+                coordinator=coordinator,
+                adapters=adapters,
+                lease=lease,
+                clock=clock,
+                step_timeout_seconds=step_timeout_seconds,
+                task_timeout_seconds=task_timeout_seconds,
+            ).execute(binding=binding, existing=existing)
+            guard = CalendarAadCurrentGuard(
+                repository=repository,
+                artifact_file=artifact_file,
+                artifact=artifact,
+                lease=lease,
+                clock=clock,
+                expected_revision="20260809_0018",
+                allow_missing=True,
+            )
+            published = await artifact_file.publish(artifact, guard)
+    except BaseException as failure:
+        # 只有 publish 与内部清理已正常交付的新文件才来到此处。timeout 先完成原有转换，
+        # 随后的补偿取消不能替换这个首次失败；退出线程也已由 lease adapter 收至终态。
+        if published:
+            rollback = asyncio.create_task(asyncio.to_thread(artifact_file.discard_new_publication))
+            try:
+                await await_calendar_aad_resource(rollback)
+            except BaseException as rollback_failure:
+                raise failure from rollback_failure
+        raise
+    return artifact
 
 
 async def _run(

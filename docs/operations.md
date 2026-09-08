@@ -316,10 +316,15 @@ producer、当前期限重读和最终发布。两次guard绑定同一原artifac
 原普通备份入口。此hook仅交接dump/checksum；完整manifest组发布、保留、remote及restore证据仍按
 Task27D门禁验收，不能据此宣布0019生产窗口可执行。
 
-preflight、resync 与此 backup hook 收到超时或重复取消后，仍持有同一 revision lease，
+preflight、resync 与此 backup hook 在主体执行阶段收到超时或重复取消后，仍持有同一 revision lease，
 等待本次同步校验、artifact I/O、子进程获取与停止、文件和目录清理全部收敛，再传播原取消。
 取消期间不会继续进入新的 provider 或业务步骤；本次新发布的 artifact/dump/checksum 必须撤回，
 已有成功文件保留。取消不表示同步 I/O 已经停止，应等维护命令退出后再开始下一次操作。
+发布及内部清理成功后，父调用仍保留本次文件的精确身份，直到最终 lease exit 成功。如果首次失败
+发生在这个最终退出阶段，先等退出线程收敛，再条件撤回仍属于本次的文件；保留碰撞文件及后来
+替换或改写的文件。此前已知的内部补偿仍在 lease 释放前完成。物理释放到条件补偿之间有短窗口，
+因此维护命令实际成功退出前不能把刚出现的文件当作可继续操作的成功结果；失败后的替换文件
+不属于本次成功产物，必须保持原样。补偿自身再次收到取消也要完整收尾，并保留首次退出失败。
 artifact 和 backup checksum 输入使用非阻塞 no-follow 打开，再对同一 fd 校验文件类型等约束；
 无 writer 的 FIFO、目录等非法对象会直接拒绝，不会等待 FIFO writer 才进入校验。
 

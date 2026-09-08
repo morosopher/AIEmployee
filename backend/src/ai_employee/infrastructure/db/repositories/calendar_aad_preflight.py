@@ -279,6 +279,7 @@ class CalendarAadArtifactFile:
         """构造时只形成路径，不触碰文件，确保失败 try-lock 先于所有 artifact 检查。"""
         self.binding = binding
         self.path = directory / f"{binding.basename}.calendar-aad-preflight.json"
+        self._publication_identity: os.stat_result | None = None
 
     def read_optional(self) -> CalendarAadArtifact | None:
         """非阻塞 no-follow 打开，并在同一 fd 验证 regular/0600/大小后读取闭合 artifact。
@@ -333,7 +334,9 @@ class CalendarAadArtifactFile:
             if existing != artifact:
                 raise CalendarAadRolloutError("calendar_aad_artifact_invalid")
             return False
+        identity = temporary.lstat()
         os.rename(temporary, self.path)
+        self._publication_identity = identity
         try:
             descriptor = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -346,11 +349,41 @@ class CalendarAadArtifactFile:
             raise
         return True
 
-    async def publish(self, artifact: CalendarAadArtifact, guard: CalendarAadGuard) -> None:
+    def discard_new_publication(self) -> None:
+        """仅撤回本实例发布且当前路径仍指向的文件；不凭 basename 或内容相同认领替换文件。
+
+        发布线程保存临时文件的 device/inode 与未随 rename 改变的内容版本事实。最终
+        lease exit 首次失败时父调用仍持有该记录；这里以 no-follow 的当前身份核对，
+        保留旧文件、符号链接、替换 inode 或已被改写的文件，不重取 lease 或执行业务。
+        调用方在线程中执行此同步文件操作，并负责等待其终态。
+
+        Raises:
+            OSError: 文件身份读取或撤回失败；父调用保留原失败，并将此异常关联为原因。
+        """
+        identity = self._publication_identity
+        if identity is None:
+            return
+        try:
+            current = self.path.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            os.path.samestat(current, identity)
+            and current.st_mode == identity.st_mode
+            and current.st_mtime_ns == identity.st_mtime_ns
+            and current.st_size == identity.st_size
+        ):
+            self.path.unlink(missing_ok=True)
+
+    async def publish(self, artifact: CalendarAadArtifact, guard: CalendarAadGuard) -> bool:
         """在当前 guard 下发布；任意阶段取消都先收完线程，再清理临时文件并撤回新发布。
 
         staging/publication Task 保留真实结果所有权。临时清理收到新的取消也必须继续
         撤回本次新文件；既有成功 artifact 的 publication 结果为 False，始终保留。
+
+        Returns:
+            True 表示本次创建了文件，父调用须保持本实例直到最终 lease exit 成功；
+            False 表示只复用了已有 artifact，不取得该文件的补偿权。
         """
         staging = asyncio.create_task(asyncio.to_thread(self._stage, artifact))
         publication: asyncio.Task[bool] | None = None
@@ -362,7 +395,7 @@ class CalendarAadArtifactFile:
                 publication = asyncio.create_task(
                     asyncio.to_thread(self._publish, temporary, artifact)
                 )
-                await await_calendar_aad_resource(publication)
+                published = await await_calendar_aad_resource(publication)
             except asyncio.CancelledError as error:
                 cancellation = error
                 raise
@@ -386,7 +419,7 @@ class CalendarAadArtifactFile:
                 and publication.exception() is None
                 and publication.result()
             ):
-                rollback = asyncio.create_task(asyncio.to_thread(self.path.unlink, missing_ok=True))
+                rollback = asyncio.create_task(asyncio.to_thread(self.discard_new_publication))
                 try:
                     await await_calendar_aad_resource(rollback)
                 except asyncio.CancelledError:
@@ -394,6 +427,7 @@ class CalendarAadArtifactFile:
                         raise failure
                     raise
             raise
+        return published
 
 
 class CalendarAadCurrentGuard:

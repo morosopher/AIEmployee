@@ -16,6 +16,7 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
     CalendarAadRolloutError,
     parse_rollout_artifact,
 )
+from ai_employee.cli import calendar_aad_preflight_0019 as preflight
 from ai_employee.config import Settings
 from ai_employee.infrastructure.db.repositories import calendar_aad_preflight as module
 from tests.unit.application.test_calendar_aad_rollout import BINDING, zero_bytes
@@ -530,3 +531,126 @@ async def test_calendar_aad_later_cancellation_cannot_interrupt_publication_roll
     assert not returned_early
     assert cancellation.value.args == ("first publication cancellation",)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "exit_error"])
+@pytest.mark.parametrize(
+    ("initial", "cancel_rollback"),
+    [("new", False), ("existing", False), ("replacement", False), ("new", True)],
+)
+async def test_calendar_aad_preflight_final_exit_failure_keeps_publication_ownership(
+    tmp_path, monkeypatch, failure, initial, cancel_rollback
+):
+    """真实父入口发布及临时清理完成后，最终 exit 超时/失败只能撤回本次仍拥有的文件。"""
+    gate, rollback_gate = ThreadBoundary(), ThreadBoundary()
+    artifact_file = module.CalendarAadArtifactFile(tmp_path, BINDING)
+    artifact = parse_rollout_artifact(zero_bytes(), BINDING)
+    if initial == "existing":
+        artifact_file.path.write_bytes(zero_bytes())
+        artifact_file.path.chmod(0o600)
+    closed, budgets, executions = [], [], []
+    exit_error = OSError("synthetic final lease exit failure")
+    original_timeout = asyncio.timeout
+    original_unlink = Path.unlink
+
+    def timeout(delay):
+        """保留父入口自己创建的真实总 timeout，仅在进入最终 exit 后显式触发它。"""
+        budget = original_timeout(delay)
+        budgets.append(budget)
+        return budget
+
+    @contextmanager
+    def context(url):
+        """仅替代物理数据库 context；发布、异步 exit 等待和最终异常都走真实父入口。"""
+        try:
+            yield object()
+        finally:
+            gate.pause()
+            closed.append(True)
+            if failure == "exit_error":
+                raise exit_error
+
+    async def execute(self, *, binding, existing):
+        """替代已成功的外部用例，只交付完整合成 artifact，不执行数据库或供应商访问。"""
+        assert binding == BINDING
+        assert existing == (artifact if initial == "existing" else None)
+        executions.append(True)
+        return artifact
+
+    async def verify(self):
+        """本例固定当前 guard 成功，把故障严格放在发布完成之后的最终 lease exit。"""
+
+    def unlink(path, *args, **kwargs):
+        """撤回已真实完成后暂停，后续取消不能穿透收尾或替换原 timeout/退出异常。"""
+        result = original_unlink(path, *args, **kwargs)
+        if cancel_rollback and path == artifact_file.path:
+            rollback_gate.pause()
+        return result
+
+    monkeypatch.setattr(asyncio, "timeout", timeout)
+    monkeypatch.setattr(module, "calendar_aad_rollout_lease", context)
+    monkeypatch.setattr(preflight.CalendarAadPreflightUseCase, "execute", execute)
+    monkeypatch.setattr(module.CalendarAadCurrentGuard, "verify", verify)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    task = asyncio.create_task(
+        preflight.run_preflight(
+            sessions=SimpleNamespace(engine=SimpleNamespace(url=URL.create("postgresql"))),
+            coordinator=object(),
+            adapters=object(),
+            backup_directory=tmp_path,
+            basename=BINDING.basename,
+            immutable_image_id=BINDING.immutable_image_id,
+            clock=lambda: datetime(2030, 1, 1, tzinfo=UTC),
+            task_timeout_seconds=30,
+        )
+    )
+    returned_early = False
+    try:
+        await gate.reached()
+        # 门控位于真正的 context.__exit__：临时文件已清除，publication 已交回父调用。
+        assert list(tmp_path.iterdir()) == [artifact_file.path]
+        assert artifact_file.path.read_bytes() == zero_bytes()
+        assert task.cancelling() == 0
+        assert not task.done()
+        if initial == "replacement":
+            previous_inode = artifact_file.path.stat().st_ino
+            replacement = tmp_path / "synthetic-replacement"
+            replacement.write_bytes(zero_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, artifact_file.path)
+            assert artifact_file.path.stat().st_ino != previous_inode
+        if failure == "timeout":
+            assert len(budgets) == 1
+            budgets[0].reschedule(asyncio.get_running_loop().time() - 1)
+            while not budgets[0].expired():
+                await asyncio.sleep(0)
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            returned_early = bool(done)
+        if cancel_rollback:
+            gate.release.set()
+            assert await asyncio.to_thread(rollback_gate.entered.wait, 0.2), (
+                "final-exit failure did not enter owned artifact rollback"
+            )
+            task.cancel("later artifact rollback cancellation")
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            returned_early = returned_early or bool(done)
+    finally:
+        gate.release.set()
+        rollback_gate.release.set()
+        try:
+            with pytest.raises(TimeoutError if failure == "timeout" else OSError) as raised:
+                await task
+        finally:
+            await gate.settle()
+            if rollback_gate.entered.is_set():
+                await rollback_gate.settle()
+    assert not returned_early, "preflight returned before the final lease exit thread settled"
+    assert closed == [True]
+    assert executions == [True]
+    if failure == "exit_error":
+        assert raised.value is exit_error
+    expected = [] if initial == "new" else [artifact_file.path]
+    assert list(tmp_path.iterdir()) == expected, "failed parent left its new success artifact"
+    if expected:
+        assert artifact_file.path.read_bytes() == zero_bytes()
