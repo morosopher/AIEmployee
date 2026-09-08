@@ -1,7 +1,25 @@
 # 备份与恢复委托给可审计脚本；恢复操作保留交互确认和生产环境保护。
 [group('operations')]
 backup:
-    docker compose --profile operations run --rm backup
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${BACKUP_ARTIFACT_BASENAME-}" ]]; then
+      exec python3 scripts/run-calendar-aad-0019.py backup
+    fi
+    exec docker compose --profile operations run --rm backup
+
+# 0019 入口不接受 scope/账户/期限参数；宿主校验停服与同一不可变镜像，CLI 持固定数据库 lease。
+[group('operations')]
+calendar-aad-preflight-0019:
+    python3 scripts/run-calendar-aad-0019.py preflight
+
+[group('operations')]
+calendar-aad-migrate-0019:
+    python3 scripts/run-calendar-aad-0019.py migrate
+
+[group('operations')]
+calendar-aad-resync-0019:
+    python3 scripts/run-calendar-aad-0019.py resync
 
 [confirm]
 [group('operations')]

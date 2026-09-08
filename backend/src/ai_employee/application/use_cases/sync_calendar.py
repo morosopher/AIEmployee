@@ -1,6 +1,6 @@
 """协调供应商中立 Calendar 分页、字段加密和单日历游标提交。"""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +18,14 @@ from ai_employee.application.ports.calendar import (
     ProviderCalendar,
 )
 from ai_employee.application.ports.encryption import EncryptedValue, Encryption
+from ai_employee.application.use_cases.calendar_aad_recovery import (
+    CalendarAadTaskBinding,
+    MarkedCalendarScopeState,
+)
+from ai_employee.application.use_cases.calendar_aad_rollout import (
+    CalendarAadGuard,
+    CalendarAadRolloutError,
+)
 from ai_employee.domain.errors import (
     InternalInvariantError,
     PermanentProviderError,
@@ -26,12 +34,110 @@ from ai_employee.domain.errors import (
 )
 
 
+async def collect_calendar_event_pages(
+    pages: AsyncIterator[CalendarSyncPage],
+    *,
+    scope_key: str | None = None,
+    before_page: Callable[[], Awaitable[None]] | None = None,
+) -> tuple[CalendarSyncPage, ...]:
+    """在供应商事务外收集有界事件链，供普通同步、0019 probe 与 marked resync 共用。
+
+    固定 100 页、10,000 events 与 32 MiB 规范化文本上界沿用现有 Microsoft 日历边界。
+    before_page 位于每次 generator 前进之前，保证跨页网络不能跳过 rollout/connection lease。
+    最终页必须有非空 cursor；scope 校验发生在任何本地 event 写入之前。
+    """
+    collected: list[CalendarSyncPage] = []
+    count, byte_count = 0, 0
+    while True:
+        if before_page is not None:
+            await before_page()
+        try:
+            page = await anext(pages)
+        except StopAsyncIteration:
+            break
+        if not isinstance(page, CalendarSyncPage) or len(collected) >= 100:
+            raise InternalInvariantError(
+                error_code="calendar_pagination_invalid", message="Calendar page chain is invalid"
+            )
+        count += len(page.events)
+        for event in page.events:
+            if scope_key is not None and event.calendar_id != scope_key:
+                raise InternalInvariantError(
+                    error_code="calendar_event_scope_mismatch",
+                    message="Calendar event scope does not match requested scope",
+                )
+            byte_count += sum(
+                len(value.encode("utf-8"))
+                for value in (
+                    event.event_id,
+                    event.calendar_id,
+                    event.title,
+                    event.description,
+                    event.location,
+                    event.provider_url,
+                    event.etag or "",
+                    event.recurring_event_id or "",
+                )
+            )
+            for fields in (
+                event.organizer or {},
+                *(event.attendees),
+                event.recurrence_metadata or {},
+            ):
+                byte_count += sum(
+                    len(key.encode("utf-8")) + len(value.encode("utf-8"))
+                    for key, value in fields.items()
+                )
+        if (
+            count > 10_000
+            or byte_count > 32 * 1024 * 1024
+            or (page.next_page_token is not None and page.next_cursor is not None)
+        ):
+            raise InternalInvariantError(
+                error_code="calendar_pagination_invalid", message="Calendar page chain is invalid"
+            )
+        if collected and collected[-1].next_page_token is None:
+            raise InternalInvariantError(
+                error_code="calendar_pagination_invalid", message="Calendar page chain is invalid"
+            )
+        collected.append(page)
+        if len(collected) == 100 and page.next_page_token is not None:
+            # 已知下一页必然越界时立即停止，不再推进可能触发网络请求的 generator。
+            raise InternalInvariantError(
+                error_code="calendar_pagination_invalid", message="Calendar page chain is invalid"
+            )
+    if not collected or collected[-1].next_page_token is not None or not collected[-1].next_cursor:
+        raise InternalInvariantError(
+            error_code="calendar_final_cursor_missing",
+            message="Calendar final page is missing a sync cursor",
+        )
+    return tuple(collected)
+
+
 class CalendarSyncStore(Protocol):
     """定义目录和单日历 scope 必须在同一事务完成的存储操作。"""
 
     async def get_state(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
     ) -> CalendarConnectionState | None: ...
+
+    async def get_marked_state(
+        self, *, binding: CalendarAadTaskBinding, now: datetime
+    ) -> MarkedCalendarScopeState | None:
+        """重验精确任务与 marker，已清除返回 None，不补造缺失 cursor。"""
+        ...
+
+    async def finish_marked_scope(
+        self,
+        *,
+        binding: CalendarAadTaskBinding,
+        expected: MarkedCalendarScopeState,
+        next_cursor: str,
+        event_count: int,
+        completed_at: datetime,
+    ) -> None:
+        """同事务 CAS marker、generation、任务与 cursor 后提交 freshness 和安全审计。"""
+        ...
 
     async def upsert_event(
         self,
@@ -124,6 +230,70 @@ class SyncCalendarUseCase:
         self._stores = stores
         self._registry = registry
         self._cipher = cipher
+
+    async def execute_marked_scope(
+        self,
+        *,
+        binding: CalendarAadTaskBinding,
+        guard: CalendarAadGuard,
+        clock: Callable[[], datetime],
+    ) -> CalendarSyncResult:
+        """执行一个已冻结 ordinal 的 exact marker 恢复，永不进入目录或增量分支。
+
+        provider 之前 marker 已清是幂等 no-op；读取期间的任何 marker、任务、授权或
+        cursor 漂移均回滚全部本地写入。分页复用普通同步的有界收集与 v2 加密边界，
+        provider 网络在事务外，最终 guard 紧邻应用事务提交。
+        """
+        await guard.verify()
+        async with self._stores() as store:
+            expected = await store.get_marked_state(binding=binding, now=clock())
+        if expected is None:
+            return CalendarSyncResult(0, None, False)
+        reader = self._registry.calendar_reader(
+            provider=expected.pair.provider,
+            connection_id=binding.input.connection_id,
+            scope_key=binding.input.scope_key,
+        )
+
+        async def before_page() -> None:
+            """每次推进 generator 前验证当前 artifact/deadline 及组合根提供的两层 lease。"""
+            await guard.verify()
+
+        pages = await collect_calendar_event_pages(
+            reader.initial_pages(binding.input.scope_key),
+            scope_key=binding.input.scope_key,
+            before_page=before_page,
+        )
+        next_cursor = pages[-1].next_cursor
+        if next_cursor is None:
+            raise CalendarAadRolloutError("calendar_aad_recovery_state_changed")
+        count = 0
+        async with self._stores() as store:
+            current = await store.get_marked_state(binding=binding, now=clock())
+            if current != expected:
+                raise CalendarAadRolloutError("calendar_aad_recovery_state_changed")
+            for page in pages:
+                for event in page.events:
+                    description, location = self._encrypt_event_fields(
+                        binding.user_id, binding.input.connection_id, event
+                    )
+                    await store.upsert_event(
+                        user_id=binding.user_id,
+                        connection_id=binding.input.connection_id,
+                        event=event,
+                        encrypted_description=description,
+                        encrypted_location=location,
+                    )
+                    count += 1
+            await store.finish_marked_scope(
+                binding=binding,
+                expected=expected,
+                next_cursor=next_cursor,
+                event_count=count,
+                completed_at=clock(),
+            )
+            await guard.verify()
+        return CalendarSyncResult(count, next_cursor, True)
 
     async def execute(
         self, *, user_id: UUID, connection_id: UUID, scope_key: str
@@ -391,7 +561,7 @@ class SyncCalendarUseCase:
     @staticmethod
     async def _collect(pages: AsyncIterator[CalendarSyncPage]) -> tuple[CalendarSyncPage, ...]:
         """在事务外完成有限分页，避免供应商网络请求持有数据库锁。"""
-        return tuple([page async for page in pages])
+        return await collect_calendar_event_pages(pages)
 
     @staticmethod
     async def _collect_directory(

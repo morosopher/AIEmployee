@@ -115,9 +115,10 @@ Secret-file-safe 的 typed CLI 薄 wrapper，不能包含 SQL、ACL parser 或 o
 
 ### M2 CalendarEvent 字段 AAD 0019 发布
 
-> **实施状态警告：** 0019 migration、CLI、typed rollout guard、专用 recipes 与恢复/审计 tooling
-> 当前尚未实现。必须先完成实施计划 Task 16A 与 Task 27A–27E，并通过 Task 30 发布门禁，才能执行本节。
-> 下文描述目标发布契约，不表示这些命令当前可用；不得用临时 shell、直接 SQL 或手工 artifact 替代。
+> **实施状态：** 仓库已提供0019迁移、共享OAuth协调、真实artifact guard、无参数preflight/migration/
+> resync入口，以及固定basename备份guard hook。Task27D的完整manifest备份组、审计、restore与镜像
+> COPY/构建证明仍是发布前置条件，随后还需Task27E和Task30门禁。下文保留完整目标发布顺序；
+> 当前dump/checksum hook不能单独作为完整恢复证据，不得用临时SQL或手工artifact替代缺少的门禁。
 
 Task 16A 是仓库首次创建并发布 `20260809_0019` 的任务；在它之前不存在已发布的 0019。若旧
 development/test 数据库曾被手工或实验性代码写入同名、未知或不完整的 obsolete 0019，先为该精确
@@ -242,9 +243,9 @@ root-key identity、automatic started/confirmed 与 explicit recovery replacemen
 snapshot CAS、`just calendar-aad-preflight-0019`、`just calendar-aad-migrate-0019`、
 `just calendar-aad-audit phase artifact`、`just calendar-aad-resync-0019`、独立
 `just calendar-aad-restore-0018 file` 及其 executor 内部 sealed verifier、合成数据库测试属于
-Task 27C/27D 要落地的运维契约；当前 0019 recipe/CLI、coordinator、versioned 通用备份 manifest、
-database maintenance gate、target lock、durable restore attempt、通用 owner-session role-switched verifier
-与两条 owner restore 边界尚未实现。Task 27D 必须把现有通用 `just backup`/`just restore file` 修正为
+Task 27C/27D 的运维契约。Task16A、27A–27C已提供0019迁移、共享coordinator、typed guard及
+preflight/migration/resync组合；versioned通用备份manifest、durable restore attempt、恢复专用gate、
+通用owner-session role-switched verifier与两条owner restore边界由Task27D交付。Task 27D 必须把现有通用 `just backup`/`just restore file` 修正为
 manifest-bound 三件套与 owner-role、生产停写、`--exit-on-error --single-transaction`、crash-surviving gate、
 恢复后同 session `SET ROLE ai_employee_app` read-only verifier 和 atomic reopen 的灾备入口；它不要求 0019 artifacts，
 且不能被当作 sealed-window 恢复证据。未完成相应任务前不得执行生产 0019 或生产整库恢复，也不得用
@@ -256,15 +257,19 @@ cd /srv/ai-employee
 export PRE_0019_APP_IMAGE_TAG=2026.08.09-0018-compatible
 export APP_IMAGE_TAG=2026.08.09-0019-v2
 export APP_ENV=production
+export EXTERNAL_WRITES_ENABLED=false
+export GOOGLE_WRITES_ENABLED=false
+export MICROSOFT_WRITES_ENABLED=false
 export BACKUP_DIR=/var/backups/ai-employee
 export BACKUP_ARTIFACT_BASENAME=ai_employee-0019-20260809
+install -d -m 0700 "${BACKUP_DIR}"
 
 # 先在外部维护流程关闭 Calendar scheduling 和新入口，再优雅停止所有旧 reader/writer。
-docker compose stop caddy api worker scheduler
+docker compose stop caddy api worker scheduler migration backup
 docker compose ps
 # 预期仅 postgres 与 redis 保持 running；若仍有旧 reader/writer，立即停止发布。
 
-# Task 27C/27D 落地前必须停在这里；禁止用临时 provider probe 或 SQL 替代。
+# Task27D完整备份/审计/restore与镜像验证门禁通过前必须停在这里。
 just calendar-aad-preflight-0019
 
 just backup
@@ -284,7 +289,14 @@ docker compose up -d api worker scheduler caddy
 just health
 ```
 
-`calendar-aad-preflight-0019`、`calendar-aad-migrate-0019` 与 `calendar-aad-resync-0019` 都不接受 user、connection 或 calendar 参数，避免运维输入把范围改写为任意对象；三者都要求预先设置安全 basename `BACKUP_ARTIFACT_BASENAME`，并使用 `${BACKUP_DIR}/${BACKUP_ARTIFACT_BASENAME}.calendar-aad-preflight.json` 作为同一 rollout state。recipe 在启动 one-off 容器前检查 Compose 状态；只要 `caddy`、`api`、`worker` 或 `scheduler` 任一仍在运行就 fail closed。recipe 还必须从 Compose 选中的 backend image 引用解析本机实际镜像内容 ID，并以内部环境变量传给固定程序；该值不得由运维人员另行输入。preflight artifact 绑定该内容 ID，后续 backup、audit、migration、resync 与 restored-0018 verifier 都必须重新解析并拒绝镜像不匹配，避免可变 tag 或切错镜像绕过同一窗口。宿主 recipe 只能验证 basename/path 形状和挂载边界，不能在 lease 之外检查 preflight artifact 是否存在；碰撞/存在性检查必须由 CLI 在成功取得 revision-global advisory lock 后完成。preflight 还要求数据库精确位于 0018，复用选定不可变镜像、`worker` 服务的 Secret/数据库配置和现有 Calendar credential/adapter resolver，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019`。它只输出 affected/connection count、locally hashed pair/connection digest、earliest UTC deadline 和稳定结果码；不得输出 token、scope 原文、正文、描述/地点或 raw `calendar_id`。
+`calendar-aad-preflight-0019`、`calendar-aad-migrate-0019` 与 `calendar-aad-resync-0019` 都不接受 user、connection 或 calendar 参数，避免运维输入把范围改写为任意对象；三者都要求预先设置安全 basename `BACKUP_ARTIFACT_BASENAME`，并使用 `${BACKUP_DIR}/${BACKUP_ARTIFACT_BASENAME}.calendar-aad-preflight.json` 作为同一 rollout state。`BACKUP_DIR`必须是已有、非根的绝对目录，basename使用`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`。recipe 在启动 one-off 容器前检查 Compose 状态；`caddy`、`api`、`worker`、`scheduler`、`migration`或`backup`仍为running/paused/restarting时都fail closed，同时拒绝已开启的三层写开关。宿主从Compose实际worker/migration镜像执行本地`docker image inspect`，要求内容ID一致，并固定one-off的`image=sha256:...`和`--pull never`；不会build/pull。所选service不得带覆盖镜像代码的额外挂载；迁移与resync的`/backups`只读。该ID通过内部环境变量传给固定程序，运维不得另行输入。preflight artifact 绑定该内容 ID，后续 backup、audit、migration、resync 与 restored-0018 verifier 都必须重新解析并拒绝镜像不匹配。宿主 recipe 只能验证 basename/path 形状和挂载边界，不能在 lease 之外检查 preflight artifact 是否存在；碰撞/存在性检查必须由 CLI 在成功取得 revision-global advisory lock 后完成。preflight 还要求数据库精确位于 0018，复用选定不可变镜像、`worker` 服务的 Secret/数据库配置和现有 Calendar credential/adapter resolver，以 `--no-deps --entrypoint /bin/sh` 运行固定程序 `export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019`。它只输出 affected/connection count、locally hashed pair/connection digest、earliest UTC deadline 和稳定结果码；不得输出 token、scope 原文、正文、描述/地点或 raw `calendar_id`。
+
+显式设置`BACKUP_ARTIFACT_BASENAME`时，`just backup`使用相同宿主校验，并由
+`calendar_aad_backup_0019`持同一revision session lease完成入口guard、既有shell dump/encrypt
+producer、当前期限重读和最终发布。两次guard绑定同一原artifact；暂存目录为0700，发布文件为0600，
+失败或取消先等待自身producer退出再删除暂存内容，已有basename产物绝不覆盖。未设置basename时保持
+原普通备份入口。此hook仅交接dump/checksum；完整manifest组发布、保留、remote及restore证据仍按
+Task27D门禁验收，不能据此宣布0019生产窗口可执行。
 
 preflight 的供应商表面严格只读，但 refresh 本身可能轮换 credential，因此必须使用 durable fence 和共享 coordinator。`oauth.refresh_started` 与 `oauth.refresh_confirmed` 使用既有 `audit_events`、`task_id=NULL`、`actor_type=system`；started 精确绑定 source、canonical attempt UUID、source/target revision、`rollout_digest_v1`、connection digest、G、两个 pre-digest、old identity/fixed key version 和稳定 result code。confirmed 必须复用同一 attempt/source，并包含 G/G/G、两个 pre-digest、两个 required post-digest、old/new identity/version、实际持久化 expiry、missing/same/different disposition、`refresh_identity_changed`、deadline candidate 与稳定 result code；missing/same 只能 old == new、changed=false，different 只能 old != new、changed=true，其 `created_at` 严格晚于 started。本地 credential 校验必须依次完成精确 AAD 解密、non-empty/UTF-8/边界验证和 identity 计算，随后提交 started 并在 provider 前重检两层 lease；网络阶段不持有业务事务。合法 matching confirmed 已永久关闭本次 automatic attempt：current credential 精确匹配 post-snapshot 时从持久 expiry 继续，后续合法 refresh/reauth 已改变 current facts 时按 current readiness 继续。没有合法 result-union member 的 started 对所有 basename 都是硬阻断；explicit progressive recovery 的 `oauth.refresh_credential_replaced` 在原 automatic attempt、recovery OAuthAttempt/event、F/S/T、pre/post digests、old/new identity/version、different-token decision、`refresh_identity_changed=true`、persisted expiry、old != new 与严格时序全部匹配时，同时关闭 recovery attempt并消费原 fence。automatic Worker refresh、targetless callback、access-only/generation/physical digest 变化和人工处置都不是 original-fence consumption。
 

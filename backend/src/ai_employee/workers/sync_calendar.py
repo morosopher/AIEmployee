@@ -1,7 +1,8 @@
 """将 durable ``sync_calendar`` 任务连接到 Calendar 同步用例。"""
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -12,11 +13,20 @@ from ai_employee.application.ports.calendar import (
     CalendarReader,
     CalendarSyncPage,
 )
+from ai_employee.application.ports.encryption import Encryption
 from ai_employee.application.ports.oauth import OAuthProviderAdapter
 from ai_employee.application.ports.oauth_refresh import (
     OAuthRefreshCoordinator,
+    OAuthRefreshLease,
     OAuthRefreshProvider,
     OAuthRefreshRequest,
+)
+from ai_employee.application.use_cases.calendar_aad_preflight import CalendarAadAdapters
+from ai_employee.application.use_cases.calendar_aad_recovery import CalendarAadTaskBinding
+from ai_employee.application.use_cases.calendar_aad_rollout import (
+    CalendarAadGuard,
+    CalendarAadPair,
+    CalendarAadRolloutError,
 )
 from ai_employee.application.use_cases.sync_calendar import (
     CalendarConnectionNotFoundError,
@@ -414,3 +424,136 @@ def build_calendar_sync_task_step(
         metrics=metrics,
         microsoft_oauth=microsoft_oauth,
     )
+
+
+class CalendarAadReadAdapters:
+    """封闭维护窗口复用普通 Calendar adapter 类型，移除自动 401 refresh 和能力状态副作用。"""
+
+    def __init__(self, settings: Settings, *, clock: Callable[[], datetime]) -> None:
+        """仅保存配置；按实际 affected provider 延迟读取对应 OAuth Secret，不联系真实账号。"""
+        self._settings, self._clock = settings, clock
+
+    def oauth(self, provider: str) -> OAuthRefreshProvider:
+        """构造与 Calendar Worker 相同的最小 provider-neutral OAuth refresh adapter。"""
+        settings = self._settings
+        if settings.app_test_mode:
+            # 维护 CLI 不从测试模式推断真实账号授权；合成测试显式注入 FakeAdapters。
+            raise PermanentProviderError(
+                error_code="calendar_aad_fake_adapter_required",
+                message="Calendar AAD requires an injected test adapter",
+            )
+        if provider == "google":
+            return GoogleOAuthAdapter(
+                settings.google_client_id,
+                settings.read_secret_file(settings.google_client_secret_file).get_secret_value(),
+                settings.google_redirect_uri,
+            )
+        if (
+            provider == "microsoft"
+            and settings.microsoft_client_id
+            and settings.microsoft_redirect_uri
+        ):
+            return MicrosoftOAuthAdapter(
+                settings.microsoft_client_id,
+                settings.read_secret_file(settings.microsoft_client_secret_file).get_secret_value(),
+                settings.microsoft_redirect_uri,
+            )
+        raise PermanentProviderError(
+            error_code="provider_read_adapter_unavailable",
+            message="Calendar read adapter is unavailable",
+        )
+
+    def calendar_reader(self, pair: CalendarAadPair, access_token: str) -> CalendarReader:
+        """仅在受控内存把当前 token 与精确 owner timezone 交给现有只读 Calendar adapter。"""
+        if self._settings.app_test_mode:
+            raise PermanentProviderError(
+                error_code="calendar_aad_fake_adapter_required",
+                message="Calendar AAD requires an injected test adapter",
+            )
+        if pair.provider == "google":
+            return GoogleCalendarAdapter(
+                access_token=access_token, user_timezone=pair.timezone, now=self._clock
+            )
+        if pair.provider == "microsoft":
+            return MicrosoftCalendarAdapter(
+                access_token=access_token, user_timezone=pair.timezone, now=self._clock
+            )
+        raise PermanentProviderError(
+            error_code="provider_read_adapter_unavailable",
+            message="Calendar read adapter is unavailable",
+        )
+
+
+class _CalendarAadLeasedGuard:
+    """把连接 lease 加到同一 artifact/current-deadline guard，供每页与最终提交复用。"""
+
+    def __init__(self, guard: CalendarAadGuard, lease: OAuthRefreshLease) -> None:
+        """租约只由该 recovery task 持有，不缓存 guard 的通过结果。"""
+        self._guard, self._lease = guard, lease
+
+    async def verify(self) -> datetime | None:
+        """在当前读取前后确认连接 lease；底层 guard 另行验证 revision-global lease。"""
+        await self._lease.assert_owned()
+        deadline = await self._guard.verify()
+        await self._lease.assert_owned()
+        return deadline
+
+
+class CalendarAadRecoveryTaskStep:
+    """为 recovery-only Runner 组合 exact marker、当前双 credential 和只读 provider。
+
+    输入先验证，marker 已清时不解析 credential/adapter。所有认证或供应商错误仅由
+    durable runner 记录稳定失败，保持连接能力与 marker；从不发起第二次 OAuth refresh。
+    """
+
+    name = "calendar_aad_0019_resync"
+
+    def __init__(
+        self,
+        *,
+        sessions: ManagedAsyncSessionMaker,
+        cipher: Encryption,
+        coordinator: OAuthRefreshCoordinator,
+        adapters: CalendarAadAdapters,
+        guard: CalendarAadGuard,
+        clock: Callable[[], datetime],
+    ) -> None:
+        """注入同 Secret 的唯一 coordinator/cipher 与 one-off 已持有的真实 rollout guard。"""
+        self._stores = SqlAlchemyCalendarSyncRepositoryFactory(sessions)
+        self._cipher, self._coordinator, self._adapters = cipher, coordinator, adapters
+        self._guard, self._clock = guard, clock
+
+    async def execute(self, task: LeasedTask) -> None:
+        """持共享连接 lease 读取当前 readiness，再运行同一事务边界的 marked scope 用例。"""
+        binding = CalendarAadTaskBinding.from_task(task)
+        await self._guard.verify()
+        async with self._stores() as store:
+            state = await store.get_marked_state(binding=binding, now=self._clock())
+        if state is None:
+            return
+        async with self._coordinator.explicit_recovery_lease(
+            user_id=binding.user_id,
+            connection_id=binding.input.connection_id,
+        ) as lease:
+            guard = _CalendarAadLeasedGuard(self._guard, lease)
+            await guard.verify()
+            ready = await self._coordinator.read_current(
+                OAuthRefreshRequest(
+                    user_id=binding.user_id,
+                    connection_id=binding.input.connection_id,
+                    capability=ConnectionCapability.CALENDAR_READ,
+                )
+            )
+            if ready.snapshot.authorization_generation != state.pair.authorization_generation:
+                raise CalendarAadRolloutError("calendar_aad_recovery_state_changed")
+            await guard.verify()
+            reader = self._adapters.calendar_reader(state.pair, ready.access_token)
+            registry = ProviderAdapterRegistry(
+                google_calendar=reader if state.pair.provider == "google" else None,
+                microsoft_calendar=reader if state.pair.provider == "microsoft" else None,
+            )
+            await SyncCalendarUseCase(
+                cast(CalendarSyncStoreFactory, self._stores),
+                registry,
+                self._cipher,
+            ).execute_marked_scope(binding=binding, guard=guard, clock=self._clock)

@@ -165,3 +165,31 @@ def connection_digest_v1(connection_id: UUID) -> str:
     return hashlib.sha256(
         CALENDAR_AAD_TARGET_REVISION.encode("ascii") + b"\x00" + canonical_uuid(connection_id)
     ).hexdigest()
+
+
+def calendar_pair_digest_v1(connection_id: UUID, calendar_id: str) -> str:
+    """固定 revision/连接/opaque calendar 的 NUL 分隔摘要，供所有 rollout 边界共用。
+
+    Args:
+        connection_id: 已验证的 canonical 连接 UUID。
+        calendar_id: 原样保留的非目录事件 scope，禁止空白补齐、NUL 或超长输入。
+
+    Raises:
+        ValueError: scope 不能由 M2 现有 512 字符事件游标安全表达。
+    """
+    if (
+        type(calendar_id) is not str
+        or not calendar_id
+        or calendar_id.strip() != calendar_id
+        or calendar_id == "directory"
+        or "\0" in calendar_id
+        or len(calendar_id) > 512
+    ):
+        raise ValueError("calendar event scope is invalid")
+    return hashlib.sha256(
+        CALENDAR_AAD_TARGET_REVISION.encode("ascii")
+        + b"\0"
+        + canonical_uuid(connection_id)
+        + b"\0"
+        + calendar_id.encode("utf-8")
+    ).hexdigest()

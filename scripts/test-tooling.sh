@@ -19,6 +19,7 @@ required_recipes=(
   test test-backend test-frontend test-integration test-e2e e2e-backend
   lint format typecheck check ci db-upgrade db-revision db-reset
   create-admin logs ps health backup restore observability-up observability-down
+  calendar-aad-preflight-0019 calendar-aad-migrate-0019 calendar-aad-resync-0019
 )
 
 # 只读取 just 的摘要，避免测试依赖面向人的分组标题、颜色或详细帮助格式。
@@ -70,6 +71,7 @@ cp justfile "${sandbox_dir}/justfile"
 cp -R justfiles "${sandbox_dir}/justfiles"
 mkdir -p "${sandbox_dir}/fake-bin" "${sandbox_dir}/scripts"
 mkdir -p "${sandbox_dir}/just-temp"
+cp scripts/run-calendar-aad-0019.py "${sandbox_dir}/scripts/"
 
 command_log="${sandbox_dir}/fake-commands.log"
 uv_environment_log="${sandbox_dir}/fake-uv-environment.log"
@@ -80,6 +82,10 @@ stderr_file="${sandbox_dir}/command-stderr.log"
 export TOOLING_TEST_LOG="${command_log}"
 export TOOLING_TEST_UV_ENV_LOG="${uv_environment_log}"
 export TOOLING_TEST_TYPED_DATABASE_NAME_LOG="${typed_database_name_log}"
+export TOOLING_TEST_COMPOSE_CONFIG="${sandbox_dir}/rollout-config.json"
+export TOOLING_TEST_COMPOSE_PS="${sandbox_dir}/rollout-ps.json"
+export TOOLING_TEST_RENDERED="${sandbox_dir}/rollout-rendered.json"
+export TOOLING_TEST_IMAGE_ID="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 # Fake 命令把每个参数作为独立的制表符字段记录，能同时验证引用边界和参数原样性。
 cat >"${sandbox_dir}/fake-bin/docker" <<'FAKE_DOCKER'
@@ -92,6 +98,27 @@ set -euo pipefail
   done
   printf '\n'
 } >>"${TOOLING_TEST_LOG}"
+if [[ "$*" == 'compose config --format json' ]]; then
+  cat "${TOOLING_TEST_COMPOSE_CONFIG}"
+elif [[ "$*" == 'compose ps --all --format json' ]]; then
+  cat "${TOOLING_TEST_COMPOSE_PS}"
+elif [[ "$*" == image\ inspect* ]]; then
+  [[ "${TOOLING_TEST_INSPECT_FAIL-}" != yes ]] || exit 1
+  if [[ "${TOOLING_TEST_IMAGE_MISMATCH-}" == yes && "${@: -1}" == synthetic-migration:* ]]; then
+    printf 'sha256:%064d\n' 0
+  else
+    printf '%s\n' "${TOOLING_TEST_IMAGE_ID}"
+  fi
+elif [[ "${2-}" == --project-directory && "$*" == *'--profile operations run'* ]]; then
+  # 捕获真实宿主渲染文件；这里不执行内部 shell 或访问任何 Secret/数据库。
+  cp "$5" "${TOOLING_TEST_RENDERED}"
+  [[ "$(stat -c %a "$5")" == 600 ]] || exit 1
+  if [[ "${TOOLING_TEST_BOUND_IMAGE-}" != '' && "${TOOLING_TEST_BOUND_IMAGE}" != "${TOOLING_TEST_IMAGE_ID}" ]]; then
+    printf 'calendar_aad_artifact_invalid\n' >&2
+    exit 1
+  fi
+  printf 'calendar_aad_oneoff_passed\n'
+fi
 FAKE_DOCKER
 
 cat >"${sandbox_dir}/fake-bin/uv" <<'FAKE_UV'
@@ -816,5 +843,170 @@ if ! grep -Fq -- '@command -v python3' <<<"${doctor_definition}"; then
   printf 'tooling behavior contract failed: doctor does not check python3\n' >&2
   exit 1
 fi
+
+# 0019 宿主入口必须执行实际 Docker metadata 查询；Fake 仅提供合成 JSON 和内容 ID。
+set_valid_rollout_environment() {
+  export APP_IMAGE_TAG=synthetic-0019
+  export BACKUP_ARTIFACT_BASENAME=calendar-aad-0019-synthetic
+  export BACKUP_DIR="${sandbox_dir}/backup output"
+  mkdir -p "${BACKUP_DIR}"
+  unset CALENDAR_AAD_IMMUTABLE_IMAGE_ID TOOLING_TEST_INSPECT_FAIL TOOLING_TEST_IMAGE_MISMATCH TOOLING_TEST_BOUND_IMAGE
+  printf '[]\n' >"${TOOLING_TEST_COMPOSE_PS}"
+  python3 - <<'PY'
+import json
+import os
+
+environment = {flag: "false" for flag in ("EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED")}
+environment["DATABASE_URL"] = "postgresql+asyncpg://synthetic_app@postgres:5432/synthetic_test"
+services = {
+    name: {"image": f"synthetic-{name}:synthetic-0019", "environment": dict(environment),
+           "secrets": [{"source": "postgres_bootstrap_password" if name == "migration" else "app_database_password"}],
+           "volumes": [], "build": {"context": "."}}
+    for name in ("worker", "migration", "api", "scheduler", "backup")
+}
+with open(os.environ["TOOLING_TEST_COMPOSE_CONFIG"], "w", encoding="utf-8") as stream:
+    json.dump({"name": "synthetic-rollout", "services": services}, stream)
+PY
+}
+
+expect_rollout_failure() {
+  local expected_code="$1"
+  local recipe="${2:-calendar-aad-preflight-0019}"
+  clear_command_log
+  if run_just_capture "${output_file}" just --yes "${recipe}"; then
+    printf 'tooling behavior contract failed: rollout accepted %s\n' "${expected_code}" >&2
+    exit 1
+  fi
+  assert_contains "${expected_code}" "${output_file}"
+  assert_not_contains $'\trun\t--rm\t--no-deps\t--pull\tnever' "${command_log}"
+}
+
+for rollout_recipe in calendar-aad-preflight-0019 calendar-aad-migrate-0019 calendar-aad-resync-0019 backup; do
+  set_valid_rollout_environment
+  clear_command_log
+  run_just_capture "${output_file}" just --yes "${rollout_recipe}" || {
+    printf 'tooling behavior contract failed: valid rollout recipe %s failed\n' "${rollout_recipe}" >&2
+    cat "${output_file}" >&2
+    exit 1
+  }
+  assert_contains $'docker\tcompose\tconfig\t--format\tjson' "${command_log}"
+  assert_contains $'docker\tcompose\tps\t--all\t--format\tjson' "${command_log}"
+  assert_contains $'docker\timage\tinspect\t--format\t{{.Id}}\tsynthetic-worker:synthetic-0019' "${command_log}"
+  assert_contains $'docker\timage\tinspect\t--format\t{{.Id}}\tsynthetic-migration:synthetic-0019' "${command_log}"
+  assert_contains $'\t--no-deps\t--pull\tnever\t--entrypoint\t/bin/sh\t' "${command_log}"
+  if [[ "${rollout_recipe}" == calendar-aad-migrate-0019 ]]; then
+    assert_contains 'exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019' "${command_log}"
+  else
+    assert_contains 'export PGPASSWORD="$(cat /run/secrets/app_database_password)";' "${command_log}"
+  fi
+  TOOLING_TEST_RECIPE="${rollout_recipe}" python3 - <<'PY'
+import json
+import os
+
+recipe = os.environ["TOOLING_TEST_RECIPE"]
+name = "migration" if recipe == "calendar-aad-migrate-0019" else "backup" if recipe == "backup" else "worker"
+with open(os.environ["TOOLING_TEST_RENDERED"], encoding="utf-8") as stream:
+    selected = json.load(stream)["services"][name]
+assert selected["image"] == os.environ["TOOLING_TEST_IMAGE_ID"]
+assert selected["pull_policy"] == "never" and "build" not in selected
+assert selected["environment"]["CALENDAR_AAD_IMMUTABLE_IMAGE_ID"] == selected["image"]
+assert selected["environment"]["BACKUP_ARTIFACT_BASENAME"] == os.environ["BACKUP_ARTIFACT_BASENAME"]
+assert selected["environment"]["BACKUP_DIR"] == "/backups"
+assert all(selected["environment"][flag] == "false" for flag in ("EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED"))
+assert selected["volumes"] == [{"type": "bind", "source": os.environ["BACKUP_DIR"], "target": "/backups",
+                                  "read_only": recipe in ("calendar-aad-migrate-0019", "calendar-aad-resync-0019")}]
+assert selected["secrets"] == [{"source": "postgres_bootstrap_password" if name == "migration" else "app_database_password"}]
+PY
+done
+
+# basename 沿用唯一 canonical 边界；内部两个点不是路径穿越，不得另造不兼容规则。
+set_valid_rollout_environment
+export BACKUP_ARTIFACT_BASENAME=synthetic..0019
+run_just_capture "${output_file}" just --yes calendar-aad-preflight-0019 || {
+  printf 'tooling behavior contract failed: canonical dotted basename rejected\n' >&2
+  exit 1
+}
+
+for bad_tag in '' latest; do
+  set_valid_rollout_environment
+  export APP_IMAGE_TAG="${bad_tag}"
+  expect_rollout_failure calendar_aad_image_invalid
+done
+set_valid_rollout_environment
+export TOOLING_TEST_INSPECT_FAIL=yes
+expect_rollout_failure calendar_aad_docker_query_failed
+set_valid_rollout_environment
+export TOOLING_TEST_IMAGE_MISMATCH=yes
+expect_rollout_failure calendar_aad_image_mismatch
+set_valid_rollout_environment
+export CALENDAR_AAD_IMMUTABLE_IMAGE_ID="${TOOLING_TEST_IMAGE_ID}"
+expect_rollout_failure calendar_aad_image_override_forbidden
+for unsafe_basename in '' ../synthetic 'synthetic/scope' 'synthetic scope'; do
+  set_valid_rollout_environment
+  export BACKUP_ARTIFACT_BASENAME="${unsafe_basename}"
+  expect_rollout_failure calendar_aad_basename_invalid
+done
+for unsafe_directory in / relative-path; do
+  set_valid_rollout_environment
+  export BACKUP_DIR="${unsafe_directory}"
+  expect_rollout_failure calendar_aad_backup_directory_invalid
+done
+for service in caddy api worker scheduler migration; do
+  for state in running paused restarting; do
+    set_valid_rollout_environment
+    printf '[{"Service":"%s","State":"%s"}]\n' "${service}" "${state}" >"${TOOLING_TEST_COMPOSE_PS}"
+    expect_rollout_failure calendar_aad_services_running
+  done
+done
+for unsafe_config in write code_mount latest_image; do
+  set_valid_rollout_environment
+  TOOLING_TEST_UNSAFE_CONFIG="${unsafe_config}" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["TOOLING_TEST_COMPOSE_CONFIG"])
+config = json.loads(path.read_text())
+worker = config["services"]["worker"]
+case = os.environ["TOOLING_TEST_UNSAFE_CONFIG"]
+if case == "write":
+    worker["environment"]["GOOGLE_WRITES_ENABLED"] = "true"
+elif case == "code_mount":
+    worker["volumes"] = [{"type": "bind", "source": "/synthetic/source", "target": "/app"}]
+else:
+    worker["image"] = "synthetic:latest"
+path.write_text(json.dumps(config))
+PY
+  case "${unsafe_config}" in
+    write) expect_rollout_failure calendar_aad_write_switch_enabled ;;
+    code_mount) expect_rollout_failure calendar_aad_image_mount_invalid ;;
+    latest_image) expect_rollout_failure calendar_aad_image_invalid ;;
+  esac
+done
+
+# 当同一个 tag 移动到另一 ID，内部 CLI 必须实际收到新 ID，不能重用 operator 缓存。
+set_valid_rollout_environment
+export TOOLING_TEST_BOUND_IMAGE="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+if run_just_capture "${output_file}" just --yes calendar-aad-resync-0019; then
+  printf 'tooling behavior contract failed: moved image was accepted\n' >&2
+  exit 1
+fi
+assert_contains calendar_aad_artifact_invalid "${output_file}"
+for recipe in calendar-aad-preflight-0019 calendar-aad-migrate-0019 calendar-aad-resync-0019; do
+  set_valid_rollout_environment
+  clear_command_log
+  if run_just_capture "${output_file}" just --yes "${recipe}" synthetic-extra-scope; then
+    printf 'tooling behavior contract failed: extra rollout scope argument accepted\n' >&2
+    exit 1
+  fi
+  assert_no_fake_calls
+done
+
+# 普通备份继续沿既有 service；只有显式 basename 的封闭窗口经过窄 guard composition。
+unset BACKUP_ARTIFACT_BASENAME
+clear_command_log
+run_just_capture "${output_file}" just --yes backup
+assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\tbackup' "${command_log}"
+grep -Fq 'ai_employee.cli.calendar_aad_backup_0019' scripts/backup-postgres.sh
 
 printf 'tooling recipe behavior contract ok\n'

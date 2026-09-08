@@ -24,6 +24,11 @@ from ai_employee.application.ports.encryption import (
     EncryptionBoundaryError,
     EncryptionKeyVersionError,
 )
+from ai_employee.application.use_cases.calendar_aad_recovery import (
+    CalendarAadTaskBinding,
+    MarkedCalendarScopeState,
+)
+from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadRolloutError
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarAvailabilityContext,
     CalendarProposalEventBinding,
@@ -44,6 +49,10 @@ from ai_employee.infrastructure.db.models.sources import (
     SyncCursorModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.repositories.calendar_aad_recovery import (
+    lock_calendar_aad_scope,
+    require_calendar_aad_task,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 _AVAILABILITY_FRESHNESS = timedelta(minutes=15)
@@ -691,6 +700,71 @@ class SqlAlchemyCalendarSyncRepository:
                 else None
             ),
         )
+
+    async def get_marked_state(
+        self, *, binding: CalendarAadTaskBinding, now: datetime
+    ) -> MarkedCalendarScopeState | None:
+        """专用恢复读取只锁现有 cursor，并验证用户任务及当前 runner 租约。
+
+        此路径与普通 get_state 的 placeholder 行为分离，任何缺失前提都不能生成猜测
+        状态。锁序与 planner 共用，末次提交重读时仍得到同一组持久身份。
+        """
+        state = await lock_calendar_aad_scope(
+            self._session,
+            user_id=binding.user_id,
+            connection_id=binding.input.connection_id,
+            scope_key=binding.input.scope_key,
+        )
+        await require_calendar_aad_task(self._session, binding=binding, now=now)
+        return state
+
+    async def finish_marked_scope(
+        self,
+        *,
+        binding: CalendarAadTaskBinding,
+        expected: MarkedCalendarScopeState,
+        next_cursor: str,
+        event_count: int,
+        completed_at: datetime,
+    ) -> None:
+        """重证 marker CAS 后原子清 marker/推进 freshness；审计仅有 digest/ordinal/count。
+
+        先前 event upsert 尚未提交，此处失败由应用事务统一回滚；不得调用含原始 scope
+        的普通 finish_sync 审计，也不改变连接状态、能力或创建外部写入事实。
+        """
+        current = await self.get_marked_state(binding=binding, now=completed_at)
+        if current != expected:
+            raise CalendarAadRolloutError("calendar_aad_recovery_state_changed")
+        cursor = await self._session.scalar(
+            select(SyncCursorModel).where(
+                SyncCursorModel.id == expected.cursor_id,
+                SyncCursorModel.connection_id == binding.input.connection_id,
+                SyncCursorModel.resource_kind == "calendar",
+                SyncCursorModel.scope_key == binding.input.scope_key,
+            )
+        )
+        if cursor is None:
+            raise CalendarAadRolloutError("calendar_aad_recovery_state_changed")
+        cursor.cursor = next_cursor
+        cursor.last_attempt_at = cursor.last_success_at = completed_at
+        cursor.last_error_code = None
+        self._session.add(
+            AuditEventModel(
+                user_id=binding.user_id,
+                task_id=binding.task_id,
+                event_type="source.calendar.aad_0019_resynced",
+                actor_type="system",
+                actor_id=None,
+                event_metadata={
+                    "pair_digest": binding.input.pair_digest,
+                    "recovery_attempt_ordinal": binding.input.recovery_attempt_ordinal,
+                    "recovery_revision": "20260809_0019",
+                    "events_upserted": event_count,
+                },
+            )
+        )
+        # 让约束、事件和 marker 写入都在最后一个 guard 之前完成；context 只负责 commit。
+        await self._session.flush()
 
     async def upsert_event(
         self,

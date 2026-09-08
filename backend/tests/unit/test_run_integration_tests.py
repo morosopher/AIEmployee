@@ -51,6 +51,9 @@ _EXPECTED_LIFECYCLE_FILES = (
     "backend/tests/integration/db/test_database_grants_catalog.py",
     "backend/tests/integration/operations/test_database_maintenance_gate.py",
     "backend/tests/integration/retention/test_role_permissions.py",
+    "backend/tests/integration/operations/test_calendar_aad_0019_preflight.py",
+    "backend/tests/integration/operations/test_calendar_aad_0019_recovery.py",
+    "backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py",
 )
 _EXPECTED_LIFECYCLE_NODES = (
     (

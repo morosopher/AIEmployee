@@ -2,6 +2,7 @@
 
 import asyncio
 import secrets
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -14,9 +15,11 @@ from ai_employee.agents.fake_write.graph import FakeWriteGraph
 from ai_employee.agents.runner import postgres_checkpointer
 from ai_employee.application.ports.trusted_actions import TrustedActionAdapterRegistry
 from ai_employee.application.use_cases.approvals import ApprovalProposalStore
+from ai_employee.application.use_cases.calendar_aad_recovery import CALENDAR_AAD_RECOVERY_KIND
 from ai_employee.application.use_cases.task_execution import (
     DurableTaskRunner,
     LeasedTask,
+    TaskExecutionStep,
     TaskWaitingApproval,
 )
 from ai_employee.config import Settings, get_settings
@@ -316,19 +319,23 @@ def build_task_runner_for_session(
     session_factory: ManagedAsyncSessionMaker,
     *,
     settings: Settings,
+    calendar_aad_step: TaskExecutionStep | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> DurableTaskRunner:
     """以调用方拥有的会话工厂构造真实任务 Runner，不创建无法关闭的额外连接池。
 
     Args:
         session_factory: API 或 Worker 生命周期负责释放的数据库会话工厂。
         settings: 当前进程已验证的配置；测试双开关会据此注入离线 fake 适配器。
+        calendar_aad_step: sealed one-off 专用注入；存在时 resolver 仅允许 recovery kind。
+        clock: 可替换 UTC 时钟，省略时保持普通 Worker 的真实时钟语义。
 
     Returns:
         使用给定会话工厂的 DurableTaskRunner。
     """
     return DurableTaskRunner(
         store=SqlAlchemyTaskExecutionStore(session_factory),
-        clock=lambda: datetime.now(UTC),
+        clock=clock or (lambda: datetime.now(UTC)),
         lease_duration=timedelta(seconds=settings.task_lease_seconds),
         task_timeout_seconds=settings.task_timeout_seconds,
         task_step_timeout_seconds=settings.task_step_timeout_seconds,
@@ -337,6 +344,12 @@ def build_task_runner_for_session(
         retry_jitter=_bounded_retry_jitter,
         resolve_steps=lambda task: (
             (
+                (calendar_aad_step,)
+                if task.kind == CALENDAR_AAD_RECOVERY_KIND
+                else (_MissingTaskHandlerStep(),)
+            )
+            if calendar_aad_step is not None
+            else (
                 build_mail_sync_task_step(
                     session_factory=session_factory, settings=settings, metrics=_worker_metrics
                 ),

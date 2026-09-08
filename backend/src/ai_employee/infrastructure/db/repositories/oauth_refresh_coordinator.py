@@ -46,6 +46,7 @@ from ai_employee.application.ports.oauth_refresh import (
     OAuthRefreshClaim,
     OAuthRefreshClosedResult,
     OAuthRefreshError,
+    OAuthRefreshLease,
     OAuthRefreshProvider,
     OAuthRefreshReady,
     OAuthRefreshRequest,
@@ -399,15 +400,29 @@ class SqlAlchemyOAuthRefreshCoordinator:
         )
 
     async def refresh(
-        self, request: OAuthRefreshRequest, provider: OAuthRefreshProvider
+        self,
+        request: OAuthRefreshRequest,
+        provider: OAuthRefreshProvider,
+        *,
+        outer_lease: OAuthRefreshLease | None = None,
     ) -> OAuthRefreshReady:
         """唯一 automatic grant 路径：已提交 started→一次网络→完整 CAS/confirmed。
 
         started 之后所有异常均先只读核对；实际 commit 可恢复。无合法结果时只保留已知
         lease/CAS 分类，其余 rollback/未知结果保持 unknown，不能重新发送旧 refresh。
+        outer_lease 供封闭 rollout 注入 revision-global lease；普通 Worker/API 省略它。
+        两层检查覆盖行锁等待之后的 started 与 confirmed 提交，不能由 provider wrapper
+        代替。已提交合法结果仍优先闭合历史，外层 rollout 独立决定能否继续发布。
         """
         async with self._lease(request.connection_id) as lease:
-            await lease.assert_owned()
+
+            async def assert_leases() -> None:
+                """在同一物理会话重读两层 ownership，不重入 acquire 或隐藏已丢失租约。"""
+                await lease.assert_owned()
+                if outer_lease is not None:
+                    await outer_lease.assert_owned()
+
+            await assert_leases()
             # session 与事务分别管理：commit ACK 异常仍执行外层 close，不能遗留池连接。
             async with self._sessions() as session, session.begin():
                 snapshot, _, _ = await load_refresh_snapshot(session, request, lock=True)
@@ -418,6 +433,8 @@ class SqlAlchemyOAuthRefreshCoordinator:
                 )
                 access, refresh, identity = self._plaintext(snapshot)
                 self._validate_history(snapshot, records, identity)
+                # load_refresh_snapshot 可能长时间等锁；在任何新 started 前重证两层租约。
+                await assert_leases()
                 if request.attempt_id is not None:
                     # 可信写 401 使用 execution/write-attempt 派生的稳定 UUID。持久结果
                     # 已存在时只恢复当前 readiness；崩溃后不能生成第二个 refresh grant。
@@ -486,19 +503,20 @@ class SqlAlchemyOAuthRefreshCoordinator:
                 session.add(started)
                 await session.flush()
                 claim = OAuthRefreshClaim(request, snapshot, audit_record(started), fence, refresh)
+                await assert_leases()
             # 此时 started 的 commit 已获 ACK；不在业务事务里等待 provider。
             attempt_id = UUID(fence.refresh_attempt_id)
             try:
-                await lease.assert_owned()
+                await assert_leases()
                 tokens = await provider.refresh(claim.refresh_token)
-                await lease.assert_owned()
+                await assert_leases()
                 self._validate_response(claim, provider, tokens)
                 async with self._sessions() as session, session.begin():
-                    await lease.assert_owned()
+                    await assert_leases()
                     await SqlAlchemyCredentialRotationRepository(
                         session, cipher=self._cipher, identity=self._identity
                     ).confirm(claim, tokens, completed_at=self._now())
-                    await lease.assert_owned()
+                    await assert_leases()
             except Exception as error:  # started 后只能查询持久结果，不能重放。
                 closed = await self.read_result(
                     user_id=request.user_id,

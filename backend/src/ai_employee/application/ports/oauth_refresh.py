@@ -210,7 +210,11 @@ class OAuthRefreshCoordinator(Protocol):
     """唯一自动 grant admission，同时为 Task27B 提供不创建 automatic started 的共享 lease。"""
 
     async def refresh(
-        self, request: OAuthRefreshRequest, provider: OAuthRefreshProvider
+        self,
+        request: OAuthRefreshRequest,
+        provider: OAuthRefreshProvider,
+        *,
+        outer_lease: OAuthRefreshLease | None = None,
     ) -> OAuthRefreshReady:
         """提交 durable started、一次 provider 调用、完整 CAS；ACK 丢失时只读结果核对。"""
         ...
