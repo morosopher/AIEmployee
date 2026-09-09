@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
 )
 from ai_employee.cli import calendar_aad_preflight_0019 as preflight
 from ai_employee.config import Settings
+from ai_employee.infrastructure import calendar_aad_publication as publication_files
 from ai_employee.infrastructure.db.repositories import calendar_aad_preflight as module
 from tests.unit.application.test_calendar_aad_rollout import BINDING, zero_bytes
 
@@ -161,6 +163,399 @@ class ThreadBoundary:
         """释放并等完合成线程；即使 RED 也不把阻塞工作留给测试退出处理。"""
         self.release.set()
         assert await asyncio.to_thread(self.finished.wait, 3)
+
+
+@contextmanager
+def replace_after_identity_snapshot(
+    monkeypatch, target: Path, replacement: Path, *, private_snapshot=False
+):
+    """真实 no-follow 快照返回前，由独立线程替换公开路径，不伪造 inode 或删除结果。
+
+    以真实文件身份识别补偿读取，允许安全实现先把同一文件移入自身目录；公开路径的
+    并发写入仍在该快照之后。所有门控、线程和替换文件均由调用测试拥有并显式收敛。
+    """
+    original_lstat = Path.lstat
+    original_stat = os.stat
+    owned_identity = original_lstat(target)
+    replacement_identity = original_lstat(replacement)
+    assert not os.path.samestat(owned_identity, replacement_identity)
+    gate = ThreadBoundary()
+    snapshots = []
+
+    def lstat(path, *args, **kwargs):
+        """先取得未经修改的真实快照，再允许另一个写入者改变公开目录项。"""
+        current = original_lstat(path, *args, **kwargs)
+        if not snapshots and os.path.samestat(current, owned_identity):
+            snapshots.append(current)
+            gate.pause()
+        return current
+
+    def descriptor_stat(path, *args, **kwargs):
+        """新增对照在捕获后的真实 fd 身份读取处暂停，公开路径后续写入仍由独立线程执行。"""
+        current = original_stat(path, *args, **kwargs)
+        if (
+            kwargs.get("dir_fd") is not None
+            and not snapshots
+            and os.path.samestat(current, owned_identity)
+        ):
+            snapshots.append(current)
+            gate.pause()
+        return current
+
+    def replace():
+        """仅在产品已读到自有 inode 之后，实际替换为另一 inode 并释放原读取。"""
+        try:
+            assert gate.entered.wait(3), "compensation never read the owned identity"
+            if stat.S_ISDIR(replacement_identity.st_mode):
+                # POSIX 不允许用目录覆盖 regular；测试写入者先自行移走旧目录项。
+                target.unlink(missing_ok=True)
+            os.replace(replacement, target)
+        finally:
+            gate.release.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor, monkeypatch.context() as patch:
+        if private_snapshot:
+            patch.setattr(os, "stat", descriptor_stat)
+        else:
+            patch.setattr(Path, "lstat", lstat)
+        writer = executor.submit(replace)
+        try:
+            yield replacement_identity
+        finally:
+            gate.release.set()
+            writer.result(timeout=3)
+            assert gate.finished.is_set()
+            assert len(snapshots) == 1
+            if private_snapshot:
+                assert os.path.samestat(snapshots[0], owned_identity)
+            else:
+                assert snapshots[0] == owned_identity
+
+
+@pytest.mark.parametrize(
+    ("kind", "private_snapshot"),
+    [("regular", False), ("fifo", False), ("symlink", False), ("regular", True)],
+)
+def test_calendar_aad_artifact_preserves_replacement_after_identity_snapshot(
+    tmp_path, monkeypatch, kind, private_snapshot
+):
+    """补偿检查读到本次文件之后发生的不同 inode 替换，不得被后续按路径删除。"""
+    artifact_file = module.CalendarAadArtifactFile(tmp_path, BINDING)
+    artifact = parse_rollout_artifact(zero_bytes(), BINDING)
+    temporary = artifact_file._stage(artifact)
+    assert artifact_file._publish(temporary, artifact)
+    replacement = tmp_path / "synthetic-replacement"
+    if kind == "fifo":
+        os.mkfifo(replacement, mode=0o600)
+    elif kind == "symlink":
+        replacement.symlink_to("synthetic-foreign-target")
+    else:
+        replacement.write_bytes(b"synthetic-foreign-artifact")
+        replacement.chmod(0o600)
+
+    with replace_after_identity_snapshot(
+        monkeypatch, artifact_file.path, replacement, private_snapshot=private_snapshot
+    ) as identity:
+        artifact_file.discard_new_publication()
+
+    assert os.path.lexists(artifact_file.path), "compensation deleted a concurrent replacement"
+    assert os.path.samestat(artifact_file.path.lstat(), identity)
+    if kind == "fifo":
+        assert stat.S_ISFIFO(artifact_file.path.lstat().st_mode)
+    elif kind == "symlink":
+        assert artifact_file.path.readlink() == Path("synthetic-foreign-target")
+    else:
+        assert artifact_file.path.read_bytes() == b"synthetic-foreign-artifact"
+    assert list(tmp_path.iterdir()) == [artifact_file.path]
+
+
+def test_calendar_aad_failed_artifact_publish_keeps_concurrent_replacement(tmp_path, monkeypatch):
+    """发布后目录 fsync 失败的内部补偿也不得删除刚被另一写入者替换的公开文件。"""
+    artifact_file = module.CalendarAadArtifactFile(tmp_path, BINDING)
+    artifact = parse_rollout_artifact(zero_bytes(), BINDING)
+    temporary = artifact_file._stage(artifact)
+    replacement = tmp_path / "synthetic-replacement"
+    replacement.write_bytes(b"synthetic-foreign-artifact")
+    replacement.chmod(0o600)
+    identity = replacement.lstat()
+    original_fsync = os.fsync
+    failure = OSError("synthetic publication fsync failure")
+    failed = False
+
+    def fsync(descriptor):
+        """真实发布已发生后替换 basename，只拒绝第一个目录 fsync，不替代补偿操作。"""
+        nonlocal failed
+        if not failed:
+            failed = True
+            os.replace(replacement, artifact_file.path)
+            raise failure
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(OSError) as raised:
+        artifact_file._publish(temporary, artifact)
+    assert raised.value is failure
+    assert artifact_file.path.exists(), "partial-publication cleanup deleted the replacement"
+    assert os.path.samestat(artifact_file.path.lstat(), identity)
+    assert artifact_file.path.read_bytes() == b"synthetic-foreign-artifact"
+    assert list(tmp_path.iterdir()) == [artifact_file.path]
+
+
+@pytest.fixture
+def published_artifact(tmp_path):
+    """创建本测试拥有的真实发布文件；后续探针不替代 stage、rename、fsync 或 identity。"""
+    artifact_file = module.CalendarAadArtifactFile(tmp_path, BINDING)
+    artifact = parse_rollout_artifact(zero_bytes(), BINDING)
+    assert artifact_file._publish(artifact_file._stage(artifact), artifact)
+    return artifact_file
+
+
+def assert_retained_custody(directory: Path, target: Path, identity: os.stat_result) -> Path:
+    """检查人工可定位的单一保管对象，验证目录权限、原 basename 与真实 inode。"""
+    directories = list(directory.glob(".calendar-aad-custody-*"))
+    assert len(directories) == 1
+    custody = directories[0]
+    assert stat.S_IMODE(custody.lstat().st_mode) == 0o700
+    captured = custody / target.name
+    assert list(custody.iterdir()) == [captured]
+    assert os.path.samestat(captured.lstat(), identity)
+    return captured
+
+
+@pytest.mark.parametrize("after_capture", [False, True])
+def test_calendar_aad_capture_error_never_erases_an_unknown_result(
+    tmp_path, monkeypatch, published_artifact, after_capture
+):
+    """rename 在生效前/后报错都不能把外来捕获物误认为占位文件删除。"""
+    target = published_artifact.path
+    replacement = tmp_path / "synthetic-replacement"
+    replacement.write_bytes(b"synthetic-foreign-capture")
+    replacement.chmod(0o600)
+    original_rename = os.rename
+
+    def rename(source, destination, *args, **kwargs):
+        """只在私有捕获边界注入错误；after 场景先执行真实 rename 再报告未知结果。"""
+        if kwargs.get("dst_dir_fd") is not None:
+            if after_capture:
+                original_rename(source, destination, *args, **kwargs)
+            raise OSError("synthetic capture outcome failure")
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", rename)
+    with (
+        replace_after_identity_snapshot(monkeypatch, target, replacement) as identity,
+        pytest.raises(CalendarAadRolloutError) as raised,
+    ):
+        published_artifact.discard_new_publication()
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    if after_capture:
+        assert not target.exists()
+        captured = assert_retained_custody(tmp_path, target, identity)
+        assert captured.read_bytes() == b"synthetic-foreign-capture"
+    else:
+        assert list(tmp_path.iterdir()) == [target]
+        assert os.path.samestat(target.lstat(), identity)
+        assert target.read_bytes() == b"synthetic-foreign-capture"
+
+
+@pytest.mark.parametrize("kind", ["regular", "fifo", "symlink"])
+@pytest.mark.parametrize("return_failure", ["collision", "unavailable"])
+def test_calendar_aad_failed_return_retains_foreign_capture_without_clobber(
+    tmp_path, monkeypatch, published_artifact, kind, return_failure
+):
+    """原子返还遇新占用者或运行环境不支持时，外来内容与新占用者都保留且明确失败。"""
+    target = published_artifact.path
+    replacement = tmp_path / "synthetic-replacement"
+    if kind == "fifo":
+        os.mkfifo(replacement, mode=0o600)
+    elif kind == "symlink":
+        replacement.symlink_to("synthetic-foreign-target")
+    else:
+        replacement.write_bytes(b"synthetic-foreign-return")
+        replacement.chmod(0o600)
+    occupant = tmp_path / "synthetic-next-occupant"
+    if return_failure == "collision":
+        # 悬空链接也是已占用的真实目录项，不能用 exists() 把它当空位置覆盖。
+        occupant.symlink_to("synthetic-next-target")
+        occupant_identity = occupant.lstat()
+    else:
+        # 只模拟 libc 缺少该入口；捕获、metadata 和保管内容仍为真实文件操作。
+        monkeypatch.setattr(
+            publication_files.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace()
+        )
+    original_rename = os.rename
+
+    def rename(source, destination, *args, **kwargs):
+        """真实捕获后才引入另一个公开占用者，让实际 RENAME_NOREPLACE 拒绝覆盖。"""
+        result = original_rename(source, destination, *args, **kwargs)
+        if kwargs.get("dst_dir_fd") is not None and return_failure == "collision":
+            os.replace(occupant, target)
+        return result
+
+    monkeypatch.setattr(os, "rename", rename)
+    with (
+        replace_after_identity_snapshot(monkeypatch, target, replacement) as identity,
+        pytest.raises(CalendarAadRolloutError) as raised,
+    ):
+        published_artifact.discard_new_publication()
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    captured = assert_retained_custody(tmp_path, target, identity)
+    if kind == "regular":
+        assert captured.read_bytes() == b"synthetic-foreign-return"
+    elif kind == "symlink":
+        assert captured.readlink() == Path("synthetic-foreign-target")
+    else:
+        assert stat.S_ISFIFO(captured.lstat().st_mode)
+    if return_failure == "collision":
+        assert os.path.samestat(target.lstat(), occupant_identity)
+        assert target.readlink() == Path("synthetic-next-target")
+    else:
+        assert not os.path.lexists(target)
+
+
+def test_calendar_aad_custody_placeholder_rejects_foreign_directory(
+    tmp_path, monkeypatch, published_artifact
+):
+    """快照后被换成非空目录时，regular 占位必须使 rename 拒绝捕获或删除其内容。"""
+    target = published_artifact.path
+    replacement = tmp_path / "synthetic-foreign-directory"
+    replacement.mkdir(mode=0o700)
+    (replacement / "synthetic-member").write_bytes(b"synthetic-foreign-directory-content")
+    with (
+        replace_after_identity_snapshot(monkeypatch, target, replacement) as identity,
+        pytest.raises(CalendarAadRolloutError) as raised,
+    ):
+        published_artifact.discard_new_publication()
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    assert os.path.samestat(target.lstat(), identity)
+    assert (target / "synthetic-member").read_bytes() == b"synthetic-foreign-directory-content"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("phase", ["directory_creation", "capture_stat", "capture_fsync"])
+def test_calendar_aad_custody_failure_preserves_files_and_closes_descriptors(
+    tmp_path, monkeypatch, published_artifact, phase
+):
+    """创建/捕获后校验/持久化失败均保守保留对象，已打开的父目录/保管目录/fd 全部关闭。"""
+    target = published_artifact.path
+    identity = target.lstat()
+    original_open, original_close, original_stat = os.open, os.close, os.stat
+    opened = set()
+
+    def open_descriptor(*args, **kwargs):
+        """记录真实 open 返回的 fd，只观察本同步补偿作用域的资源所有权。"""
+        descriptor = original_open(*args, **kwargs)
+        opened.add(descriptor)
+        return descriptor
+
+    def close_descriptor(descriptor):
+        """真实关闭之后移出活跃集，防止用 Fake fd 状态掩盖泄漏。"""
+        original_close(descriptor)
+        opened.remove(descriptor)
+
+    def descriptor_stat(path, *args, **kwargs):
+        """真实捕获后的同 fd 身份读取失败，不允许退回公开路径清理。"""
+        current = original_stat(path, *args, **kwargs)
+        if kwargs.get("dir_fd") is not None:
+            raise OSError("synthetic captured metadata failure")
+        return current
+
+    def fail(*args, **kwargs):
+        """只在指定真实文件边界拒绝操作，其他边界保持原生产行为。"""
+        raise OSError("synthetic custody boundary failure")
+
+    monkeypatch.setattr(os, "open", open_descriptor)
+    monkeypatch.setattr(os, "close", close_descriptor)
+    if phase == "directory_creation":
+        monkeypatch.setattr(publication_files.tempfile, "mkdtemp", fail)
+    elif phase == "capture_stat":
+        monkeypatch.setattr(os, "stat", descriptor_stat)
+    else:
+        monkeypatch.setattr(os, "fsync", fail)
+    with pytest.raises(CalendarAadRolloutError) as raised:
+        published_artifact.discard_new_publication()
+    assert not opened, "compensation leaked its opened file descriptors"
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    if phase == "directory_creation":
+        assert list(tmp_path.iterdir()) == [target]
+        assert os.path.samestat(target.lstat(), identity)
+    else:
+        assert not target.exists()
+        captured = assert_retained_custody(tmp_path, target, identity)
+        assert captured.read_bytes() == zero_bytes()
+
+
+@pytest.mark.parametrize("phase", ["unlink_before", "unlink_after", "directory_cleanup"])
+def test_calendar_aad_custody_cleanup_failure_preserves_new_public_file(
+    tmp_path, monkeypatch, published_artifact, phase
+):
+    """私有删除/空目录清理失败时，新公开文件仍独立存在，未知私有结果不会被递归删除。"""
+    target = published_artifact.path
+    owned_identity = target.lstat()
+    replacement = tmp_path / "synthetic-replacement"
+    replacement.write_bytes(b"synthetic-after-capture")
+    original_unlink, original_rmdir = os.unlink, Path.rmdir
+
+    def unlink(path, *args, **kwargs):
+        """只在私有目录 fd 的真实删除前/后注入失败；不替换公开目录项操作。"""
+        if kwargs.get("dir_fd") is not None:
+            if phase == "unlink_after":
+                original_unlink(path, *args, **kwargs)
+            raise OSError("synthetic private unlink failure")
+        return original_unlink(path, *args, **kwargs)
+
+    def rmdir(path):
+        """只拒绝清理本例空保管目录，保留可由运维辨认的失败证据。"""
+        if path.name.startswith(".calendar-aad-custody-"):
+            raise OSError("synthetic empty custody cleanup failure")
+        return original_rmdir(path)
+
+    if phase == "directory_cleanup":
+        monkeypatch.setattr(Path, "rmdir", rmdir)
+    else:
+        monkeypatch.setattr(os, "unlink", unlink)
+    with (
+        replace_after_identity_snapshot(
+            monkeypatch, target, replacement, private_snapshot=True
+        ) as identity,
+        pytest.raises(CalendarAadRolloutError) as raised,
+    ):
+        published_artifact.discard_new_publication()
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    assert os.path.samestat(target.lstat(), identity)
+    assert target.read_bytes() == b"synthetic-after-capture"
+    if phase == "unlink_before":
+        captured = assert_retained_custody(tmp_path, target, owned_identity)
+        assert captured.read_bytes() == zero_bytes()
+    elif phase == "directory_cleanup":
+        directories = list(tmp_path.glob(".calendar-aad-custody-*"))
+        assert len(directories) == 1
+        assert list(directories[0].iterdir()) == []
+    else:
+        assert list(tmp_path.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("change", ["content", "mode", "missing"])
+def test_calendar_aad_custody_skips_changes_visible_before_capture(
+    tmp_path, published_artifact, change
+):
+    """保留身份核对时已经可见的原地改写、权限变更和消失，不把预检查当删除授权。"""
+    target = published_artifact.path
+    if change == "missing":
+        target.unlink()
+    elif change == "mode":
+        target.chmod(0o400)
+    else:
+        target.write_bytes(b"synthetic-modified-content")
+    published_artifact.discard_new_publication()
+    if change == "missing":
+        assert list(tmp_path.iterdir()) == []
+    else:
+        assert list(tmp_path.iterdir()) == [target]
+        if change == "content":
+            assert target.read_bytes() == b"synthetic-modified-content"
+        else:
+            assert stat.S_IMODE(target.lstat().st_mode) == 0o400
 
 
 async def cancel_twice_while_pending(task: asyncio.Task) -> bool:
@@ -479,13 +874,15 @@ async def test_calendar_aad_cancelled_artifact_read_finishes_before_lease_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_error", [False, True])
 async def test_calendar_aad_later_cancellation_cannot_interrupt_publication_rollback(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, rollback_error
 ):
-    """取消触发撤回后再次取消，必须收完真实 unlink 线程以及随后临时文件清理。"""
+    """取消触发撤回后遇后来取消或补偿错误，都必须收完真实清理并保留首次取消。"""
     publication_gate, rollback_gate = ThreadBoundary(), ThreadBoundary()
     artifact_file = module.CalendarAadArtifactFile(tmp_path, BINDING)
-    original_publish, original_unlink = artifact_file._publish, Path.unlink
+    original_publish = artifact_file._publish
+    original_discard = artifact_file.discard_new_publication
 
     def publish(path, artifact):
         """完成真实新文件发布，延迟交回 True 所有权结果。"""
@@ -493,12 +890,12 @@ async def test_calendar_aad_later_cancellation_cannot_interrupt_publication_roll
         publication_gate.pause()
         return result
 
-    def unlink(path, *args, **kwargs):
-        """真实撤回后暂停；此前首次取消不能让此处第二次取消穿透收尾。"""
-        result = original_unlink(path, *args, **kwargs)
-        if path == artifact_file.path:
-            rollback_gate.pause()
-        return result
+    def discard():
+        """真实撤回及保管目录清理后暂停，第二次取消不能先于线程的结果交付返回。"""
+        original_discard()
+        rollback_gate.pause()
+        if rollback_error:
+            raise CalendarAadRolloutError("synthetic_compensation_failed")
 
     class Guard:
         """本例只覆盖资源补偿，既有真实数据库 guard 由相邻集成验证。"""
@@ -507,7 +904,7 @@ async def test_calendar_aad_later_cancellation_cannot_interrupt_publication_roll
             return None
 
     monkeypatch.setattr(artifact_file, "_publish", publish)
-    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(artifact_file, "discard_new_publication", discard)
     task = asyncio.create_task(
         artifact_file.publish(parse_rollout_artifact(zero_bytes(), BINDING), Guard())
     )
@@ -516,7 +913,8 @@ async def test_calendar_aad_later_cancellation_cannot_interrupt_publication_roll
         task.cancel("first publication cancellation")
         publication_gate.release.set()
         await rollback_gate.reached()
-        task.cancel("second rollback cancellation")
+        if not rollback_error:
+            task.cancel("second rollback cancellation")
         done, _ = await asyncio.wait({task}, timeout=0.05)
         returned_early = bool(done)
     finally:
@@ -552,7 +950,7 @@ async def test_calendar_aad_preflight_final_exit_failure_keeps_publication_owner
     closed, budgets, executions = [], [], []
     exit_error = OSError("synthetic final lease exit failure")
     original_timeout = asyncio.timeout
-    original_unlink = Path.unlink
+    original_discard = module.CalendarAadArtifactFile.discard_new_publication
 
     def timeout(delay):
         """保留父入口自己创建的真实总 timeout，仅在进入最终 exit 后显式触发它。"""
@@ -581,18 +979,17 @@ async def test_calendar_aad_preflight_final_exit_failure_keeps_publication_owner
     async def verify(self):
         """本例固定当前 guard 成功，把故障严格放在发布完成之后的最终 lease exit。"""
 
-    def unlink(path, *args, **kwargs):
+    def discard(owned):
         """撤回已真实完成后暂停，后续取消不能穿透收尾或替换原 timeout/退出异常。"""
-        result = original_unlink(path, *args, **kwargs)
-        if cancel_rollback and path == artifact_file.path:
+        original_discard(owned)
+        if cancel_rollback:
             rollback_gate.pause()
-        return result
 
     monkeypatch.setattr(asyncio, "timeout", timeout)
     monkeypatch.setattr(module, "calendar_aad_rollout_lease", context)
     monkeypatch.setattr(preflight.CalendarAadPreflightUseCase, "execute", execute)
     monkeypatch.setattr(module.CalendarAadCurrentGuard, "verify", verify)
-    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(module.CalendarAadArtifactFile, "discard_new_publication", discard)
     task = asyncio.create_task(
         preflight.run_preflight(
             sessions=SimpleNamespace(engine=SimpleNamespace(url=URL.create("postgresql"))),

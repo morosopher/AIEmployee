@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import stat
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -15,10 +16,13 @@ from sqlalchemy import URL
 from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadRolloutError
 from ai_employee.cli import calendar_aad_backup_0019 as backup
 from ai_employee.cli.calendar_aad_backup_0019 import _SCRIPT, run_backup_shell
+from ai_employee.infrastructure import calendar_aad_publication as publication_files
 from ai_employee.infrastructure.db.repositories import calendar_aad_preflight as resources
 from tests.unit.application.test_calendar_aad_resources import (
     ThreadBoundary,
+    assert_retained_custody,
     cancel_twice_while_pending,
+    replace_after_identity_snapshot,
 )
 from tests.unit.application.test_calendar_aad_rollout import BINDING, zero_bytes
 
@@ -345,11 +349,219 @@ def test_calendar_aad_backup_checksum_rejects_fifo_without_writer(tmp_path):
     assert not artifact.with_suffix(".enc.sha256").exists()
 
 
-@pytest.mark.asyncio
-async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
-    tmp_path, monkeypatch, guarded_backup_resources
+@pytest.mark.parametrize("member", ["dump", "checksum"])
+@pytest.mark.parametrize(
+    ("kind", "private_snapshot"),
+    [("regular", False), ("fifo", False), ("symlink", False), ("regular", True)],
+)
+def test_calendar_aad_backup_preserves_replacement_after_identity_snapshot(
+    tmp_path, monkeypatch, member, kind, private_snapshot
 ):
-    """发布取消的补偿遇第二次取消，须完成两文件撤回与目录清理后再释放 lease。"""
+    """一个成员在真实身份快照后被替换时保留其 inode/内容，另一个本次成员仍须撤回。"""
+    directory = tmp_path / "staged"
+    directory.mkdir(mode=0o700)
+    target = tmp_path / f"{BINDING.basename}.dump.enc"
+    checksum = target.with_suffix(".enc.sha256")
+    staged = directory / target.name
+    staged.write_bytes(b"synthetic-encrypted-dump")
+    backup._prepare_checksum(staged)
+    identities = backup._publish_backup(staged, target)
+    staged.unlink()
+    staged.with_suffix(".enc.sha256").unlink()
+    directory.rmdir()
+    replaced = target if member == "dump" else checksum
+    other = checksum if member == "dump" else target
+    replacement = tmp_path / "synthetic-replacement"
+    if kind == "fifo":
+        os.mkfifo(replacement, mode=0o600)
+    elif kind == "symlink":
+        replacement.symlink_to("synthetic-foreign-target")
+    else:
+        replacement.write_bytes(b"synthetic-foreign-backup-member")
+        replacement.chmod(0o600)
+
+    with replace_after_identity_snapshot(
+        monkeypatch, replaced, replacement, private_snapshot=private_snapshot
+    ) as identity:
+        backup._remove_published(target, identities)
+
+    assert not other.exists(), "compensation skipped the other owned backup member"
+    assert os.path.lexists(replaced), "compensation deleted a concurrent replacement"
+    assert os.path.samestat(replaced.lstat(), identity)
+    if kind == "fifo":
+        assert stat.S_ISFIFO(replaced.lstat().st_mode)
+    elif kind == "symlink":
+        assert replaced.readlink() == Path("synthetic-foreign-target")
+    else:
+        assert replaced.read_bytes() == b"synthetic-foreign-backup-member"
+    assert list(tmp_path.iterdir()) == [replaced]
+
+
+def test_calendar_aad_partial_backup_publish_keeps_concurrent_replacement(tmp_path, monkeypatch):
+    """第二成员发布失败时，第一成员的内部补偿也必须保留另一个写入者的替换文件。"""
+    directory = tmp_path / "staged"
+    directory.mkdir(mode=0o700)
+    target = tmp_path / f"{BINDING.basename}.dump.enc"
+    staged = directory / target.name
+    staged.write_bytes(b"synthetic-encrypted-dump")
+    backup._prepare_checksum(staged)
+    replacement = tmp_path / "synthetic-replacement"
+    replacement.write_bytes(b"synthetic-foreign-backup-member")
+    identity = replacement.lstat()
+    original_link = os.link
+    failure = OSError("synthetic second publication failure")
+
+    def link(source, destination, *args, **kwargs):
+        """第一成员保持真实发布；仅在第二成员提交前替换公开 dump 并报告失败。"""
+        if destination == target.with_suffix(".enc.sha256"):
+            os.replace(replacement, target)
+            raise failure
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    with pytest.raises(OSError) as raised:
+        backup._publish_backup(staged, target)
+    assert raised.value is failure
+    assert not target.with_suffix(".enc.sha256").exists()
+    assert target.exists(), "partial-publication cleanup deleted the replacement"
+    assert os.path.samestat(target.lstat(), identity)
+    assert target.read_bytes() == b"synthetic-foreign-backup-member"
+
+
+@pytest.mark.parametrize("member", ["dump", "checksum"])
+def test_calendar_aad_backup_compensation_conflict_still_removes_other_owned_member(
+    tmp_path, monkeypatch, member
+):
+    """真实无覆盖返还冲突须保留两个外来对象，同时继续处理另一个本次 backup 成员。"""
+    directory = tmp_path / "staged"
+    directory.mkdir(mode=0o700)
+    target = tmp_path / f"{BINDING.basename}.dump.enc"
+    checksum = target.with_suffix(".enc.sha256")
+    staged = directory / target.name
+    staged.write_bytes(b"synthetic-encrypted-dump")
+    backup._prepare_checksum(staged)
+    identities = backup._publish_backup(staged, target)
+    staged.unlink()
+    staged.with_suffix(".enc.sha256").unlink()
+    directory.rmdir()
+    replaced = target if member == "dump" else checksum
+    other = checksum if member == "dump" else target
+    replacement, occupant = tmp_path / "synthetic-replacement", tmp_path / "synthetic-occupant"
+    replacement.write_bytes(b"synthetic-foreign-capture")
+    occupant.write_bytes(b"synthetic-current-occupant")
+    occupant_identity = occupant.lstat()
+    original_rename = os.rename
+
+    def rename(source, destination, *args, **kwargs):
+        """只在被替换成员真实捕获后安置新占用者，另一成员使用未改变的真实文件路径。"""
+        result = original_rename(source, destination, *args, **kwargs)
+        if kwargs.get("dst_dir_fd") is not None and source == replaced.name:
+            os.replace(occupant, replaced)
+        return result
+
+    monkeypatch.setattr(os, "rename", rename)
+    with (
+        replace_after_identity_snapshot(monkeypatch, replaced, replacement) as identity,
+        pytest.raises(CalendarAadRolloutError) as raised,
+    ):
+        backup._remove_published(target, identities)
+    assert raised.value.error_code == "calendar_aad_publication_compensation_failed"
+    assert not other.exists(), "one compensation failure skipped the other owned member"
+    assert os.path.samestat(replaced.lstat(), occupant_identity)
+    assert replaced.read_bytes() == b"synthetic-current-occupant"
+    captured = assert_retained_custody(tmp_path, replaced, identity)
+    assert captured.read_bytes() == b"synthetic-foreign-capture"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["capture", "return", "cleanup"])
+async def test_calendar_aad_backup_later_cancellations_drain_new_custody_operations(
+    tmp_path, monkeypatch, guarded_backup_resources, boundary
+):
+    """最终退出先失败，新的捕获/返还/空目录清理又遇双取消时仍保持首错并收完另一成员。"""
+    gate = ThreadBoundary()
+    exit_error = OSError("synthetic final lease exit failure")
+    exited, produced = [], []
+
+    def on_close():
+        """只在主体发布成功后的最终物理退出失败；后来取消全部发生在本地补偿内部。"""
+        exited.append(True)
+        raise exit_error
+
+    fixture = guarded_backup_resources(tmp_path, on_close)
+    target = tmp_path / f"{BINDING.basename}.dump.enc"
+    checksum = target.with_suffix(".enc.sha256")
+    replacement = tmp_path / "synthetic-replacement"
+    if boundary == "return":
+        replacement.write_bytes(b"synthetic-foreign-return")
+        replacement_identity = replacement.lstat()
+    original_rename, original_rmdir = os.rename, Path.rmdir
+    original_return = publication_files._return_without_replacement
+
+    def rename(source, destination, *args, **kwargs):
+        """捕获使用真实目录 fd；return 场景在真实预检查之后才替换公开文件。"""
+        selected = kwargs.get("dst_dir_fd") is not None and source == target.name
+        if selected and boundary == "return":
+            os.replace(replacement, target)
+        result = original_rename(source, destination, *args, **kwargs)
+        if selected and boundary == "capture":
+            gate.pause()
+        return result
+
+    def return_capture(name, custody_fd, parent_fd):
+        """保留实际 RENAME_NOREPLACE，只在外来对象安全返还后延迟线程继续。"""
+        original_return(name, custody_fd, parent_fd)
+        if name == target.name and boundary == "return":
+            gate.pause()
+
+    def rmdir(path):
+        """第一个保管空目录真实删除后暂停；补偿线程仍持有下一成员的清理责任。"""
+        original_rmdir(path)
+        if (
+            boundary == "cleanup"
+            and path.name.startswith(".calendar-aad-custody-")
+            and not gate.entered.is_set()
+        ):
+            gate.pause()
+
+    async def producer(path):
+        """生成合成 dump，其他发布与补偿都保留真实父组合。"""
+        produced.append(True)
+        path.write_bytes(b"synthetic-encrypted-dump")
+
+    monkeypatch.setattr(os, "rename", rename)
+    monkeypatch.setattr(publication_files, "_return_without_replacement", return_capture)
+    monkeypatch.setattr(Path, "rmdir", rmdir)
+    task = asyncio.create_task(backup.run_guarded_backup(**fixture.arguments, producer=producer))
+    try:
+        await gate.reached()
+        assert exited == [True]
+        assert checksum.exists(), "second member was already removed before the first settled"
+        returned_early = await cancel_twice_while_pending(task)
+    finally:
+        gate.release.set()
+        try:
+            with pytest.raises(OSError) as raised:
+                await task
+        finally:
+            await gate.settle()
+    assert not returned_early
+    assert raised.value is exit_error
+    assert produced == [True]
+    expected = {fixture.artifact_file.path}
+    if boundary == "return":
+        expected.add(target)
+        assert os.path.samestat(target.lstat(), replacement_identity)
+        assert target.read_bytes() == b"synthetic-foreign-return"
+    assert set(tmp_path.iterdir()) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_error", [False, True])
+async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
+    tmp_path, monkeypatch, guarded_backup_resources, rollback_error
+):
+    """发布取消的补偿遇后来取消或错误，须收完两文件/目录并保留首错后再释放 lease。"""
     publication_gate, rollback_gate = ThreadBoundary(), ThreadBoundary()
     fixture = guarded_backup_resources(tmp_path, rollback_gate.finished.is_set)
     original_publish, original_remove = backup._publish_backup, backup._remove_published
@@ -364,6 +576,8 @@ async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
         """真实撤回两个本次成员后暂停，使第二次取消落在补偿自身的等待边界。"""
         original_remove(target, identities)
         rollback_gate.pause()
+        if rollback_error:
+            raise CalendarAadRolloutError("synthetic_compensation_failed")
 
     async def producer(path):
         """只提供合成加密内容；checksum、发布与清理都由真实父流程执行。"""
@@ -377,7 +591,8 @@ async def test_calendar_aad_backup_later_cancel_waits_for_publication_rollback(
         task.cancel("first backup publication cancellation")
         publication_gate.release.set()
         await rollback_gate.reached()
-        task.cancel("second backup rollback cancellation")
+        if not rollback_error:
+            task.cancel("second backup rollback cancellation")
         done, _ = await asyncio.wait({task}, timeout=0.05)
         returned_early = bool(done)
     finally:
@@ -427,7 +642,7 @@ async def test_calendar_aad_backup_final_exit_failure_keeps_publication_ownershi
     fixture = guarded_backup_resources(tmp_path, on_close)
     target = tmp_path / f"{BINDING.basename}.dump.enc"
     checksum = target.with_suffix(".enc.sha256")
-    original_unlink = Path.unlink
+    original_discard = backup.discard_calendar_aad_publication
     previous = set()
     if initial in {"dump_collision", "checksum_collision"}:
         collision = target if initial == "dump_collision" else checksum
@@ -439,14 +654,13 @@ async def test_calendar_aad_backup_final_exit_failure_keeps_publication_ownershi
         produced.append(path)
         path.write_bytes(b"synthetic-encrypted-dump")
 
-    def unlink(path, *args, **kwargs):
+    def discard(path, identity):
         """第一个真实成员撤回后暂停；后续取消仍必须完成另一个成员的条件补偿。"""
-        result = original_unlink(path, *args, **kwargs)
+        original_discard(path, identity)
         if cancel_rollback and path == target:
             rollback_gate.pause()
-        return result
 
-    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(backup, "discard_calendar_aad_publication", discard)
     task = asyncio.create_task(backup.run_guarded_backup(**fixture.arguments, producer=producer))
     returned_early = False
     try:

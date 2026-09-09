@@ -29,6 +29,7 @@ from ai_employee.cli.calendar_aad_preflight_0019 import (
 )
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
+from ai_employee.infrastructure.calendar_aad_publication import discard_calendar_aad_publication
 from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
@@ -145,44 +146,54 @@ def _publish_backup(staged: Path, target: Path) -> _BackupPublication:
         mtime 或 size，父调用须保留到最终 lease exit 确定成功之后。
     """
     identities = (staged.lstat(), staged.with_suffix(".enc.sha256").lstat())
-    published: list[Path] = []
+    published: list[tuple[Path, os.stat_result]] = []
     try:
-        for source, destination in (
-            (staged, target),
-            (staged.with_suffix(".enc.sha256"), target.with_suffix(".enc.sha256")),
+        for (source, destination), identity in zip(
+            (
+                (staged, target),
+                (staged.with_suffix(".enc.sha256"), target.with_suffix(".enc.sha256")),
+            ),
+            identities,
+            strict=True,
         ):
             os.link(source, destination, follow_symlinks=False)
-            published.append(destination)
+            published.append((destination, identity))
         descriptor = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-    except BaseException:
-        for path in published:
-            path.unlink(missing_ok=True)
+    except BaseException as failure:
+        try:
+            _discard_backup_members(published)
+        except BaseException as rollback_failure:
+            raise failure from rollback_failure
         raise
     return identities
 
 
+def _discard_backup_members(publications: Sequence[tuple[Path, os.stat_result]]) -> None:
+    """仅处理调用方已成功发布的固定成员；某个补偿失败也先收完另一个，再传播首错。"""
+    failure: CalendarAadRolloutError | None = None
+    for path, identity in publications:
+        try:
+            discard_calendar_aad_publication(path, identity)
+        except CalendarAadRolloutError as error:
+            if failure is None:
+                failure = error
+    if failure is not None:
+        raise failure
+
+
 def _remove_published(target: Path, identities: _BackupPublication) -> None:
-    """逐个撤回仍匹配本次发布身份的成员；保留碰撞、符号链接及后来替换/改写的文件。
+    """逐个在独占保管目录内撤回本次成员；外来对象无覆盖返还，冲突时保留并失败。
 
     由一个 caller-owned 线程完成两成员补偿，后续取消不会中断成员之间的收尾。
-    无论某个路径已消失或已被替换，另一个本次成员仍须独立核对并撤回。
+    无论某个路径已消失、已被替换或补偿失败，另一个本次成员仍须独立核对并撤回。
     """
-    for path, identity in zip((target, target.with_suffix(".enc.sha256")), identities, strict=True):
-        try:
-            current = path.lstat()
-        except FileNotFoundError:
-            continue
-        if (
-            os.path.samestat(current, identity)
-            and current.st_mode == identity.st_mode
-            and current.st_mtime_ns == identity.st_mtime_ns
-            and current.st_size == identity.st_size
-        ):
-            path.unlink(missing_ok=True)
+    _discard_backup_members(
+        tuple(zip((target, target.with_suffix(".enc.sha256")), identities, strict=True))
+    )
 
 
 async def run_guarded_backup(
@@ -271,10 +282,8 @@ async def run_guarded_backup(
                     )
                     try:
                         await await_calendar_aad_resource(rollback)
-                    except asyncio.CancelledError:
-                        if isinstance(failure, asyncio.CancelledError):
-                            raise failure
-                        raise
+                    except BaseException as rollback_failure:
+                        raise failure from rollback_failure
                 raise
             # 仅整个 body（含目录 cleanup）成功后才把精确归属带过最终 lease exit。
             # 在此之后不再启动业务步骤，后续失败只可能来自该最终退出边界。

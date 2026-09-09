@@ -36,6 +36,7 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
     serialize_rollout_artifact,
     verify_rollout,
 )
+from ai_employee.infrastructure.calendar_aad_publication import discard_calendar_aad_publication
 from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
@@ -343,9 +344,12 @@ class CalendarAadArtifactFile:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        except BaseException:
-            # 仅移除本调用刚 rename 的文件，不能把 fsync 失败暴露为可继续 rollout 的成功证据。
-            self.path.unlink(missing_ok=True)
+        except BaseException as failure:
+            # fsync 失败也只补偿本次 inode；公开路径可能已被另一写入者替换。
+            try:
+                self.discard_new_publication()
+            except BaseException as rollback_failure:
+                raise failure from rollback_failure
             raise
         return True
 
@@ -353,27 +357,16 @@ class CalendarAadArtifactFile:
         """仅撤回本实例发布且当前路径仍指向的文件；不凭 basename 或内容相同认领替换文件。
 
         发布线程保存临时文件的 device/inode 与未随 rename 改变的内容版本事实。最终
-        lease exit 首次失败时父调用仍持有该记录；这里以 no-follow 的当前身份核对，
-        保留旧文件、符号链接、替换 inode 或已被改写的文件，不重取 lease 或执行业务。
-        调用方在线程中执行此同步文件操作，并负责等待其终态。
+        lease exit 首次失败时父调用仍持有该记录；这里在独占保管目录/fd 内验证并删除，
+        不按已检查的公开路径 unlink。捕获的替换者无覆盖返还，冲突则保留供人工处置；
+        不重取 lease 或执行业务。调用方在线程中执行此操作，并负责等待其终态。
 
         Raises:
-            OSError: 文件身份读取或撤回失败；父调用保留原失败，并将此异常关联为原因。
+            CalendarAadRolloutError: 有界文件补偿失败；父调用保留原失败并关联补偿原因。
         """
         identity = self._publication_identity
-        if identity is None:
-            return
-        try:
-            current = self.path.lstat()
-        except FileNotFoundError:
-            return
-        if (
-            os.path.samestat(current, identity)
-            and current.st_mode == identity.st_mode
-            and current.st_mtime_ns == identity.st_mtime_ns
-            and current.st_size == identity.st_size
-        ):
-            self.path.unlink(missing_ok=True)
+        if identity is not None:
+            discard_calendar_aad_publication(self.path, identity)
 
     async def publish(self, artifact: CalendarAadArtifact, guard: CalendarAadGuard) -> bool:
         """在当前 guard 下发布；任意阶段取消都先收完线程，再清理临时文件并撤回新发布。
@@ -422,10 +415,8 @@ class CalendarAadArtifactFile:
                 rollback = asyncio.create_task(asyncio.to_thread(self.discard_new_publication))
                 try:
                     await await_calendar_aad_resource(rollback)
-                except asyncio.CancelledError:
-                    if isinstance(failure, asyncio.CancelledError):
-                        raise failure
-                    raise
+                except BaseException as rollback_failure:
+                    raise failure from rollback_failure
             raise
         return published
 
