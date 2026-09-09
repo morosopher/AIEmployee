@@ -8,18 +8,25 @@ database ACL、运行时角色和对象授权的 catalog SQL/完整 inventory �
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import NoReturn, Protocol
-from uuid import UUID
+from pathlib import Path
+from typing import Literal, NoReturn, Protocol
+from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Engine, text
+from sqlalchemy import Connection, Engine, Row, text
+from sqlalchemy.engine import RootTransaction
+from sqlalchemy.exc import DBAPIError
 
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.alembic import (
     AlembicMigrationInvariantError,
     OnlineMigrationAuthority,
@@ -34,6 +41,7 @@ from ai_employee.infrastructure.db.database_access import (
     DatabaseAclProfile,
     apply_baseline_connect_reassertion,
     apply_database_acl_mutation,
+    apply_restore_database_acl_transition,
     apply_safe_runtime_roles,
     classify_bootstrap_candidate,
     read_database_access_snapshot_sync,
@@ -48,14 +56,23 @@ from ai_employee.infrastructure.db.database_grants import (
     BootstrapGrantPosture,
     GrantPhase,
     apply_bootstrap_object_grants,
+    apply_restore_object_grants,
+    apply_restore_phase_grants,
     verify_bootstrap_object_grants,
     verify_object_grants,
+    verify_restore_pre_grants,
+)
+from ai_employee.infrastructure.db.postgres_restore_stream import (
+    RestoreConsumerProof,
+    RestoreStreamRequest,
+    execute_restore_stream,
 )
 
 TARGET_IDENTITY_DOMAIN = b"ai_employee.restore_target.v1\0"
 DATABASE_LIFECYCLE_LOCK_DOMAIN = b"ai_employee.database_lifecycle_lock.v1\0"
 DATABASE_MAINTENANCE_LOCK_DOMAIN = b"ai_employee.database_maintenance_lock.v1\0"
 SCHEMA_LIFECYCLE_LOCK = (20260806, 143)
+BACKUP_LIFECYCLE_LOCK = (20260806, 274)
 
 DATABASE_RESTORE_FACTS_SQL = """WITH current_values AS (
     SELECT
@@ -260,6 +277,129 @@ class DatabaseRestoreFacts:
     restore_completion: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RestoreHolderSessionRegistration:
+    """记录唯一物理holder的初值和三键已证明的NULL→空串注册，不承载catalog事实。
+
+    ``initial``永不变化；``registered``只能在本holder已授权SET成功后逐键递增。
+    PostgreSQL的占位注册可跨事务回滚保留，因此该记录属于session而非事务。新连接
+    必须重新走普通reader严格验证，不能接收或恢复此私有记录。
+    """
+
+    initial: DatabaseRestoreFacts
+    registered: tuple[bool, bool, bool] = (False, False, False)
+
+    def expected(self) -> DatabaseRestoreFacts:
+        """返回已有证据允许的完整session表示，绝不由当前catalog推导。"""
+        values = (
+            self.initial.maintenance_gate,
+            self.initial.restore_call_authority,
+            self.initial.restore_completion,
+        )
+        return DatabaseRestoreFacts(
+            *(
+                "" if registered else value
+                for value, registered in zip(values, self.registered, strict=True)
+            )
+        )
+
+    def after_set(
+        self, slot: int, observed: DatabaseRestoreFacts
+    ) -> _RestoreHolderSessionRegistration:
+        """只允许本次SET地址对应的NULL首次注册，其余槽位逐字相同。
+
+        Args:
+            slot: 唯一固定三键表内的当前SET下标。
+            observed: 成功SET后立即读取的同session完整三元组。
+
+        Raises:
+            DatabaseMaintenanceInvariantError: 错键、反向、非空覆盖或无法证明的变化。
+        """
+        if type(slot) is not int or slot not in (0, 1, 2):
+            _fail()
+        before = self.expected()
+        values = [
+            before.maintenance_gate,
+            before.restore_call_authority,
+            before.restore_completion,
+        ]
+        registered = list(self.registered)
+        if values[slot] is None:
+            values[slot] = ""
+            registered[slot] = True
+        if observed != DatabaseRestoreFacts(*values):
+            _fail()
+        return _RestoreHolderSessionRegistration(
+            self.initial, (registered[0], registered[1], registered[2])
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreFingerprint:
+    """绑定支持的完整schema/业务内容摘要；不承诺sequence计数器或audit逐字节相同。"""
+
+    revision: str
+    digest: str
+
+    def __post_init__(self) -> None:
+        """在任何数据库调用前拒绝中间迁移版本、非canonical摘要和宽松类型。"""
+        if self.revision not in {"20260809_0018", "20260809_0019"}:
+            _fail()
+        _canonical_digest(self.digest)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreClaim:
+    """单次generic/sealed请求的精确匹配边界；legacy不能进入workspace恢复状态机。"""
+
+    kind: Literal["generic", "sealed_0018"]
+    source_digest: str
+    expected: RestoreFingerprint
+
+    def __post_init__(self) -> None:
+        """绑定manifest SHA-256与支持版本，不接受basename/env/projection作为authority。"""
+        if (
+            self.kind not in {"generic", "sealed_0018"}
+            or type(self.expected) is not RestoreFingerprint
+        ):
+            _fail()
+        _canonical_digest(self.source_digest)
+        if self.kind == "sealed_0018" and self.expected.revision != "20260809_0018":
+            _fail()
+
+
+class RestoreCompletionAckUnknown(RuntimeError):
+    """最终COMMIT返回未知；仅保存内容无关的精确前后tuple供全新holder只读核对。
+
+    此异常不代表数据库已提交或未提交，也不赋予重试许可。只有重新取得全部锁并
+    通过完整admission的catalog事实才允许确认completed或落reopen_not_applied。
+    """
+
+    def __init__(self, before: DatabaseRestoreFacts, completed: DatabaseRestoreFacts) -> None:
+        if (
+            before.maintenance_gate is None
+            or before.restore_call_authority is None
+            or before.restore_completion is not None
+            or completed.maintenance_gate is not None
+            or completed.restore_call_authority is None
+            or completed.restore_completion is None
+        ):
+            _fail()
+        call = _validate_active_authority(before.maintenance_gate, before.restore_call_authority)
+        if call.phase is not _RestoreCallPhase.REOPEN_COMMITTING:
+            _fail()
+        _validate_completed_authority(
+            completed.restore_call_authority, completed.restore_completion
+        )
+        restore_completion_metadata(completed.restore_call_authority)
+        validate_restore_call_transition(
+            before.restore_call_authority, completed.restore_call_authority
+        )
+        self.before = before
+        self.completed = completed
+        super().__init__("restore completion acknowledgement unknown")
+
+
 class DatabaseAdmissionState(StrEnum):
     """表示 restore catalog 与 access posture 唯一允许的三个 steady state。"""
 
@@ -344,6 +484,17 @@ class TargetMaintenanceLease(Protocol):
     def acquire_schema_lifecycle_lock(self) -> AbstractContextManager[None]:
         """在 target lock 之后取得固定 schema-lifecycle exclusive lock。"""
 
+    def restore_holder(
+        self, claim: RestoreClaim
+    ) -> AbstractContextManager[RestoreMaintenanceHolder]:
+        """在既有三锁physical session上创建本调用私有restore anchor与匹配claim。"""
+
+    def backup_holder(self) -> AbstractContextManager[BackupMaintenanceHolder]:
+        """先取得固定backup session锁，调用方再取flock和shared schema lease。"""
+
+    def read_only_holder(self) -> AbstractContextManager[ReadOnlyMaintenanceHolder]:
+        """在既有schema lease内签发不提供写操作的固定facts holder。"""
+
     def owner_transaction(self) -> AbstractContextManager[OwnerBootstrapTransaction]:
         """开启 candidate 收敛所需的唯一显式 owner transaction。"""
 
@@ -371,6 +522,11 @@ class ManagementLifecycleLease(Protocol):
 
     def acquire_target_lock(self) -> AbstractContextManager[TargetMaintenanceLease]:
         """在 management lock 后取得目标库 maintenance lock。"""
+
+    def acquire_restore_target_lock(
+        self, claim: RestoreClaim
+    ) -> AbstractContextManager[TargetMaintenanceLease]:
+        """使用同一target锁实现，延后revision读取至精确backend退出证明之后。"""
 
     def confirm_exact_non_production_target(self) -> None:
         """复核非生产环境、精确目标与完整名称人工确认。"""
@@ -516,6 +672,21 @@ def read_database_restore_facts(
         DatabaseMaintenanceInvariantError: catalog/current 行类型、作用域、唯一性或
             exact identity 不合法。
     """
+    return _read_restore_facts(connection, target_database_oid=target_database_oid)
+
+
+def _read_restore_facts(
+    connection: Connection,
+    *,
+    target_database_oid: object,
+    holder_session_facts: DatabaseRestoreFacts | None = None,
+) -> DatabaseRestoreFacts:
+    """复用唯一catalog parser；只有真实holder可提供物理连接绑定的已证明session表示。
+
+    普通reader不传anchor，因此仍严格比较当前catalog/current_setting。恢复holder的
+    ALTER DATABASE不刷新旧session的配置值；仅本holder自己SET引起的NULL→空串注册
+    由私有记录追踪。catalog每次重读、完整解析并执行CAS，绝不SET SESSION镜像。
+    """
     if type(target_database_oid) is not int or not 1 <= target_database_oid <= (1 << 32) - 1:
         _fail()
     result = connection.execute(
@@ -579,10 +750,11 @@ def read_database_restore_facts(
         restore_call_authority=values.get(_RESTORE_FACT_KEYS[1]),
         restore_completion=values.get(_RESTORE_FACT_KEYS[2]),
     )
+    session_facts = facts if holder_session_facts is None else holder_session_facts
     if current_values != (
-        facts.maintenance_gate,
-        facts.restore_call_authority,
-        facts.restore_completion,
+        session_facts.maintenance_gate,
+        session_facts.restore_call_authority,
+        session_facts.restore_completion,
     ):
         _fail()
     return facts
@@ -868,6 +1040,250 @@ def _validate_completed_authority(
     if type(completion) is not str or completion != f"restore_completion:v1:{expected_digest}":
         _fail()
     return authority
+
+
+_COMPLETION_METADATA_FIELDS = {
+    "attempt_id": 1,
+    "kind": 2,
+    "target_identity_digest_v1": 3,
+    "source_binding_digest_v1": 4,
+    "manifest_sha256": 5,
+    "previous_completion_authority_digest_v1": 6,
+    "final_call_ordinal": 7,
+    "final_reopen_ordinal": 8,
+    "gate_established_at": 10,
+    "final_call_started_at": 11,
+    "final_backend_start": 13,
+    "expected_post_revision": 16,
+    "expected_post_restore_fingerprint_v1": 17,
+    "observed_post_revision": 18,
+    "observed_post_restore_fingerprint_v1": 19,
+    "completed_at": 20,
+    "completion_authority_digest_v1": 21,
+}
+_COMPLETION_METADATA_KEYS = frozenset(
+    (*_COMPLETION_METADATA_FIELDS, "schema", "maintenance_gate_version", "maintenance_gate_value")
+)
+
+
+def restore_completion_metadata(call: str) -> Mapping[str, str | int | None]:
+    """从完整completed call复算zero-slot摘要并构造唯一闭合审计metadata。
+
+    历史审计没有pre/PID，永远不能替代call/GUC authority；只有本次完整call能给
+    最终INSERT提供精确参数。outer字段和数据库中实际插入结果由同一SQL validator复核。
+    """
+    parsed = _parse_call_authority(call)
+    fields = parsed.fields
+    if parsed.phase is not _RestoreCallPhase.COMPLETED or fields[16:18] != fields[18:20]:
+        _fail()
+    timeline = [fields[index] for index in (10, 11, 13, 20) if fields[index] != "-"]
+    if timeline != sorted(timeline):
+        _fail()
+    metadata: dict[str, str | int | None] = {
+        "schema": "ai_employee.database_restore_completed.v1",
+        "maintenance_gate_version": 1,
+        "maintenance_gate_value": f"restore:v1:{fields[1]}:{fields[2]}:{fields[3]}:{fields[4]}",
+    }
+    for key, index in _COMPLETION_METADATA_FIELDS.items():
+        value = fields[index]
+        metadata[key] = int(value) if index in {7, 8} else None if value == "-" else value
+    return metadata
+
+
+def restore_completion_audit_predicate() -> str:
+    """返回固定alias `a` 的严格历史/最终INSERT共用谓词，只在PostgreSQL内读取行。
+
+    谓词验证全部可获得的outer/schema/key/type/时间/交叉绑定；缺少历史pre/PID使其
+    无法认证原zero-slot摘要，因此该布尔事实只供fingerprint归一化和审计插入校验。
+    任意reserved event malformed会由调用者硬失败，绝不能静默从hash中排除。
+    """
+    metadata = "a.metadata"
+    keys = ",".join(f"'{key}'" for key in sorted(_COMPLETION_METADATA_KEYS))
+    clauses = [
+        "a.event_type = 'database.restore.completed'",
+        "a.id > 0",
+        "a.task_id IS NULL",
+        "a.actor_type = 'system'",
+        "a.actor_id = 'database_restore'",
+        "a.created_at IS NOT NULL",
+        "(SELECT count(*) FROM public.users) = 1",
+        "a.user_id = (SELECT id FROM public.users LIMIT 1)",
+        f"jsonb_typeof({metadata}) = 'object'",
+        f"(SELECT array_agg(key ORDER BY key) FROM jsonb_object_keys({metadata}) AS key) = ARRAY[{keys}]::text[]",
+        f"{metadata}->>'schema' = 'ai_employee.database_restore_completed.v1'",
+        f"{metadata}->'maintenance_gate_version' = '1'::jsonb",
+    ]
+    nullable = {
+        "previous_completion_authority_digest_v1",
+        "final_call_started_at",
+        "final_backend_start",
+    }
+    for key in _COMPLETION_METADATA_KEYS - {
+        "maintenance_gate_version",
+        "final_call_ordinal",
+        "final_reopen_ordinal",
+    }:
+        clause = f"jsonb_typeof({metadata}->'{key}') = 'string'"
+        clauses.append(
+            f"({clause} OR {metadata}->'{key}' = 'null'::jsonb)" if key in nullable else clause
+        )
+    clauses.extend(
+        [
+            f"{metadata}->>'attempt_id' ~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'",
+            f"{metadata}->>'kind' IN ('generic','sealed_0018')",
+            f"{metadata}->>'source_binding_digest_v1' = {metadata}->>'manifest_sha256'",
+            f"{metadata}->>'expected_post_revision' = {metadata}->>'observed_post_revision'",
+            f"{metadata}->>'expected_post_restore_fingerprint_v1' = {metadata}->>'observed_post_restore_fingerprint_v1'",
+            f"{metadata}->>'expected_post_revision' IN ('20260809_0018','20260809_0019')",
+            f"({metadata}->>'kind' <> 'sealed_0018' OR {metadata}->>'expected_post_revision' = '20260809_0018')",
+            f"{metadata}->>'maintenance_gate_value' = 'restore:v1:' || ({metadata}->>'attempt_id') || ':' || ({metadata}->>'kind') || ':' || ({metadata}->>'target_identity_digest_v1') || ':' || ({metadata}->>'source_binding_digest_v1')",
+        ]
+    )
+    for key in (
+        "target_identity_digest_v1",
+        "source_binding_digest_v1",
+        "manifest_sha256",
+        "expected_post_restore_fingerprint_v1",
+        "observed_post_restore_fingerprint_v1",
+        "completion_authority_digest_v1",
+    ):
+        clauses.append(f"{metadata}->>'{key}' ~ '^[0-9a-f]{{64}}$'")
+    clauses.append(
+        f"({metadata}->'previous_completion_authority_digest_v1' = 'null'::jsonb OR {metadata}->>'previous_completion_authority_digest_v1' ~ '^[0-9a-f]{{64}}$')"
+    )
+    for key in ("final_call_ordinal", "final_reopen_ordinal"):
+        clauses.append(f"jsonb_typeof({metadata}->'{key}') = 'number'")
+        clauses.append(f"{metadata}->>'{key}' ~ '^(0|[1-9][0-9]{{0,5}})$'")
+    clauses.append(f"({metadata}->>'final_reopen_ordinal')::integer >= 1")
+    timestamp_pattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"
+    for key in (
+        "gate_established_at",
+        "final_call_started_at",
+        "final_backend_start",
+        "completed_at",
+    ):
+        valid = f"({metadata}->>'{key}' ~ '{timestamp_pattern}' AND to_char(({metadata}->>'{key}')::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') = {metadata}->>'{key}')"
+        clauses.append(
+            f"({metadata}->'{key}' = 'null'::jsonb OR {valid})" if key in nullable else valid
+        )
+    clauses.extend(
+        [
+            f"(({metadata}->>'final_call_ordinal' = '0' AND {metadata}->'final_call_started_at' = 'null'::jsonb AND {metadata}->'final_backend_start' = 'null'::jsonb) OR (({metadata}->>'final_call_ordinal')::integer >= 1 AND {metadata}->>'final_call_started_at' IS NOT NULL AND {metadata}->>'final_backend_start' IS NOT NULL AND {metadata}->>'gate_established_at' <= {metadata}->>'final_call_started_at' AND {metadata}->>'final_call_started_at' <= {metadata}->>'final_backend_start' AND {metadata}->>'final_backend_start' <= {metadata}->>'completed_at'))",
+            f"{metadata}->>'gate_established_at' <= {metadata}->>'completed_at'",
+            f"a.created_at >= ({metadata}->>'completed_at')::timestamptz",
+        ]
+    )
+    return "COALESCE((" + " AND ".join(f"({clause})" for clause in clauses) + "), false)"
+
+
+_RESTORE_PHASE_EDGES: dict[_RestoreCallPhase, frozenset[_RestoreCallPhase]] = {
+    _RestoreCallPhase.GATE_ESTABLISHED: frozenset(
+        {
+            _RestoreCallPhase.RESTORE_BACKEND_STARTING,
+            _RestoreCallPhase.RESTORE_SUCCEEDED,
+        }
+    ),
+    _RestoreCallPhase.RESTORE_BACKEND_STARTING: frozenset(
+        {
+            _RestoreCallPhase.RESTORE_BACKEND_READY,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }
+    ),
+    _RestoreCallPhase.RESTORE_BACKEND_READY: frozenset(
+        {
+            _RestoreCallPhase.RESTORE_STARTED,
+            _RestoreCallPhase.RESTORE_NOT_APPLIED,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }
+    ),
+    _RestoreCallPhase.RESTORE_STARTED: frozenset(
+        {
+            _RestoreCallPhase.RESTORE_SUCCEEDED,
+            _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN,
+            _RestoreCallPhase.RESTORE_NOT_APPLIED,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }
+    ),
+    _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN: frozenset(
+        {
+            _RestoreCallPhase.RESTORE_SUCCEEDED,
+            _RestoreCallPhase.RESTORE_NOT_APPLIED,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }
+    ),
+    _RestoreCallPhase.RESTORE_NOT_APPLIED: frozenset({_RestoreCallPhase.RESTORE_BACKEND_STARTING}),
+    _RestoreCallPhase.RESTORE_SUCCEEDED: frozenset({_RestoreCallPhase.GRANTS_SUCCEEDED}),
+    _RestoreCallPhase.GRANTS_SUCCEEDED: frozenset({_RestoreCallPhase.VERIFIED}),
+    _RestoreCallPhase.VERIFIED: frozenset({_RestoreCallPhase.REOPEN_COMMITTING}),
+    _RestoreCallPhase.REOPEN_COMMITTING: frozenset(
+        {
+            _RestoreCallPhase.COMPLETED,
+            _RestoreCallPhase.REOPEN_NOT_APPLIED,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }
+    ),
+    _RestoreCallPhase.REOPEN_NOT_APPLIED: frozenset({_RestoreCallPhase.REOPEN_COMMITTING}),
+    _RestoreCallPhase.COMPLETED: frozenset(),
+    _RestoreCallPhase.NEEDS_ATTENTION: frozenset(),
+}
+
+
+def validate_restore_call_transition(previous: str, following: str) -> _RestoreCallAuthority:
+    """验证两条已绑定 call 的闭集 edge、ordinal 和逐字段单调性，不执行任何写入。
+
+    Args:
+        previous: holder 刚从 catalog 重读且将用于 exact CAS 的旧 canonical bytes。
+        following: 拟写入的完整新 canonical bytes，必须通过同一个 v4 parser。
+
+    Returns:
+        新 call 的既有强类型解析结果。真实 current-pre/post/backend 证明由持锁 holder 提供。
+
+    Raises:
+        DatabaseMaintenanceInvariantError: 跳步、ordinal 复用/越界、冻结事实篡改或丢失。
+    """
+    old = _parse_call_authority(previous)
+    new = _parse_call_authority(following)
+    if new.phase not in _RESTORE_PHASE_EDGES[old.phase]:
+        _fail()
+    before, after = old.fields, new.fields
+    if any(before[index] != after[index] for index in (*range(7), 10, 16, 17)):
+        _fail()
+
+    new_call = new.phase is _RestoreCallPhase.RESTORE_BACKEND_STARTING
+    new_reopen = new.phase is _RestoreCallPhase.REOPEN_COMMITTING
+    if new.call_ordinal != old.call_ordinal + int(new_call):
+        _fail()
+    if new.reopen_ordinal != old.reopen_ordinal + int(new_reopen):
+        _fail()
+    if new_call:
+        # 唯一允许的跨 ordinal 重冻：pre 仍须等于被证明未应用的旧 pre，call-start 更新，
+        # backend 清空；parser 同时强制 observed/completed 使用 starting shape。
+        if after[11] <= max(before[10], before[11]) or after[12:14] != ("-", "-"):
+            _fail()
+        if before[14] != "-" and after[14:16] != before[14:16]:
+            _fail()
+        if after[14:16] == after[16:18]:
+            _fail()
+    else:
+        if any(before[index] != after[index] for index in (11, 14, 15)):
+            _fail()
+        if new.phase is _RestoreCallPhase.RESTORE_BACKEND_READY:
+            if before[12:14] != ("-", "-") or after[13] <= after[11]:
+                _fail()
+        elif after[12:14] != before[12:14]:
+            _fail()
+
+    if new.phase is _RestoreCallPhase.RESTORE_SUCCEEDED:
+        if after[18:20] != after[16:18] or before[18:20] != ("-", "-"):
+            _fail()
+    elif after[18:20] != before[18:20]:
+        _fail()
+    if new.phase is _RestoreCallPhase.COMPLETED:
+        if after[20] < max(after[10], after[11], after[13]):
+            _fail()
+    elif after[20:22] != before[20:22]:
+        _fail()
+    return new
 
 
 def classify_database_admission(
@@ -1243,6 +1659,21 @@ def _rollback_open_transaction(connection: Connection) -> None:
         connection.rollback()
 
 
+@contextmanager
+def _preserving_owned_cleanup(cleanup: Callable[[], None]) -> Iterator[None]:
+    """收完本作用域资源且保留首错；cleanup异常不得抹去ACK未知或调用者取消的身份。"""
+    try:
+        yield
+    except BaseException as failure:
+        try:
+            cleanup()
+        except BaseException as cleanup_failure:
+            raise failure from cleanup_failure
+        raise
+    else:
+        cleanup()
+
+
 def _acquire_single_session_lock(connection: Connection, *, lock_key: int) -> None:
     """非阻塞取得单 bigint session advisory lock；已被持有时立即拒绝。"""
     acquired = connection.execute(
@@ -1259,6 +1690,8 @@ def _acquire_single_session_lock(connection: Connection, *, lock_key: int) -> No
 
 def _release_single_session_lock(connection: Connection, *, lock_key: int) -> None:
     """在关闭 session 前显式释放单 bigint advisory lock并验证唯一持有事实。"""
+    if connection.closed or connection.invalidated:
+        _fail()
     _rollback_open_transaction(connection)
     released = connection.execute(
         text(_UNLOCK_SINGLE_LOCK_SQL),
@@ -1289,6 +1722,8 @@ def _acquire_schema_session_lock(connection: Connection) -> None:
 
 def _release_schema_session_lock(connection: Connection) -> None:
     """显式释放固定 schema-lifecycle lock并验证本 session 曾持有。"""
+    if connection.closed or connection.invalidated:
+        _fail()
     _rollback_open_transaction(connection)
     parameters = {
         "lock_class": SCHEMA_LIFECYCLE_LOCK[0],
@@ -1403,7 +1838,11 @@ class SqlAlchemyDatabaseMaintenanceContext:
                 connection,
                 lock_key=discovered.identity.lifecycle_lock_key,
             )
-            try:
+            with _preserving_owned_cleanup(
+                lambda: _release_single_session_lock(
+                    connection, lock_key=discovered.identity.lifecycle_lock_key
+                )
+            ):
                 locked = _read_management_target_catalog(
                     connection,
                     target_database_name=self._target_database_name,
@@ -1412,16 +1851,15 @@ class SqlAlchemyDatabaseMaintenanceContext:
                 if type(locked) is not type(discovered) or locked != discovered:
                     _fail()
                 _commit_read_transaction(connection)
-                yield _SqlAlchemyManagementLifecycleLease(
+                lease = _SqlAlchemyManagementLifecycleLease(
                     context=self,
                     connection=connection,
                     target=locked,
                 )
-            finally:
-                _release_single_session_lock(
-                    connection,
-                    lock_key=discovered.identity.lifecycle_lock_key,
-                )
+                try:
+                    yield lease
+                finally:
+                    lease._live = False
 
 
 class _SqlAlchemyManagementLifecycleLease:
@@ -1437,6 +1875,7 @@ class _SqlAlchemyManagementLifecycleLease:
         self._context = context
         self._connection = connection
         self._target: _ManagementTargetCatalog = target
+        self._live = True
         self._exact_target_confirmed = False
         self._reset_admitted_target: _ManagementTargetCatalog | None = None
         self._post_create_provenance: _PostCreateTargetProvenance | None = None
@@ -1445,6 +1884,20 @@ class _SqlAlchemyManagementLifecycleLease:
     @contextmanager
     def acquire_target_lock(self) -> Iterator[TargetMaintenanceLease]:
         """在 management lock 仍持有时取得同 identity 的 target session lock。"""
+        with self._acquire_target_lock(None) as lease:
+            yield lease
+
+    @contextmanager
+    def acquire_restore_target_lock(self, claim: RestoreClaim) -> Iterator[TargetMaintenanceLease]:
+        """只接收typed restore claim；从不在backend-exit证明前读取alembic表。"""
+        if type(claim) is not RestoreClaim or self._active_post_create_provenance is not None:
+            _fail()
+        with self._acquire_target_lock(claim) as lease:
+            yield lease
+
+    @contextmanager
+    def _acquire_target_lock(self, claim: RestoreClaim | None) -> Iterator[TargetMaintenanceLease]:
+        """唯一management→target session锁实现；restore的revision仅为声明而非观察事实。"""
         target = self._target
         if type(target) is not _DatabaseTargetCatalog:
             _fail()
@@ -1461,25 +1914,34 @@ class _SqlAlchemyManagementLifecycleLease:
                 connection,
                 lock_key=target.identity.target_lock_key,
             )
-            try:
+            with _preserving_owned_cleanup(
+                lambda: _release_single_session_lock(
+                    connection, lock_key=target.identity.target_lock_key
+                )
+            ):
                 _read_target_catalog(connection, expected=target)
-                revision = _read_current_revision(
-                    connection,
-                    authority=self._context._published_authority,
+                revision = (
+                    claim.expected.revision
+                    if claim is not None
+                    else _read_current_revision(
+                        connection,
+                        authority=self._context._published_authority,
+                    )
                 )
                 _commit_read_transaction(connection)
-                yield _SqlAlchemyTargetMaintenanceLease(
+                target_lease = _SqlAlchemyTargetMaintenanceLease(
                     context=self._context,
                     connection=connection,
                     target=target,
                     revision=revision,
                     post_create_provenance=provenance,
+                    management=self,
+                    restore_claim=claim,
                 )
-            finally:
-                _release_single_session_lock(
-                    connection,
-                    lock_key=target.identity.target_lock_key,
-                )
+                try:
+                    yield target_lease
+                finally:
+                    target_lease._live = False
 
     @contextmanager
     def _acquire_post_create_target_lock(
@@ -1638,10 +2100,17 @@ class _SqlAlchemyTargetMaintenanceLease:
         target: _DatabaseTargetCatalog,
         revision: str,
         post_create_provenance: _PostCreateTargetProvenance | None = None,
+        management: _SqlAlchemyManagementLifecycleLease | None = None,
+        restore_claim: RestoreClaim | None = None,
     ) -> None:
         self._context = context
         self._connection = connection
         self._target = target
+        self._management = management
+        self._live = True
+        self._backup_lock_held = False
+        self._schema_shared = False
+        self._restore_claim = restore_claim
         if post_create_provenance is not None and (
             type(post_create_provenance) is not _PostCreateTargetProvenance
             or context._bootstrap_caller is not BootstrapCaller.DB_RESET_POST_CREATE
@@ -1683,6 +2152,8 @@ class _SqlAlchemyTargetMaintenanceLease:
 
     def _read_bootstrap_candidate(self) -> BootstrapCandidate:
         """在当前 target session 重读全部 candidate admission 事实。"""
+        if self._restore_claim is not None:
+            _fail()
         _read_target_catalog(self._connection, expected=self._target)
         revision = _read_current_revision(
             self._connection,
@@ -1720,6 +2191,8 @@ class _SqlAlchemyTargetMaintenanceLease:
         self, *, require_revision: str | None
     ) -> tuple[str, DatabaseAdmissionState]:
         """在当前 session 重读 steady access/facts/session/object-grant admission。"""
+        if self._restore_claim is not None:
+            _fail()
         _read_target_catalog(self._connection, expected=self._target)
         revision = _read_current_revision(
             self._connection,
@@ -1847,11 +2320,72 @@ class _SqlAlchemyTargetMaintenanceLease:
             _fail()
         _acquire_schema_session_lock(self._connection)
         self._schema_lock_held = True
-        try:
-            yield
-        finally:
-            self._schema_lock_held = False
-            _release_schema_session_lock(self._connection)
+        with _preserving_owned_cleanup(lambda: _release_schema_session_lock(self._connection)):
+            try:
+                yield
+            finally:
+                self._schema_lock_held = False
+
+    @contextmanager
+    def restore_holder(self, claim: RestoreClaim) -> Iterator[RestoreMaintenanceHolder]:
+        """只在真实management/target/exclusive-schema lease内签发私有holder，禁止重连重用。"""
+        if (
+            not self._schema_lock_held
+            or self._schema_shared
+            or not self._live
+            or self._restore_claim != claim
+        ):
+            _fail()
+        holder = RestoreMaintenanceHolder(self, claim)
+        with _preserving_owned_cleanup(lambda: _rollback_open_transaction(self._connection)):
+            try:
+                yield holder
+            finally:
+                holder._live = False
+
+    @contextmanager
+    def read_only_holder(self) -> Iterator[ReadOnlyMaintenanceHolder]:
+        """读取可以与应用会话并存；仍要求management→target→schema及完整idle权限。"""
+        if not self._live or not self._schema_lock_held or self._restore_claim is not None:
+            _fail()
+        holder = ReadOnlyMaintenanceHolder(self)
+        with _preserving_owned_cleanup(lambda: _rollback_open_transaction(self._connection)):
+            try:
+                holder.assert_idle()
+                yield holder
+            finally:
+                holder._live = False
+
+    @contextmanager
+    def backup_holder(self) -> Iterator[BackupMaintenanceHolder]:
+        """按固定锁序签发holder，发布/清理结束后释放；清理失败不能覆盖主体错误或取消。"""
+        if (
+            self._backup_lock_held
+            or self._schema_lock_held
+            or not self._live
+            or self._restore_claim is not None
+        ):
+            _fail()
+        holder = BackupMaintenanceHolder(self)
+        holder.assert_idle()
+        self._connection.execute(text("SELECT pg_advisory_lock(20260806, 274)"))
+        _commit_read_transaction(self._connection)
+        self._backup_lock_held = True
+
+        def release_backup_lock() -> None:
+            """本地holder标记先失效；沿原顺序收尾事务和锁，失败由共用边界保留首异常。"""
+            _rollback_open_transaction(self._connection)
+            released = self._connection.scalar(text("SELECT pg_advisory_unlock(20260806, 274)"))
+            _commit_read_transaction(self._connection)
+            if released is not True:
+                _fail()
+
+        with _preserving_owned_cleanup(release_backup_lock):
+            try:
+                yield holder
+            finally:
+                holder._live = False
+                self._backup_lock_held = False
 
     @contextmanager
     def owner_transaction(self) -> Iterator[OwnerBootstrapTransaction]:
@@ -2076,6 +2610,1069 @@ class _SqlAlchemyTargetMaintenanceLease:
         except BaseException:
             _rollback_open_transaction(self._connection)
             raise
+
+
+class RestoreEvidenceStore(Protocol):
+    """外部projection的窄接口；实现只保存无内容catalog副本，永远不能授权状态转换。"""
+
+    def publish(self, facts: DatabaseRestoreFacts, result: str) -> None:
+        """fsync当前状态投影，失败不能继续把SQL送给psql。"""
+
+    def archive(self, facts: DatabaseRestoreFacts) -> str:
+        """fsync完成pair的不可覆盖归档并返回其字节摘要。"""
+
+    def verify_archive(self, facts: DatabaseRestoreFacts, digest: str) -> None:
+        """最终gate事务前验证旧pair归档仍与catalog逐字绑定。"""
+
+    def already_applied(
+        self, target: str, claim: RestoreClaim, observed: RestoreFingerprint
+    ) -> None:
+        """原子no-clobber发布无timestamp/随机值的独立already-applied证据。"""
+
+
+def _assert_single_lock_held(connection: Connection, key: int) -> None:
+    """读取当前backend的精确bigint advisory lock，不能以进程/文件锁代替数据库租约。"""
+    unsigned = key % (1 << 64)
+    held = connection.scalar(
+        text("""SELECT count(*)=1 FROM pg_locks WHERE locktype='advisory'
+        AND pid=pg_backend_pid() AND granted AND mode='ExclusiveLock' AND objsubid=1
+        AND classid::bigint=:high AND objid::bigint=:low
+        AND database=(SELECT oid FROM pg_database WHERE datname=current_database())"""),
+        {"high": unsigned >> 32, "low": unsigned & 0xFFFFFFFF},
+    )
+    if held is not True:
+        _fail()
+
+
+def _assert_pair_lock_held(connection: Connection, key: tuple[int, int], *, shared: bool) -> None:
+    """验证固定双int session锁的当前backend/mode，与Task16A的key派生完全共用。"""
+    held = connection.scalar(
+        text("""SELECT count(*)=1 FROM pg_locks WHERE locktype='advisory'
+        AND pid=pg_backend_pid() AND granted AND mode=:mode AND objsubid=2
+        AND classid::bigint=:high AND objid::bigint=:low
+        AND database=(SELECT oid FROM pg_database WHERE datname=current_database())"""),
+        {"high": key[0], "low": key[1], "mode": "ShareLock" if shared else "ExclusiveLock"},
+    )
+    if held is not True:
+        _fail()
+
+
+class _OperationsHolder:
+    """绑定真实physical owner连接、目标与既有management/target/schema leases。"""
+
+    def __init__(self, target: _SqlAlchemyTargetMaintenanceLease) -> None:
+        if type(target) is not _SqlAlchemyTargetMaintenanceLease or target._management is None:
+            _fail()
+        self._target = target
+        self._management = target._management
+        self.connection = target._connection
+        self._physical_connection = self.connection.connection.driver_connection
+        self._management_connection = self._management._connection.connection.driver_connection
+        self._live = True
+        self._backend = self._physical_identity(self.connection)
+        self._management_backend = self._physical_identity(self._management._connection)
+        self.assert_live()
+        _commit_read_transaction(self.connection)
+
+    @staticmethod
+    def _physical_identity(connection: Connection) -> tuple[int, datetime]:
+        row = connection.execute(
+            text(
+                "SELECT pid,backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid() AND backend_type='client backend'"
+            )
+        ).one()
+        if type(row[0]) is not int or not isinstance(row[1], datetime) or row[1].tzinfo is None:
+            _fail()
+        return row[0], row[1]
+
+    @property
+    def target_identity_digest(self) -> str:
+        """返回Task16A规范派生的目标摘要，不接受CLI传入另一种字节编码。"""
+        return self._target._target.identity.digest_hex
+
+    def assert_live(self) -> None:
+        """每个critical边界重新证明同一物理连接、角色、target和全部已持lease。"""
+        target, management = self._target, self._management
+        if (
+            not self._live
+            or not target._live
+            or not management._live
+            or self.connection.closed
+            or self.connection.invalidated
+            or management._connection.closed
+            or management._connection.invalidated
+            or self.connection.connection.driver_connection is not self._physical_connection
+            or management._connection.connection.driver_connection
+            is not self._management_connection
+        ):
+            _fail()
+        if (
+            self._physical_identity(self.connection) != self._backend
+            or self._physical_identity(management._connection) != self._management_backend
+        ):
+            _fail()
+        _read_target_catalog(self.connection, expected=target._target)
+        if (
+            _read_management_target_catalog(
+                management._connection,
+                target_database_name=target._target.database_name,
+                allow_absent=False,
+            )
+            != target._target
+        ):
+            _fail()
+        _assert_single_lock_held(management._connection, target._target.identity.lifecycle_lock_key)
+        _commit_read_transaction(management._connection)
+        _assert_single_lock_held(self.connection, target._target.identity.target_lock_key)
+        if target._schema_lock_held:
+            _assert_pair_lock_held(
+                self.connection, SCHEMA_LIFECYCLE_LOCK, shared=target._schema_shared
+            )
+        if target._backup_lock_held:
+            _assert_pair_lock_held(self.connection, BACKUP_LIFECYCLE_LOCK, shared=False)
+
+    def read_only[T](self, reader: Callable[[Connection], T]) -> T:
+        """借同一holder执行一个新RR/RO事务，结束后才允许网络调用或fresh CAS。"""
+        self.assert_live()
+        _commit_read_transaction(self.connection)
+        with self.connection.begin():
+            self.connection.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
+            result = reader(self.connection)
+            self.assert_live()
+            return result
+
+    def _access(self) -> DatabaseAccessSnapshot:
+        access = read_database_access_snapshot_sync(
+            self.connection, target_database_oid=self._target._target.database_oid
+        )
+        if access.acl_profile is DatabaseAclProfile.BASELINE:
+            transition_baseline_to_active(access)
+        elif access.acl_profile is DatabaseAclProfile.ACTIVE:
+            transition_active_to_baseline(access)
+        else:
+            _fail()
+        return access
+
+
+class ReadOnlyMaintenanceHolder(_OperationsHolder):
+    """固定owner只读事实生命周期；允许应用coordinator会话，拒绝active和权限漂移。"""
+
+    def assert_idle(self) -> None:
+        """普通备份允许并发业务写入，但必须是完整baseline且没有active restore。"""
+        self.assert_live()
+        access = self._access()
+        facts = read_database_restore_facts(
+            self.connection, target_database_oid=self._target._target.database_oid
+        )
+        revision = _read_current_revision(
+            self.connection, authority=self._target._context._published_authority
+        )
+        verify_object_grants(self.connection, revision=revision, phase=GrantPhase.BASELINE)
+        state = classify_database_admission(
+            facts=facts,
+            access_snapshot=access,
+            object_grants_match=True,
+            expected_target_identity_digest=self.target_identity_digest,
+        )
+        if state is DatabaseAdmissionState.ACTIVE:
+            _fail()
+        _commit_read_transaction(self.connection)
+
+
+class BackupMaintenanceHolder(ReadOnlyMaintenanceHolder):
+    """只读backup生命周期；数据库锁先于父流程flock，shared-schema作用域可精确嵌套。"""
+
+    @contextmanager
+    def shared_schema(self) -> Iterator[None]:
+        """在backup DB锁/flock内覆盖dump与fresh校验，保留主体首错并撤销本scope标记。"""
+        if not self._target._backup_lock_held or self._target._schema_lock_held:
+            _fail()
+        self.assert_live()
+        self.connection.execute(text("SELECT pg_advisory_lock_shared(20260806,143)"))
+        _commit_read_transaction(self.connection)
+        self._target._schema_lock_held = True
+        self._target._schema_shared = True
+
+        def release_shared_schema_lock() -> None:
+            """沿原事务/解锁顺序执行清理；其失败只能作为既有主体错误或取消的cause。"""
+            _rollback_open_transaction(self.connection)
+            released = self.connection.scalar(
+                text("SELECT pg_advisory_unlock_shared(20260806,143)")
+            )
+            _commit_read_transaction(self.connection)
+            if released is not True:
+                _fail()
+
+        with _preserving_owned_cleanup(release_shared_schema_lock):
+            try:
+                yield
+                self.assert_live()
+            finally:
+                self._target._schema_lock_held = False
+                self._target._schema_shared = False
+
+
+class RestoreMaintenanceHolder(_OperationsHolder):
+    """同一owner物理连接上的restore authority/CAS、psql登记、grant/verifier/reopen。
+
+    初次session事实严格等于catalog后才建立不可变anchor；后续仅追踪自己SET导致的
+    首次NULL注册，所有其他session值必须逐字不变。记录不对外导出，也不能用于重连。
+    """
+
+    def __init__(self, target: _SqlAlchemyTargetMaintenanceLease, claim: RestoreClaim) -> None:
+        super().__init__(target)
+        if not target._schema_lock_held or target._schema_shared or type(claim) is not RestoreClaim:
+            _fail()
+        self.claim = claim
+        self._access()
+        self._session_anchor = read_database_restore_facts(
+            self.connection, target_database_oid=target._target.database_oid
+        )
+        self._session_registration = _RestoreHolderSessionRegistration(self._session_anchor)
+        _commit_read_transaction(self.connection)
+
+    def read_facts(self) -> DatabaseRestoreFacts:
+        """读取并严格解析fresh catalog；session只能等于本物理holder已证明的表示。"""
+        self.assert_live()
+        self._access()
+        try:
+            facts = _read_restore_facts(
+                self.connection,
+                target_database_oid=self._target._target.database_oid,
+                holder_session_facts=self._session_registration.expected(),
+            )
+        except BaseException:
+            self._live = False
+            raise
+        if facts.maintenance_gate is not None:
+            if facts.restore_call_authority is None or facts.restore_completion is not None:
+                _fail()
+            call = _validate_active_authority(facts.maintenance_gate, facts.restore_call_authority)
+            if (
+                call.kind,
+                call.source_digest,
+                call.target_digest,
+                call.fields[16],
+                call.fields[17],
+            ) != (
+                self.claim.kind,
+                self.claim.source_digest,
+                self.target_identity_digest,
+                self.claim.expected.revision,
+                self.claim.expected.digest,
+            ):
+                _fail()
+        elif facts.restore_call_authority is not None or facts.restore_completion is not None:
+            if facts.restore_call_authority is None or facts.restore_completion is None:
+                _fail()
+            call = _validate_completed_authority(
+                facts.restore_call_authority, facts.restore_completion
+            )
+            if call.target_digest != self.target_identity_digest:
+                _fail()
+        return facts
+
+    def _call(self, facts: DatabaseRestoreFacts) -> _RestoreCallAuthority:
+        if facts.restore_call_authority is None:
+            _fail()
+        return _parse_call_authority(facts.restore_call_authority)
+
+    def _verify_inventory(
+        self,
+        facts: DatabaseRestoreFacts,
+        *,
+        unfed_consumer: RestoreConsumerProof | None = None,
+    ) -> None:
+        """按phase验证完整grant形状，登记backend未退出时禁止读取当前revision。
+
+        原controller的ready/started CAS可凭同一尚未喂SQL的child/pipe使用已冻结pre版本
+        选择inventory；这不是新的revision观察。其他controller没有此私有证明，必须
+        先证明登记backend退出，才能读取revision或fingerprint。
+        """
+        call = self._call(facts) if facts.maintenance_gate is not None else None
+        unresolved_backend = (
+            call is not None
+            and call.fields[12] != "-"
+            and call.phase
+            in {
+                _RestoreCallPhase.RESTORE_BACKEND_READY,
+                _RestoreCallPhase.RESTORE_STARTED,
+                _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN,
+                _RestoreCallPhase.NEEDS_ATTENTION,
+            }
+        )
+        if unresolved_backend and call is not None and not self._backend_exited(call):
+            if (
+                type(unfed_consumer) is not RestoreConsumerProof
+                or not unfed_consumer.owns_unfed_pipe()
+                or unfed_consumer.application_name
+                != f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}"
+            ):
+                _fail()
+            revision = call.fields[14]
+        else:
+            revision = _read_current_revision(
+                self.connection, authority=self._target._context._published_authority
+            )
+        if facts.maintenance_gate is None:
+            verify_object_grants(self.connection, revision=revision, phase=GrantPhase.BASELINE)
+            return
+        assert call is not None
+        if call.phase is _RestoreCallPhase.RESTORE_SUCCEEDED and call.call_ordinal > 0:
+            verify_restore_pre_grants(self.connection, revision=revision)
+        elif call.phase in {
+            _RestoreCallPhase.RESTORE_STARTED,
+            _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN,
+            _RestoreCallPhase.NEEDS_ATTENTION,
+        }:
+            # stream提交后但结果CAS前只能处于精确pre-grant或原active形状；额外/部分权限
+            # 两者都会拒绝，不能把宽松subset当作下一步授予权限的依据。
+            from ai_employee.infrastructure.db.database_grants import ObjectGrantInvariantError
+
+            try:
+                verify_object_grants(self.connection, revision=revision, phase=GrantPhase.ACTIVE)
+            except ObjectGrantInvariantError:
+                verify_restore_pre_grants(self.connection, revision=revision)
+        else:
+            verify_object_grants(self.connection, revision=revision, phase=GrantPhase.ACTIVE)
+
+    def admit(self) -> DatabaseRestoreFacts:
+        """每次调用按既有三态矩阵重新验证全部facts/access/grants，candidate零写拒绝。"""
+        facts = self.read_facts()
+        access = self._access()
+        self._verify_inventory(facts)
+        classify_database_admission(
+            facts=facts,
+            access_snapshot=access,
+            object_grants_match=True,
+            expected_target_identity_digest=self.target_identity_digest,
+        )
+        _commit_read_transaction(self.connection)
+        return facts
+
+    def _database_time(self) -> str:
+        value = self.connection.scalar(
+            text(
+                "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+            )
+        )
+        if type(value) is not str:
+            _fail()
+        _canonical_timestamp(value)
+        return value
+
+    def _set_facts(self, expected: DatabaseRestoreFacts, following: DatabaseRestoreFacts) -> None:
+        """已持锁事务内逐字段CAS，并在每条SET两侧证明唯一允许的session注册。
+
+        私有注册记录与事务分离：成功观察可跨回滚保留；statement或观察不确定时
+        holder永久失效，不猜测注册结果，也不把失败当作可以重放的授权。
+        """
+        if self.read_facts() != expected:
+            _fail()
+        database = self.connection.dialect.identifier_preparer.quote_identifier(
+            self._target._target.database_name
+        )
+        before = (
+            expected.maintenance_gate,
+            expected.restore_call_authority,
+            expected.restore_completion,
+        )
+        after = (
+            following.maintenance_gate,
+            following.restore_call_authority,
+            following.restore_completion,
+        )
+        for slot, (key, old, new) in enumerate(zip(_RESTORE_FACT_KEYS, before, after, strict=True)):
+            if old == new:
+                continue
+            try:
+                self.assert_live()
+                if self._read_session_observation() != self._session_registration.expected():
+                    _fail()
+                # 只有规范parser产生的新值才能到达这里，literal仍转义以防未来扩展注入。
+                if new is None:
+                    self.connection.execute(text(f"ALTER DATABASE {database} RESET {key}"))
+                    if self._read_session_observation() != self._session_registration.expected():
+                        _fail()
+                else:
+                    literal = "'" + new.replace("'", "''") + "'"
+                    self.connection.execute(
+                        text(f"ALTER DATABASE {database} SET {key} TO {literal}")
+                    )
+                    self._session_registration = self._session_registration.after_set(
+                        slot, self._read_session_observation()
+                    )
+                self.assert_live()
+            except BaseException:
+                # 包括取消在内的任何不确定结果都不能继续使用该session授权；不掩盖首错。
+                self._live = False
+                raise
+        if self.read_facts() != following:
+            _fail()
+
+    def _read_session_observation(self) -> DatabaseRestoreFacts:
+        """一次只读statement取得完整session三元组，不注册GUC或供给catalog authority。"""
+        row = self.connection.execute(
+            text(
+                "SELECT current_setting('ai_employee.maintenance_gate',true),"
+                "current_setting('ai_employee.restore_call_authority',true),"
+                "current_setting('ai_employee.restore_completion',true)"
+            )
+        ).one()
+        values: list[str | None] = []
+        for value in row:
+            if value is not None and type(value) is not str:
+                _fail()
+            values.append(value)
+        if len(values) != 3:
+            _fail()
+        return DatabaseRestoreFacts(*values)
+
+    def _advance(
+        self,
+        facts: DatabaseRestoreFacts,
+        phase: _RestoreCallPhase,
+        updates: Mapping[int, str] | None = None,
+    ) -> DatabaseRestoreFacts:
+        fields = list(self._call(facts).fields)
+        fields[9] = phase.value
+        for index, value in (updates or {}).items():
+            fields[index] = value
+        value = "|".join(fields)
+        validate_restore_call_transition(str(facts.restore_call_authority), value)
+        return DatabaseRestoreFacts(facts.maintenance_gate, value, facts.restore_completion)
+
+    def _transition(
+        self,
+        facts: DatabaseRestoreFacts,
+        following: DatabaseRestoreFacts,
+        evidence: RestoreEvidenceStore,
+        *,
+        unfed_consumer: RestoreConsumerProof | None = None,
+    ) -> DatabaseRestoreFacts:
+        _commit_read_transaction(self.connection)
+        with self.connection.begin():
+            self._verify_inventory(facts, unfed_consumer=unfed_consumer)
+            self._set_facts(facts, following)
+            self._verify_inventory(following, unfed_consumer=unfed_consumer)
+            self.assert_live()
+        evidence.publish(following, self._call(following).phase.value)
+        return following
+
+    def _establish_gate(
+        self, facts: DatabaseRestoreFacts, evidence: RestoreEvidenceStore
+    ) -> DatabaseRestoreFacts:
+        """归档旧完成pair后，以一次owner事务原子建立gate/call、撤销CONNECT并切换ACTIVE。"""
+        if facts.maintenance_gate is not None:
+            _fail()
+        archive = None if facts.restore_call_authority is None else evidence.archive(facts)
+        _commit_read_transaction(self.connection)
+        with self.connection.begin():
+            if self.read_facts() != facts:
+                _fail()
+            self._verify_inventory(facts)
+            if archive is not None:
+                evidence.verify_archive(facts, archive)
+            previous = "-" if facts.restore_call_authority is None else self._call(facts).fields[21]
+            fields = [
+                "restore-call:v4",
+                str(uuid4()),
+                self.claim.kind,
+                self.target_identity_digest,
+                self.claim.source_digest,
+                self.claim.source_digest,
+                previous,
+                "0",
+                "0",
+                "gate_established",
+                self._database_time(),
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                self.claim.expected.revision,
+                self.claim.expected.digest,
+                "-",
+                "-",
+                "-",
+                "-",
+            ]
+            call = _parse_call_authority("|".join(fields))
+            gate = f"restore:v1:{call.attempt_uuid}:{call.kind}:{call.target_digest}:{call.source_digest}"
+            following = DatabaseRestoreFacts(gate, "|".join(fields), None)
+            access = self._access()
+            revision = _read_current_revision(
+                self.connection, authority=self._target._context._published_authority
+            )
+            apply_restore_phase_grants(
+                self.connection, revision=revision, destination=GrantPhase.ACTIVE
+            )
+            apply_restore_database_acl_transition(
+                self.connection,
+                target_database_name=self._target._target.database_name,
+                snapshot=access,
+                destination=DatabaseAclProfile.ACTIVE,
+            )
+            self._set_facts(facts, following)
+            classify_database_admission(
+                facts=following,
+                access_snapshot=self._access(),
+                object_grants_match=True,
+                expected_target_identity_digest=self.target_identity_digest,
+            )
+            self._verify_inventory(following)
+            self.assert_live()
+        evidence.publish(following, "gate_established")
+        # gate事务不插入任何AuditEvent。现存客户端排空后，精确ACTIVE与safe-role检查
+        # 才共同证明新runtime连接被拒；owner consumer将在独立登记步骤出现。
+        self.connection.execute(
+            text("""SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datid=:database AND pid<>pg_backend_pid() AND usesysid<>:owner
+              AND backend_type='client backend'"""),
+            {
+                "database": self._target._target.database_oid,
+                "owner": self._target._target.owner_oid,
+            },
+        )
+        _commit_read_transaction(self.connection)
+        for _ in range(100):
+            if not _has_active_non_owner_sessions(self.connection, target=self._target._target):
+                break
+            _commit_read_transaction(self.connection)
+            time.sleep(0.05)
+        else:
+            _fail()
+        if self._access().acl_profile is not DatabaseAclProfile.ACTIVE:
+            _fail()
+        _commit_read_transaction(self.connection)
+        return following
+
+    def _backend_exited(self, call: _RestoreCallAuthority) -> bool:
+        """以authority中的PID/start/database/role/app精确tuple证明旧backend退出。
+
+        PID复用或同application另一个backend都属于不一致，不能仅看列表为空就分配ordinal。
+        此读取必须发生在任何已登记ordinal的revision/fingerprint重核前。
+        """
+        if call.fields[12] == "-" or call.fields[13] == "-":
+            _fail()
+        rows = self.connection.execute(
+            text("""SELECT pid,backend_start,datid,usesysid,application_name
+            FROM pg_stat_activity WHERE backend_type='client backend'
+            AND (pid=:pid OR application_name=:application)"""),
+            {
+                "pid": int(call.fields[12]),
+                "application": f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}",
+            },
+        ).all()
+        if not rows:
+            return True
+        if len(rows) != 1:
+            _fail()
+        row = rows[0]
+        expected_start = datetime.fromisoformat(call.fields[13])
+        if (row[0], row[1], row[2], row[3], row[4]) != (
+            int(call.fields[12]),
+            expected_start,
+            self._target._target.database_oid,
+            self._target._target.owner_oid,
+            f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}",
+        ):
+            _fail()
+        return False
+
+    def _assert_no_foreign_owner(self, *, allowed_application: str | None = None) -> None:
+        if (
+            self.connection.scalar(
+                text("""SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+           WHERE datid=:database AND usesysid=:owner AND pid<>pg_backend_pid()
+           AND backend_type='client backend' AND (CAST(:application AS text) IS NULL OR application_name<>CAST(:application AS text)))"""),
+                {
+                    "database": self._target._target.database_oid,
+                    "owner": self._target._target.owner_oid,
+                    "application": allowed_application,
+                },
+            )
+            is not False
+        ):
+            _fail()
+
+    def _start_call(
+        self,
+        facts: DatabaseRestoreFacts,
+        reader: Callable[[Connection], RestoreFingerprint],
+        evidence: RestoreEvidenceStore,
+    ) -> DatabaseRestoreFacts:
+        """同一owner事务重新计算完整pre事实并分配ordinal+1，禁止继承旧backend字段。"""
+        call = self._call(facts)
+        if call.call_ordinal >= 999999:
+            _fail()
+        _commit_read_transaction(self.connection)
+        with self.connection.begin():
+            if self.read_facts() != facts:
+                _fail()
+            self._assert_no_foreign_owner()
+            self._verify_inventory(facts)
+            observed = reader(self.connection)
+            if observed == self.claim.expected or (
+                call.phase is _RestoreCallPhase.RESTORE_NOT_APPLIED
+                and (observed.revision, observed.digest) != call.fields[14:16]
+            ):
+                _fail()
+            following = self._advance(
+                facts,
+                _RestoreCallPhase.RESTORE_BACKEND_STARTING,
+                {
+                    7: str(call.call_ordinal + 1),
+                    11: self._database_time(),
+                    12: "-",
+                    13: "-",
+                    14: observed.revision,
+                    15: observed.digest,
+                },
+            )
+            self._set_facts(facts, following)
+            self.assert_live()
+        evidence.publish(following, "restore_backend_starting")
+        return following
+
+    def _register_and_start(
+        self,
+        facts: DatabaseRestoreFacts,
+        proof: RestoreConsumerProof,
+        evidence: RestoreEvidenceStore,
+    ) -> DatabaseRestoreFacts:
+        """原controller拥有未喂SQL的精确child/pipe时才登记backend，并在started/fsync后放行。"""
+        call = self._call(facts)
+        if (
+            call.phase is not _RestoreCallPhase.RESTORE_BACKEND_STARTING
+            or not proof.owns_unfed_pipe()
+            or proof.application_name
+            != f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}"
+        ):
+            _fail()
+        rows: Sequence[Row[tuple[int, datetime]]] = ()
+        for _ in range(100):
+            self.assert_live()
+            if self.read_facts() != facts or not proof.owns_unfed_pipe():
+                _fail()
+            rows = self.connection.execute(
+                text("""SELECT pid,backend_start FROM pg_stat_activity
+                WHERE datid=:database AND usesysid=:owner AND application_name=:application
+                  AND backend_type='client backend'"""),
+                {
+                    "database": self._target._target.database_oid,
+                    "owner": self._target._target.owner_oid,
+                    "application": proof.application_name,
+                },
+            ).all()
+            _commit_read_transaction(self.connection)
+            if rows:
+                break
+            time.sleep(0.05)
+        if (
+            len(rows) != 1
+            or type(rows[0][0]) is not int
+            or not isinstance(rows[0][1], datetime)
+            or rows[0][1] <= datetime.fromisoformat(call.fields[11])
+        ):
+            _fail()
+        backend_start = rows[0][1].astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        ready = self._advance(
+            facts, _RestoreCallPhase.RESTORE_BACKEND_READY, {12: str(rows[0][0]), 13: backend_start}
+        )
+        ready = self._transition(facts, ready, evidence, unfed_consumer=proof)
+        if not proof.owns_unfed_pipe() or self._backend_exited(self._call(ready)):
+            _fail()
+        self._assert_no_foreign_owner(allowed_application=proof.application_name)
+        started = self._advance(ready, _RestoreCallPhase.RESTORE_STARTED)
+        return self._transition(ready, started, evidence, unfed_consumer=proof)
+
+    def _reconcile_stream(
+        self,
+        facts: DatabaseRestoreFacts,
+        reader: Callable[[Connection], RestoreFingerprint],
+        evidence: RestoreEvidenceStore,
+    ) -> DatabaseRestoreFacts:
+        """登记backend退出后，唯精确post/pre可分别进入succeeded/not_applied；歧义保守拒绝。"""
+        call = self._call(facts)
+        if not self._backend_exited(call):
+            evidence.publish(facts, "restore_outcome_unknown")
+            return facts
+        _commit_read_transaction(self.connection)
+        try:
+            observed = self.read_only(reader)
+        except (DBAPIError, DatabaseMaintenanceInvariantError):
+            _rollback_open_transaction(self.connection)
+            return self._transition(
+                facts, self._advance(facts, _RestoreCallPhase.NEEDS_ATTENTION), evidence
+            )
+        post = observed == self.claim.expected
+        pre = (observed.revision, observed.digest) == call.fields[14:16]
+        if post == pre:
+            phase = _RestoreCallPhase.NEEDS_ATTENTION
+            updates = None
+        elif post:
+            phase = _RestoreCallPhase.RESTORE_SUCCEEDED
+            updates = {18: observed.revision, 19: observed.digest}
+        else:
+            phase = _RestoreCallPhase.RESTORE_NOT_APPLIED
+            updates = None
+        return self._transition(facts, self._advance(facts, phase, updates), evidence)
+
+    def _grant_restored(
+        self, facts: DatabaseRestoreFacts, evidence: RestoreEvidenceStore
+    ) -> DatabaseRestoreFacts:
+        """grant与phase在同一事务提交，失败仍为restore_succeeded，可做有界重试。"""
+        call = self._call(facts)
+        following = self._advance(facts, _RestoreCallPhase.GRANTS_SUCCEEDED)
+        _commit_read_transaction(self.connection)
+        with self.connection.begin():
+            if (
+                self.read_facts() != facts
+                or self._access().acl_profile is not DatabaseAclProfile.ACTIVE
+            ):
+                _fail()
+            if call.call_ordinal:
+                apply_restore_object_grants(self.connection, revision=self.claim.expected.revision)
+            else:
+                verify_object_grants(
+                    self.connection, revision=self.claim.expected.revision, phase=GrantPhase.ACTIVE
+                )
+            self._set_facts(facts, following)
+            self.assert_live()
+        evidence.publish(following, "grants_succeeded")
+        return following
+
+    def _verify_as_app(
+        self,
+        facts: DatabaseRestoreFacts,
+        verifier: Callable[[Connection, RestoreFingerprint], None],
+        evidence: RestoreEvidenceStore,
+    ) -> DatabaseRestoreFacts:
+        """在已有owner连接切app role执行RR/RO verifier，SQLSTATE25006是实际DML拒绝证据。"""
+        if self.admit() != facts or self._access().acl_profile is not DatabaseAclProfile.ACTIVE:
+            _fail()
+        _commit_read_transaction(self.connection)
+        self.connection.execute(text("SET ROLE ai_employee_app"))
+        self.connection.commit()
+        try:
+            with self.connection.begin():
+                self.connection.execute(
+                    text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                )
+                if tuple(
+                    self.connection.execute(text("SELECT session_user,current_user")).one()
+                ) != (self._target._target.owner_role_name, "ai_employee_app"):
+                    _fail()
+                rejected = False
+                try:
+                    with self.connection.begin_nested():
+                        self.connection.execute(text("UPDATE public.users SET id=id WHERE false"))
+                except DBAPIError as error:
+                    if getattr(error.orig, "sqlstate", None) != "25006":
+                        raise
+                    rejected = True
+                if not rejected:
+                    _fail()
+                verifier(self.connection, self.claim.expected)
+        finally:
+            _rollback_open_transaction(self.connection)
+            self.connection.execute(text("RESET ROLE"))
+            self.connection.commit()
+        self.assert_live()
+        return self._transition(facts, self._advance(facts, _RestoreCallPhase.VERIFIED), evidence)
+
+    def _complete(
+        self, facts: DatabaseRestoreFacts, evidence: RestoreEvidenceStore
+    ) -> DatabaseRestoreFacts:
+        """一次commit原子绑定completed call、普通ID审计、completion GUC、gate和最小恢复授权。"""
+        if self._call(facts).phase is not _RestoreCallPhase.REOPEN_COMMITTING:
+            _fail()
+        _commit_read_transaction(self.connection)
+        transaction = self.connection.begin()
+        try:
+            if self.read_facts() != facts:
+                _fail()
+            self._verify_inventory(facts)
+            self.connection.execute(text("LOCK TABLE public.users IN SHARE ROW EXCLUSIVE MODE"))
+            administrators = (
+                self.connection.execute(text("SELECT id FROM public.users ORDER BY id FOR UPDATE"))
+                .scalars()
+                .all()
+            )
+            if len(administrators) != 1 or not isinstance(administrators[0], UUID):
+                _fail()
+            fields = list(self._call(facts).fields)
+            fields[9] = "completed"
+            fields[20] = self._database_time()
+            fields[21] = "0" * 64
+            fields[21] = sha256(
+                _COMPLETION_AUTHORITY_DOMAIN + "|".join(fields).encode("ascii")
+            ).hexdigest()
+            completed_call = "|".join(fields)
+            validate_restore_call_transition(str(facts.restore_call_authority), completed_call)
+            metadata = restore_completion_metadata(completed_call)
+            if (
+                self.connection.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM public.audit_events WHERE event_type='database.restore.completed' AND (metadata->>'attempt_id'=:attempt OR metadata->>'completion_authority_digest_v1'=:digest))"
+                    ),
+                    {"attempt": fields[1], "digest": fields[21]},
+                )
+                is not False
+            ):
+                _fail()
+            # created_at也由数据库clock生成，必须不早于同事务冻结的completed_at。
+            audit_id = self.connection.scalar(
+                text("""INSERT INTO public.audit_events(user_id,task_id,event_type,actor_type,actor_id,metadata,created_at)
+               VALUES(:user,NULL,'database.restore.completed','system','database_restore',CAST(:metadata AS jsonb),clock_timestamp()) RETURNING id"""),
+                {
+                    "user": administrators[0],
+                    "metadata": json.dumps(dict(metadata), sort_keys=True, separators=(",", ":")),
+                },
+            )
+            if type(audit_id) is not int or audit_id <= 0:
+                _fail()
+            predicate = restore_completion_audit_predicate()
+            if (
+                self.connection.scalar(
+                    text(
+                        f"SELECT count(*) FROM public.audit_events a WHERE a.id=:id AND a.metadata=CAST(:metadata AS jsonb) AND ({predicate})"
+                    ),
+                    {
+                        "id": audit_id,
+                        "metadata": json.dumps(
+                            dict(metadata), sort_keys=True, separators=(",", ":")
+                        ),
+                    },
+                )
+                != 1
+            ):
+                _fail()
+            following = DatabaseRestoreFacts(
+                None, completed_call, f"restore_completion:v1:{fields[21]}"
+            )
+            access = self._access()
+            apply_restore_phase_grants(
+                self.connection,
+                revision=self.claim.expected.revision,
+                destination=GrantPhase.BASELINE,
+            )
+            apply_restore_database_acl_transition(
+                self.connection,
+                target_database_name=self._target._target.database_name,
+                snapshot=access,
+                destination=DatabaseAclProfile.BASELINE,
+            )
+            self._set_facts(facts, following)
+            self._verify_inventory(following)
+            classify_database_admission(
+                facts=following,
+                access_snapshot=self._access(),
+                object_grants_match=True,
+                expected_target_identity_digest=self.target_identity_digest,
+            )
+            self.assert_live()
+        except BaseException as failure:
+            try:
+                transaction.rollback()
+            except BaseException as cleanup_failure:
+                raise failure from cleanup_failure
+            raise
+        self._commit_completion(transaction, facts, following)
+        evidence.publish(following, "restore_completed")
+        evidence.archive(following)
+        return following
+
+    def _commit_completion(
+        self,
+        transaction: RootTransaction,
+        before: DatabaseRestoreFacts,
+        completed: DatabaseRestoreFacts,
+    ) -> None:
+        """只把COMMIT阶段的不确定性移交新session；body失败保留原可重试phase。
+
+        先构造并校验待核对的精确事实，随后commit发生异常就关闭原物理连接；清理不得
+        在invalidated Connection上触发自动重连。取消仍保持其原始异常身份。
+        """
+        unknown = RestoreCompletionAckUnknown(before, completed)
+        try:
+            transaction.commit()
+        except BaseException as failure:
+            self._live = False
+            disposition = unknown if isinstance(failure, Exception) else failure
+            try:
+                self.connection.invalidate()
+            except BaseException as cleanup_failure:
+                raise disposition from cleanup_failure
+            raise disposition from failure
+
+    def reconcile_completion_ack(
+        self, unknown: RestoreCompletionAckUnknown, evidence: RestoreEvidenceStore
+    ) -> str:
+        """全新holder仅核对精确完成pair或原reopen_committing，不重跑verifier或restore。
+
+        已完成的audit/本地投影可以缺失；权限/角色/成员关系/对象inventory与三个catalog
+        事实始终通过同一admission。只有精确原active tuple可以CAS为reopen_not_applied，
+        任意其他状态返回人工处置，不能据其创建新ordinal或自动重新开放连接。
+        """
+        if type(unknown) is not RestoreCompletionAckUnknown:
+            _fail()
+        facts = self.admit()
+        if facts == unknown.completed:
+            evidence.publish(facts, "restore_completed")
+            evidence.archive(facts)
+            return "restore_completed"
+        if facts == unknown.before:
+            following = self._advance(facts, _RestoreCallPhase.REOPEN_NOT_APPLIED)
+            self._transition(facts, following, evidence)
+            return "restore_reopen_not_applied"
+        return "restore_needs_attention"
+
+    def execute(
+        self,
+        *,
+        dump: Path,
+        reader: Callable[[Connection], RestoreFingerprint],
+        verifier: Callable[[Connection, RestoreFingerprint], None],
+        evidence: RestoreEvidenceStore,
+        consumer_environment: Mapping[str, str],
+        approve_call_ordinal: int | None = None,
+        approve_reopen_ordinal: int | None = None,
+        before_stream: Callable[[], None] | None = None,
+    ) -> str:
+        """运行/核对一个精确claim；恢复重试只接受显式新ordinal，不从文件状态推断authority。
+
+        generator/consumer统一由Python stream监督；owner Secret只进入consumer环境，
+        已登记backend仍活跃时不做fingerprint，不启动新的psql，不盲重放。
+        """
+        facts = self.read_facts()
+        if facts.maintenance_gate is not None:
+            call = self._call(facts)
+            if call.phase is _RestoreCallPhase.RESTORE_BACKEND_STARTING:
+                # 进入execute的是新controller；只有当前stream的私有回调可继续starting。
+                self._transition(
+                    facts, self._advance(facts, _RestoreCallPhase.NEEDS_ATTENTION), evidence
+                )
+                return "restore_needs_attention"
+            if call.phase in {
+                _RestoreCallPhase.RESTORE_BACKEND_READY,
+                _RestoreCallPhase.RESTORE_STARTED,
+                _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN,
+            } and not self._backend_exited(call):
+                _commit_read_transaction(self.connection)
+                evidence.publish(facts, "restore_outcome_unknown")
+                return "restore_outcome_unknown"
+        facts = self.admit()
+        if facts.maintenance_gate is None:
+            self._assert_no_foreign_owner()
+            observed = self.read_only(reader)
+            if observed == self.claim.expected:
+                evidence.already_applied(self.target_identity_digest, self.claim, observed)
+                return "restore_already_applied"
+            facts = self._establish_gate(facts, evidence)
+        call = self._call(facts)
+        if call.phase is _RestoreCallPhase.NEEDS_ATTENTION:
+            evidence.publish(facts, "restore_needs_attention")
+            return "restore_needs_attention"
+        if call.phase in {
+            _RestoreCallPhase.RESTORE_BACKEND_READY,
+            _RestoreCallPhase.RESTORE_STARTED,
+            _RestoreCallPhase.RESTORE_OUTCOME_UNKNOWN,
+        }:
+            facts = self._reconcile_stream(facts, reader, evidence)
+            call = self._call(facts)
+        if call.phase is _RestoreCallPhase.GATE_ESTABLISHED:
+            observed = self.read_only(reader)
+            if observed == self.claim.expected:
+                facts = self._transition(
+                    facts,
+                    self._advance(
+                        facts,
+                        _RestoreCallPhase.RESTORE_SUCCEEDED,
+                        {18: observed.revision, 19: observed.digest},
+                    ),
+                    evidence,
+                )
+                call = self._call(facts)
+        if call.phase is _RestoreCallPhase.GATE_ESTABLISHED or (
+            call.phase is _RestoreCallPhase.RESTORE_NOT_APPLIED
+            and approve_call_ordinal == call.call_ordinal + 1
+        ):
+            facts = self._start_call(facts, reader, evidence)
+            call = self._call(facts)
+            started_facts: list[DatabaseRestoreFacts] = []
+
+            async def start(proof: RestoreConsumerProof) -> None:
+                started_facts.append(
+                    await await_calendar_aad_resource(
+                        asyncio.create_task(
+                            asyncio.to_thread(self._register_and_start, facts, proof, evidence)
+                        )
+                    )
+                )
+                if before_stream is not None:
+                    await await_calendar_aad_resource(
+                        asyncio.create_task(asyncio.to_thread(before_stream))
+                    )
+
+            environment = dict(consumer_environment)
+            environment["PGAPPNAME"] = (
+                f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}"
+            )
+            try:
+                asyncio.run(
+                    execute_restore_stream(
+                        RestoreStreamRequest(dump, UUID(call.attempt_uuid), call.call_ordinal),
+                        consumer_environment=environment,
+                        establish_started=start,
+                    )
+                )
+            finally:
+                # 不依据child exit推断成功；只在原control连接仍有效时读取catalog+backend。
+                _rollback_open_transaction(self.connection)
+            facts = self.read_facts()
+            if not started_facts:
+                _fail()
+            facts = self._reconcile_stream(facts, reader, evidence)
+            call = self._call(facts)
+        if call.phase is _RestoreCallPhase.RESTORE_SUCCEEDED:
+            facts = self._grant_restored(facts, evidence)
+            call = self._call(facts)
+        if call.phase is _RestoreCallPhase.GRANTS_SUCCEEDED:
+            facts = self._verify_as_app(facts, verifier, evidence)
+            call = self._call(facts)
+        if call.phase is _RestoreCallPhase.REOPEN_COMMITTING:
+            # 新invocation看到原active提交前tuple，证明原final transaction未应用；本次
+            # 只能落reopen_not_applied。显式ordinal批准才能在下一步重开commit。
+            facts = self._transition(
+                facts, self._advance(facts, _RestoreCallPhase.REOPEN_NOT_APPLIED), evidence
+            )
+            call = self._call(facts)
+        if call.phase is _RestoreCallPhase.VERIFIED or (
+            call.phase is _RestoreCallPhase.REOPEN_NOT_APPLIED
+            and approve_reopen_ordinal == call.reopen_ordinal + 1
+        ):
+            if call.reopen_ordinal >= 999999:
+                _fail()
+            facts = self._transition(
+                facts,
+                self._advance(
+                    facts, _RestoreCallPhase.REOPEN_COMMITTING, {8: str(call.reopen_ordinal + 1)}
+                ),
+                evidence,
+            )
+            self._complete(facts, evidence)
+            return "restore_completed"
+        evidence.publish(facts, self._call(facts).phase.value)
+        return "restore_" + (
+            "needs_attention"
+            if call.phase is _RestoreCallPhase.NEEDS_ATTENTION
+            else call.phase.value.removeprefix("restore_")
+        )
 
 
 class _SqlAlchemyOwnerBootstrapTransaction:

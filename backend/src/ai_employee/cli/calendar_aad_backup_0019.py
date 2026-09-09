@@ -1,7 +1,7 @@
 """在一个 revision session lease 内组合既有备份 producer 与最终 rollout guard。
 
-仅为 sealed basename 入口提供 guard/临时产物交接。普通备份的加密、retention 和 remote
-仍由既有 shell 函数拥有；本模块不定义 manifest、恢复协议或完整备份组生命周期。
+sealed入口把原artifact/revision lease传给完整备份父流程的typed publisher；无publisher
+的既有内部调用保留pair语义。manifest/remote/retention由外层同一锁生命周期负责。
 """
 
 import asyncio
@@ -11,40 +11,35 @@ import signal
 import stat
 import sys
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
-
-from sqlalchemy.exc import SQLAlchemyError
 
 from ai_employee.application.use_cases.calendar_aad_rollout import (
     CalendarAadBinding,
     CalendarAadRolloutError,
 )
-from ai_employee.cli.calendar_aad_preflight_0019 import (
-    require_no_rollout_arguments,
-    require_sealed_settings,
-    rollout_environment,
-)
-from ai_employee.config import Settings
-from ai_employee.domain.errors import DomainError
 from ai_employee.infrastructure.calendar_aad_publication import discard_calendar_aad_publication
 from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
+from ai_employee.infrastructure.db.postgres_backup_manifest import (
+    BackupGroupPublication,
+    BackupGroupPublisher,
+)
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
+    CalendarAadFactsReader,
     SqlAlchemyCalendarAadPreflightRepository,
     async_calendar_aad_rollout_lease,
 )
-from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
+from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 _SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "backup-postgres.sh"
 # TERM 同时发送给独立组；父 shell 等待已接收 TERM 的子 shell，而 producer 再等待 pg_dump，
 # 避免只等 leader 退出就误把尚在收尾的孙进程当作完成。
 _PROGRAMS = {
-    "produce": 'trap \'wait; exit 143\' TERM; source "$1"; create_encrypted_backup "$2"',
-    "finish": 'trap \'wait; exit 143\' TERM; source "$1"; finish_existing_backup "$2"',
+    "produce": 'trap \'wait; exit 143\' TERM; source "$1"; create_encrypted_backup "$2" "${3-}"',
 }
 # 只记录本次两个既有成员的文件身份；顺序固定为 dump、checksum，不定义通用备份组协议。
 type _BackupPublication = tuple[os.stat_result, os.stat_result]
@@ -68,11 +63,17 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def run_backup_shell(operation: Literal["produce", "finish"], artifact: Path) -> None:
+async def run_backup_shell(
+    operation: Literal["produce"],
+    artifact: Path,
+    *,
+    snapshot: str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> None:
     """使用固定内部 source 入口复用 shell，argv 中只有受控路径且不输出子进程原始诊断。
 
     Args:
-        operation: 唯一生产 dump/encrypt 或既有后处理分支；无任意命令入口。
+        operation: 唯一生产dump/encrypt分支；remote和保留由父流程处理；无任意命令入口。
         artifact: producer 的私有暂存路径，或已通过最终 guard 的公开 basename 产物。
 
     Raises:
@@ -86,6 +87,8 @@ async def run_backup_shell(operation: Literal["produce", "finish"], artifact: Pa
             "calendar-aad-backup",
             str(_SCRIPT),
             str(artifact),
+            snapshot or "",
+            env=None if environment is None else dict(environment),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
@@ -204,6 +207,8 @@ async def run_guarded_backup(
     immutable_image_id: str,
     clock: Callable[[], datetime],
     producer: Callable[[Path], Awaitable[None]],
+    publisher: BackupGroupPublisher | None = None,
+    facts_reader: CalendarAadFactsReader | None = None,
 ) -> Path:
     """持同一 lease 验证原 artifact、调用 producer，再重读当前期限后发布精确 basename。
 
@@ -213,6 +218,17 @@ async def run_guarded_backup(
     既有成功备份或 no-clobber 碰撞文件从不覆盖或删除。只有最终 lease exit 首次
     失败时，才在其线程结束后按留存的精确身份补偿；后来替换的成员仍归替换者所有。
     """
+    if publisher is not None:
+        return await _run_group_guarded_backup(
+            sessions=sessions,
+            backup_directory=backup_directory,
+            basename=basename,
+            immutable_image_id=immutable_image_id,
+            clock=clock,
+            producer=producer,
+            publisher=publisher,
+            facts_reader=facts_reader,
+        )
     binding = CalendarAadBinding(basename, immutable_image_id)
     target = backup_directory / f"{basename}.dump.enc"
     completed_publication: _BackupPublication | None = None
@@ -223,7 +239,9 @@ async def run_guarded_backup(
                 asyncio.create_task(asyncio.to_thread(artifact_file.read))
             )
             guard = CalendarAadCurrentGuard(
-                repository=SqlAlchemyCalendarAadPreflightRepository(sessions),
+                repository=SqlAlchemyCalendarAadPreflightRepository(
+                    sessions, facts_reader=facts_reader
+                ),
                 artifact_file=artifact_file,
                 artifact=artifact,
                 lease=lease,
@@ -302,39 +320,72 @@ async def run_guarded_backup(
     return target
 
 
-async def _run(settings: Settings, directory: Path, binding: CalendarAadBinding) -> None:
-    """复用 app Secret 身份读取0018，guard通过后才进入既有 retention/remote 后处理。"""
-    sessions = build_session_factory(settings.database_url)
+async def _run_group_guarded_backup(
+    *,
+    sessions: ManagedAsyncSessionMaker,
+    backup_directory: Path,
+    basename: str,
+    immutable_image_id: str,
+    clock: Callable[[], datetime],
+    producer: Callable[[Path], Awaitable[None]],
+    publisher: BackupGroupPublisher,
+    facts_reader: CalendarAadFactsReader | None,
+) -> Path:
+    """接收外层owned staging并保留完整receipt；最终lease失败仍在外层锁内补偿。
+
+    publication线程/协程的取消必须收至终态，成功交付但随后被取消的receipt也不能丢失。
+    此分支绝不生成旧checksum、不自行清理父staging、不调用旧post-return finish。
+    """
+    binding = CalendarAadBinding(basename, immutable_image_id)
+    target = backup_directory / f"{basename}.dump.enc"
+    publication: asyncio.Task[BackupGroupPublication] | None = None
     try:
-        artifact = await run_guarded_backup(
-            sessions=sessions,
-            backup_directory=directory,
-            basename=binding.basename,
-            immutable_image_id=binding.immutable_image_id,
-            clock=lambda: datetime.now(UTC),
-            producer=lambda path: run_backup_shell("produce", path),
-        )
-        await run_backup_shell("finish", artifact)
-    finally:
-        await sessions.dispose()
+        async with async_calendar_aad_rollout_lease(sessions.engine.url) as lease:
+            artifact_file = CalendarAadArtifactFile(backup_directory, binding)
+            artifact = await await_calendar_aad_resource(
+                asyncio.create_task(asyncio.to_thread(artifact_file.read))
+            )
+            guard = CalendarAadCurrentGuard(
+                repository=SqlAlchemyCalendarAadPreflightRepository(
+                    sessions, facts_reader=facts_reader
+                ),
+                artifact_file=artifact_file,
+                artifact=artifact,
+                lease=lease,
+                clock=clock,
+                expected_revision="20260809_0018",
+            )
+            await guard.verify()
+            staged = publisher.staging_root / target.name
+            await producer(staged)
+            await guard.verify()
+            publication = asyncio.create_task(publisher.publish(staged, target, guard))
+            await await_calendar_aad_resource(publication)
+            await guard.verify()
+    except BaseException as failure:
+        if (
+            publication is not None
+            and not publication.cancelled()
+            and publication.exception() is None
+        ):
+            try:
+                await await_calendar_aad_resource(
+                    asyncio.create_task(publisher.discard(publication.result()))
+                )
+            except BaseException as cleanup_failure:
+                raise failure from cleanup_failure
+        raise
+    return target
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    """无参数备份 hook；宿主解析的 image ID 是唯一镜像绑定，错误只含稳定码。"""
-    try:
-        require_no_rollout_arguments(arguments)
-        directory, binding = rollout_environment()
-        settings = Settings()
-        require_sealed_settings(settings)
-        asyncio.run(_run(settings, directory, binding))
-    except (DomainError, SQLAlchemyError, OSError, ValueError, RuntimeError) as error:
-        print(
-            error.error_code if isinstance(error, DomainError) else "calendar_aad_backup_failed",
-            file=sys.stderr,
-        )
+    """保留无参数入口和稳定拒绝码，通过后才交给完整锁定的父备份流程。"""
+    if arguments if arguments is not None else sys.argv[1:]:
+        print("calendar_aad_arguments_invalid", file=sys.stderr)
         return 1
-    print("calendar_aad_backup_passed")
-    return 0
+    from ai_employee.cli.postgres_backup import main as backup_main
+
+    return backup_main(arguments)
 
 
 if __name__ == "__main__":

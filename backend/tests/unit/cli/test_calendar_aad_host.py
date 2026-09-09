@@ -1,9 +1,11 @@
 """验证 0019 宿主边界；Docker 仅由进程内 Fake 提供 metadata，不启动容器。"""
 
+import io
 import json
 import runpy
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,7 +69,7 @@ def test_calendar_aad_host_freezes_the_validated_physical_directory(
 
     def fake_docker(*arguments):
         """只返回合成 metadata，并在目录 admission 之后替换测试自有链接。"""
-        if arguments == ("compose", "config", "--format", "json"):
+        if arguments == ("compose", "--profile", "operations", "config", "--format", "json"):
             alias.unlink()
             alias.symlink_to(Path("/"), target_is_directory=True)
             return json.dumps({"services": services})
@@ -136,12 +138,14 @@ def docker_probe(host_module, monkeypatch, tmp_path):
         def query(self, *arguments):
             """按实际查询参数返回 metadata；需要时只在 screen 完成后改变观察结果。"""
             self.events.append(arguments)
-            if arguments == ("compose", "config", "--format", "json"):
+            if arguments == ("compose", "--profile", "operations", "config", "--format", "json"):
                 return json.dumps({"services": self.services})
             if arguments == ("compose", "ps", "--all", "--format", "json"):
                 if self.screened and self.changed_after_screen == "service":
                     return '[{"Service":"api","State":"running"}]'
                 return "[]"
+            if arguments[:2] == ("run", "--rm"):
+                return json.dumps({"/app/scripts/backup-postgres.sh": "c" * 64})
             assert arguments[:2] == ("image", "inspect")
             if self.screened and self.changed_after_screen == "image":
                 return "sha256:" + "b" * 64
@@ -164,9 +168,20 @@ def docker_probe(host_module, monkeypatch, tmp_path):
                 )
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
+        def guarded_oneoff(self, command, **kwargs):
+            """固定Popen边界模拟一次host请求；实际guard仍执行Compose、停服和image重查。"""
+            self.oneoff(command)
+            return SimpleNamespace(
+                stdin=io.StringIO(),
+                stdout=io.StringIO("operations.guard.request\npostgres_backup_completed\n"),
+                wait=lambda **kwargs: 0,
+                poll=lambda: 0,
+            )
+
     probe = Probe()
     monkeypatch.setitem(host_module["run"].__globals__, "_docker", probe.query)
     monkeypatch.setattr(subprocess, "run", probe.oneoff)
+    monkeypatch.setattr(subprocess, "Popen", probe.guarded_oneoff)
     return probe
 
 
@@ -182,8 +197,13 @@ def test_calendar_aad_host_preserves_fixed_state_and_secret_wrapper(
         "/backups/synthetic..0019.calendar-aad-preflight.json"
     )
     assert selected["environment"]["CALENDAR_AAD_IMMUTABLE_IMAGE_ID"] == _IMAGE
-    secret = "postgres_bootstrap_password" if operation == "migrate" else "app_database_password"
-    assert command.startswith(f'export PGPASSWORD="$(cat /run/secrets/{secret})"; exec ')
+    if operation == "backup":
+        assert command == "exec bash /app/scripts/backup-postgres.sh"
+    else:
+        secret = (
+            "postgres_bootstrap_password" if operation == "migrate" else "app_database_password"
+        )
+        assert command.startswith(f'export PGPASSWORD="$(cat /run/secrets/{secret})"; exec ')
 
 
 def test_calendar_aad_migration_uses_the_prescribed_owner_secret_wrapper(host_module, docker_probe):
@@ -248,3 +268,20 @@ def test_calendar_aad_host_rejects_failed_or_stale_screen_before_operation(
         host_module["run"]("preflight")
     assert len(docker_probe.calls) == 1
     assert docker_probe.calls[0][1].endswith("ai_employee.cli.calendar_aad_revision_0019")
+
+
+@pytest.mark.parametrize("operation", ["preflight", "resync"])
+def test_calendar_oneoff_private_owner_reader_mount_only_after_guards(
+    host_module, docker_probe, operation
+):
+    """固定one-off额外持只读owner Secret文件；普通worker配置和app provider命令不变。"""
+    docker_probe.screen_output = "20260809_0019\n" if operation == "resync" else "20260809_0018\n"
+    host_module["run"](operation)
+    _, command, selected = docker_probe.calls[-1]
+    assert {item["source"] for item in selected["secrets"]} == {
+        "app_database_password",
+        "postgres_bootstrap_password",
+    }
+    assert "cat /run/secrets/app_database_password" in command
+    assert "cat /run/secrets/postgres_bootstrap_password" not in command
+    assert docker_probe.services["worker"]["secrets"] == [{"source": "app_database_password"}]

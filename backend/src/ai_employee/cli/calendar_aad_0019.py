@@ -33,12 +33,14 @@ from ai_employee.cli.calendar_aad_preflight_0019 import (
     require_sealed_settings,
     rollout_environment,
 )
+from ai_employee.cli.database_maintenance import CalendarAadOwnerFactsReader
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
 from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
+    CalendarAadFactsReader,
     SqlAlchemyCalendarAadPreflightRepository,
     async_calendar_aad_rollout_lease,
 )
@@ -87,6 +89,7 @@ async def run_recovery(
     immutable_image_id: str,
     clock: Callable[[], datetime],
     settings: Settings,
+    facts_reader: CalendarAadFactsReader | None = None,
 ) -> CalendarAadRecoveryResult:
     """持 revision lease 验证 artifact，规划一次、逐项精确分派并运行原 durable runner。
 
@@ -105,7 +108,9 @@ async def run_recovery(
             asyncio.create_task(asyncio.to_thread(artifact_file.read))
         )
         guard = CalendarAadCurrentGuard(
-            repository=SqlAlchemyCalendarAadPreflightRepository(sessions),
+            repository=SqlAlchemyCalendarAadPreflightRepository(
+                sessions, facts_reader=facts_reader
+            ),
             artifact_file=artifact_file,
             artifact=artifact,
             lease=lease,
@@ -143,6 +148,8 @@ async def run_recovery(
         deadline = await guard.verify()
         async with stores() as store:
             remaining = len(await store.marked_pairs())
+        # 最终计数也必须夹在当前owner事实guard内，不能因app查询成功而复用较早的版本/期限。
+        deadline = await guard.verify()
         return CalendarAadRecoveryResult(planned, remaining, deadline)
 
 
@@ -168,6 +175,7 @@ async def _run(
             immutable_image_id=binding.immutable_image_id,
             clock=clock,
             settings=settings,
+            facts_reader=CalendarAadOwnerFactsReader.from_environment(),
         )
     finally:
         await sessions.dispose()

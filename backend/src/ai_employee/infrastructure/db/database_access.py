@@ -1245,3 +1245,42 @@ def transition_active_to_baseline(
         role_action=RuntimeRoleAction.NONE,
         acl_action=DatabaseAclAction.ACTIVE_TO_BASELINE,
     )
+
+
+def apply_restore_database_acl_transition(
+    connection: Connection,
+    *,
+    target_database_name: str,
+    snapshot: DatabaseAccessSnapshot,
+    destination: DatabaseAclProfile,
+) -> None:
+    """在 holder 的同一事务内应用精确 baseline↔active CONNECT 差值。
+
+    Args:
+        connection: 已持 management/target/schema locks 的 owner connection。
+        target_database_name: 已冻结的精确目标名。
+        snapshot: 本事务刚重读的完整 ACL、safe runtime roles 与零 membership 事实。
+        destination: 只接受 ACTIVE 或 BASELINE，且 source 必须为另一合法 steady profile。
+
+    Raises:
+        DatabaseAccessInvariantError: 任一漂移或非法状态在首条 SQL 前拒绝。
+
+    restore authority 由上层验证，本服务只拥有 access 边界；绝不重设角色、修复 PUBLIC，
+    不接受任意 tuple 或全库 ALL grants。开闸与 audit/completion 必须由外层整体提交。
+    """
+    if destination is DatabaseAclProfile.ACTIVE:
+        transition_baseline_to_active(snapshot)
+        verb, preposition = "REVOKE", "FROM"
+    elif destination is DatabaseAclProfile.BASELINE:
+        transition_active_to_baseline(snapshot)
+        verb, preposition = "GRANT", "TO"
+    else:
+        _fail()
+    database_name = _validated_database_name(target_database_name)
+    preparer = connection.dialect.identifier_preparer
+    quoted_database = preparer.quote_identifier(database_name)
+    for role in (APP_RUNTIME_ROLE_NAME, RETENTION_RUNTIME_ROLE_NAME):
+        quoted_role = preparer.quote_identifier(role)
+        connection.execute(
+            text(f"{verb} CONNECT ON DATABASE {quoted_database} {preposition} {quoted_role}")
+        )

@@ -3,10 +3,10 @@
 backup:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -n "${BACKUP_ARTIFACT_BASENAME-}" ]]; then
+    if [[ -v BACKUP_ARTIFACT_BASENAME ]]; then
       exec python3 scripts/run-calendar-aad-0019.py backup
     fi
-    exec docker compose --profile operations run --rm backup
+    exec uv run --project backend python scripts/run-postgres-operations.py backup
 
 # 0019 入口不接受 scope/账户/期限参数；宿主校验停服与同一不可变镜像，CLI 持固定数据库 lease。
 [group('operations')]
@@ -21,40 +21,57 @@ calendar-aad-migrate-0019:
 calendar-aad-resync-0019:
     python3 scripts/run-calendar-aad-0019.py resync
 
+# 宿主先验证三件套/本地image/停服；production再要求精确文件路径二次确认。
 [confirm]
 [group('operations')]
-restore file:
+restore file approve_call_ordinal='' approve_reopen_ordinal='':
     #!/usr/bin/env bash
     set -euo pipefail
-
-    fail() {
-      printf 'restore refused: %s\n' "$1" >&2
-      exit 1
-    }
-
-    app_env="${APP_ENV-}"
-    case "${app_env}" in
+    case "${APP_ENV-}" in
       development|test) ;;
-      production) [[ "${ALLOW_PRODUCTION_RESTORE-}" == yes ]] || fail 'ALLOW_PRODUCTION_RESTORE=yes is required in production' ;;
-      *) fail 'APP_ENV must be explicitly set to development, test, or production' ;;
+      production) [[ "${ALLOW_PRODUCTION_RESTORE-}" == yes ]] || { printf '%s\n' 'restore refused: production confirmation required' >&2; exit 1; } ;;
+      *) printf '%s\n' 'restore refused: explicit environment required' >&2; exit 1 ;;
     esac
-
-    restore_file="${1-}"
-    [[ -n "${restore_file}" ]] || fail 'restore file must not be empty'
-
-    printf 'APP_ENV=%s\nCompose service: postgres\nRestore target: %s\n' \
-      "${app_env}" "${restore_file}" >&2
+    [[ -n "$1" ]] || { printf '%s\n' 'restore refused: empty file' >&2; exit 1; }
+    # 保留原有全环境精确路径确认；production的第二次确认由纯验证后的host入口执行。
+    printf 'APP_ENV=%s\nCompose service: postgres\nRestore target: %s\n' "$APP_ENV" "$1" >&2
     printf 'Type the exact restore file path to confirm: ' >&2
-    confirmation=''
-    IFS= read -r confirmation || fail 'confirmation input is required'
-    [[ "${confirmation}" == "${restore_file}" ]] || fail 'confirmation did not match restore target'
+    IFS= read -r confirmation || exit 1
+    [[ "$confirmation" == "$1" ]] || { printf '%s\n' 'restore refused: confirmation mismatch' >&2; exit 1; }
+    arguments=(restore "$1")
+    [[ -z "${2-}" ]] || arguments+=(--approve-call-ordinal "$2")
+    [[ -z "${3-}" ]] || arguments+=(--approve-reopen-ordinal "$3")
+    exec uv run --project backend python scripts/run-postgres-operations.py "${arguments[@]}"
 
-    # basename 只能作为 Compose 环境参数传递，绝不能拼接进 /bin/sh -ec 的固定程序文本。
-    restore_basename="$(basename -- "${restore_file}")"
+# sealed入口额外绑定原preflight与pre-migration；复用controller，不复用普通validator。
+[confirm]
+[group('operations')]
+calendar-aad-restore-0018 file approve_call_ordinal='' approve_reopen_ordinal='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "${APP_ENV-}" in
+      development|test) ;;
+      production) [[ "${ALLOW_PRODUCTION_RESTORE-}" == yes ]] || { printf '%s\n' 'restore refused: production confirmation required' >&2; exit 1; } ;;
+      *) printf '%s\n' 'restore refused: explicit environment required' >&2; exit 1 ;;
+    esac
+    [[ -n "$1" ]] || { printf '%s\n' 'restore refused: empty file' >&2; exit 1; }
+    printf 'APP_ENV=%s\nCompose service: postgres\nRestore target: %s\n' "$APP_ENV" "$1" >&2
+    printf 'Type the exact restore file path to confirm: ' >&2
+    IFS= read -r confirmation || exit 1
+    [[ "$confirmation" == "$1" ]] || { printf '%s\n' 'restore refused: confirmation mismatch' >&2; exit 1; }
+    arguments=(sealed "$1")
+    [[ -z "${2-}" ]] || arguments+=(--approve-call-ordinal "$2")
+    [[ -z "${3-}" ]] || arguments+=(--approve-reopen-ordinal "$3")
+    exec uv run --project backend python scripts/run-postgres-operations.py "${arguments[@]}"
 
-    # 恢复容器同时获得 PostgreSQL 内网和受限 Secret 文件，宿主机无需安装数据库客户端。
-    docker compose --profile operations run --rm --no-deps \
-      -e APP_ENV="${app_env}" -e ALLOW_PRODUCTION_RESTORE="${ALLOW_PRODUCTION_RESTORE-}" \
-      -e "RESTORE_FILE=/backups/${restore_basename}" \
-      --entrypoint /bin/sh backup -ec \
-      'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"'
+[group('operations')]
+calendar-aad-audit phase artifact:
+    uv run --project backend python scripts/run-postgres-operations.py audit "$1" "$2"
+
+[group('operations')]
+restore-legacy-to-isolated file output_basename:
+    bash scripts/convert-legacy-backup.sh "$1" "$2"
+
+[group('operations')]
+legacy-backup-scavenge:
+    bash scripts/scavenge-legacy-backups.sh

@@ -2,6 +2,7 @@
 
 import importlib
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import URL
 
 from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadRolloutError
@@ -137,6 +139,30 @@ def test_calendar_aad_no_argument_cli_rejects_without_echoing_input(module_name,
     assert output.out == ""
 
 
+@pytest.mark.parametrize("explicit_arguments", [False, True])
+def test_calendar_backup_rejects_arguments_before_parent_entry(
+    explicit_arguments, monkeypatch, capsys
+):
+    """兼容入口在父备份流程前拒绝显式或进程参数，不能先触发任何owner工作。"""
+    from ai_employee.cli import calendar_aad_backup_0019 as module
+    from ai_employee.cli import postgres_backup as parent
+
+    calls = []
+
+    def delegated(arguments):
+        """观察父入口是否被错误调用，不替代参数拒绝或输出断言。"""
+        calls.append(arguments)
+        return 99
+
+    arguments = ["--scope", "synthetic-private-scope"]
+    monkeypatch.setattr(sys, "argv", ["calendar-backup", *arguments])
+    monkeypatch.setattr(parent, "main", delegated)
+    assert module.main(arguments if explicit_arguments else None) == 1
+    assert calls == []
+    output = capsys.readouterr()
+    assert output.err == "calendar_aad_arguments_invalid\n" and output.out == ""
+
+
 @pytest.mark.parametrize("module_name", ["calendar_aad_preflight_0019", "calendar_aad_0019"])
 def test_calendar_aad_cli_http_exception_is_content_free(
     module_name, monkeypatch, tmp_path, capsys
@@ -171,7 +197,7 @@ def test_calendar_aad_cli_rejects_fifo_without_writer_and_closes_lease(
 ):
     """真实 CLI/asyncio.run 必须在无 FIFO writer 时返回稳定错误并完整退出 lease。"""
     module = importlib.import_module(f"ai_employee.cli.{module_name}")
-    closed, disposed = [], []
+    closed, disposed, owner_closed = [], [], []
     artifact_file = resources.CalendarAadArtifactFile(tmp_path, BINDING)
     os.mkfifo(artifact_file.path, mode=0o600)
 
@@ -190,20 +216,65 @@ def test_calendar_aad_cli_rejects_fifo_without_writer_and_closes_lease(
     sessions = SimpleNamespace(
         engine=SimpleNamespace(url=URL.create("postgresql")), dispose=dispose
     )
-    monkeypatch.setattr(resources, "calendar_aad_rollout_lease", context)
-    monkeypatch.setattr(module, "rollout_environment", lambda: (tmp_path, BINDING))
-    monkeypatch.setattr(
-        module,
-        "Settings",
-        lambda: Settings(
-            app_env="test",
-            app_test_mode=True,
-            task_timeout_seconds=1,
-            task_step_timeout_seconds=1,
-        ),
+    # 新增的固定owner事实读取器只构造合法endpoint；FIFO拒绝前绝不读它的Secret或数据库。
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://ai_employee_app@postgres:5432/ai_employee_test"
     )
-    monkeypatch.setattr(module, "build_session_factory", lambda url: sessions)
-    if module_name != "calendar_aad_backup_0019":
+    monkeypatch.setattr(resources, "calendar_aad_rollout_lease", context)
+    if module_name == "calendar_aad_backup_0019":
+        from ai_employee.cli import postgres_backup as parent
+        from ai_employee.cli import postgres_restore
+        from ai_employee.infrastructure.db.postgres_backup_manifest import OPERATIONS_EXECUTABLES
+
+        @contextmanager
+        def owned(label, value):
+            """仅替代物理owner连接及数据库锁，真实文件锁、父组合和revision lease均保留。"""
+            try:
+                yield value
+            finally:
+                owner_closed.append(label)
+
+        holder = SimpleNamespace(shared_schema=lambda: owned("schema", None))
+        target = SimpleNamespace(backup_holder=lambda: owned("backup", holder))
+        management = SimpleNamespace(acquire_target_lock=lambda: owned("target", target))
+        owner = SimpleNamespace(
+            acquire_management_lifecycle_lock=lambda: owned("management", management)
+        )
+        monkeypatch.setattr(
+            parent, "_open_maintenance_context", lambda *args: owned("owner", owner)
+        )
+        monkeypatch.setattr(parent, "_read_secret_file", lambda path: SecretStr("synthetic-only"))
+        monkeypatch.setattr(parent, "build_session_factory", lambda url: sessions)
+        monkeypatch.setattr(
+            parent,
+            "image_executable_digests",
+            lambda: dict.fromkeys(OPERATIONS_EXECUTABLES, "a" * 64),
+        )
+        monkeypatch.setattr(postgres_restore, "_host_guard", lambda: None)
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.setenv("BACKUP_DIR", str(tmp_path))
+        monkeypatch.setenv("BACKUP_ARTIFACT_BASENAME", BINDING.basename)
+        monkeypatch.setenv("BACKUP_IMMUTABLE_IMAGE_ID", BINDING.immutable_image_id)
+        monkeypatch.delenv("BACKUP_RCLONE_REMOTE", raising=False)
+        for flag in (
+            "EXTERNAL_WRITES_ENABLED",
+            "GOOGLE_WRITES_ENABLED",
+            "MICROSOFT_WRITES_ENABLED",
+        ):
+            monkeypatch.setenv(flag, "false")
+    else:
+        monkeypatch.setattr(module, "rollout_environment", lambda: (tmp_path, BINDING))
+        monkeypatch.setattr(
+            module,
+            "Settings",
+            lambda: Settings(
+                app_env="test",
+                app_test_mode=True,
+                task_timeout_seconds=1,
+                task_step_timeout_seconds=1,
+            ),
+        )
+        monkeypatch.setattr(module, "build_session_factory", lambda url: sessions)
         monkeypatch.setattr(
             module,
             "build_oauth_security_services",
@@ -223,5 +294,11 @@ def test_calendar_aad_cli_rejects_fifo_without_writer_and_closes_lease(
     assert closed == [True]
     assert disposed == [True]
     output = capsys.readouterr()
-    assert output.err == "calendar_aad_artifact_invalid\n"
+    if module_name == "calendar_aad_backup_0019":
+        assert owner_closed == ["schema", "backup", "target", "management", "owner"]
+        assert output.err == "postgres_backup_failed\n"
+        assert not tuple(tmp_path.glob("*.dump.enc*"))
+        assert not tuple(tmp_path.glob(".partial.*"))
+    else:
+        assert output.err == "calendar_aad_artifact_invalid\n"
     assert output.out == ""

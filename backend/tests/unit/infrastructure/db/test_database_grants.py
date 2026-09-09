@@ -488,6 +488,12 @@ def _independent_expected_inventory(
                         privilege_type,
                     )
                 )
+        elif phase is GrantPhase.ACTIVE:
+            grants.append(
+                _independent_grant(
+                    ObjectKind.TABLE, table_name, APP_RUNTIME_ROLE_NAME, RELATION_OWNER, "SELECT"
+                )
+            )
         for privilege_type in sorted(retention_tables.get(table_name, ())):
             grants.append(
                 _independent_grant(
@@ -1925,12 +1931,88 @@ def test_database_grants_public_function_surface_is_closed() -> None:
         "verify_pre_migration_object_grants",
         "apply_migration_grant_delta",
         "verify_object_grants",
+        "restore_inventory_objects",
+        "verify_restore_pre_grants",
+        "apply_restore_object_grants",
+        "apply_restore_phase_grants",
     }
+
+
+def test_restore_active_policy_has_only_one_revision_select_delta() -> None:
+    """恢复ACTIVE可读revision；普通BASELINE及序列权限完全保持原值。"""
+    baseline = set(_inventory(HEAD_REVISION, GrantPhase.BASELINE))
+    active = set(_inventory(HEAD_REVISION, GrantPhase.ACTIVE))
+    assert active - baseline == {
+        _independent_grant(
+            ObjectKind.TABLE, "alembic_version", APP_RUNTIME_ROLE_NAME, RELATION_OWNER, "SELECT"
+        )
+    }
+    assert not baseline - active
+
+
+def _native_restore_pre_inventory(revision: str) -> tuple[ObjectGrantTuple, ...]:
+    """native pg_dump不重建public schema；两条既有USAGE必须保留，其余runtime tuple移除。"""
+    return tuple(
+        grant
+        for grant in _independent_expected_inventory(revision, GrantPhase.ACTIVE)
+        if grant.grantee not in {APP_RUNTIME_ROLE_NAME, RETENTION_RUNTIME_ROLE_NAME}
+        or grant.object_kind is ObjectKind.SCHEMA
+    )
+
+
+@pytest.mark.parametrize("revision", (HEAD_REVISION, DESTINATION_REVISION))
+def test_restore_pre_grants_requires_exact_preserved_public_schema_usage(revision: str) -> None:
+    """真实no-privileges形状保留原public schema两条USAGE，读取成功本身不写权限。"""
+    connection = _FakeConnection(_native_restore_pre_inventory(revision))
+    snapshot = database_grants_module.verify_restore_pre_grants(
+        cast(Connection, connection), revision=revision
+    )
+    assert snapshot.grants == _native_restore_pre_inventory(revision)
+    assert not connection.mutation_sql
+
+
+@pytest.mark.parametrize(
+    "posture", ("partial-runtime", "extra-owner", "wrong-grantor", "missing-schema-usage")
+)
+def test_restore_pre_grants_rejects_drift_without_mutation(posture: str) -> None:
+    """no-privileges后的完整默认形状是唯一允许加grant的前置条件。"""
+    assert hasattr(database_grants_module, "apply_restore_object_grants"), (
+        "restore has no exact pre-grant boundary"
+    )
+    grants = list(_native_restore_pre_inventory(HEAD_REVISION))
+    if posture == "partial-runtime":
+        grants.append(
+            _independent_grant(
+                ObjectKind.TABLE, "users", APP_RUNTIME_ROLE_NAME, RELATION_OWNER, "SELECT"
+            )
+        )
+    elif posture == "extra-owner":
+        grants.append(
+            _independent_grant(
+                ObjectKind.TABLE, "foreign_table", RELATION_OWNER, RELATION_OWNER, "SELECT"
+            )
+        )
+    elif posture == "wrong-grantor":
+        grants[0] = replace(grants[0], grantor=OTHER_GRANTOR)
+    else:
+        grants = [
+            grant
+            for grant in grants
+            if not (
+                grant.object_kind is ObjectKind.SCHEMA and grant.grantee == APP_RUNTIME_ROLE_NAME
+            )
+        ]
+    connection = _FakeConnection(tuple(grants))
+    with pytest.raises(ObjectGrantInvariantError):
+        database_grants_module.apply_restore_object_grants(
+            cast(Connection, connection), revision=HEAD_REVISION
+        )
+    assert not connection.mutation_sql
 
 
 def test_destination_verifier_returns_new_snapshot_for_callback_chain() -> None:
     """delta 后完整 destination multiset 验证成功才返回下一步 snapshot。"""
-    connection = _FakeConnection(_inventory(DESTINATION_REVISION))
+    connection = _FakeConnection(_inventory(DESTINATION_REVISION, GrantPhase.ACTIVE))
     snapshot = verify_object_grants(
         cast(Connection, connection),
         revision=DESTINATION_REVISION,

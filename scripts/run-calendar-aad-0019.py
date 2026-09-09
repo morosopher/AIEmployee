@@ -12,7 +12,9 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -31,7 +33,7 @@ _COMMANDS = {
     "preflight": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_preflight_0019',
     "migrate": 'export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019',
     "resync": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_0019',
-    "backup": 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/backup-postgres.sh',
+    "backup": "exec bash /app/scripts/backup-postgres.sh",
 }
 _SCREEN_COMMAND = 'export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_revision_0019'
 
@@ -74,7 +76,9 @@ def _image_id(service: dict[str, object]) -> str:
     return image_id
 
 
-def _require_stopped() -> None:
+def _require_stopped(
+    *, own_name: str | None = None, own_image: str | None = None
+) -> None:
     """检查当前 Compose 项目全部容器，paused/restarting 也不是可接受的已停止状态。"""
     raw = _docker("compose", "ps", "--all", "--format", "json").strip()
     try:
@@ -84,15 +88,37 @@ def _require_stopped() -> None:
     rows = parsed if isinstance(parsed, list) else [parsed]
     for value in rows:
         row = _mapping(value)
-        if row.get("Service") in {
-            "caddy",
-            "api",
-            "worker",
-            "scheduler",
-            "migration",
-            "backup",
-        } and row.get("State") not in {"exited", "created", "dead"}:
-            raise RolloutHostError("calendar_aad_services_running")
+        if row.get("State") in {"exited", "created", "dead"} or row.get("Service") in {
+            "postgres",
+            "redis",
+            "prometheus",
+            "grafana",
+        }:
+            continue
+        if (
+            own_name is not None
+            and row.get("Name") == own_name
+            and row.get("Service") == "backup"
+        ):
+            identifier = row.get("ID")
+            if (
+                type(identifier) is not str
+                or re.fullmatch(r"[0-9a-f]{12,64}", identifier) is None
+            ):
+                raise RolloutHostError("calendar_aad_services_running")
+            result = json.loads(_docker("inspect", "--type", "container", identifier))
+            if not isinstance(result, list) or len(result) != 1:
+                raise RolloutHostError("calendar_aad_services_running")
+            container = _mapping(result[0])
+            labels = _mapping(_mapping(container.get("Config")).get("Labels"))
+            if (
+                container.get("Name") != "/" + own_name
+                or container.get("Image") != own_image
+                or labels.get("com.docker.compose.service") != "backup"
+            ):
+                raise RolloutHostError("calendar_aad_services_running")
+            continue
+        raise RolloutHostError("calendar_aad_services_running")
 
 
 def _oneoff(
@@ -101,6 +127,8 @@ def _oneoff(
     command: str,
     *,
     timeout: float | None = None,
+    guard: Callable[[], None] | None = None,
+    own_name: str | None = None,
 ) -> str:
     """以 0600 临时 Compose 执行一个内部固定命令，只返回成功 stdout 或稳定错误码。
 
@@ -112,27 +140,67 @@ def _oneoff(
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(config, stream)
+        arguments = [
+            "docker",
+            "compose",
+            "--project-directory",
+            str(Path.cwd()),
+            "-f",
+            str(path),
+            "--profile",
+            "operations",
+            "run",
+            "--rm",
+            "--no-deps",
+            "--pull",
+            "never",
+            *(["--name", own_name, "-T"] if own_name is not None else []),
+            "--entrypoint",
+            "/bin/sh",
+            service,
+            "-ec",
+            command,
+        ]
+        if guard is not None:
+            # 只有新的sealed backup父流程使用匿名握手；固定preflight/migrate/resync命令保持原契约。
+            with tempfile.TemporaryFile() as errors:
+                process = subprocess.Popen(
+                    arguments,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=errors,
+                    text=True,
+                    bufsize=1,
+                )
+                try:
+                    assert process.stdin is not None and process.stdout is not None
+                    completed = False
+                    while line := process.stdout.readline(128):
+                        if line == "operations.guard.request\n":
+                            guard()
+                            process.stdin.write("operations.guard.confirmed\n")
+                            process.stdin.flush()
+                        elif line == "postgres_backup_completed\n" and not completed:
+                            completed = True
+                        else:
+                            raise RolloutHostError("calendar_aad_backup_output_invalid")
+                    process.stdin.close()
+                    if process.wait() != 0 or not completed:
+                        raise RolloutHostError("calendar_aad_backup_failed")
+                    guard()
+                    return "postgres_backup_completed\n"
+                finally:
+                    if not process.stdin.closed:
+                        process.stdin.close()
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
         result = subprocess.run(
-            [
-                "docker",
-                "compose",
-                "--project-directory",
-                str(Path.cwd()),
-                "-f",
-                str(path),
-                "--profile",
-                "operations",
-                "run",
-                "--rm",
-                "--no-deps",
-                "--pull",
-                "never",
-                "--entrypoint",
-                "/bin/sh",
-                service,
-                "-ec",
-                command,
-            ],
+            arguments,
             capture_output=True,
             text=True,
             check=False,
@@ -203,7 +271,12 @@ def run(operation: str) -> None:
         raise RolloutHostError("calendar_aad_backup_directory_invalid")
     # 后续 mount 必须复用此物理路径；若在 Docker 查询后重新解析 operator symlink，
     # 校验与挂载之间的替换会绕过非根目录约束。
-    config = _mapping(json.loads(_docker("compose", "config", "--format", "json")))
+    # preflight 与 backup 共用固定 profile，必须包含默认不激活的 operations 服务。
+    config = _mapping(
+        json.loads(
+            _docker("compose", "--profile", "operations", "config", "--format", "json")
+        )
+    )
     services = _mapping(config.get("services"))
     worker = _mapping(services.get("worker"))
     migration = _mapping(services.get("migration"))
@@ -229,6 +302,30 @@ def run(operation: str) -> None:
     # 使内容 ID 失去实际运行身份。Secret 仍走 Compose 原有独立 secrets 定义。
     if any(_mapping(value).get("target") != "/backups" for value in volumes):
         raise RolloutHostError("calendar_aad_image_mount_invalid")
+    if operation == "backup":
+        # 无网络、无数据/Secret挂载的镜像内部摘要检查必须早于owner revision screen。
+        inventory = _mapping(
+            json.loads(
+                _docker(
+                    "run",
+                    "--rm",
+                    "--pull",
+                    "never",
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "/app/backend/.venv/bin/python",
+                    image_id,
+                    "-c",
+                    "import json; from ai_employee.infrastructure.db.postgres_backup_manifest import image_executable_digests; print(json.dumps(dict(image_executable_digests()),sort_keys=True))",
+                )
+            )
+        )
+        if not inventory or any(
+            type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in inventory.values()
+        ):
+            raise RolloutHostError("calendar_aad_image_invalid")
     _screen_revision(
         config, image_id, "20260809_0019" if operation == "resync" else "20260809_0018"
     )
@@ -240,6 +337,18 @@ def run(operation: str) -> None:
     selected["image"] = image_id
     selected["pull_policy"] = "never"
     selected.pop("build", None)
+    if operation in {"preflight", "resync"}:
+        # 仅固定命令在screen/停服/image全部复查后取得只读facts Secret；普通worker永不持有。
+        secrets = selected.get("secrets", [])
+        if not isinstance(secrets, list):
+            raise RolloutHostError("calendar_aad_compose_invalid")
+        selected["secrets"] = [
+            *secrets,
+            {
+                "source": "postgres_bootstrap_password",
+                "target": "postgres_bootstrap_password",
+            },
+        ]
     environment = _mapping(selected.get("environment", {}))
     environment.update({flag: "false" for flag in _FLAGS})
     environment.update(
@@ -248,12 +357,9 @@ def run(operation: str) -> None:
             "BACKUP_ARTIFACT_BASENAME": basename,
             "CALENDAR_AAD_ROLLOUT_STATE": f"/backups/{basename}.calendar-aad-preflight.json",
             "CALENDAR_AAD_IMMUTABLE_IMAGE_ID": image_id,
+            "BACKUP_IMMUTABLE_IMAGE_ID": image_id,
         }
     )
-    if operation == "backup":
-        environment["DATABASE_URL"] = _mapping(worker.get("environment")).get(
-            "DATABASE_URL"
-        )
     selected["environment"] = environment
     selected["volumes"] = [
         {
@@ -263,7 +369,55 @@ def run(operation: str) -> None:
             "read_only": operation in {"migrate", "resync"},
         },
     ]
-    print(_oneoff(config, service_name, _COMMANDS[operation]), end="")
+    if operation == "backup":
+        selected["user"] = f"{os.geteuid()}:{os.getegid()}"
+        name = "aiemployee-calendar-backup-" + uuid4().hex
+        directory_identity = directory.stat()
+
+        def backup_guard() -> None:
+            """每次容器请求都重新inspect停服、开关、三个image和已固定目录，不接收外部批准。"""
+            current = _mapping(
+                json.loads(
+                    _docker(
+                        "compose",
+                        "--profile",
+                        "operations",
+                        "config",
+                        "--format",
+                        "json",
+                    )
+                )
+            )
+            current_services = _mapping(current.get("services"))
+            _require_stopped(own_name=name, own_image=image_id)
+            for service in current_services.values():
+                values = _mapping(_mapping(service).get("environment", {}))
+                if any(
+                    str(values.get(flag, "false")).lower() not in {"false", "0"}
+                    for flag in _FLAGS
+                ):
+                    raise RolloutHostError("calendar_aad_write_switch_enabled")
+            if any(
+                _image_id(_mapping(current_services.get(service))) != image_id
+                for service in ("worker", "migration", "backup")
+            ):
+                raise RolloutHostError("calendar_aad_image_mismatch")
+            if not os.path.samestat(directory.lstat(), directory_identity):
+                raise RolloutHostError("calendar_aad_backup_directory_invalid")
+
+        backup_guard()
+        print(
+            _oneoff(
+                config,
+                service_name,
+                _COMMANDS[operation],
+                guard=backup_guard,
+                own_name=name,
+            ),
+            end="",
+        )
+    else:
+        print(_oneoff(config, service_name, _COMMANDS[operation]), end="")
 
 
 def main() -> int:

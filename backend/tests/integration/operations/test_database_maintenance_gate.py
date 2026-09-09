@@ -38,6 +38,7 @@ from ai_employee.infrastructure.db.database_grants import (
     BootstrapGrantPosture,
     GrantPhase,
     apply_bootstrap_object_grants,
+    apply_restore_phase_grants,
     verify_bootstrap_object_grants,
     verify_object_grants,
 )
@@ -3138,6 +3139,14 @@ def test_live_database_acl_profiles_and_safe_candidate_shapes_are_exact(
             if roles_exist:
                 _create_safe_runtime_roles(connection)
                 _apply_current_runtime_object_grants(connection)
+                if profile is DatabaseAclProfile.ACTIVE:
+                    # ACTIVE verifier需要唯一revision SELECT delta；数据库CONNECT撤销
+                    # 本身不能把baseline对象授权变成active，必须沿真实typed转换建立。
+                    apply_restore_phase_grants(
+                        connection,
+                        revision="20260809_0018",
+                        destination=GrantPhase.ACTIVE,
+                    )
             _apply_database_profile_setup(
                 connection,
                 target_database_name=target_name,

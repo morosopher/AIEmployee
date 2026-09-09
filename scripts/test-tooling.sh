@@ -20,6 +20,7 @@ required_recipes=(
   lint format typecheck check ci db-upgrade db-revision db-reset
   create-admin logs ps health backup restore observability-up observability-down
   calendar-aad-preflight-0019 calendar-aad-migrate-0019 calendar-aad-resync-0019
+  calendar-aad-audit calendar-aad-restore-0018 restore-legacy-to-isolated legacy-backup-scavenge
 )
 
 # 只读取 just 的摘要，避免测试依赖面向人的分组标题、颜色或详细帮助格式。
@@ -100,7 +101,7 @@ set -euo pipefail
   done
   printf '\n'
 } >>"${TOOLING_TEST_LOG}"
-if [[ "$*" == 'compose config --format json' ]]; then
+if [[ "$*" == 'compose --profile operations config --format json' ]]; then
   cat "${TOOLING_TEST_COMPOSE_CONFIG}"
 elif [[ "$*" == 'compose ps --all --format json' ]]; then
   if [[ -f "${TOOLING_TEST_SCREEN_SEEN}" && "${TOOLING_TEST_SERVICE_AFTER_SCREEN-}" == yes ]]; then
@@ -117,6 +118,8 @@ elif [[ "$*" == image\ inspect* ]]; then
   else
     printf '%s\n' "${TOOLING_TEST_IMAGE_ID}"
   fi
+elif [[ "${1-}" == run && "$*" == *image_executable_digests* ]]; then
+  printf '{"/app/scripts/backup-postgres.sh":"%064d"}\n' 0
 elif [[ "${2-}" == --project-directory && "$*" == *'--profile operations run'* ]]; then
   # 捕获真实宿主渲染文件；这里不执行内部 shell 或访问任何 Secret/数据库。
   [[ "$(stat -c %a "$5")" == 600 ]] || exit 1
@@ -135,7 +138,14 @@ elif [[ "${2-}" == --project-directory && "$*" == *'--profile operations run'* ]
     printf 'calendar_aad_artifact_invalid\n' >&2
     exit 1
   fi
-  printf 'calendar_aad_oneoff_passed\n'
+  if [[ "${@: -1}" == 'exec bash /app/scripts/backup-postgres.sh' ]]; then
+    printf 'operations.guard.request\n'
+    IFS= read -r confirmation
+    [[ "$confirmation" == operations.guard.confirmed ]] || exit 1
+    printf 'postgres_backup_completed\n'
+  else
+    printf 'calendar_aad_oneoff_passed\n'
+  fi
 fi
 FAKE_DOCKER
 
@@ -494,8 +504,7 @@ assert_contains "${logs_payload}" "${command_log}"
 assert_exact_line $'docker\tcompose\tlogs\t-f\t--\t'"${logs_payload}" "${command_log}"
 assert_line_count 1 "${command_log}"
 
-# restore file 必须经过自有精确确认；容器映射只取 basename，但仍要作为独立环境参数
-# 传给 Compose，不能插入固定的 /bin/sh -ec 程序文本。
+# restore file 保留首个精确确认，原始路径作为独立argv交给纯文件/镜像host guard。
 set_valid_database_environment
 clear_command_log
 restore_sentinel="${sandbox_dir}/restore-injection-sentinel"
@@ -508,8 +517,7 @@ if [[ -e "${restore_sentinel}" ]]; then
   printf 'tooling behavior contract failed: restore payload escaped into shell\n' >&2
   exit 1
 fi
-restore_basename="$(basename -- "${restore_payload}")"
-assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\t--no-deps\t-e\tAPP_ENV=development\t-e\tALLOW_PRODUCTION_RESTORE=\t-e\tRESTORE_FILE=/backups/'"${restore_basename}"$'\t--entrypoint\t/bin/sh\tbackup\t-ec\texport PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"' "${command_log}"
+assert_exact_line $'uv\trun\t--project\tbackend\tpython\tscripts/run-postgres-operations.py\trestore\t'"${restore_payload}" "${command_log}"
 assert_line_count 1 "${command_log}"
 
 # 生产、缺失、拼错或未知环境一律 fail-closed；测试绕过 just 自身确认，但 recipe 仍应拒绝。
@@ -801,8 +809,7 @@ for allowed_environment in development test; do
   assert_contains "APP_ENV=${allowed_environment}" "${stderr_file}"
   assert_contains 'Compose service: postgres' "${stderr_file}"
   assert_contains "Restore target: ${restore_target}" "${stderr_file}"
-  restore_target_basename="$(basename -- "${restore_target}")"
-  assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\t--no-deps\t-e\tAPP_ENV='"${allowed_environment}"$'\t-e\tALLOW_PRODUCTION_RESTORE=\t-e\tRESTORE_FILE=/backups/'"${restore_target_basename}"$'\t--entrypoint\t/bin/sh\tbackup\t-ec\texport PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec bash /app/scripts/restore-postgres.sh "$RESTORE_FILE"' "${command_log}"
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\tscripts/run-postgres-operations.py\trestore\t'"${restore_target}" "${command_log}"
   assert_line_count 1 "${command_log}"
 done
 
@@ -850,7 +857,22 @@ assert_recipe_has_confirm() {
 }
 
 assert_recipe_has_confirm db-reset 'db-reset:'
-assert_recipe_has_confirm restore 'restore file:'
+assert_recipe_has_confirm restore "restore file approve_call_ordinal='' approve_reopen_ordinal='':"
+assert_recipe_has_confirm calendar-aad-restore-0018 "calendar-aad-restore-0018 file approve_call_ordinal='' approve_reopen_ordinal='':"
+
+# 两类恢复的ordinal只通过固定flag+独立值转交；reopen-only保留空call slot，默认不加批准。
+set_valid_database_environment
+for recipe in restore calendar-aad-restore-0018; do
+  operation=restore
+  [[ "$recipe" != calendar-aad-restore-0018 ]] || operation=sealed
+  ordinal_target="${sandbox_dir}/synthetic.dump.enc"
+  clear_command_log
+  run_just_with_input_capture "$ordinal_target" "$output_file" just --yes "$recipe" "$ordinal_target" 2
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\tscripts/run-postgres-operations.py\t'"$operation"$'\t'"$ordinal_target"$'\t--approve-call-ordinal\t2' "$command_log"
+  clear_command_log
+  run_just_with_input_capture "$ordinal_target" "$output_file" just --yes "$recipe" "$ordinal_target" '' 3
+  assert_exact_line $'uv\trun\t--project\tbackend\tpython\tscripts/run-postgres-operations.py\t'"$operation"$'\t'"$ordinal_target"$'\t--approve-reopen-ordinal\t3' "$command_log"
+done
 
 # db-reset 直接使用 Python 标准库执行安全 guard，因此 doctor 必须显式暴露该本地依赖。
 doctor_definition="$(
@@ -886,6 +908,7 @@ services = {
     for name in ("worker", "migration", "api", "scheduler", "backup")
 }
 services["migration"]["environment"]["DATABASE_URL"] = "postgresql+psycopg://synthetic_owner@postgres:5432/synthetic_test"
+services["backup"]["secrets"] = [{"source": name} for name in ("postgres_bootstrap_password", "app_database_password", "backup_passphrase")]
 with open(os.environ["TOOLING_TEST_COMPOSE_CONFIG"], "w", encoding="utf-8") as stream:
     json.dump({"name": "synthetic-rollout", "services": services}, stream)
 PY
@@ -914,13 +937,15 @@ for rollout_recipe in calendar-aad-preflight-0019 calendar-aad-migrate-0019 cale
     cat "${output_file}" >&2
     exit 1
   }
-  assert_contains $'docker\tcompose\tconfig\t--format\tjson' "${command_log}"
+  assert_contains $'docker\tcompose\t--profile\toperations\tconfig\t--format\tjson' "${command_log}"
   assert_contains $'docker\tcompose\tps\t--all\t--format\tjson' "${command_log}"
   assert_contains $'docker\timage\tinspect\t--format\t{{.Id}}\tsynthetic-worker:synthetic-0019' "${command_log}"
   assert_contains $'docker\timage\tinspect\t--format\t{{.Id}}\tsynthetic-migration:synthetic-0019' "${command_log}"
   assert_contains $'\t--no-deps\t--pull\tnever\t--entrypoint\t/bin/sh\t' "${command_log}"
   if [[ "${rollout_recipe}" == calendar-aad-migrate-0019 ]]; then
     assert_contains 'export PGPASSWORD="$(cat /run/secrets/postgres_bootstrap_password)"; exec uv run --no-sync python -m ai_employee.cli.calendar_aad_migrate_0019' "${command_log}"
+  elif [[ "${rollout_recipe}" == backup ]]; then
+    assert_contains 'exec bash /app/scripts/backup-postgres.sh' "${command_log}"
   else
     assert_contains 'export PGPASSWORD="$(cat /run/secrets/app_database_password)";' "${command_log}"
   fi
@@ -941,7 +966,12 @@ assert selected["environment"]["CALENDAR_AAD_ROLLOUT_STATE"] == f'/backups/{os.e
 assert all(selected["environment"][flag] == "false" for flag in ("EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED"))
 assert selected["volumes"] == [{"type": "bind", "source": os.environ["BACKUP_DIR"], "target": "/backups",
                                   "read_only": recipe in ("calendar-aad-migrate-0019", "calendar-aad-resync-0019")}]
-assert selected["secrets"] == [{"source": "postgres_bootstrap_password" if name == "migration" else "app_database_password"}]
+if name == "backup":
+    assert selected["secrets"] == [{"source": name} for name in ("postgres_bootstrap_password", "app_database_password", "backup_passphrase")]
+elif name == "worker":
+    assert selected["secrets"] == [{"source": "app_database_password"}, {"source": "postgres_bootstrap_password", "target": "postgres_bootstrap_password"}]
+else:
+    assert selected["secrets"] == [{"source": "postgres_bootstrap_password"}]
 with open(os.environ["TOOLING_TEST_SCREEN_RENDERED"], encoding="utf-8") as stream:
     screen = json.load(stream)["services"]["migration"]
 assert screen["image"] == selected["image"] and screen["pull_policy"] == "never"
@@ -1068,11 +1098,13 @@ for recipe in calendar-aad-preflight-0019 calendar-aad-migrate-0019 calendar-aad
   assert_no_fake_calls
 done
 
-# 普通备份继续沿既有 service；只有显式 basename 的封闭窗口经过窄 guard composition。
+# 普通备份也走完整manifest父流程；只有unset使用自动命名，显式空值必须拒绝。
 unset BACKUP_ARTIFACT_BASENAME
 clear_command_log
 run_just_capture "${output_file}" just --yes backup
-assert_exact_line $'docker\tcompose\t--profile\toperations\trun\t--rm\tbackup' "${command_log}"
-grep -Fq 'ai_employee.cli.calendar_aad_backup_0019' scripts/backup-postgres.sh
+assert_exact_line $'uv\trun\t--project\tbackend\tpython\tscripts/run-postgres-operations.py\tbackup' "${command_log}"
+grep -Fq 'ai_employee.cli.postgres_backup' scripts/backup-postgres.sh
+export BACKUP_ARTIFACT_BASENAME=''
+expect_rollout_failure calendar_aad_basename_invalid backup
 
 printf 'tooling recipe behavior contract ok\n'

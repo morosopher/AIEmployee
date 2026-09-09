@@ -1293,6 +1293,48 @@ def test_baseline_connect_reassertion_rejects_drift_before_first_sql() -> None:
         assert connection.calls == []
 
 
+@pytest.mark.parametrize(
+    ("source", "destination", "verb"),
+    (
+        (DatabaseAclProfile.BASELINE, DatabaseAclProfile.ACTIVE, "REVOKE"),
+        (DatabaseAclProfile.ACTIVE, DatabaseAclProfile.BASELINE, "GRANT"),
+    ),
+)
+def test_restore_acl_mutator_changes_only_the_two_runtime_connect_tuples(
+    source: DatabaseAclProfile,
+    destination: DatabaseAclProfile,
+    verb: str,
+) -> None:
+    """restore 入闸/开闸不能重建角色、修复 PUBLIC 或扩大数据库权限。"""
+    import ai_employee.infrastructure.db.database_access as access
+
+    mutator = getattr(access, "apply_restore_database_acl_transition", None)
+    assert callable(mutator), "restore has no exact baseline-active ACL mutator"
+    connection = _FakeSyncConnection()
+    mutator(
+        cast(Connection, connection),
+        target_database_name="synthetic_database",
+        snapshot=_snapshot(source),
+        destination=destination,
+    )
+    preposition = "FROM" if verb == "REVOKE" else "TO"
+    assert [sql for sql, _ in connection.calls] == [
+        f'{verb} CONNECT ON DATABASE "synthetic_database" {preposition} "ai_employee_app"',
+        f'{verb} CONNECT ON DATABASE "synthetic_database" {preposition} "ai_employee_retention"',
+    ]
+    drift = replace(_snapshot(source), app_role=replace(SAFE_APP_ROLE, is_superuser=True))
+    rejected = _FakeSyncConnection()
+    _assert_invariant(
+        lambda: mutator(
+            cast(Connection, rejected),
+            target_database_name="synthetic_database",
+            snapshot=drift,
+            destination=destination,
+        )
+    )
+    assert rejected.calls == []
+
+
 def test_database_acl_mutator_allows_only_exact_candidate_to_baseline_plan() -> None:
     """ACL mutator 只能撤销 PUBLIC 并授予两条 owner/non-grantable CONNECT。"""
     from ai_employee.infrastructure.db.database_access import (

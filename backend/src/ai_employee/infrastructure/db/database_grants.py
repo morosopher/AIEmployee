@@ -1269,8 +1269,8 @@ def _build_inventory_policy(revision: str) -> _InventoryPolicy:
     )
 
 
-# baseline/active 当前内容同构，但两个 phase 都拥有独立 registry key；任何 key 缺失都失败，
-# 不能以 baseline 作为 active 的隐式 fallback。
+# baseline/active的表、列、序列目录同构，但权限包含独立验证的revision SELECT delta。
+# 两个phase均使用独立registry key；任一key缺失都失败，禁止以baseline隐式替代active。
 _INVENTORY_REGISTRY: dict[tuple[str, GrantPhase], _InventoryPolicy] = {
     (revision, phase): _build_inventory_policy(revision)
     for revision in _REVISION_ORDER
@@ -1378,6 +1378,14 @@ def _expected_object_grants(
                         privilege,
                     )
                 )
+        elif validated_phase is GrantPhase.ACTIVE:
+            # 只在恢复门禁内让SET ROLE app的READ ONLY verifier读取版本；普通baseline
+            # 保持无此tuple，完成事务必须撤回这一唯一phase delta后才能恢复CONNECT。
+            grants.append(
+                _grant(
+                    ObjectKind.TABLE, table_name, APP_RUNTIME_ROLE_NAME, validated_owner, "SELECT"
+                )
+            )
         for privilege in retention_tables.get(table_name, ()):
             grants.append(
                 _grant(
@@ -2268,6 +2276,88 @@ def apply_bootstrap_object_grants(
     # 证明阻止该幂等动作退化为 partial drift repair，也禁止提前应用 destination policy。
     for grant in tuple(grant for grant in expected if _runtime_grant(grant)):
         connection.execute(text(_render_mutation_sql("GRANT", grant)))
+
+
+def restore_inventory_objects(revision: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """返回同一权限registry冻结的恢复表/序列全集，fingerprint不得自行遗漏业务表。
+
+    Args:
+        revision: 当前镜像明确支持的已完成0018/0019版本；中间迁移态不是可恢复版本。
+
+    Returns:
+        稳定排序的表名与序列名，无供应商类型、数据值或用户可扩展对象。
+    """
+    if revision not in {"20260809_0018", "20260809_0019"}:
+        _fail()
+    policy = _INVENTORY_REGISTRY[(revision, GrantPhase.ACTIVE)]
+    return policy.tables, policy.sequences
+
+
+def verify_restore_pre_grants(connection: Connection, *, revision: str) -> CatalogObjectSnapshot:
+    """验证真实no-privileges恢复后的完整对象形状及原public schema权限。
+
+    这不是通用repair入口。调用方必须持同一management/target/schema恢复lease，且
+    catalog已证明本次restore成功。PG17的普通dump不重建public schema，其原有两条
+    runtime USAGE必须精确保留；被重建的table/column/sequence才没有runtime tuple。
+    任何多余、部分grant、schema USAGE缺失或owner漂移在首条写入前拒绝。
+    """
+    restore_inventory_objects(revision)
+    catalog = _read_catalog(connection, revision=revision, phase=GrantPhase.ACTIVE)
+    expected = _expected_object_grants(
+        revision=revision, phase=GrantPhase.ACTIVE, relation_owner=catalog.relation_owner
+    )
+    _verify_exact_grant_multiset(
+        catalog.snapshot.grants,
+        tuple(
+            grant
+            for grant in expected
+            if not _runtime_grant(grant) or grant.object_kind is ObjectKind.SCHEMA
+        ),
+    )
+    return catalog.snapshot
+
+
+def apply_restore_object_grants(connection: Connection, *, revision: str) -> None:
+    """在既有holder事务内验证no-privileges形状、逐tuple授予ACTIVE并完整复核。
+
+    不调用bootstrap、不创建角色或连接、不授予CONNECT。任何失败由调用方事务整体
+    回滚，catalog phase仍为restore_succeeded，只有新的有界调用才能重试。
+    """
+    verify_restore_pre_grants(connection, revision=revision)
+    catalog = _read_catalog(connection, revision=revision, phase=GrantPhase.ACTIVE)
+    expected = _expected_object_grants(
+        revision=revision, phase=GrantPhase.ACTIVE, relation_owner=catalog.relation_owner
+    )
+    for grant in expected:
+        if _runtime_grant(grant) and grant.object_kind is not ObjectKind.SCHEMA:
+            connection.execute(text(_render_mutation_sql("GRANT", grant)))
+    verify_object_grants(connection, revision=revision, phase=GrantPhase.ACTIVE)
+
+
+def apply_restore_phase_grants(
+    connection: Connection, *, revision: str, destination: GrantPhase
+) -> None:
+    """只在已验证完整inventory间应用唯一ACTIVE revision SELECT delta并复核。
+
+    BASELINE→ACTIVE与gate/CONNECT撤销共用事务；ACTIVE→BASELINE与completion/audit/
+    gate RESET共用事务。部分权限漂移不能借此修复，非法destination在任何SQL前拒绝。
+    """
+    restore_inventory_objects(revision)
+    _validate_phase(destination)
+    source = GrantPhase.BASELINE if destination is GrantPhase.ACTIVE else GrantPhase.ACTIVE
+    catalog = _read_catalog(connection, revision=revision, phase=source)
+    before = _expected_object_grants(
+        revision=revision, phase=source, relation_owner=catalog.relation_owner
+    )
+    after = _expected_object_grants(
+        revision=revision, phase=destination, relation_owner=catalog.relation_owner
+    )
+    _verify_exact_grant_multiset(catalog.snapshot.grants, before)
+    for grant in sorted(set(before) - set(after)):
+        connection.execute(text(_render_mutation_sql("REVOKE", grant)))
+    for grant in sorted(set(after) - set(before)):
+        connection.execute(text(_render_mutation_sql("GRANT", grant)))
+    verify_object_grants(connection, revision=revision, phase=destination)
 
 
 def apply_migration_grant_delta(

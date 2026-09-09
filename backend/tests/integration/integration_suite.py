@@ -69,6 +69,7 @@ LIFECYCLE_FILE_TARGETS = (
     # roles-absent lifecycle 文件一起在第二阶段运行，不能被 regular UUID 数据库阶段收集。
     "backend/tests/integration/db/test_database_grants_catalog.py",
     "backend/tests/integration/operations/test_database_maintenance_gate.py",
+    "backend/tests/integration/operations/test_postgres_backup_restore.py",
     "backend/tests/integration/retention/test_role_permissions.py",
     # 0019 rollout 必须使用由 empty_migration_database 创建的真正 0018 target；
     # regular head 阶段已有 cluster roles，不能把准入拒绝误当作业务 RED。

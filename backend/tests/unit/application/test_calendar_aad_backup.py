@@ -110,15 +110,27 @@ async def test_calendar_aad_backup_cancellation_stops_actual_child_group(
     assert not list(directory.glob("*.dump.enc"))
 
 
-def test_calendar_aad_backup_keeps_ordinary_script_entry(synthetic_backup_commands):
-    """未指定 rollout basename 的原公开脚本仍生成时间戳 dump/checksum，保持普通备份路径。"""
+def test_calendar_aad_backup_keeps_ordinary_script_entry(synthetic_backup_commands, tmp_path):
+    """实际bash公开入口只委托镜像内父CLI；宿主替换exec边界，不建立生产路径fallback。"""
     directory, _ = synthetic_backup_commands
-    result = subprocess.run(["bash", str(_SCRIPT)], capture_output=True, text=True, check=False)
+    recorded = tmp_path / "recorded-exec"
+    boundary = tmp_path / "synthetic-bash-exec"
+    boundary.write_text('exec() { printf "%s\\n" "$@" > "$SYNTHETIC_EXEC_RECORD"; }\n')
+    environment = {
+        **os.environ,
+        "BASH_ENV": str(boundary),
+        "SYNTHETIC_EXEC_RECORD": str(recorded),
+    }
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)], env=environment, capture_output=True, text=True, check=False
+    )
     assert result.returncode == 0
-    artifacts = list(directory.glob("ai_employee-*.dump.enc"))
-    assert len(artifacts) == 1
-    assert artifacts[0].read_bytes() == b"synthetic-encrypted:synthetic-dump"
-    assert artifacts[0].with_suffix(".enc.sha256").is_file()
+    assert recorded.read_text().splitlines() == [
+        "/app/backend/.venv/bin/python",
+        "-m",
+        "ai_employee.cli.postgres_backup",
+    ]
+    assert list(directory.iterdir()) == [], "thin shell must not publish an unguarded legacy pair"
 
 
 @pytest.fixture
@@ -159,6 +171,65 @@ def guarded_backup_resources(monkeypatch):
         )
 
     return prepare
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_failure", [False, True])
+async def test_calendar_aad_group_publisher_keeps_receipt_through_final_lease(
+    tmp_path, guarded_backup_resources, monkeypatch, late_failure
+):
+    """新三件套publisher独占暂存和checksum；最终lease失败仍必须撤回该receipt。"""
+    from ai_employee.infrastructure.db.postgres_backup_manifest import BackupGroupPublication
+
+    events = []
+
+    def close():
+        events.append("lease_exit")
+        if late_failure:
+            raise CalendarAadRolloutError("calendar_aad_rollout_lock_lost")
+
+    fixture = guarded_backup_resources(tmp_path / "backups", close)
+    staging = tmp_path / "backups" / ".partial.00000000-0000-0000-0000-000000000701"
+    staging.mkdir(mode=0o700)
+    receipt = BackupGroupPublication(())
+
+    class Publisher:
+        """仅替代完整27D发布边界，旧pair流程的任何访问都判错。"""
+
+        staging_root = staging
+
+        async def publish(self, staged, target, guard):
+            assert staged.parent == staging and staged.read_bytes() == b"synthetic"
+            assert target.parent == staging.parent
+            assert not Path(f"{staged}.sha256").exists()
+            await guard.verify()
+            events.append("published")
+            return receipt
+
+        async def discard(self, owned):
+            assert owned is receipt
+            events.append("discard")
+
+    async def producer(path):
+        path.write_bytes(b"synthetic")
+
+    def forbidden(*args):
+        raise AssertionError("pair-only path was used by group publisher")
+
+    monkeypatch.setattr(backup, "_prepare_checksum", forbidden)
+    monkeypatch.setattr(backup, "_publish_backup", forbidden)
+    if late_failure:
+        with pytest.raises(CalendarAadRolloutError):
+            await backup.run_guarded_backup(
+                **fixture.arguments, producer=producer, publisher=Publisher()
+            )
+        assert events == ["published", "lease_exit", "discard"]
+    else:
+        await backup.run_guarded_backup(
+            **fixture.arguments, producer=producer, publisher=Publisher()
+        )
+        assert events == ["published", "lease_exit"]
+    assert staging.is_dir(), "only the outer locked owner may clean its staging root"
 
 
 @pytest.mark.asyncio

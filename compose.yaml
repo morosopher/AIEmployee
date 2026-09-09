@@ -213,17 +213,128 @@ services:
       BACKUP_DIR: /backups
       BACKUP_RCLONE_REMOTE: "${BACKUP_RCLONE_REMOTE:-}"
       PGHOST: postgres
-      PGUSER: ai_employee_app
       PGDATABASE: "${POSTGRES_DB:-ai_employee}"
+      DATABASE_URL: "postgresql+psycopg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
       BACKUP_PASSPHRASE_FILE: /run/secrets/backup_passphrase
     secrets:
+      - postgres_bootstrap_password
       - app_database_password
       - backup_passphrase
     volumes:
       - "${BACKUP_DIR:-./var/backups}:/backups"
-    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec bash /app/scripts/backup-postgres.sh"]
+    command: ["bash", "/app/scripts/backup-postgres.sh"]
     depends_on:
       postgres:
+        condition: service_healthy
+
+  # 两类restore独立于backend-common，只有固定controller可读owner Secret；不自动迁移/重启业务。
+  postgres-restore:
+    image: *backend-image
+    profiles: ["operations"]
+    restart: "no"
+    pull_policy: never
+    environment:
+      APP_ENV: "${APP_ENV:-production}"
+      # 只读artifact与可写投影分离；CLI仍使用同一固定绝对路径，不接受环境作为授权。
+      RESTORE_STATE_DIR: /var/lib/ai-employee/restore-state
+      PGHOST: postgres
+      PGDATABASE: "${POSTGRES_DB:-ai_employee}"
+      DATABASE_URL: "postgresql+psycopg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
+      EXTERNAL_WRITES_ENABLED: "${EXTERNAL_WRITES_ENABLED:-false}"
+      GOOGLE_WRITES_ENABLED: "${GOOGLE_WRITES_ENABLED:-false}"
+      MICROSOFT_WRITES_ENABLED: "${MICROSOFT_WRITES_ENABLED:-false}"
+    secrets:
+      - postgres_bootstrap_password
+      - app_database_password
+      - retention_database_password
+      - backup_passphrase
+    volumes:
+      - "${BACKUP_DIR:-./var/backups}:/backups:ro"
+      - "${RESTORE_STATE_DIR:-./var/restore-state}:/var/lib/ai-employee/restore-state"
+    command: ["bash", "/app/scripts/restore-postgres.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  calendar-aad-restore-0018:
+    # 全零默认值不可运行，只为未使用operations profile时允许解析；host必须注入实际匹配ID。
+    image: "${CALENDAR_AAD_RESTORE_IMAGE_ID:-sha256:0000000000000000000000000000000000000000000000000000000000000000}"
+    profiles: ["operations"]
+    restart: "no"
+    pull_policy: never
+    environment:
+      APP_ENV: "${APP_ENV:-production}"
+      RESTORE_STATE_DIR: /var/lib/ai-employee/restore-state
+      PGHOST: postgres
+      PGDATABASE: "${POSTGRES_DB:-ai_employee}"
+      DATABASE_URL: "postgresql+psycopg://ai_employee_owner@postgres:5432/${POSTGRES_DB:-ai_employee}"
+      EXTERNAL_WRITES_ENABLED: "${EXTERNAL_WRITES_ENABLED:-false}"
+      GOOGLE_WRITES_ENABLED: "${GOOGLE_WRITES_ENABLED:-false}"
+      MICROSOFT_WRITES_ENABLED: "${MICROSOFT_WRITES_ENABLED:-false}"
+    secrets:
+      - postgres_bootstrap_password
+      - app_database_password
+      - retention_database_password
+      - backup_passphrase
+    volumes:
+      - "${BACKUP_DIR:-./var/backups}:/backups:ro"
+      - "${RESTORE_STATE_DIR:-./var/restore-state}:/var/lib/ai-employee/restore-state"
+    command: ["bash", "/app/scripts/restore-calendar-aad-0018.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # legacy的资源名/labels/Secret路径由已fsync registry生成；只接项目私有internal网络和空卷。
+  legacy-conversion-postgres:
+    image: docker.io/library/postgres:17.5-alpine
+    # 仅初始化本次私有空卷；官方入口随后降为postgres用户，不挂载宿主或workspace数据卷。
+    user: "0:0"
+    profiles: ["legacy-conversion"]
+    restart: "no"
+    container_name: "${LEGACY_PROJECT_NAME:-aiemployee-legacy-unconfigured}-postgres"
+    environment:
+      POSTGRES_USER: ai_employee_owner
+      POSTGRES_DB: ai_employee_legacy_conversion
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_bootstrap_password
+    secrets:
+      - source: legacy_database_password
+        target: postgres_bootstrap_password
+    networks: [legacy_conversion]
+    volumes: ["legacy_conversion_data:/var/lib/postgresql/data"]
+    labels: &legacy-labels
+      com.ai-employee.maintenance.kind: legacy_conversion
+      com.ai-employee.maintenance.attempt: "${LEGACY_ATTEMPT_ID:-unconfigured}"
+      com.ai-employee.maintenance.created_at: "${LEGACY_CREATED_AT:-unconfigured}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_employee_owner -d ai_employee_legacy_conversion"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  legacy-backup-converter:
+    image: *backend-image
+    profiles: ["legacy-conversion"]
+    restart: "no"
+    container_name: "${LEGACY_PROJECT_NAME:-aiemployee-legacy-unconfigured}-converter"
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://ai_employee_owner@legacy-conversion-postgres:5432/ai_employee_legacy_conversion
+      BACKUP_DIR: /backups
+    secrets:
+      - source: legacy_database_password
+        target: postgres_bootstrap_password
+      - source: legacy_database_password
+        target: app_database_password
+      - source: legacy_database_password
+        target: retention_database_password
+      - backup_passphrase
+    networks: [legacy_conversion]
+    labels: *legacy-labels
+    volumes:
+      - "${BACKUP_DIR:-./var/backups}:/backups"
+    command: ["/app/backend/.venv/bin/python", "/app/scripts/legacy-backup-operations.py", "isolated"]
+    depends_on:
+      legacy-conversion-postgres:
         condition: service_healthy
 
   prometheus:
@@ -260,9 +371,21 @@ volumes:
   caddy_config:
   prometheus_data:
   grafana_data:
+  legacy_conversion_data:
+    name: "${LEGACY_PROJECT_NAME:-aiemployee-legacy-unconfigured}-postgres-data"
+    labels: *legacy-labels
+
+networks:
+  legacy_conversion:
+    name: "${LEGACY_PROJECT_NAME:-aiemployee-legacy-unconfigured}-internal"
+    internal: true
+    labels: *legacy-labels
 
 # 生产 Secret 必须由部署平台预先创建；Compose 仅以只读文件形式挂入相应容器。
 secrets:
+  legacy_database_password:
+    # 仅临时registry拥有的文件，默认不存在；不复用workspace数据库Secret或数据卷。
+    file: "${LEGACY_DATABASE_SECRET_PATH:-./var/backups/.legacy-conversion-registry/unconfigured.secret}"
   postgres_bootstrap_password:
     external: true
   app_database_password:

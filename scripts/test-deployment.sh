@@ -2,6 +2,52 @@
 # 验证生产编排、数据库权限和可观测性入口的最小部署契约，不连接外部账号或生产资源。
 set -euo pipefail
 
+# Task27D完整operations profile的真实Compose渲染必须保持三个独立身份边界。
+# 检查只读取配置元数据，任何断言都不回显完整配置或Secret内容。
+check_database_operations_profiles() (
+  unset EXTERNAL_WRITES_ENABLED GOOGLE_WRITES_ENABLED MICROSOFT_WRITES_ENABLED
+  unset RESTORE_STATE_DIR CALENDAR_AAD_RESTORE_IMAGE_ID
+  docker compose --env-file /dev/null -f compose.yaml --profile '*' config --format json | python3 -c '
+import json, sys
+config = json.load(sys.stdin)
+services = config["services"]
+fixed_state = "/var/lib/ai-employee/restore-state"
+for name, script in (("postgres-restore", "restore-postgres.sh"), ("calendar-aad-restore-0018", "restore-calendar-aad-0018.sh")):
+    service = services[name]
+    assert service["profiles"] == ["operations"], "restore profile boundary"
+    assert set(service["depends_on"]) == {"postgres"}, "restore starts a general consumer"
+    assert service["command"] == ["bash", "/app/scripts/" + script], "restore fixed executable"
+    environment = service["environment"]
+    assert environment["RESTORE_STATE_DIR"] == fixed_state, "fixed container state missing"
+    assert "PGUSER" not in environment and "PGPASSWORD" not in environment, "broad credential environment"
+    assert all(environment[key] == "false" for key in ("EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED")), "restore write switches"
+    mounts = {item["target"]: item for item in service["volumes"]}
+    assert set(mounts) == {"/backups", fixed_state}, "restore executable mount"
+    assert mounts["/backups"]["read_only"] is True, "backup must be read only"
+    assert not mounts[fixed_state].get("read_only", False), "state must be writable"
+    assert mounts[fixed_state]["source"].endswith("/var/restore-state"), "development state default"
+    assert {item["source"] for item in service["secrets"]} == {"postgres_bootstrap_password", "app_database_password", "retention_database_password", "backup_passphrase"}, "restore exact Secret boundary"
+for name in ("api", "worker", "scheduler"):
+    assert "postgres_bootstrap_password" not in {item["source"] for item in services[name]["secrets"]}, "ordinary consumer owner Secret"
+backup = services["backup"]
+assert backup["command"] == ["bash", "/app/scripts/backup-postgres.sh"], "backup fixed controller"
+assert "PGUSER" not in backup["environment"] and "PGPASSWORD" not in backup["environment"], "backup broad owner credential"
+assert {item["source"] for item in backup["secrets"]} == {"postgres_bootstrap_password", "app_database_password", "backup_passphrase"}, "backup exact Secret boundary"
+for name in ("legacy-conversion-postgres", "legacy-backup-converter"):
+    service = services[name]
+    assert service["profiles"] == ["legacy-conversion"], "legacy profile"
+    assert set(service["networks"]) == {"legacy_conversion"}, "legacy workspace network"
+    assert not service.get("ports"), "legacy published port"
+    assert service["labels"]["com.ai-employee.maintenance.kind"] == "legacy_conversion", "legacy labels"
+    assert set(service["labels"]) == {"com.ai-employee.maintenance.kind", "com.ai-employee.maintenance.attempt", "com.ai-employee.maintenance.created_at"}, "legacy exact labels"
+assert config["networks"]["legacy_conversion"]["internal"] is True, "legacy private network"
+assert services["legacy-conversion-postgres"]["user"] == "0:0", "legacy volume bootstrap user"
+assert services["legacy-conversion-postgres"]["volumes"][0]["source"] == "legacy_conversion_data", "legacy workspace volume"
+assert config["secrets"]["legacy_database_password"]["file"].endswith("/.legacy-conversion-registry/unconfigured.secret"), "legacy generated Secret default"
+print("database operations profile contracts ok")
+'
+)
+
 # 四个真实 API 启动命令均必须关闭原始 request-target 日志；注释中的 flag 不算证据。
 for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just scripts/run-e2e-backend.sh; do
   if ! grep -Eq -- '^[[:space:]]*(command:|uv run).*uvicorn.*--no-access-log' "${api_entry}"; then
@@ -122,6 +168,7 @@ overridden_development_config="$(
   render_overridden_compose -f compose.yaml -f compose.dev.yaml
 )"
 render_default_compose -f compose.yaml --profile observability >/dev/null
+check_database_operations_profiles
 
 # 只检查渲染后的非秘密开关、Secret 名称与挂载路径，不读取或输出任何 Secret 文件内容。
 rendered_service_config() {

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_employee.application.use_cases.calendar_aad_recovery import (
@@ -164,12 +164,11 @@ class SqlAlchemyCalendarAadRecoveryStore:
         self._session = session
 
     async def marked_pairs(self) -> tuple[CalendarAadPair, ...]:
-        """仅扫描 0019 的非目录 marker；LEFT JOIN 保留损坏 owner/目录以 fail closed。"""
-        if (
-            await self._session.scalar(text("SELECT version_num FROM alembic_version"))
-            != "20260809_0019"
-        ):
-            raise CalendarAadRolloutError("calendar_aad_revision_mismatch")
+        """仅由typed CurrentGuard包围的调用方扫描非目录marker，保留坏owner/目录以拒绝。
+
+        revision由固定one-off的owner RR/RO完整事实读取证明；应用基线无版本表权限。
+        本store只提供app业务查询/锁定/CAS，不接收缓存revision或owner连接。
+        """
         rows = await self._session.execute(
             select(
                 SyncCursorModel.connection_id,

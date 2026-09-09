@@ -8,11 +8,12 @@ fragment；owner/app/retention Secret 只从普通文件读取，并在进程内
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
 import stat
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -23,11 +24,17 @@ from urllib.parse import unquote, urlsplit
 from alembic.config import Config
 from alembic.util.exc import CommandError
 from pydantic import SecretStr
-from sqlalchemy import URL, create_engine
+from sqlalchemy import URL, Connection, create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
 
+from ai_employee.application.use_cases.calendar_aad_rollout import (
+    CalendarAadFacts,
+    CalendarAadRevision,
+    CalendarAadRolloutError,
+)
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.alembic import (
     load_published_alembic_authority,
     run_alembic_upgrade_on_connection,
@@ -36,6 +43,11 @@ from ai_employee.infrastructure.db.database_access import BootstrapCaller
 from ai_employee.infrastructure.db.database_maintenance import (
     DatabaseMaintenanceInvariantError,
     ProtectedResetPolicy,
+    ReadOnlyMaintenanceHolder,
+    RestoreClaim,
+    RestoreCompletionAckUnknown,
+    RestoreEvidenceStore,
+    RestoreFingerprint,
     SqlAlchemyDatabaseMaintenanceContext,
     migrate_database,
     reset_then_migrate,
@@ -396,6 +408,151 @@ def _open_maintenance_context(
     finally:
         target_engine.dispose()
         management_engine.dispose()
+
+
+class CalendarAadOwnerFactsReader:
+    """固定calendar one-off专用的短owner读取器；绝不把连接交给应用或provider。
+
+    每次独立读取取得management→target→schema，验证baseline后执行一整个新RR/RO
+    facts读取；借用backup/audit持有者时复用其同一物理连接，不建立第二个锁竞争者。
+    endpoint/Secret路径仅存在于该CLI组合对象，调用方只能取得CalendarAadFacts。
+    """
+
+    def __init__(
+        self,
+        endpoint: DatabaseEndpoint,
+        owner_password_file: Path,
+        *,
+        holder: ReadOnlyMaintenanceHolder | None = None,
+    ) -> None:
+        """保存固定目标和Secret文件；构造不读Secret，实际每次读取才建立受控资源。"""
+        self._endpoint = endpoint
+        self._password_file = owner_password_file
+        self._holder = holder
+
+    @classmethod
+    def from_environment(cls) -> CalendarAadOwnerFactsReader:
+        """只从现有passwordless应用endpoint派生同库固定owner，不接受新的连接来源。"""
+        app = _load_database_endpoint()
+        if app.owner_role != "ai_employee_app":
+            raise CalendarAadRolloutError("calendar_aad_owner_facts_invalid")
+        return cls(
+            DatabaseEndpoint(app.host, app.port, "ai_employee_owner", app.database_name),
+            Path("/run/secrets/postgres_bootstrap_password"),
+        )
+
+    async def read_facts(self, *, expected_revision: CalendarAadRevision) -> CalendarAadFacts:
+        """等待自己拥有的完整读取线程结束；取消不遗留owner事务或延长旧快照。"""
+        return await await_calendar_aad_resource(
+            asyncio.create_task(asyncio.to_thread(self._read, expected_revision))
+        )
+
+    def _read(self, expected_revision: CalendarAadRevision) -> CalendarAadFacts:
+        """完整revision/pair/expiry读取只发生在实际owner RR/RO中，退出后才交付事实。"""
+        from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
+            read_calendar_aad_facts,
+        )
+
+        def read(connection: Connection) -> CalendarAadFacts:
+            state = connection.execute(
+                text(
+                    "SELECT current_user,session_user,current_database(),"
+                    "current_setting('transaction_read_only'),"
+                    "current_setting('transaction_isolation')"
+                )
+            ).one()
+            if tuple(state) != (
+                self._endpoint.owner_role,
+                self._endpoint.owner_role,
+                self._endpoint.database_name,
+                "on",
+                "repeatable read",
+            ):
+                raise CalendarAadRolloutError("calendar_aad_owner_facts_invalid")
+            return read_calendar_aad_facts(connection, expected_revision=expected_revision)
+
+        if self._holder is not None:
+            self._holder.assert_idle()
+            return self._holder.read_only(read)
+        with (
+            _open_maintenance_context(
+                MigrateArguments(self._password_file), self._endpoint
+            ) as context,
+            context.acquire_management_lifecycle_lock() as management,
+            management.acquire_target_lock() as target,
+            target.acquire_schema_lifecycle_lock(),
+            target.read_only_holder() as holder,
+        ):
+            return holder.read_only(read)
+
+
+def run_restore_maintenance(
+    *,
+    endpoint: DatabaseEndpoint,
+    owner_password_file: Path,
+    claim: RestoreClaim,
+    dump: Path,
+    reader: Callable[[Connection], RestoreFingerprint],
+    verifier: Callable[[Connection, RestoreFingerprint], None],
+    evidence: RestoreEvidenceStore,
+    consumer_environment: Mapping[str, str],
+    host_guard: Callable[[], None],
+    approve_call_ordinal: int | None = None,
+    approve_reopen_ordinal: int | None = None,
+) -> str:
+    """generic/sealed共用既有owner生命周期；只在最终COMMIT未知后新建session核对。
+
+    Args:
+        endpoint: 已通过纯文件/镜像/宿主校验的唯一passwordless目标。
+        owner_password_file: 固定只读bootstrap Secret文件，不进入generator环境。
+        claim: manifest精确kind/source/revision/fingerprint绑定。
+        dump: 私有解密目录中的单一native dump。
+        reader: 完整内容无关fingerprint reader，始终由持有者控制事务。
+        verifier: 操作选定的同session app READ ONLY验证回调。
+        evidence: 独立state-v4投影存储，不提供admission或重试授权。
+        consumer_environment: 只给固定psql consumer的进程内连接参数。
+        host_guard: 重查stopped-services/三开关的宿主握手，不替代数据库事实。
+        approve_call_ordinal: 操作者明确批准的下一个真实恢复调用序号。
+        approve_reopen_ordinal: 操作者明确批准的下一个最终提交序号。
+
+    Returns:
+        完成、未应用或人工处置的固定结果码；任何未知ACK均禁止盲目重放。
+    """
+    arguments = MigrateArguments(owner_password_file)
+    host_guard()
+    try:
+        with (
+            _open_maintenance_context(arguments, endpoint) as context,
+            context.acquire_management_lifecycle_lock() as management,
+            management.acquire_restore_target_lock(claim) as target,
+            target.acquire_schema_lifecycle_lock(),
+            target.restore_holder(claim) as holder,
+        ):
+            host_guard()
+            return holder.execute(
+                dump=dump,
+                reader=reader,
+                verifier=verifier,
+                evidence=evidence,
+                consumer_environment=consumer_environment,
+                approve_call_ordinal=approve_call_ordinal,
+                approve_reopen_ordinal=approve_reopen_ordinal,
+                before_stream=host_guard,
+            )
+    except RestoreCompletionAckUnknown as unknown:
+        # 原context及两条物理session均已退出，不能让连接池或调用者anchor复用旧授权。
+        host_guard()
+        try:
+            with (
+                _open_maintenance_context(arguments, endpoint) as context,
+                context.acquire_management_lifecycle_lock() as management,
+                management.acquire_restore_target_lock(claim) as target,
+                target.acquire_schema_lifecycle_lock(),
+                target.restore_holder(claim) as holder,
+            ):
+                return holder.reconcile_completion_ack(unknown, evidence)
+        except DatabaseMaintenanceInvariantError:
+            return "restore_needs_attention"
 
 
 def main(arguments: Sequence[str] | None = None) -> int:

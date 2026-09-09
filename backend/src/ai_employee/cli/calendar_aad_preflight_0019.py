@@ -21,12 +21,14 @@ from ai_employee.application.use_cases.calendar_aad_rollout import (
     CalendarAadRolloutError,
     serialize_rollout_artifact,
 )
+from ai_employee.cli.database_maintenance import CalendarAadOwnerFactsReader
 from ai_employee.config import Settings
 from ai_employee.domain.errors import DomainError
 from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
 from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
     CalendarAadArtifactFile,
     CalendarAadCurrentGuard,
+    CalendarAadFactsReader,
     SqlAlchemyCalendarAadPreflightRepository,
     async_calendar_aad_rollout_lease,
 )
@@ -91,6 +93,7 @@ async def run_preflight(
     clock: Callable[[], datetime],
     task_timeout_seconds: float = 900,
     step_timeout_seconds: float = 300,
+    facts_reader: CalendarAadFactsReader | None = None,
 ) -> CalendarAadArtifact:
     """取得固定 lease 后才读取 artifact，组合应用用例并在当前 guard 下原子发布。
 
@@ -111,7 +114,9 @@ async def run_preflight(
             existing = await await_calendar_aad_resource(
                 asyncio.create_task(asyncio.to_thread(artifact_file.read_optional))
             )
-            repository = SqlAlchemyCalendarAadPreflightRepository(sessions)
+            repository = SqlAlchemyCalendarAadPreflightRepository(
+                sessions, facts_reader=facts_reader
+            )
             artifact = await CalendarAadPreflightUseCase(
                 store=repository,
                 coordinator=coordinator,
@@ -166,6 +171,7 @@ async def _run(
             clock=clock,
             task_timeout_seconds=settings.task_timeout_seconds,
             step_timeout_seconds=settings.task_step_timeout_seconds,
+            facts_reader=CalendarAadOwnerFactsReader.from_environment(),
         )
     finally:
         await sessions.dispose()

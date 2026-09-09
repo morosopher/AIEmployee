@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import URL, Connection, create_engine, select, text
@@ -135,15 +136,31 @@ def read_calendar_aad_facts(
     return CalendarAadFacts(expected_revision, tuple(pairs), tuple(sorted(expiries.items())))
 
 
+class CalendarAadFactsReader(Protocol):
+    """固定one-off只读事实端口；仅交付typed facts，不向业务层交付owner资源。"""
+
+    async def read_facts(self, *, expected_revision: CalendarAadRevision) -> CalendarAadFacts:
+        """每次读取必须覆盖同一新RR/RO快照中的revision、affected pair和expiry。"""
+        ...
+
+
 class SqlAlchemyCalendarAadPreflightRepository:
     """每次以新短只读事务加载事实，不让先前 token/expiry 缓存延长 rollout。"""
 
-    def __init__(self, sessions: ManagedAsyncSessionMaker) -> None:
-        """保存由调用方负责释放的进程级会话工厂。"""
+    def __init__(
+        self,
+        sessions: ManagedAsyncSessionMaker,
+        *,
+        facts_reader: CalendarAadFactsReader | None = None,
+    ) -> None:
+        """保存应用会话工厂；固定维护组合根可单独注入不提供写接口的owner facts端口。"""
         self._sessions = sessions
+        self._facts_reader = facts_reader
 
     async def read_facts(self, *, expected_revision: CalendarAadRevision) -> CalendarAadFacts:
         """重新查询当前完整 affected set，事务结束后才允许 provider I/O。"""
+        if self._facts_reader is not None:
+            return await self._facts_reader.read_facts(expected_revision=expected_revision)
         async with self._sessions() as session, session.begin():
             await session.execute(
                 text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
