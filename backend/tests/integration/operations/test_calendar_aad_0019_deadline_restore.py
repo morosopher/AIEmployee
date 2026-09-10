@@ -145,6 +145,166 @@ async def test_calendar_aad_backup_cancellation_waits_for_producer_cleanup(aad_o
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage,foreign_replacement",
+    (("body", False), ("body", True), ("final_exit", False)),
+)
+async def test_calendar_aad_group_compensation_keeps_real_revision_lease(
+    aad_oauth, tmp_path, monkeypatch, failure_stage, foreign_replacement
+):
+    """真实revision锁竞争和三件套文件补偿区分body失效与final-exit特许窗口。
+
+    publisher只提供本例合成dump/manifest；发布、精确receipt删除、原guard和PG lease均
+    执行产品实现。body截止线失效后必须持锁收齐补偿；外来替换保留且其他成员仍撤回。
+    """
+    import os
+    from contextlib import asynccontextmanager
+
+    from ai_employee.cli import calendar_aad_backup_0019 as backup
+    from ai_employee.infrastructure.db.postgres_backup_manifest import (
+        OPERATIONS_EXECUTABLES,
+        BackupManifest,
+        discard_backup_publication,
+        publish_backup_group,
+        write_backup_group,
+    )
+    from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
+        calendar_aad_rollout_lease,
+    )
+
+    sessions, _, _, _ = aad_oauth
+    await seed_pair(sessions)
+    await run_fixture(aad_oauth, tmp_path)
+    staging = tmp_path / "owned-staging"
+    staging.mkdir(mode=0o700)
+    target = tmp_path / f"{BASENAME}.dump.enc"
+    clock = [NOW]
+    observations = []
+    receipts = []
+    first_failures = []
+    exit_failure = OSError("synthetic final revision exit failure")
+    original_lease = backup.async_calendar_aad_rollout_lease
+    original_verify = backup.CalendarAadCurrentGuard.verify
+
+    @asynccontextmanager
+    async def observed_lease(url):
+        """只在真实物理lease退出后记录边界；final-exit首错不假称仍持有该锁。"""
+        try:
+            async with original_lease(url) as lease:
+                yield lease
+        finally:
+            observations.append("lease_exited")
+        if failure_stage == "final_exit":
+            raise exit_failure
+
+    async def observe_guard(guard):
+        try:
+            return await original_verify(guard)
+        except CalendarAadRolloutError as error:
+            first_failures.append(error)
+            raise
+
+    monkeypatch.setattr(backup, "async_calendar_aad_rollout_lease", observed_lease)
+    monkeypatch.setattr(backup.CalendarAadCurrentGuard, "verify", observe_guard)
+
+    class Publisher:
+        """采用真实三件套原语；receipt返回后才越过截止线，精确命中最后body guard。"""
+
+        staging_root = staging
+
+        async def publish(self, staged, target, guard):
+            await guard.verify()
+
+            def publish_files():
+                data = staged.read_bytes()
+                write_backup_group(
+                    staged,
+                    BackupManifest(
+                        staged.name,
+                        "2030-01-01T00:00:00.000000Z",
+                        "17.6",
+                        "20260809_0018",
+                        hashlib.sha256(data).hexdigest(),
+                        len(data),
+                        staged.name + ".sha256",
+                        IMAGE,
+                        {"release_version": "0.1.0-synthetic"},
+                        "a" * 64,
+                        {name: "b" * 64 for name in OPERATIONS_EXECUTABLES},
+                    ),
+                )
+                return publish_backup_group(staged, target.parent)
+
+            receipt = await asyncio.to_thread(publish_files)
+            assert len(receipt.members) == 3
+            receipts.append(receipt)
+            observations.append("published")
+            if foreign_replacement:
+                foreign = tmp_path / "foreign-member"
+                foreign.write_bytes(b"synthetic-foreign-file")
+                foreign.chmod(0o600)
+                os.replace(foreign, target)
+            if failure_stage == "body":
+                clock[0] = NOW + timedelta(minutes=45)
+            return receipt
+
+        async def discard(self, receipt):
+            def discard_files():
+                """物理PG竞争结果与文件最终状态共同证明补偿时机，不从调用计数猜测锁。"""
+                if failure_stage == "body":
+                    with (
+                        pytest.raises(CalendarAadRolloutError) as caught,
+                        calendar_aad_rollout_lease(sessions.engine.url),
+                    ):
+                        pytest.fail("body compensation released the revision lease")
+                    assert caught.value.error_code == "calendar_aad_rollout_locked"
+                else:
+                    with calendar_aad_rollout_lease(sessions.engine.url) as lease:
+                        lease.verify_owned()
+                observations.append("discard")
+                try:
+                    discard_backup_publication(receipt)
+                finally:
+                    # marker与checksum必须收齐；外来dump不能借本次receipt删除。
+                    assert not target.with_name(target.name + ".manifest.json").exists()
+                    assert not target.with_name(target.name + ".sha256").exists()
+                    assert target.exists() is foreign_replacement
+
+            await asyncio.to_thread(discard_files)
+
+    async def producer(path):
+        await asyncio.to_thread(path.write_bytes, b"synthetic-encrypted-dump")
+        await asyncio.to_thread(path.chmod, 0o600)
+
+    with pytest.raises(CalendarAadRolloutError if failure_stage == "body" else OSError) as caught:
+        await backup.run_guarded_backup(
+            sessions=sessions,
+            backup_directory=tmp_path,
+            basename=BASENAME,
+            immutable_image_id=IMAGE,
+            clock=lambda: clock[0],
+            producer=producer,
+            publisher=Publisher(),
+        )
+    assert len(receipts) == 1
+    if failure_stage == "body":
+        assert caught.value is first_failures[0]
+        assert caught.value.error_code == "calendar_aad_rollout_deadline_exceeded"
+        assert observations == ["published", "discard", "lease_exited"]
+    else:
+        assert caught.value is exit_failure
+        assert observations == ["published", "lease_exited", "discard"]
+    if foreign_replacement:
+        # precheck已知为外来成员时按既有协议跳过；只有捕获后身份漂移才产生cleanup错误。
+        assert caught.value.__cause__ is None
+        assert target.read_bytes() == b"synthetic-foreign-file"
+    else:
+        assert not list(tmp_path.glob("*.dump.enc*"))
+    async with original_lease(sessions.engine.url) as lease:
+        await lease.assert_owned()
+
+
+@pytest.mark.asyncio
 async def test_calendar_aad_migration_guard_rejects_changed_original_artifact(aad_oauth, tmp_path):
     """两个 frozen phase 必须绑定同一原始 artifact；同 image 的新合法 JSON 也不是延期许可。"""
     from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadBinding

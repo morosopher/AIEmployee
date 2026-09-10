@@ -15,8 +15,11 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from ai_employee.infrastructure.calendar_aad_resources import await_calendar_aad_resource
+
 _CHUNK_BYTES = 64 * 1024
 _SHUTDOWN_SECONDS = 5
+_CONTROL_POLL_SECONDS = 0.05
 _GENERATOR_ENVIRONMENT_KEYS = frozenset({"PATH", "LANG", "LC_ALL", "TZ"})
 
 # --single-transaction 只有配合 -f/-c 才适用；显式 --file=- 让 stdin 也属于该事务。
@@ -125,13 +128,19 @@ class RestoreConsumerProof:
             and self._sql_bytes == 0
         )
 
-    async def _write(self, value: bytes) -> None:
-        """仅由 started 后的 controller 调用；先计数以免 write 后异常丢失 byte 证据。"""
+    async def _write(
+        self,
+        value: bytes,
+        assert_control_live: Callable[[], Awaitable[None]],
+        consumer_exit: asyncio.Task[int] | None = None,
+    ) -> None:
+        """每笔供流前重证原control，drain阻塞时持续监督；先计数以保留失败byte证据。"""
+        await assert_control_live()
         if self._writer is None or self._writer.is_closing():
             raise BrokenPipeError("restore consumer pipe is closed")
         self._sql_bytes += len(value)
         self._writer.write(value)
-        await self._writer.drain()
+        await _await_with_control(self._writer.drain(), assert_control_live, consumer_exit)
 
 
 async def _stop_child(process: asyncio.subprocess.Process) -> None:
@@ -169,21 +178,48 @@ async def _cleanup_children(
         raise failure
 
 
-async def _read_while_consumer_lives(
-    source: asyncio.StreamReader,
-    consumer_exit: asyncio.Task[int],
-) -> bytes:
-    """同时监督 stdout 与 consumer，避免 consumer 已死时等一个永不 EOF 的 generator。"""
-    reading = asyncio.create_task(source.read(_CHUNK_BYTES))
+async def _await_with_control[T](
+    operation: Awaitable[T],
+    assert_control_live: Callable[[], Awaitable[None]],
+    consumer_exit: asyncio.Task[int] | None = None,
+) -> T:
+    """在每个有界等待及成功返回边界重证control，失效后取消并收齐本次waiter。
+
+    operation只承载本调用拥有的异步等待；spawn传入shield以保留已开始child的归属。
+    同步holder检查由调用方串行移交线程，不在event loop执行，也不与登记SQL并发。
+    已失败的operation保留首错；成功结果必须通过本次活性检查才可进入下一写阶段。
+    """
+    pending = asyncio.ensure_future(operation)
+    watched = (pending,) if consumer_exit is None else (pending, consumer_exit)
+    failure: BaseException | None = None
     try:
-        done, _ = await asyncio.wait((reading, consumer_exit), return_when=asyncio.FIRST_COMPLETED)
-        if consumer_exit in done:
-            raise BrokenPipeError("restore consumer exited before stream completion")
-        return reading.result()
+        while True:
+            done, _ = await asyncio.wait(
+                watched, timeout=_CONTROL_POLL_SECONDS, return_when=asyncio.FIRST_COMPLETED
+            )
+            if pending in done and (pending.cancelled() or pending.exception() is not None):
+                return pending.result()
+            await assert_control_live()
+            if consumer_exit is not None and consumer_exit in done:
+                raise BrokenPipeError("restore consumer exited before stream completion")
+            if pending in done:
+                return pending.result()
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        if not reading.done():
-            reading.cancel()
-        await asyncio.gather(reading, return_exceptions=True)
+        if not pending.done():
+            pending.cancel()
+
+        async def collect() -> None:
+            await asyncio.gather(pending, return_exceptions=True)
+
+        try:
+            await await_calendar_aad_resource(asyncio.create_task(collect()))
+        except BaseException as cleanup_failure:
+            if failure is not None:
+                raise failure from cleanup_failure
+            raise
 
 
 async def execute_restore_stream(
@@ -191,6 +227,7 @@ async def execute_restore_stream(
     *,
     consumer_environment: Mapping[str, str],
     establish_started: Callable[[RestoreConsumerProof], Awaitable[None]],
+    assert_control_live: Callable[[], Awaitable[None]],
     spawn: _Spawner = asyncio.create_subprocess_exec,
 ) -> RestoreStreamResult:
     """在 started 屏障后执行有完成 guard 的 pg_restore→psql 流。
@@ -199,6 +236,7 @@ async def execute_restore_stream(
         request: 已批准单次 ordinal 的无 Secret 输入。
         consumer_environment: 只给 psql 的固定 target/owner 凭据环境；不会复制给 generator。
         establish_started: 同一 owner holder 登记 backend、CAS started 和 fsync 的回调。
+        assert_control_live: 绑定原物理holder和全部锁的串行异步检查；不得静默重连。
         spawn: 默认为真实 subprocess；测试仅替换最外层进程启动。
 
     Returns:
@@ -222,8 +260,20 @@ async def execute_restore_stream(
     }
     children: list[asyncio.Task[asyncio.subprocess.Process]] = []
     first_failure: BaseException | None = None
+    control_failure: BaseException | None = None
     result: RestoreStreamResult | None = None
+
+    async def check_control() -> None:
+        """区分control失效与child pipe错误；相同异常类型也不能被降格为可核对流结果。"""
+        nonlocal control_failure
+        try:
+            await assert_control_live()
+        except BaseException as error:
+            control_failure = error
+            raise
+
     try:
+        await check_control()
         creation = asyncio.create_task(
             spawn(
                 "psql",
@@ -240,14 +290,14 @@ async def execute_restore_stream(
             )
         )
         children.append(creation)
-        consumer = await asyncio.shield(creation)
+        consumer = await _await_with_control(asyncio.shield(creation), check_control)
         proof = RestoreConsumerProof(consumer, request.application_name)
         if not proof.owns_unfed_pipe():
             raise RestoreStreamInvariantError("restore consumer pipe ownership is invalid")
-        await establish_started(proof)
+        await _await_with_control(establish_started(proof), check_control)
         if not proof.owns_unfed_pipe():
             raise RestoreStreamInvariantError("restore consumer start fence is invalid")
-        await proof._write(_PRELUDE)
+        await proof._write(_PRELUDE, check_control)
         creation = asyncio.create_task(
             spawn(
                 "pg_restore",
@@ -266,7 +316,7 @@ async def execute_restore_stream(
             )
         )
         children.append(creation)
-        generator = await asyncio.shield(creation)
+        generator = await _await_with_control(asyncio.shield(creation), check_control)
         if generator.stdout is None:
             raise RestoreStreamInvariantError("restore generator stdout is unavailable")
         trailer_sent = False
@@ -274,16 +324,23 @@ async def execute_restore_stream(
         generator_exit: int | None = None
         consumer_exit: int | None = None
         try:
-            while chunk := await _read_while_consumer_lives(generator.stdout, consumer_exit_task):
-                await proof._write(chunk)
-            generator_exit = await generator.wait()
+            while chunk := await _await_with_control(
+                generator.stdout.read(_CHUNK_BYTES), check_control, consumer_exit_task
+            ):
+                await proof._write(chunk, check_control, consumer_exit_task)
+            generator_exit = await _await_with_control(
+                generator.wait(), check_control, consumer_exit_task
+            )
             if generator_exit == 0:
-                await proof._write(_TRAILER)
+                # EOF和exit=0不代表control仍持锁；trailer是允许提交的独立写边界。
+                await proof._write(_TRAILER, check_control, consumer_exit_task)
                 trailer_sent = True
             if consumer.stdin is not None:
                 consumer.stdin.close()
-            consumer_exit = await consumer_exit_task
+            consumer_exit = await _await_with_control(consumer_exit_task, check_control)
         except (BrokenPipeError, ConnectionResetError):
+            if control_failure is not None:
+                raise
             await _stop_child(generator)
             await _stop_child(consumer)
             generator_exit = generator.returncode

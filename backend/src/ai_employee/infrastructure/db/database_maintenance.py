@@ -3126,6 +3126,17 @@ class RestoreMaintenanceHolder(_OperationsHolder):
             self._verify_inventory(following)
             self.assert_live()
         evidence.publish(following, "gate_established")
+        self._drain_gate_sessions()
+        return following
+
+    def _drain_gate_sessions(self) -> None:
+        """在已准入的gate下终止旧非owner会话，确认排空后才读取稳定恢复事实。
+
+        CONNECT撤销不影响既有认证；新建gate的投影/fsync失败也可能使排空尚未发生。
+        因此matching gate续接必须重新执行本步骤，不能从catalog phase推断它已完成。
+        仅操作本target内的非owner client backend；每次等待都保持原物理holder的锁证明。
+        """
+        self.assert_live()
         # gate事务不插入任何AuditEvent。现存客户端排空后，精确ACTIVE与safe-role检查
         # 才共同证明新runtime连接被拒；owner consumer将在独立登记步骤出现。
         self.connection.execute(
@@ -3139,6 +3150,7 @@ class RestoreMaintenanceHolder(_OperationsHolder):
         )
         _commit_read_transaction(self.connection)
         for _ in range(100):
+            self.assert_live()
             if not _has_active_non_owner_sessions(self.connection, target=self._target._target):
                 break
             _commit_read_transaction(self.connection)
@@ -3148,7 +3160,6 @@ class RestoreMaintenanceHolder(_OperationsHolder):
         if self._access().acl_profile is not DatabaseAclProfile.ACTIVE:
             _fail()
         _commit_read_transaction(self.connection)
-        return following
 
     def _backend_exited(self, call: _RestoreCallAuthority) -> bool:
         """以authority中的PID/start/database/role/app精确tuple证明旧backend退出。
@@ -3554,6 +3565,18 @@ class RestoreMaintenanceHolder(_OperationsHolder):
             call = self._call(facts)
             if call.phase is _RestoreCallPhase.RESTORE_BACKEND_STARTING:
                 # 进入execute的是新controller；只有当前stream的私有回调可继续starting。
+                # starting也必须通过完整三态准入才能CAS；单独合法的ACL或对象授权
+                # 不能为active gate授权。拒绝时仅写诊断投影，原catalog事故事实不变。
+                try:
+                    if self.admit() != facts:
+                        _fail()
+                except DatabaseMaintenanceInvariantError as failure:
+                    try:
+                        _rollback_open_transaction(self.connection)
+                    except BaseException as cleanup_failure:
+                        raise failure from cleanup_failure
+                    evidence.publish(facts, "restore_needs_attention")
+                    return "restore_needs_attention"
                 self._transition(
                     facts, self._advance(facts, _RestoreCallPhase.NEEDS_ATTENTION), evidence
                 )
@@ -3574,6 +3597,9 @@ class RestoreMaintenanceHolder(_OperationsHolder):
                 evidence.already_applied(self.target_identity_digest, self.claim, observed)
                 return "restore_already_applied"
             facts = self._establish_gate(facts, evidence)
+        elif self._call(facts).phase is _RestoreCallPhase.GATE_ESTABLISHED:
+            # gate commit与旧session排空不在同一事务；原controller可能在两者之间退出。
+            self._drain_gate_sessions()
         call = self._call(facts)
         if call.phase is _RestoreCallPhase.NEEDS_ATTENTION:
             evidence.publish(facts, "restore_needs_attention")
@@ -3605,15 +3631,36 @@ class RestoreMaintenanceHolder(_OperationsHolder):
             facts = self._start_call(facts, reader, evidence)
             call = self._call(facts)
             started_facts: list[DatabaseRestoreFacts] = []
+            control_lock = asyncio.Lock()
+            stream_control_lost = False
+
+            def check_stream_control() -> None:
+                """原session只读重证后结束autobegin；失效永远不能借重连恢复此调用。"""
+                nonlocal stream_control_lost
+                try:
+                    self.assert_live()
+                    _commit_read_transaction(self.connection)
+                except BaseException:
+                    stream_control_lost = True
+                    self._live = False
+                    raise
+
+            async def assert_stream_control_live() -> None:
+                """同步SQL退出event loop，且不能与尚在运行的backend登记共享连接。"""
+                async with control_lock:
+                    await await_calendar_aad_resource(
+                        asyncio.create_task(asyncio.to_thread(check_stream_control))
+                    )
 
             async def start(proof: RestoreConsumerProof) -> None:
-                started_facts.append(
-                    await await_calendar_aad_resource(
-                        asyncio.create_task(
-                            asyncio.to_thread(self._register_and_start, facts, proof, evidence)
+                async with control_lock:
+                    started_facts.append(
+                        await await_calendar_aad_resource(
+                            asyncio.create_task(
+                                asyncio.to_thread(self._register_and_start, facts, proof, evidence)
+                            )
                         )
                     )
-                )
                 if before_stream is not None:
                     await await_calendar_aad_resource(
                         asyncio.create_task(asyncio.to_thread(before_stream))
@@ -3623,17 +3670,27 @@ class RestoreMaintenanceHolder(_OperationsHolder):
             environment["PGAPPNAME"] = (
                 f"ai_employee_restore:{call.attempt_uuid}:{call.call_ordinal}"
             )
-            try:
-                asyncio.run(
-                    execute_restore_stream(
-                        RestoreStreamRequest(dump, UUID(call.attempt_uuid), call.call_ordinal),
-                        consumer_environment=environment,
-                        establish_started=start,
+            # stream首错（包括control失效与取消）优先于rollback；child已由stream完整收齐。
+            with _preserving_owned_cleanup(lambda: _rollback_open_transaction(self.connection)):
+                try:
+                    asyncio.run(
+                        execute_restore_stream(
+                            RestoreStreamRequest(dump, UUID(call.attempt_uuid), call.call_ordinal),
+                            consumer_environment=environment,
+                            establish_started=start,
+                            assert_control_live=assert_stream_control_live,
+                        )
                     )
-                )
-            finally:
-                # 不依据child exit推断成功；只在原control连接仍有效时读取catalog+backend。
-                _rollback_open_transaction(self.connection)
+                except BaseException as failure:
+                    if stream_control_lost and started_facts:
+                        # 失锁后禁止catalog CAS；仅将已提交的最后started事实投影为unknown。
+                        # 双child退出也不授权原controller读fingerprint或重放，交给新holder核对。
+                        try:
+                            evidence.publish(started_facts[-1], "restore_outcome_unknown")
+                        except BaseException as projection_failure:
+                            raise failure from projection_failure
+                    raise
+            # 不依据child exit推断成功；只在原control连接仍有效时读取catalog+backend。
             facts = self.read_facts()
             if not started_facts:
                 _fail()

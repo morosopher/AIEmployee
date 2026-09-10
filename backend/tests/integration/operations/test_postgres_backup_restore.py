@@ -1593,6 +1593,247 @@ def _restore_fixture(database_url: URL, tmp_path: Path, *, revision: str = "2026
 
 
 @pytest.mark.parametrize("kind", ("generic", "sealed_0018"))
+@pytest.mark.parametrize("posture", ("baseline", "active"))
+def test_starting_resume_requires_matching_database_acl_before_authority_cas(
+    empty_migration_database: URL, tmp_path: Path, monkeypatch, kind: str, posture: str
+) -> None:
+    """真实starting事实遇baseline漂移只能报告人工处置，不能借早返回绕过三态准入。
+
+    fixture通过原typed bootstrap/迁移和实际gate/start CAS建立；只对本例数据库注入
+    精确ACL漂移，保留完整ACTIVE对象授权。执行前后的catalog与实际SQL事件独立核对。
+    删除starting分支的admission检查会产生一条真实ALTER DATABASE，从而直接捕获SPEC-03。
+    """
+    from sqlalchemy import event
+
+    from ai_employee.cli import database_maintenance as cli
+    from ai_employee.cli.verify_restored_backup import read_restore_fingerprint
+    from ai_employee.infrastructure.db import database_maintenance as maintenance
+    from ai_employee.infrastructure.db.database_access import (
+        DatabaseAclProfile,
+        apply_restore_database_acl_transition,
+    )
+    from tests.integration.operations.test_database_maintenance_gate import (
+        _capture_sync_transactional_state,
+    )
+
+    endpoint, secret, expected, store, dump = _restore_fixture(
+        empty_migration_database,
+        tmp_path,
+        revision="20260809_0018" if kind == "sealed_0018" else "20260809_0019",
+    )
+    claim = maintenance.RestoreClaim(kind, "c" * 64, expected)
+    stream_calls: list[bool] = []
+    reads: list[bool] = []
+
+    async def forbidden_stream(*args, **kwargs):
+        stream_calls.append(True)
+        raise AssertionError("starting resume attempted to spawn a new stream")
+
+    def reader(connection):
+        reads.append(True)
+        return read_restore_fingerprint(connection)
+
+    monkeypatch.setattr(maintenance, "execute_restore_stream", forbidden_stream)
+    with (
+        cli._open_maintenance_context(cli.MigrateArguments(secret), endpoint) as context,
+        context.acquire_management_lifecycle_lock() as management,
+        management.acquire_restore_target_lock(claim) as target,
+        target.acquire_schema_lifecycle_lock(),
+        target.restore_holder(claim) as holder,
+    ):
+        holder.admit()
+        with holder.connection.begin():
+            holder.connection.execute(text("UPDATE users SET display_name='synthetic-pre-restore'"))
+        gate = holder._establish_gate(holder.admit(), store)
+        starting = holder._start_call(gate, read_restore_fingerprint, store)
+        if posture == "baseline":
+            with holder.connection.begin():
+                apply_restore_database_acl_transition(
+                    holder.connection,
+                    target_database_name=endpoint.database_name,
+                    snapshot=holder._access(),
+                    destination=DatabaseAclProfile.BASELINE,
+                )
+            with pytest.raises(maintenance.DatabaseMaintenanceInvariantError):
+                holder.admit()
+            holder.connection.rollback()
+        else:
+            holder.admit()
+        before = _capture_sync_transactional_state(holder.connection)
+        holder.connection.rollback()
+        mutations: list[str] = []
+
+        def observe(connection, cursor, statement, parameters, execution_context, executemany):
+            verb = statement.lstrip().split()[0].upper()
+            if verb in {
+                "ALTER",
+                "GRANT",
+                "REVOKE",
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "DROP",
+                "CREATE",
+                "TRUNCATE",
+            }:
+                mutations.append(verb)
+
+        event.listen(holder.connection, "before_cursor_execute", observe)
+        try:
+            result = holder.execute(
+                dump=dump,
+                reader=reader,
+                verifier=lambda *args: None,
+                evidence=store,
+                consumer_environment={},
+            )
+        finally:
+            event.remove(holder.connection, "before_cursor_execute", observe)
+        assert result == "restore_needs_attention" and stream_calls == [] and reads == []
+        if posture == "baseline":
+            assert mutations == [], "off-matrix starting must not mutate database authority"
+            assert holder.read_facts() == starting
+            assert _capture_sync_transactional_state(holder.connection) == before
+            projection = json.loads(
+                (
+                    store.directory
+                    / holder.target_identity_digest
+                    / f"{holder._call(starting).attempt_uuid}.json"
+                ).read_text()
+            )
+            assert projection["result_code"] == "restore_needs_attention"
+            assert projection["restore_call_authority"] == starting.restore_call_authority
+        else:
+            assert mutations == ["ALTER"]
+            following = list(holder._call(holder.read_facts()).fields)
+            following[9] = "restore_backend_starting"
+            assert tuple(following) == holder._call(starting).fields
+
+
+@pytest.mark.parametrize("kind", ("generic", "sealed_0018"))
+def test_gate_resume_drains_authenticated_sessions_after_projection_failure(
+    empty_migration_database: URL, tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    """gate真实提交后投影失败，matching续接必须先排空已有app/retention物理会话。
+
+    两个runtime连接在CONNECT撤销前认证，提交后仍可执行SELECT；因此不能把精确ACTIVE
+    ACL误当作已排空。首个业务fingerprint前核对原PID均退出，只有随后才允许分配ordinal。
+    本例在实际stream入口停止，数据库gate/CAS/terminate均保持真实实现。
+    """
+    from contextlib import ExitStack
+
+    from ai_employee.cli import database_maintenance as cli
+    from ai_employee.cli.verify_restored_backup import read_restore_fingerprint
+    from ai_employee.infrastructure.db import database_maintenance as maintenance
+
+    class StreamBoundaryReached(RuntimeError):
+        """表示已跨过受测排空边界；本例不启动恢复子进程。"""
+
+    endpoint, secret, expected, store, dump = _restore_fixture(
+        empty_migration_database,
+        tmp_path,
+        revision="20260809_0018" if kind == "sealed_0018" else "20260809_0019",
+    )
+    claim = maintenance.RestoreClaim(kind, "d" * 64, expected)
+    projection_failure = OSError("synthetic gate projection failure")
+    original_publish = store.publish
+    committed = []
+    stream_calls = []
+    fingerprint_calls = []
+
+    def reject_gate_projection(facts, result):
+        """只在实际gate事务成功退出后的首个投影边界制造中断。"""
+        assert result == "gate_established"
+        committed.append(facts)
+        raise projection_failure
+
+    async def stop_at_stream(request, **kwargs):
+        stream_calls.append(request)
+        raise StreamBoundaryReached
+
+    monkeypatch.setattr(maintenance, "execute_restore_stream", stop_at_stream)
+    with ExitStack() as stack:
+        clients = []
+        pids = []
+        for role, password in (
+            ("ai_employee_app", "app-role-integration-password"),
+            ("ai_employee_retention", "retention-role-integration-password"),
+        ):
+            engine = create_engine(
+                empty_migration_database.set(
+                    drivername="postgresql+psycopg", username=role, password=password
+                ),
+                poolclass=NullPool,
+                hide_parameters=True,
+            )
+            stack.callback(engine.dispose)
+            connection = stack.enter_context(engine.connect())
+            assert connection.scalar(text("SELECT current_user")) == role
+            pids.append(connection.scalar(text("SELECT pg_backend_pid()")))
+            connection.commit()
+            clients.append(connection)
+        with (
+            cli._open_maintenance_context(cli.MigrateArguments(secret), endpoint) as context,
+            context.acquire_management_lifecycle_lock() as management,
+            management.acquire_restore_target_lock(claim) as target,
+            target.acquire_schema_lifecycle_lock(),
+            target.restore_holder(claim) as holder,
+        ):
+            holder.admit()
+            with holder.connection.begin():
+                holder.connection.execute(
+                    text("UPDATE users SET display_name='synthetic-pre-restore'")
+                )
+            monkeypatch.setattr(store, "publish", reject_gate_projection)
+            with pytest.raises(OSError) as rejected:
+                holder._establish_gate(holder.admit(), store)
+            assert rejected.value is projection_failure and len(committed) == 1
+            assert holder.read_facts() == committed[0]
+            assert holder._call(committed[0]).call_ordinal == 0
+        # 撤销CONNECT只阻止新认证；旧session此刻真实存活，不能从gate投影猜测它们已退出。
+        for connection in clients:
+            assert connection.scalar(text("SELECT 1")) == 1
+            connection.commit()
+        monkeypatch.setattr(store, "publish", original_publish)
+        with (
+            cli._open_maintenance_context(cli.MigrateArguments(secret), endpoint) as context,
+            context.acquire_management_lifecycle_lock() as management,
+            management.acquire_restore_target_lock(claim) as target,
+            target.acquire_schema_lifecycle_lock(),
+            target.restore_holder(claim) as holder,
+        ):
+            assert holder.admit() == committed[0]
+
+            def reader(connection):
+                """首个稳定内容读取即观察真实旧backend；未排空时直接失败而不等待stream。"""
+                active = (
+                    connection.execute(
+                        text("SELECT pid FROM pg_stat_activity WHERE pid IN (:app,:retention)"),
+                        {"app": pids[0], "retention": pids[1]},
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert active == [], (
+                    "matching gate resumed fingerprint before draining old sessions"
+                )
+                fingerprint_calls.append(True)
+                return read_restore_fingerprint(connection)
+
+            with pytest.raises(StreamBoundaryReached):
+                holder.execute(
+                    dump=dump,
+                    reader=reader,
+                    verifier=lambda *args: None,
+                    evidence=store,
+                    consumer_environment={},
+                )
+            assert len(fingerprint_calls) == 2 and len(stream_calls) == 1
+            assert stream_calls[0].call_ordinal == 1
+            assert holder._call(holder.read_facts()).phase.value == "restore_backend_starting"
+
+
+@pytest.mark.parametrize("kind", ("generic", "sealed_0018"))
 @pytest.mark.parametrize("prior_completion", (False, True))
 def test_restore_no_gate_is_complete_database_zero_write_and_zero_spawn(
     empty_migration_database: URL, tmp_path: Path, monkeypatch, kind, prior_completion

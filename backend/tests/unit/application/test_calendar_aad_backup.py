@@ -233,6 +233,129 @@ async def test_calendar_aad_group_publisher_keeps_receipt_through_final_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("discard_fails", [False, True])
+async def test_group_body_failure_discards_receipt_before_revision_lease_exit(
+    tmp_path: Path, guarded_backup_resources, monkeypatch, cancelled: bool, discard_fails: bool
+) -> None:
+    """末次主体guard失败/取消须先补偿再退出revision lease，且保留首异常对象。
+
+    真实group hook和异步lease adapter执行；只替代数据库guard与完整publisher边界。
+    若把补偿重新移到外层except，事件顺序会先出现lease_exit，从而直接捕获SPEC-04。
+    """
+    from ai_employee.infrastructure.db.postgres_backup_manifest import BackupGroupPublication
+
+    events: list[str] = []
+    primary = (
+        asyncio.CancelledError("synthetic body cancellation")
+        if cancelled
+        else CalendarAadRolloutError("calendar_aad_rollout_expired")
+    )
+    cleanup_failure = RuntimeError("synthetic group discard failure")
+    fixture = guarded_backup_resources(tmp_path / "backups", lambda: events.append("lease_exit"))
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    receipt = BackupGroupPublication(())
+    published = False
+
+    async def verify(_guard) -> None:
+        if published:
+            events.append("body_failure")
+            raise primary
+
+    class Publisher:
+        """模拟外部组发布和补偿；receipt身份与调用顺序属于被测hook的行为。"""
+
+        staging_root = staging
+
+        async def publish(self, staged, target, guard) -> BackupGroupPublication:
+            nonlocal published
+            assert staged.read_bytes() == b"synthetic"
+            published = True
+            events.append("published")
+            return receipt
+
+        async def discard(self, owned: BackupGroupPublication) -> None:
+            assert owned is receipt
+            events.append("discard")
+            if discard_fails:
+                raise cleanup_failure
+
+    async def producer(path: Path) -> None:
+        path.write_bytes(b"synthetic")
+
+    monkeypatch.setattr(backup.CalendarAadCurrentGuard, "verify", verify)
+    with pytest.raises(type(primary)) as failure:
+        await backup.run_guarded_backup(
+            **fixture.arguments, producer=producer, publisher=Publisher()
+        )
+    assert failure.value is primary
+    if discard_fails:
+        assert failure.value.__cause__ is cleanup_failure
+    assert events == ["published", "body_failure", "discard", "lease_exit"]
+
+
+@pytest.mark.asyncio
+async def test_group_body_failure_keeps_revision_lease_during_repeated_cleanup_cancellation(
+    tmp_path: Path, guarded_backup_resources, monkeypatch
+) -> None:
+    """已知主体首错后的补偿遇重复取消仍须收完receipt，再退出原revision lease。"""
+    from ai_employee.infrastructure.db.postgres_backup_manifest import BackupGroupPublication
+
+    events: list[str] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    fixture = guarded_backup_resources(tmp_path / "backups", lambda: events.append("lease_exit"))
+    staging = tmp_path / "staging"
+    staging.mkdir(mode=0o700)
+    receipt = BackupGroupPublication(())
+    primary = CalendarAadRolloutError("calendar_aad_rollout_expired")
+    published = False
+
+    async def verify(_guard) -> None:
+        if published:
+            raise primary
+
+    class Publisher:
+        """把真实hook的补偿停在可控await，观察lease是否被提前释放。"""
+
+        staging_root = staging
+
+        async def publish(self, staged, target, guard) -> BackupGroupPublication:
+            nonlocal published
+            published = True
+            return receipt
+
+        async def discard(self, owned: BackupGroupPublication) -> None:
+            assert owned is receipt
+            entered.set()
+            await release.wait()
+            events.append("discard_finished")
+
+    async def producer(path: Path) -> None:
+        path.write_bytes(b"synthetic")
+
+    monkeypatch.setattr(backup.CalendarAadCurrentGuard, "verify", verify)
+    task = asyncio.create_task(
+        backup.run_guarded_backup(**fixture.arguments, producer=producer, publisher=Publisher())
+    )
+    await entered.wait()
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        returned_early = task.done()
+        lease_exited_early = bool(fixture.closed)
+    finally:
+        release.set()
+        with pytest.raises(CalendarAadRolloutError) as failure:
+            await task
+    assert failure.value is primary
+    assert not returned_early and not lease_exited_early
+    assert events == ["discard_finished", "lease_exit"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("boundary", "collision"),
     [

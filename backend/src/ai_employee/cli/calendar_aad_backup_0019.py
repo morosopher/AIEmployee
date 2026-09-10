@@ -331,14 +331,17 @@ async def _run_group_guarded_backup(
     publisher: BackupGroupPublisher,
     facts_reader: CalendarAadFactsReader | None,
 ) -> Path:
-    """接收外层owned staging并保留完整receipt；最终lease失败仍在外层锁内补偿。
+    """接收外层owned staging，在原revision lease内补偿已知主体失败并保留完整receipt。
 
     publication线程/协程的取消必须收至终态，成功交付但随后被取消的receipt也不能丢失。
+    只有主体（含末次guard）完整成功后才把receipt带过lease退出；最终退出自身首次
+    失败的补偿仍由外层backup/flock持有者覆盖，不重复已在主体内尝试的补偿。
     此分支绝不生成旧checksum、不自行清理父staging、不调用旧post-return finish。
     """
     binding = CalendarAadBinding(basename, immutable_image_id)
     target = backup_directory / f"{basename}.dump.enc"
     publication: asyncio.Task[BackupGroupPublication] | None = None
+    completed_publication: BackupGroupPublication | None = None
     try:
         async with async_calendar_aad_rollout_lease(sessions.engine.url) as lease:
             artifact_file = CalendarAadArtifactFile(backup_directory, binding)
@@ -355,22 +358,35 @@ async def _run_group_guarded_backup(
                 clock=clock,
                 expected_revision="20260809_0018",
             )
-            await guard.verify()
-            staged = publisher.staging_root / target.name
-            await producer(staged)
-            await guard.verify()
-            publication = asyncio.create_task(publisher.publish(staged, target, guard))
-            await await_calendar_aad_resource(publication)
-            await guard.verify()
+            try:
+                await guard.verify()
+                staged = publisher.staging_root / target.name
+                await producer(staged)
+                await guard.verify()
+                publication = asyncio.create_task(publisher.publish(staged, target, guard))
+                await await_calendar_aad_resource(publication)
+                await guard.verify()
+            except BaseException as failure:
+                # 末次guard或取消已经在lease主体内暴露失败；必须收齐成功publication的
+                # 精确receipt补偿后才能释放revision lease，不能使用final-exit特许路径。
+                if (
+                    publication is not None
+                    and not publication.cancelled()
+                    and publication.exception() is None
+                ):
+                    try:
+                        await await_calendar_aad_resource(
+                            asyncio.create_task(publisher.discard(publication.result()))
+                        )
+                    except BaseException as cleanup_failure:
+                        raise failure from cleanup_failure
+                raise
+            completed_publication = publication.result()
     except BaseException as failure:
-        if (
-            publication is not None
-            and not publication.cancelled()
-            and publication.exception() is None
-        ):
+        if completed_publication is not None:
             try:
                 await await_calendar_aad_resource(
-                    asyncio.create_task(publisher.discard(publication.result()))
+                    asyncio.create_task(publisher.discard(completed_publication))
                 )
             except BaseException as cleanup_failure:
                 raise failure from cleanup_failure

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -98,6 +99,234 @@ def _consumer_environment() -> dict[str, str]:
     }
 
 
+async def _synthetic_control_live() -> None:
+    """孤立process测试的控制边界；真实holder注入与活性失败由下方组合回归独立覆盖。"""
+
+
+def _bound_stream_holder(monkeypatch: pytest.MonkeyPatch, assert_live: Callable[[], None]):
+    """只模拟DB边界，保留真实holder.execute、canonical phase转换与stream回调组合。
+
+    gate排空与数据库authority在独立PostgreSQL回归验证；本fixture仅提供合法前置事实，
+    使每个流故障都能到达真实父函数，避免未接入新callback的孤立stream测试伪造GREEN。
+    """
+    from ai_employee.infrastructure.db import database_maintenance as maintenance
+    from tests.unit.infrastructure.db import test_database_restore_parser as fixture
+
+    holder = object.__new__(maintenance.RestoreMaintenanceHolder)
+    holder.connection = SimpleNamespace(in_transaction=lambda: False)
+    holder.claim = maintenance.RestoreClaim(
+        "generic",
+        fixture.SOURCE_DIGEST,
+        maintenance.RestoreFingerprint("20260809_0018", fixture.EXPECTED_FINGERPRINT),
+    )
+    current = maintenance.DatabaseRestoreFacts(
+        fixture._gate(), fixture._call("gate_established", "empty"), None
+    )
+    pre = maintenance.RestoreFingerprint("20260809_0018", fixture.PRE_FINGERPRINT)
+
+    def read_facts():
+        assert_live()
+        return current
+
+    def start_call(facts, reader, evidence):
+        nonlocal current
+        assert_live()
+        current = holder._advance(
+            facts,
+            maintenance._RestoreCallPhase.RESTORE_BACKEND_STARTING,
+            {7: "1", 11: fixture.CALL_STARTED_AT, 14: pre.revision, 15: pre.digest},
+        )
+        return current
+
+    def register(facts, proof, evidence):
+        nonlocal current
+        assert_live()
+        assert proof.owns_unfed_pipe()
+        ready = holder._advance(
+            facts,
+            maintenance._RestoreCallPhase.RESTORE_BACKEND_READY,
+            {12: "4321", 13: fixture.BACKEND_STARTED_AT},
+        )
+        current = holder._advance(ready, maintenance._RestoreCallPhase.RESTORE_STARTED)
+        return current
+
+    monkeypatch.setattr(holder, "read_facts", read_facts)
+    monkeypatch.setattr(holder, "admit", read_facts)
+    monkeypatch.setattr(holder, "assert_live", assert_live)
+    monkeypatch.setattr(holder, "_drain_gate_sessions", assert_live)
+    monkeypatch.setattr(holder, "read_only", lambda reader: reader(holder.connection))
+    monkeypatch.setattr(holder, "_start_call", start_call)
+    monkeypatch.setattr(holder, "_register_and_start", register)
+    return holder, pre
+
+
+@pytest.mark.parametrize(
+    "boundary,rollback_fails",
+    (
+        ("chunk_ready", False),
+        ("read_wait", False),
+        ("drain_wait", False),
+        ("generator_wait", False),
+        ("before_trailer", False),
+        ("consumer_wait", False),
+        ("chunk_ready", True),
+    ),
+)
+def test_restore_holder_stops_stream_when_original_control_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str, rollback_fails: bool
+) -> None:
+    """原holder在供流/阻塞/退出各边界失效必须停止、收齐child且保持首错与未知结果。
+
+    chunk-ready和trailer前反例可完成整个旧流，阻塞反例由测试超时明确暴露无监督。
+    control检查必须离开event loop；数据库rollback再次失败也不能抹去首个控制失效。
+    """
+    from ai_employee.infrastructure.db import database_maintenance as maintenance
+
+    module = _module()
+    control_live = True
+    bytes_after_loss = 0
+    checks_after_loss = 0
+    stream_results = []
+    projections = []
+    failure = ConnectionResetError("synthetic original control lost")
+    cleanup_failure = OSError("synthetic rollback failure")
+
+    def lose_control():
+        nonlocal control_live
+        control_live = False
+
+    def assert_live():
+        nonlocal checks_after_loss
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("synchronous holder SQL ran on the stream event loop")
+        if not control_live:
+            checks_after_loss += 1
+            raise failure
+
+    class Writer(_Writer):
+        """在已接收body后的drain边界注入失效，记录失效后的任何新供流。"""
+
+        def write(self, value: bytes) -> None:
+            nonlocal bytes_after_loss
+            if not control_live:
+                bytes_after_loss += len(value)
+            self.last_value = value
+            super().write(value)
+
+        async def drain(self) -> None:
+            if boundary == "drain_wait" and self.last_value == b"SELECT 1;\n":
+                lose_control()
+                await asyncio.Future()
+            await super().drain()
+
+    class Source:
+        """分别模拟已读到body与仍无输出的等待；不输出或落盘SQL内容。"""
+
+        sent = False
+
+        async def read(self, limit: int) -> bytes:
+            if self.sent:
+                return b""
+            self.sent = True
+            if boundary in {"chunk_ready", "read_wait"}:
+                lose_control()
+            if boundary == "read_wait":
+                await asyncio.Future()
+            return b"SELECT 1;\n"
+
+    class Process(_Process):
+        """等待consumer退出时也必须持续检查control；child回收可唤醒所有waiter。"""
+
+        def __init__(self, *, generator: bool) -> None:
+            self.pid = 12002 if generator else 12001
+            self.stdin = None if generator else Writer()
+            self.stdout = Source() if generator else None
+            self.returncode = None
+            self.terminated = self.waited = False
+            self.is_generator = generator
+            self.exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            self.waited = True
+            if self.stdin is not None:
+                await self.stdin.closed_event.wait()
+            if self.returncode is None:
+                if self.is_generator and boundary in {"generator_wait", "before_trailer"}:
+                    lose_control()
+                if (
+                    self.is_generator
+                    and boundary == "generator_wait"
+                    or not self.is_generator
+                    and boundary == "consumer_wait"
+                ):
+                    lose_control()
+                    await self.exited.wait()
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            super().terminate()
+            self.exited.set()
+
+        def kill(self) -> None:
+            super().kill()
+            self.exited.set()
+
+    consumer = Process(generator=False)
+    generator = Process(generator=True)
+
+    async def spawn(program, *arguments, **options):
+        return consumer if program == "psql" else generator
+
+    async def execute(request, **options):
+        result = await asyncio.wait_for(
+            module.execute_restore_stream(request, **options, spawn=spawn), timeout=1
+        )
+        stream_results.append(result)
+        return result
+
+    holder, pre = _bound_stream_holder(monkeypatch, assert_live)
+    if rollback_fails:
+
+        def rollback():
+            raise cleanup_failure
+
+        holder.connection = SimpleNamespace(
+            in_transaction=lambda: True, commit=lambda: None, rollback=rollback
+        )
+    monkeypatch.setattr(maintenance, "execute_restore_stream", execute)
+    observed = None
+    try:
+        holder.execute(
+            dump=tmp_path / "synthetic.dump",
+            reader=lambda connection: pre,
+            verifier=lambda *args: None,
+            evidence=SimpleNamespace(
+                publish=lambda facts, result: projections.append((facts, result))
+            ),
+            consumer_environment=_consumer_environment(),
+            before_stream=assert_live,
+        )
+    except OSError as caught:
+        observed = caught
+    assert not control_live
+    assert observed is failure, "control loss must be detected before a blocked stream times out"
+    assert checks_after_loss >= 1 and bytes_after_loss == 0
+    assert stream_results == [] and consumer.waited and generator.waited
+    assert consumer.terminated
+    assert consumer.stdin is not None and consumer.stdin.closed
+    assert (b"SET complete = true" in consumer.stdin.data) is (boundary == "consumer_wait")
+    assert len(projections) == 1 and projections[0][1] == "restore_outcome_unknown"
+    assert holder._call(projections[0][0]).phase.value == "restore_started"
+    if rollback_fails:
+        assert observed.__cause__ is cleanup_failure
+
+
 def test_restore_stream_has_controller_owned_process_boundary() -> None:
     """冻结的 SQL-byte-zero 协议需要镜像内专用 stream executor，不能使用 shell pipeline。"""
     _module()
@@ -144,6 +373,7 @@ async def test_started_barrier_precedes_all_sql_and_generator_spawn(tmp_path: Pa
         module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
         consumer_environment=_consumer_environment(),
         establish_started=establish_started,
+        assert_control_live=_synthetic_control_live,
         spawn=spawn,
     )
     assert calls[0][0] == (
@@ -185,6 +415,7 @@ async def test_start_barrier_failure_closes_unfed_child_without_generator(tmp_pa
             module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
             consumer_environment=_consumer_environment(),
             establish_started=refuse,
+            assert_control_live=_synthetic_control_live,
             spawn=spawn,
         )
     assert spawn_count == 1
@@ -219,6 +450,7 @@ async def test_consumer_exit_stops_a_generator_that_has_not_reached_eof(tmp_path
             module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
             consumer_environment=_consumer_environment(),
             establish_started=started,
+            assert_control_live=_synthetic_control_live,
             spawn=spawn,
         ),
         timeout=0.2,
@@ -245,6 +477,7 @@ async def test_generator_failure_never_sends_completion_trailer(tmp_path: Path) 
         module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
         consumer_environment=_consumer_environment(),
         establish_started=started,
+        assert_control_live=_synthetic_control_live,
         spawn=spawn,
     )
     assert result.generator_exit == 3 and not result.trailer_sent
@@ -272,6 +505,7 @@ async def test_cancelled_start_barrier_drains_spawn_and_child(tmp_path: Path) ->
             module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
             consumer_environment=_consumer_environment(),
             establish_started=started,
+            assert_control_live=_synthetic_control_live,
             spawn=spawn,
         )
     )
