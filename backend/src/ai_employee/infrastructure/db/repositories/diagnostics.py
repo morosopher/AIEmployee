@@ -132,7 +132,7 @@ class SqlAlchemyDiagnosticSnapshotStore:
                     )
                     .where(
                         OAuthConnectionModel.user_id == user_id,
-                        OAuthConnectionModel.provider == "google",
+                        OAuthConnectionModel.provider.in_(("google", "microsoft")),
                     )
                     .order_by(SyncCursorModel.resource_kind, SyncCursorModel.id)
                 )

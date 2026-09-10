@@ -1,11 +1,141 @@
 """定义隐私删除请求的窄用例，确保 API 不执行长时间删除且重试保持幂等。"""
 
 import hashlib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
 from uuid import UUID
 
+from ai_employee.application.ports.trusted_actions import (
+    ProviderWriteOutcome,
+    TrustedActionDispatchSnapshot,
+)
 from ai_employee.application.use_cases.tasks import CreateTaskResult, CreateTaskUseCase
+from ai_employee.domain.tasks import JsonValue
 
 _ALL_DATA_DELETION_REQUEST_ID_DOMAIN = b"AIEMPLOYEE/privacy-delete-all-data-request-id/v1\x00"
+PRIVACY_DELETION_STARTED_EVENT_TYPE = "privacy.deletion_started"
+PRIVACY_DELETION_STARTED_SCHEMA_VERSION = "privacy_deletion_started.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyDeletionStartedFact:
+    """提供不含 ORM/内容的删除屏障事实，保留外层归属以防 metadata 冒充授权。"""
+
+    event_type: str
+    user_id: UUID
+    task_id: UUID | None
+    event_metadata: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyDeletionStartedAuthority:
+    """表示唯一 true→false CAS 赢家绑定的不可变用户、任务及原始删除请求。"""
+
+    user_id: UUID
+    task_id: UUID
+    request_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyDeletionBinding:
+    """保存一次删除尝试的租约身份；它不替代数据库中完整 started 集和活租约检查。"""
+
+    user_id: UUID
+    task_id: UUID
+    request_id: str
+    lease_owner: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyReconciliationTarget:
+    """只传递冻结执行投影与已持久化的最小资源定位，不携带审批命令或内容。"""
+
+    dispatch: TrustedActionDispatchSnapshot
+    resource_id: str | None
+
+
+class PrivacyReconciliationReader(Protocol):
+    """已获单次资格的隐私读取端口；没有写、refresh、授权码或命令解密入口。"""
+
+    async def reconcile(
+        self,
+        *,
+        binding: PrivacyDeletionBinding,
+        target: PrivacyReconciliationTarget,
+    ) -> ProviderWriteOutcome:
+        """重验精确用户/执行/连接，至多一个有界 GET；不完整证据只能返回 unknown。"""
+
+
+class PrivacyCheckpointCleaner(Protocol):
+    """通过已有 app/checkpointer 权限删除规范任务 thread 的窄能力。"""
+
+    async def clear_thread(
+        self,
+        *,
+        binding: PrivacyDeletionBinding,
+        task_id: UUID,
+        now: datetime,
+    ) -> None:
+        """同事务证明赢家活租约和 thread 归属，再显式删除三张数据表；失败保留父任务。"""
+
+
+class ExpiredTaskCheckpointCleaner(Protocol):
+    """普通历史清理持有 Task→active user 锁期间使用的 app 三表删除能力。
+
+    只由历史 Repository 的同一未提交事务调用，直到父任务删除提交前不能释放锁。
+    实现不得重获调用者持有的行锁，也不能删除业务父表或扩大 retention 权限。
+    """
+
+    async def clear_expired_thread(
+        self,
+        *,
+        user_id: UUID,
+        task_id: UUID,
+        cutoff: datetime,
+    ) -> None:
+        """精确只读重验归属、终态、截止及 active/authority，再提交原生三表删除。"""
+
+
+def parse_privacy_deletion_started_authority(
+    facts: Sequence[PrivacyDeletionStartedFact],
+    *,
+    expected_user_id: UUID,
+    expected_task_id: UUID,
+    expected_request_id: str,
+) -> PrivacyDeletionStartedAuthority | None:
+    """严格解析完整 per-user started 集合；不择优、不强转、不吞掉冲突事实。
+
+    Args:
+        facts: 调用者按用户读取的全部 started 事实，不得预先按 task/request 过滤。
+        expected_user_id: 当前锁定的任务所属用户。
+        expected_task_id: 当前锁定的预屏障删除任务。
+        expected_request_id: 原任务输入中的非空删除请求标识。
+
+    Returns:
+        只有单行、外层归属及关闭 metadata 全部精确匹配时返回授权；其余返回 None。
+        本纯函数是屏障、租约、恢复扫描和最终删除的共享判定，SQL 预筛不能替代它。
+    """
+    if len(facts) != 1 or not expected_request_id:
+        return None
+    fact = facts[0]
+    expected_metadata: dict[str, JsonValue] = {
+        "schema_version": PRIVACY_DELETION_STARTED_SCHEMA_VERSION,
+        "request_id": expected_request_id,
+    }
+    if (
+        fact.event_type != PRIVACY_DELETION_STARTED_EVENT_TYPE
+        or fact.user_id != expected_user_id
+        or fact.task_id != expected_task_id
+        or fact.event_metadata != expected_metadata
+    ):
+        return None
+    return PrivacyDeletionStartedAuthority(
+        user_id=expected_user_id,
+        task_id=expected_task_id,
+        request_id=expected_request_id,
+    )
 
 
 class RequestSourceCacheDeletionUseCase:

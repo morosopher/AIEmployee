@@ -16,6 +16,7 @@ from ai_employee.application.use_cases.tasks import (
 )
 from ai_employee.domain.errors import StateConflictError
 from ai_employee.domain.tasks import JsonValue, TaskStatus
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
     AuditEventModel,
     OutboxEventModel,
@@ -106,6 +107,17 @@ class SqlAlchemyTaskRepository:
         if existing is not None:
             return existing
 
+        # 新任务尚无 TaskRun 可锁；在任何 INSERT 之前锁拥有者，和 privacy 屏障串行。
+        # 既有幂等结果上方只读复用；不能以新的客户端键在匿名根行下重建业务图。
+        active = await self._session.scalar(
+            select(UserModel.is_active)
+            .where(
+                UserModel.id == user_id,
+            )
+            .with_for_update()
+        )
+        if active is not True:
+            raise StateConflictError(error_code="user_inactive", message="User is inactive")
         task_id = uuid4()
         status = TaskStatus.CREATED.value
         claimed_task_id: UUID | None = await self._session.scalar(

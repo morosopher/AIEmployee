@@ -6,23 +6,29 @@ from uuid import uuid4
 
 import pytest
 
-from ai_employee.domain.errors import InternalInvariantError
+from ai_employee.application.use_cases.privacy import PrivacyDeletionBinding
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.workers import privacy as privacy_module
 from ai_employee.workers.privacy import PrivacyDeletionWorker
 
 
-class _MissingUserSession:
-    """只允许执行一次用户根行锁查询，并记录任何越界数据库动作。"""
+class _MissingTaskSession:
+    """只允许执行一次 Task 根行锁查询，并记录任何越界数据库动作。"""
 
     def __init__(self) -> None:
         self.scalar_calls = 0
 
-    async def scalar(self, statement: object) -> None:
-        """第一次 scalar 表示目标用户不存在；第二次调用即违反边界。"""
+    async def scalars(self, statement: object) -> _MissingTaskSession:
+        """空 Task 集合表示绑定根不存在；不能继续锁用户或读取审计。"""
         del statement
         self.scalar_calls += 1
         if self.scalar_calls != 1:
-            raise AssertionError("missing user must stop before audit lookup")
+            raise AssertionError("missing task must stop before user or audit lookup")
+        return self
+
+    def all(self) -> list[object]:
+        """返回真实缺少目标 Task 的空查询投影。"""
+        return []
 
     async def execute(self, statement: object) -> None:
         """不存在用户时不得执行匿名化 UPDATE。"""
@@ -39,13 +45,13 @@ class _MissingUserSessionFactory:
     """为 Worker 提供单个可追踪的合成事务。"""
 
     def __init__(self) -> None:
-        self.session = _MissingUserSession()
+        self.session = _MissingTaskSession()
 
     def begin(self) -> _MissingUserSessionFactory:
         """返回自身作为异步事务 context manager。"""
         return self
 
-    async def __aenter__(self) -> _MissingUserSession:
+    async def __aenter__(self) -> _MissingTaskSession:
         """进入合成事务。"""
         return self.session
 
@@ -58,7 +64,7 @@ class _MissingUserSessionFactory:
 async def test_finalize_deleted_user_rejects_missing_lock_root_before_time_or_audit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """用户根行不存在时必须在取时、审计读取与写入前抛稳定领域错误。"""
+    """M2最终事务先锁Task；缺失绑定根必须在取时、审计读取与写入前拒绝。"""
 
     class _ForbiddenDatetime:
         """证明 missing-user 分支不应读取当前时间。"""
@@ -73,13 +79,14 @@ async def test_finalize_deleted_user_rejects_missing_lock_root_before_time_or_au
     session_factory = _MissingUserSessionFactory()
     worker = PrivacyDeletionWorker(session_factory)  # type: ignore[arg-type]
 
-    with pytest.raises(InternalInvariantError) as caught:
+    with pytest.raises(StateConflictError) as caught:
         await worker._finalize_deleted_user(
-            user_id=uuid4(),
-            request_id="synthetic-missing-user-request",
+            binding=PrivacyDeletionBinding(
+                uuid4(), uuid4(), "synthetic-missing-task-request", "synthetic-owner"
+            ),
         )
 
-    assert caught.value.error_code == "privacy_deletion_user_missing"
-    assert caught.value.message == "privacy deletion user is missing"
+    assert caught.value.error_code == "privacy_deletion_unavailable"
+    assert caught.value.message == "Privacy deletion lease is unavailable"
     assert caught.value.metadata == {}
     assert session_factory.session.scalar_calls == 1

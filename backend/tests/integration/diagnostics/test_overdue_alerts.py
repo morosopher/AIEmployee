@@ -1,16 +1,79 @@
 """验证逾期简报告警在 PostgreSQL 持久化边界上的用户隔离。"""
 
 from datetime import UTC, date, datetime, time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import select
 
 from ai_employee.application.use_cases.diagnostics import GetDailyBriefOverdueAlertUseCase
 from ai_employee.infrastructure.db.models.briefs import DailyBriefModel
 from ai_employee.infrastructure.db.models.identity import UserModel
+from ai_employee.infrastructure.db.models.sources import OAuthConnectionModel, SyncCursorModel
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
-from ai_employee.infrastructure.db.repositories.diagnostics import SqlAlchemyOverdueBriefReader
+from ai_employee.infrastructure.db.repositories.diagnostics import (
+    SqlAlchemyDiagnosticSnapshotStore,
+    SqlAlchemyOverdueBriefReader,
+)
 from ai_employee.infrastructure.db.session import build_session_factory
+
+
+@pytest.mark.asyncio
+async def test_task27e_diagnostics_include_both_provider_scopes_without_content(
+    database_url: str,
+) -> None:
+    """同用户 Google/Microsoft 游标均参与来源新鲜度，另一用户和 raw cursor 都不可见。"""
+    from tests.integration.retention.test_m2_action_retention import NOW, seed_lifecycle_action
+
+    sessions = build_session_factory(database_url)
+    try:
+        seed = await seed_lifecycle_action(sessions)
+        other = await seed_lifecycle_action(sessions)
+        microsoft_id = uuid4()
+        async with sessions.begin() as session:
+            session.add(
+                OAuthConnectionModel(
+                    id=microsoft_id,
+                    user_id=seed.user_id,
+                    provider="microsoft",
+                    provider_account_id="synthetic-ms",
+                    provider_tenant_id="synthetic-tenant",
+                    account_type="work_school",
+                    account_email="synthetic@example.test",
+                    scopes=[],
+                    status="connected",
+                )
+            )
+            await session.flush()
+            for connection_id, kind in (
+                (seed.connection_id, "mail"),
+                (microsoft_id, "calendar"),
+                (other.connection_id, "other"),
+            ):
+                session.add(
+                    SyncCursorModel(
+                        connection_id=connection_id,
+                        resource_kind=kind,
+                        scope_key="synthetic-scope",
+                        cursor="synthetic-sensitive-cursor",
+                        last_success_at=NOW,
+                    )
+                )
+        await SqlAlchemyDiagnosticSnapshotStore(sessions).save_snapshot(
+            task_id=seed.task_id, user_id=seed.user_id, now=NOW
+        )
+        async with sessions() as session:
+            payload = await session.scalar(
+                select(TaskRunModel.result_payload).where(TaskRunModel.id == seed.task_id)
+            )
+            assert payload is not None
+            assert payload["freshness"] == [
+                {"resource": "calendar", "last_success_at": NOW.isoformat(), "error_code": None},
+                {"resource": "mail", "last_success_at": NOW.isoformat(), "error_code": None},
+            ]
+            assert "synthetic-sensitive-cursor" not in str(payload)
+    finally:
+        await sessions.dispose()
 
 
 @pytest.mark.asyncio

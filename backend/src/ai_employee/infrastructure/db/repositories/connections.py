@@ -39,6 +39,7 @@ from ai_employee.domain.connections import (
     ConnectionStatus,
     validate_capability_disable,
 )
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     EncryptedCredentialModel,
@@ -603,6 +604,18 @@ class SqlAlchemyConnectionStore:
             .with_for_update()
         )
         if owned_connection_id is None:
+            raise ConnectionCredentialOwnershipError
+
+        # code exchange 已在事务外发生；本地删除可能在等待响应时提交。连接仍存在
+        # 不能授权复活 credential，锁住 user 后重检并让同一事务的 scope/upsert 整体回滚。
+        active = await self._session.scalar(
+            select(UserModel.is_active)
+            .where(
+                UserModel.id == user_id,
+            )
+            .with_for_update()
+        )
+        if active is not True:
             raise ConnectionCredentialOwnershipError
 
         await assert_connection_unfenced(

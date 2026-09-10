@@ -6023,6 +6023,23 @@ sole completion audit. Do not commit between authority/task deletion, anonymizat
 transaction rolls back, the recovery TaskRun and authority remain; if it commits but the queue ACK is lost, the
 existing `AllDataDeletionCompleted`/missing-task path returns without another completion event.
 
+Close the already-authenticated late-request interleavings in the existing short mutation transactions:
+ordinary OAuth token save, manual resolution/reconciliation reopen, settings update, new task creation, and
+conversation create/delete must lock and recheck the user active state. A pre-barrier commit is deleted by the
+winner; a post-barrier mutation cannot recreate data, overwrite the privacy read qualification, modify anonymous
+defaults, or append ordinary audit. Ordinary action retention must preserve inactive privacy ownership. Keep
+the public schemas, fixed ACL and TaskRun-before-user ordering; use no cross-request transaction or middleware.
+
+Ordinary expired terminal TaskRun cleanup must also remove its native checkpoint thread before dropping ownership.
+Keep the retention transaction's exact TaskRun→active-user locks continuously held across the narrow app cleaner's
+three-table deletion commit and the retention dependency/parent deletion commit. Recheck terminal status, cutoff,
+active ownership, and absence of deletion-started authority. The app callback performs exact read-only validation
+without reacquiring those row locks, then calls native `adelete_thread`; it cannot delete business parents or change
+roles. A saver finishing first is cleaned; a saver arriving during the app/retention commit interval remains blocked
+until the TaskRun disappears and rejects. App failure or later retention rollback preserves the parent for retry.
+Prove both orders, the commit interval, rollback, cutoff/state/user/authority rejection, real app success/retention
+denial, and preservation of other users and global migration/catalog facts.
+
 - [ ] **Step 4: Verify and commit Task 27E**
 
 ~~~bash
@@ -6361,9 +6378,18 @@ automatic started attempt. It must invoke the same strict parser as ACK-lost rec
 valid only with old == new and `refresh_identity_changed=false`, confirmed different only with old != new and
 changed=true, and replacement only with old != new and changed=true. Any disposition/flag/equality mismatch is not a
 closing result and is not deletable.
-For each candidate, explicitly filter `user_id`; lock owning connection, access credential row, refresh credential
-row, and matching started audit in that order—confirmed, recovery-result, and replacement transactions use the same
-order—then requery the exact event group. An automatic success group is started + confirmed. An unsuccessful
+For each actual candidate, use an independent short transaction for one connection/bounded group. With the frozen
+SELECT/DELETE privileges, first acquire `LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT`, then
+`LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT`. These stronger physical table locks exclude the
+existing writer/recovery row locks and writes without granting UPDATE; they are not row-level FOR UPDATE. Either
+contention rolls back the whole transaction and exits boundedly, leaving work for a later maintenance/recovery run;
+never busy-loop or fall back to unlocked cleanup. Then explicitly filter `user_id`, read identity only in
+connection → access row → refresh row order, reuse the existing `lock_refresh_audit_event` mutex in original →
+recovery order, and fresh-read the exact event group. Do not load token/ciphertext/expiry/generation/current lineage,
+change the audit mutex key, or call session-lease methods that commit the shared transaction. Existing
+confirmed/recovery-result/replacement writer row locks, ACL, and migrations remain unchanged. Prove real app and
+retention bidirectional exclusion, zero deletion on contention, lock release, group commit/rollback, parser-result
+races, and isolation. An automatic success group is started + confirmed. An unsuccessful
 recovery group is recovery-started + unsatisfied and never closes the original automatic fence. The unsatisfied
 event must use `oauth_refresh_recovery_unsatisfied.v1` and match the recovery event/`OAuthAttempt.id`, original
 attempt/started source/connection digest, F/S/T, both frozen pre-digests, old identity/fixed key version, canonical
@@ -6413,8 +6439,19 @@ Implement all-data deletion in these fixed phases:
 2. Invalidate every unclaimed action. For claimed/executing/reconciling actions, run at most one bounded read-only
    reconcile pass; never replay a write. Regardless of the result, continue local deletion after warning that an
    external side effect may already exist.
-3. For each connection, lock `connection → access credential → refresh credential → matching started audit`, select
-   at most one token into controlled memory, explicitly delete all local credential rows, and commit. Only after
+   Use a fixed privacy-only typed target/reader that reuses dispatch/execution bindings without decrypting a trusted
+   command. Persist one attempt qualification under the valid winner before any read; recovery and ACK loss must not
+   initiate another round. With safe durable location, exact ownership, corresponding read capability and a usable
+   current access token, perform at most one bounded provider GET with minimum fields. Only missing/invalid binding,
+   read capability, access or safe location permits a zero-network UNKNOWN. Never refresh, exchange a code, call a
+   write, fabricate a command or weaken ordinary reconcile proof. Existence, absence/404, ID, ETag and operation
+   marker alone remain UNKNOWN, with no confirmed-not-applied/retryable claim or retained response/body.
+3. For each actual connection candidate, acquire the two EXCLUSIVE NOWAIT table locks in the preceding retention
+   protocol in an independent short transaction, then read user-scoped connection → access credential → refresh
+   credential identities and use the existing original → recovery audit mutex before fresh-reading. Select at most
+   one token into controlled memory, explicitly delete all local credential rows, and commit. A lock conflict rolls
+   back and exits boundedly with the winner/authority recoverable; never finalize past an uncleared connection.
+   Only after
    that commit make one best-effort provider-specific revoke call. Failure cannot restore local credentials or stop
    deletion, and no token may enter logs/audit/errors/intermediate tables.
 4. Explicitly delete child-to-parent in bounded user-scoped batches: action versions/snapshots and every other task
@@ -6423,6 +6460,13 @@ Implement all-data deletion in these fixed phases:
    user data while leaving database-wide restore catalog facts untouched. Preserve the current deletion TaskRun and
    its exact `task_id/user_id/deletion_request_id`, RUNNING/lease history, and every deletion-started authority row
    needed for strict zero/one/many validation until the final transaction. The same batches delete the CAS loser.
+   Before deleting each TaskRun, use the existing app/checkpointer capability in a narrow composition boundary to
+   clear its user/task-bound thread through `adelete_thread`; retention itself receives no checkpoint grant or role
+   switch. Delete the three checkpoint data tables, never global `checkpoint_migrations`, and preserve the task and
+   winner on failure. Guard every production native `aput`/`aput_writes` through `postgres_checkpointer`: in the same
+   transaction lock TaskRun→user and recheck task existence/active before the SDK write. Use the same ordering for
+   authorized deletion so a late Graph cannot repopulate deleted data. Prove both transaction orders with real
+   sessions and retain normal M1 checkpoint coverage; do not duplicate SDK SQL or rely on lease expiry alone.
 5. In one final transaction lock the winner TaskRun then user, lock and strictly parse the complete per-user
    deletion-started authority set, delete that authority plus the current deletion task's remaining
    Audit/Outbox/dependent rows and TaskRun, preserve exactly one user row, keep `is_active=false`, write deterministic

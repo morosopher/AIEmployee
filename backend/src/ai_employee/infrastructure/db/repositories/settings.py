@@ -47,6 +47,9 @@ class SqlAlchemySettingsRepository:
         user = await self.get_for_update(user_id=user_id)
         if user is None:
             return None
+        if not user.is_active:
+            # 认证可能早于最终匿名化；当前短事务的 user 锁才决定是否仍可改默认值/审计。
+            raise StateConflictError(error_code="user_inactive", message="User is inactive")
         merged_mail_connection_id = values.get(
             "default_mail_connection_id", user.default_mail_connection_id
         )

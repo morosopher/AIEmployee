@@ -26,6 +26,9 @@ describe('SettingsPage', () => {
 
   it('requires exact confirmation and links accepted deletion tasks', async () => {
     const wrapper = mount(SettingsPage, { global: { plugins: [createPinia()], stubs: { RouterLink: { template: '<a :href="to.path + \'?task_id=\' + to.query.task_id"><slot /></a>', props: ['to'] } } } })
+    // 用户输入确认前必须可见外部副作用说明；本地删除成功不能被理解为供应商撤回成功。
+    expect(wrapper.text()).toContain('删除本地数据不能撤回已发送的邮件或已生效的日程变更。')
+    expect(wrapper.text()).toContain('结果未知的操作也可能已在供应商侧生效。')
     const allDataButton = wrapper.findAll('button').find((button) => button.text() === '删除全部数据')
     expect(allDataButton).toBeDefined()
     if (!allDataButton) throw new Error('All-data button missing')

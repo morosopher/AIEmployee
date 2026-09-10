@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from ai_employee.api.deps import (
     ApiProblem,
@@ -19,6 +20,7 @@ from ai_employee.application.use_cases.conversations import (
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
 from ai_employee.infrastructure.db.models.briefs import ConversationModel
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.conversations import (
     SqlAlchemyConversationMessageStoreFactory,
@@ -64,6 +66,21 @@ def build_conversations_router() -> APIRouter:
     async def create_conversation(authenticated: CsrfProtectedSession, request: Request) -> ConversationResponse:
         """创建空会话，标题保持合成默认值且不推断隐私内容。"""
         async with request.app.state.auth_session_factory.begin() as session:
+            # 认证事务早于路由事务；锁后复核使创建与隐私最终提交有唯一先后顺序。
+            active = await session.scalar(
+                select(UserModel.is_active)
+                .where(
+                    UserModel.id == authenticated.user.id,
+                )
+                .with_for_update()
+            )
+            if active is not True:
+                raise ApiProblem(
+                    401,
+                    "authentication_required",
+                    "Authentication required",
+                    "Sign in to continue.",
+                )
             value = ConversationModel(user_id=authenticated.user.id, title="New conversation")
             session.add(value)
             await session.flush()
@@ -103,6 +120,21 @@ def build_conversations_router() -> APIRouter:
     async def delete_conversation(conversation_id: UUID, authenticated: CsrfProtectedSession, request: Request) -> Response:
         """仅删除本人会话与级联消息，并追加不含内容的删除审计。"""
         async with request.app.state.auth_session_factory.begin() as session:
+            # 同一锁覆盖 lookup/DELETE/audit，旧请求不能在匿名化之后追加删除审计。
+            active = await session.scalar(
+                select(UserModel.is_active)
+                .where(
+                    UserModel.id == authenticated.user.id,
+                )
+                .with_for_update()
+            )
+            if active is not True:
+                raise ApiProblem(
+                    401,
+                    "authentication_required",
+                    "Authentication required",
+                    "Sign in to continue.",
+                )
             value = await SqlAlchemyConversationRepository(session).get(user_id=authenticated.user.id, conversation_id=conversation_id)
             if value is None: raise ApiProblem(404, "conversation_not_found", "Conversation not found", "The requested conversation was not found.")
             await session.delete(value)

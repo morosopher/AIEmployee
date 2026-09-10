@@ -92,8 +92,15 @@ sequence grant inventory；已有 missing/extra/wrong-grantor/grant-option drift
 3. 核验 destination revision 的完整 object-grant inventory；
 4. destination 为 exact `20260809_0019` 时，最后才调用同一 Calendar guard 的 `before_commit`。
 
-任一步失败都在同一 migration transaction 回滚 DDL/DML、Alembic version row 与 grant delta。非 0019
+事务型 step 的任一步失败都在同一 migration transaction 回滚 DDL/DML、Alembic version row 与 grant delta。非 0019
 revision 也逐 step grant/verify；fresh upgrade 不需要第二个 owner session或 migration 后置修复。
+
+0016～0018 含 autocommit 批次或 `CREATE UNIQUE INDEX CONCURRENTLY`，演练必须记录失败后实际持久的
+列、索引/约束、revision 与权限，不能声称整个 revision 已回滚。重跑只接受该 migration 自己以固定名称
+创建、catalog 形状逐列匹配且无额外 ACL 的精确 resume candidate；同名错误对象、部分 contract、未知
+业务行变化或 revision 不匹配都必须拒绝。resume 只继续原 revision，不提前应用 0019 policy，也不提供
+通用 repair。0019 没有 autocommit：DDL/DML、version row、grant delta、完整 destination inventory 与
+最后的 `before_commit` guard 必须在同一事务中全部提交或全部回滚。
 
 首次安装与 Compose 顺序固定为 `role-bootstrap → typed migrate`；`scripts/init-db-roles.sh` 只能是
 Secret-file-safe 的 typed CLI 薄 wrapper，不能包含 SQL、ACL parser 或 object-grant inventory。受保护
@@ -1041,6 +1048,107 @@ Scheduler 复用每分钟 `expire-approvals` 入口，扫描已关闭全局/供�
 
 模型 API Key 轮换时，更新 Secret、滚动 API/Worker/Scheduler，并确认结构化模型调用仍使用预期
 供应商与数据最小披露策略。
+
+## M2 数据保留与隐私删除
+
+本节衔接规格 17.2～17.4。任务级合成验证只证明本地实现；生产发布仍须完成本手册的迁移、备份/
+恢复、access-log canary 和[验收清单](acceptance-checklist.md)，不得据此认定生产 0019 已执行。
+
+### 到期内容、来源与历史
+
+现有设置默认采用 30/180/365 天：邮件正文 30 天，来源及草稿元数据 180 天，任务与无内容审计
+365 天；日程内容及补偿快照使用事件结束后 180 天。邮件草稿正文按最后编辑期限判断，元数据
+以全部不可变版本中最新创建时间判断，不能因一个旧版本而删掉新版本。未来日程不得被历史清理误删。
+
+内容清理在用户范围内按 TaskRun→ApprovalRequest→ToolExecution→动作→版本/快照锁定并重读
+期限、审批、哈希和执行状态。正文/快照与引用审批的 AEAD 三元组同事务清空；CalendarEvent 描述
+与地点分别清空 ciphertext、nonce、key_version、aad_version 四列，包含
+`description_aad_version` 和 `location_aad_version`，失败时整体回滚。尚无 ToolExecution 的动作
+失效审批、取消任务及动作，使用 `action_content_expired`，并清除调度、重试、审批恢复与租约字段；
+已有未知执行一并转入 `needs_attention`，保留哈希、供应商资源/关联标识、检查链接、核对计数和
+人工结果入口；已终态执行只清内容，确定结果保持不变。清理不得创建新的写入或自动重试资格。
+
+来源绑定只由 `source_thread_id IS NOT NULL OR source_message_id IS NOT NULL`（邮件）或
+`target_event_id IS NOT NULL`（日程）决定。未认领的绑定动作先失效，再显式删除其子记录、审批
+与聚合；已认领动作保留最小核对事实。独立新邮件草稿及无目标事件的 `calendar.create` 提案保留。
+清理缓存不解密命令、不依赖 cascade 证明覆盖，也不调用供应商写接口。
+
+普通历史清理删除父任务前，retention 连续持有 TaskRun→user 锁，重验 active、终态、
+`finished_at < cutoff` 且不存在 deletion-started authority；随后通过已有 app/checkpointer 的
+`adelete_thread` 删除 `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`，保留全局
+`checkpoint_migrations`。app 窄入口只读重验归属/期限，不重新申请外层已持行锁。其删除提交后，
+retention 仍持原锁，才删除依赖与父 TaskRun；任一步失败保留父行供下轮恢复。原生 saver 的
+`aput`/`aput_writes` 同事务锁定 TaskRun→user，父行消失或用户 inactive 时拒绝迟到保存。
+app 与 retention 的原有角色和 checkpoint 权限不变，不允许运维补 grant 或切换清理身份。
+
+### OAuth 审计与恢复事实
+
+普通 cutoff 删除必须排除五类 OAuth 事件：`oauth.refresh_started`、`oauth.refresh_confirmed`、
+`oauth.refresh_recovery_authorization_started`、`oauth.refresh_recovery_unsatisfied`、
+`oauth.refresh_credential_replaced`；同时保留所有未被最终删除事务消费的
+`privacy.deletion_started`，包括格式错误或相互冲突的集合，不能靠删除坏行选出赢家。
+
+OAuth 专用清理复用同一严格 versioned result-union parser。confirmed 只关闭对应 automatic
+started，unsatisfied 只关闭本次 recovery started 并保留 original fence，replacement 才同时消费
+其 recovery started 与 original fence。每组只有全部成员早于 cutoff，即组内最大 `created_at < cutoff`，
+才可原子删除。缺失、重复、字段/身份/时序不匹配的组保留；后续凭据变化不会复活已关闭 attempt。
+
+只有实际候选才在独立短事务依次取得
+`LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT` 和
+`LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT`，再按用户限定的
+connection→access→refresh 读取行身份，按 original→recovery 复用既有审计互斥锁，锁后重新读取
+完整事件组并解析。普通审计清理不读取 token、密文、expiry、generation 或后续 lineage。
+任一表锁竞争立即回滚并有界返回，留待下一轮维护或原删除赢家恢复；禁止忙等、无锁降级、
+audit UPDATE、新增清理专用锁或追加角色权限。清理事务中没有网络请求。
+
+`database.restore.completed` 使用普通 365 天 cutoff，并随全数据删除移除。上述清理不修改
+database-wide completed call 与 `ai_employee.restore_completion` 的 zero-slot 互绑事实；恢复准入/
+ACK 仍需该 pair、gate absent、精确 baseline ACL、安全角色、双向无 membership 和完整对象权限。
+审计行存在与否、BigInteger ID、数量或 metadata 均不能替代 catalog authority。后续合法恢复仍可
+把新的完成审计绑定到全数据删除后保留的唯一匿名用户。
+
+### 全数据删除、故障恢复与诊断
+
+设置页在确认前展示：“删除本地数据不能撤回已发送的邮件或已生效的日程变更。结果未知的操作也
+可能已在供应商侧生效。”用户仍须输入精确的 `DELETE ALL DATA`。请求创建唯一可恢复任务，
+Worker 按以下顺序执行：
+
+1. 锁定当前 RUNNING 删除 TaskRun→user，锁后取当前时间并校验 owner、有效租约及精确
+   `task_id/user_id/deletion_request_id`。true→false CAS 与唯一 `privacy.deletion_started`
+   同事务提交，metadata 精确为 `{"schema_version":"privacy_deletion_started.v1","request_id":<原请求 ID>}`。
+   解析必须读取完整 per-user 集合；零条、多条、格式或绑定错误都拒绝恢复。并发 CAS 失败者不得
+   取得 authority。普通任务认领/续租、工具认领、命令解密前检查与 request-start 均重检 active；
+   OAuth callback 保存、设置、任务/对话变更、人工确认/重开核对和普通清理审计也不能在屏障后回写。
+2. 失效未认领动作。每个已认领动作先持久化 `privacy_reconciliation_started` 一次资格，再通过
+   固定无内容端口最多执行一次有界 GET。只使用归属匹配、具备只读能力且仍有效的 access token；
+   定位、能力或 access 缺失时零网络返回 UNKNOWN。GET 的存在/404、ID、ETag 或 marker 也始终
+   保持 UNKNOWN，不授权重试，不读取完整内容或保存响应。此阶段禁止解密可信命令、refresh、
+   code exchange 和邮件/日历写入；崩溃或 ACK 丢失不会再次取得读取资格。
+3. 每个连接按上述物理锁序最多解密一个撤销 token，优先 refresh；credential 删除提交后才进行
+   best-effort revoke。Google 使用窄撤销端点；Microsoft 的窄撤销返回不支持的稳定结果，仍完成
+   本地删除。网络失败或进程崩溃均不能恢复已删凭据；恢复时不再解密或撤销已删除行。
+4. 显式按子到父批量删除用户业务图和 checkpoint，保留当前删除任务及完整 started-authority
+   集合。最终事务再次锁定并严格验证赢家，原子删除其 TaskRun/Outbox/authority、匿名化用户并
+   追加唯一 `privacy.deletion_completed`。任何中途失败都回滚；提交后消息重放不会创建第二条完成审计。
+
+最终保留一行 inactive 用户：匿名地址 `deleted-{user_id}@invalid.local`，清空密码与三个默认
+连接/日历字段；恢复 UTC、zh-CN、08:00、30/180/365 天、周一至周五 09:00–18:00、周末为空及
+10 分钟会议缓冲，并更新 `updated_at`。完成审计没有 task/正文/地址/标题/provider ID，metadata
+精确为 `{"operation":"all_data_deletion","request_id":<原请求 ID>,"completed_at":<UTC ISO 时间>,"trace_id":null}`。
+
+屏障后仅原 RUNNING 赢家在租约过期时可取得 `INACTIVE_ALL_DATA_RECOVERY`；不得从 CREATED、
+QUEUED、RETRY_SCHEDULED 或 WAITING_APPROVAL 进入该例外，也不得已有 ToolExecution。每次接管
+获得新的有界尝试预算，保留原 `started_at`；普通任务仍使用 M1 生命周期预算。通用成功、失败、
+取消或重试分支不能把赢家移出 RUNNING，只有最终隐私事务删除它。Scanner 在 limit 前过滤零变更
+候选，以五分钟 UTC 桶追加仅含 `task_id` 的 Outbox，去重键固定为
+`task.execute:{task_id}:inactive-deletion-recovery:{bucket_start_utc_iso8601}`。同桶并发只插入一次；
+Redis 丢失已发布消息后，后续桶可以再次投递，TaskRun 状态与旧租约历史保持不变，接管成功后停止
+补发直到新租约到期。
+
+诊断只收集任务/请求标识、阶段、租约、稳定错误码、authority 数量与 Outbox 状态，不采集正文或
+凭据。表锁竞争由原维护/删除任务有界重试；checkpoint 失败保留父任务后恢复。无法证明唯一
+authority 时保留现场交由事故处置，不得手工重新激活用户、编辑/删除 authority、创建替代删除任务、
+重放供应商请求或凭猜测确认未应用。普通 retention 不得为 inactive 用户追加完成审计或覆盖一次核对标记。
 
 ## M2 操作快照与监控
 

@@ -26,6 +26,26 @@ from tests.integration.alembic_commands import run_alembic_upgrade
 ROOT = Path(__file__).resolve().parents[4]
 
 
+@pytest.mark.parametrize("mode", ["retention", "privacy"])
+def test_task27e_restore_completion_audit_cleanup_preserves_catalog_authority(
+    empty_migration_database: URL,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """真实审计被普通保留/全数据删除后，完成pair准入和ACK仍有效且新恢复可绑定唯一用户。"""
+    from tests.integration.operations.privacy_restore_cases import (
+        assert_restore_completion_survives_user_audit_cleanup,
+    )
+
+    assert_restore_completion_survives_user_audit_cleanup(
+        empty_migration_database,
+        tmp_path,
+        monkeypatch,
+        mode=mode,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("revision", ("20260809_0018", "20260809_0019"))
 async def test_calendar_owner_facts_isolated_from_app_identity(

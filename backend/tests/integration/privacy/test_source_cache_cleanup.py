@@ -23,6 +23,7 @@ from ai_employee.infrastructure.db.models.sources import (
 from ai_employee.infrastructure.db.models.tasks import TaskRunModel
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.workers.privacy import PrivacyDeletionWorker
+from tests.integration.retention.test_m2_action_retention import seed_lifecycle_action
 
 
 @pytest.mark.asyncio
@@ -97,5 +98,79 @@ async def test_source_cache_cleanup_removes_only_source_rows_and_resets_cursors(
                 "mail": (None, None), "calendar": (None, None)
             }
             assert await session.scalar(select(func.count()).select_from(EmailMessageModel).where(EmailMessageModel.user_id == other.id)) == 1
+    finally:
+        await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,binding", [("mail", "thread"), ("mail", "message"), ("calendar", "event")]
+)
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_task27e_source_cache_binding_preserves_independent_and_claimed_actions(
+    database_url: str,
+    kind: str,
+    binding: str,
+    claimed: bool,
+) -> None:
+    """精确来源绑定决定删除；已认领最小事实留存且独立新建内容不受影响。"""
+    from ai_employee.infrastructure.db.models.actions import (
+        CalendarChangeProposalModel,
+        CalendarChangeSnapshotModel,
+        MailDraftModel,
+        MailDraftVersionModel,
+    )
+    from ai_employee.infrastructure.db.models.tasks import ApprovalRequestModel, ToolExecutionModel
+
+    session_factory = build_session_factory(database_url)
+    try:
+        bound = await seed_lifecycle_action(
+            session_factory,
+            kind=kind,
+            binding=binding,
+            execution_status="reconciling" if claimed else None,
+        )
+        independent = await seed_lifecycle_action(
+            session_factory,
+            kind=kind,
+            retained=True,
+            user_id=bound.user_id,
+        )
+        await PrivacyDeletionWorker(session_factory).clear_source_cache(
+            user_id=bound.user_id, batch_size=1
+        )
+        async with session_factory() as session:
+            aggregate = MailDraftModel if kind == "mail" else CalendarChangeProposalModel
+            content = MailDraftVersionModel if kind == "mail" else CalendarChangeSnapshotModel
+            task = await session.get(TaskRunModel, bound.task_id)
+            assert task is not None
+            if claimed:
+                action = await session.get(aggregate, bound.action_id)
+                execution = await session.get(ToolExecutionModel, bound.execution_id)
+                approval = await session.get(ApprovalRequestModel, bound.approval_id)
+                version = await session.get(content, bound.content_id)
+                assert (
+                    action is not None
+                    and execution is not None
+                    and approval is not None
+                    and version is not None
+                )
+                assert action.status == task.status == execution.status == "needs_attention"
+                assert execution.provider_resource_id == "synthetic-resource"
+                assert approval.payload_ciphertext is None
+                assert (
+                    getattr(version, "body_ciphertext" if kind == "mail" else "content_ciphertext")
+                    is None
+                )
+            else:
+                assert task.status == "cancelled"
+                assert await session.get(aggregate, bound.action_id) is None
+                assert await session.get(content, bound.content_id) is None
+                assert await session.get(ApprovalRequestModel, bound.approval_id) is None
+                assert await session.get(ToolExecutionModel, bound.execution_id) is None
+            own = await session.get(aggregate, independent.action_id)
+            approval = await session.get(ApprovalRequestModel, independent.approval_id)
+            assert own is not None and own.status == "awaiting_approval"
+            assert approval is not None and approval.payload_ciphertext is not None
     finally:
         await session_factory.dispose()

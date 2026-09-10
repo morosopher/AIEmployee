@@ -43,6 +43,37 @@ async def test_second_worker_resumes_postgres_checkpoint_without_rerunning_compl
     """第二个 Worker 用同一 task_id thread 恢复时，不得重跑已写 checkpoint 的前置节点。"""
     task_id = uuid4()
     calls = {"prepare": 0, "continue": 0}
+    # 生产 saver 只接受真实业务 TaskRun 的规范 thread；平台Graph回归也须补齐归属，
+    # 不能为测试绕过保存入口的活动用户屏障。
+    sessions = build_session_factory(database_url)
+    try:
+        async with sessions.begin() as session:
+            user_id = uuid4()
+            session.add(
+                UserModel(
+                    id=user_id,
+                    email=f"{user_id}@example.test",
+                    display_name="Synthetic",
+                    timezone="UTC",
+                    locale="zh-CN",
+                    brief_time=time(8),
+                    is_active=True,
+                )
+            )
+            await session.flush()
+            session.add(
+                TaskRunModel(
+                    id=task_id,
+                    user_id=user_id,
+                    kind="fake_write",
+                    status="running",
+                    idempotency_key=str(task_id),
+                    input_payload={},
+                    graph_thread_id=str(task_id),
+                )
+            )
+    finally:
+        await sessions.dispose()
 
     async def prepare(state: dict[str, object]) -> dict[str, object]:
         """模拟第一个 Worker 已完成的无副作用预处理节点。"""
@@ -610,3 +641,75 @@ async def test_redelivered_initial_message_uses_persisted_approval_decision(
         assert task.status == TaskStatus.SUCCEEDED.value
     finally:
         await session_factory.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_kind", ["aput", "aput_writes"])
+async def test_task27e_late_native_checkpoint_write_cannot_recreate_deleted_thread(
+    database_url: str,
+    write_kind: str,
+) -> None:
+    """真实 saver 已取得上下文后，另一事务提交 inactive/清理，迟到原生写必须零行。"""
+    from langgraph.checkpoint.base import empty_checkpoint
+    from sqlalchemy import text, update
+
+    from ai_employee.domain.errors import StateConflictError
+    from tests.integration.retention.test_m2_action_retention import NOW, seed_lifecycle_action
+
+    sessions = build_session_factory(database_url)
+    try:
+        seed = await seed_lifecycle_action(sessions, retained=True)
+        async with sessions.begin() as session:
+            await session.execute(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == seed.task_id)
+                .values(
+                    graph_thread_id=str(seed.task_id),
+                )
+            )
+        checkpoint = empty_checkpoint()
+        checkpoint["ts"] = NOW.isoformat()
+        checkpoint["channel_values"] = {"synthetic": {"item": "synthetic"}}
+        checkpoint["channel_versions"] = {"synthetic": "1"}
+        config = {"configurable": {"thread_id": str(seed.task_id), "checkpoint_ns": ""}}
+        async with postgres_checkpointer(database_url) as saver:
+            saved = await saver.aput(
+                config,
+                checkpoint,
+                {"source": "input", "step": 0, "parents": {}},
+                {"synthetic": "1"},
+            )
+            await saver.aput_writes(saved, [("synthetic", "old-write")], "synthetic-node")
+            async with sessions.begin() as session:
+                await session.execute(
+                    update(UserModel).where(UserModel.id == seed.user_id).values(is_active=False)
+                )
+            # 旧 SDK 的删除能力仅作 RED 现场构造；真实 privacy 组合另测其精确授权与三表覆盖。
+            await saver.adelete_thread(str(seed.task_id))
+            rejected = False
+            try:
+                if write_kind == "aput":
+                    await saver.aput(
+                        saved,
+                        checkpoint,
+                        {"source": "loop", "step": 1, "parents": {}},
+                        {"synthetic": "1"},
+                    )
+                else:
+                    await saver.aput_writes(saved, [("synthetic", "late-write")], "synthetic-node")
+            except StateConflictError:
+                rejected = True
+            assert rejected, "inactive checkpoint writer must be rejected"
+        async with sessions() as session:
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                assert (
+                    await session.scalar(
+                        text(f"SELECT count(*) FROM {table} WHERE thread_id=:thread"),
+                        {
+                            "thread": str(seed.task_id),
+                        },
+                    )
+                    == 0
+                )
+    finally:
+        await sessions.dispose()

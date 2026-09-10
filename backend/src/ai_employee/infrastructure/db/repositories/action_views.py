@@ -56,6 +56,7 @@ from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeSnapshotModel,
     MailDraftModel,
 )
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     CalendarEventModel,
     OAuthConnectionModel,
@@ -153,6 +154,17 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
             .with_for_update()
         )
         if task is None or task.kind != "trusted_action":
+            raise _manual_conflict()
+        # Cookie 认证可能先于删除屏障；必须在 Task→user 锁内再次检查，防止迟到的
+        # 人工确认/重开核对覆盖 privacy 的持久一次资格或新建恢复任务。
+        active = await self._session.scalar(
+            select(UserModel.is_active)
+            .where(
+                UserModel.id == user_id,
+            )
+            .with_for_update()
+        )
+        if active is not True:
             raise _manual_conflict()
         identifiers = _task_identifiers(task)
         if identifiers is None:

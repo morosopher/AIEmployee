@@ -36,6 +36,7 @@ from ai_employee.application.ports.trusted_actions import (
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
     ProviderWriteOutcome,
+    RequestPreparationDisposition,
     RequestStartDisposition,
     TrustedActionAdapterRegistry,
     TrustedActionCommandCipher,
@@ -222,6 +223,20 @@ class TrustedActionAttemptAbandoned(Exception):
     """表示当前 Worker 不得完成任务，后续投递只能从持久事实恢复。"""
 
 
+class TrustedActionUserInactive(StateConflictError):
+    """保留删除屏障的独立控制流，Worker 不再解密或落通用失败终态。
+
+    对既有调用方仍是无内容的 trusted_action_unavailable 冲突；Worker 则能够识别
+    privacy 拥有后续失效/有界核对，不把 inactive 伪装为供应商未执行结果。
+    """
+
+    def __init__(self) -> None:
+        """使用既有安全错误码，不暴露账户、任务内容或删除请求。"""
+        super().__init__(
+            error_code="trusted_action_unavailable", message="trusted action unavailable"
+        )
+
+
 def _connection_scope_missing_outcome(
     snapshot: TrustedActionDispatchSnapshot,
 ) -> ProviderWriteOutcome:
@@ -361,6 +376,9 @@ class TrustedActionExecutionUseCase:
             )
             if snapshot is None:
                 raise _trusted_action_unavailable()
+            if not snapshot.user_is_active:
+                # 用户 CAS 已把所有本地收敛权交给 privacy；不新增 claim 或失败审计。
+                raise TrustedActionUserInactive
             # 首次授权必须使用全部行锁取得后的 PostgreSQL 权威时间。应用时钟可能在
             # 等锁期间跨过租约或审批截止点，不能作为创建外部写授权事实的依据。
             now = _utc_now(snapshot.database_now)
@@ -474,6 +492,12 @@ class TrustedActionExecutionUseCase:
             )
         ):
             raise _trusted_action_unavailable()
+        async with self._transactions() as transaction:
+            preparation = await transaction.check_request_preparation(snapshot=snapshot)
+        if preparation is RequestPreparationDisposition.USER_INACTIVE:
+            raise TrustedActionUserInactive
+        if preparation is not RequestPreparationDisposition.READY:
+            raise TrustedActionAttemptAbandoned
         try:
             async with self._transactions() as transaction:
                 command_payload = await transaction.load_command(
@@ -646,6 +670,8 @@ class TrustedActionExecutionUseCase:
                     error_code=request_start_error_code,
                     message="trusted action authorization changed before request start",
                 )
+            if request_start.disposition is RequestStartDisposition.USER_INACTIVE:
+                raise TrustedActionUserInactive
             if request_start.disposition is not RequestStartDisposition.STARTED:
                 # 租约已丢失或另一调用已经提交 request-start 时，本调用绝不能释放赢家
                 # 的 live lease，也不能让 Graph/Runner 把 loser 当作成功完成。

@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 import ai_employee.workers.execute_task as execute_task_module
+from ai_employee.application.use_cases import task_execution as task_execution_use_cases
 from ai_employee.application.use_cases.task_execution import (
     DurableTaskRunner,
     LeasedTask,
@@ -1239,3 +1240,72 @@ async def test_taskiq_entrypoint_propagates_unknown_when_failure_cannot_be_persi
 
     with pytest.raises(RuntimeError, match="task execution persistence boundary unavailable"):
         await execute_task_module.execute_task.original_func(str(uuid4()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "recovery", "runs"),
+    [
+        ("daily_brief", False, False),
+        ("calendar.aad_0019.resync", False, False),
+        ("privacy.delete_all_data", False, False),
+        ("privacy.delete_all_data", True, True),
+    ],
+)
+async def test_only_typed_inactive_recovery_gets_fresh_attempt_budget(
+    kind: str,
+    recovery: bool,
+    runs: bool,
+) -> None:
+    """旧 started_at 已耗尽时，仅显式 inactive 删除恢复继续节点；普通任务预算不变。"""
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+    task = replace(_leased_task(started_at=now - timedelta(days=2)), kind=kind)
+    if recovery:
+        task = replace(
+            task, lease_mode=task_execution_use_cases.TaskLeaseMode.INACTIVE_ALL_DATA_RECOVERY
+        )
+    store = RecordingLeaseStore(task)
+    observed: list[str] = []
+
+    async def step() -> None:
+        """记录真实 Runner 是否进入删除步骤，不接触外部供应商。"""
+        observed.append("entered")
+
+    runner = _runner(store=store, clock=MutableClock(now), steps=(CallableStep("delete", step),))
+    await runner.run(task.task_id, lease_owner="worker-a")
+    assert observed == (["entered"] if runs else [])
+    assert task.started_at == now - timedelta(days=2)
+    assert store.finished == (
+        [(TaskStatus.SUCCEEDED, None)] if runs else [(TaskStatus.FAILED, "task_timeout")]
+    )
+
+
+@pytest.mark.asyncio
+async def test_inactive_recovery_still_has_a_bounded_step_budget() -> None:
+    """新尝试总预算不会关闭单步超时，也不会改写历史起点。"""
+    import asyncio
+
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+    task = replace(
+        _leased_task(started_at=now - timedelta(days=2)),
+        kind="privacy.delete_all_data",
+        lease_mode=task_execution_use_cases.TaskLeaseMode.INACTIVE_ALL_DATA_RECOVERY,
+    )
+    store = RecordingLeaseStore(task)
+    entered: list[bool] = []
+
+    async def stalled() -> None:
+        """用可取消等待模拟崩溃前停滞，避免真实网络与计时竞态。"""
+        entered.append(True)
+        await asyncio.Event().wait()
+
+    runner = _runner(
+        store=store,
+        clock=MutableClock(now),
+        steps=(CallableStep("delete", stalled),),
+        task_timeout_seconds=1,
+        task_step_timeout_seconds=0.01,
+    )
+    await runner.run(task.task_id, lease_owner="worker-a")
+    assert entered == [True]
+    assert store.finished == [(TaskStatus.FAILED, "task_step_timeout")]

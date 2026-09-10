@@ -22,6 +22,7 @@ from ai_employee.application.ports.trusted_actions import (
     ExistingTrustedActionSubmission,
     MailDraftSubmissionSnapshot,
     ProviderWriteOutcome,
+    RequestPreparationDisposition,
     RequestStartAuthorizer,
     RequestStartDisposition,
     RequestStartResult,
@@ -1042,6 +1043,37 @@ class SqlAlchemyTrustedActionRepository:
             )
         )
 
+    async def check_request_preparation(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+    ) -> RequestPreparationDisposition:
+        """在任何命令解密前按 TaskRun→user 锁序执行只读删除屏障检查。
+
+        此检查不标记 executing，不递增尝试，不判断供应商是否已应用。它只关闭已提交
+        claim 与后续解密之间的 inactive 窗口；最终 request-start 事务仍重复同样检查。
+        """
+        task = await self._session.scalar(
+            select(TaskRunModel)
+            .where(
+                TaskRunModel.id == snapshot.task_id,
+                TaskRunModel.user_id == snapshot.user_id,
+            )
+            .with_for_update()
+        )
+        if task is None:
+            return RequestPreparationDisposition.ABANDONED
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+        )
+        if user is None:
+            return RequestPreparationDisposition.ABANDONED
+        return (
+            RequestPreparationDisposition.READY
+            if user.is_active
+            else RequestPreparationDisposition.USER_INACTIVE
+        )
+
     async def mark_request_started(
         self,
         *,
@@ -1104,6 +1136,10 @@ class SqlAlchemyTrustedActionRepository:
         user = await self._session.scalar(
             select(UserModel).where(UserModel.id == snapshot.user_id).with_for_update()
         )
+        if user is not None and task.user_id == user.id and not user.is_active:
+            # 已冻结的 claim 仍可能对应未知外部副作用；inactive 不是 confirmed-not-applied
+            # 证据。保持请求计数/时间及执行事实原样，由 privacy 的有界收敛负责处理。
+            return RequestStartResult(RequestStartDisposition.USER_INACTIVE)
         connection = (
             await self._session.scalar(
                 select(OAuthConnectionModel)

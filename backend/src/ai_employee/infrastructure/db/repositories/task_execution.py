@@ -4,23 +4,107 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_employee.application.use_cases.task_execution import LeasedTask, utc_instant
+from ai_employee.application.use_cases.privacy import (
+    PRIVACY_DELETION_STARTED_EVENT_TYPE,
+    PrivacyDeletionStartedAuthority,
+    PrivacyDeletionStartedFact,
+    parse_privacy_deletion_started_authority,
+)
+from ai_employee.application.use_cases.task_execution import LeasedTask, TaskLeaseMode, utc_instant
 from ai_employee.domain.tasks import JsonValue, TaskStatus
+from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.tasks import (
     AuditEventModel,
     OutboxEventModel,
     TaskRunModel,
+    ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 
-class SqlAlchemyTaskExecutionStore:
-    """用 PostgreSQL 条件 UPDATE 实现租约、续租与 owner 保护的状态写入。
+async def load_deletion_started_authority(
+    session: AsyncSession,
+    *,
+    task: TaskRunModel,
+) -> PrivacyDeletionStartedAuthority | None:
+    """在 TaskRun→user 锁后投影完整 started 集合，仅识别预屏障精确删除赢家。
 
-    每个方法使用独立短事务。租约 acquisition 在一条 ``UPDATE ... RETURNING`` 中同时
-    判断状态、过期时间并写 owner，避免先查后写竞态；完成、失败和 RETRY_SCHEDULED
-    同样以当前 ``lease_owner`` 做 CAS，丢失租约的 Worker 无法提交陈旧终态。
+    Args:
+        session: 已锁定任务及所属用户的当前短事务；本方法不提交、不加反向行锁。
+        task: 当前事务中的 RUNNING 任务。owner/租约时间由具体 acquire/renew/finalize 校验。
+
+    Returns:
+        原任务输入、运行历史、无 ToolExecution 与唯一 started 事实全部匹配的授权。
+        查询只按 user/event 过滤，绝不以 expected task/request 隐藏冲突事实。
+    """
+    request_id = task.input_payload.get("deletion_request_id")
+    if (
+        task.kind != "privacy.delete_all_data"
+        or task.status != TaskStatus.RUNNING.value
+        or task.started_at is None
+        or task.attempt_count <= 0
+        or set(task.input_payload) != {"deletion_request_id"}
+        or not isinstance(request_id, str)
+        or not request_id
+        or await session.scalar(
+            select(ToolExecutionModel.id).where(ToolExecutionModel.task_id == task.id).limit(1)
+        )
+        is not None
+    ):
+        return None
+    rows = (
+        await session.scalars(
+            select(AuditEventModel).where(
+                AuditEventModel.user_id == task.user_id,
+                AuditEventModel.event_type == PRIVACY_DELETION_STARTED_EVENT_TYPE,
+            )
+        )
+    ).all()
+    return parse_privacy_deletion_started_authority(
+        [
+            PrivacyDeletionStartedFact(
+                event_type=row.event_type,
+                user_id=row.user_id,
+                task_id=row.task_id,
+                event_metadata=row.event_metadata,
+            )
+            for row in rows
+        ],
+        expected_user_id=task.user_id,
+        expected_task_id=task.id,
+        expected_request_id=request_id,
+    )
+
+
+async def _protect_inactive_deletion_task(session: AsyncSession, *, task_id: UUID) -> bool:
+    """在通用终态/重试写之前锁住 TaskRun→user，只保护精确 inactive 删除赢家。
+
+    普通任务及 CAS 失败者仍遵守既有通用 owner/time CAS；不能把 inactive 状态本身
+    扩张为新的任务终态保护规则。返回 True 时调用方必须保持所有任务列和审计不变。
+    """
+    task = await session.scalar(
+        select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+    )
+    if task is None:
+        return False
+    user = await session.scalar(
+        select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+    )
+    return (
+        user is not None
+        and not user.is_active
+        and await load_deletion_started_authority(session, task=task) is not None
+    )
+
+
+class SqlAlchemyTaskExecutionStore:
+    """用 TaskRun→user 锁序及条件 UPDATE 实现删除屏障和 owner 保护的状态写入。
+
+    每个方法使用独立短事务，锁后重检 active 或唯一 deletion authority；UPDATE 仍
+    保留状态、owner、时间谓词。精确 inactive 删除赢家只能续租/接管，不能被通用
+    完成或错误路径移出 RUNNING，使最后的 privacy 原子事务始终拥有可恢复身份。
     """
 
     def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
@@ -41,6 +125,8 @@ class SqlAlchemyTaskExecutionStore:
         """
         now = utc_instant(now, field="now")
         async with self._session_factory.begin() as session:
+            if await _protect_inactive_deletion_task(session, task_id=task_id):
+                return
             row = (
                 await session.execute(
                     update(TaskRunModel)
@@ -129,6 +215,30 @@ class SqlAlchemyTaskExecutionStore:
             TaskRunModel.lease_expires_at <= now,
         )
         async with self._session_factory.begin() as session:
+            task = await session.scalar(
+                select(TaskRunModel)
+                .where(TaskRunModel.id == task_id, eligible_status, lease_available)
+                .with_for_update()
+            )
+            if task is None:
+                return None
+            user = await session.scalar(
+                select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+            )
+            if user is None:
+                return None
+            lease_mode = TaskLeaseMode.NORMAL
+            if not user.is_active:
+                # QUEUED 等状态即使伪造 exact metadata 也不能产生恢复例外；原任务必须
+                # 已运行且仍带过期 lease。完整 per-user parser 是最终权威。
+                if (
+                    recover_waiting_approval
+                    or task.lease_expires_at is None
+                    or task.lease_expires_at > now
+                    or await load_deletion_started_authority(session, task=task) is None
+                ):
+                    return None
+                lease_mode = TaskLeaseMode.INACTIVE_ALL_DATA_RECOVERY
             row = (
                 await session.execute(
                     update(TaskRunModel)
@@ -177,6 +287,7 @@ class SqlAlchemyTaskExecutionStore:
                 user_id=row.user_id,
                 attempt_count=row.attempt_count,
                 lease_owner=lease_owner,
+                lease_mode=lease_mode,
             )
 
     async def renew(
@@ -207,6 +318,27 @@ class SqlAlchemyTaskExecutionStore:
         if lease_expires_at <= renewed_at:
             raise ValueError("lease_expires_at must be later than renewed_at")
         async with self._session_factory.begin() as session:
+            task = await session.scalar(
+                select(TaskRunModel)
+                .where(
+                    TaskRunModel.id == task_id,
+                    TaskRunModel.status == TaskStatus.RUNNING.value,
+                    TaskRunModel.lease_owner == lease_owner,
+                    TaskRunModel.lease_expires_at.is_not(None),
+                    TaskRunModel.lease_expires_at > renewed_at,
+                )
+                .with_for_update()
+            )
+            if task is None:
+                return False
+            user = await session.scalar(
+                select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+            )
+            if user is None or (
+                not user.is_active
+                and await load_deletion_started_authority(session, task=task) is None
+            ):
+                return False
             task_id_result = await session.scalar(
                 update(TaskRunModel)
                 .where(
@@ -268,6 +400,8 @@ class SqlAlchemyTaskExecutionStore:
             TaskStatus.CANCELLED,
         }
         async with self._session_factory.begin() as session:
+            if await _protect_inactive_deletion_task(session, task_id=task_id):
+                return False
             row = (
                 await session.execute(
                     update(TaskRunModel)
@@ -329,6 +463,8 @@ class SqlAlchemyTaskExecutionStore:
         if attempt_count <= 0:
             raise ValueError("attempt_count must be positive")
         async with self._session_factory.begin() as session:
+            if await _protect_inactive_deletion_task(session, task_id=task_id):
+                return False
             row = (
                 await session.execute(
                     update(TaskRunModel)
@@ -409,6 +545,8 @@ class SqlAlchemyTaskExecutionStore:
             TaskRunModel.lease_expires_at > failed_at,
         )
         async with self._session_factory.begin() as session:
+            if await _protect_inactive_deletion_task(session, task_id=task_id):
+                return False
             row = (
                 await session.execute(
                     update(TaskRunModel)

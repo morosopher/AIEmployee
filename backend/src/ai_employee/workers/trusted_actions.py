@@ -18,6 +18,7 @@ from ai_employee.application.use_cases.task_execution import (
 from ai_employee.application.use_cases.trusted_actions import (
     TrustedActionAttemptAbandoned,
     TrustedActionExecutionUseCase,
+    TrustedActionUserInactive,
 )
 from ai_employee.config import Settings
 from ai_employee.domain.tasks import JsonValue
@@ -121,8 +122,8 @@ class TrustedActionTaskStep:
                     )
                 else:
                     result = await compiled.ainvoke(Command(resume=self._resume), config=config)
-        except TrustedActionAttemptAbandoned:
-            # request-start CAS loser、UNKNOWN 或已由另一调用提交的 executing 事实都不是
+        except (TrustedActionAttemptAbandoned, TrustedActionUserInactive):
+            # inactive 屏障、request-start CAS loser、UNKNOWN 或另一调用的 executing 事实都不是
             # 成功节点；应用用例已用未 checkpoint 化的 dispatch 投影处理需要释放的
             # 精确尝试，这里只映射为 Runner no-finish，不能让 loser 释放赢家租约。
             raise TaskWaitingApproval from None

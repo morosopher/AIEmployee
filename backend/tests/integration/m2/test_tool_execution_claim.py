@@ -4068,3 +4068,132 @@ async def test_crash_after_committed_request_start_recovers_only_by_reconciliati
     assert execution.write_attempt_count == 1
     assert adapter.write_calls == 1
     assert adapter.reconcile_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_task27e_existing_claim_inactive_preparation_rejects_before_decryption(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claim先提交再遇屏障时，准备阶段在任何命令解密和供应商解析前拒绝，保留核对事实。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url,
+        seed,
+        existing_execution_status=ToolExecutionStatus.CLAIMED,
+        user_is_active=False,
+    )
+    original = SqlAlchemyTrustedActionRepository.load_command
+    decrypt_calls: list[UUID] = []
+
+    async def read_command(repository, *, user_id: UUID, approval_id: UUID):
+        """记录真实AEAD读取边界，仍执行原实现以避免mock屏蔽被测行为。"""
+        decrypt_calls.append(approval_id)
+        return await original(repository, user_id=user_id, approval_id=approval_id)
+
+    monkeypatch.setattr(SqlAlchemyTrustedActionRepository, "load_command", read_command)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        for _ in range(2):
+            with pytest.raises(StateConflictError):
+                await workflow.execute_or_reconcile(
+                    task_id=seed.task_id,
+                    approval_id=seed.approval_id,
+                    operation_id=seed.operation_id,
+                    expected_payload_hash=payload_hash,
+                    lease_owner=seed.owner,
+                )
+        assert decrypt_calls == []
+        assert adapter.write_calls == adapter.reconcile_calls == 0
+        snapshot = await _load_dispatch_snapshot_for_test(database_url, seed)
+        assert snapshot.execution.status is ToolExecutionStatus.CLAIMED
+        assert snapshot.execution.request_started_at is None
+        assert snapshot.execution.write_attempt_count == 0
+        assert snapshot.execution.result_summary is None
+    finally:
+        await workflow.dispose()
+
+
+@pytest.mark.asyncio
+async def test_task27e_barrier_after_decryption_rejects_committed_start_without_fabricating_result(
+    database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """active准备成功后插入真实屏障事务，最终request-start必须再次检查并保持零调用。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(
+        database_url, seed, existing_execution_status=ToolExecutionStatus.CLAIMED
+    )
+    original = SqlAlchemyTrustedActionRepository.load_command
+    barrier_factory = build_session_factory(database_url)
+
+    async def read_then_barrier(repository, *, user_id: UUID, approval_id: UUID):
+        """在真实解密后提交独立CAS，构造两次授权检查之间的竞争窗口。"""
+        payload = await original(repository, user_id=user_id, approval_id=approval_id)
+        async with barrier_factory.begin() as session:
+            await session.execute(
+                update(UserModel)
+                .where(UserModel.id == user_id, UserModel.is_active.is_(True))
+                .values(is_active=False)
+            )
+        return payload
+
+    monkeypatch.setattr(SqlAlchemyTrustedActionRepository, "load_command", read_then_barrier)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    try:
+        with pytest.raises(StateConflictError):
+            await workflow.execute_or_reconcile(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        snapshot = await _load_dispatch_snapshot_for_test(database_url, seed)
+        assert snapshot.execution.status is ToolExecutionStatus.CLAIMED
+        assert snapshot.execution.request_started_at is None
+        assert snapshot.execution.write_attempt_count == 0
+        assert snapshot.execution.result_summary is None
+        assert adapter.write_calls == adapter.reconcile_calls == 0
+        async with barrier_factory() as session:
+            assert (
+                await session.scalar(
+                    select(UserModel.is_active).where(UserModel.id == seed.user_id)
+                )
+                is False
+            )
+    finally:
+        await workflow.dispose()
+        await barrier_factory.dispose()
+
+
+@pytest.mark.asyncio
+async def test_task27e_inactive_claim_does_not_fabricate_failure_or_reconcile(
+    database_url: str,
+) -> None:
+    """TaskRun租约已提交但ToolExecution尚未出现时，后到屏障把失效工作交给privacy。"""
+    seed = _Seed()
+    payload_hash = await _seed_action(database_url, seed, user_is_active=False)
+    adapter = _RecordingAdapter()
+    workflow = _workflow(database_url, adapter)
+    factory = build_session_factory(database_url)
+    try:
+        with pytest.raises(StateConflictError):
+            await workflow.claim(
+                task_id=seed.task_id,
+                approval_id=seed.approval_id,
+                operation_id=seed.operation_id,
+                expected_payload_hash=payload_hash,
+                lease_owner=seed.owner,
+            )
+        async with factory() as session:
+            assert await session.scalar(select(func.count()).select_from(ToolExecutionModel)) == 0
+            assert await session.scalar(select(func.count()).select_from(AuditEventModel)) == 0
+            task = await session.get(TaskRunModel, seed.task_id)
+            assert task is not None and task.status == "running"
+        assert adapter.write_calls == adapter.reconcile_calls == 0
+    finally:
+        await workflow.dispose()
+        await factory.dispose()

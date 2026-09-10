@@ -116,7 +116,8 @@ async def lock_refresh_audit_event(session: AsyncSession, *, event_id: int) -> N
     """取得按 AuditEvent.id 隔离的事务互斥，供自动 writer、恢复和清理共用。
 
     Args:
-        session: 已按 connection→access→refresh 顺序完成行锁的短业务事务。
+        session: writer 已按 connection→access→refresh 完成行锁的短事务；retention/privacy
+            按清理协议先取得两表 EXCLUSIVE NOWAIT 的更强物理保护并依该顺序读取身份。
         event_id: 待确认或清理的既有 started 审计事件主键，必须为正整数。
 
     审计表只授予应用角色 SELECT/INSERT，不能使用需要 UPDATE 权限的物理行锁。

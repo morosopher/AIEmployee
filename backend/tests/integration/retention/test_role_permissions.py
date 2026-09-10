@@ -5,20 +5,22 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from functools import partial
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from ai_employee.domain.errors import InternalInvariantError
+from ai_employee.application.use_cases.privacy import PrivacyDeletionBinding
+from ai_employee.application.use_cases.task_execution import TaskLeaseMode
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.infrastructure.db.alembic import (
     load_published_alembic_authority,
     run_alembic_upgrade_on_connection,
@@ -48,7 +50,10 @@ from ai_employee.infrastructure.db.models.sources import (
     OAuthConnectionModel,
     SyncCursorModel,
 )
-from ai_employee.infrastructure.db.models.tasks import AuditEventModel
+from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
+from ai_employee.infrastructure.db.repositories.privacy_checkpoints import (
+    PostgresPrivacyCheckpointCleaner,
+)
 from ai_employee.infrastructure.db.session import (
     ManagedAsyncSessionMaker,
     build_session_factory,
@@ -293,22 +298,36 @@ async def _assert_retention_statement_is_denied(
     assert getattr(error.value.orig, "sqlstate", None) == "42501"
 
 
-class _FinalizeBarrierPrivacyDeletionWorker(PrivacyDeletionWorker):
-    """让两个独立 retention Worker 同时进入最终串行化临界区。"""
+class _PreBarrierPrivacyDeletionWorker(PrivacyDeletionWorker):
+    """让两个预先具有独立 RUNNING 租约的删除任务竞争真实 inactive CAS。"""
 
     def __init__(
         self,
         session_factory: ManagedAsyncSessionMaker,
-        finalize_barrier: asyncio.Barrier,
+        start_barrier: asyncio.Barrier,
+        checkpoint_url: str,
     ) -> None:
-        """保存独立 factory 与只用于测试的双参与者 barrier。"""
-        super().__init__(session_factory)
-        self._finalize_barrier = finalize_barrier
+        """只暂停 CAS 前，不能让注定失败的第二个赢家等待最终阶段而形成测试死锁。"""
+        from tests.integration.privacy.test_all_data_deletion import _DeletionClock
 
-    async def _finalize_deleted_user(self, *, user_id: UUID, request_id: str) -> None:
-        """等待两个 Worker 都完成前置删除后，再竞争真实 PostgreSQL 行锁。"""
-        await self._finalize_barrier.wait()
-        await super()._finalize_deleted_user(user_id=user_id, request_id=request_id)
+        super().__init__(
+            session_factory,
+            clock=_DeletionClock(),
+            checkpoint_cleaner=PostgresPrivacyCheckpointCleaner(checkpoint_url),
+        )
+        self._start_barrier = start_barrier
+        self.phases: list[str] = []
+
+    async def _establish_barrier(
+        self, binding: PrivacyDeletionBinding, *, lease_mode: TaskLeaseMode
+    ) -> None:
+        """两个参与者同时进入实际 Task→user 加锁与 CAS；只有获胜者有后续清理资格。"""
+        await self._start_barrier.wait()
+        await super()._establish_barrier(binding, lease_mode=lease_mode)
+
+    async def _after_deletion_phase(self, *, phase: str) -> None:
+        """仅记录赢家实际经过的阶段，失败者必须没有任何删除、核对或 revoke 阶段。"""
+        self.phases.append(phase)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -686,6 +705,12 @@ async def test_retention_role_runs_source_cleanup_and_application_cannot_mutate_
         )
 
         # 该路径会 SELECT 来源主键，再 DELETE 邮件与线程并 UPDATE 游标，不能由宽泛授权替代。
+        # 上面冻结0018拒绝矩阵；当前M2 Worker只能在0019正式delta后执行其新增表查询。
+        # 正式维护门禁拒绝仍有runtime会话；先释放测试自身空闲池，再走原入口，不绕过门禁。
+        await app_engine.dispose()
+        await retention_engine.dispose()
+        await retention_factory.dispose()
+        disposable_role_database.upgrade_to_0019()
         await PrivacyDeletionWorker(retention_factory).clear_source_cache(
             user_id=user_id, batch_size=10
         )
@@ -929,15 +954,16 @@ async def test_revision_0019_retention_login_matches_complete_destination_matrix
     try:
         missing_user_id = uuid4()
         missing_request_id = "synthetic-missing-user-finalization"
-        with pytest.raises(InternalInvariantError) as missing_user_error:
+        with pytest.raises(StateConflictError) as missing_user_error:
             await PrivacyDeletionWorker(
                 retention_factories[0]
             )._finalize_deleted_user(
-                user_id=missing_user_id,
-                request_id=missing_request_id,
+                binding=PrivacyDeletionBinding(
+                    missing_user_id, uuid4(), missing_request_id, "synthetic-owner"
+                ),
             )
-        assert missing_user_error.value.error_code == "privacy_deletion_user_missing"
-        assert missing_user_error.value.message == "privacy deletion user is missing"
+        assert missing_user_error.value.error_code == "privacy_deletion_unavailable"
+        assert missing_user_error.value.message == "Privacy deletion lease is unavailable"
         assert missing_user_error.value.metadata == {}
         async with owner_factory() as session:
             missing_user_audit_count = await session.scalar(
@@ -1126,25 +1152,58 @@ async def test_revision_0019_retention_login_matches_complete_destination_matrix
             {},
         )
 
-        reactivation_request_id = "retention-destination-reactivation-guard"
-        finalize_barrier = asyncio.Barrier(2)
+        from tests.integration.privacy.test_all_data_deletion import BARRIER_NOW
+
+        request_ids = ("retention-destination-winner-a", "retention-destination-winner-b")
+        task_ids = (uuid4(), uuid4())
+        async with owner_factory.begin() as session:
+            for task_id, request_id in zip(task_ids, request_ids, strict=True):
+                session.add(
+                    TaskRunModel(
+                        id=task_id,
+                        user_id=synthetic_user_id,
+                        kind="privacy.delete_all_data",
+                        status="running",
+                        idempotency_key=str(task_id),
+                        input_payload={"deletion_request_id": request_id},
+                        started_at=BARRIER_NOW,
+                        attempt_count=1,
+                        lease_owner=str(task_id),
+                        lease_expires_at=BARRIER_NOW + timedelta(minutes=5),
+                    )
+                )
+        start_barrier = asyncio.Barrier(2)
         privacy_workers = tuple(
-            _FinalizeBarrierPrivacyDeletionWorker(factory, finalize_barrier)
+            _PreBarrierPrivacyDeletionWorker(
+                factory, start_barrier, disposable_role_database.app_url
+            )
             for factory in retention_factories
         )
-        await asyncio.wait_for(
+        outcomes = await asyncio.wait_for(
             asyncio.gather(
                 *(
                     worker.delete_all_data(
                         user_id=synthetic_user_id,
-                        request_id=reactivation_request_id,
+                        task_id=task_id,
+                        request_id=request_id,
+                        lease_owner=str(task_id),
+                        lease_mode=TaskLeaseMode.NORMAL,
                         batch_size=10,
                     )
-                    for worker in privacy_workers
-                )
+                    for worker, task_id, request_id in zip(
+                        privacy_workers, task_ids, request_ids, strict=True
+                    )
+                ),
+                return_exceptions=True,
             ),
             timeout=15.0,
         )
+        assert sum(outcome is None for outcome in outcomes) == 1
+        assert sum(isinstance(outcome, StateConflictError) for outcome in outcomes) == 1
+        winner = outcomes.index(None)
+        reactivation_request_id = request_ids[winner]
+        assert privacy_workers[1 - winner].phases == []
+        assert privacy_workers[winner].phases[-1] == "before_final_commit"
         async with owner_factory() as session:
             anonymized_user = (
                 await session.execute(
@@ -1205,3 +1264,236 @@ async def test_revision_0019_retention_login_matches_complete_destination_matrix
             await retention_factory.dispose()
         await app_engine.dispose()
         await retention_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_task27e_retention_oauth_row_lock_admission(
+    disposable_role_database: _DisposableRoleDatabase,
+) -> None:
+    """以真实 retention 登录证明 OAuth 行锁与冻结列权限的实际 PostgreSQL 边界。
+
+    这是 Task27E 的实现准入证据：审计只能使用既有 advisory mutex，而 connection 与
+    credential 也没有 UPDATE。每条探测都回滚独立事务，既不改 ACL，也不读取密文。
+    """
+    disposable_role_database.upgrade_to_0019()
+    engine = create_async_engine(disposable_role_database.retention_url, hide_parameters=True)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT current_user")) == "ai_employee_retention"
+            await connection.rollback()
+            for table in ("oauth_connections", "encrypted_credentials", "audit_events"):
+                for lock in ("UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"):
+                    with pytest.raises(DBAPIError) as failure:
+                        await connection.execute(text(f"SELECT id FROM {table} FOR {lock}"))
+                    assert getattr(failure.value.orig, "sqlstate", None) == "42501"
+                    await connection.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_task27e_retention_exclusive_table_lock_probe(
+    disposable_role_database: _DisposableRoleDatabase,
+) -> None:
+    """按控制器要求仅探测既有DELETE是否允许短事务表锁，绝不修改权限或读取凭据。
+
+    此探针不表示批准产品采用替代锁协议。两个锁按connection→credential顺序获得，
+    从pg_locks确认物理模式后整体rollback，外部资源及数据均保持原样。
+    """
+    disposable_role_database.upgrade_to_0019()
+    engine = create_async_engine(disposable_role_database.retention_url, hide_parameters=True)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT current_user")) == "ai_employee_retention"
+            await connection.execute(text("LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT"))
+            await connection.execute(
+                text("LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT")
+            )
+            locks = (
+                await connection.execute(
+                    text(
+                        "SELECT relation::regclass::text, mode, granted FROM pg_locks "
+                        "WHERE pid = pg_backend_pid() AND relation IN "
+                        "('oauth_connections'::regclass, 'encrypted_credentials'::regclass) "
+                        "ORDER BY relation::regclass::text"
+                    )
+                )
+            ).all()
+            assert [tuple(row) for row in locks] == [
+                ("encrypted_credentials", "ExclusiveLock", True),
+                ("oauth_connections", "ExclusiveLock", True),
+            ]
+            await connection.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["history", "privacy"])
+@pytest.mark.parametrize("mutation", ["aput", "aput_writes"])
+@pytest.mark.parametrize("order", ["save_first", "cleanup_first"])
+async def test_task27e_real_roles_checkpoint_save_delete_race(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    mutation: str,
+    order: str,
+) -> None:
+    """真实 app/retention 两连接证明两个保存入口、两个清理路径与两个先后顺序。"""
+    from tests.integration.retention.checkpoint_cases import assert_checkpoint_race
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_checkpoint_race(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+        mutation=mutation,
+        order=order,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["history", "privacy"])
+@pytest.mark.parametrize("failure_phase", ["app_delete", "retention_delete"])
+async def test_task27e_real_roles_checkpoint_cleanup_failure_resumes(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    failure_phase: str,
+) -> None:
+    """app 三表删除回滚及 retention 后续回滚都保留父行，privacy 仍用原赢家恢复。"""
+    from tests.integration.retention.checkpoint_cases import assert_checkpoint_failure_resume
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_checkpoint_failure_resume(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+        failure_phase=failure_phase,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "negative", ["inactive", "running", "at_cutoff", "wrong_user", "bad_thread", "authority"]
+)
+async def test_task27e_real_roles_history_checkpoint_rechecks_admission(
+    disposable_role_database: _DisposableRoleDatabase,
+    negative: str,
+) -> None:
+    """app 窄入口逐项重验显式归属/状态/截止/authority，retention 对三表仍没有权限。"""
+    from tests.integration.privacy.test_all_data_deletion import BARRIER_NOW
+    from tests.integration.privacy.test_deletion_checkpoints import seed_checkpoint_thread
+    from tests.integration.retention.checkpoint_cases import _checkpoint_counts, _seed_tasks
+
+    disposable_role_database.upgrade_to_0019()
+    app = build_session_factory(disposable_role_database.app_url)
+    engine = create_async_engine(disposable_role_database.retention_url, hide_parameters=True)
+    try:
+        user_id, task_id, _ = await _seed_tasks(app, kind="history")
+        await seed_checkpoint_thread(disposable_role_database.app_url, task_id)
+        cutoff = BARRIER_NOW - timedelta(days=365)
+        async with app.begin() as session:
+            if negative == "inactive":
+                await session.execute(
+                    update(UserModel).where(UserModel.id == user_id).values(is_active=False)
+                )
+            elif negative in ("running", "at_cutoff", "bad_thread"):
+                values = (
+                    {"status": "running"}
+                    if negative == "running"
+                    else (
+                        {"finished_at": cutoff}
+                        if negative == "at_cutoff"
+                        else {"graph_thread_id": str(uuid4())}
+                    )
+                )
+                await session.execute(
+                    update(TaskRunModel).where(TaskRunModel.id == task_id).values(**values)
+                )
+            elif negative == "authority":
+                session.add(
+                    AuditEventModel(
+                        user_id=user_id,
+                        task_id=task_id,
+                        event_type="privacy.deletion_started",
+                        actor_type="system",
+                        event_metadata={"malformed": True},
+                    )
+                )
+        with pytest.raises(StateConflictError):
+            await PostgresPrivacyCheckpointCleaner(
+                disposable_role_database.app_url
+            ).clear_expired_thread(
+                user_id=uuid4() if negative == "wrong_user" else user_id,
+                task_id=task_id,
+                cutoff=cutoff,
+            )
+        assert await _checkpoint_counts(app, task_id) == (1, 1, 1)
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+            await _assert_retention_statement_is_denied(
+                engine, f"DELETE FROM {table} WHERE thread_id=:thread", {"thread": str(task_id)}
+            )
+    finally:
+        await engine.dispose()
+        await app.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["confirmed", "unsatisfied", "replacement"])
+@pytest.mark.parametrize("order", ["writer_first", "cleanup_first"])
+async def test_task27e_real_roles_oauth_cleanup_writer_race(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    order: str,
+) -> None:
+    """仅网络 Fake；实际三种 CAS/result writer 与 retention 双向竞争不依赖新权限。"""
+    from tests.integration.retention.oauth_cases import assert_oauth_writer_cleanup_race
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_oauth_writer_cleanup_race(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+        order=order,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["confirmed", "unsatisfied", "replacement"])
+async def test_task27e_real_roles_oauth_group_cutoff_and_rollback(
+    disposable_role_database: _DisposableRoleDatabase,
+    kind: str,
+) -> None:
+    """真实写出的完整事件组使用每成员截止，删除异常整体回滚并保持未决原始 fence。"""
+    from tests.integration.retention.oauth_cases import assert_oauth_cutoff_and_rollback
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_oauth_cutoff_and_rollback(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["confirmed", "unsatisfied", "replacement"])
+async def test_task27e_real_roles_oauth_group_fresh_reread_rejects_conflict(
+    disposable_role_database: _DisposableRoleDatabase,
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """实际候选形成后组事实变化，app INSERT 的歧义必须被retention锁后完整重读识别。"""
+    from tests.integration.retention.oauth_cases import assert_oauth_fresh_group_recheck
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_oauth_fresh_group_recheck(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+        monkeypatch=monkeypatch,
+    )

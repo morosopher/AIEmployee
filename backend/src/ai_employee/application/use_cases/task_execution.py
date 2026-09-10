@@ -5,6 +5,7 @@ import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -15,12 +16,20 @@ from ai_employee.domain.tasks import JsonValue, TaskStatus
 _MIN_PERSISTED_RETRY_DELAY = timedelta(microseconds=1)
 
 
+class TaskLeaseMode(StrEnum):
+    """区分普通终生预算与仅精确删除赢家可获准的 inactive 恢复尝试。"""
+
+    NORMAL = "normal"
+    INACTIVE_ALL_DATA_RECOVERY = "inactive_all_data_recovery"
+
+
 @dataclass(frozen=True, slots=True)
 class LeasedTask:
     """保存 Worker 已通过 PostgreSQL CAS 获得的最小任务快照。
 
-    ``started_at`` 是跨 Taskiq 重投持久保留的总预算起点；执行用例不使用当前消息
-    接收时间重置它。``user_id`` 由持久租约读取，为源同步等用户域节点提供强制归属条件；
+    ``started_at`` 是跨 Taskiq 重投持久保留的历史起点；普通模式仍以它计算总预算。
+    只有 store 严格核验删除赢家后授予的 inactive 恢复模式使用独立本次尝试预算。
+    ``user_id`` 由持久租约读取，为源同步等用户域节点提供强制归属条件；
     旧的纯执行单测可留空，但真实 SQLAlchemy store 必须返回非空用户。输入只含内部 JSON 值，
     不携带 ORM 或队列 SDK 类型。
     """
@@ -33,6 +42,7 @@ class LeasedTask:
     user_id: UUID | None = None
     attempt_count: int = 1
     lease_owner: str | None = None
+    lease_mode: TaskLeaseMode = TaskLeaseMode.NORMAL
 
 
 class TaskExecutionStep(Protocol):
@@ -268,7 +278,13 @@ class DurableTaskRunner:
         started_at = utc_instant(leased.started_at, field="started_at")
         # acquisition 自首次写入 started_at 起也消耗总预算；读取新鲜时钟而非复用查询前 now。
         budget_now = utc_instant(self._clock(), field="clock")
-        remaining = self._task_timeout_seconds - (budget_now - started_at).total_seconds()
+        # 删除赢家必须保留原 started_at，但它可能在长时间故障后才恢复。窄类型来自
+        # store 的锁后授权判定，不能由任务输入声明；其他任务继续使用 M1 终生预算。
+        remaining = (
+            self._task_timeout_seconds
+            if leased.lease_mode is TaskLeaseMode.INACTIVE_ALL_DATA_RECOVERY
+            else self._task_timeout_seconds - (budget_now - started_at).total_seconds()
+        )
         if remaining <= 0:
             return await self._finish(
                 leased,

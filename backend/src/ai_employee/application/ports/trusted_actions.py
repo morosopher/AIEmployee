@@ -157,13 +157,22 @@ class TrustedActionRisk(StrEnum):
     HIGH = "high"
 
 
+class RequestPreparationDisposition(StrEnum):
+    """描述解密前只读用户屏障检查；任何结果都不产生 request-start 事实。"""
+
+    READY = "ready"
+    ABANDONED = "abandoned"
+    USER_INACTIVE = "user_inactive"
+
+
 class RequestStartDisposition(StrEnum):
-    """描述 request-start 锁内 CAS 的四种内容无关结论。"""
+    """描述 request-start 锁内 CAS，包括由 privacy 接管的 inactive 零写结论。"""
 
     STARTED = "started"
     ABANDONED = "abandoned"
     RECONCILE = "reconcile"
     INVALIDATED = "invalidated"
+    USER_INACTIVE = "user_inactive"
 
 
 @dataclass(frozen=True, slots=True)
@@ -727,6 +736,13 @@ class TrustedActionSubmissionTransaction(Protocol):
         approval_id: UUID,
     ) -> dict[str, object] | None:
         """认证解密并重新规范化一条精确审批命令。"""
+
+    async def check_request_preparation(
+        self,
+        *,
+        snapshot: TrustedActionDispatchSnapshot,
+    ) -> RequestPreparationDisposition:
+        """先按 TaskRun→user 加锁检查 active，不解密、不提交请求或虚构结果。"""
 
     async def mark_request_started(
         self,

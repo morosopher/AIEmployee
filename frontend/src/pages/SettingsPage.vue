@@ -96,7 +96,18 @@ onUnmounted(() => { disposed = true; stopDeletionMonitor() })
       <h2 id="privacy-heading">隐私与数据</h2>
       <button type="button" :disabled="deletionPending" @click="deleteSourceCache">删除来源缓存</button>
       <RouterLink v-if="sourceDeletionTaskId" :to="{ path: '/tasks', query: { task_id: sourceDeletionTaskId } }">查看来源缓存删除任务</RouterLink>
-      <label>确认全部删除 <input v-model="allDataConfirmation" autocomplete="off" /></label>
+      <!-- 确认前说明本地删除边界，避免把未知写结果或删除完成理解为供应商撤回。 -->
+      <p id="all-data-deletion-notice">
+        删除本地数据不能撤回已发送的邮件或已生效的日程变更。结果未知的操作也可能已在供应商侧生效。
+      </p>
+      <label>
+        确认全部删除
+        <input
+          v-model="allDataConfirmation"
+          autocomplete="off"
+          aria-describedby="all-data-deletion-notice"
+        >
+      </label>
       <button type="button" :disabled="deletionPending" @click="deleteAllData">删除全部数据</button>
       <RouterLink v-if="allDataDeletionTaskId" :to="{ path: '/tasks', query: { task_id: allDataDeletionTaskId } }">查看全部数据删除任务</RouterLink>
       <p v-if="deletionError" role="alert">{{ deletionError }}</p>

@@ -1311,10 +1311,19 @@ MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期�
    仍 active，否则在任何供应商写调用前拒绝。
 2. 在屏障之后失效所有未认领动作；对每个已认领动作至多执行一次有界、只读 reconcile，禁止借删除
    请求重放写命令。结果仍未知时也继续本地删除，但必须先向用户说明外部副作用可能已经发生。
+   inactive 恢复不得解密可信命令，因此使用仅含已绑定 dispatch/execution 与必要目标标识的固定
+   隐私只读端口，不调用需要完整命令的普通 reconcile/resolver。有效 winner 在网络前持久化该动作
+   一次尝试资格，复投、恢复或 ACK 丢失均不得另启一轮。仅使用精确连接仍可用且具备对应只读能力的
+   access token；有安全持久定位时执行至多一次有界 GET，无定位、归属不符或能力/access 不可用时
+   才零网络返回明确 UNKNOWN。禁止 refresh、授权码交换或任何写调用。资源存在/不存在、ID、ETag、
+   operation marker 或 404 都不足以证明完整精确命令，本轮观察保持 UNKNOWN，不生成未应用或重试
+   授权；不得读取完整正文/日程或保存响应。
 3. 每个连接至多解密并在受控内存中保留一个用于 revoke 的 token；不得同时保留 access/refresh token，
-   不得把 token 写入日志、审计、异常或中间表。读取与删除连接/credential/fence 时复用 17.3 的
-   `connection → access credential → refresh credential → matching started audit` 锁序，锁后重查归属与
-   当前 credential 行，不能从后续 connection 借 token。
+   不得把 token 写入日志、审计、异常或中间表。读取与删除连接/credential/fence 时遵守 17.2.5 的
+   更强物理保护：独立短事务按连接表、凭据表顺序取得 `EXCLUSIVE NOWAIT` 表锁，再按
+   `connection → access credential → refresh credential → matching started audit` 顺序读取用户限定的
+   身份并取得既有审计互斥锁，锁后重查归属；不能从后续 connection 借 token。任一表锁竞争都整笔
+   回滚并有界退出，保留当前 winner 的恢复事实，不能跳过仍有凭据的连接而最终完成。
 4. 先在本地事务中显式删除该连接的 credential 行并提交，再使用内存中的单个 token best-effort 调用
    对应供应商 revoke。网络失败、供应商拒绝或 token 已失效均不得回滚或阻断已经提交的本地删除。
 5. 所有业务表按外键拓扑显式子到父、有界批次删除；不得把 cascade 当作覆盖证明，也不得跨用户读取
@@ -1324,6 +1333,29 @@ MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期�
    Audit/Outbox/TaskRun 事实、匿名化但保留 M1 用户根行，并追加唯一、无
    正文/地址/标题/provider ID 的 `privacy.deletion_completed` 审计事实。最终事务任一步失败必须整体回滚，
    使删除任务仍可恢复；提交成功但队列 ACK 丢失时，缺失 TaskRun 与既有精确完成审计共同表示已完成。
+
+Checkpoint 属于上述本地任务数据，不能作为保留例外。retention 没有三张 checkpoint 数据表的权限；
+组合根仅为精确 TaskRun 归属清理使用已有 app/checkpointer 的 `adelete_thread` 能力，不更换整个删除
+工厂、不 SET ROLE 或加 grant。删除 TaskRun 前，按明确 user/task 与有效 winner 绑定 thread，先成功
+删除 `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`；全局 `checkpoint_migrations` 不属于用户
+数据。清理失败保留 TaskRun/authority 供恢复。所有生产 `postgres_checkpointer` 的原生 `aput` 与
+`aput_writes` 必须在同一数据库事务按 TaskRun→user 加锁并重检 task 存在与用户 active，再调用既有
+SDK 写入；屏障后的迟到 Graph 写入不得重新创建已清理 checkpoint。清理同样使用 TaskRun→user
+同步并重验 winner，不能只等旧租约最终过期，也不能复制另一套 SDK 持久化实现。
+
+普通 365 天历史删除也必须在父 TaskRun 消失前清理同一三表，否则后续隐私删除将失去 thread 归属。
+活动用户没有 inactive 屏障，因此 retention 短事务须按 TaskRun→user 连续持锁，重验终态、
+`finished_at < cutoff`、active 与不存在删除 started authority，再调用同一 app cleaner 的窄历史入口。
+app 入口只按精确 user/task 只读重验状态、截止与归属，不能再次申请 retention 持有的行锁；原生
+三表删除提交后，retention 仍持原 Task 锁，重验并显式删除依赖和父行后才提交。这样旧 saver 要么先
+保存且被清理，要么等待到父行删除后拒绝，不能在两个提交之间复活数据。app 或后续 retention
+失败均保留父行供下轮恢复；已提交的过期 Checkpoint 清理可幂等重试。全程仅有界本地数据库 I/O。
+
+认证事务完成不等于后续写事务仍有活动用户授权。普通 OAuth callback 保存凭据、人工结果确认/
+重开核对、设置更新、任务创建和对话创建/删除必须在原有短事务锁后重检 `users.is_active`。
+屏障前提交的写入由删除覆盖；屏障或最终提交后的迟到请求不得重建凭据/业务数据、覆盖一次核对资格、
+修改匿名默认值或追加普通审计。普通 retention 对 inactive 用户不收敛动作，不得抹除核对资格；
+这些补充不改变 API 形状、OAuth 协议或冻结 ACL，不使用跨请求事务或通用 middleware。
 
 这里的“新的普通 TaskRun claim”不包含同一预屏障删除操作的恢复接管。唯一例外是：用户已经 inactive，
 TaskRun 精确为 `privacy.delete_all_data`，原 `task_id/user_id/deletion_request_id` 和输入形状仍匹配，任务在
@@ -1477,10 +1509,23 @@ capabilities、`capability_transition` 与稳定 `error_code`/`result_code`；`a
 
 未 confirmed、未被 replacement consumption 消费的 automatic started 必须跨 cutoff 保留，并继续让
 automatic provider call 为零；多次显式 recovery 的 closed unsatisfied pair 不改变该事实。cleanup 与所有
-credential CAS 使用统一锁序，锁后重查 matching event、F/S/T、old/new identity/version、
+credential CAS 使用统一身份与审计锁序，锁后重查 matching event、F/S/T、old/new identity/version、
 `refresh_identity_changed` 与严格 `created_at` 顺序，并通过同一 result-union parser 验证 flag/equality 关系，
 但不读取或约束后续 current credential lineage。M2 root key/version 固定且不得轮换，
 因此 retention 不引入 historical identity key 保存或删除逻辑；root key 缺失/变化一律 fail closed。
+
+retention 对 connection/credential 只有 SELECT/DELETE，没有行锁所需的 UPDATE；清理采用现有
+DELETE 权限允许的更强物理保护，不能把它描述为逐行 `FOR UPDATE`。只有实际候选可在独立短事务中
+依次执行 `LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT` 和
+`LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT`，一次只处理一个连接/有界组。
+这会排斥既有 writer/recovery 的物理行锁与写事务，包括未取得 session lease 的回调；普通 SELECT
+仍可并发。任一步竞争立即回滚本事务并有界结束，留给下次维护或 deletion winner 恢复，不忙等也不
+降级无锁删除。随后仅按 user-scoped connection→access→refresh 读取必要行身份，按 original→recovery
+复用唯一 `lock_refresh_audit_event` 的事务互斥，再 fresh-read 完整事件组并调用同一严格 parser。
+普通 audit retention 不读取 token、密文、expiry、generation 或后续 lineage；只有全数据删除凭据阶段
+按 17.2.2 受控选取至多一个 token。事务内无 provider/network，revoke 必须在本地删除提交后。
+既有 writer 的行锁、审计 helper 的 key、17.2.3 ACL 和迁移不变；不能引入 audit UPDATE、另一把
+清理专用互斥锁，或把会隐式 commit 的 session lease 方法放进业务事务。
 
 `database.restore.completed` 不获得 retention 或隐私删除豁免。database-wide
 completed `ai_employee.restore_call_authority` + matching `ai_employee.restore_completion` zero-slot pair 是
@@ -1757,9 +1802,10 @@ confirmed disposition/flag/equality 与 replacement changed=true/identity-inequa
   consumption；同一原 fence 的更早 unsatisfied pair 仍按各自关闭组处理。
 
 只有组内每一行 `created_at < cutoff`，等价于组内最大 `created_at < cutoff`，才可在同一事务删除该组。
-未消费的 original started 必须跨 cutoff 保留；unsatisfied 不能释放它。cleanup 固定按 connection →
-access row → refresh row → original started → recovery started 锁序重查关联与时序，不读取后续 credential
-lineage，也不能先删 result 留下伪 unresolved 事实。
+未消费的 original started 必须跨 cutoff 保留；unsatisfied 不能释放它。cleanup 先按 17.2.5 的两表
+`EXCLUSIVE NOWAIT` 取得更强物理保护，再按 connection → access row → refresh row → original started →
+recovery started 的身份读取/共享审计互斥顺序重查关联与时序，不读取后续 credential lineage，也不能先删
+result 留下伪 unresolved 事实。writer/recovery 保持既有行锁协议不变。
 
 replacement consumption 首次有效后永久关闭原 fence，并且必为 `refresh_identity_changed=true`。后续
 generation、scope/capability、access 或 refresh credential 正常变化不使它复活；current guard 使用同一固定

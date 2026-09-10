@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+from ai_employee.application.use_cases import privacy as privacy_use_cases
 from ai_employee.application.use_cases.privacy import RequestAllDataDeletionUseCase
 from ai_employee.application.use_cases.tasks import CreateTaskResult, CreateTaskUseCase
 from ai_employee.domain.tasks import JsonValue
@@ -82,3 +83,74 @@ async def test_all_data_deletion_request_id_is_scoped_to_user_and_key() -> None:
     ]
 
     assert len(set(request_ids)) == 3
+
+
+@pytest.mark.parametrize(
+    ("change", "accepted"),
+    [
+        ("exact", True),
+        ("zero", False),
+        ("many", False),
+        ("empty_expected_request", False),
+        ("wrong_event", False),
+        ("null_task", False),
+        ("wrong_task", False),
+        ("wrong_user", False),
+        ("missing_schema", False),
+        ("missing_request", False),
+        ("extra_metadata", False),
+        ("wrong_schema", False),
+        ("null_request", False),
+        ("number_request", False),
+        ("empty_request", False),
+        ("wrong_request", False),
+    ],
+)
+def test_deletion_started_authority_requires_one_exact_fact(change: str, accepted: bool) -> None:
+    """完整 per-user 事实集只允许唯一精确绑定，任何歧义均不得选择或强制转换赢家。"""
+    task_id = UUID("00000000-0000-0000-0000-000000000401")
+    other_task_id = UUID("00000000-0000-0000-0000-000000000402")
+    metadata: dict[str, JsonValue] = {
+        "schema_version": "privacy_deletion_started.v1",
+        "request_id": "synthetic-request-1",
+    }
+    if change == "missing_schema":
+        del metadata["schema_version"]
+    elif change == "missing_request":
+        del metadata["request_id"]
+    elif change == "extra_metadata":
+        metadata["extra"] = None
+    elif change == "wrong_schema":
+        metadata["schema_version"] = "privacy_deletion_started.v2"
+    elif change in {"null_request", "number_request", "empty_request", "wrong_request"}:
+        metadata["request_id"] = {
+            "null_request": None,
+            "number_request": 1,
+            "empty_request": "",
+            "wrong_request": "synthetic-request-2",
+        }[change]
+    fact = privacy_use_cases.PrivacyDeletionStartedFact(
+        event_type="task.running" if change == "wrong_event" else "privacy.deletion_started",
+        user_id=OTHER_USER_ID if change == "wrong_user" else USER_ID,
+        task_id=None
+        if change == "null_task"
+        else other_task_id
+        if change == "wrong_task"
+        else task_id,
+        event_metadata=metadata,
+    )
+    facts = [] if change == "zero" else [fact, fact] if change == "many" else [fact]
+    result = privacy_use_cases.parse_privacy_deletion_started_authority(
+        facts,
+        expected_user_id=USER_ID,
+        expected_task_id=task_id,
+        expected_request_id="" if change == "empty_expected_request" else "synthetic-request-1",
+    )
+    if accepted:
+        assert result == privacy_use_cases.PrivacyDeletionStartedAuthority(
+            user_id=USER_ID,
+            task_id=task_id,
+            request_id="synthetic-request-1",
+        )
+    else:
+        assert result is None

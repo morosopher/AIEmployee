@@ -24,12 +24,25 @@ class _NoopSession:
         """接受审计对象；内容不属于本编排测试的断言边界。"""
         del item
 
+    async def scalars(self, statement: object) -> "_NoopSession":
+        """新增动作与OAuth阶段没有候选；具体保留行为由真实数据库矩阵覆盖。"""
+        del statement
+        return self
+
+    def all(self) -> list[object]:
+        """返回空扫描集合，不伪造行权限或持久状态。"""
+        return []
+
 
 class _NoopSessionFactory:
     """返回可重复进入的空异步事务，隔离策略测试与数据库 I/O。"""
 
     def begin(self) -> "_NoopSessionFactory":
         """返回自身作为短事务上下文。"""
+        return self
+
+    def __call__(self) -> "_NoopSessionFactory":
+        """提供新阶段使用的短只读扫描会话。"""
         return self
 
     async def __aenter__(self) -> _NoopSession:
@@ -53,6 +66,13 @@ class _RecordingRetentionWorker(RetentionCleanupWorker):
         """记录正文擦除阶段。"""
         del user_id, cutoff, batch_size
         self.calls.append("body")
+
+    async def _scrub_calendar_content(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """记录M2描述/地点四列清理，必须早于来源元数据删除。"""
+        del user_id, cutoff, batch_size
+        self.calls.append("calendar")
 
     async def _delete_source_metadata(
         self, user_id: UUID, cutoff: datetime, batch_size: int
@@ -110,7 +130,7 @@ async def test_workspace_history_and_disconnected_credentials_are_processed_befo
 
     await worker._clean_user(user, now=datetime(2026, 8, 4, tzinfo=UTC), batch_size=10)
 
-    assert worker.calls == ["body", "source", "workspace", "credentials", "audit"]
+    assert worker.calls == ["body", "calendar", "source", "workspace", "credentials", "audit"]
 
 
 class _AuditPreservingRetentionWorker(RetentionCleanupWorker):
@@ -138,6 +158,13 @@ class _AuditPreservingRetentionWorker(RetentionCleanupWorker):
     ) -> None:
         """阻止进入真实任务图 SQL，仅验证上层表选择边界。"""
         del user_id, cutoff, batch_size
+
+    async def _delete_ordinary_audits(
+        self, user_id: UUID, cutoff: datetime, batch_size: int
+    ) -> None:
+        """记录普通审计的专用路径；不能再期望用通用删除器跳过OAuth/authority保护。"""
+        del user_id, cutoff, batch_size
+        self.deleted_models.append(AuditEventModel)
 
     async def _delete_empty_conversations(self, user_id: UUID, batch_size: int) -> None:
         """阻止进入真实会话 SQL，子类可覆盖以观察该安全清理路径。"""
