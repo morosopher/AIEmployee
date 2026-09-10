@@ -473,10 +473,11 @@ def validate_generic_backup_group(
 
 
 def write_backup_group(staged_dump: Path, manifest: BackupManifest) -> ValidatedBackupGroup:
-    """在调用方独占 staging 内写最终清单和双条checksum，文件/目录均fsync后返回。
+    """在独占 staging 写并同步清单、双条checksum及目录，再返回完整组校验结果。
 
     只接受真实 dump 摘要已绑定的清单；禁止凭空给旧格式字节补一个 manifest 入口。
     legacy 转换只能先实际恢复、验证，再调用正常 backup producer 到这个内部边界。
+    加密 dump 自身的持久化由 publisher 在重新绑定其精确 inode 后、任何最终名出现前完成。
     """
     manifest_path = Path(f"{staged_dump}.manifest.json")
     data = manifest.canonical_bytes()
@@ -504,10 +505,11 @@ def write_backup_group(staged_dump: Path, manifest: BackupManifest) -> Validated
 
 
 def publish_backup_group(staged_dump: Path, destination_dir: Path) -> BackupGroupPublication:
-    """以 no-clobber 硬链接和 manifest-last 发布，失败只补偿本次receipt的成员。
+    """先同步已验证的密文，再以 no-clobber 硬链接和 manifest-last 发布。
 
     同目录/文件系统 staging 由持锁备份父流程提供；所有最终名先检查且每次 link 仍
-    原子拒绝覆盖。receipt 在 sealed hook 最终 guard/lease exit 前不能丢弃。
+    原子拒绝覆盖。密文同步前后必须保持验证时的精确文件身份；目录同步不能替代数据
+    持久化。失败只补偿本次 receipt，sealed hook 最终 guard/lease exit 前不能丢弃它。
     """
     data, _, _ = _regular(Path(f"{staged_dump}.manifest.json"), limit=65536)
     manifest = parse_backup_manifest(data)
@@ -521,6 +523,20 @@ def publish_backup_group(staged_dump: Path, destination_dir: Path) -> BackupGrou
     try:
         if any(os.path.lexists(destination_dir / item.path.name) for item in group.members):
             raise BackupManifestError("backup_group_collision")
+        dump = group.members[0]
+        descriptor = os.open(dump.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            # 只同步刚完成摘要/0600/owner 验证的原 inode，不能为替换者补持久化证明。
+            if BackupFileIdentity(dump.path, os.fstat(descriptor)) != dump:
+                raise BackupManifestError("backup_file_changed")
+            os.fsync(descriptor)
+            if any(
+                BackupFileIdentity(dump.path, observed) != dump
+                for observed in (os.fstat(descriptor), dump.path.lstat())
+            ):
+                raise BackupManifestError("backup_file_changed")
+        finally:
+            os.close(descriptor)
         for item in group.members:
             destination = destination_dir / item.path.name
             # 在系统调用前保留身份；即使调用已成功却报告错误，也只处理已证明归属者。

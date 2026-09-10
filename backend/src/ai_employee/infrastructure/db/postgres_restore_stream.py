@@ -144,22 +144,51 @@ class RestoreConsumerProof:
 
 
 async def _stop_child(process: asyncio.subprocess.Process) -> None:
-    """关闭自身 writer，发送 TERM 并在固定宽限后 KILL；每条分支都收取退出状态。"""
-    if process.stdin is not None:
-        process.stdin.close()
-    if process.returncode is None:
+    """停止业务供流后终止 child，并收齐 stdout EOF 与退出状态；重复取消不拆散收尾。
+
+    asyncio 的既有 wait 还等待 pipe transport 关闭；只发 KILL 不能解除已暂停 stdout
+    的 EOF 阻塞。并行逐块丢弃自有 stdout，不累计/记录/转发 SQL；stderr 固定为 DEVNULL。
+    完整收尾由本次独占 Task 持有，避免内层 pipe 错误分支取消后留下竞争读取者。
+    """
+
+    async def stop_and_collect() -> None:
+        """TERM 宽限与丢弃读取同时进行，KILL 后仍消费 EOF，不遗留 child 或 reader。"""
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+        async def discard_output() -> None:
+            if process.stdout is not None:
+                while await process.stdout.read(_CHUNK_BYTES):
+                    pass
+
+        discarded = asyncio.create_task(discard_output())
+        failure: BaseException | None = None
         try:
-            process.terminate()
-        except ProcessLookupError:
-            pass
-    try:
-        await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_SECONDS)
-    except TimeoutError:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        await process.wait()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_SECONDS)
+            except TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            try:
+                await discarded
+            except BaseException as cleanup_failure:
+                if failure is not None:
+                    raise failure from cleanup_failure
+                raise
+
+    await await_calendar_aad_resource(asyncio.create_task(stop_and_collect()))
 
 
 async def _cleanup_children(

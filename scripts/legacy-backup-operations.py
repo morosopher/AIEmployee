@@ -95,7 +95,12 @@ def _mapping(value: object) -> dict[str, object]:
 
 
 def _directory(path: Path, *, create: bool = False) -> Path:
-    """可写根与registry都必须是本UID的0700真实目录；不把relative或symlink当删除依据。"""
+    """校验本 UID 的 0700 真实目录；创建路径时先持久化全部目录项，才允许资源继续。
+
+    新祖先逐级使用 0700，不能让 parents=True 按宿主 umask 留下较宽权限。同步从叶到根
+    覆盖每个目录本身和其父项；已有目录也重做屏障，因为上次 fsync 失败后它仍可能存在。
+    不修改既存目录权限，不把 relative、symlink 或仅存在的路径当作持久化/删除依据。
+    """
     if (
         not path.is_absolute()
         or path == Path("/")
@@ -103,7 +108,15 @@ def _directory(path: Path, *, create: bool = False) -> Path:
     ):
         raise LegacyConversionError("legacy_directory_invalid")
     if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        missing: list[Path] = []
+        ancestor = path
+        while not os.path.lexists(ancestor):
+            missing.append(ancestor)
+            ancestor = ancestor.parent
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o700, exist_ok=True)
+            # 每个新目录立即通过原 no-symlink/owner/mode 检查，再创建其下一层。
+            _directory(directory)
     info = path.lstat()
     if (
         not stat.S_ISDIR(info.st_mode)
@@ -111,10 +124,15 @@ def _directory(path: Path, *, create: bool = False) -> Path:
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise LegacyConversionError("legacy_directory_invalid")
+    if create:
+        # 目录存在不证明上次创建已落盘；重入也同步完整链，避免失败重试跳过某个祖先父项。
+        for directory in (path, *path.parents):
+            _sync_directory(directory)
     return path
 
 
 def _sync_directory(path: Path) -> None:
+    """在 no-follow 目录 fd 上同步目录项；失败原样交回资源创建前的调用边界。"""
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(descriptor)
@@ -180,7 +198,7 @@ def read_registry(path: Path, directory: Path | None = None) -> LegacyRegistry:
 
 
 def _publish_registry(record: LegacyRegistry) -> Path:
-    """先完成文件与目录fsync的no-clobber发布；返回前不得创建任何本次临时资源。"""
+    """先同步目录创建链，再完成文件/目录 fsync 的 no-clobber 发布，之后才可创建资源。"""
     directory = _directory(Path(record.backup_directory) / _REGISTRY, create=True)
     target = directory / f"{record.attempt_id}.json"
     descriptor, temporary = tempfile.mkstemp(prefix=".registry-", dir=directory)

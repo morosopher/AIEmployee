@@ -558,6 +558,8 @@ completion-audit shape的历史`database.restore.completed`行被归一化；同
 checksum，并以同文件系统原子no-clobber link发布manifest作为最后marker。任一最终成员已存在都按整组冲突
 拒绝，不能覆盖、拼接或删除冲突成员。失败只处理本run staging与精确receipt证明的本次发布；
 最终guard/lease失败可先撤回本次manifest再补偿其成员，绝不清理外来替换。缺final manifest的残留不是可恢复备份。
+首次发布最终名之前，publisher 必须在 no-follow fd 上同步已验证的加密 dump，并重证同步前后的精确
+文件身份；同步失败或身份漂移时不发布任何最终成员。manifest/checksum 和目录的同步不能替代密文数据同步。
 
 rclone使用`<target_identity_digest_v1>/<canonical-run-uuid>/`私有前缀，以immutable copy先上传dump/checksum，最后发布remote manifest；远端整组
 完成前命令不得成功。local/remote orphan grace 固定为 3600 秒，且清理必须在两把串行锁内、删除前重新
@@ -827,6 +829,8 @@ stdout 并写入已登记 psql pipe，禁止 shell/uncontrolled pipeline、整�
 只允许稳定脱敏摘要。只有 pg_restore EOF 且 exit=0 时才发送 completion-guard trailer并正常关闭 pipe。
 缺 trailer 的 EOF、controller crash、任一 child 非零或中途 pipe failure 必须令 psql 的 deferred guard/
 single transaction rollback；controller 要终止另一 child、关闭所有 FD并记录两个 exit/status。
+停止业务供流后，controller 在 TERM/KILL 收尾期间以最多 64 KiB 的块丢弃自有 stdout，直到 EOF；
+不累计、记录或重新供流这些字节。重复取消仍须等待双 child 与自有 pipe 收齐，再传播首个错误或取消。
 
 controller 在 psql backend visible 前 crash 时，唯一 pipe write end 随父进程关闭；psql 即使稍后连接也只
 读取 EOF，且 phase 未到 `restore_started`，不得执行 SQL。`restore_backend_ready` 后、feed 前 crash 同样
@@ -962,7 +966,9 @@ recipe 签名是 `just restore-legacy-to-isolated file output_basename`，只允
 2. 生成 attempt UUID，并在创建 Docker/temp 资源前原子+fsync 发布
    `${BACKUP_DIR}/.legacy-conversion-registry/<attempt_uuid>.json`；record mode `0600`、目录 `0700`，登记
    project/container/network/volume 名、UTC `created_at`、kind/source binding、统一 labels 与受控临时 Secret
-   path。随后创建 `aiemployee-legacy-<32位小写十六进制 UUID>` Compose project，只启动 profile
+   path。首次创建备份根、registry 或祖先目录时逐级使用 `0700`，发布 record 前同步目录本身与完整父项链；
+   失败后同路径重试也重做该同步链，不能从目录仍存在推断上次已持久化。任一必要同步失败均先于 Secret、
+   Compose 临时文件或容器/网络/卷创建。随后创建 `aiemployee-legacy-<32位小写十六进制 UUID>` Compose project，只启动 profile
    `legacy-conversion` 下的 `legacy-conversion-postgres` 与 `legacy-backup-converter`，使用 project-private
    `internal: true` network、ephemeral PostgreSQL volume，以及登记路径中的 mode `0600` 临时数据库
    Secret。全部资源使用精确labels `com.ai-employee.maintenance.attempt`、

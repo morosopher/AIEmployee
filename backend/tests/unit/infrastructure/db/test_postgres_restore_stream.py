@@ -1,10 +1,12 @@
-"""以确定性进程和 pipe 替身验证 started 屏障、completion trailer 与清理归属。"""
+"""以确定性替身及真实匿名 pipe 验证 started 屏障、completion trailer 与清理归属。"""
 
 from __future__ import annotations
 
 import asyncio
 import importlib
 import importlib.util
+import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -78,10 +80,15 @@ class _Process:
     def terminate(self) -> None:
         self.terminated = True
         self.returncode = -15
+        # 与真实匿名 pipe 一样，替身的 child 退出后也必须交付 EOF 给收尾 reader。
+        if isinstance(self.stdout, asyncio.StreamReader):
+            self.stdout.feed_eof()
 
     def kill(self) -> None:
         self.terminated = True
         self.returncode = -9
+        if isinstance(self.stdout, asyncio.StreamReader):
+            self.stdout.feed_eof()
 
 
 def _consumer_environment() -> dict[str, str]:
@@ -515,3 +522,183 @@ async def test_cancelled_start_barrier_drains_spawn_and_child(tmp_path: Path) ->
         await task
     assert consumer.stdin is not None and consumer.stdin.closed and consumer.stdin.data == b""
     assert consumer.waited and consumer.terminated
+
+
+async def _wait_for_pipe_state(predicate: Callable[[], bool]) -> None:
+    """按真实 pipe/进程状态等待；截止时间只负责测试失败，固定睡眠不充当就绪证明。"""
+    async with asyncio.timeout(2):
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+
+async def _release_test_children(
+    children: list[asyncio.subprocess.Process], operation: asyncio.Task[object]
+) -> None:
+    """即使旧产品等待失败，也关闭本测试的 transport 并回收精确 child，避免测试挂死。
+
+    私有 transport 仅供失败夹具的兜底；成功断言必须先证明产品自行完成收尾，不能把
+    这里的主动关闭算作产品通过。没有按进程名扫描或终止本测试之外的进程。
+    """
+    for child in children:
+        if child.returncode is None:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+        for descriptor in (0, 1, 2):
+            transport = child._transport.get_pipe_transport(descriptor)
+            if transport is not None:
+                transport.close()
+    await asyncio.wait_for(asyncio.gather(operation, return_exceptions=True), timeout=3)
+    await asyncio.wait_for(asyncio.gather(*(child.wait() for child in children)), timeout=3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("consumer_exit", "control_error", "cancellation"))
+async def test_failed_stream_reaps_paused_generator_without_refeeding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
+    """真实大 stdout + 忽略 TERM 必须经 KILL 收敛，首错/重复取消不能留下 child 或 pipe。
+
+    只替换最外层 executable 为固定合成 Python child，保留 asyncio Process、匿名 pipe、
+    backpressure、产品供流与清理。生成器先进入真实 paused 状态才注入故障；宽限缩短
+    为 0.05 秒只加快同一 TERM→KILL 分支，不以该值推断生产 PostgreSQL 的信号行为。
+    """
+    module = _module()
+    monkeypatch.setattr(module, "_SHUTDOWN_SECONDS", 0.05)
+    children: list[asyncio.subprocess.Process] = []
+    ready, terminated, cancel_boundary = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    primary = RuntimeError("synthetic original control failure")
+    original_cancellations: list[asyncio.CancelledError] = []
+    failed = False
+    bytes_after_failure = 0
+    read_limits: set[int] = set()
+    output_read = 0
+    kill_count = 0
+
+    async def control_live() -> None:
+        """只有原 control 故障路径抛首错；取消路径捕获原取消对象以核对重复取消不覆盖。"""
+        if not failed or failure_kind == "consumer_exit":
+            return
+        if failure_kind == "control_error":
+            raise primary
+        cancel_boundary.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as cancellation:
+            original_cancellations.append(cancellation)
+            raise
+
+    async def started(_proof: object) -> None:
+        """此测试只观察进程边界，catalog started 屏障由既有独立回归验证。"""
+
+    async def spawn(program: str, *arguments: str, **options: object) -> asyncio.subprocess.Process:
+        """按产品原始 pipe/env 选项启动合成 child，不引入 shell 或数据库连接。"""
+        nonlocal failed
+        del arguments
+        code = (
+            "import os\nwhile os.read(0, 65536):\n    pass\n"
+            if program == "psql"
+            else "import os, signal\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "remaining = 4 * 1024 * 1024\n"
+            "while remaining:\n"
+            "    remaining -= os.write(1, b'x' * min(65536, remaining))\n"
+            "while True:\n"
+            "    signal.pause()\n"
+        )
+        child = await asyncio.create_subprocess_exec(sys.executable, "-B", "-c", code, **options)
+        children.append(child)
+        if program == "psql":
+            assert child.stdin is not None
+            write = child.stdin.write
+
+            def count_write(value: bytes) -> None:
+                nonlocal bytes_after_failure
+                if failed:
+                    bytes_after_failure += len(value)
+                write(value)
+
+            monkeypatch.setattr(child.stdin, "write", count_write)
+            return child
+
+        assert child.stdout is not None
+        read, terminate, kill = child.stdout.read, child.terminate, child.kill
+
+        async def count_read(limit: int = -1) -> bytes:
+            nonlocal output_read
+            read_limits.add(limit)
+            chunk = await read(limit)
+            output_read += len(chunk)
+            return chunk
+
+        def record_terminate() -> None:
+            terminate()
+            terminated.set()
+
+        def record_kill() -> None:
+            nonlocal kill_count
+            kill_count += 1
+            kill()
+
+        monkeypatch.setattr(child.stdout, "read", count_read)
+        monkeypatch.setattr(child, "terminate", record_terminate)
+        monkeypatch.setattr(child, "kill", record_kill)
+        await _wait_for_pipe_state(lambda: child.stdout._paused)
+        assert child.returncode is None and len(child.stdout._buffer) > 2 * child.stdout._limit
+        failed = True
+        if failure_kind == "consumer_exit":
+            children[0].terminate()
+            await asyncio.wait_for(children[0].wait(), timeout=2)
+        ready.set()
+        return child
+
+    operation = asyncio.create_task(
+        module.execute_restore_stream(
+            module.RestoreStreamRequest(tmp_path / "synthetic.dump", ATTEMPT_ID, 1),
+            consumer_environment=_consumer_environment(),
+            establish_started=started,
+            assert_control_live=control_live,
+            spawn=spawn,
+        )
+    )
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=3)
+        if failure_kind == "cancellation":
+            await asyncio.wait_for(cancel_boundary.wait(), timeout=2)
+            operation.cancel("original stream cancellation")
+        if failure_kind != "consumer_exit":
+            await asyncio.wait_for(terminated.wait(), timeout=2)
+            operation.cancel("later cancellation one")
+            await asyncio.sleep(0)
+            operation.cancel("later cancellation two")
+        done, _ = await asyncio.wait((operation,), timeout=2)
+        assert operation in done, (
+            f"shutdown still waits on paused stdout after KILL: returncode={children[1].returncode}"
+        )
+        if failure_kind == "consumer_exit":
+            result = await operation
+            assert (result.generator_exit, result.consumer_exit) == (-9, -15)
+            assert result.sql_bytes_forwarded == len(module._PRELUDE)
+            assert not result.trailer_sent
+        elif failure_kind == "control_error":
+            with pytest.raises(RuntimeError) as caught:
+                await operation
+            assert caught.value is primary
+        else:
+            with pytest.raises(asyncio.CancelledError) as cancelled:
+                await operation
+            assert len(original_cancellations) == 1 and original_cancellations[0] is cancelled.value
+        assert len(children) == 2 and children[1].returncode == -9 and kill_count == 1
+        assert bytes_after_failure == 0 and output_read > 0
+        assert read_limits and all(0 < limit <= 65536 for limit in read_limits)
+        assert children[1].stdout is not None and children[1].stdout.at_eof()
+        for child in children:
+            assert child.returncode is not None
+            with pytest.raises(ChildProcessError):
+                await asyncio.to_thread(os.waitpid, child.pid, os.WNOHANG)
+            for descriptor in (0, 1, 2):
+                transport = child._transport.get_pipe_transport(descriptor)
+                assert transport is None or transport.is_closing()
+    finally:
+        await _release_test_children(children, operation)
