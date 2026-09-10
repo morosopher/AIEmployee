@@ -39,6 +39,7 @@ from ai_employee.domain.connections import (
     ConnectionStatus,
     validate_capability_disable,
 )
+from ai_employee.domain.errors import StateConflictError
 from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
@@ -136,7 +137,21 @@ class SqlAlchemyConnectionStore:
         target_connection_id: UUID | None = None,
         target_authorization_generation: int | None = None,
     ) -> UUID:
-        """持久化唯一 state 摘要、供应商、能力意图及记录绑定 PKCE 密文。"""
+        """持久化唯一 state 摘要、供应商、能力意图及记录绑定 PKCE 密文。
+
+        首次授权没有目标连接，必须在本事务锁后重验用户 active，并持锁直到调用方提交，
+        防止旧认证请求在全数据删除后向保留的匿名用户重新写入 attempt。渐进授权已先锁
+        目标连接，不能在共享路径无条件追加用户锁而改变其既有锁序。
+
+        Raises:
+            StateConflictError: 首次授权的用户缺失或已停用；不写入任何 attempt 数据。
+        """
+        if target_connection_id is None:
+            active = await self._session.scalar(
+                select(UserModel.is_active).where(UserModel.id == user_id).with_for_update()
+            )
+            if active is not True:
+                raise StateConflictError(error_code="user_inactive", message="User is inactive")
         attempt = OAuthAttemptModel(
             id=attempt_id,
             user_id=user_id,

@@ -1482,9 +1482,11 @@ async def test_task27e_real_roles_oauth_group_cutoff_and_rollback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["confirmed", "unsatisfied", "replacement"])
+@pytest.mark.parametrize("duplicate_timing", ["expired", "at_cutoff", "after_cutoff"])
 async def test_task27e_real_roles_oauth_group_fresh_reread_rejects_conflict(
     disposable_role_database: _DisposableRoleDatabase,
     kind: str,
+    duplicate_timing: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """实际候选形成后组事实变化，app INSERT 的歧义必须被retention锁后完整重读识别。"""
@@ -1495,5 +1497,6 @@ async def test_task27e_real_roles_oauth_group_fresh_reread_rejects_conflict(
         app_url=disposable_role_database.app_url,
         retention_url=disposable_role_database.retention_url,
         kind=kind,
+        duplicate_timing=duplicate_timing,
         monkeypatch=monkeypatch,
     )

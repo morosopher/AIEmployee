@@ -410,15 +410,22 @@ async def assert_oauth_fresh_group_recheck(
     app_url: str,
     retention_url: str,
     kind: str,
+    duplicate_timing: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """候选读取后插入另一条matching结果，锁后完整读取必须拒绝歧义而不删除部分组。"""
+    """候选读取后插入重复结果，过期、cutoff 当刻或更新结果都必须使完整组保留。"""
     app, retention = build_session_factory(app_url), build_session_factory(retention_url)
     try:
         state = await _seed_state(app)
         await (await _prepare_writer(state, kind))()
         initial = await _events(app, state)
         result = initial[-1]
+        cutoff = NOW + timedelta(days=1)
+        duplicate_created_at = {
+            "expired": result.created_at + timedelta(microseconds=1),
+            "at_cutoff": cutoff,
+            "after_cutoff": cutoff + timedelta(microseconds=1),
+        }[duplicate_timing]
         observed = []
         original_lock = oauth_lifecycle.lock_oauth_cleanup_identity
 
@@ -435,7 +442,7 @@ async def assert_oauth_fresh_group_recheck(
                             actor_type="system",
                             actor_id=None,
                             event_metadata=dict(result.metadata),
-                            created_at=result.created_at + timedelta(microseconds=1),
+                            created_at=duplicate_created_at,
                         )
                     )
             return await original_lock(session, user_id=user_id, connection_id=connection_id)
@@ -446,7 +453,7 @@ async def assert_oauth_fresh_group_recheck(
         assert (
             await oauth_lifecycle.OAuthLifecycleCleanup(retention).clean_user(
                 user_id=state.user_id,
-                cutoff=NOW + timedelta(days=1),
+                cutoff=cutoff,
                 batch_size=1,
             )
             == 0

@@ -14,6 +14,7 @@ from ai_employee.application.ports.credential_rotation import (
     RecoveryUnsatisfiedV1,
     parse_oauth_refresh_result,
 )
+from ai_employee.infrastructure.db.repositories.oauth_lifecycle import _closed_groups
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000101")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000201")
@@ -262,3 +263,41 @@ def test_replacement_flag_requires_json_boolean_not_integer() -> None:
     """JSON true 与数字 1 不同；Pydantic Literal 不得把整数默认为 replacement proof。"""
     event = result_event("replacement")
     assert parse(replace(event, metadata={**event.metadata, "refresh_identity_changed": 1})) is None
+
+
+@pytest.mark.parametrize("kind", ["confirmed", "replacement", "unsatisfied"])
+@pytest.mark.parametrize("duplicate_timing", ["none", "expired", "at_cutoff", "after_cutoff"])
+def test_closing_uniqueness_uses_complete_history_before_cutoff(
+    kind: str, duplicate_timing: str
+) -> None:
+    """较新的重复 closing 仍使旧组歧义，不能先筛过期项再选出看似唯一的结果。"""
+    automatic = started()
+    recovery = recovery_started() if kind != "confirmed" else None
+    result = result_event(kind)
+    records = (automatic, result) if recovery is None else (automatic, recovery, result)
+    cutoff = NOW + timedelta(days=1)
+    if duplicate_timing != "none":
+        created_at = {
+            "expired": result.created_at + timedelta(microseconds=1),
+            "at_cutoff": cutoff,
+            "after_cutoff": cutoff + timedelta(microseconds=1),
+        }[duplicate_timing]
+        duplicate = replace(result, event_id=4, created_at=created_at)
+        # 先证明输入本身是合法 matching result；失败必须来自组判断而不是错误 fixture。
+        assert parse_oauth_refresh_result(
+            duplicate,
+            automatic=automatic,
+            recovery=recovery,
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            key_version=7,
+        ) is not None
+        records += (duplicate,)
+    groups = _closed_groups(
+        records,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        key_version=7,
+        cutoff=cutoff,
+    )
+    assert len(groups) == (1 if duplicate_timing == "none" else 0)

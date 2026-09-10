@@ -5681,9 +5681,15 @@ migration branches, or restore services.
   across claim/request preparation/request-start orchestration without weakening pre-request command validation.
 - Modify: `backend/src/ai_employee/workers/trusted_actions.py` — keep the sequence active precheck → decrypt/validate
   → committed request-start recheck → adapter call, and treat either inactive rejection as zero-provider-call.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/connections.py` — lock and recheck the active user
+  within the initial targetless OAuth attempt transaction through commit, preserving progressive authorization's
+  existing connection lock order.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
+- Create: `backend/tests/integration/privacy/test_oauth_start_deletion.py` — pause both providers' real HTTP start
+  routes after authentication/CSRF, complete real deletion, and assert stable rejection with no new attempts;
+  reverse the order to prove that deletion covers an already committed attempt.
 - Create: `backend/tests/unit/application/test_privacy.py` — independently table-test the exact one-row authority
   parser, including all zero/many/outer-binding/schema/request/extra-key negatives.
 - Modify: `backend/tests/integration/workers/test_retry_recovery.py` — freeze strict winner-authority admission,
@@ -5693,7 +5699,12 @@ migration branches, or restore services.
   attempt budget, and protected renew/terminal/retry behavior while keeping unrelated task kinds unchanged.
 - Modify: `backend/tests/integration/m2/test_tool_execution_claim.py` — race the inactive barrier against
   ToolExecution claim and request-start, including a claim committed before the barrier.
+- Create: `backend/tests/integration/m2/test_tool_execution_deletion_races.py` — separately race actual claim and
+  committed request-start transactions against the real deletion barrier in both orders, proving exact backend
+  blocking and preserving started facts through the same deletion Worker's UNKNOWN reconciliation phase.
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py`
+- Create: `backend/tests/integration/retention/test_action_retention_api.py` — run the real retention writer before
+  authenticated Task26 reads of mail, calendar desired/before snapshots, and claimed unknown execution facts.
 - Modify: `docs/operations.md` — extend, without replacing, Task 27D's manifest/restore sections with the final
   retention/privacy/operator integration.
 - Modify: `docs/acceptance-checklist.md`
@@ -5704,6 +5715,10 @@ Cover every M2 encrypted content group, CalendarEvent four-column atomic clear, 
 barrier/final reconcile, user isolation, and the shared versioned result-union retention rules. Unresolved automatic
 fences survive cutoff; automatic-success, unsatisfied-recovery, and successful-recovery groups delete only when every
 member is older than cutoff; parser mismatches remain protected; cleanup never depends on later credential lineage.
+On the same persistent fixtures, call the authenticated Task26 action API after the actual retention Worker:
+mail/approval and calendar desired/before/approval content must return nested `content_status=redacted` and
+`preview=null`; claimed unknown executions retain their request facts as `needs_attention`, and terminal conclusions
+remain unchanged. Do not replace the writer with manual redaction or a Fake.
 `database.restore.completed` follows ordinary 365-day audit retention and all-data deletion; it has no
 catalog-authority exemption. Tests must delete an old completion audit while preserving the valid completed call +
 `ai_employee.restore_completion=restore_completion:v1:<digest>` pair, then prove completed admission/ACK still uses
@@ -5732,6 +5747,12 @@ In `test_all_data_deletion.py`, race the independent `users.is_active=true → f
 without `task.running`, a lease, or provider work. If an ordinary trusted-action TaskRun lease commits first but no
 ToolExecution exists, the later barrier wins before ToolExecution claim and privacy invalidates that unclaimed
 action with zero provider calls; it does not fabricate a reconcile result.
+
+The initial Google/Microsoft OAuth start must also recheck active state inside its original attempt transaction.
+Pause each real authenticated/CSRF-validated HTTP request before start persistence, finish the real all-data deletion,
+then resume it: no OAuthAttempt may be recreated, anonymous defaults and the sole completion audit stay unchanged,
+and no provider/network call occurs. In the opposite order, the committed attempt must be removed by deletion.
+The initial user lock must cover INSERT through commit without adding a reversed lock to progressive authorization.
 
 The barrier winner must append exactly one `privacy.deletion_started` AuditEvent in the same true→false CAS
 transaction. Assert its outer `task_id` and `user_id`, `actor_type="system"`, `actor_id is None`, and exact metadata:

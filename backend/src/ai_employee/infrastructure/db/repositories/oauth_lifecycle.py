@@ -128,6 +128,7 @@ def _closed_groups(
 
     先清理 unsatisfied pair，最后才移除 original。其他尚存 recovery 仍需要原始行来
     证明自身关联，因此不提前移除其原始事实；坏格式/重复闭合均 fail closed。
+    闭合唯一性必须先使用完整历史判断，再独立检查整组是否过期，避免 cutoff 隐藏新冲突。
     """
     groups: list[_ClosedGroup] = []
     for automatic in records:
@@ -149,8 +150,6 @@ def _closed_groups(
         )
         closing: list[_ClosedGroup] = []
         for result in records:
-            if result.created_at >= cutoff:
-                continue
             parsed = parse_oauth_refresh_result(
                 result,
                 automatic=automatic,
@@ -158,7 +157,7 @@ def _closed_groups(
                 connection_id=connection_id,
                 key_version=key_version,
             )
-            if isinstance(parsed, ConfirmedV1) and automatic.created_at < cutoff:
+            if isinstance(parsed, ConfirmedV1):
                 if not recoveries:
                     closing.append(
                         _ClosedGroup(
@@ -172,8 +171,6 @@ def _closed_groups(
                     )
                 continue
             for recovery in recoveries:
-                if recovery.created_at >= cutoff:
-                    continue
                 parsed = parse_oauth_refresh_result(
                     result,
                     automatic=automatic,
@@ -208,9 +205,7 @@ def _closed_groups(
                                 ),
                             )
                         )
-                elif isinstance(parsed, CredentialReplacedV1) and (
-                    automatic.created_at < cutoff and len(recoveries) == 1
-                ):
+                elif isinstance(parsed, CredentialReplacedV1) and len(recoveries) == 1:
                     closing.append(
                         _ClosedGroup(
                             automatic.event_id,
@@ -224,7 +219,9 @@ def _closed_groups(
                     )
         if len(closing) == 1:
             groups.extend(closing)
-    return tuple(groups)
+    # 年龄只决定已证明完整的组能否整组删除，不能改变同一事实集的闭合或冲突结论。
+    expired_ids = {record.event_id for record in records if record.created_at < cutoff}
+    return tuple(group for group in groups if set(group.delete_ids) <= expired_ids)
 
 
 class OAuthLifecycleCleanup:
