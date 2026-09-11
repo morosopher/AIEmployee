@@ -161,21 +161,32 @@ class PostgreSQLOAuthRefreshLease:
 
 
 async def read_refresh_events(
-    session: AsyncSession, *, user_id: UUID, connection_id: UUID
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    connection_id: UUID,
+    refresh_attempt_id: str | None = None,
 ) -> tuple[OAuthRefreshAuditRecord, ...]:
-    """只按显式用户与固定连接 digest 读取五种版本化事件，原 credential 内容不进入查询。"""
-    rows = (
-        await session.scalars(
-            select(AuditEventModel)
-            .where(
-                AuditEventModel.user_id == user_id,
-                AuditEventModel.event_type.in_(OAUTH_REFRESH_EVENT_TYPES),
-                AuditEventModel.event_metadata["connection_digest"].astext
-                == connection_digest_v1(connection_id),
-            )
-            .order_by(AuditEventModel.id)
+    """按用户/连接读取内容无关历史，可精确限定一个完整原始 attempt。
+
+    Args:
+        session: 调用方拥有的短事务，不在此处提交或申请任何锁。
+        user_id: 必须显式注入的归属条件。
+        connection_id: 用于匹配固定 connection digest，不查询当前凭据。
+        refresh_attempt_id: cleanup 从严格 parser 得到的原始 attempt 标识；不传时保持
+            coordinator 原有完整连接历史读取。限定时仍包含全部 recovery/closing，不加年龄或数量截断。
+    """
+    statement = select(AuditEventModel).where(
+        AuditEventModel.user_id == user_id,
+        AuditEventModel.event_type.in_(OAUTH_REFRESH_EVENT_TYPES),
+        AuditEventModel.event_metadata["connection_digest"].astext
+        == connection_digest_v1(connection_id),
+    )
+    if refresh_attempt_id is not None:
+        statement = statement.where(
+            AuditEventModel.event_metadata["refresh_attempt_id"].astext == refresh_attempt_id
         )
-    ).all()
+    rows = (await session.scalars(statement.order_by(AuditEventModel.id))).all()
     return tuple(audit_record(row) for row in rows)
 
 

@@ -11,10 +11,14 @@ from ai_employee.application.ports.credential_rotation import (
     ConfirmedV1,
     CredentialReplacedV1,
     OAuthRefreshAuditRecord,
+    OAuthRefreshResultV1,
     RecoveryUnsatisfiedV1,
     parse_oauth_refresh_result,
 )
+from ai_employee.application.ports.oauth_refresh import OAuthRefreshError
+from ai_employee.infrastructure.db.repositories import oauth_lifecycle
 from ai_employee.infrastructure.db.repositories.oauth_lifecycle import _closed_groups
+from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import find_refresh_result
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000101")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000201")
@@ -301,3 +305,109 @@ def test_closing_uniqueness_uses_complete_history_before_cutoff(
         cutoff=cutoff,
     )
     assert len(groups) == (1 if duplicate_timing == "none" else 0)
+
+
+@pytest.mark.parametrize("conflict_kind", ["unsatisfied", "confirmed"])
+@pytest.mark.parametrize("conflict_timing", ["expired", "at_cutoff", "after_cutoff"])
+def test_mixed_closings_keep_the_complete_history(
+    conflict_kind: str, conflict_timing: str
+) -> None:
+    """合法混合结果已被 coordinator 判冲突时，cleanup 不能删掉 replacement 或原 fence。"""
+    automatic, recovery = started(), recovery_started()
+    replacement = result_event("replacement")
+    cutoff = NOW + timedelta(days=1)
+    conflict = replace(
+        result_event(conflict_kind),
+        event_id=4,
+        created_at={
+            "expired": replacement.created_at + timedelta(microseconds=1),
+            "at_cutoff": cutoff,
+            "after_cutoff": cutoff + timedelta(microseconds=1),
+        }[conflict_timing],
+    )
+    for result in (replacement, conflict):
+        assert parse_oauth_refresh_result(
+            result,
+            automatic=automatic,
+            recovery=recovery,
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            key_version=7,
+        ) is not None
+    records = (automatic, recovery, replacement, conflict)
+    with pytest.raises(OAuthRefreshError) as raised:
+        find_refresh_result(
+            records,
+            user_id=USER_ID,
+            connection_id=CONNECTION_ID,
+            attempt_id=UUID(RECOVERY_ID if conflict_kind == "unsatisfied" else ATTEMPT_ID),
+            key_version=7,
+            recovery=conflict_kind == "unsatisfied",
+        )
+    assert raised.value.error_code == "oauth_credential_state_conflict"
+    assert _closed_groups(
+        records,
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        key_version=7,
+        cutoff=cutoff,
+    ) == ()
+
+
+@pytest.mark.parametrize("group_count", [10, 40])
+def test_unrelated_refresh_attempts_have_linear_result_parsing(
+    group_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """大量独立合法组只解析各自结果，不能对 automatic 与整条历史做笛卡尔匹配。"""
+    records: list[OAuthRefreshAuditRecord] = []
+    for index in range(group_count):
+        attempt_id = str(UUID(int=index + 1, version=4))
+        automatic, result = started(), result_event()
+        records.extend(
+            (
+                replace(
+                    automatic,
+                    event_id=index * 2 + 1,
+                    metadata={**automatic.metadata, "refresh_attempt_id": attempt_id},
+                ),
+                replace(
+                    result,
+                    event_id=index * 2 + 2,
+                    metadata={**result.metadata, "refresh_attempt_id": attempt_id},
+                ),
+            )
+        )
+    calls = 0
+    original_parse = oauth_lifecycle.parse_oauth_refresh_result
+
+    def counted_parse(
+        record: OAuthRefreshAuditRecord,
+        *,
+        automatic: OAuthRefreshAuditRecord,
+        recovery: OAuthRefreshAuditRecord | None = None,
+        user_id: UUID,
+        connection_id: UUID,
+        key_version: int,
+    ) -> OAuthRefreshResultV1 | None:
+        """只计数并调用真实共享 parser，不用 Fake 结果掩盖合法性校验。"""
+        nonlocal calls
+        calls += 1
+        return original_parse(
+            record,
+            automatic=automatic,
+            recovery=recovery,
+            user_id=user_id,
+            connection_id=connection_id,
+            key_version=key_version,
+        )
+
+    monkeypatch.setattr(oauth_lifecycle, "parse_oauth_refresh_result", counted_parse)
+    groups = _closed_groups(
+        tuple(records),
+        user_id=USER_ID,
+        connection_id=CONNECTION_ID,
+        key_version=7,
+        cutoff=NOW + timedelta(days=1),
+    )
+    assert len(groups) == group_count
+    assert calls <= 2 * group_count

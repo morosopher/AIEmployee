@@ -17,6 +17,7 @@ from ai_employee.application.ports.credential_rotation import (
     ConfirmedV1,
     CredentialReplacedV1,
     OAuthRefreshAuditRecord,
+    OAuthRefreshResultV1,
     RecoveryUnsatisfiedV1,
     parse_automatic_started,
     parse_oauth_refresh_result,
@@ -91,20 +92,32 @@ async def lock_cleanup_refresh_events(
     *,
     user_id: UUID,
     connection_id: UUID,
+    refresh_attempt_id: str | None = None,
 ) -> tuple[OAuthRefreshAuditRecord, ...]:
     """在两表锁之后依 original→recovery 共用唯一审计 mutex，然后重新读取完整组。
 
     隐私删除还需清理未闭合/损坏历史，因此本函数只提供同步，不把任何格式当作
-    关闭证明；普通 retention 在返回后仍必须经过同一严格 parser。
+    关闭证明；普通 retention 显式限定一个原始 attempt，包含其全部关联 recovery/closing，
+    不为其他 attempt 取锁或重读。返回后仍必须经过同一严格 parser，不能按年龄截断冲突。
     """
-    records = await read_refresh_events(session, user_id=user_id, connection_id=connection_id)
+    records = await read_refresh_events(
+        session,
+        user_id=user_id,
+        connection_id=connection_id,
+        refresh_attempt_id=refresh_attempt_id,
+    )
     for event_type in ("oauth.refresh_started", "oauth.refresh_recovery_authorization_started"):
         for record in records:
             if record.event_type == event_type:
                 await lock_refresh_audit_event(session, event_id=record.event_id)
     # 已有 ORM identity map 不能代替锁后数据库事实；只清除本次读取的缓存，不做隐式提交。
     session.expire_all()
-    return await read_refresh_events(session, user_id=user_id, connection_id=connection_id)
+    return await read_refresh_events(
+        session,
+        user_id=user_id,
+        connection_id=connection_id,
+        refresh_attempt_id=refresh_attempt_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +127,16 @@ class _ClosedGroup:
     automatic_id: int
     recovery_id: int | None
     delete_ids: tuple[int, ...]
+    refresh_attempt_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchedClosing:
+    """共享严格 parser 已验证的结果及关联 recovery；只在本次内容无关匹配内使用。"""
+
+    event: OAuthRefreshAuditRecord
+    recovery: OAuthRefreshAuditRecord | None
+    value: OAuthRefreshResultV1
 
 
 def _closed_groups(
@@ -130,8 +153,18 @@ def _closed_groups(
     证明自身关联，因此不提前移除其原始事实；坏格式/重复闭合均 fail closed。
     闭合唯一性必须先使用完整历史判断，再独立检查整组是否过期，避免 cutoff 隐藏新冲突。
     """
+    by_attempt: dict[str, list[OAuthRefreshAuditRecord]] = {}
+    for record in records:
+        attempt_id = record.metadata.get("refresh_attempt_id")
+        if isinstance(attempt_id, str):
+            by_attempt.setdefault(attempt_id, []).append(record)
     groups: list[_ClosedGroup] = []
-    for automatic in records:
+    for related in by_attempt.values():
+        starts = [record for record in related if record.event_type == "oauth.refresh_started"]
+        if len(starts) != 1:
+            # 标识索引只缩小工作集合，不能从多个原始事实中挑一个制造唯一关闭证明。
+            continue
+        automatic = starts[0]
         original = parse_automatic_started(
             automatic,
             user_id=user_id,
@@ -140,85 +173,71 @@ def _closed_groups(
         )
         if original is None:
             continue
-        recoveries = tuple(
-            record
-            for record in records
-            if (
-                record.event_type == "oauth.refresh_recovery_authorization_started"
-                and record.metadata.get("refresh_attempt_id") == original.refresh_attempt_id
-            )
-        )
-        closing: list[_ClosedGroup] = []
-        for result in records:
+        recoveries = {
+            str(record.event_id): record
+            for record in related
+            if record.event_type == "oauth.refresh_recovery_authorization_started"
+        }
+        automatic_closings: list[_MatchedClosing] = []
+        recovery_closings: dict[str, list[_MatchedClosing]] = {}
+        for result in related:
+            if result.event_type not in {
+                "oauth.refresh_confirmed",
+                "oauth.refresh_recovery_unsatisfied",
+                "oauth.refresh_credential_replaced",
+            }:
+                continue
+            recovery_id = result.metadata.get("recovery_authorization_started_event_id")
+            recovery = recoveries.get(recovery_id) if isinstance(recovery_id, str) else None
             parsed = parse_oauth_refresh_result(
                 result,
                 automatic=automatic,
+                recovery=recovery,
                 user_id=user_id,
                 connection_id=connection_id,
                 key_version=key_version,
             )
             if isinstance(parsed, ConfirmedV1):
-                if not recoveries:
-                    closing.append(
-                        _ClosedGroup(
-                            automatic.event_id,
-                            None,
-                            (
-                                automatic.event_id,
-                                result.event_id,
-                            ),
-                        )
+                automatic_closings.append(_MatchedClosing(result, None, parsed))
+            elif isinstance(parsed, (RecoveryUnsatisfiedV1, CredentialReplacedV1)) and recovery:
+                matched = _MatchedClosing(result, recovery, parsed)
+                recovery_closings.setdefault(parsed.recovery_oauth_attempt_id, []).append(matched)
+                if isinstance(parsed, CredentialReplacedV1):
+                    automatic_closings.append(matched)
+        # 两个 union 都必须先从完整历史证明唯一；不能在 replacement 分支跳过另一类结果。
+        if len(automatic_closings) > 1 or any(len(items) > 1 for items in recovery_closings.values()):
+            continue
+        for items in recovery_closings.values():
+            closing = items[0]
+            if isinstance(closing.value, RecoveryUnsatisfiedV1) and closing.recovery is not None:
+                groups.append(
+                    _ClosedGroup(
+                        automatic.event_id,
+                        closing.recovery.event_id,
+                        (closing.recovery.event_id, closing.event.event_id),
+                        original.refresh_attempt_id,
                     )
-                continue
-            for recovery in recoveries:
-                parsed = parse_oauth_refresh_result(
-                    result,
-                    automatic=automatic,
-                    recovery=recovery,
-                    user_id=user_id,
-                    connection_id=connection_id,
-                    key_version=key_version,
                 )
-                if isinstance(parsed, RecoveryUnsatisfiedV1):
-                    matches = sum(
-                        isinstance(
-                            parse_oauth_refresh_result(
-                                candidate,
-                                automatic=automatic,
-                                recovery=recovery,
-                                user_id=user_id,
-                                connection_id=connection_id,
-                                key_version=key_version,
-                            ),
-                            (RecoveryUnsatisfiedV1, CredentialReplacedV1),
-                        )
-                        for candidate in records
+        if len(automatic_closings) == 1:
+            closing = automatic_closings[0]
+            if closing.recovery is None and not recoveries:
+                groups.append(
+                    _ClosedGroup(
+                        automatic.event_id,
+                        None,
+                        (automatic.event_id, closing.event.event_id),
+                        original.refresh_attempt_id,
                     )
-                    if matches == 1:
-                        groups.append(
-                            _ClosedGroup(
-                                automatic.event_id,
-                                recovery.event_id,
-                                (
-                                    recovery.event_id,
-                                    result.event_id,
-                                ),
-                            )
-                        )
-                elif isinstance(parsed, CredentialReplacedV1) and len(recoveries) == 1:
-                    closing.append(
-                        _ClosedGroup(
-                            automatic.event_id,
-                            recovery.event_id,
-                            (
-                                automatic.event_id,
-                                recovery.event_id,
-                                result.event_id,
-                            ),
-                        )
+                )
+            elif closing.recovery is not None and len(recoveries) == 1:
+                groups.append(
+                    _ClosedGroup(
+                        automatic.event_id,
+                        closing.recovery.event_id,
+                        (automatic.event_id, closing.recovery.event_id, closing.event.event_id),
+                        original.refresh_attempt_id,
                     )
-        if len(closing) == 1:
-            groups.extend(closing)
+                )
     # 年龄只决定已证明完整的组能否整组删除，不能改变同一事实集的闭合或冲突结论。
     expired_ids = {record.event_id for record in records if record.created_at < cutoff}
     return tuple(group for group in groups if set(group.delete_ids) <= expired_ids)
@@ -276,6 +295,7 @@ class OAuthLifecycleCleanup:
                                 session,
                                 user_id=user_id,
                                 connection_id=connection_id,
+                                refresh_attempt_id=candidate.refresh_attempt_id,
                             )
                             current = _closed_groups(
                                 records,

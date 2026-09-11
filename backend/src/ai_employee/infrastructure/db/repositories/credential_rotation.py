@@ -135,6 +135,26 @@ async def lock_refresh_audit_event(session: AsyncSession, *, event_id: int) -> N
     )
 
 
+async def lock_oauth_user(session: AsyncSession, *, user_id: UUID) -> bool:
+    """在 OAuth 行锁或用户外键写入之前同步所属 user，返回锁后的活动状态。
+
+    Args:
+        session: 调用方拥有的短事务；涉及可信任务时必须已先取得 TaskRun 锁。
+        user_id: 来自已验证请求或仅用于定位的 attempt 归属，不能由供应商响应改绑。
+
+    Returns:
+        只有存在且活动的用户返回 True。调用方保留各自已有 active 拒绝与错误分类；
+        state 消费和失败关闭路径只复用同步，不把本函数当成新的授权或错误协议。
+
+    此锁与 claim/request-start 的 user FOR UPDATE 同强度，避免持 OAuth 资源后再被
+    OAuthAttempt/AuditEvent 的 user 外键 KEY SHARE 阻塞。锁持续到原事务结束，不跨网络。
+    """
+    active = await session.scalar(
+        select(UserModel.is_active).where(UserModel.id == user_id).with_for_update()
+    )
+    return active is True
+
+
 async def load_refresh_snapshot(
     session: AsyncSession,
     request: OAuthRefreshRequest | OAuthRecoveryRequest,
@@ -146,7 +166,7 @@ async def load_refresh_snapshot(
     Args:
         session: 调用方拥有的短事务；本函数不提交或执行网络。
         request: automatic 请求校验 enabled 能力；recovery 请求只定位当前连接凭据。
-        lock: 写入/恢复准入时为 True，按 connection→access→refresh 加行锁。
+        lock: 写入/恢复准入时为 True，按 user→connection→access→refresh 加行锁。
 
     Returns:
         不可变 snapshot 与仍在当前事务内的 access/refresh ORM 行；ORM 不离开仓储层。
@@ -154,6 +174,9 @@ async def load_refresh_snapshot(
     Raises:
         OAuthRefreshError: 连接、用户、能力、scope 或完整双行不满足当前状态不变量。
     """
+    # 所有写入 snapshot 的后续 started/result 都可能触发 user 外键检查，必须在
+    # 第一把连接锁之前取得 user；只读 readiness 保持普通 SELECT，不升级其锁模式。
+    active = await lock_oauth_user(session, user_id=request.user_id) if lock else None
     query = select(OAuthConnectionModel).where(
         OAuthConnectionModel.id == request.connection_id,
         OAuthConnectionModel.user_id == request.user_id,
@@ -161,9 +184,10 @@ async def load_refresh_snapshot(
     connection = await session.scalar(query.with_for_update() if lock else query)
     if connection is None or connection.status != "connected":
         raise OAuthRefreshError("oauth_credential_state_conflict")
-    active = await session.scalar(
-        select(UserModel.is_active).where(UserModel.id == request.user_id)
-    )
+    if not lock:
+        active = await session.scalar(
+            select(UserModel.is_active).where(UserModel.id == request.user_id)
+        )
     capability = None
     if isinstance(request, OAuthRefreshRequest):
         capability = await session.scalar(
@@ -893,6 +917,9 @@ class SqlAlchemyCredentialRotationRepository:
         Raises:
             OAuthRefreshError: attempt、两个 started、目标 T 或实际能力状态相互矛盾。
         """
+        # 此关闭路径不会经过 load_refresh_snapshot，且可由没有 session lease 的 error
+        # callback 进入；必须独立在 connection/access/refresh/audit 之前同步 user。
+        await lock_oauth_user(self.session, user_id=authorization.user_id)
         connection = await self.session.scalar(
             select(OAuthConnectionModel)
             .where(

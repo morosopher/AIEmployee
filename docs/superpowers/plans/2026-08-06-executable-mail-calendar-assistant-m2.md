@@ -5682,8 +5682,12 @@ migration branches, or restore services.
 - Modify: `backend/src/ai_employee/workers/trusted_actions.py` — keep the sequence active precheck → decrypt/validate
   → committed request-start recheck → adapter call, and treat either inactive rejection as zero-provider-call.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/connections.py` — lock and recheck the active user
-  within the initial targetless OAuth attempt transaction through commit, preserving progressive authorization's
-  existing connection lock order.
+  within the initial targetless OAuth attempt transaction through commit; begin callback, progressive-start and
+  failed-authorization transactions with user before OAuth resources. State consumption first locates only the
+  user ID, then locks user and rereads the exact state+user attempt without changing existing validation/errors.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/credential_rotation.py` — prefix the existing
+  connection→access→refresh→audit order with user synchronization for locked snapshots and direct unsatisfied
+  writes, preserving active checks, CAS, audit mutexes, lease ownership and zero provider/code replay.
 - Modify: `backend/src/ai_employee/infrastructure/db/repositories/diagnostics.py`
 - Modify: `backend/tests/integration/privacy/test_source_cache_cleanup.py`
 - Modify: `backend/tests/integration/privacy/test_all_data_deletion.py`
@@ -5705,6 +5709,24 @@ migration branches, or restore services.
 - Create: `backend/tests/integration/retention/test_m2_action_retention.py`
 - Create: `backend/tests/integration/retention/test_action_retention_api.py` — run the real retention writer before
   authenticated Task26 reads of mail, calendar desired/before snapshots, and claimed unknown execution facts.
+- Create: `backend/tests/unit/workers/test_action_lifecycle.py` — preserve the first completion fact for repeated
+  unclaimed expiry while keeping first-time cancellation and terminal execution controls.
+- Create: `backend/tests/integration/retention/action_history_cases.py` — use real app/retention roles for two
+  retention passes separated by 366 days, followed by TaskHistory and native checkpoint three-table deletion.
+- Modify: `backend/tests/integration/retention/test_role_permissions.py` — expose the same official lifecycle
+  fixture to the focused retention/history role cases.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/oauth_lifecycle.py` — index complete attempt
+  groups, reject mixed closing conflicts, and synchronize only the selected group's audit identities under locks.
+- Modify: `backend/src/ai_employee/infrastructure/db/repositories/oauth_refresh_coordinator.py` — let the shared
+  reader select a complete explicit refresh attempt without changing the default writer/coordinator history read.
+- Create: `backend/tests/integration/retention/oauth_group_cases.py` — cover real mixed-closing fresh rereads and
+  bounded SQL rows, parser calls, and audit mutex sets with unrelated same-connection history.
+- Create: `backend/tests/integration/retention/oauth_action_lock_cases.py` — prove real user/OAuth and FK lock
+  interleavings with claim/request-start, including failed callbacks and same-user disconnected cleanup.
+- Modify: `backend/tests/unit/application/test_oauth_refresh_coordinator.py` — compare mixed closing semantics
+  with the coordinator and verify linear parsing of independent complete attempts.
+- Modify: `backend/tests/integration/m2/test_oauth_refresh_coordinator.py` — anchor lease-loss injection to
+  committed started, actual provider response and flushed confirmed facts instead of ownership-check counts.
 - Modify: `docs/operations.md` — extend, without replacing, Task 27D's manifest/restore sections with the final
   retention/privacy/operator integration.
 - Modify: `docs/acceptance-checklist.md`
@@ -5715,10 +5737,17 @@ Cover every M2 encrypted content group, CalendarEvent four-column atomic clear, 
 barrier/final reconcile, user isolation, and the shared versioned result-union retention rules. Unresolved automatic
 fences survive cutoff; automatic-success, unsatisfied-recovery, and successful-recovery groups delete only when every
 member is older than cutoff; parser mismatches remain protected; cleanup never depends on later credential lineage.
+Before cutoff, reject replacement+unsatisfied and replacement+confirmed conflicts across old/at-cutoff/newer
+results. Real app INSERT after candidate discovery and before cleanup locks must be seen by the fresh reread.
+With many unrelated complete attempts, prove one group's locked SELECT row counts, shared parser calls, and actual
+audit mutex IDs remain scoped to that full original attempt; do not truncate related history or infer a timing benchmark.
 On the same persistent fixtures, call the authenticated Task26 action API after the actual retention Worker:
 mail/approval and calendar desired/before/approval content must return nested `content_status=redacted` and
 `preview=null`; claimed unknown executions retain their request facts as `needs_attention`, and terminal conclusions
 remain unchanged. Do not replace the writer with manual redaction or a Fake.
+Repeat actual mail/calendar expiry after 366 days: preserve the first `cancelled/action_content_expired`
+`finished_at`, still remove late scheduling/lease residue and paired content, then prove TaskHistory uses the real
+app native checkpoint cleaner before deleting the task and dependencies. Keep a terminal execution control.
 `database.restore.completed` follows ordinary 365-day audit retention and all-data deletion; it has no
 catalog-authority exemption. Tests must delete an old completion audit while preserving the valid completed call +
 `ai_employee.restore_completion=restore_completion:v1:<digest>` pair, then prove completed admission/ACK still uses
@@ -5893,6 +5922,13 @@ PostgreSQL re-enqueue/final atomicity, scan-limit starvation prevention, and the
 contract are incomplete.
 
 - [ ] **Step 3: Implement lifecycle cleanup and freeze operator-facing contracts**
+
+OAuth callback saves, progressive attempt insertion, automatic started insertion and both failed-authorization
+entry points must serialize with real ToolExecution claim/request-start through user-before-OAuth locking.
+Disconnected cleanup checks the locked active user before the unchanged two EXCLUSIVE NOWAIT table locks.
+Keep TaskRun before user where a task is involved, all existing OAuth relative lock order, FK/ACL and stable
+error semantics. Verify exact blocking PIDs and actual PostgreSQL RED→GREEN, plus single state consumption,
+accurate authorizing/action_required capability outcomes, atomic failure audits and zero repeated provider writes.
 
 Implement the detailed retention/privacy rules below, update `docs/operations.md` and
 `docs/acceptance-checklist.md` as target contracts rather than claims that production 0019 already ran, and retain

@@ -214,7 +214,7 @@ class ConnectionStore(Protocol):
         user_id: UUID,
         connection_id: UUID,
     ) -> StoredConnection | None:
-        """在当前事务内锁定目标连接，供授权代际与能力快照保持一致。"""
+        """在当前事务先同步所属 user 再锁定目标连接，保持能力/代际及后续外键写入锁序。"""
         ...
 
     async def ensure_connection(
@@ -874,7 +874,8 @@ class ConnectionsUseCase:
         """
         now = _utc_now(self._clock)
         async with self._stores() as store:
-            # 先锁连接再读取 enabled 快照；否则断开/关闭与授权发起可能观察到不同代际。
+            # 仓储先按 user→connection 同步再读取 enabled 快照；后续 attempt/恢复审计
+            # 的 user 外键不能与可信执行 user→connection 反序，代际快照仍在同一事务。
             connection = await store.get_connection_for_update(
                 user_id=user_id,
                 connection_id=connection_id,

@@ -1442,6 +1442,104 @@ async def test_task27e_real_roles_history_checkpoint_rechecks_admission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["mail", "calendar"])
+async def test_task27e_real_roles_repeated_expiry_reaches_history(
+    disposable_role_database: _DisposableRoleDatabase,
+    kind: str,
+) -> None:
+    """真实两轮清理保留首次完成时间，随后由 app 原生三表和 retention 删除完整任务图。"""
+    from tests.integration.retention.action_history_cases import (
+        assert_repeated_expiry_reaches_history,
+    )
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_repeated_expiry_reaches_history(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        kind=kind,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "phase"),
+    [
+        ("callback_unbound", "claim"),
+        ("callback_unbound", "request_start"),
+        ("callback_bound", "claim"),
+        ("callback_bound", "request_start"),
+        ("disconnected_credentials", "claim"),
+        ("progressive_attempt", "claim"),
+        ("automatic_started", "claim"),
+        ("authorization_failed", "claim"),
+        ("recovery_unsatisfied", "claim"),
+    ],
+)
+async def test_task27e_real_roles_oauth_execution_lock_order(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scenario: str,
+    phase: str,
+) -> None:
+    """精确 PID 证明真实 OAuth/清理事务与原 claim/request-start 可串行且不重放请求。"""
+    from tests.integration.retention.oauth_action_lock_cases import (
+        assert_oauth_execution_lock_order,
+    )
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_oauth_execution_lock_order(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        scenario=scenario,
+        phase=phase,
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict_kind", ["unsatisfied", "confirmed"])
+@pytest.mark.parametrize("conflict_timing", ["expired", "at_cutoff", "after_cutoff"])
+async def test_task27e_real_roles_mixed_closing_fresh_reread(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict_kind: str,
+    conflict_timing: str,
+) -> None:
+    """真实 app 插入合法混合 closing 后，retention 锁后重读必须保留完整关联组。"""
+    from tests.integration.retention.oauth_group_cases import assert_mixed_closing_fresh_reread
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_mixed_closing_fresh_reread(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        conflict_kind=conflict_kind,
+        conflict_timing=conflict_timing,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_count", [10, 40])
+async def test_task27e_real_roles_single_oauth_group_is_bounded(
+    disposable_role_database: _DisposableRoleDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    group_count: int,
+) -> None:
+    """大量无关 attempt 不扩大一个关闭组的锁内读取、解析或实际 mutex 集合。"""
+    from tests.integration.retention.oauth_group_cases import assert_single_group_work_is_bounded
+
+    disposable_role_database.upgrade_to_0019()
+    await assert_single_group_work_is_bounded(
+        app_url=disposable_role_database.app_url,
+        retention_url=disposable_role_database.retention_url,
+        group_count=group_count,
+        monkeypatch=monkeypatch,
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["confirmed", "unsatisfied", "replacement"])
 @pytest.mark.parametrize("order", ["writer_first", "cleanup_first"])
 async def test_task27e_real_roles_oauth_cleanup_writer_race(

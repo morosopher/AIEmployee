@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
@@ -17,12 +17,14 @@ from sqlalchemy.orm import object_session
 
 from ai_employee.application.oauth_refresh_identity import OAuthRefreshIdentity
 from ai_employee.application.ports.credential_rotation import (
+    ConfirmedV1,
     CredentialReplacedV1,
     RecoveryUnsatisfiedV1,
     parse_recovery_started,
 )
 from ai_employee.application.ports.oauth import OAuthProvider, OAuthTokenSet
 from ai_employee.application.ports.oauth_refresh import (
+    OAuthRefreshClaim,
     OAuthRefreshError,
     OAuthRefreshRequest,
     OAuthRefreshSnapshot,
@@ -272,46 +274,126 @@ async def test_lease_acquire_commit_ack_loss_releases_session_lock_before_pool_r
 @pytest.mark.parametrize("loss", ["unlock", "disconnect"])
 async def test_explicit_session_lock_loss_is_fail_closed_and_never_reacquired(
     oauth_state,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     stage: str,
     loss: str,
 ) -> None:
-    """同一个 session 必须在每个 provider/CAS 边界仍持锁，不能重入 acquire 掩盖丢锁。"""
+    """以真实提交/响应/CAS 阶段注入丢锁，拒绝重入 acquire 或重放已留 fence 的 grant。
+
+    ownership 检查次数可随准入防护增加；阶段必须由独立事务可见的 started、Fake
+    返回和真实 confirm 完成来确定。before_commit 另证实 confirmed 只在 writer 事务
+    内可见，丢锁后完整回滚，不能用 response 后检查冒充最终提交前检查。
+    """
     sessions, _, coordinator = oauth_state
+    from ai_employee.infrastructure.db.repositories.credential_rotation import (
+        SqlAlchemyCredentialRotationRepository,
+    )
     from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
         PostgreSQLOAuthRefreshLease,
     )
 
     original = PostgreSQLOAuthRefreshLease.assert_owned
-    checks = 0
-    target_check = {"before_network": 2, "after_response": 3, "before_commit": 5}[stage]
-
-    async def lose_lock(self):
-        """真实释放 session advisory lock；随后仍调用真实 ownership 检查。"""
-        nonlocal checks
-        checks += 1
-        if checks == target_check:
-            if loss == "disconnect":
-                await self.connection.invalidate()
-            else:
-                await self.connection.execute(text("SELECT pg_advisory_unlock_all()"))
-                await self.connection.commit()
-        await original(self)
-
-    monkeypatch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", lose_lock)
+    original_confirm = SqlAlchemyCredentialRotationRepository.confirm
     provider = FakeRefreshProvider(token_response())
+    original_refresh = provider.refresh
+    before = await persisted_credentials(sessions)
+    checks = 0
+    injected_check: int | None = None
+    response_received = False
+    confirmed_written = False
+
+    async def mark_response(refresh_token: str) -> OAuthTokenSet:
+        """保持原 Fake 返回值，只在正常响应完成后记录阶段，不输出凭据。"""
+        nonlocal response_received
+        tokens = await original_refresh(refresh_token)
+        response_received = True
+        return tokens
+
+    async def mark_confirm(
+        repository: SqlAlchemyCredentialRotationRepository,
+        claim: OAuthRefreshClaim,
+        tokens: OAuthTokenSet,
+        *,
+        completed_at: datetime,
+    ) -> ConfirmedV1:
+        """运行真实双行 CAS，确认同事务已写 matching result 后再标记提交前阶段。"""
+        nonlocal confirmed_written
+        result = await original_confirm(repository, claim, tokens, completed_at=completed_at)
+        own_events = (
+            await repository.session.scalars(
+                select(AuditEventModel.event_type)
+                .where(AuditEventModel.user_id == USER_ID)
+                .order_by(AuditEventModel.id)
+            )
+        ).all()
+        assert own_events == ["oauth.refresh_started", "oauth.refresh_confirmed"]
+        confirmed_written = True
+        return result
+
+    async def lose_lock(lease: PostgreSQLOAuthRefreshLease) -> None:
+        """只在真实目标阶段释放物理锁；其他复核及故障后的 ownership 检查保持原样。"""
+        nonlocal checks, injected_check
+        checks += 1
+        phase_ready = {
+            "before_network": not response_received,
+            "after_response": response_received and not confirmed_written,
+            "before_commit": confirmed_written,
+        }[stage]
+        committed_events: list[str] = []
+        if injected_check is None and phase_ready:
+            # 独立会话仅查询已提交事实：started flush 或 confirm flush 都不能冒充 commit。
+            async with sessions() as observer:
+                committed_events = list(
+                    await observer.scalars(
+                        select(AuditEventModel.event_type)
+                        .where(AuditEventModel.user_id == USER_ID)
+                        .order_by(AuditEventModel.id)
+                    )
+                )
+        if committed_events == ["oauth.refresh_started"]:
+            injected_check = checks
+            if loss == "disconnect":
+                await lease.connection.invalidate()
+            else:
+                await lease.connection.execute(text("SELECT pg_advisory_unlock_all()"))
+                await lease.connection.commit()
+        await original(lease)
+
+    monkeypatch.setattr(provider, "refresh", mark_response)
+    monkeypatch.setattr(SqlAlchemyCredentialRotationRepository, "confirm", mark_confirm)
+    monkeypatch.setattr(PostgreSQLOAuthRefreshLease, "assert_owned", lose_lock)
     with pytest.raises(OAuthRefreshError) as lost:
         await coordinator.refresh(refresh_request(), provider)
+    assert injected_check is not None
     assert lost.value.error_code == "oauth_refresh_claim_lost"
     expected_calls = 0 if stage == "before_network" else 1
-    assert provider.calls == expected_calls
+    provider_calls = provider.calls
+    assert provider_calls == expected_calls
+    assert response_received is (stage != "before_network")
+    assert confirmed_written is (stage == "before_commit")
     with pytest.raises(OAuthRefreshError):
         await coordinator.refresh(refresh_request(), provider)
-    assert provider.calls == expected_calls
+    provider_calls = provider.calls
+    assert provider_calls == expected_calls
+    unchanged = await persisted_credentials(sessions) == before
+    assert unchanged, "丢锁不能留下部分或已提交的凭据更新"
     async with sessions() as session:
-        assert (await session.scalars(select(AuditEventModel.event_type))).all() == [
-            "oauth.refresh_started"
-        ]
+        durable_events = (
+            await session.scalars(
+                select(AuditEventModel.event_type)
+                .where(AuditEventModel.user_id == USER_ID)
+                .order_by(AuditEventModel.id)
+            )
+        ).all()
+        assert durable_events == ["oauth.refresh_started"]
+    with capsys.disabled():
+        print(
+            f"QI4_LEASE_STAGE stage={stage} loss={loss} injected_check={injected_check} "
+            f"provider_calls={provider_calls} confirmed_written={confirmed_written} "
+            f"durable_events={len(durable_events)} credentials_unchanged={unchanged}",
+            flush=True,
+        )
 
 
 @pytest.mark.asyncio

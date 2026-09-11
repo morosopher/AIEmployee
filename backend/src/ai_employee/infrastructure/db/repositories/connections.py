@@ -40,7 +40,6 @@ from ai_employee.domain.connections import (
     validate_capability_disable,
 )
 from ai_employee.domain.errors import StateConflictError
-from ai_employee.infrastructure.db.models.identity import UserModel
 from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     EncryptedCredentialModel,
@@ -53,6 +52,7 @@ from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.credential_rotation import (
     SqlAlchemyCredentialRotationRepository,
     assert_connection_unfenced,
+    lock_oauth_user,
 )
 from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import read_refresh_events
 from ai_employee.infrastructure.db.repositories.trusted_actions import (
@@ -140,16 +140,15 @@ class SqlAlchemyConnectionStore:
         """持久化唯一 state 摘要、供应商、能力意图及记录绑定 PKCE 密文。
 
         首次授权没有目标连接，必须在本事务锁后重验用户 active，并持锁直到调用方提交，
-        防止旧认证请求在全数据删除后向保留的匿名用户重新写入 attempt。渐进授权已先锁
-        目标连接，不能在共享路径无条件追加用户锁而改变其既有锁序。
+        防止旧认证请求在全数据删除后向保留的匿名用户重新写入 attempt。渐进授权已由
+        get_connection_for_update 按 user→connection 同步，再走本路径的用户外键写入；
+        不在持连接之后新增另一套用户锁或改变原有失败分类。
 
         Raises:
             StateConflictError: 首次授权的用户缺失或已停用；不写入任何 attempt 数据。
         """
         if target_connection_id is None:
-            active = await self._session.scalar(
-                select(UserModel.is_active).where(UserModel.id == user_id).with_for_update()
-            )
+            active = await lock_oauth_user(self._session, user_id=user_id)
             if active is not True:
                 raise StateConflictError(error_code="user_inactive", message="User is inactive")
         attempt = OAuthAttemptModel(
@@ -183,11 +182,26 @@ class SqlAlchemyConnectionStore:
         state_hash: bytes,
         now: datetime,
     ) -> ConsumedOAuthAttempt | None:
-        """锁定并一次性消费未过期 state，防止并发 callback 重放。"""
+        """先同步 user 再锁后重读并一次性消费 state，防止重放及失败审计外键反序。
+
+        预读只定位所属 user，不使用预读 attempt 状态作任何授权决定。等待 user 期间
+        attempt 可能已被消费、失效或删除，因此下方必须按 state+user 重新读取全部守卫。
+        用户同步不新增 inactive 错误分类，消费、能力失败与失败审计仍由原事务原子提交。
+        """
+        user_id = await self._session.scalar(
+            select(OAuthAttemptModel.user_id).where(OAuthAttemptModel.state_hash == state_hash)
+        )
+        if user_id is None:
+            return None
+        await lock_oauth_user(self._session, user_id=user_id)
         attempt = await self._session.scalar(
             select(OAuthAttemptModel)
-            .where(OAuthAttemptModel.state_hash == state_hash)
+            .where(
+                OAuthAttemptModel.state_hash == state_hash,
+                OAuthAttemptModel.user_id == user_id,
+            )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if attempt is None:
             return None
@@ -294,7 +308,12 @@ class SqlAlchemyConnectionStore:
         user_id: UUID,
         provider: str,
     ) -> None:
-        """锁定已消费的首次 OAuth attempt，并拒绝断开事务写入的失效标记。"""
+        """先同步 user，再锁定已消费首次 attempt 并拒绝持久失效标记。
+
+        本方法是 targetless 保存事务的首次锁入口；只调整 save helper 内的 SELECT
+        会遗留 attempt/connection→user 反序。原 attempt 拒绝和后续 active 守卫不变。
+        """
+        await lock_oauth_user(self._session, user_id=user_id)
         attempt = await self._session.scalar(
             select(OAuthAttemptModel)
             .where(
@@ -319,7 +338,8 @@ class SqlAlchemyConnectionStore:
         user_id: UUID,
         connection_id: UUID,
     ) -> StoredConnection | None:
-        """按用户锁定连接行，确保授权能力快照与代际递增处于同一事务。"""
+        """先同步用户再锁定连接，确保能力/代际和后续 attempt/result FK 使用同一锁序。"""
+        await lock_oauth_user(self._session, user_id=user_id)
         row = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -602,13 +622,16 @@ class SqlAlchemyConnectionStore:
     ) -> None:
         """写入记录绑定 token，并确保 M1 兼容的规范初始同步游标存在。
 
-        在任何 credential upsert 或 cursor insert 前，先用 ``id + user_id + connected``
-        锁定连接行。即使调用方错误传入其他用户的连接 ID，也只能得到稳定拒绝，不能利用
+        在任何 credential upsert 或 cursor insert 前，先同步 user，再用
+        ``id + user_id + connected`` 锁定连接行。即使调用方传入其他用户的连接 ID，也只能拒绝，不能利用
         ``connection_id + credential_kind`` 唯一键覆写原用户密文。
 
         ``refresh_token=None`` 表示供应商没有轮换，而不是撤销；此时不执行 upsert，保留
         既有密文。0013 已把 Gmail 游标原位迁移为 ``mail/mailbox``，重连不能再建旧键。
         """
+        # callback 的首个 attempt/connection 入口已按 user-first 同步；直接调用 save
+        # 也必须保持该顺序。仍先判连接归属、再沿原分类拒绝 inactive，不引入新错误码。
+        active = await lock_oauth_user(self._session, user_id=user_id)
         owned_connection_id = await self._session.scalar(
             select(OAuthConnectionModel.id)
             .where(
@@ -623,13 +646,6 @@ class SqlAlchemyConnectionStore:
 
         # code exchange 已在事务外发生；本地删除可能在等待响应时提交。连接仍存在
         # 不能授权复活 credential，锁住 user 后重检并让同一事务的 scope/upsert 整体回滚。
-        active = await self._session.scalar(
-            select(UserModel.is_active)
-            .where(
-                UserModel.id == user_id,
-            )
-            .with_for_update()
-        )
         if active is not True:
             raise ConnectionCredentialOwnershipError
 
@@ -794,6 +810,9 @@ class SqlAlchemyConnectionStore:
             return "stale_target_noop"
         if error_code not in get_args(RecoveryFailureCode):
             raise ValueError("progressive authorization failure code is invalid")
+        # 普通 error callback 已从 consume 取得 user；独立 unsatisfied 事务也从此入口
+        # 开始，不能先锁 connection 再让后续失败审计的 user 外键造成反向等待。
+        await lock_oauth_user(self._session, user_id=user_id)
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -837,7 +856,8 @@ class SqlAlchemyConnectionStore:
         account_type: str,
         identity_key_version: int | None = None,
     ) -> UUID:
-        """锁定并核对冻结连接身份与授权代际，任何不一致都 fail closed。"""
+        """按 user→connection 锁定并核对冻结身份/代际，原拒绝语义与 active 守卫保持不变。"""
+        await lock_oauth_user(self._session, user_id=user_id)
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(

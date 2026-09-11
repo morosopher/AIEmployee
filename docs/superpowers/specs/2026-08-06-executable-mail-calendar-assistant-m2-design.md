@@ -1275,7 +1275,9 @@ MailDraftVersion/CalendarChangeSnapshot`。锁后必须重新读取内容到期�
 - 尚未创建 `ToolExecution` 时，审批转为失效，TaskRun 与草稿/提案动作转为取消，稳定错误码为
   `action_content_expired`；同时清空 `scheduled_for`、`retry_recovery_at`、
   `approval_checkpoint_recovery_at`、lease owner/expiry 与其他可重新进入执行的调度字段。该动作不得
-  重新提交，用户只能基于仍可用的非敏感元数据创建新版本。
+  重新提交，用户只能基于仍可用的非敏感元数据创建新版本。首次失效取消记录 `finished_at`；重复处理
+  同一 `cancelled/action_content_expired` 时保留已有首次完成时间，同时继续清空调度/租约和成对内容，
+  使任务最终能够达到普通 365 天历史 cutoff。
 - 已存在非终态 `ToolExecution` 时，草稿/提案动作、ToolExecution 与 TaskRun 一并收敛为
   `needs_attention`，错误码为 `action_content_expired`。必须保留供应商资源 ID、请求/关联 ID、检查链接、
   只读核对计数与人工结果入口，禁止把未知外部副作用伪装为取消或未执行。
@@ -1353,8 +1355,15 @@ app 入口只按精确 user/task 只读重验状态、截止与归属，不能�
 
 认证事务完成不等于后续写事务仍有活动用户授权。首次 OAuth start 持久化 attempt、普通 OAuth
 callback 保存凭据、人工结果确认/重开核对、设置更新、任务创建和对话创建/删除必须在原有短事务
-锁后重检 `users.is_active`。首次 start 的用户锁连续覆盖 attempt 插入和提交；渐进授权保持既有
-连接锁序，不得在共享 attempt 写入路径无条件增加反向用户锁。
+锁后重检 `users.is_active`。首次 start 的用户锁连续覆盖 attempt 插入和提交。普通 callback 保存、
+渐进发起和 refresh/recovery 写事务必须从首次锁入口遵守 user→OAuth 顺序；可信任务仍先锁 TaskRun，
+OAuth 内部 connection→access→refresh→audit 的相对顺序不变。不能先持 connection 或清理表锁，
+再等待显式 user 锁或 OAuthAttempt/AuditEvent 外键隐式取得的 user KEY SHARE。
+state 消费仅按 state hash 预读所属 user ID 来定位锁，随后先锁 user，再以 state hash+user 重新锁读
+attempt；失效、消费、有效期和供应商绑定仍使用重读结果。targetless 保存先锁 user，再锁 attempt；
+bound 保存和渐进发起先锁 user，再锁 connection。普通失败回调与独立 unsatisfied 事务也保持该顺序。
+用户锁只提供事务同步，不替代既有 active 守卫，不新增 OAuth 错误分类，也不改变 state 一次消费、
+失败审计的原子性或任何 provider/code 的零重放约束。
 屏障前提交的写入由删除覆盖；屏障或最终提交后的迟到请求不得重建凭据/业务数据、覆盖一次核对资格、
 修改匿名默认值或追加普通审计。普通 retention 对 inactive 用户不收敛动作，不得抹除核对资格；
 这些补充不改变 API 形状、OAuth 协议或冻结 ACL，不使用跨请求事务或通用 middleware。
@@ -1502,6 +1511,8 @@ recovery authorization started 和原 automatic fence，且只有 replacement �
 分别按完整组原子清理，且组内每一行都必须早于 cutoff，等价于组内最大
 `created_at < cutoff`。旧 started 加较新 confirmed/unsatisfied/consumption 不得提前删除，不能先删 result
 再留下伪 unresolved 事实。
+年龄筛选前必须统一检查 automatic 的 confirmed/replacement 和每个 recovery 的
+unsatisfied/replacement 关闭唯一性；同类型重复或合法混合 closing 冲突都保留完整关联事实。
 
 unsatisfied recovery 组还必须按其关闭 schema 精确匹配 OAuthAttempt/recovery event、F/S/T、requested
 capabilities、`capability_transition` 与稳定 `error_code`/`result_code`；`action_required` 和
@@ -1520,10 +1531,15 @@ retention 对 connection/credential 只有 SELECT/DELETE，没有行锁所需的
 DELETE 权限允许的更强物理保护，不能把它描述为逐行 `FOR UPDATE`。只有实际候选可在独立短事务中
 依次执行 `LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT` 和
 `LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT`，一次只处理一个连接/有界组。
+普通 disconnected 凭据清理必须在这两把表锁之前取得 user FOR UPDATE 并重检 active，避免与同用户
+另一 connected 账户的可信动作 claim 形成 user/全表锁等待环；inactive 时不进入 OAuth 清理。
 这会排斥既有 writer/recovery 的物理行锁与写事务，包括未取得 session lease 的回调；普通 SELECT
 仍可并发。任一步竞争立即回滚本事务并有界结束，留给下次维护或 deletion winner 恢复，不忙等也不
 降级无锁删除。随后仅按 user-scoped connection→access→refresh 读取必要行身份，按 original→recovery
 复用唯一 `lock_refresh_audit_event` 的事务互斥，再 fresh-read 完整事件组并调用同一严格 parser。
+候选发现按无内容的原始 `refresh_attempt_id` 建立事件索引，每个结果只交给它关联的 started/recovery
+解析。锁内仅同步并读取该原始 attempt 的完整关联历史及全部冲突 closing，不扫描或取得同连接其他
+attempt 的审计互斥；不得通过 cutoff、LIMIT 或截断关联历史隐藏冲突。一个关联组本身仍须完整读取。
 普通 audit retention 不读取 token、密文、expiry、generation 或后续 lineage；只有全数据删除凭据阶段
 按 17.2.2 受控选取至多一个 token。事务内无 provider/network，revoke 必须在本地删除提交后。
 既有 writer 的行锁、审计 helper 的 key、17.2.3 ACL 和迁移不变；不能引入 audit UPDATE、另一把
@@ -1647,6 +1663,9 @@ ACK-lost 只读 reconcile 的返回类型必须是版本化、按 event type 判
   `oauth.refresh_recovery_unsatisfied` 或同一个 `oauth.refresh_credential_replaced` consumption 作为关闭
   result；replacement 同时关闭 recovery attempt 与它绑定的 original automatic fence，而 unsatisfied 只关闭
   recovery attempt。
+
+同一 attempt 的全部适用 matching result 必须唯一，包括上述两类跨类型组合；多条合法 closing
+返回 `oauth_credential_state_conflict`，retention 也不得选择其中一组删除。
 
 每个 union member 都必须验证自己的 event type、result/proof schema version、精确 user/connection/attempt、
 source、必要的 original-attempt 关联、identity-change 关系和严格 `created_at` 顺序。confirmed 必须满足上述

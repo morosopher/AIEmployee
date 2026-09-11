@@ -317,7 +317,8 @@ class RetentionCleanupWorker:
     async def _clean_disconnected_credentials(self, user_id: UUID, batch_size: int) -> None:
         """锁后重验 disconnected 再清凭据/游标，阻止旧扫描误删并发重连的新凭据。
 
-        仅对确有本地残留的连接取得两表 EXCLUSIVE NOWAIT 和已有 refresh audit mutex。
+        仅对确有本地残留的连接先锁 user 并重检 active，再取得两表 EXCLUSIVE NOWAIT
+        和已有 refresh audit mutex；同用户另一连接的 claim 也先锁 user，不能反序等待。
         竞争时整笔回滚并有界结束；不调用 OAuth lease 方法、不读 lineage、不解密 token。
         """
         after: UUID | None = None
@@ -354,6 +355,13 @@ class RetentionCleanupWorker:
             for connection_id in connection_ids:
                 try:
                     async with self._session_factory.begin() as session:
+                        active = await session.scalar(
+                            select(UserModel.is_active)
+                            .where(UserModel.id == user_id)
+                            .with_for_update()
+                        )
+                        if active is not True:
+                            return
                         identity = await lock_oauth_cleanup_identity(
                             session,
                             user_id=user_id,
@@ -372,15 +380,6 @@ class RetentionCleanupWorker:
                         await lock_cleanup_refresh_events(
                             session, user_id=user_id, connection_id=connection_id
                         )
-                        active = await session.scalar(
-                            select(UserModel.is_active)
-                            .where(
-                                UserModel.id == user_id,
-                            )
-                            .with_for_update()
-                        )
-                        if active is not True:
-                            return
                         await session.execute(
                             delete(EncryptedCredentialModel).where(
                                 EncryptedCredentialModel.user_id == user_id,

@@ -181,7 +181,7 @@ preflight 还必须持有 revision-global PostgreSQL session lease。固定锁�
 
 revision-global lease 只解决 0019 窗口并发，不证明 OAuth refresh 的未知结果。automatic refresh 只有两类来源：0019 preflight 的 `calendar_aad_preflight`，以及 Google/Microsoft mail/calendar Worker 的 `provider_refresh`。它们必须通过供应商中立的 `OAuthRefreshCoordinator` 取得按 `connection_id` 隔离的 PostgreSQL session advisory lease；带 `connection_id` 的 explicit progressive recovery 使用同一 connection lease，但属于一次性 authorization-code 通道，不创建第二个 automatic started。无 target 的 `/provider/start` 不属于恢复通道。任何路径都不得调用 `ensure_connection` 覆盖既有行、无条件 upsert，或让适配器自行 refresh/retry。
 
-每次 automatic claim 在短事务中按 connection → access credential → refresh credential → matching started audit 的顺序锁定并冻结 generation `G`、两行完整物理 snapshot、old `refresh_token_identity_v1` 与固定 identity key version。若存在没有被合法 matching confirmed 或 replacement result 关闭的 `oauth.refresh_started`，provider call 必须为零；否则提交 content-free `oauth.refresh_started`，事务提交成功后才允许进入 provider。started metadata 使用 `fence_schema_version="oauth_refresh_fence.v1"`，并精确绑定 `source`、canonical lowercase `refresh_attempt_id`、`connection_digest`、适用的 source/target revision 与 `rollout_digest_v1`、`fence_generation=G`、两个 pre-digest、old identity/key version 和稳定 `result_code`。网络阶段只保持 session lease，不持有业务事务；provider 前、响应后、CAS 前和结果提交前都由同一 session 证明 lease 仍在。资源 401 最多触发一次新的 automatic coordinator claim；重复 Taskiq delivery、`TransientProviderError` 或进程恢复不能绕过已提交 fence。
+每次 automatic claim 在短事务中按 user → connection → access credential → refresh credential → matching started audit 的顺序锁定并冻结 generation `G`、两行完整物理 snapshot、old `refresh_token_identity_v1` 与固定 identity key version。若存在没有被合法 matching confirmed 或 replacement result 关闭的 `oauth.refresh_started`，provider call 必须为零；否则提交 content-free `oauth.refresh_started`，事务提交成功后才允许进入 provider。started metadata 使用 `fence_schema_version="oauth_refresh_fence.v1"`，并精确绑定 `source`、canonical lowercase `refresh_attempt_id`、`connection_digest`、适用的 source/target revision 与 `rollout_digest_v1`、`fence_generation=G`、两个 pre-digest、old identity/key version 和稳定 `result_code`。网络阶段只保持 session lease，不持有业务事务；provider 前、响应后、CAS 前和结果提交前都由同一 session 证明 lease 仍在。资源 401 最多触发一次新的 automatic coordinator claim；重复 Taskiq delivery、`TransientProviderError` 或进程恢复不能绕过已提交 fence。
 
 provider token response 只有通过 non-empty access token、正数 expiry、canonical scope 覆盖等完整校验后才是 known-valid。随后在另一短事务重检 lease、connection/capability/generation、两行旧 snapshot 与 old identity，并把 credential CAS 与 matching `oauth.refresh_confirmed` 原子提交。known-valid missing、same、different refresh token 都必须 confirmed：missing/same 只更新 access row并逐字节保留 refresh row，要求 old == new 且 `refresh_identity_changed=false`；different non-empty refresh 更新两行，要求 old != new 且 `refresh_identity_changed=true`，但仍只关闭本次 automatic started，不能追加 `oauth.refresh_credential_replaced` 或消费更早 fence。confirmed metadata 使用 `result_schema_version="oauth_refresh_confirmed.v1"`，精确包含 source/started_source、matching attempt、connection digest、适用 revision/rollout 字段、G/G/G、两个 pre-digest、两个 required post-digest、old/new identity 与各自固定 key version、实际持久化 expiry、`refresh_token_disposition`、`refresh_identity_changed` 和稳定 result code；0019 还包含由该 expiry 得出的 deadline candidate，普通 Worker 使用规范 NULL。candidate 只证明历史 result schema，不授权后续 deadline。confirmed 的 `created_at` 必须严格晚于 matching started。confirmed 后崩溃只从持久 credential/result 恢复，不再次调用 provider。
 
@@ -1093,11 +1093,14 @@ started，unsatisfied 只关闭本次 recovery started 并保留 original fence�
 其 recovery started 与 original fence。每组只有全部成员早于 cutoff，即组内最大 `created_at < cutoff`，
 才可原子删除。缺失、重复、字段/身份/时序不匹配的组保留；后续凭据变化不会复活已关闭 attempt。
 
-只有实际候选才在独立短事务依次取得
-`LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT` 和
+只有实际候选才进入独立清理短事务。普通 disconnected 凭据清理先取得 user FOR UPDATE
+并重检 active，inactive 时立即返回；普通闭组审计清理的锁入口仍从下述两张表开始。
+两种入口随后依次取得 `LOCK TABLE oauth_connections IN EXCLUSIVE MODE NOWAIT` 和
 `LOCK TABLE encrypted_credentials IN EXCLUSIVE MODE NOWAIT`，再按用户限定的
 connection→access→refresh 读取行身份，按 original→recovery 复用既有审计互斥锁，锁后重新读取
-完整事件组并解析。普通审计清理不读取 token、密文、expiry、generation 或后续 lineage。
+完整事件组并解析。普通闭组清理仅同步选中原始 attempt 的完整关联历史，不截断冲突 closing，
+也不为同连接其他 attempt 取得审计互斥。普通审计清理不读取 token、密文、expiry、generation
+或后续 lineage。
 任一表锁竞争立即回滚并有界返回，留待下一轮维护或原删除赢家恢复；禁止忙等、无锁降级、
 audit UPDATE、新增清理专用锁或追加角色权限。清理事务中没有网络请求。
 

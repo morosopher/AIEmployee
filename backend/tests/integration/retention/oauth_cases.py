@@ -300,10 +300,13 @@ async def assert_oauth_writer_cleanup_race(
         else:
             original_locks = oauth_lifecycle.lock_cleanup_refresh_events
 
-            async def pause_cleanup(session, *, user_id, connection_id):
+            async def pause_cleanup(session, *, user_id, connection_id, refresh_attempt_id=None):
                 """真实表锁/共同 audit mutex 后暂停，未释放时 app 的真实行锁必须等待。"""
                 records = await original_locks(
-                    session, user_id=user_id, connection_id=connection_id
+                    session,
+                    user_id=user_id,
+                    connection_id=connection_id,
+                    refresh_attempt_id=refresh_attempt_id,
                 )
                 if user_id == state.user_id and not locked.is_set():
                     locked.set()

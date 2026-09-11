@@ -335,7 +335,11 @@ class ActionLifecycleCleanup:
         *,
         now: datetime,
     ) -> None:
-        """未知外部副作用只转人工处理，确定结果只抹内容，不改写 provider/check/count。"""
+        """收敛失效状态，保留同一次未认领取消的首次完成时间及已确定的执行结论。
+
+        重复处理仍清除调度和租约，不能把整个动作当作已处理而跳过；但刷新 finished_at
+        会令任务永远达不到历史截止。未知副作用只转人工处理，不改写 provider/check/count。
+        """
         terminal = {ToolExecutionStatus.SUCCEEDED.value, ToolExecutionStatus.CONFIRMED_FAILED.value}
         nonterminal = [item for item in executions if item.status not in terminal]
         claimed_task_ids = {item.task_id for item in executions}
@@ -346,6 +350,11 @@ class ActionLifecycleCleanup:
         for task in tasks:
             if task.id in claimed_task_ids and task.id not in pending_task_ids:
                 continue
+            repeated_cancellation = (
+                task.status == TaskStatus.CANCELLED.value
+                and task.error_code == "action_content_expired"
+                and task.finished_at is not None
+            )
             task.status = (
                 TaskStatus.NEEDS_ATTENTION.value
                 if task.id in pending_task_ids
@@ -357,7 +366,7 @@ class ActionLifecycleCleanup:
             )
             task.lease_owner = task.lease_expires_at = None
             task.updated_at = now
-            if task.id not in claimed_task_ids:
+            if task.id not in claimed_task_ids and not repeated_cancellation:
                 task.finished_at = now
         for approval in approvals:
             if approval.task_id not in claimed_task_ids:
