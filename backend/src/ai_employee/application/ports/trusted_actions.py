@@ -522,6 +522,7 @@ class TrustedActionSubmission:
     operation_id: UUID
     idempotency_key: str
     action: str
+    frozen_connection_id: UUID
     schema_version: str
     risk_level: TrustedActionRisk
     proposal_kind: str

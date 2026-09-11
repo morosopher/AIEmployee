@@ -1,4 +1,5 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import type { ActionItemKind, ActionProvider, ActionStatus } from '@/api/types'
 import { groupActions } from '@/features/actions/presentation'
 import { useActionsStore } from '@/stores/actions'
@@ -11,6 +12,8 @@ import { useTaskEvents } from './useTaskEvents'
  */
 export function useActionCenter() {
   const actions = useActionsStore()
+  const route = useRoute(),
+    router = useRouter()
   const auth = useAuthStore()
   const provider = ref<ActionProvider | ''>('')
   const itemKind = ref<ActionItemKind | ''>('')
@@ -47,11 +50,30 @@ export function useActionCenter() {
   function selectTask(taskId: string): void {
     selectedTaskId.value = taskId
     void actions.loadSnapshot(taskId)
+    void router.replace({ query: { ...route.query, task: taskId } })
   }
   /** 关闭详情将触发既有 task stream 的关闭，不改写任何业务状态。 */
   function closeDetail(): void {
     selectedTaskId.value = null
+    const query = { ...route.query }
+    delete query.task
+    void router.replace({ query })
   }
+  // 创建回执只在 query 中传递内容无关的 UUID；刷新必须以 REST 验证其归属与快照。
+  watch(
+    () => route.query.task,
+    (value) => {
+      const id =
+        typeof value === 'string' &&
+        /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)
+          ? value
+          : null
+      if (id === selectedTaskId.value) return
+      selectedTaskId.value = id
+      if (id) void actions.loadSnapshot(id)
+    },
+    { immediate: true },
+  )
   /**
    * @param nextOffset 服务端分页偏移。
    * @returns 当前筛选的新页面。

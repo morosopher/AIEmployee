@@ -145,7 +145,7 @@ async def _seed_mail_action(
                 name="await_approval",
                 kind="trusted_action",
                 status="running",
-                input_summary={},
+                input_summary={"action": "mail.send", "proposal_version": 1},
             )
         )
         await session.flush()
@@ -580,6 +580,18 @@ async def test_calendar_preview_preserves_before_after_notification_and_conflict
                 proposal_kind="calendar_proposal",
                 proposal_id=proposal_id,
                 risk_level="medium",
+            )
+        )
+        # fixture 从邮件动作转换为日程时，步骤索引也必须绑定同一冻结动作。
+        # 不能依赖读取端忽略不一致摘要，否则会掩盖生产数据的归属错误。
+        await session.execute(
+            update(TaskStepModel)
+            .where(TaskStepModel.task_id == seeded.task_id)
+            .values(
+                input_summary={
+                    "action": f"calendar.{operation}",
+                    "proposal_version": 1,
+                }
             )
         )
     response = await clients.owner.get(f"/api/v1/actions/{seeded.task_id}")

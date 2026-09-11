@@ -36,6 +36,8 @@ export interface TaskSnapshot {
   /** 服务端快照对应的最大持久审计 ID；仅作为精确十进制游标使用。 */
   event_cursor: string
   steps: TaskStep[]
+  /** 仅成功恢复准备任务的已验证结果；旧M1快照可省略，不能据此猜测结果。 */
+  calendar_restore_proposal_id?: string | null
 }
 
 /** SSE 传输的类型化信封；payload 保留给事件 reducer 再做事件级收窄。 */
@@ -180,6 +182,12 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
   const eventCursor = asEventCursor(object.event_cursor)
   if (eventCursor === null)
     throw new Error('Invalid task event cursor')
+  const restoreId = object.calendar_restore_proposal_id
+  if (restoreId !== undefined && restoreId !== null && (
+    object.kind !== 'calendar.restore.prepare' || status !== 'succeeded' ||
+    typeof restoreId !== 'string' ||
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(restoreId)
+  )) throw new Error('Invalid calendar restore task result')
   return {
     id: object.id,
     kind: object.kind,
@@ -192,6 +200,7 @@ export function parseTaskSnapshot(value: unknown): TaskSnapshot {
       typeof object.error_code === 'string' ? object.error_code : null,
     event_cursor: eventCursor,
     steps: object.steps.map(parseTaskStep),
+    ...(restoreId === undefined ? {} : { calendar_restore_proposal_id: restoreId as string | null }),
   }
 }
 

@@ -30,6 +30,8 @@ export interface CreateMailDraftInput {
 }
 export interface UpdateMailDraftInput {
   version: number
+  /** 仅 new/editing 可显式重绑；回复字段必须省略，禁止 null。 */
+  connection_id?: string
   to?: string[]
   cc?: string[]
   bcc?: string[]

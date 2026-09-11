@@ -13,6 +13,7 @@ from pydantic import TypeAdapter, ValidationError
 from ai_employee.api.deps import (
     ApiProblem,
     get_authenticated_session,
+    get_calendar_editor_use_case,
     get_calendar_proposal_use_case,
     handle_api_problem,
     handle_request_validation_error,
@@ -438,6 +439,8 @@ async def test_calendar_sensitive_http_responses_are_no_store() -> None:
     authenticated = SimpleNamespace(user=SimpleNamespace(id=uuid4()))
     app.dependency_overrides[get_authenticated_session] = lambda: authenticated
     app.dependency_overrides[get_calendar_proposal_use_case] = lambda: _ListProposals()
+    # 无效 UUID 的测试不应启动真实组合根；GET 新增的编辑器依赖也须在此最小应用中替换。
+    app.dependency_overrides[get_calendar_editor_use_case] = lambda: object()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
         success = await client.get("/api/v1/calendar/proposals")

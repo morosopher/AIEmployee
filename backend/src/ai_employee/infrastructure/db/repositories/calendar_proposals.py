@@ -35,6 +35,9 @@ from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeSnapshotModel,
 )
 from ai_employee.infrastructure.db.models.sources import CalendarEventModel
+from ai_employee.infrastructure.db.repositories.historical_action_bindings import (
+    preserve_historical_action_bindings,
+)
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import (
@@ -313,6 +316,45 @@ class SqlAlchemyCalendarProposalRepository:
             raise ValueError("calendar retarget identity must be provided together")
         if calendar_id is not None and (not isinstance(calendar_id, str) or not calendar_id):
             raise ValueError("calendar retarget calendar_id is invalid")
+        if connection_id is not None and calendar_id is not None:
+            current = await self._session.scalar(
+                select(CalendarChangeProposalModel)
+                .where(
+                    CalendarChangeProposalModel.id == proposal_id,
+                    CalendarChangeProposalModel.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            if current is None:
+                return None
+            if current.current_version != expected_version:
+                raise _proposal_version_conflict()
+            changed_target = (current.connection_id, current.calendar_id) != (
+                connection_id,
+                calendar_id,
+            )
+            if changed_target and current.operation_kind != "create":
+                raise StateConflictError(
+                    error_code="calendar_proposal_binding_immutable",
+                    message="calendar proposal source cannot be changed",
+                )
+            if current.status != CalendarProposalStatus.EDITING.value:
+                raise StateConflictError(
+                    error_code="calendar_proposal_not_editable",
+                    message="calendar proposal is not editable",
+                )
+            if changed_target:
+                await preserve_historical_action_bindings(
+                    self._session,
+                    self._cipher,
+                    user_id=user_id,
+                    proposal_kind="calendar_proposal",
+                    proposal_id=proposal_id,
+                    original_connection_id=current.connection_id,
+                    original_version=expected_version,
+                    original_calendar_id=current.calendar_id,
+                    calendar_proposals=self,
+                )
         next_version = expected_version + 1
         prepared_snapshot = self._prepare_snapshot(
             snapshot_id=snapshot_id,

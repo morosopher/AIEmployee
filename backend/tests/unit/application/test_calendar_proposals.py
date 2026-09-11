@@ -1079,7 +1079,7 @@ async def test_restore_rejects_deleted_uneditable_or_recurring_provider_facts(
 
 @pytest.mark.asyncio
 async def test_restore_uses_current_etag_complete_diff_and_new_operation_identity() -> None:
-    """恢复创建新版本一提案，保存当前 before，并对历史状态生成完整 diff。"""
+    """恢复创建独立提案和完整 diff；历史内容可复用，通知仍须另行确认后才能提交。"""
     ids = (
         PROPOSAL_ID,
         DESIRED_ID,
@@ -1118,7 +1118,8 @@ async def test_restore_uses_current_etag_complete_diff_and_new_operation_identit
         "title",
     }
     assert restored.notification_policy is NotificationPolicy.ALL
-    assert restored.submission_ready is True
+    assert restored.required_confirmations == ("notification_policy",)
+    assert restored.submission_ready is False
     before = repository.snapshots[restored.before_snapshot_id]
     assert before.content["location"] == "Current room"
 

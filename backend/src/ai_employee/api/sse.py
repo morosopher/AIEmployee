@@ -302,7 +302,9 @@ class TaskEventStream:
         if subscription_factory is not None:
             self._subscription_factory = subscription_factory
         elif redis_url is not None:
-            self._subscription_factory = lambda task_id: RedisTaskEventSubscription(redis_url, task_id)
+            self._subscription_factory = lambda task_id: RedisTaskEventSubscription(
+                redis_url, task_id
+            )
         else:
             self._subscription_factory = lambda _: PollingTaskEventSubscription()
         self._metrics = metrics
@@ -329,7 +331,9 @@ class TaskEventStream:
                 if snapshot is None:
                     return
             elif last_event_id is not None and last_event_id < oldest - 1:
-                snapshot, cursor = await self._store.snapshot_and_max(task_id=task_id, user_id=user_id)
+                snapshot, cursor = await self._store.snapshot_and_max(
+                    task_id=task_id, user_id=user_id
+                )
                 if snapshot is None:
                     return
                 yield _snapshot_event(task_id=task_id, snapshot=snapshot, event_id=cursor)
@@ -399,6 +403,11 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                     ),
                     "error_code": snapshot.error_code,
                     "event_cursor": str(snapshot.event_cursor),
+                    "calendar_restore_proposal_id": (
+                        str(snapshot.calendar_restore_proposal_id)
+                        if snapshot.calendar_restore_proposal_id is not None
+                        else None
+                    ),
                     "steps": [
                         {
                             "id": str(step.id),
@@ -413,7 +422,9 @@ def _snapshot_event(*, task_id: UUID, snapshot: TaskSnapshot, event_id: int) -> 
                             ),
                             "error_code": step.error_code,
                             "started_at": step.started_at.isoformat() if step.started_at else None,
-                            "finished_at": step.finished_at.isoformat() if step.finished_at else None,
+                            "finished_at": step.finished_at.isoformat()
+                            if step.finished_at
+                            else None,
                         }
                         for step in snapshot.steps
                     ],

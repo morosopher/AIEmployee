@@ -341,7 +341,7 @@ async def test_expired_approval_replays_as_canonical_approval_resolution(
 async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
     sse_store: tuple[ManagedAsyncSessionMaker, UUID, Callable[[], TaskEventStream]],
 ) -> None:
-    """过期游标先接收同一数据库快照中的任务状态和最大审计游标。"""
+    """过期游标接收同一快照的任务状态与最大审计游标；普通任务的恢复结果必须为空。"""
     session_factory, user_id, build_stream = sse_store
     original_task_id = await _create_task(session_factory, user_id, status="failed")
     task_id = await _create_task(session_factory, user_id, status="running")
@@ -379,6 +379,7 @@ async def test_retention_gap_emits_current_snapshot_at_current_audit_id(
         "retry_of_task_id": str(original_task_id),
         "error_code": "provider_temporarily_unavailable",
         "event_cursor": str(event_id),
+        "calendar_restore_proposal_id": None,
         "steps": [
             {
                 "id": payload["payload"]["steps"][0]["id"],

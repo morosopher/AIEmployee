@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_employee.application.commands import parse_trusted_command, trusted_command_hash
 from ai_employee.application.ports.encryption import EncryptedValue, Encryption
 from ai_employee.application.ports.trusted_actions import trusted_execution_binding_matches
+from ai_employee.application.trusted_action_summary import parse_trusted_action_step_summary
 from ai_employee.application.use_cases.action_views import (
     ActionApprovalView,
     ActionExecutionView,
@@ -67,6 +68,7 @@ from ai_employee.infrastructure.db.models.tasks import (
     AuditEventModel,
     OutboxEventModel,
     TaskRunModel,
+    TaskStepModel,
     ToolExecutionModel,
 )
 from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyCalendarSyncRepository
@@ -93,14 +95,17 @@ def _manual_conflict() -> StateConflictError:
 def _task_identifiers(task: TaskRunModel) -> tuple[UUID, UUID] | None:
     """从锁定的 identifier-only TaskRun 输入解析审批与操作 UUID。"""
     payload = task.input_payload
-    if set(payload) != {"approval_id", "operation_id"}:
+    if not isinstance(payload, dict) or set(payload) != {"approval_id", "operation_id"}:
         return None
     raw_approval = payload.get("approval_id")
     raw_operation = payload.get("operation_id")
     if type(raw_approval) is not str or type(raw_operation) is not str:
         return None
     try:
-        return UUID(raw_approval), UUID(raw_operation)
+        approval_id, operation_id = UUID(raw_approval), UUID(raw_operation)
+        if str(approval_id) != raw_approval or str(operation_id) != raw_operation:
+            return None
+        return approval_id, operation_id
     except ValueError:
         return None
 
@@ -642,6 +647,28 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                         CalendarChangeProposalModel.user_id == user_id,
                     )
                 )
+        if self._encryption_factory is not None:
+            step = await self._session.scalar(
+                select(TaskStepModel).where(
+                    TaskStepModel.id == approval.step_id,
+                    TaskStepModel.task_id == task_id,
+                )
+            )
+            summary = (
+                None if step is None else parse_trusted_action_step_summary(step.input_summary)
+            )
+            if (
+                summary is None
+                or summary.action != approval.action
+                or summary.proposal_version != approval.proposal_version
+                or approval.schema_version != summary.action.replace(".", "_") + ".v1"
+                or step is None
+                or step.kind != "trusted_action"
+            ):
+                return None
+            # 只有精确 legacy 可沿用尚未重绑的 local；新格式损坏不能由密文补救。
+            if summary.frozen_connection_id is not None:
+                connection_id = summary.frozen_connection_id
         provider: str | None = None
         if connection_id is not None:
             provider = await self._session.scalar(
@@ -718,6 +745,15 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
             )
         )
         if local is None or connection is None or approval.proposal_version is None:
+            return None
+        if (
+            approval.proposal_version > local.current_version
+            or (approval.proposal_kind == "mail_draft" and approval.action != "mail.send")
+            or (
+                isinstance(local, CalendarChangeProposalModel)
+                and approval.action != "calendar." + local.operation_kind
+            )
+        ):
             return None
         rows = tuple(
             (
@@ -845,7 +881,7 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                 or command.action != approval.action
                 or command.schema_version != approval.schema_version
                 or command.operation_id != operation_id
-                or command.connection_id != local.connection_id
+                or command.connection_id != connection.id
             ):
                 raise ValueError("invalid frozen binding")
             provider = cast(ActionProvider, connection.provider)
@@ -866,15 +902,12 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                     subject=command.subject,
                     body_text=command.body_text,
                 )
-            if (
-                not isinstance(local, CalendarChangeProposalModel)
-                or command.calendar_id != local.calendar_id
-            ):
-                raise ValueError("invalid calendar binding")
+            if not isinstance(local, CalendarChangeProposalModel):
+                raise TypeError("invalid calendar binding")
             calendar = await self._session.scalar(
                 select(ProviderCalendarModel).where(
                     ProviderCalendarModel.user_id == local.user_id,
-                    ProviderCalendarModel.connection_id == local.connection_id,
+                    ProviderCalendarModel.connection_id == connection.id,
                     ProviderCalendarModel.provider_calendar_id == command.calendar_id,
                 )
             )
@@ -952,7 +985,7 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                 else await self._session.scalar(
                     select(CalendarEventModel.id).where(
                         CalendarEventModel.user_id == local.user_id,
-                        CalendarEventModel.connection_id == local.connection_id,
+                        CalendarEventModel.connection_id == connection.id,
                         CalendarEventModel.calendar_id == command.calendar_id,
                         CalendarEventModel.provider_event_id == command.provider_event_id,
                     )
@@ -1035,7 +1068,22 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                 calendar.status.in_(("editing", "cancelled", "stale")),
             )
         )
-        task, approval = TaskRunModel, ApprovalRequestModel
+        task, approval, step = TaskRunModel, ApprovalRequestModel, TaskStepModel
+        # JSONB 精确对象相等同时限制字段集合；版本另作文本相等，拒绝 1.0/布尔/字符串。
+        # 所有 UUID 都只把可信关系列转成字符串比较，从不 cast 不可信 JSON。
+        legacy_summary = func.jsonb_build_object(
+            "action", approval.action, "proposal_version", approval.proposal_version
+        )
+        indexed_summary = func.jsonb_build_object(
+            "summary_version",
+            "trusted_action_step.v1",
+            "action",
+            approval.action,
+            "proposal_version",
+            approval.proposal_version,
+            "frozen_connection_id",
+            sql_cast(connection.id, String()),
+        )
         trusted = (
             select(
                 task.id,
@@ -1053,6 +1101,7 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
                 (approval.task_id == task.id)
                 & (task.input_payload["approval_id"].astext == sql_cast(approval.id, String())),
             )
+            .join(step, (step.id == approval.step_id) & (step.task_id == task.id))
             .outerjoin(
                 mail,
                 (approval.proposal_kind == "mail_draft")
@@ -1067,12 +1116,44 @@ class SqlAlchemyActionViewRepository(ActionViewTransaction):
             )
             .join(
                 connection,
-                connection.id == func.coalesce(mail.connection_id, calendar.connection_id),
+                (
+                    (step.input_summary == legacy_summary)
+                    & (connection.id == func.coalesce(mail.connection_id, calendar.connection_id))
+                )
+                | (step.input_summary == indexed_summary),
             )
             .where(
                 task.user_id == user_id,
                 task.kind == "trusted_action",
                 connection.user_id == user_id,
+                step.kind == "trusted_action",
+                step.input_summary["proposal_version"].astext
+                == sql_cast(approval.proposal_version, String()),
+                approval.proposal_version > 0,
+                approval.proposal_version
+                <= func.coalesce(mail.current_version, calendar.current_version),
+                approval.schema_version == func.replace(approval.action, ".", "_") + ".v1",
+                (
+                    (approval.proposal_kind == "mail_draft")
+                    & (mail.id.is_not(None))
+                    & (approval.action == "mail.send")
+                )
+                | (
+                    (approval.proposal_kind == "calendar_proposal")
+                    & (calendar.id.is_not(None))
+                    & (approval.action == literal("calendar.") + calendar.operation_kind)
+                ),
+                task.input_payload
+                == func.jsonb_build_object(
+                    "approval_id",
+                    sql_cast(approval.id, String()),
+                    "operation_id",
+                    task.input_payload["operation_id"],
+                ),
+                func.jsonb_typeof(task.input_payload["operation_id"]) == "string",
+                task.input_payload["operation_id"].astext.op("~")(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                ),
             )
         )
         combined = union_all(local_mail, local_calendar, trusted).subquery()

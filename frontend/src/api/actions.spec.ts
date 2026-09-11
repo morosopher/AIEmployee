@@ -426,7 +426,7 @@ describe('M2 authenticated clients', () => {
       expect(init.method).toBe('POST')
       return new Response(
         JSON.stringify(
-          url.endsWith('/proposals') || url.endsWith('/restore-proposal')
+          url.endsWith('/proposals')
             ? calendarProposal()
             : url.endsWith('/sync')
               ? { gmail_task_id: TASK_ID, calendar_task_id: TASK_ID }

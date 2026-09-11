@@ -178,6 +178,7 @@ export function calendarProposal(): CalendarProposal {
     ],
     retain_until: NOW,
     availability: null,
+    editor_facts: null,
   }
 }
 

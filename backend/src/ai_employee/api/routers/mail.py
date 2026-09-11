@@ -149,11 +149,20 @@ class UpdateMailDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = Field(ge=1)
+    connection_id: UUID | None = None
     to: list[str] | None = Field(default=None, max_length=50)
     cc: list[str] | None = Field(default=None, max_length=50)
     bcc: list[str] | None = Field(default=None, max_length=50)
     subject: str | None = Field(default=None, max_length=255)
     body_text: str | None = Field(default=None, max_length=100_000)
+
+    @field_validator("connection_id")
+    @classmethod
+    def explicit_connection_is_not_null(cls, value: UUID | None) -> UUID:
+        """省略表示保留账户；显式选择必须是 UUID，不能用 null 清除来源。"""
+        if value is None:
+            raise ValueError("connection_id cannot be null")
+        return value
 
     @field_validator("to", "cc", "bcc")
     @classmethod

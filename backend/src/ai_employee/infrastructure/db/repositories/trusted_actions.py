@@ -485,8 +485,10 @@ class SqlAlchemyTrustedActionRepository:
             kind="trusted_action",
             status="pending",
             input_summary={
+                "summary_version": "trusted_action_step.v1",
                 "action": submission.action,
                 "proposal_version": submission.proposal_version,
+                "frozen_connection_id": str(submission.frozen_connection_id),
             },
         )
         approval = ApprovalRequestModel(

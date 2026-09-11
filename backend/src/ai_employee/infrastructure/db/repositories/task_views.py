@@ -1,6 +1,7 @@
 """以 PostgreSQL 实现任务 API 所需的用户隔离读写视图。"""
 
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import UUID, uuid4
 
@@ -23,19 +24,34 @@ from ai_employee.infrastructure.db.models.tasks import (
     TaskStepModel,
     ToolExecutionModel,
 )
+from ai_employee.infrastructure.db.repositories.calendar_restore_results import (
+    load_calendar_restore_result,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
 
 class SqlAlchemyTaskViewStore:
     """把任务状态变更、审计与 Outbox 保持在单一短事务内。"""
 
-    def __init__(self, session_factory: ManagedAsyncSessionMaker) -> None:
-        """保存 API 进程共享的 Session factory。"""
+    def __init__(
+        self,
+        session_factory: ManagedAsyncSessionMaker,
+        *,
+        restore_cipher_factory: Callable[[], ActionPayloadCipher] | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        """保存Session与恢复结果的惰性解密边界；普通任务不读取Secret或额外业务内容。"""
         self._session_factory = session_factory
+        self._restore_cipher_factory = restore_cipher_factory
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
     def _snapshot(
-        task: TaskRunModel, steps: tuple[TaskStepModel, ...], event_cursor: int
+        task: TaskRunModel,
+        steps: tuple[TaskStepModel, ...],
+        event_cursor: int,
+        calendar_restore_proposal_id: UUID | None = None,
     ) -> TaskSnapshot:
         """显式白名单映射 ORM，阻止 API 暴露租约或内部图字段。"""
         return TaskSnapshot(
@@ -46,6 +62,7 @@ class SqlAlchemyTaskViewStore:
             input_payload=task.input_payload,
             error_code=task.error_code,
             event_cursor=event_cursor,
+            calendar_restore_proposal_id=calendar_restore_proposal_id,
             steps=tuple(
                 TaskStepSnapshot(
                     id=step.id,
@@ -89,7 +106,18 @@ class SqlAlchemyTaskViewStore:
                 AuditEventModel.task_id == task_id, AuditEventModel.user_id == user_id
             )
         )
-        return self._snapshot(task, steps, event_cursor or 0)
+        restore_id = (
+            await load_calendar_restore_result(
+                typed_session,
+                task=task,
+                user_id=user_id,
+                cipher_factory=self._restore_cipher_factory,
+                observed_at=self._clock(),
+            )
+            if self._restore_cipher_factory is not None
+            else None
+        )
+        return self._snapshot(task, steps, event_cursor or 0, restore_id)
 
     async def get(self, *, task_id: UUID, user_id: UUID) -> TaskSnapshot | None:
         """在同一个可重复读快照内读取用户拥有的任务与稳定排序时间线。
@@ -148,7 +176,11 @@ class SqlAlchemyTaskViewStore:
                 withdrawn = True
             else:
                 withdrawn = False
-            if not withdrawn and current_status is TaskStatus.RUNNING and task.result_payload is not None:
+            if (
+                not withdrawn
+                and current_status is TaskStatus.RUNNING
+                and task.result_payload is not None
+            ):
                 raise StateConflictError(
                     error_code="task_state_conflict",
                     message="task result is already committed",
@@ -307,9 +339,7 @@ class SqlAlchemyTaskViewStore:
                 OutboxEventModel(
                     topic="approval.invalidated",
                     aggregate_id=task.id,
-                    deduplication_key=(
-                        f"approval.invalidated:{approval.id}:{approval.version}"
-                    ),
+                    deduplication_key=(f"approval.invalidated:{approval.id}:{approval.version}"),
                     payload={
                         "task_id": str(task.id),
                         "audit_event_id": approval_invalidated_audit.id,

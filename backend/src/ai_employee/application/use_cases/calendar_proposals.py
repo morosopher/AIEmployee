@@ -1009,6 +1009,13 @@ class CalendarProposalUseCase:
                 or not calendar_id
             ):
                 raise ValueError("calendar confirmation requires connection_id and calendar_id")
+            if current.operation_kind != "create" and (
+                connection_id != current.connection_id or calendar_id != current.calendar_id
+            ):
+                raise StateConflictError(
+                    error_code="calendar_proposal_binding_immutable",
+                    message="calendar proposal source cannot be changed",
+                )
             target = _require_writable_target(
                 await self._calendar.get_proposal_target(
                     user_id=user_id,
@@ -1032,6 +1039,12 @@ class CalendarProposalUseCase:
         _require_confirmation_value(content, normalized_confirmation, target=target)
         confirmed = _ordered_confirmations({*content.confirmed_fields, normalized_confirmation})
         updated_values = content.model_dump(mode="python")
+        if (selected_connection_id, selected_calendar_id) != (
+            current.connection_id,
+            current.calendar_id,
+        ):
+            # 旧候选只描述旧目标，不能跟随重选的账户/日历继续显示。
+            updated_values["availability"] = None
         updated_values.update(
             {
                 "confirmed_fields": confirmed,
@@ -1140,9 +1153,12 @@ class CalendarProposalUseCase:
                 "notification_policy": notification,
                 "notification_policy_user_set": False,
                 "changed_fields": changed_fields,
-                "confirmed_fields": _SHELL_CONFIRMATIONS,
-                "required_confirmations": (),
-                "requires_explicit_confirmation": False,
+                # 恢复是新的受控修改；已有来源/时刻/参会人事实保留，通知策略必须另行确认。
+                "confirmed_fields": tuple(
+                    field for field in _SHELL_CONFIRMATIONS if field != "notification_policy"
+                ),
+                "required_confirmations": ("notification_policy",),
+                "requires_explicit_confirmation": True,
                 "source_event_ids": (source.provider_event_id,),
                 "availability": None,
             }
@@ -1766,6 +1782,39 @@ def _provider_attendees(event: CalendarEvent) -> tuple[str, ...]:
 def _content_json(content: CalendarProposalContent) -> dict[str, JsonValue]:
     """把已验证内容复制为标准 JSON，禁止 ORM/枚举/日期对象渗入仓储。"""
     return cast(dict[str, JsonValue], content.model_dump(mode="json"))
+
+
+def calendar_restore_creation_hash(
+    *,
+    connection_id: UUID,
+    calendar_id: str,
+    target_event_id: str,
+    content: CalendarProposalContent,
+    base_etag: str,
+    source_snapshot_id: UUID,
+) -> str:
+    """复用原规范算法验证恢复准备任务与初始提案的来源绑定。
+
+    Args:
+        connection_id: 本人恢复提案绑定的连接。
+        calendar_id: 精确供应商日历。
+        target_event_id: 精确供应商事件身份，不是本地UUID。
+        content: 已通过AEAD和snapshot哈希的初始desired v1，不能使用后续编辑版本。
+        base_etag: 创建恢复提案时观察到的当前版本。
+        source_snapshot_id: 准备任务严格输入中的原历史before UUID。
+
+    Returns:
+        与现行创建合同完全一致的SHA-256，不建立第二套哈希格式。
+    """
+    return _creation_hash(
+        connection_id=connection_id,
+        calendar_id=calendar_id,
+        operation_kind="restore",
+        target_event_id=target_event_id,
+        content=content,
+        base_etag=base_etag,
+        source_snapshot_id=source_snapshot_id,
+    )
 
 
 def _creation_hash(

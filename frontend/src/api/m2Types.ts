@@ -248,6 +248,17 @@ export interface CalendarAvailability {
   missing_connections: string[]
   attendee_availability_checked: false
 }
+/** 原始修改前快照与本次有界冲突读取分别声明完整性，空列表只代表已执行检查。 */
+export type CalendarEditorFacts = {
+  restore_source: { event_id: string; snapshot_id: string } | null
+} & (
+  | { before_status: 'available'; before: CalendarPreviewFields }
+  | { before_status: 'not_applicable' | 'unavailable'; before: null }
+) &
+  (
+    | { conflict_status: 'incomplete'; conflicts: null }
+    | { conflict_status: 'checked'; conflicts: CalendarConflictPreview[] }
+  )
 /** 未确认 shell 的内容可空，但版本、状态与待确认枚举仍必须存在。 */
 export interface CalendarProposal {
   id: string
@@ -273,6 +284,7 @@ export interface CalendarProposal {
   required_confirmations: CalendarConfirmation[]
   retain_until: string
   availability: CalendarAvailability | null
+  editor_facts: CalendarEditorFacts | null
 }
 export interface AcceptedActionTask {
   task_id: string

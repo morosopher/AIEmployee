@@ -34,6 +34,8 @@ class TaskSnapshot:
     error_code: str | None
     event_cursor: int
     steps: tuple[TaskStepSnapshot, ...]
+    # 仅成功恢复准备任务可公开已验证的本人提案UUID，绝不传播任意result_payload。
+    calendar_restore_proposal_id: UUID | None = None
 
 
 class TaskViewStore(Protocol):

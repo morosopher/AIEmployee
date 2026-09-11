@@ -4,7 +4,8 @@
 import { calendarOperations } from './calendar'
 import { actionProviders } from './connections'
 import { mailModes } from './mail'
-import type { ApprovalPreview, CalendarPreviewFields } from './types'
+import type { ApprovalPreview } from './types'
+import { parseCalendarFields, parseCalendarConflict } from './calendarFields'
 import * as v from './validation'
 
 /**
@@ -41,50 +42,12 @@ export function parseApprovalPreview(value: unknown): ApprovalPreview {
     operation: v.enumeration(o.operation, calendarOperations),
     before: v.nullable(o.before, parseCalendarFields),
     after: parseCalendarFields(o.after),
-    conflicts: v.array(o.conflicts, (item) => {
-      const conflict = v.record(item)
-      return {
-        kind: v.enumeration(conflict.kind, [
-          'overlap',
-          'outside_working_hours',
-          'partial_sources',
-        ]),
-        starts_at: v.nullable(conflict.starts_at, v.timestamp),
-        ends_at: v.nullable(conflict.ends_at, v.timestamp),
-        missing_connection_ids: v.array(
-          conflict.missing_connection_ids,
-          v.uuid,
-        ),
-      }
-    }),
+    conflicts: v.array(o.conflicts, parseCalendarConflict),
     notification_policy: v.enumeration(o.notification_policy, ['all', 'none']),
     base_etag: v.nullable(o.base_etag, v.text),
     compensation_available: v.boolean(o.compensation_available),
     provider_warnings: v.array(o.provider_warnings, (warning) =>
       v.enumeration(warning, ['google_send_updates_none_external_sync']),
     ),
-  }
-}
-
-/** 全天日期原样保留，定时时刻必须携带 offset；展示层不得猜测时区。 */
-function parseCalendarFields(value: unknown): CalendarPreviewFields {
-  const o = v.record(value)
-  const all_day = v.boolean(o.all_day)
-  const temporal = (value: unknown): string => {
-    if (!all_day) return v.timestamp(value)
-    const date = v.text(value)
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date))
-      throw new Error('Invalid all-day date')
-    return date
-  }
-  return {
-    title: v.text(o.title),
-    description: v.nullable(o.description, v.text),
-    location: v.nullable(o.location, v.text),
-    starts_at: temporal(o.starts_at),
-    ends_at: temporal(o.ends_at),
-    timezone: v.text(o.timezone),
-    all_day,
-    attendees: v.array(o.attendees, v.text),
   }
 }

@@ -469,7 +469,16 @@ async def test_calendar_crud_replay_suggestions_and_no_store_contract(
     assert listed.status_code == fetched.status_code == 200
     assert listed.headers["Cache-Control"] == fetched.headers["Cache-Control"] == "no-store"
     assert [item["id"] for item in listed.json()["items"]] == [proposal_id]
-    assert fetched.json() == created.json()
+    # mutation 只返回持久化提案；GET 另在短读事务结束后计算编辑器事实。
+    created_payload = created.json()
+    fetched_payload = fetched.json()
+    assert created_payload.pop("editor_facts") is None
+    editor_facts = fetched_payload.pop("editor_facts")
+    assert editor_facts["before_status"] == "not_applicable"
+    assert editor_facts["before"] is None
+    assert editor_facts["conflict_status"] == "checked"
+    assert isinstance(editor_facts["conflicts"], list)
+    assert fetched_payload == created_payload
     assert other_fetched.status_code == 404
     assert other_fetched.json()["error_code"] == "calendar_proposal_not_found"
 

@@ -64,6 +64,8 @@ from ai_employee.infrastructure.observability.metrics import (
 )
 from ai_employee.infrastructure.observability.sync import refresh_sync_age_metrics
 from ai_employee.infrastructure.observability.tracing import initialize_tracing
+from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.infrastructure.security.passwords import PasswordHasher
 from ai_employee.infrastructure.security.tokens import hash_token, new_token
 from ai_employee.integrations.registry import build_trusted_action_registry
@@ -156,7 +158,16 @@ def create_app(
     app.state.trusted_action_preflight_registry = build_trusted_action_registry(
         session_factory=session_factory, settings=settings
     )
-    task_store = SqlAlchemyTaskViewStore(session_factory)
+
+    def restore_result_cipher() -> ActionPayloadCipher:
+        """只在合格恢复结果读取时解密初始v1；应用启动和普通任务不提前读取Secret。"""
+        return ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file))
+
+    task_store = SqlAlchemyTaskViewStore(
+        session_factory,
+        restore_cipher_factory=restore_result_cipher,
+        clock=lambda: app.state.auth_clock.now(),
+    )
     app.state.create_task_use_case = CreateTaskUseCase(
         SqlAlchemyTaskRepositoryFactory(session_factory),
         PostgresQueuedTaskDispatcher(session_factory),

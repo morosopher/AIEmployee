@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { nextTick, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import ActionDetail from '@/components/ActionDetail.vue'
+import EditorRecovery from '@/components/EditorRecovery.vue'
 import { useActionCenter } from '@/composables/useActionCenter'
+import { useLocalActionCreation } from '@/features/actions/useLocalActionCreation'
 import {
   actionLabel,
   actionStatusLabel,
@@ -25,6 +28,12 @@ const {
   closeDetail,
   changePage,
 } = useActionCenter()
+const {
+  busy: creating,
+  error: creationError,
+  newMail,
+  newCalendar,
+} = useLocalActionCreation()
 const detailRegion = ref<HTMLElement | null>(null)
 let selectionTrigger: HTMLElement | null = null
 const connectionLabels = {
@@ -75,6 +84,34 @@ async function closeSelected(): Promise<void> {
         刷新操作
       </button>
     </header>
+    <div class="creation-controls">
+      <button
+        type="button"
+        name="new-mail"
+        :disabled="creating"
+        @click="newMail"
+      >
+        新邮件
+      </button><button
+        type="button"
+        name="new-calendar"
+        :disabled="creating"
+        @click="newCalendar"
+      >
+        新日程
+      </button>
+    </div>
+    <p
+      v-if="creating"
+      role="status"
+    >
+      正在创建本地编辑对象…
+    </p>
+    <EditorRecovery
+      :error="creationError"
+      :busy="creating"
+      @reload="refresh"
+    />
     <div class="action-layout">
       <div class="action-list-region">
         <form
@@ -204,12 +241,17 @@ async function closeSelected(): Promise<void> {
                 >
                   查看详情
                 </button>
-                <span
+                <RouterLink
                   v-else
                   class="local-status"
-                >{{
-                  item.item_kind === 'mail_draft' ? '本地草稿' : '本地提案'
-                }}</span>
+                  :to="item.editor_url"
+                >
+                  {{
+                    item.item_kind === 'mail_draft'
+                      ? '编辑本地草稿'
+                      : '编辑本地提案'
+                  }}
+                </RouterLink>
               </li>
             </ul>
             <p
@@ -297,6 +339,12 @@ async function closeSelected(): Promise<void> {
 </template>
 
 <style scoped>
+.creation-controls {
+  display: flex;
+  gap: 0.75rem;
+  margin: 1rem 0;
+  flex-wrap: wrap;
+}
 .actions-page {
   color: #1e293b;
   min-width: 0;

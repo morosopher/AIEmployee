@@ -24,7 +24,8 @@ vi.mock('@/composables/useTaskEvents', () => ({
 }))
 const route = reactive({ query: { task_id: 'task-1' as string } })
 
-vi.mock('vue-router', () => ({
+vi.mock('vue-router', async (original) => ({
+  ...(await original<typeof import('vue-router')>()),
   useRoute: () => route,
   useRouter: () => ({ replace: vi.fn() }),
 }))
@@ -60,6 +61,38 @@ describe('TasksPage', () => {
     api.cancelTask.mockReset()
     api.getTask.mockReset()
     api.retryTask.mockReset()
+  })
+
+  it('opens only the authoritative successful restore result after a refreshed task snapshot', async () => {
+    const proposalId = '00000000-0000-0000-0000-000000000502'
+    api.getTask.mockResolvedValue({ ...queuedSnapshot, kind: 'calendar.restore.prepare' })
+    const wrapper = mount(TasksPage, { global: {
+      plugins: [createPinia()],
+      stubs: { RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' } },
+    } })
+    await flushPromises()
+    expect(wrapper.find('a[data-testid="restore-result"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('准备完成后仍需核对并提交新的审批')
+    useTasksStore().setTask({
+      ...queuedSnapshot, kind: 'calendar.restore.prepare', status: 'succeeded',
+      event_cursor: '12', calendar_restore_proposal_id: proposalId,
+    })
+    await flushPromises()
+    expect(wrapper.get('a[data-testid="restore-result"]').attributes('href')).toBe(`/calendar/proposals/${proposalId}`)
+    wrapper.unmount()
+
+    // 刷新后只依赖任务GET返回的持久结果，不在浏览器持久化提案内容或标识映射。
+    api.getTask.mockResolvedValue({
+      ...queuedSnapshot, kind: 'calendar.restore.prepare', status: 'succeeded',
+      event_cursor: '12', calendar_restore_proposal_id: proposalId,
+    })
+    const refreshed = mount(TasksPage, { global: {
+      plugins: [createPinia()],
+      stubs: { RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' } },
+    } })
+    await flushPromises()
+    expect(refreshed.get('a[data-testid="restore-result"]').attributes('href')).toBe(`/calendar/proposals/${proposalId}`)
+    refreshed.unmount()
   })
 
   it('does not let an initial REST snapshot overwrite a newer SSE projection', async () => {

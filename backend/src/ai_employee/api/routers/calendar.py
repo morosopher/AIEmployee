@@ -16,12 +16,17 @@ from ai_employee.api.deps import (
     CurrentSession,
     get_auth_clock,
     get_calendar_availability_use_case,
+    get_calendar_editor_use_case,
     get_calendar_proposal_use_case,
     get_calendar_restore_enqueue_use_case,
     get_submit_calendar_proposal_use_case,
 )
 from ai_employee.application.commands import parse_strict_rfc3339_datetime
 from ai_employee.application.use_cases.auth import Clock
+from ai_employee.application.use_cases.calendar_editor import (
+    CalendarEditorFacts,
+    CalendarEditorUseCase,
+)
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarProposalNotFoundError,
     CalendarProposalUseCase,
@@ -192,10 +197,50 @@ class CreateUpdateProposalRequest(_StrictCalendarTemporalModel):
         return self
 
 
-type CreateProposalRequest = Annotated[
-    CreateEventProposalRequest | CreateUpdateProposalRequest,
-    Field(discriminator="operation_kind"),
-]
+class CreateProposalShellRequest(_StrictCalendarModel):
+    """显式创建默认目标的未确认 shell，不接受可被误认为已审阅的字段。"""
+
+    operation_kind: Literal["create"]
+    initialization: Literal["shell"]
+
+
+class UpdateProposalShellRequest(_StrictCalendarModel):
+    """从本人本地事件绑定 update shell；空 diff 禁止直接提交。"""
+
+    operation_kind: Literal["update"]
+    initialization: Literal["shell"]
+    event_id: UUID
+
+
+type CreateProposalRequest = (
+    CreateEventProposalRequest
+    | CreateUpdateProposalRequest
+    | CreateProposalShellRequest
+    | UpdateProposalShellRequest
+)
+
+
+class CalendarTargetConfirmation(_StrictCalendarModel):
+    """确认精确连接和日历；create 可重选，update/restore 保持来源。"""
+
+    kind: Literal["calendar"]
+    connection_id: UUID
+    calendar_id: str = Field(min_length=1, max_length=512)
+
+
+class CalendarValueConfirmation(_StrictCalendarModel):
+    """逐项确认当前已保存值，不接受任何顺带编辑字段。"""
+
+    kind: Literal["time", "attendees", "notification_policy"]
+
+
+class ConfirmProposalRequest(_StrictCalendarModel):
+    """与普通编辑互斥的版本化显式确认请求。"""
+
+    version: int = Field(ge=1, strict=True)
+    confirmation: Annotated[
+        CalendarTargetConfirmation | CalendarValueConfirmation, Field(discriminator="kind")
+    ]
 
 
 class UpdateProposalRequest(_StrictCalendarTemporalModel):
@@ -326,6 +371,7 @@ class CalendarProposalResponse(_StrictCalendarModel):
     required_confirmations: list[str]
     retain_until: datetime
     availability: SuggestTimesResponse | None
+    editor_facts: CalendarEditorFacts | None = None
 
 
 class CalendarProposalListResponse(_StrictCalendarModel):
@@ -456,7 +502,9 @@ def _set_no_store(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
 
 
-def _proposal_response(value: CalendarProposalView) -> CalendarProposalResponse:
+def _proposal_response(
+    value: CalendarProposalView, *, editor_facts: CalendarEditorFacts | None = None
+) -> CalendarProposalResponse:
     """显式白名单投影应用视图，并把缓存候选转换为公共 Schema。"""
     availability = value.content.availability
     availability_response = None
@@ -502,6 +550,7 @@ def _proposal_response(value: CalendarProposalView) -> CalendarProposalResponse:
         required_confirmations=list(value.content.required_confirmations),
         retain_until=value.retain_until,
         availability=availability_response,
+        editor_facts=editor_facts,
     )
 
 
@@ -553,7 +602,11 @@ def build_calendar_router() -> APIRouter:
         """幂等创建本地 create/update 提案，绝不写供应商日历。"""
         _set_no_store(response)
         try:
-            if isinstance(payload, CreateEventProposalRequest):
+            if isinstance(payload, CreateProposalShellRequest):
+                value = await use_case.create_shell(
+                    user_id=authenticated.user.id, idempotency_key=idempotency_key
+                )
+            elif isinstance(payload, CreateEventProposalRequest):
                 values = _changes(
                     payload,
                     excluded={"operation_kind", "connection_id", "calendar_id"},
@@ -572,7 +625,7 @@ def build_calendar_router() -> APIRouter:
                     idempotency_key=idempotency_key,
                     changes=_changes(
                         payload,
-                        excluded={"operation_kind", "event_id"},
+                        excluded={"operation_kind", "event_id", "initialization"},
                     ),
                 )
         except CalendarProposalNotFoundError:
@@ -591,23 +644,23 @@ def build_calendar_router() -> APIRouter:
         proposal_id: UUID,
         authenticated: CurrentSession,
         response: Response,
-        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
+        use_case: Annotated[CalendarEditorUseCase, Depends(get_calendar_editor_use_case)],
     ) -> CalendarProposalResponse:
         """读取当前用户拥有的当前提案版本。"""
         _set_no_store(response)
         try:
-            value = await use_case.get(
+            value, facts = await use_case.get(
                 user_id=authenticated.user.id,
                 proposal_id=proposal_id,
             )
         except CalendarProposalNotFoundError:
             raise _missing_proposal() from None
-        return _proposal_response(value)
+        return _proposal_response(value, editor_facts=facts)
 
     @router.patch("/proposals/{proposal_id}", response_model=CalendarProposalResponse)
     async def update_calendar_proposal(
         proposal_id: UUID,
-        payload: UpdateProposalRequest,
+        payload: UpdateProposalRequest | ConfirmProposalRequest,
         authenticated: CsrfProtectedSession,
         response: Response,
         use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
@@ -615,12 +668,27 @@ def build_calendar_router() -> APIRouter:
         """以版本 CAS 保存下一不可变 desired snapshot。"""
         _set_no_store(response)
         try:
-            value = await use_case.edit(
-                user_id=authenticated.user.id,
-                proposal_id=proposal_id,
-                expected_version=payload.version,
-                changes=_changes(payload, excluded={"version"}),
-            )
+            if isinstance(payload, ConfirmProposalRequest):
+                confirmation = payload.confirmation
+                value = await use_case.confirm(
+                    user_id=authenticated.user.id,
+                    proposal_id=proposal_id,
+                    expected_version=payload.version,
+                    confirmation=confirmation.kind,
+                    connection_id=confirmation.connection_id
+                    if isinstance(confirmation, CalendarTargetConfirmation)
+                    else None,
+                    calendar_id=confirmation.calendar_id
+                    if isinstance(confirmation, CalendarTargetConfirmation)
+                    else None,
+                )
+            else:
+                value = await use_case.edit(
+                    user_id=authenticated.user.id,
+                    proposal_id=proposal_id,
+                    expected_version=payload.version,
+                    changes=_changes(payload, excluded={"version"}),
+                )
         except CalendarProposalNotFoundError:
             raise _missing_proposal() from None
         except (TypeError, ValueError):

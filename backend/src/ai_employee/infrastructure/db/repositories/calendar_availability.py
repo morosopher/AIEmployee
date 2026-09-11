@@ -1,13 +1,28 @@
 """以两次短事务持久化本人日历可用性建议。"""
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, date, datetime, time
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
+from cryptography.exceptions import InvalidTag
+from pydantic import ValidationError
+from sqlalchemy import select
+
+from ai_employee.application.use_cases.calendar_editor import (
+    BeforeStatus,
+    CalendarEditorRead,
+    editor_calendar_fields,
+)
 from ai_employee.application.use_cases.calendar_proposals import (
     CalendarAvailabilityRead,
+    CalendarProposalContent,
     CalendarProposalSnapshot,
+    CalendarProposalUseCase,
 )
+from ai_employee.domain.actions import CalendarProposalStatus
+from ai_employee.domain.errors import StateConflictError
+from ai_employee.infrastructure.db.models.sources import CalendarEventModel
 from ai_employee.infrastructure.db.repositories.calendar import (
     SqlAlchemyCalendarSyncRepository,
 )
@@ -40,6 +55,88 @@ class SqlAlchemyCalendarAvailabilityRepository:
         self._session_factory = session_factory
         self._action_cipher = action_cipher
 
+    async def load_editor(
+        self, *, user_id: UUID, proposal_id: UUID, observed_at: datetime
+    ) -> CalendarEditorRead | None:
+        """在单次本人短读中获取原 before 和完整编辑区间，不使用当前事件替代历史。
+
+        同时返回上下文 DTO；冲突算法由应用层在本方法退出、事务释放后执行。
+        未完整输入不读取冲突上下文，避免把空数组误认为无冲突。
+        """
+        async with self._session_factory.begin() as session:
+            repository = SqlAlchemyCalendarProposalRepository(session, self._action_cipher)
+            source = SqlAlchemyCalendarSyncRepository(session)
+            proposal = await CalendarProposalUseCase(
+                proposals=repository, calendar=source, clock=lambda: observed_at
+            ).get(user_id=user_id, proposal_id=proposal_id)
+            before = None
+            before_status: BeforeStatus = (
+                "not_applicable" if proposal.operation_kind == "create" else "unavailable"
+            )
+            if proposal.operation_kind != "create" and proposal.before_snapshot_id is not None:
+                try:
+                    snapshot = await repository.load_snapshot(
+                        user_id=user_id, snapshot_id=proposal.before_snapshot_id
+                    )
+                    if (
+                        snapshot is not None
+                        and snapshot.proposal_id == proposal_id
+                        and snapshot.snapshot_kind == "before"
+                    ):
+                        before = editor_calendar_fields(
+                            CalendarProposalContent.model_validate(snapshot.content)
+                        )
+                        if before is not None:
+                            before_status = "available"
+                except (InvalidTag, ValidationError, ValueError):
+                    before = None
+                except StateConflictError as error:
+                    if error.error_code != "calendar_snapshot_unavailable":
+                        raise
+            context = None
+            fields = editor_calendar_fields(proposal.content)
+            if fields is not None:
+                zone = ZoneInfo(fields.timezone)
+                start = (
+                    datetime.combine(date.fromisoformat(fields.starts_at), time(), zone)
+                    if fields.all_day
+                    else datetime.fromisoformat(fields.starts_at)
+                )
+                end = (
+                    datetime.combine(date.fromisoformat(fields.ends_at), time(), zone)
+                    if fields.all_day
+                    else datetime.fromisoformat(fields.ends_at)
+                )
+                target_event_id = None
+                if proposal.operation_kind != "create":
+                    target_event_id = await session.scalar(
+                        select(CalendarEventModel.id).where(
+                            CalendarEventModel.user_id == user_id,
+                            CalendarEventModel.connection_id == proposal.connection_id,
+                            CalendarEventModel.calendar_id == proposal.calendar_id,
+                            CalendarEventModel.provider_event_id == proposal.target_event_id,
+                        )
+                    )
+                context = await source.get_availability_context(
+                    user_id=user_id,
+                    observed_at=observed_at,
+                    search_start=start,
+                    horizon_days=(end.astimezone(UTC) - start.astimezone(UTC)).days + 1,
+                    excluded_event_id=target_event_id,
+                )
+            restore_projection = None
+            if (
+                proposal.operation_kind == "update"
+                and proposal.status is CalendarProposalStatus.APPLIED
+                and before_status == "available"
+                and proposal.before_snapshot_id is not None
+            ):
+                # 复用入队的本人来源读取；短事务内仅锁定现有事实，不访问供应商或创建任务。
+                restore_projection = await repository.get_restore_source_projection(
+                    user_id=user_id, source_snapshot_id=proposal.before_snapshot_id
+                )
+            return CalendarEditorRead(proposal, before, before_status, context, restore_projection)
+
     async def load_suggestion(
         self,
         *,
@@ -61,9 +158,7 @@ class SqlAlchemyCalendarAvailabilityRepository:
             ).get_current(user_id=user_id, proposal_id=proposal_id)
             if proposal is None:
                 return None
-            context = await SqlAlchemyCalendarSyncRepository(
-                session
-            ).get_availability_context(
+            context = await SqlAlchemyCalendarSyncRepository(session).get_availability_context(
                 user_id=user_id,
                 observed_at=observed_at,
                 search_start=search_start,

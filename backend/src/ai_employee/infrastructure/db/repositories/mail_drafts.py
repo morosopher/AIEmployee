@@ -31,6 +31,9 @@ from ai_employee.infrastructure.db.models.sources import (
     ConnectionCapabilityModel,
     OAuthConnectionModel,
 )
+from ai_employee.infrastructure.db.repositories.historical_action_bindings import (
+    preserve_historical_action_bindings,
+)
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
@@ -407,6 +410,7 @@ class SqlAlchemyMailDraftRepository:
         prompt_version: str | None,
         model_name: str | None,
         retain_until: datetime,
+        connection_id: UUID | None = None,
     ) -> MailDraftSnapshot | None:
         """以父行单语句 CAS 认领下一版本，再写入一条不可变加密内容事实。
 
@@ -423,6 +427,7 @@ class SqlAlchemyMailDraftRepository:
             prompt_version: 可选 Prompt 版本。
             model_name: 可选模型名称。
             retain_until: 从本次成功编辑重新计算的正文保留截止时间。
+            connection_id: 新邮件的显式账户选择；同一 CAS 同时更新账户和版本。
 
         Returns:
             保存成功后的当前快照；草稿不存在或跨用户时返回 ``None``。
@@ -432,6 +437,37 @@ class SqlAlchemyMailDraftRepository:
         """
         if type(expected_version) is not int or expected_version <= 0:
             raise ValueError("expected_version must be a positive integer")
+        original_connection_id = None
+        if connection_id is not None:
+            # 先锁父行，确保所有历史验证与下一条不可变版本属于同一次 CAS 事务。
+            current = await self._session.scalar(
+                select(MailDraftModel)
+                .where(MailDraftModel.id == draft_id, MailDraftModel.user_id == user_id)
+                .with_for_update()
+            )
+            if current is None:
+                return None
+            if current.current_version != expected_version:
+                raise _draft_version_conflict()
+            if (
+                current.mode != MailMode.NEW.value
+                or current.status != MailDraftStatus.EDITING.value
+            ):
+                raise StateConflictError(
+                    error_code="mail_draft_not_editable",
+                    message="mail draft binding is not editable",
+                )
+            original_connection_id = current.connection_id
+            if original_connection_id != connection_id:
+                await preserve_historical_action_bindings(
+                    self._session,
+                    self._cipher,
+                    user_id=user_id,
+                    proposal_kind="mail_draft",
+                    proposal_id=draft_id,
+                    original_connection_id=original_connection_id,
+                    original_version=expected_version,
+                )
         next_version = expected_version + 1
         normalized_retain_until = _as_utc(retain_until)
         encrypted_body = self._encrypt_body(
@@ -465,6 +501,7 @@ class SqlAlchemyMailDraftRepository:
             .values(
                 current_version=next_version,
                 retain_until=normalized_retain_until,
+                **({"connection_id": connection_id} if connection_id is not None else {}),
             )
             .returning(MailDraftModel.id)
         )

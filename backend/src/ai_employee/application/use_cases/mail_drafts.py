@@ -234,6 +234,7 @@ class UpdateMailDraftInput(BaseModel):
     expected_version: int = Field(
         ge=1, validation_alias=AliasChoices("expected_version", "version")
     )
+    connection_id: UUID | None = None
     to_recipients: tuple[str, ...] | None = Field(
         default=None, validation_alias=AliasChoices("to_recipients", "to")
     )
@@ -245,6 +246,14 @@ class UpdateMailDraftInput(BaseModel):
     )
     subject: str | None = Field(default=None, max_length=255)
     body_text: str | None = Field(default=None, max_length=100_000)
+
+    @field_validator("connection_id")
+    @classmethod
+    def explicit_connection_is_not_null(cls, value: UUID | None) -> UUID:
+        """内部调用同样区分省略与显式空账户，不让 Worker 绕过 HTTP 约束。"""
+        if value is None:
+            raise ValueError("connection_id cannot be null")
+        return value
 
     @field_validator("subject")
     @classmethod
@@ -333,6 +342,7 @@ class MailDraftRepository(Protocol):
         prompt_version: str | None,
         model_name: str | None,
         retain_until: datetime,
+        connection_id: UUID | None = None,
     ) -> MailDraftSnapshot | None:
         """以 ``expected_version`` CAS 保存下一不可变版本。"""
         ...
@@ -623,8 +633,17 @@ class MailDraftUseCase:
             raise MailDraftNotFoundError
         current = _snapshot_to_view(current_raw)
         _ensure_editable(current.status)
-        if current.mode is not MailMode.NEW and "subject" in request.model_fields_set:
+        if current.mode is not MailMode.NEW and {"subject", "connection_id"}.intersection(
+            request.model_fields_set
+        ):
             raise _binding_immutable()
+        if request.connection_id is not None:
+            await self._require_send_connection(
+                user_id=request.user_id,
+                connection=await self._connections.get_connection(
+                    user_id=request.user_id, connection_id=request.connection_id
+                ),
+            )
 
         to, cc, bcc = _normalize_and_limit_recipients(
             request.to_recipients if request.to_recipients is not None else current.to_recipients,
@@ -654,6 +673,7 @@ class MailDraftUseCase:
             prompt_version=prompt_version,
             model_name=model_name,
             retain_until=retain_until,
+            connection_id=request.connection_id,
         )
         if saved is None:
             raise MailDraftNotFoundError

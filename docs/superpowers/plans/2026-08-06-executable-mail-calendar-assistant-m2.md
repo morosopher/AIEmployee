@@ -8280,6 +8280,34 @@ git commit -m "feat: add frontend action center"
 
 ### Task 29: Build mail/calendar editors, structured approvals, needs-attention, connections, and settings UI
 
+**已批准的接口衔接（2026-09-12）：** 先按规格 3.3/15.1/15.2 同步严格请求和投影，再做真实
+API/数据库 RED→GREEN。既有 POST 新增明确 create/source-update shell 变体；既有 PATCH 将
+逐项 confirmation 与普通字段编辑设为互斥输入，保留版本 CAS 和 readiness。新邮件 PATCH
+显式账户切换复用原 CAS，回复保持绑定。编辑 GET 的 typed `editor_facts` 从原 before 和
+有界本人日历读取，在短事务外计算冲突，未完整输入明确 incomplete。
+
+历史账户索引复用 TaskStep.input_summary 的严格 `trusted_action_step.v1` 投影，保留原
+action/proposal_version；不新增 migration，不改变0018/0019、ACL、备份、TaskRun双ID或
+ApprovalRequest marker。新 submission 从已验证命令写入冻结 connection；首次重绑在同一
+事务验证并升级全部精确 legacy，已清除且无法证明旧绑定时409并给明确新建恢复。覆盖
+完整/清除历史、错误摘要、跨用户、双供应商筛选、分页和详情一致性，SQL 不依赖条件求值顺序
+保护非法 cast。真实执行继续只以原 AEAD/hash/审批为权威。
+
+接口补足涉及 mail/calendar 路由与用例、原 Repository、typed submission/步骤摘要、小型
+历史绑定 helper、frontend API 类型/解析及其真实 HTTP/DB 回归。UI 组合可使用专门 feature、
+composable 和小组件；Brief 使用真实来源和稳定 intent，Chat 同时接通生产 API 相对 Markdown
+链接与 action editor_url，不自动提交审批。关键流程补充浏览器验证，本轮提交前执行 just check。
+候选查询按既有 API 保存新版本的契约重取完整提案；回执后的读取失败必须锁定旧版本。
+
+恢复入口按规格 10.4/13.5/15.2 复用既有异步准备流程：editor_facts 仅投影已应用 update
+的合格本地 event/snapshot 来源，显式点击按202任务回执进入现有任务页；Task REST/SSE
+仅增加受限的 calendar_restore_proposal_id 结果投影，成功后打开精准 restore 编辑器并
+另行确认、审批。覆盖真实来源GET→202→任务结果、用户/意图绑定、刷新与浏览器入口，
+不得新增任务种类、供应商写请求或同步外部读取。
+恢复结果绑定复用初始 desired v1 AEAD 与既有创建哈希，严格验证原 source_snapshot 和
+creation key；缺失或篡改时返回null。恢复新提案仅通知策略待显式确认，先证明确认前提交
+被拒绝；覆盖同事件另一before、错误kind/status/marker、跨用户、错误意图及GET/SSE一致。
+
 **Files:**
 - Create: `frontend/src/pages/MailDraftPage.vue`
 - Create: `frontend/src/pages/CalendarProposalPage.vue`

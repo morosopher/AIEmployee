@@ -1230,6 +1230,7 @@ class SubmitMailDraftUseCase:
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             action=action,
+            frozen_connection_id=command.connection_id,
             schema_version=schema_version,
             risk_level=risk_level,
             proposal_kind=proposal_kind,

@@ -58,6 +58,7 @@ class TaskResponse(BaseModel):
     error_code: str | None
     event_cursor: str
     steps: list[StepResponse]
+    calendar_restore_proposal_id: UUID | None = None
 
 
 class CreateTaskResponse(BaseModel):
@@ -76,6 +77,7 @@ def _task_response(snapshot: TaskSnapshot) -> TaskResponse:
         retry_of_task_id=snapshot.retry_of_task_id,
         error_code=snapshot.error_code,
         event_cursor=str(snapshot.event_cursor),
+        calendar_restore_proposal_id=snapshot.calendar_restore_proposal_id,
         steps=[
             StepResponse(
                 id=item.id,
@@ -181,7 +183,9 @@ def build_tasks_router() -> APIRouter:
         request: Request,
         authenticated: CurrentSession,
         use_case: Annotated[GetTaskUseCase, Depends(get_get_task_use_case)],
-        query_last_event_id: Annotated[str | None, Query(alias="last_event_id", max_length=20)] = None,
+        query_last_event_id: Annotated[
+            str | None, Query(alias="last_event_id", max_length=20)
+        ] = None,
     ):
         """建立事件流；认证后先验证任务存在，避免跨用户订阅。"""
         if await use_case.execute(task_id=task_id, user_id=authenticated.user.id) is None:

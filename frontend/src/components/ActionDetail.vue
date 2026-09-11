@@ -1,6 +1,10 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, toRef } from 'vue'
+import { RouterLink } from 'vue-router'
 import type { ActionSnapshot } from '@/api/types'
+import { useActionControls } from '@/features/actions/useActionControls'
+import ApprovalCard from './ApprovalCard.vue'
+import NeedsAttentionPanel from './NeedsAttentionPanel.vue'
 import {
   actionEventLabel,
   actionLabel,
@@ -10,12 +14,26 @@ import {
   safeProviderUrl,
 } from '@/features/actions/presentation'
 
-/** 只读详情只接收已验证快照；审批和编辑交互由专用组件负责。 */
+/** 详情只接收已验证快照；专用组件明确触发审批或核对，所有回执随后重新读取。 */
 interface Props {
   snapshot: ActionSnapshot
   timezone: string
 }
 const props = defineProps<Props>()
+const emit = defineEmits<{ changed: [] }>()
+const { busy, error, refresh, decide, reconcile, resolve, withdraw } =
+  useActionControls(toRef(props, 'snapshot'), () => emit('changed'))
+const editorUrl = computed(() =>
+  props.snapshot.local_action
+    ? `${props.snapshot.local_action.editor_url}?task=${props.snapshot.task_id}`
+    : undefined,
+)
+const canWithdraw = computed(
+  () =>
+    props.snapshot.approval?.status === 'pending' &&
+    !props.snapshot.execution &&
+    ['created', 'queued', 'waiting_approval'].includes(props.snapshot.status),
+)
 const providerUrl = computed(() =>
   safeProviderUrl(props.snapshot.provider_url, props.snapshot.provider),
 )
@@ -103,6 +121,49 @@ const approvalLabels = {
           : '确认未执行'
       }}。该记录不会自动重新发送或修改日程。
     </p>
+    <RouterLink
+      v-if="editorUrl"
+      :to="editorUrl"
+    >
+      打开{{
+        snapshot.local_action?.item_kind === 'mail_draft'
+          ? '邮件草稿'
+          : '日程提案'
+      }}
+    </RouterLink>
+    <ApprovalCard
+      v-if="snapshot.approval"
+      :approval="snapshot.approval"
+      :decide="decide"
+      :reload="() => refresh()"
+      :editor-url="editorUrl"
+      :timezone="timezone"
+      :locked="busy"
+    />
+    <button
+      v-if="canWithdraw"
+      type="button"
+      name="withdraw-action"
+      :disabled="busy"
+      @click="withdraw"
+    >
+      撤回审批以继续编辑
+    </button>
+    <p
+      v-if="error"
+      role="alert"
+    >
+      {{ error.message
+      }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
+    </p>
+    <NeedsAttentionPanel
+      v-if="snapshot.status === 'needs_attention'"
+      :snapshot="snapshot"
+      :reconcile="reconcile"
+      :resolve="resolve"
+      :reload="() => refresh()"
+      :locked="busy"
+    />
     <a
       v-if="providerUrl"
       :href="providerUrl"

@@ -110,6 +110,19 @@ M2 开始实施前应将根 `AGENTS.md`、README 和验收文档中的「当前�
 - 默认连接或默认日历已禁用、断开或失去写权限时，创建操作必须要求用户重新选择；禁止静默
   回退到另一个账户或 primary calendar。
 
+编辑态重选账户必须成为服务端版本 CAS 的持久事实，不能只替换浏览器显示。旧任务的账户与
+日历始终来自冻结绑定；本地对象重选后，历史列表的供应商筛选和详情不得转向新账户。TaskStep
+的 `input_summary` 保存版本化、严格类型化的内容无关历史投影：
+`summary_version="trusted_action_step.v1"`、`action`、`proposal_version`、`frozen_connection_id`。
+该投影只用于显示和筛选，完整密文存在时必须与原命令验证一致，执行权限仍只取自原命令、
+哈希和审批。TaskRun 的双 ID 载荷与 ApprovalRequest 的无敏感 marker 不变。
+
+只含原 `action/proposal_version` 的精确 legacy 摘要仍可读取；首次重绑必须在同一短 CAS 事务
+验证全部关联旧命令并补全投影。未知摘要版本、缺失字段、非法类型或跨用户引用禁止回退到当前
+账户。legacy 密文已清除且无可证明冻结绑定时，原对象重绑返回
+`historical_action_binding_unavailable`，保留原对象并提示用户明确新建草稿/提案；不得猜测、
+取消或修改旧历史。新投影在内容到期后继续支持历史供应商显示和筛选，不额外保留个人内容。
+
 ## 4. 总体架构
 
 M2 延续模块化单体和独立运行单元：
@@ -1052,6 +1065,10 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 | `POST` | `/api/v1/mail/drafts/{id}/generate` | 创建异步模型草拟任务，返回 202 |
 | `POST` | `/api/v1/mail/drafts/{id}/submit` | 冻结当前版本并返回 202 与 task_id |
 
+新邮件的版本化 PATCH 允许显式非空 `connection_id`，在同一 CAS 中校验归属及
+`mail.read/mail.send`、保存新账户并追加不可变内容版本。回复/全部回复禁止该字段；待审批
+对象仍先经已有 `POST /api/v1/tasks/{task_id}/cancel` 撤回，不能由编辑接口自动撤回。
+
 ### 15.2 日程提案 API
 
 | 方法 | 路径 | 行为 |
@@ -1063,7 +1080,50 @@ AEAD 列。加密 AAD 至少绑定 `user_id`、ApprovalRequest ID、action 和 s
 | `DELETE` | `/api/v1/calendar/proposals/{id}` | 取消未执行提案 |
 | `POST` | `/api/v1/calendar/proposals/{id}/suggest-times` | 在短事务外同步计算并返回 200 与确定性候选 |
 | `POST` | `/api/v1/calendar/proposals/{id}/submit` | 冻结当前版本并返回 202 |
-| `POST` | `/api/v1/calendar/events/{id}/restore-proposal` | 从历史快照创建恢复提案 |
+| `POST` | `/api/v1/calendar/events/{id}/restore-proposal` | 从历史快照排队恢复准备任务，返回 202 与持久任务 ID |
+
+完整 create/update 请求保持兼容。显式新建入口可以 POST
+`{operation_kind:"create", initialization:"shell"}`：仅按默认可写日历建立本地 editing
+归属，时间、参会人及通知不视为确认，返回四项待确认。简报事件入口 POST
+`{operation_kind:"update", initialization:"shell", event_id:UUID}`，由本地来源 UUID
+解析真实账户、日历、ETag 和 before；初始 diff 为空，不能提交。两种 shell 变体禁止同时
+携带普通编辑字段；创建请求继续要求稳定 Idempotency-Key，不产生审批或供应商写入。
+
+PATCH 严格区分普通字段编辑与逐项确认，禁止混合。确认请求为
+`{version, confirmation:{kind:"calendar", connection_id:UUID, calendar_id:string}}`，或
+`{version, confirmation:{kind:"time"|"attendees"|"notification_policy"}}`。每次只确认
+当前已保存版本的一项并推进版本；普通保存只能使相关确认失效，不能隐式确认。create shell
+允许显式重选目标，update/restore 继续固定来源账户与日历。提交始终检查完整字段、四项确认、
+当前版本以及 update/restore 的非空 diff；完成编辑、确认和提交审批是独立的用户操作。
+
+GET 提案提供 `editor_facts` 的严格投影：`before` 为原不可变 before 的精确字段（create 为
+null），`before_status` 为 `not_applicable/available/unavailable`；`conflict_status` 为
+`incomplete/checked`，对应 `conflicts` 为 null 或服务端类型化列表。未完整 shell 不能显示
+“已检查无冲突”。读取使用现有按用户隔离、固定有界的 availability 端口与显式时钟，释放
+短事务后复用纯冲突计算；不可用 before 不得由当前事件代替。mutation 响应中的
+`editor_facts` 为 null，
+编辑器保存或确认后重取 GET，并在未保存时间变化时立即废弃旧检查结果。
+
+`editor_facts.restore_source` 为 null 或精确 `{event_id:UUID, snapshot_id:UUID}`。只有本人
+已应用的 update 提案、仍可用的原 before 与本地事件三元身份通过现有恢复来源校验时，才
+提供该入口事实；供应商 `target_event_id` 不能当作本地事件 UUID。该投影不授予执行权限，
+恢复 POST 和 Worker 仍重新校验来源、能力、保留期与供应商当前状态。
+
+已应用修改的编辑页提供显式“准备恢复提案”按钮。点击后只发送上述精确来源和稳定
+Idempotency-Key，按 202 回执进入现有任务页；不得把回执伪装成已创建或已恢复的提案。
+任务 REST/SSE 快照的可空 `calendar_restore_proposal_id` 仅投影本人已成功
+`calendar.restore.prepare` 的精确单键持久结果，且验证目标是同一创建意图的本人 restore
+提案。绑定复用初始 desired v1 的 AEAD 与既有规范 creation hash，验证任务两键输入中的
+`source_snapshot_id/creation_idempotency_key`；当前编辑版本不能替代初始版本，无法证明
+绑定时不退回同用户或同事件的其他提案。其他任务、未成功、异常 marker、跨用户、初始
+密文不可用或目标已清除时均为 null，不公开任意
+`result_payload`。任务页从此结果构造精确编辑器链接，刷新后仍可恢复；用户打开新提案后
+核对当前 before/历史 desired、新 ETag、通知策略，并独立提交新的审批。准备出的恢复
+提案保留其他已有确认事实，仅将 `notification_policy` 标为待显式确认；确认前提交必须拒绝。
+
+候选查询也保存新的不可变提案版本；响应中的 `version` 绑定该新版本。编辑器随后 GET 完整
+提案，只展示其自身版本的候选；更晚 GET 已无候选时不得用旧回执覆盖。新版本已保存而读取
+失败时，必须先重新加载才能继续编辑、确认或提交，不能沿用旧 CAS 或推算确认状态。
 
 ### 15.3 操作与连接 API
 

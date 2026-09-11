@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { cancelTask, getTask, ProblemError, retryTask } from '@/api/client'
 import TaskTimeline from '@/components/TaskTimeline.vue'
 import { useTaskEvents } from '@/composables/useTaskEvents'
 import { cancellableTaskStatuses, useTasksStore } from '@/stores/tasks'
+import { focusedEditorPath } from '@/features/actions/editorLinks'
 
 const route = useRoute()
 const router = useRouter()
@@ -21,6 +22,10 @@ const task = computed(() =>
   taskId.value ? (tasks.tasks[taskId.value] ?? null) : null,
 )
 const connectionState = useTaskEvents(taskId)
+/** 只用受限任务快照构造恢复结果链接，准备回执和临时事件不能伪造完成提案。 */
+const restoreEditorUrl = computed(() => task.value?.kind === 'calendar.restore.prepare' &&
+  task.value.status === 'succeeded' && task.value.calendar_restore_proposal_id
+  ? focusedEditorPath(`/calendar/proposals/${task.value.calendar_restore_proposal_id}`) : null)
 const canCancel = computed(
   () => task.value !== null && cancellableTaskStatuses.has(task.value.status),
 )
@@ -134,6 +139,24 @@ function followReplacement(replacementTaskId: string): void {
         <template v-if="task">
           <h2>{{ task.kind }}</h2>
           <p>当前状态：{{ task.status }}</p>
+          <template v-if="task.kind === 'calendar.restore.prepare'">
+            <p role="status">
+              准备完成后仍需核对并提交新的审批，日程尚未因此恢复。
+            </p>
+            <RouterLink
+              v-if="restoreEditorUrl"
+              :to="restoreEditorUrl"
+              data-testid="restore-result"
+            >
+              打开恢复提案
+            </RouterLink>
+            <p
+              v-else-if="task.status === 'succeeded'"
+              role="alert"
+            >
+              恢复提案结果已不可用，请返回操作中心核对原修改和保留期。
+            </p>
+          </template>
           <button
             v-if="canCancel"
             type="button"

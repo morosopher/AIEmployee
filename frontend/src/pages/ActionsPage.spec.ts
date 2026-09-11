@@ -1,11 +1,16 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ActionsPage from './ActionsPage.vue'
 import {
   actionItems,
   actionSnapshot,
   TASK_ID,
+  DRAFT_ID,
+  PROPOSAL_ID,
+  mailDraft,
+  calendarProposal,
 } from '@/test-support/actionFixtures'
 import { TaskEventSource } from '@/test-support/taskEventSource'
 
@@ -23,13 +28,135 @@ afterEach(() => {
 })
 
 /** 页面边界保留真实客户端和 Store，只有网络与原生 EventSource 使用替身。 */
-function renderPage() {
-  const wrapper = mount(ActionsPage, { global: { plugins: [createPinia()] } })
+async function renderPage(query = '') {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/actions', component: ActionsPage },
+      {
+        path: '/mail/drafts/:draftId',
+        component: { template: '<p>邮件编辑器</p>' },
+      },
+      {
+        path: '/calendar/proposals/:proposalId',
+        component: { template: '<p>日程编辑器</p>' },
+      },
+      { path: '/connections', component: { template: '<p>连接</p>' } },
+    ],
+  })
+  await router.push(`/actions${query}`)
+  const wrapper = mount(ActionsPage, {
+    global: { plugins: [createPinia(), router] },
+  })
   wrappers.push(wrapper)
   return wrapper
 }
 
 describe('ActionsPage', () => {
+  it.each(['mail', 'calendar'] as const)(
+    'creates a local %s object only on explicit click and opens the returned editor',
+    async (kind) => {
+      const fetch = vi.fn(
+        async (_url: string, init?: RequestInit) =>
+          new Response(
+            JSON.stringify(
+              init?.method === 'POST'
+                ? kind === 'mail'
+                  ? mailDraft()
+                  : calendarProposal()
+                : { items: actionItems(), limit: 50, offset: 0 },
+            ),
+          ),
+      )
+      vi.stubGlobal('fetch', fetch)
+      const wrapper = await renderPage()
+      await flushPromises()
+      expect(
+        fetch.mock.calls.filter(([, init]) => init?.method === 'POST'),
+      ).toHaveLength(0)
+      expect(wrapper.find(`a[href="/mail/drafts/${DRAFT_ID}"]`).exists()).toBe(
+        true,
+      )
+      await wrapper.get(`button[name="new-${kind}"]`).trigger('click')
+      await flushPromises()
+      const calls = fetch.mock.calls.filter(
+        ([, init]) => init?.method === 'POST',
+      )
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.[0]).toBe(
+        kind === 'mail' ? '/api/v1/mail/drafts' : '/api/v1/calendar/proposals',
+      )
+      expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual(
+        kind === 'mail'
+          ? { mode: 'new' }
+          : { operation_kind: 'create', initialization: 'shell' },
+      )
+      expect(wrapper.vm.$router.currentRoute.value.path).toBe(
+        kind === 'mail'
+          ? `/mail/drafts/${DRAFT_ID}`
+          : `/calendar/proposals/${PROPOSAL_ID}`,
+      )
+      expect(
+        fetch.mock.calls.some(
+          ([url]) => url.includes('/submit') || url.includes('/decision'),
+        ),
+      ).toBe(false)
+    },
+  )
+
+  it('restores the precise task selected by a submission link', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async (url: string) =>
+          new Response(
+            JSON.stringify(
+              url === '/api/v1/actions'
+                ? { items: [], limit: 50, offset: 0 }
+                : url.startsWith('/api/v1/actions/')
+                  ? actionSnapshot()
+                  : {
+                      id: TASK_ID,
+                      kind: 'trusted_action',
+                      status: 'needs_attention',
+                      retry_of_task_id: null,
+                      error_code: null,
+                      event_cursor: '9007199254740993',
+                      steps: [],
+                    },
+            ),
+          ),
+      ),
+    )
+    const wrapper = await renderPage(`?task=${TASK_ID}`)
+    await flushPromises()
+    expect(wrapper.find('[aria-label="操作详情与时间线"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('先核实供应商中的实际结果')
+  })
+
+  it('reuses the creation intent after transport failure and never automatically retries', async () => {
+    let attempts = 0
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        attempts += 1
+        if (attempts === 1) throw new TypeError('Synthetic transport failure')
+        return new Response(JSON.stringify(mailDraft()))
+      }
+      return new Response(JSON.stringify({ items: [], limit: 50, offset: 0 }))
+    })
+    vi.stubGlobal('fetch', fetch)
+    const wrapper = await renderPage()
+    await flushPromises()
+    await wrapper.get('button[name="new-mail"]').trigger('click')
+    await flushPromises()
+    expect(attempts).toBe(1)
+    await wrapper.get('button[name="new-mail"]').trigger('click')
+    await flushPromises()
+    const calls = fetch.mock.calls.filter(([, init]) => init?.method === 'POST')
+    expect(new Headers(calls[0]?.[1]?.headers).get('Idempotency-Key')).toBe(
+      new Headers(calls[1]?.[1]?.headers).get('Idempotency-Key'),
+    )
+  })
   it('refreshes server actions after focus without persisting sensitive content', async () => {
     let listCalls = 0
     vi.stubGlobal(
@@ -45,7 +172,7 @@ describe('ActionsPage', () => {
         )
       }),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     await flushPromises()
     expect(wrapper.text()).toContain('暂无操作')
     window.dispatchEvent(new Event('focus'))
@@ -69,7 +196,7 @@ describe('ActionsPage', () => {
           }),
       ),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     expect(wrapper.text()).toContain('正在加载操作')
     complete(
       new Response(
@@ -144,7 +271,7 @@ describe('ActionsPage', () => {
           )
         }),
       )
-      const wrapper = renderPage()
+      const wrapper = await renderPage()
       await flushPromises()
       await wrapper.get(`[data-action-id="${TASK_ID}"] button`).trigger('click')
       await flushPromises()
@@ -183,7 +310,7 @@ describe('ActionsPage', () => {
         )
       }),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     await flushPromises()
     for (const label of [
       '邮件草稿',
@@ -210,7 +337,7 @@ describe('ActionsPage', () => {
         return new Response(JSON.stringify({ items: [], limit: 50, offset: 0 }))
       }),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     await flushPromises()
     for (const status of [
       'created',
@@ -272,7 +399,7 @@ describe('ActionsPage', () => {
         )
       }),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     await flushPromises()
     await wrapper.get(`[data-action-id="${TASK_ID}"] button`).trigger('click')
     await flushPromises()
@@ -350,7 +477,7 @@ describe('ActionsPage', () => {
           ),
       ),
     )
-    const wrapper = renderPage()
+    const wrapper = await renderPage()
     await flushPromises()
     await wrapper.get(`[data-action-id="${TASK_ID}"] button`).trigger('click')
     await flushPromises()

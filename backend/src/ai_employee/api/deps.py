@@ -62,6 +62,7 @@ from ai_employee.integrations.google.oauth import (
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 
 if TYPE_CHECKING:
+    from ai_employee.application.use_cases.calendar_editor import CalendarEditorUseCase
     from ai_employee.application.use_cases.calendar_proposals import (
         CalendarProposalUseCase,
         CalendarRestoreEnqueueUseCase,
@@ -531,6 +532,25 @@ async def get_calendar_availability_use_case(
             ),
             clock=get_auth_clock(request).now,
         )
+
+
+def get_calendar_editor_use_case(request: Request) -> "CalendarEditorUseCase":
+    """复用日历短读 adapter；此依赖不持有事务，计算时也不保持请求级事务。"""
+    from ai_employee.application.use_cases.calendar_editor import CalendarEditorUseCase
+    from ai_employee.infrastructure.db.repositories.calendar_availability import (
+        SqlAlchemyCalendarAvailabilityRepository,
+    )
+    from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
+    from ai_employee.infrastructure.security.encryption import AeadCipher
+
+    settings = get_auth_settings(request)
+    return CalendarEditorUseCase(
+        SqlAlchemyCalendarAvailabilityRepository(
+            request.app.state.auth_session_factory,
+            ActionPayloadCipher(AeadCipher.from_file(settings.app_master_key_file)),
+        ),
+        get_auth_clock(request).now,
+    )
 
 
 def get_calendar_restore_enqueue_use_case(

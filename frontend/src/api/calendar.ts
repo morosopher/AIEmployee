@@ -2,6 +2,7 @@
  * 非重复日程提案 REST 边界：解析本地 shell、精确版本和候选完整性。所有写接口经 Cookie/CSRF，创建类请求使用稳定意图；领域冲突、ETag 与批准规则仍由服务端判断。
  */
 import { requestJson } from './client'
+import { parseCalendarEditorFacts } from './calendarFields'
 import { parseAcceptedActionTask } from './mail'
 import { requestCreation, type RequestIntent } from './requestIntent'
 import type {
@@ -52,6 +53,8 @@ export interface CalendarEventInput {
   notification_policy?: 'all' | 'none' | null
 }
 export type CreateCalendarProposalInput =
+  | { operation_kind: 'create'; initialization: 'shell' }
+  | { operation_kind: 'update'; initialization: 'shell'; event_id: string }
   | (CalendarEventInput & {
       operation_kind: 'create'
       connection_id: string
@@ -61,9 +64,17 @@ export type CreateCalendarProposalInput =
       operation_kind: 'update'
       event_id: string
     })
-export type UpdateCalendarProposalInput = Partial<CalendarEventInput> & {
-  version: number
+/** 普通保存与显式确认互斥；来源重选只能通过单独的 calendar 确认完成。 */
+export type CalendarConfirmationInput =
+  | { kind: 'calendar'; connection_id: string; calendar_id: string }
+  | { kind: 'time' | 'attendees' | 'notification_policy' }
+/** 与既有 PATCH 一致，shell 字段可显式清空；确认仍使用互斥的独立变体。 */
+export type CalendarProposalChanges = {
+  [K in keyof CalendarEventInput]?: CalendarEventInput[K] | null
 }
+export type UpdateCalendarProposalInput =
+  | (CalendarProposalChanges & { version: number; confirmation?: never })
+  | { version: number; confirmation: CalendarConfirmationInput }
 
 /**
  * @param value 服务端候选结果。
@@ -106,6 +117,21 @@ export function parseCalendarProposal(value: unknown): CalendarProposal {
       const id = v.uuid(o.id)
       const version = v.integer(o.version, 1)
       const availability = v.nullable(o.availability, parseCalendarAvailability)
+      const editorFacts = v.nullable(o.editor_facts, parseCalendarEditorFacts)
+      if (
+        editorFacts &&
+        (o.operation_kind === 'create') !==
+          (editorFacts.before_status === 'not_applicable')
+      )
+        throw new Error('Invalid before operation binding')
+      if (
+        editorFacts?.restore_source &&
+        (o.operation_kind !== 'update' ||
+          o.status !== 'applied' ||
+          editorFacts.before_status !== 'available' ||
+          editorFacts.restore_source.snapshot_id !== o.before_snapshot_id)
+      )
+        throw new Error('Invalid calendar restore source binding')
       if (
         availability &&
         (availability.proposal_id !== id || availability.version !== version)
@@ -148,6 +174,7 @@ export function parseCalendarProposal(value: unknown): CalendarProposal {
         ),
         retain_until: v.timestamp(o.retain_until),
         availability,
+        editor_facts: editorFacts,
       }
     },
     'Invalid calendar proposal',
@@ -221,7 +248,7 @@ export function cancelCalendarProposal(id: string): Promise<CalendarProposal> {
 /**
  * @param id 提案 ID。
  * @param input 可选当前版本和搜索下界。
- * @returns 确定性候选；不创建任务。
+ * @returns 绑定新提案版本的确定性候选；须重新 GET 完整提案，且不会创建执行任务。
  */
 export function suggestCalendarTimes(
   id: string,
@@ -260,16 +287,16 @@ export function submitCalendarProposal(
  * @param eventId 本地日程 ID。
  * @param snapshotId 精确历史快照。
  * @param intent 稳定意图。
- * @returns 新恢复提案，仍需人工审批。
+ * @returns 恢复准备任务的202回执；准备成功后才能读取新提案，并另行确认、审批。
  */
 export function createRestoreProposal(
   eventId: string,
   snapshotId: string,
   intent: RequestIntent,
-): Promise<CalendarProposal> {
+): Promise<AcceptedActionTask> {
   return requestCreation(
     `/calendar/events/${encodeURIComponent(eventId)}/restore-proposal`,
-    parseCalendarProposal,
+    parseAcceptedActionTask,
     intent,
     JSON.stringify({ snapshot_id: snapshotId }),
   )
