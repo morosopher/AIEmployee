@@ -225,9 +225,19 @@ test('unknown native named event recovers once through id-less heartbeats and ke
   // 两个心跳均在同一读取完成前到达，只合并恢复需求，不发送第二个并行读取。
   releaseTask()
   await expect(page.locator('.action-detail')).toContainText('结果需要核实')
-  await expect.poll(() => listReads).toBe(2)
+  // 初次各读取一次；恢复时先采纳的一侧使另一侧补读，总计恰好五次，不能分别放宽上界。
+  await expect.poll(() => listReads + actionReads).toBe(5)
+  await expect(
+    page.getByRole('button', { name: '刷新操作', exact: true }),
+  ).toBeEnabled()
+  await expect(
+    page.getByText('正在恢复操作快照…', { exact: true }),
+  ).toHaveCount(0)
+  expect([
+    [2, 3],
+    [3, 2],
+  ]).toContainEqual([listReads, actionReads])
   expect(taskReads).toBe(1)
-  expect(actionReads).toBe(2)
   await page.getByRole('button', { name: '关闭操作详情' }).click()
   await page.getByRole('button', { name: '查看发送邮件详情' }).click()
   await expect.poll(() => streamCursors.length).toBe(2)
@@ -360,8 +370,19 @@ test('unknown native event followed by a known nonterminal event recovers throug
     await expect.poll(() => taskReads).toBe(1)
     releaseTask()
     await expect(page.locator('.action-detail')).toContainText('结果需要核实')
-    await expect.poll(() => actionReads).toBe(2)
-    await expect.poll(() => listReads).toBeGreaterThanOrEqual(2)
+    // 两类刷新可能以任一次序完成；先等待真实加载结束，再固定只有一侧补读的精确计数对。
+    await expect.poll(() => listReads + actionReads).toBe(5)
+    await expect(
+      page.getByRole('button', { name: '刷新操作', exact: true }),
+    ).toBeEnabled()
+    await expect(
+      page.getByText('正在恢复操作快照…', { exact: true }),
+    ).toHaveCount(0)
+    const recoveredReads = [listReads, actionReads]
+    expect([
+      [2, 3],
+      [3, 2],
+    ]).toContainEqual(recoveredReads)
     // 权威快照已覆盖 K 后，在仍打开的同一原生流中重复发送 id-less 心跳，不应继续补读。
     stream.write(heartbeat.repeat(3))
     await expect
@@ -372,8 +393,7 @@ test('unknown native event followed by a known nonterminal event recovers throug
         new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
     )
     expect(taskReads).toBe(1)
-    expect(actionReads).toBe(2)
-    expect(listReads).toBeLessThanOrEqual(3)
+    expect([listReads, actionReads]).toEqual(recoveredReads)
     expect(streamRequests).toBe(1)
     expect(
       frames

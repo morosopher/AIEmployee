@@ -206,6 +206,276 @@ describe('server authoritative action state', () => {
     ])
   })
 
+  it.each([
+    { name: 'cached cursor', cached: true, lateCursor: '9007199254740993' },
+    { name: 'first detail', cached: false, lateCursor: '9007199254740993' },
+    { name: 'higher cursor', cached: true, lateCursor: '9007199254740994' },
+  ])(
+    'rereads a late detail after a newer list is accepted ($name)',
+    async ({ cached, lateCursor }) => {
+      let listReads = 0
+      let snapshotReads = 0
+      let finishOldDetail: (response: Response) => void = () => undefined
+      let finishRecovery: (response: Response) => void = () => undefined
+      const delayedRead = cached ? 2 : 1
+      const newerTime = '2030-01-01T00:01:00Z'
+      const newerItem = {
+        ...taskItem('needs_attention'),
+        updated_at: newerTime,
+      }
+      const lateSnapshot = {
+        ...runningSnapshot(),
+        event_cursor: lateCursor,
+        task_version: lateCursor,
+      }
+      const recoveredSnapshot = actionSnapshot({
+        event_cursor: '9007199254740995',
+        task_version: '9007199254740995',
+        updated_at: newerTime,
+      })
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => {
+          if (url === '/api/v1/actions') {
+            listReads += 1
+            return new Response(
+              JSON.stringify({ items: [newerItem], limit: 50, offset: 0 }),
+            )
+          }
+          snapshotReads += 1
+          if (snapshotReads === delayedRead)
+            return new Promise<Response>((resolve) => {
+              finishOldDetail = resolve
+            })
+          if (snapshotReads === delayedRead + 1)
+            return new Promise<Response>((resolve) => {
+              finishRecovery = resolve
+            })
+          if (cached && snapshotReads === 1)
+            return new Response(JSON.stringify(runningSnapshot()))
+          throw new Error('Unexpected synthetic detail read')
+        }),
+      )
+      const store = useActionsStore()
+      if (cached) await store.loadSnapshot(TASK_ID)
+      const previousSnapshot = store.snapshots[TASK_ID]
+      const pending = store.loadSnapshot(TASK_ID)
+      const duplicate = store.loadSnapshot(TASK_ID)
+      await store.refreshList()
+      expect(store.items[0]?.status).toBe('needs_attention')
+      expect(snapshotReads).toBe(delayedRead)
+
+      // 完整后续响应在 RED 时已定义：旧 GET 无论是否高于缓存，都不能覆盖后来采纳的列表。
+      finishOldDetail(new Response(JSON.stringify(lateSnapshot)))
+      await flushPromises()
+      expect(store.items[0]?.status).toBe('needs_attention')
+      expect(store.items[0]?.updated_at).toBe(newerTime)
+      expect(store.snapshots[TASK_ID]).toBe(previousSnapshot)
+      expect(store.snapshotErrors[TASK_ID]).toBeNull()
+      expect(store.snapshotLoading[TASK_ID]).toBe(true)
+      expect(snapshotReads).toBe(delayedRead + 1)
+
+      // 补读晚于列表采纳启动，返回新的权威快照；同任务并发调用共用这一次恢复。
+      finishRecovery(new Response(JSON.stringify(recoveredSnapshot)))
+      await Promise.all([pending, duplicate])
+      expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740995')
+      expect(store.snapshots[TASK_ID]?.status).toBe('needs_attention')
+      expect(store.items[0]?.status).toBe('needs_attention')
+      expect(store.snapshotErrors[TASK_ID]).toBeNull()
+      expect(store.snapshotLoading[TASK_ID]).toBe(false)
+      expect(snapshotReads).toBe(delayedRead + 1)
+      expect(listReads).toBe(1)
+    },
+  )
+
+  it('rereads a later-started list when the earlier detail completes first', async () => {
+    let listReads = 0
+    let snapshotReads = 0
+    let finishDetail: (response: Response) => void = () => undefined
+    let finishList: (response: Response) => void = () => undefined
+    const newerSnapshot = actionSnapshot({
+      event_cursor: '9007199254740995',
+      task_version: '9007199254740995',
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/api/v1/actions') {
+          listReads += 1
+          if (listReads === 1)
+            return new Promise<Response>((resolve) => {
+              finishList = resolve
+            })
+          return new Response(
+            JSON.stringify({
+              items: [taskItem('needs_attention')],
+              limit: 50,
+              offset: 0,
+            }),
+          )
+        }
+        snapshotReads += 1
+        if (snapshotReads === 2)
+          return new Promise<Response>((resolve) => {
+            finishDetail = resolve
+          })
+        return new Response(JSON.stringify(runningSnapshot()))
+      }),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    const detail = store.loadSnapshot(TASK_ID)
+    const list = store.refreshList()
+    // 交换同一次竞争的完成顺序；详情被采纳后，列表只补读一次，不相互触发无限刷新。
+    finishDetail(new Response(JSON.stringify(newerSnapshot)))
+    await detail
+    expect(store.snapshots[TASK_ID]?.status).toBe('needs_attention')
+    finishList(
+      new Response(
+        JSON.stringify({ items: [taskItem('running')], limit: 50, offset: 0 }),
+      ),
+    )
+    await list
+    expect(store.items[0]?.status).toBe('needs_attention')
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740995')
+    expect(store.snapshotErrors[TASK_ID]).toBeNull()
+    expect(store.listError).toBeNull()
+    expect(snapshotReads).toBe(2)
+    expect(listReads).toBe(2)
+  })
+
+  it('accepts an authoritative detail requested after a newer list was adopted', async () => {
+    let snapshotReads = 0
+    let listReads = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/api/v1/actions') {
+          listReads += 1
+          return new Response(
+            JSON.stringify({
+              items: [taskItem('needs_attention')],
+              limit: 50,
+              offset: 0,
+            }),
+          )
+        }
+        snapshotReads += 1
+        return new Response(
+          JSON.stringify(
+            snapshotReads === 1
+              ? runningSnapshot()
+              : actionSnapshot({
+                  status: 'succeeded',
+                  event_cursor: '9007199254740995',
+                  task_version: '9007199254740995',
+                }),
+          ),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    await store.refreshList()
+    expect(store.items[0]?.status).toBe('needs_attention')
+    await store.loadSnapshot(TASK_ID)
+    expect(store.items[0]?.status).toBe('succeeded')
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740995')
+    expect(store.snapshotErrors[TASK_ID]).toBeNull()
+    expect(snapshotReads).toBe(2)
+    expect(listReads).toBe(1)
+  })
+
+  it('bounds detail recovery when another list is adopted during the reread', async () => {
+    let listReads = 0
+    let snapshotReads = 0
+    let finishOldDetail: (response: Response) => void = () => undefined
+    let finishRecovery: (response: Response) => void = () => undefined
+    const firstNewTime = '2030-01-01T00:01:00Z'
+    const latestTime = '2030-01-01T00:02:00Z'
+    const interruptedRecovery = actionSnapshot({
+      event_cursor: '9007199254740995',
+      task_version: '9007199254740995',
+      updated_at: firstNewTime,
+    })
+    const finalSnapshot = actionSnapshot({
+      status: 'succeeded',
+      event_cursor: '9007199254740996',
+      task_version: '9007199254740996',
+      updated_at: latestTime,
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/api/v1/actions') {
+          listReads += 1
+          return new Response(
+            JSON.stringify({
+              items: [
+                {
+                  ...taskItem(
+                    listReads === 1 ? 'needs_attention' : 'succeeded',
+                  ),
+                  updated_at: listReads === 1 ? firstNewTime : latestTime,
+                },
+              ],
+              limit: 50,
+              offset: 0,
+            }),
+          )
+        }
+        snapshotReads += 1
+        if (snapshotReads === 2)
+          return new Promise<Response>((resolve) => {
+            finishOldDetail = resolve
+          })
+        if (snapshotReads === 3)
+          return new Promise<Response>((resolve) => {
+            finishRecovery = resolve
+          })
+        if (snapshotReads === 1 || snapshotReads === 4)
+          return new Response(
+            JSON.stringify(
+              snapshotReads === 1 ? runningSnapshot() : finalSnapshot,
+            ),
+          )
+        throw new Error('Unexpected synthetic detail read')
+      }),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    const previousSnapshot = store.snapshots[TASK_ID]
+    const detail = store.loadSnapshot(TASK_ID)
+    await store.refreshList()
+    finishOldDetail(new Response(JSON.stringify(runningSnapshot())))
+    await flushPromises()
+    expect(store.items[0]?.status).toBe('needs_attention')
+    expect(snapshotReads).toBe(3)
+
+    // 第二次列表采纳使补读也无法证明新鲜；本次调用必须结束，不能靠不停 GET 追赶列表。
+    await store.refreshList()
+    finishRecovery(new Response(JSON.stringify(interruptedRecovery)))
+    await detail
+    expect(store.items[0]?.status).toBe('succeeded')
+    expect(store.items[0]?.updated_at).toBe(latestTime)
+    expect(store.snapshots[TASK_ID]).toBe(previousSnapshot)
+    expect(store.snapshotErrors[TASK_ID]).toEqual({
+      message: '无法刷新操作，请重试。',
+      trace_id: null,
+    })
+    expect(store.snapshotLoading[TASK_ID]).toBe(false)
+    expect(snapshotReads).toBe(3)
+    expect(listReads).toBe(2)
+
+    // 用户后续显式重试取得真正后发的服务端结果，不受上一次已耗尽预算的永久影响。
+    await store.loadSnapshot(TASK_ID)
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740996')
+    expect(store.items[0]?.status).toBe('succeeded')
+    expect(store.snapshotErrors[TASK_ID]).toBeNull()
+    expect(snapshotReads).toBe(4)
+    expect(listReads).toBe(2)
+  })
+
   it('accepts a later server list without overlaying an older cached snapshot', async () => {
     vi.stubGlobal(
       'fetch',
@@ -440,6 +710,124 @@ describe('server authoritative action state', () => {
     expect(store.snapshots[TASK_ID]?.status).toBe('failed')
     expect(reads).toBe(4)
     expect(store.snapshotErrors[TASK_ID]).toBeNull()
+  })
+
+  it('keeps a new owner snapshot and errors when an old manual conflict recovery finishes late', async () => {
+    let reads = 0
+    let submissions = 0
+    let finishRecovery: (response: Response) => void = () => undefined
+    const freshSnapshot = actionSnapshot({
+      status: 'failed',
+      event_cursor: '9007199254740995',
+      task_version: '9007199254740995',
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/manual-resolution')) {
+          submissions += 1
+          return new Response(
+            JSON.stringify({
+              title: 'Conflict',
+              error_code: 'task_version_conflict',
+              trace_id: 'synthetic-old-owner-conflict',
+            }),
+            { status: 409 },
+          )
+        }
+        reads += 1
+        if (reads === 3)
+          return new Promise<Response>((resolve) => {
+            finishRecovery = resolve
+          })
+        return new Response(
+          JSON.stringify(reads === 4 ? freshSnapshot : actionSnapshot()),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    const mutation = store.resolveManually(TASK_ID, 'confirmed_not_executed')
+    // 提前监听原始失败，避免把预期 409 当成未处理 rejection；清理不能吞掉调用方异常。
+    const rejected = expect(mutation).rejects.toMatchObject({
+      name: 'ProblemError',
+      problem: {
+        status: 409,
+        error_code: 'task_version_conflict',
+        trace_id: 'synthetic-old-owner-conflict',
+      },
+    })
+    await flushPromises()
+    expect(reads).toBe(3)
+    expect(submissions).toBe(1)
+    store.clear()
+    await store.loadSnapshot(TASK_ID)
+    const acceptedSnapshot = store.snapshots[TASK_ID]
+    expect(acceptedSnapshot?.task_version).toBe('9007199254740995')
+    expect(store.snapshotErrors[TASK_ID]).toBeNull()
+    expect(store.snapshotErrors[TASK_ID]?.trace_id).toBeUndefined()
+
+    // 旧 catch 的恢复 GET 跨越 clear；它和外层错误处理都必须服从新 owner 的边界。
+    finishRecovery(new Response(JSON.stringify(actionSnapshot())))
+    await rejected
+    expect(store.snapshots[TASK_ID]).toBe(acceptedSnapshot)
+    expect(store.snapshots[TASK_ID]?.status).toBe('failed')
+    expect(store.snapshotErrors[TASK_ID]).toBeNull()
+    expect(store.snapshotErrors[TASK_ID]?.trace_id).toBeUndefined()
+    expect(store.snapshotLoading[TASK_ID]).toBe(false)
+    expect(store.mutating[TASK_ID]).toBeUndefined()
+    expect(reads).toBe(4)
+    expect(submissions).toBe(1)
+  })
+
+  it('preserves a same-owner manual conflict and its safe trace after refreshing the snapshot', async () => {
+    let reads = 0
+    let submissions = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/manual-resolution')) {
+          submissions += 1
+          return new Response(
+            JSON.stringify({
+              title: 'Conflict',
+              error_code: 'task_version_conflict',
+              trace_id: 'synthetic-current-owner-conflict',
+            }),
+            { status: 409 },
+          )
+        }
+        reads += 1
+        return new Response(
+          JSON.stringify(
+            actionSnapshot(
+              reads === 3
+                ? {
+                    event_cursor: '9007199254740994',
+                    task_version: '9007199254740994',
+                  }
+                : {},
+            ),
+          ),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    await expect(
+      store.resolveManually(TASK_ID, 'confirmed_not_executed'),
+    ).rejects.toMatchObject({
+      name: 'ProblemError',
+      problem: { status: 409, trace_id: 'synthetic-current-owner-conflict' },
+    })
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740994')
+    expect(store.snapshotErrors[TASK_ID]).toEqual({
+      message: '无法刷新操作，请重试。',
+      trace_id: 'synthetic-current-owner-conflict',
+    })
+    expect(store.mutating[TASK_ID]).toBe(false)
+    expect(reads).toBe(3)
+    expect(submissions).toBe(1)
   })
 
   it('preserves the last good list when refresh fails and exposes a safe trace', async () => {

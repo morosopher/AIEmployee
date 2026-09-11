@@ -46,6 +46,8 @@ export const useActionsStore = defineStore('actions', () => {
   let epoch = 0
   let listGeneration = 0
   let projectionGeneration = 0
+  // 列表没有任务游标；以已采纳响应的内存代际约束在途详情，不推断服务端状态的版本顺序。
+  let acceptedListGeneration = 0
 
   /**
    * 重取当前服务端筛选页，拒绝过时筛选或新快照/事件抵达之前发出的迟到列表。
@@ -68,6 +70,7 @@ export const useActionsStore = defineStore('actions', () => {
         await refreshList()
         return
       }
+      acceptedListGeneration += 1
       items.value = page.items
       limit.value = page.limit
       offset.value = page.offset
@@ -83,6 +86,7 @@ export const useActionsStore = defineStore('actions', () => {
 
   /**
    * 合并同任务的并发读取；请求中有新事件时最多补取下一轮，旧快照不能回退投影。
+   * 已采纳的新列表也使在途详情失效；每次合并调用只为列表竞争自动补读一次，耗尽后提示重试。
    * @param taskId 权威任务 ID。
    * @param minimumCursor mutation 已返回的新游标；不足时保留旧投影并显示恢复提示。
    * @returns 读取结束，不把失败伪装为业务状态。
@@ -105,13 +109,26 @@ export const useActionsStore = defineStore('actions', () => {
     }
     const owner = epoch
     const pending = (async () => {
+      let retriedAfterList = false
       do {
         refreshAgain.delete(taskId)
         snapshotLoading.value[taskId] = true
         snapshotErrors.value[taskId] = null
         try {
+          const observedList = acceptedListGeneration
           const snapshot = await getAction(taskId)
           if (owner !== epoch) return
+          if (observedList !== acceptedListGeneration) {
+            // 即使详情游标高于缓存，也无法证明其包含请求期间新采纳的列表事实；先丢弃再重读。
+            // 若补读又跨越列表采纳，保留有效投影并结束，避免两类刷新互相追赶形成请求循环。
+            if (!retriedAfterList) {
+              retriedAfterList = true
+              refreshAgain.add(taskId)
+            } else if (!refreshAgain.has(taskId)) {
+              snapshotErrors.value[taskId] = loadError(null)
+            }
+            continue
+          }
           const latest = latestSequences.get(taskId)
           if (
             (latest !== undefined &&
@@ -246,6 +263,7 @@ export const useActionsStore = defineStore('actions', () => {
    * @param taskId 需要人工核对的任务 ID。
    * @param resolution 由下一阶段确认对话框产生的明确枚举。
    * @returns 权威快照重新读取后完成；原始安全错误供调用方处理冲突。
+   * @throws 原 mutation 或快照不可用错误仍交给调用方；不写入清理后的新 owner。
    */
   async function resolveManually(
     taskId: string,
@@ -269,7 +287,8 @@ export const useActionsStore = defineStore('actions', () => {
     } catch (error) {
       if (owner === epoch) {
         await loadSnapshot(taskId)
-        snapshotErrors.value[taskId] = loadError(error)
+        // 恢复 GET 同样可能跨越页面卸载；await 后再次核对，防止旧错误污染新 owner。
+        if (owner === epoch) snapshotErrors.value[taskId] = loadError(error)
       }
       throw error
     } finally {
