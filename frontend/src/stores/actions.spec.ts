@@ -8,7 +8,12 @@ import {
   NOW,
   TASK_ID,
 } from '@/test-support/actionFixtures'
-import type { TaskEvent } from '@/api/types'
+import type {
+  ActionListItem,
+  ActionSnapshot,
+  TaskEvent,
+  TaskStatus,
+} from '@/api/types'
 
 /** 创建只含状态与尝试次数的持久事件。 */
 function event(
@@ -25,6 +30,31 @@ function event(
     step_id: null,
     payload,
   }
+}
+
+/** @returns 状态一致的合成执行中快照，避免解析失败掩盖列表与详情的读取竞争。 */
+function runningSnapshot(): ActionSnapshot {
+  const snapshot = actionSnapshot()
+  return {
+    ...snapshot,
+    status: 'running',
+    error_code: null,
+    timeline: [],
+    local_action: snapshot.local_action
+      ? { ...snapshot.local_action, status: 'executing' }
+      : null,
+    execution: snapshot.execution
+      ? { ...snapshot.execution, status: 'executing' }
+      : null,
+  }
+}
+
+/** @param status 服务端明确返回的任务状态。 @returns 合法的合成任务列表行。 */
+function taskItem(status: TaskStatus): ActionListItem {
+  const item = actionItems().find((entry) => entry.item_kind === 'trusted_task')
+  if (!item || item.item_kind !== 'trusted_task')
+    throw new Error('Missing synthetic task row')
+  return { ...item, status }
 }
 
 beforeEach(() => setActivePinia(createPinia()))
@@ -49,6 +79,194 @@ describe('server authoritative action state', () => {
     expect(store.items).toHaveLength(3)
     await store.refreshList()
     expect(store.items).toHaveLength(0)
+  })
+
+  it('keeps a newer REST snapshot when a list started before it arrives late', async () => {
+    let listReads = 0
+    let snapshotReads = 0
+    let finishOldList: (response: Response) => void = () => undefined
+    const oldPage = { items: [taskItem('running')], limit: 50, offset: 0 }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === '/api/v1/actions') {
+          listReads += 1
+          if (listReads === 2)
+            return new Promise<Response>((resolve) => {
+              finishOldList = resolve
+            })
+          return new Response(
+            JSON.stringify(
+              listReads === 1
+                ? oldPage
+                : {
+                    items: [taskItem('needs_attention')],
+                    limit: 50,
+                    offset: 0,
+                  },
+            ),
+          )
+        }
+        snapshotReads += 1
+        return new Response(
+          JSON.stringify(
+            snapshotReads === 1
+              ? runningSnapshot()
+              : actionSnapshot({
+                  event_cursor: '9007199254740994',
+                  task_version: '9007199254740994',
+                }),
+          ),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    await store.refreshList()
+    await store.loadSnapshot(TASK_ID)
+    // focus/reconnect 同时发出两类 GET；旧列表必须等新详情已被采纳后才返回。
+    const pendingList = store.refreshList()
+    await store.loadSnapshot(TASK_ID)
+    expect(store.items[0]?.status).toBe('needs_attention')
+    finishOldList(new Response(JSON.stringify(oldPage)))
+    await pendingList
+    expect(store.snapshots[TASK_ID]?.status).toBe('needs_attention')
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740994')
+    expect(store.items[0]?.status).toBe('needs_attention')
+    expect(listReads).toBe(3)
+    expect(store.listError).toBeNull()
+    expect(store.loading).toBe(false)
+  })
+
+  it('rereads the same filtered page when a newer snapshot moves a task out of it', async () => {
+    const urls: string[] = []
+    let snapshotReads = 0
+    let finishOldList: (response: Response) => void = () => undefined
+    const oldPage = { items: [taskItem('running')], limit: 1, offset: 1 }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.startsWith('/api/v1/actions?')) {
+          urls.push(url)
+          if (urls.length === 2)
+            return new Promise<Response>((resolve) => {
+              finishOldList = resolve
+            })
+          return new Response(
+            JSON.stringify(
+              urls.length === 1
+                ? oldPage
+                : {
+                    items: [],
+                    limit: 1,
+                    offset: 1,
+                  },
+            ),
+          )
+        }
+        snapshotReads += 1
+        return new Response(
+          JSON.stringify(
+            snapshotReads === 1
+              ? runningSnapshot()
+              : actionSnapshot({
+                  event_cursor: '9007199254740994',
+                  task_version: '9007199254740994',
+                }),
+          ),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    await store.refreshList({
+      provider: 'google',
+      status: 'running',
+      limit: 1,
+      offset: 1,
+    })
+    await store.loadSnapshot(TASK_ID)
+    const pendingList = store.refreshList()
+    await store.loadSnapshot(TASK_ID)
+    finishOldList(new Response(JSON.stringify(oldPage)))
+    await pendingList
+    // 服务端已把该任务移出 running 的第二页，缓存详情不能把它重新插入或覆盖筛选。
+    expect(store.items).toHaveLength(0)
+    expect(store.snapshots[TASK_ID]?.status).toBe('needs_attention')
+    expect(store.limit).toBe(1)
+    expect(store.offset).toBe(1)
+    expect(store.filters).toEqual({
+      provider: 'google',
+      status: 'running',
+      limit: 1,
+      offset: 1,
+    })
+    expect(urls).toEqual([
+      '/api/v1/actions?provider=google&status=running&limit=1&offset=1',
+      '/api/v1/actions?provider=google&status=running&limit=1&offset=1',
+      '/api/v1/actions?provider=google&status=running&limit=1&offset=1',
+    ])
+  })
+
+  it('accepts a later server list without overlaying an older cached snapshot', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async (url: string) =>
+          new Response(
+            JSON.stringify(
+              url === '/api/v1/actions'
+                ? { items: [taskItem('succeeded')], limit: 50, offset: 0 }
+                : actionSnapshot(),
+            ),
+          ),
+      ),
+    )
+    const store = useActionsStore()
+    await store.loadSnapshot(TASK_ID)
+    await store.refreshList()
+    expect(store.items[0]?.status).toBe('succeeded')
+    expect(store.snapshots[TASK_ID]?.task_version).toBe('9007199254740993')
+  })
+
+  it('discards an invalidated old-owner list without refreshing the new owner', async () => {
+    let listReads = 0
+    let finishOldList: (response: Response) => void = () => undefined
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === `/api/v1/actions/${TASK_ID}`)
+          return new Response(JSON.stringify(actionSnapshot()))
+        listReads += 1
+        if (listReads === 1)
+          return new Promise<Response>((resolve) => {
+            finishOldList = resolve
+          })
+        return new Response(
+          JSON.stringify({
+            items: actionItems().filter(
+              (item) => item.item_kind === 'calendar_proposal',
+            ),
+            limit: 50,
+            offset: 0,
+          }),
+        )
+      }),
+    )
+    const store = useActionsStore()
+    const pendingList = store.refreshList()
+    await store.loadSnapshot(TASK_ID)
+    store.clear()
+    await store.refreshList({ item_kind: 'calendar_proposal' })
+    finishOldList(
+      new Response(
+        JSON.stringify({ items: [taskItem('running')], limit: 50, offset: 0 }),
+      ),
+    )
+    await pendingList
+    expect(listReads).toBe(2)
+    expect(store.items).toHaveLength(1)
+    expect(store.items[0]?.item_kind).toBe('calendar_proposal')
+    expect(store.filters).toEqual({ item_kind: 'calendar_proposal' })
+    expect(Object.keys(store.snapshots)).toHaveLength(0)
   })
 
   it('deduplicates and orders events above the safe integer limit without stale rollback', async () => {

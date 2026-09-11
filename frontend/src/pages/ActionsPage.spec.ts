@@ -83,6 +83,95 @@ describe('ActionsPage', () => {
     expect(wrapper.text()).not.toContain('暂无操作')
   })
 
+  it.each(['focus', 'reconnect'])(
+    'keeps the new detail and group when an older list completes during %s recovery',
+    async (signal) => {
+      let listReads = 0
+      let snapshotReads = 0
+      let finishOldList: (response: Response) => void = () => undefined
+      const initial = actionSnapshot()
+      const oldPage = {
+        items: actionItems().map((item) =>
+          item.item_kind === 'trusted_task'
+            ? { ...item, status: 'running' }
+            : item,
+        ),
+        limit: 50,
+        offset: 0,
+      }
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => {
+          if (url === '/api/v1/actions') {
+            listReads += 1
+            if (listReads === 2)
+              return new Promise<Response>((resolve) => {
+                finishOldList = resolve
+              })
+            return new Response(
+              JSON.stringify(
+                listReads === 1
+                  ? oldPage
+                  : {
+                      items: actionItems(),
+                      limit: 50,
+                      offset: 0,
+                    },
+              ),
+            )
+          }
+          snapshotReads += 1
+          return new Response(
+            JSON.stringify(
+              snapshotReads === 1
+                ? {
+                    ...initial,
+                    status: 'running',
+                    error_code: null,
+                    timeline: [],
+                    local_action: initial.local_action
+                      ? { ...initial.local_action, status: 'executing' }
+                      : null,
+                    execution: initial.execution
+                      ? { ...initial.execution, status: 'executing' }
+                      : null,
+                  }
+                : actionSnapshot({
+                    event_cursor: '9007199254740994',
+                    task_version: '9007199254740994',
+                  }),
+            ),
+          )
+        }),
+      )
+      const wrapper = renderPage()
+      await flushPromises()
+      await wrapper.get(`[data-action-id="${TASK_ID}"] button`).trigger('click')
+      await flushPromises()
+      const source = TaskEventSource.instances.at(-1)
+      if (!source) throw new Error('Missing synthetic task stream')
+      source.onopen?.(new Event('open'))
+      if (signal === 'focus') window.dispatchEvent(new Event('focus'))
+      else {
+        source.onerror?.(new Event('error'))
+        source.onopen?.(new Event('open'))
+      }
+      await flushPromises()
+      expect(wrapper.get(`[data-action-id="${TASK_ID}"]`).text()).toContain(
+        '需要人工确认',
+      )
+      // 详情已进入人工核对，迟到列表不能把同一行重新移回执行分组。
+      finishOldList(new Response(JSON.stringify(oldPage)))
+      await flushPromises()
+      expect(wrapper.get('.action-detail').text()).toContain('需要人工确认')
+      expect(wrapper.get(`[data-action-id="${TASK_ID}"]`).text()).toContain(
+        '需要人工确认',
+      )
+      expect(listReads).toBe(3)
+      expect(TaskEventSource.instances).toHaveLength(1)
+    },
+  )
+
   it('renders all six groups and sends filters without content in URLs', async () => {
     const urls: string[] = []
     vi.stubGlobal(

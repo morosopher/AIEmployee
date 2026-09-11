@@ -35,7 +35,7 @@ const m2EventNames = [
  *
  * @param taskId 任务标识或响应式任务标识；空值时不建立连接。
  * @param onEvent 可选内容无关事件投影回调，仍由本 composable 独占连接。
- * @param onRecovery 重连或未知事件恢复后重取操作列表等 REST 投影；不新建事件流。
+ * @param onRecovery 重连或心跳发现快照未覆盖流游标后，重取操作列表等 REST 投影；不新建事件流。
  * @returns 可供界面显示的连接状态 ref。
  */
 export function useTaskEvents(
@@ -151,12 +151,14 @@ export function useTaskEvents(
       const event = parseTaskEvent(message.data)
       if (!event) {
         // 原生 EventSource 没有未知 named event 的 wildcard；随后不带 id 的 heartbeat
-        // 仍保留浏览器 lastEventId。仅当它超过已见持久游标时进行一次有界快照恢复。
+        // 仍保留浏览器 lastEventId。已知非终态事件可能先推进 latestSequences，却没有覆盖
+        // 未知事件的完整事实；恢复必须比较 snapshotCursors，不能把“已见”当作“已恢复”。
+        // 这里不判断数字跳号；同任务审计 ID 可以稀疏，已覆盖的重复心跳不再触发读取。
         const wireCursor = asEventCursor(message.lastEventId)
-        const knownCursor = tasks.latestSequences[nextTaskId] ?? '0'
+        const snapshotCursor = tasks.snapshotCursors[nextTaskId] ?? '0'
         if (
           wireCursor !== null &&
-          compareEventCursors(wireCursor, knownCursor) > 0
+          compareEventCursors(wireCursor, snapshotCursor) > 0
         )
           refreshSnapshot(true)
         return

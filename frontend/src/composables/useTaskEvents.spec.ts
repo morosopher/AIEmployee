@@ -320,6 +320,159 @@ describe('M2 EventSource listener boundary', () => {
     vi.unstubAllGlobals()
   })
 
+  it.each(['9007199254740995', '9007199254741999'])(
+    'recovers unknown events after a known nonterminal event advances the seen cursor to %s',
+    async (knownCursor) => {
+      vi.stubGlobal('EventSource', TaskEventSource)
+      setActivePinia(createPinia())
+      vi.mocked(getTask).mockReset()
+      const tasks = useTasksStore()
+      const baseline = {
+        id: TASK_ID,
+        kind: 'trusted_action',
+        status: 'running' as const,
+        event_cursor: '9007199254740993',
+        retry_of_task_id: null,
+        error_code: null,
+        steps: [],
+      }
+      tasks.setTask(baseline)
+      let complete: (value: Awaited<ReturnType<typeof getTask>>) => void = () =>
+        undefined
+      vi.mocked(getTask).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            complete = resolve
+          }),
+      )
+      const recovered = vi.fn()
+      const initialSourceCount = TaskEventSource.instances.length
+      const Host = defineComponent({
+        setup() {
+          useTaskEvents(TASK_ID, undefined, recovered)
+          return () => null
+        },
+      })
+      const wrapper = mount(Host)
+      try {
+        const source = TaskEventSource.instances.at(-1)
+        if (!source) throw new Error('Missing synthetic task stream')
+        source.emit('future.audit_event', {}, '9007199254740994')
+        const knownEvent = {
+          id: knownCursor,
+          sequence: knownCursor,
+          task_id: TASK_ID,
+          event: 'task.status_changed',
+          occurred_at: NOW,
+          step_id: null,
+          payload: { status: 'running' },
+        }
+        source.emit('task.status_changed', knownEvent, knownCursor)
+        expect(tasks.latestSequences[TASK_ID]).toBe(knownCursor)
+        expect(tasks.snapshotCursors[TASK_ID]).toBe('9007199254740993')
+        // 单任务游标允许稀疏；已知非终态事件本身不证明遗漏，恢复依据完整快照覆盖水位。
+        expect(getTask).not.toHaveBeenCalled()
+        source.emit('heartbeat', {}, knownCursor)
+        source.emit('heartbeat', {}, knownCursor)
+        expect(getTask).toHaveBeenCalledTimes(1)
+        complete({
+          ...baseline,
+          event_cursor: knownCursor,
+          steps: [
+            {
+              id: '00000000-0000-0000-0000-000000000402',
+              name: 'persist',
+              sequence: 1,
+              status: 'completed',
+              error_code: null,
+              output_summary: null,
+            },
+          ],
+        })
+        await flushPromises()
+        expect(tasks.tasks[TASK_ID]?.steps).toHaveLength(1)
+        expect(tasks.snapshotCursors[TASK_ID]).toBe(knownCursor)
+        expect(recovered).toHaveBeenCalledOnce()
+        source.emit('task.status_changed', knownEvent, knownCursor)
+        source.emit('heartbeat', {}, knownCursor)
+        source.emit('heartbeat', {}, knownCursor)
+        await flushPromises()
+        expect(getTask).toHaveBeenCalledTimes(1)
+        expect(recovered).toHaveBeenCalledOnce()
+        expect(TaskEventSource.instances).toHaveLength(initialSourceCount + 1)
+      } finally {
+        wrapper.unmount()
+        vi.unstubAllGlobals()
+      }
+    },
+  )
+
+  it('ignores an old source recovery when the active task changes before its snapshot arrives', async () => {
+    vi.stubGlobal('EventSource', TaskEventSource)
+    setActivePinia(createPinia())
+    vi.mocked(getTask).mockReset()
+    let complete: (value: Awaited<ReturnType<typeof getTask>>) => void = () =>
+      undefined
+    vi.mocked(getTask).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve
+        }),
+    )
+    const recovered = vi.fn()
+    const taskId = ref(TASK_ID)
+    const Host = defineComponent({
+      setup() {
+        useTaskEvents(taskId, undefined, recovered)
+        return () => null
+      },
+    })
+    const wrapper = mount(Host)
+    try {
+      const source = TaskEventSource.instances.at(-1)
+      if (!source) throw new Error('Missing synthetic task stream')
+      source.emit('future.audit_event', {}, '9007199254740994')
+      source.emit(
+        'task.status_changed',
+        {
+          id: '9007199254740995',
+          sequence: '9007199254740995',
+          task_id: TASK_ID,
+          event: 'task.status_changed',
+          occurred_at: NOW,
+          step_id: null,
+          payload: { status: 'running' },
+        },
+        '9007199254740995',
+      )
+      source.emit('heartbeat', {}, '9007199254740995')
+      expect(getTask).toHaveBeenCalledOnce()
+      taskId.value = '00000000-0000-0000-0000-000000000410'
+      await nextTick()
+      complete({
+        id: TASK_ID,
+        kind: 'trusted_action',
+        status: 'needs_attention',
+        event_cursor: '9007199254740995',
+        retry_of_task_id: null,
+        error_code: null,
+        steps: [],
+      })
+      source.emit('heartbeat', {}, '9007199254740995')
+      await flushPromises()
+      const tasks = useTasksStore()
+      expect(source.closed).toBe(true)
+      expect(tasks.tasks[TASK_ID]?.status).toBe('running')
+      expect(tasks.snapshotCursors[TASK_ID]).toBeUndefined()
+      expect(tasks.tasks[taskId.value]).toBeUndefined()
+      expect(recovered).not.toHaveBeenCalled()
+      expect(getTask).toHaveBeenCalledOnce()
+    } finally {
+      wrapper.unmount()
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('does not let a wrong-task envelope or late recovery response mutate the active owner', async () => {
     vi.stubGlobal('EventSource', TaskEventSource)
     setActivePinia(createPinia())

@@ -1,5 +1,10 @@
+import { createServer, type ServerResponse } from 'node:http'
 import { expect, test, type Page, type Route } from '@playwright/test'
-import type { ActionListItem, ActionSnapshot } from '../src/api/types'
+import type {
+  ActionListItem,
+  ActionSnapshot,
+  TaskEvent,
+} from '../src/api/types'
 import {
   actionItems,
   actionSnapshot,
@@ -47,8 +52,17 @@ async function fulfillJson(route: Route, value: unknown): Promise<void> {
   })
 }
 
-/** @param name 持久事件名。 @param cursor 精确字符串游标。 @returns 原生 SSE 帧，不模拟 EventSource 类。 */
-function persistentFrame(name: string, cursor: string): string {
+/**
+ * @param name 持久事件名。
+ * @param cursor 精确字符串游标。
+ * @param payload 只含合成状态或快照的公开载荷。
+ * @returns 原生 SSE 帧，不模拟 EventSource 类。
+ */
+function persistentFrame(
+  name: string,
+  cursor: string,
+  payload: TaskEvent['payload'] = { status: 'succeeded' },
+): string {
   return [
     `id: ${cursor}`,
     `event: ${name}`,
@@ -59,7 +73,7 @@ function persistentFrame(name: string, cursor: string): string {
       event: name,
       occurred_at: NOW,
       step_id: null,
-      payload: { status: 'succeeded' },
+      payload,
     })}`,
     '',
     '',
@@ -221,6 +235,176 @@ test('unknown native named event recovers once through id-less heartbeats and ke
   expect(
     await page.evaluate(() => [localStorage.length, sessionStorage.length]),
   ).toEqual([0, 0])
+})
+
+test('unknown native event followed by a known nonterminal event recovers through bounded heartbeats', async ({
+  page,
+}, testInfo) => {
+  await authenticateFixture(page)
+  let listReads = 0
+  let actionReads = 0
+  let taskReads = 0
+  let streamRequests = 0
+  let releaseTask: () => void = () => undefined
+  const taskReady = new Promise<void>((resolve) => {
+    releaseTask = resolve
+  })
+  let acceptStream: (response: ServerResponse) => void = () => undefined
+  const streamReady = new Promise<ServerResponse>((resolve) => {
+    acceptStream = resolve
+  })
+  const frames: Array<{ name: string; cursor: string }> = []
+  const devtools = await page.context().newCDPSession(page)
+  await devtools.send('Network.enable')
+  // 被动记录原生传输的事件名和游标，不改写 EventSource、reducer 或响应内容。
+  devtools.on(
+    'Network.eventSourceMessageReceived',
+    ({ eventName, eventId }) => {
+      frames.push({ name: eventName, cursor: eventId })
+    },
+  )
+  const origin = new URL(String(testInfo.project.use.baseURL)).origin
+  const server = createServer((_request, response) => {
+    streamRequests += 1
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': origin,
+      'Access-Control-Allow-Credentials': 'true',
+    })
+    response.write('retry: 60000\n\n')
+    acceptStream(response)
+  })
+  // 只在 loopback 的临时端口提供合成 SSE，可在同一流里分别控制恢复前、后的心跳。
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const address = server.address()
+    if (!address || typeof address === 'string')
+      throw new Error('Synthetic SSE server has no TCP address')
+    const runningItems = actionItems().map((item) =>
+      item.item_kind === 'trusted_task'
+        ? { ...item, status: 'running' as const }
+        : item,
+    )
+    await page.route('**/api/v1/actions', (route) => {
+      listReads += 1
+      return fulfillJson(route, {
+        items: listReads === 1 ? runningItems : actionItems(),
+        limit: 50,
+        offset: 0,
+      })
+    })
+    await page.route(`**/api/v1/actions/${TASK_ID}`, (route) => {
+      actionReads += 1
+      return fulfillJson(
+        route,
+        actionReads === 1
+          ? runningAction()
+          : actionSnapshot({
+              event_cursor: RECOVERED_CURSOR,
+              task_version: RECOVERED_CURSOR,
+            }),
+      )
+    })
+    await page.route(`**/api/v1/tasks/${TASK_ID}`, async (route) => {
+      taskReads += 1
+      await taskReady
+      await fulfillJson(route, {
+        id: TASK_ID,
+        kind: 'trusted_action',
+        status: 'needs_attention',
+        retry_of_task_id: null,
+        error_code: null,
+        event_cursor: RECOVERED_CURSOR,
+        steps: [],
+      })
+    })
+    await page.route(`**/api/v1/tasks/${TASK_ID}/events*`, async (route) => {
+      await expect(page.locator('.action-detail')).toContainText('执行中')
+      await route.continue({ url: `http://127.0.0.1:${address.port}/events` })
+    })
+    await page.goto('/actions')
+    await page.getByRole('button', { name: '查看发送邮件详情' }).click()
+    await expect.poll(() => streamRequests).toBe(1)
+    const stream = await streamReady
+    const heartbeat = 'event: heartbeat\ndata: {}\n\n'
+    stream.write(
+      [
+        persistentFrame('task.snapshot', '9007199254740993', {
+          id: TASK_ID,
+          kind: 'trusted_action',
+          status: 'running',
+          retry_of_task_id: null,
+          error_code: null,
+          event_cursor: '9007199254740993',
+          steps: [],
+        }),
+        persistentFrame('future.audit_event', '9007199254740994', {}),
+        persistentFrame('task.status_changed', RECOVERED_CURSOR, {
+          status: 'running',
+        }),
+        heartbeat,
+        heartbeat,
+      ].join(''),
+    )
+    await expect
+      .poll(() => frames.filter((frame) => frame.name === 'heartbeat').length)
+      .toBe(2)
+    expect(frames.slice(0, 5)).toEqual([
+      { name: 'task.snapshot', cursor: '9007199254740993' },
+      { name: 'future.audit_event', cursor: '9007199254740994' },
+      { name: 'task.status_changed', cursor: RECOVERED_CURSOR },
+      { name: 'heartbeat', cursor: RECOVERED_CURSOR },
+      { name: 'heartbeat', cursor: RECOVERED_CURSOR },
+    ])
+    await expect.poll(() => taskReads).toBe(1)
+    releaseTask()
+    await expect(page.locator('.action-detail')).toContainText('结果需要核实')
+    await expect.poll(() => actionReads).toBe(2)
+    await expect.poll(() => listReads).toBeGreaterThanOrEqual(2)
+    // 权威快照已覆盖 K 后，在仍打开的同一原生流中重复发送 id-less 心跳，不应继续补读。
+    stream.write(heartbeat.repeat(3))
+    await expect
+      .poll(() => frames.filter((frame) => frame.name === 'heartbeat').length)
+      .toBe(5)
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    )
+    expect(taskReads).toBe(1)
+    expect(actionReads).toBe(2)
+    expect(listReads).toBeLessThanOrEqual(3)
+    expect(streamRequests).toBe(1)
+    expect(
+      frames
+        .filter((frame) => frame.name === 'heartbeat')
+        .every((frame) => frame.cursor === RECOVERED_CURSOR),
+    ).toBe(true)
+    expect(
+      await page.evaluate(() => [localStorage.length, sessionStorage.length]),
+    ).toEqual([0, 0])
+  } finally {
+    releaseTask()
+    await page.unrouteAll({ behavior: 'wait' })
+    await devtools.detach()
+    await page.close()
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    )
+    await testInfo.attach('native-sse-recovery-counters', {
+      body: Buffer.from(
+        JSON.stringify({
+          listReads,
+          actionReads,
+          taskReads,
+          streamRequests,
+          frames,
+        }),
+      ),
+      contentType: 'application/json',
+    })
+  }
 })
 
 test('action groups, filters, provider links, keyboard focus and narrow detail use the actual page', async ({

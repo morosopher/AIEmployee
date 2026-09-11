@@ -45,10 +45,10 @@ export const useActionsStore = defineStore('actions', () => {
   const refreshAgain = new Set<string>()
   let epoch = 0
   let listGeneration = 0
-  let eventGeneration = 0
+  let projectionGeneration = 0
 
   /**
-   * 重取当前服务端筛选页，拒绝过时筛选或事件到达之前的迟到列表。
+   * 重取当前服务端筛选页，拒绝过时筛选或新快照/事件抵达之前发出的迟到列表。
    * @param nextFilters 已验证的内容无关筛选项。
    * @returns 请求结束；失败保留上一有效列表并公开恢复提示。
    */
@@ -58,13 +58,13 @@ export const useActionsStore = defineStore('actions', () => {
     filters.value = { ...nextFilters }
     const generation = ++listGeneration,
       owner = epoch,
-      observedEvents = eventGeneration
+      observedProjection = projectionGeneration
     loading.value = true
     listError.value = null
     try {
       const page = await listActions(nextFilters)
       if (owner !== epoch || generation !== listGeneration) return
-      if (observedEvents !== eventGeneration) {
+      if (observedProjection !== projectionGeneration) {
         await refreshList()
         return
       }
@@ -124,6 +124,18 @@ export const useActionsStore = defineStore('actions', () => {
               snapshotErrors.value[taskId] = loadError(null)
             continue
           }
+          const previousSnapshot = snapshots.value[taskId]
+          if (
+            !previousSnapshot ||
+            compareEventCursors(
+              snapshot.event_cursor,
+              previousSnapshot.event_cursor,
+            ) > 0
+          ) {
+            // 列表没有任务版本，不能证明在途 GET 已包含这次权威进展；重新按原筛选和分页读取，
+            // 不把缓存详情无条件覆盖到后续列表，避免把已移出筛选页的任务重新插入。
+            projectionGeneration += 1
+          }
           snapshots.value[taskId] = snapshot
           latestSequences.set(taskId, snapshot.event_cursor)
           items.value = items.value.map((item) =>
@@ -159,7 +171,7 @@ export const useActionsStore = defineStore('actions', () => {
     )
       return
     latestSequences.set(event.task_id, sequence)
-    eventGeneration += 1
+    projectionGeneration += 1
     const snapshot = snapshots.value[event.task_id]
     const status =
       event.event === 'task.status_changed'
