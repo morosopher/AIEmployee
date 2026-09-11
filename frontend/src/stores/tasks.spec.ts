@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { parseTaskEvent } from '../api/types'
+import { parseTaskEvent, parseTaskSnapshot } from '../api/types'
 import type { TaskEvent } from '../api/types'
 import { useTasksStore } from './tasks'
 
@@ -34,6 +34,14 @@ function event(
 
 describe('tasks store', () => {
   beforeEach(() => setActivePinia(createPinia()))
+
+  it.each(['reconciling', 'needs_attention'])('restores M2 state %s without treating it as a terminal failure', (status) => {
+    const store = useTasksStore()
+    store.setTask(parseTaskSnapshot({ id: 'task-1', kind: 'mail.send', status, error_code: null, retry_of_task_id: null, event_cursor: '9007199254740993', steps: [] }))
+    expect(store.tasks['task-1']?.status).toBe(status)
+    store.applyEvent(event({ event: 'task.status_changed', sequence: '9007199254740994', payload: { status } }))
+    expect(store.latestSequences['task-1']).toBe('9007199254740994')
+  })
 
   it('shows the first step and its completion from the shared server SSE contract', () => {
     // 与真实 PostgreSQL/SSE 测试共用线上信封，不能用 reducer 编造名称掩盖服务端字段丢失。

@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { defineComponent, nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
@@ -8,6 +8,8 @@ vi.mock('@/api/client', () => ({ getTask: vi.fn() }))
 import { useTaskEvents } from './useTaskEvents'
 import { getTask } from '@/api/client'
 import { useTasksStore } from '@/stores/tasks'
+import { TaskEventSource } from '@/test-support/taskEventSource'
+import { NOW, TASK_ID } from '@/test-support/actionFixtures'
 
 /** 模拟浏览器 EventSource，验证 composable 的资源释放契约。 */
 class FakeEventSource {
@@ -275,6 +277,65 @@ describe('useTaskEvents', () => {
     expect(useTasksStore().tasks['task-1']?.event_cursor).toBe('8')
     expect(useTasksStore().tasks['task-1']?.steps).toHaveLength(1)
     wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('M2 EventSource listener boundary', () => {
+  it('delivers all eight persistent M2 names without treating OAuth refresh as write success', () => {
+    vi.stubGlobal('EventSource', TaskEventSource)
+    setActivePinia(createPinia())
+    const received: string[] = []
+    const Host = defineComponent({ setup() { useTaskEvents(TASK_ID, (event) => received.push(event.event)); return () => null } })
+    const wrapper = mount(Host)
+    const names = ['action.submitted', 'approval.invalidated', 'tool.claimed', 'tool.oauth_refresh_required', 'tool.oauth_refresh_confirmed', 'tool.reconciling', 'tool.needs_attention', 'tool.manually_resolved']
+    names.forEach((name, index) => TaskEventSource.instances.at(-1)?.emit(name, { id: String(index + 1), sequence: String(index + 1), task_id: TASK_ID, event: name, occurred_at: NOW, step_id: null, payload: { status: 'retryable_failed' } }))
+    expect(received).toEqual(names)
+    expect(useTasksStore().tasks[TASK_ID]?.status).not.toBe('succeeded')
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
+
+  it('recovers an unregistered named event from heartbeat lastEventId once per pending refresh', async () => {
+    vi.stubGlobal('EventSource', TaskEventSource)
+    setActivePinia(createPinia())
+    vi.mocked(getTask).mockReset()
+    let complete: (value: Awaited<ReturnType<typeof getTask>>) => void = () => undefined
+    vi.mocked(getTask).mockImplementation(() => new Promise((resolve) => { complete = resolve }))
+    const recovered = vi.fn()
+    const Host = defineComponent({ setup() { useTaskEvents(TASK_ID, undefined, recovered); return () => null } })
+    const wrapper = mount(Host)
+    const source = TaskEventSource.instances.at(-1)
+    source?.emit('future.status', { status: 'failed' }, '9007199254740993')
+    source?.emit('heartbeat', {}, '9007199254740993')
+    source?.emit('heartbeat', {}, '9007199254740993')
+    expect(getTask).toHaveBeenCalledTimes(1)
+    complete({ id: TASK_ID, kind: 'mail.send', status: 'needs_attention', event_cursor: '9007199254740993', retry_of_task_id: null, error_code: null, steps: [] })
+    await flushPromises()
+    expect(useTasksStore().tasks[TASK_ID]?.status).toBe('needs_attention')
+    expect(recovered).toHaveBeenCalledOnce()
+    source?.emit('heartbeat', {}, '9007199254740993')
+    expect(getTask).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
+
+  it('does not let a wrong-task envelope or late recovery response mutate the active owner', async () => {
+    vi.stubGlobal('EventSource', TaskEventSource)
+    setActivePinia(createPinia())
+    vi.mocked(getTask).mockReset()
+    let complete: (value: Awaited<ReturnType<typeof getTask>>) => void = () => undefined
+    vi.mocked(getTask).mockImplementation(() => new Promise((resolve) => { complete = resolve }))
+    const Host = defineComponent({ setup() { useTaskEvents(TASK_ID); return () => null } })
+    const wrapper = mount(Host)
+    const source = TaskEventSource.instances.at(-1)
+    source?.emit('task.status_changed', { id: '1', sequence: '1', task_id: 'other-task', event: 'task.status_changed', occurred_at: NOW, step_id: null, payload: { status: 'running' } })
+    expect(useTasksStore().tasks['other-task']).toBeUndefined()
+    source?.emit('heartbeat', {}, '2')
+    wrapper.unmount()
+    complete({ id: TASK_ID, kind: 'mail.send', status: 'running', event_cursor: '2', retry_of_task_id: null, error_code: null, steps: [] })
+    await flushPromises()
+    expect(useTasksStore().tasks[TASK_ID]).toBeUndefined()
     vi.unstubAllGlobals()
   })
 })

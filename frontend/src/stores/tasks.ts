@@ -3,6 +3,7 @@ import { defineStore } from 'pinia'
 import {
   asJsonObject,
   asTaskStatus,
+  compareEventCursors,
   parseTaskSnapshot,
   parseTaskStep,
   type JsonObject,
@@ -315,18 +316,6 @@ function statusForStepEvent(eventName: string): string | null {
  */
 function orderSteps(steps: readonly TaskStep[]): TaskStep[] {
   return [...steps].sort((left, right) => left.sequence - right.sequence)
-}
-
-/**
- * 比较两个规范化的非负十进制游标，不把 PostgreSQL BIGINT 交给 JavaScript number。
- *
- * @param left 左侧游标。
- * @param right 右侧游标。
- * @returns 负数、零或正数，分别表示左侧更小、相等或更大。
- */
-function compareEventCursors(left: string, right: string): number {
-  if (left.length !== right.length) return left.length - right.length
-  return left < right ? -1 : left > right ? 1 : 0
 }
 
 /**

@@ -5,6 +5,8 @@ export type TaskStatus =
   | 'running'
   | 'waiting_approval'
   | 'retry_scheduled'
+  | 'reconciling'
+  | 'needs_attention'
   | 'succeeded'
   | 'failed'
   | 'cancelled'
@@ -59,11 +61,11 @@ export interface AuthUser {
 
 export interface BriefItem { position: number; section: string; priority: string; title: string; body_markdown: string; source_refs: Array<{ source_type: string; source_id: string; provider_url: string | null }>; suggested_action_kind: string | null }
 export interface Brief { id: string; local_date: string; version: number; task_id: string; source_cutoff: string; completeness: string; headline: string; structured_content: JsonObject; markdown: string; warnings: string[]; items: BriefItem[] }
-export interface UserSettings { timezone: string; locale: string; brief_time: string; email_body_retention_days: number; source_metadata_retention_days: number; workspace_history_retention_days: number; updated_at: string }
 export interface Conversation { id: string; title: string; created_at: string; updated_at: string }
 export interface Message { id: string; role: string; content_markdown: string; task_id: string | null; created_at: string }
 export interface Session { id: string; created_at: string; last_seen_at: string; expires_at: string; is_current?: boolean }
-export interface Connection { id: string; provider: string; account_email: string; scopes: string[]; status: string; last_error_code: string | null }
+// M2 领域响应独立声明，统一从此公共边界导出，避免旧任务解析器混入编辑器规则。
+export type * from './m2Types'
 
 /** 运行时验证简报公开响应，拒绝数组及缺失核心字段。 */
 export function parseBrief(value: unknown): Brief {
@@ -101,6 +103,8 @@ const taskStatuses: readonly TaskStatus[] = [
   'running',
   'waiting_approval',
   'retry_scheduled',
+  'reconciling',
+  'needs_attention',
   'succeeded',
   'failed',
   'cancelled',
@@ -140,6 +144,17 @@ export function asEventCursor(value: unknown): string | null {
   return typeof value === 'string' && /^(0|[1-9]\d*)$/.test(value)
     ? value
     : null
+}
+
+/**
+ * 比较规范非负十进制游标，复用 M1 的长度及字典序算法，不经过 number。
+ * @param left 左侧已验证游标。
+ * @param right 右侧已验证游标。
+ * @returns 负数、零或正数代表顺序关系。
+ */
+export function compareEventCursors(left: string, right: string): number {
+  if (left.length !== right.length) return left.length - right.length
+  return left < right ? -1 : left > right ? 1 : 0
 }
 
 /**

@@ -23,5 +23,23 @@ watch(
 )
 const retry = async (id: string) => { throw new Error(`请在任务页重试 ${id}`) }
 </script>
-<template><div class="app-shell"><p v-if="alertsLoading" class="system-alert-state" role="status">正在检查系统告警</p><p v-if="alertsError" class="system-alert-state" role="alert">系统告警暂时无法刷新。</p><div v-if="alerts.length" class="overdue-alert" role="alert"><strong>每日简报已逾期</strong><RouterLink v-if="alerts[0]?.diagnostic_task_id" :to="{ path: '/tasks', query: { task_id: alerts[0].diagnostic_task_id } }">查看诊断任务</RouterLink></div><nav aria-label="主导航"><RouterLink to="/chat">新聊天</RouterLink><RouterLink to="/brief">今日简报</RouterLink><RouterLink to="/tasks">任务历史</RouterLink><RouterLink to="/connections">连接</RouterLink><RouterLink to="/settings">设置</RouterLink></nav><main><RouterView /></main><aside><TaskTimeline :task="task" :retry="retry" :follow="(id) => undefined" /></aside></div></template>
-<style scoped>.app-shell{display:grid;grid-template-columns:12rem minmax(0,1fr) 20rem;min-height:100vh}/* 告警加载或失败同样属于全局横幅，不能占用正文 Grid 单元并挤压任务中心。 */.system-alert-state{grid-column:1/-1;margin:0;padding:.75rem 1rem}.overdue-alert{grid-column:1/-1;background:#a61b1b;color:#fff;padding:.75rem 1rem;display:flex;gap:1rem}.overdue-alert a{color:#fff}nav{display:flex;flex-direction:column;gap:1rem;padding:1rem;border-right:1px solid #ddd}main{padding:1.5rem}@media(max-width:800px){.app-shell{display:block}.overdue-alert{position:sticky;top:0;z-index:2}nav{flex-direction:row;overflow:auto}.app-shell>aside{display:none}}</style>
+<template>
+  <div
+    class="app-shell"
+    :class="{ 'actions-shell': route.path === '/actions' }"
+  >
+    <p v-if="alertsLoading" class="system-alert-state" role="status">正在检查系统告警</p><p v-if="alertsError" class="system-alert-state" role="alert">系统告警暂时无法刷新。</p><div v-if="alerts.length" class="overdue-alert" role="alert"><strong>每日简报已逾期</strong><RouterLink v-if="alerts[0]?.diagnostic_task_id" :to="{ path: '/tasks', query: { task_id: alerts[0].diagnostic_task_id } }">查看诊断任务</RouterLink></div>
+    <nav aria-label="主导航">
+      <RouterLink to="/chat">新聊天</RouterLink><RouterLink to="/brief">今日简报</RouterLink>
+      <RouterLink to="/actions">
+        操作中心
+      </RouterLink>
+      <RouterLink to="/tasks">任务历史</RouterLink><RouterLink to="/connections">连接</RouterLink><RouterLink to="/settings">设置</RouterLink>
+    </nav>
+    <main><RouterView /></main>
+    <aside v-if="route.path !== '/actions'">
+      <TaskTimeline :task="task" :retry="retry" :follow="(id) => undefined" />
+    </aside>
+  </div>
+</template>
+<style scoped>.app-shell{display:grid;grid-template-columns:12rem minmax(0,1fr) 20rem;min-height:100vh}/* 操作中心自有独立详情区域，避免在全局时间线旁叠出第四栏。 */.actions-shell{grid-template-columns:12rem minmax(0,1fr)}/* 告警加载或失败同样属于全局横幅，不能占用正文 Grid 单元并挤压任务中心。 */.system-alert-state{grid-column:1/-1;margin:0;padding:.75rem 1rem}.overdue-alert{grid-column:1/-1;background:#a61b1b;color:#fff;padding:.75rem 1rem;display:flex;gap:1rem}.overdue-alert a{color:#fff}nav{display:flex;flex-direction:column;gap:1rem;padding:1rem;border-right:1px solid #ddd}main{padding:1.5rem}@media(max-width:800px){.app-shell{display:block}.overdue-alert{position:sticky;top:0;z-index:2}nav{flex-direction:row;overflow:auto}.app-shell>aside{display:none}}</style>

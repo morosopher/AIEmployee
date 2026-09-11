@@ -11,6 +11,7 @@ import ChatPage from '@/pages/ChatPage.vue'
 import TodayBriefPage from '@/pages/TodayBriefPage.vue'
 import ConnectionsPage from '@/pages/ConnectionsPage.vue'
 import SettingsPage from '@/pages/SettingsPage.vue'
+import ActionsPage from '@/pages/ActionsPage.vue'
 import { useAuthStore } from '@/stores/auth'
 
 /** 路由只公开登录入口，其他页面必须由安全 Cookie 会话恢复后访问。 */
@@ -32,6 +33,7 @@ const router = createRouter({
       children: [
         { path: '', redirect: '/brief' },
         { path: 'tasks', component: TasksPage },
+        { path: 'actions', component: ActionsPage },
         { path: 'chat', component: ChatPage },
         { path: 'brief', component: TodayBriefPage },
         { path: 'connections', component: ConnectionsPage },

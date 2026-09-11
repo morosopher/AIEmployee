@@ -7,28 +7,48 @@ import {
   type Ref,
 } from 'vue'
 
-import { parseTaskEvent, type TaskConnectionState, type TaskEvent } from '@/api/types'
+import {
+  asEventCursor,
+  compareEventCursors,
+  parseTaskEvent,
+  type TaskConnectionState,
+  type TaskEvent,
+} from '@/api/types'
 import { getTask } from '@/api/client'
 import { useTasksStore } from '@/stores/tasks'
 
 /** 服务端每 15 秒发送 heartbeat；连续两个周期无任何活动即主动建立新连接。 */
 const HEARTBEAT_TIMEOUT_MS = 30_000
+const m2EventNames = [
+  'action.submitted',
+  'approval.invalidated',
+  'tool.claimed',
+  'tool.oauth_refresh_required',
+  'tool.oauth_refresh_confirmed',
+  'tool.reconciling',
+  'tool.needs_attention',
+  'tool.manually_resolved',
+] as const
 
 /**
  * 订阅单个任务的可重放 SSE，并在组件销毁或任务切换时释放浏览器连接。
  *
  * @param taskId 任务标识或响应式任务标识；空值时不建立连接。
+ * @param onEvent 可选内容无关事件投影回调，仍由本 composable 独占连接。
+ * @param onRecovery 重连或未知事件恢复后重取操作列表等 REST 投影；不新建事件流。
  * @returns 可供界面显示的连接状态 ref。
  */
 export function useTaskEvents(
   taskId: MaybeRefOrGetter<string | null>,
   onEvent?: (event: TaskEvent) => void,
+  onRecovery?: () => void,
 ): Ref<TaskConnectionState> {
   const tasks = useTasksStore()
   const connectionState = ref<TaskConnectionState>('disconnected')
   let source: EventSource | null = null
   let openedTaskId: string | null = null
   let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  let connectedTaskId: string | null = null
 
   /** 清除旧流的静默监视器，避免卸载或切换后回调写入已失效任务。 */
   const clearHeartbeatTimeout = (): void => {
@@ -62,6 +82,44 @@ export function useTaskEvents(
     )
     source = eventSource
     openedTaskId = nextTaskId
+    let snapshotPending = false
+    let snapshotAgain = false
+    let notifyRecovery = false
+
+    /**
+     * 同一源最多保留一个快照请求；新持久事件抵达时补取，重复心跳不产生请求风暴。
+     * 响应归属和源身份都要匹配，关闭后的异步结果不能污染下一任务。
+     */
+    const refreshSnapshot = (
+      recovery: boolean,
+      changedDuringRequest = false,
+    ): void => {
+      notifyRecovery ||= recovery
+      if (snapshotPending) {
+        snapshotAgain ||= changedDuringRequest
+        return
+      }
+      snapshotPending = true
+      const observedSequence = tasks.latestSequences[nextTaskId]
+      void getTask(nextTaskId)
+        .then((snapshot) => {
+          if (source !== eventSource || snapshot.id !== nextTaskId) return
+          tasks.setTaskIfUnchangedSince(snapshot, observedSequence)
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          snapshotPending = false
+          if (source !== eventSource) return
+          if (notifyRecovery) {
+            notifyRecovery = false
+            onRecovery?.()
+          }
+          if (snapshotAgain) {
+            snapshotAgain = false
+            refreshSnapshot(false)
+          }
+        })
+    }
     /**
      * 用所有传输活动续期。若代理或网络静默截断连接而未触发 onerror，主动关闭并
      * 以已知持久游标重开，PostgreSQL 重放负责恢复遗漏事件。
@@ -91,17 +149,35 @@ export function useTaskEvents(
       // 必须在解析前续期，且已由上方身份判断隔离关闭流的滞后回调。
       armHeartbeatTimeout()
       const event = parseTaskEvent(message.data)
-      if (!event) return
+      if (!event) {
+        // 原生 EventSource 没有未知 named event 的 wildcard；随后不带 id 的 heartbeat
+        // 仍保留浏览器 lastEventId。仅当它超过已见持久游标时进行一次有界快照恢复。
+        const wireCursor = asEventCursor(message.lastEventId)
+        const knownCursor = tasks.latestSequences[nextTaskId] ?? '0'
+        if (
+          wireCursor !== null &&
+          compareEventCursors(wireCursor, knownCursor) > 0
+        )
+          refreshSnapshot(true)
+        return
+      }
+      if (event.task_id !== nextTaskId) return
       connectionState.value = 'connected'
       tasks.setConnectionState(event.task_id, 'connected')
+      const previousSequence = tasks.latestSequences[nextTaskId]
       tasks.applyEvent(event)
-      if (event.event === 'task.status_changed' && isTerminalStatus(event.payload.status)) {
+      const isNew =
+        previousSequence === undefined ||
+        compareEventCursors(event.sequence, previousSequence) > 0
+      if (
+        isNew &&
+        ((event.event === 'task.status_changed' &&
+          requiresSnapshot(event.payload.status)) ||
+          m2EventNames.some((name) => name === event.event))
+      ) {
         // 终态事件可能在代理断线边缘只携带状态；立即以 PostgreSQL 快照对账，补齐步骤、
         // 错误码与最终游标，同时用事件前后的 sequence 防止慢响应回退新事件。
-        const observedSequence = tasks.latestSequences[event.task_id]
-        void getTask(event.task_id)
-          .then((snapshot) => tasks.setTaskIfUnchangedSince(snapshot, observedSequence))
-          .catch(() => undefined)
+        refreshSnapshot(false, true)
       }
       onEvent?.(event)
     }
@@ -110,6 +186,8 @@ export function useTaskEvents(
       armHeartbeatTimeout()
       connectionState.value = 'connected'
       tasks.setConnectionState(nextTaskId, 'connected')
+      if (connectedTaskId === nextTaskId) onRecovery?.()
+      connectedTaskId = nextTaskId
     }
     eventSource.onerror = () => {
       if (source !== eventSource) return
@@ -128,6 +206,7 @@ export function useTaskEvents(
       'brief.ready',
       'assistant.delta',
       'heartbeat',
+      ...m2EventNames,
     ]) {
       eventSource.addEventListener(eventName, handleEvent as EventListener)
     }
@@ -137,6 +216,7 @@ export function useTaskEvents(
     () => toValue(taskId),
     (nextTaskId) => {
       close()
+      connectedTaskId = null
       if (nextTaskId) open(nextTaskId)
     },
     { immediate: true },
@@ -145,7 +225,12 @@ export function useTaskEvents(
   return connectionState
 }
 
-/** 判断 SSE 载荷给出的任务状态是否已不可再转换。 */
-function isTerminalStatus(value: unknown): boolean {
-  return value === 'succeeded' || value === 'failed' || value === 'cancelled'
+/** 终态和人工处理状态需要完整持久字段，不能只展示临时状态变化。 */
+function requiresSnapshot(value: unknown): boolean {
+  return (
+    value === 'succeeded' ||
+    value === 'failed' ||
+    value === 'cancelled' ||
+    value === 'needs_attention'
+  )
 }
