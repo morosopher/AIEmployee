@@ -205,7 +205,7 @@ class CreateProposalShellRequest(_StrictCalendarModel):
 
 
 class UpdateProposalShellRequest(_StrictCalendarModel):
-    """从本人本地事件绑定 update shell；空 diff 禁止直接提交。"""
+    """从本人本地事件绑定未确认 update shell；须独立编辑及逐项确认后才能提交。"""
 
     operation_kind: Literal["update"]
     initialization: Literal["shell"]
@@ -623,6 +623,7 @@ def build_calendar_router() -> APIRouter:
                     user_id=authenticated.user.id,
                     event_id=payload.event_id,
                     idempotency_key=idempotency_key,
+                    requires_explicit_confirmation=isinstance(payload, UpdateProposalShellRequest),
                     changes=_changes(
                         payload,
                         excluded={"operation_kind", "event_id", "initialization"},

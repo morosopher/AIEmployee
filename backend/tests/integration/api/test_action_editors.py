@@ -276,6 +276,7 @@ async def test_editor_calendar_shell_saves_without_confirming_and_uses_versioned
         "conflict_status": "incomplete",
         "conflicts": None,
         "restore_source": None,
+        "reprepare_source": None,
     }
     saved = await clients.owner.patch(
         path,

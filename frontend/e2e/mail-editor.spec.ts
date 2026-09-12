@@ -114,6 +114,25 @@ test('new mail stays local until explicit submission and can withdraw its frozen
     .fill('recipient@example.test')
   await page.getByLabel('抄送 CC', { exact: true }).fill('copy@example.test')
   await page.getByLabel('密送 BCC', { exact: true }).fill('blind@example.test')
+  await expect(page.getByTestId('recipient-count')).toHaveText(
+    '当前收件人数：3 位',
+  )
+  const bccInput = page.getByLabel('密送 BCC', { exact: true })
+  const originalBcc = await bccInput.inputValue()
+  await bccInput.fill(`${originalBcc}, synthetic-extra@example.test`)
+  await expect(page.getByTestId('recipient-count')).toHaveText(
+    '当前收件人数：4 位',
+  )
+  await bccInput.fill(
+    await page.getByLabel('收件人 To', { exact: true }).inputValue(),
+  )
+  await expect(page.getByTestId('recipient-count')).toContainText(
+    '收件人数待核对',
+  )
+  await bccInput.fill(originalBcc)
+  await expect(page.getByTestId('recipient-count')).toHaveText(
+    '当前收件人数：3 位',
+  )
   await page
     .getByLabel('主题', { exact: true })
     .fill('Synthetic subject browser review')

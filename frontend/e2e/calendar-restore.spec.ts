@@ -41,6 +41,7 @@ test('calendar restore follows preparation, reloads its exact result and require
       before: historical,
       conflict_status: 'checked',
       conflicts: [],
+      reprepare_source: null,
       restore_source: { event_id: EVENT_ID, snapshot_id: SNAPSHOT_ID },
     },
   }
@@ -60,6 +61,7 @@ test('calendar restore follows preparation, reloads its exact result and require
       before: current,
       conflict_status: 'checked',
       conflicts: [],
+      reprepare_source: null,
       restore_source: null,
     },
   }

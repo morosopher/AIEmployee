@@ -52,6 +52,20 @@ const structured = computed(() =>
 const legacy = computed(() =>
   'tool' in props.approval ? props.approval : null,
 )
+/** 仅日程编辑链接携带固定恢复枚举；原任务参数保留，落地后仍须显式重新准备。 */
+const recoveryUrl = computed(() => {
+  if (!props.editorUrl) return undefined
+  const url = new URL(props.editorUrl, 'https://local.invalid')
+  if (
+    url.origin !== 'https://local.invalid' ||
+    !/^\/calendar\/proposals\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(
+      url.pathname,
+    )
+  )
+    return props.editorUrl
+  url.searchParams.set('recovery', 'new_version')
+  return `${url.pathname}${url.search}${url.hash}`
+})
 const expired = computed(
   () =>
     !Number.isFinite(Date.parse(props.approval.expires_at)) ||
@@ -228,7 +242,7 @@ async function submitDecision(
       </RouterLink>
       <RouterLink
         v-else-if="error.action === 'new_version' && editorUrl"
-        :to="editorUrl"
+        :to="recoveryUrl ?? editorUrl"
       >
         创建新版本
       </RouterLink>

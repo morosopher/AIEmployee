@@ -133,6 +133,15 @@ export function parseCalendarProposal(value: unknown): CalendarProposal {
       )
         throw new Error('Invalid calendar restore source binding')
       if (
+        editorFacts?.reprepare_source &&
+        (o.operation_kind !== 'update' ||
+          !['editing', 'stale', 'cancelled'].includes(v.text(o.status)) ||
+          editorFacts.before_status !== 'available' ||
+          o.before_snapshot_id === null ||
+          o.target_event_id === null)
+      )
+        throw new Error('Invalid calendar reprepare source binding')
+      if (
         availability &&
         (availability.proposal_id !== id || availability.version !== version)
       )

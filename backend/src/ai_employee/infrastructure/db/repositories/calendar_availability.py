@@ -12,6 +12,7 @@ from sqlalchemy import select
 from ai_employee.application.use_cases.calendar_editor import (
     BeforeStatus,
     CalendarEditorRead,
+    CalendarReprepareSourceProjection,
     editor_calendar_fields,
 )
 from ai_employee.application.use_cases.calendar_proposals import (
@@ -70,6 +71,7 @@ class SqlAlchemyCalendarAvailabilityRepository:
                 proposals=repository, calendar=source, clock=lambda: observed_at
             ).get(user_id=user_id, proposal_id=proposal_id)
             before = None
+            before_content = None
             before_status: BeforeStatus = (
                 "not_applicable" if proposal.operation_kind == "create" else "unavailable"
             )
@@ -82,10 +84,10 @@ class SqlAlchemyCalendarAvailabilityRepository:
                         snapshot is not None
                         and snapshot.proposal_id == proposal_id
                         and snapshot.snapshot_kind == "before"
+                        and snapshot.retain_until > observed_at
                     ):
-                        before = editor_calendar_fields(
-                            CalendarProposalContent.model_validate(snapshot.content)
-                        )
+                        before_content = CalendarProposalContent.model_validate(snapshot.content)
+                        before = editor_calendar_fields(before_content)
                         if before is not None:
                             before_status = "available"
                 except (InvalidTag, ValidationError, ValueError):
@@ -94,6 +96,20 @@ class SqlAlchemyCalendarAvailabilityRepository:
                     if error.error_code != "calendar_snapshot_unavailable":
                         raise
             context = None
+            target_event = None
+            if proposal.operation_kind != "create":
+                # 同一次有界查询复用于冲突排除与重新准备。严格绑定本人和原三元身份，
+                # 只读本地 UUID/ETag，不取供应商内容、不把当前事件充当原 before。
+                target_event = (
+                    await session.execute(
+                        select(CalendarEventModel.id, CalendarEventModel.etag).where(
+                            CalendarEventModel.user_id == user_id,
+                            CalendarEventModel.connection_id == proposal.connection_id,
+                            CalendarEventModel.calendar_id == proposal.calendar_id,
+                            CalendarEventModel.provider_event_id == proposal.target_event_id,
+                        )
+                    )
+                ).one_or_none()
             fields = editor_calendar_fields(proposal.content)
             if fields is not None:
                 zone = ZoneInfo(fields.timezone)
@@ -107,22 +123,12 @@ class SqlAlchemyCalendarAvailabilityRepository:
                     if fields.all_day
                     else datetime.fromisoformat(fields.ends_at)
                 )
-                target_event_id = None
-                if proposal.operation_kind != "create":
-                    target_event_id = await session.scalar(
-                        select(CalendarEventModel.id).where(
-                            CalendarEventModel.user_id == user_id,
-                            CalendarEventModel.connection_id == proposal.connection_id,
-                            CalendarEventModel.calendar_id == proposal.calendar_id,
-                            CalendarEventModel.provider_event_id == proposal.target_event_id,
-                        )
-                    )
                 context = await source.get_availability_context(
                     user_id=user_id,
                     observed_at=observed_at,
                     search_start=start,
                     horizon_days=(end.astimezone(UTC) - start.astimezone(UTC)).days + 1,
-                    excluded_event_id=target_event_id,
+                    excluded_event_id=target_event.id if target_event is not None else None,
                 )
             restore_projection = None
             if (
@@ -135,7 +141,21 @@ class SqlAlchemyCalendarAvailabilityRepository:
                 restore_projection = await repository.get_restore_source_projection(
                     user_id=user_id, source_snapshot_id=proposal.before_snapshot_id
                 )
-            return CalendarEditorRead(proposal, before, before_status, context, restore_projection)
+            reprepare_projection = (
+                CalendarReprepareSourceProjection(
+                    event_id=target_event.id,
+                    current_etag=target_event.etag,
+                    before_operation_id=before_content.operation_id,
+                    before_source_event_ids=before_content.source_event_ids,
+                )
+                if target_event is not None
+                and before_status == "available"
+                and before_content is not None
+                else None
+            )
+            return CalendarEditorRead(
+                proposal, before, before_status, context, restore_projection, reprepare_projection
+            )
 
     async def load_suggestion(
         self,

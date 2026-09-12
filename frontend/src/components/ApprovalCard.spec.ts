@@ -30,9 +30,52 @@ describe('ApprovalCard', () => {
     expect(wrapper.text()).toContain('冻结版本 3')
   })
 
+  it('links the production calendar conflict to the explicit new-version recovery route', async () => {
+    const decide = vi.fn().mockRejectedValue(
+      new ProblemError({
+        type: 'about:blank',
+        title: 'Conflict',
+        status: 409,
+        detail: '',
+        instance: '',
+        error_code: 'calendar_event_version_conflict',
+        trace_id: 'synthetic-calendar-trace',
+      }),
+    )
+    const path = '/calendar/proposals/00000000-0000-0000-0000-000000000301'
+    const task = '00000000-0000-0000-0000-000000000302'
+    const wrapper = mount(ApprovalCard, {
+      props: {
+        approval: calendarApproval(),
+        decide,
+        editorUrl: `${path}?task=${task}`,
+      },
+      global: {
+        stubs: {
+          RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' },
+        },
+      },
+    })
+    await wrapper.get('button[name="approved"]').trigger('click')
+    await flushPromises()
+    expect(
+      wrapper.get('[data-testid="approval-error"] a').attributes('href'),
+    ).toBe(`${path}?task=${task}&recovery=new_version`)
+    expect(decide).toHaveBeenCalledTimes(1)
+    expect(
+      wrapper.get('button[name="approved"]').attributes('disabled'),
+    ).toBeDefined()
+    wrapper.unmount()
+  })
+
   it('shows calendar before/after, exact zone, ETag, notifications and source warnings', () => {
     const wrapper = mount(ApprovalCard, {
       props: { approval: calendarApproval(), decide: vi.fn() },
+      global: {
+        stubs: {
+          RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' },
+        },
+      },
     })
     expect(wrapper.get('[aria-label="日程前后对比"]').text()).toContain(
       'Synthetic room',

@@ -118,6 +118,66 @@ async function renderPage(query = '') {
 }
 
 describe('MailDraftPage', () => {
+  it('shows the current recipient count across To CC and BCC before submission and after edits', async () => {
+    current = {
+      ...current,
+      to: ['one@mail.example.test'],
+      cc: ['two@mail.example.test'],
+      bcc: ['three@mail.example.test'],
+    }
+    const { wrapper } = await renderPage()
+    const count = () => wrapper.get('[data-testid="recipient-count"]').text()
+    expect(count()).toContain('当前收件人数：3 位')
+    await wrapper
+      .get('input[aria-label="收件人 To"]')
+      .setValue('one@mail.example.test, four@mail.example.test')
+    expect(count()).toContain('当前收件人数：4 位')
+    await wrapper.get('input[aria-label="抄送 CC"]').setValue('')
+    expect(count()).toContain('当前收件人数：3 位')
+    // 人数来自正在核对的输入，不等待保存，也不能因此提前创建审批。
+    expect(mail.updateMailDraft).not.toHaveBeenCalled()
+    expect(mail.submitMailDraft).not.toHaveBeenCalled()
+    await wrapper.get('button[name="save-draft"]').trigger('click')
+    await flushPromises()
+    expect(count()).toContain('当前收件人数：3 位')
+    expect(mail.submitMailDraft).not.toHaveBeenCalled()
+  })
+
+  it.each(['duplicate', 'malformed'] as const)(
+    'marks recipient count unavailable for %s input without weakening validation',
+    async (kind) => {
+      current = { ...current, to: ['one@mail.example.test'], cc: [], bcc: [] }
+      const { wrapper } = await renderPage()
+      await wrapper
+        .get('input[aria-label="抄送 CC"]')
+        .setValue(
+          kind === 'duplicate' ? 'one@MAIL.EXAMPLE.TEST' : 'invalid-address',
+        )
+      await wrapper
+        .get('input[aria-label="密送 BCC"]')
+        .setValue('two@mail.example.test')
+      const count = wrapper.get('[data-testid="recipient-count"]').text()
+      expect(count).toContain('收件人数待核对')
+      expect(count).not.toContain('当前收件人数：3 位')
+      if (kind === 'duplicate') {
+        expect(count).toContain('当前输入地址：3 项')
+        expect(count).toContain('收件人地址重复')
+      }
+      await wrapper.get('button[name="save-draft"]').trigger('click')
+      expect(mail.updateMailDraft).not.toHaveBeenCalled()
+      expect(mail.submitMailDraft).not.toHaveBeenCalled()
+      expect(
+        wrapper.get('button[name="submit-draft"]').attributes('disabled'),
+      ).toBeDefined()
+      await wrapper
+        .get('input[aria-label="抄送 CC"]')
+        .setValue('three@mail.example.test')
+      expect(wrapper.get('[data-testid="recipient-count"]').text()).toContain(
+        '当前收件人数：3 位',
+      )
+    },
+  )
+
   it.each(['reply', 'reply_all'] as const)(
     'locks the account, source and subject of %s while keeping ordinary text controls',
     async (mode) => {

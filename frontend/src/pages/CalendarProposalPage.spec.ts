@@ -45,6 +45,7 @@ beforeEach(() => {
     calendar_id: 'synthetic-google-calendar',
     notification_policy: 'none',
     editor_facts: {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'not_applicable',
       before: null,
@@ -138,6 +139,81 @@ async function renderPage() {
 }
 
 describe('CalendarProposalPage', () => {
+  it.each([
+    'available',
+    'capability-unavailable',
+    'removed',
+    'directory-unavailable',
+  ] as const)(
+    'shows missing calendar account identities beside both partial results when the catalog is %s',
+    async (catalogState) => {
+      const missing = connection('microsoft')
+      current = {
+        ...current,
+        editor_facts: {
+          before_status: 'not_applicable',
+          before: null,
+          reprepare_source: null,
+          restore_source: null,
+          conflict_status: 'checked',
+          conflicts: [
+            {
+              kind: 'partial_sources',
+              starts_at: null,
+              ends_at: null,
+              missing_connection_ids: [missing.id],
+            },
+          ],
+        },
+        availability: {
+          proposal_id: PROPOSAL_ID,
+          version: 1,
+          completeness: 'partial',
+          missing_connections: [missing.id],
+          attendee_availability_checked: false,
+          candidates: [
+            {
+              starts_at: '2030-01-02T01:00:00Z',
+              ends_at: '2030-01-02T02:00:00Z',
+            },
+          ],
+        },
+      }
+      if (catalogState === 'removed')
+        vi.mocked(connections.listConnections).mockResolvedValue([connection()])
+      if (catalogState === 'directory-unavailable')
+        vi.mocked(connections.listConnections).mockRejectedValue(
+          new Error('Synthetic directory failure'),
+        )
+      if (catalogState === 'capability-unavailable')
+        vi.mocked(connections.getConnectionCapabilities).mockImplementation(
+          async (id) => {
+            if (id === missing.id)
+              throw new Error('Synthetic capability failure')
+            return connectionCapabilities()
+          },
+        )
+      const { wrapper } = await renderPage()
+      // 必须在各自的结果旁标识缺失账户，不能借页面其他位置的完整目录让断言误通过。
+      for (const label of ['服务端候选时间', '日程冲突检查']) {
+        const result = wrapper.get(`[aria-label="${label}"]`).text()
+        if (
+          catalogState === 'available' ||
+          catalogState === 'capability-unavailable'
+        ) {
+          expect(result).toContain('Microsoft')
+          expect(result).toContain(missing.account_email)
+        } else {
+          expect(result).toContain(missing.id)
+          expect(result).toContain('账户资料暂不可用')
+        }
+        expect(result).not.toContain(connection().account_email)
+      }
+      expect(connections.listConnections).toHaveBeenCalledTimes(1)
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+
   it('prepares a restore only on explicit click and follows the real queued task', async () => {
     const eventId = '00000000-0000-0000-0000-000000000501'
     const snapshotId = '00000000-0000-0000-0000-000000000502'
@@ -152,6 +228,7 @@ describe('CalendarProposalPage', () => {
         before: calendarFields(),
         conflict_status: 'checked',
         conflicts: [],
+        reprepare_source: null,
         restore_source: { event_id: eventId, snapshot_id: snapshotId },
       },
     }
@@ -180,6 +257,7 @@ describe('CalendarProposalPage', () => {
         before: calendarFields(),
         conflict_status: 'checked',
         conflicts: [],
+        reprepare_source: null,
         restore_source: {
           event_id: '00000000-0000-0000-0000-000000000501',
           snapshot_id: '00000000-0000-0000-0000-000000000502',
@@ -220,6 +298,7 @@ describe('CalendarProposalPage', () => {
         before: null,
         conflict_status: 'checked',
         conflicts: [],
+        reprepare_source: null,
         restore_source: null,
       },
     }
@@ -278,6 +357,7 @@ describe('CalendarProposalPage', () => {
       base_etag: 'synthetic-etag',
       before_snapshot_id: '00000000-0000-0000-0000-000000000099',
       editor_facts: {
+        reprepare_source: null,
         restore_source: null,
         before_status: 'available',
         before: {
@@ -511,6 +591,7 @@ describe('CalendarProposalPage', () => {
       required_confirmations: [],
       changed_fields: ['location'],
       editor_facts: {
+        reprepare_source: null,
         restore_source: null,
         before_status: 'unavailable',
         before: null,

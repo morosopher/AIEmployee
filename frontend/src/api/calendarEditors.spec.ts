@@ -15,6 +15,7 @@ function proposalWithFacts() {
     ...calendarProposal(),
     ...calendarFields(),
     editor_facts: {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'not_applicable',
       before: null,
@@ -31,6 +32,7 @@ describe('calendar editor response boundary', () => {
       'checked',
     )
     const incomplete = {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'not_applicable',
       before: null,
@@ -53,18 +55,20 @@ describe('calendar editor response boundary', () => {
     { conflict_status: 'incomplete', conflicts: [] },
     { conflict_status: 'maybe' },
     { conflict_status: undefined },
-    { restore_source: null, before_status: 'available', before: null },
+    { reprepare_source: null, restore_source: null, before_status: 'available', before: null },
     {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'not_applicable',
       before: calendarFields(),
     },
     {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'unavailable',
       before: calendarFields(),
     },
-    { restore_source: null, before_status: 'missing' },
+    { reprepare_source: null, restore_source: null, before_status: 'missing' },
     { extra: true },
     {
       conflicts: [
@@ -91,6 +95,7 @@ describe('calendar editor response boundary', () => {
       ...proposalWithFacts(),
       operation_kind: 'update',
       editor_facts: {
+        reprepare_source: null,
         restore_source: null,
         before_status: 'available',
         before: calendarFields(),

@@ -69,6 +69,7 @@ for (const kind of ['mail.reply', 'calendar.update'] as const) {
       base_etag: 'synthetic-etag',
       before_snapshot_id: '00000000-0000-0000-0000-000000000604',
       editor_facts: {
+        reprepare_source: null,
         restore_source: null,
         before_status: 'available' as const,
         before,

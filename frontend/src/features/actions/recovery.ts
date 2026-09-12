@@ -30,7 +30,10 @@ export function actionRecovery(error: unknown): ActionRecovery {
       traceId,
       action: 'reauthorize',
     }
-  if (/etag|expired|invalidated|payload_hash|not_editable/.test(code))
+  if (
+    code === 'calendar_event_version_conflict' ||
+    /etag|expired|invalidated|payload_hash|not_editable/.test(code)
+  )
     return {
       message: '原版本已不可使用，请重新加载并创建新版本。',
       traceId,

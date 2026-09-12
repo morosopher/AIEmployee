@@ -3,8 +3,12 @@ import { RouterLink } from 'vue-router'
 import type { ActionRecovery } from '@/features/actions/recovery'
 
 /** 固定错误文案和显式恢复动作；创建替代对象必须来自用户点击。 */
-defineProps<{ error: ActionRecovery | null; busy?: boolean }>()
-defineEmits<{ reload: []; newObject: [] }>()
+defineProps<{
+  error: ActionRecovery | null
+  busy?: boolean
+  newVersionAvailable?: boolean
+}>()
+defineEmits<{ reload: []; newObject: []; newVersion: [] }>()
 </script>
 <template>
   <div
@@ -22,6 +26,15 @@ defineEmits<{ reload: []; newObject: [] }>()
     >
       检查连接并重新授权
     </RouterLink>
+    <button
+      v-else-if="error.action === 'new_version' && newVersionAvailable"
+      type="button"
+      name="recover-new-version"
+      :disabled="busy"
+      @click="$emit('newVersion')"
+    >
+      创建新版本
+    </button>
     <button
       v-else-if="error.action === 'new_object'"
       type="button"

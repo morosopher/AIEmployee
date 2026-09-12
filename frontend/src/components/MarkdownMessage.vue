@@ -66,9 +66,11 @@ function open(event: MouseEvent): void {
 }
 </script>
 <template>
+  <!-- eslint-disable vue/no-v-html -- rendered 已经过禁用原始 HTML、协议白名单和 DOMPurify 清洗；仅此输出点允许 HTML。 -->
   <div
     class="markdown-message"
     @click="open"
     v-html="rendered"
   />
+  <!-- eslint-enable vue/no-v-html -->
 </template>

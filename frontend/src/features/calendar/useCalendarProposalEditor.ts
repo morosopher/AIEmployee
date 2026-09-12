@@ -153,25 +153,29 @@ export function useCalendarProposalEditor(
     availability.value = value.availability
     evidenceKey.value = currentKey.value
   }
-  /** 显式刷新读取原始 before 和当前冲突；不能从当前供应商事件重建 before。 */
-  async function reload(): Promise<void> {
+  /** 显式刷新原始 before 和当前冲突；只返回仍归属当前路由的已采纳版本，失败返回 null。 */
+  async function reload(): Promise<CalendarProposal | null> {
     const owner = ++epoch,
       id = proposalId.value
     if (!id) {
       proposal.value = null
       loading.value = false
-      return
+      return null
     }
     loading.value = true
     error.value = null
     try {
       const value = await getCalendarProposal(id)
-      if (!disposed && owner === epoch) adopt(value)
+      if (!disposed && owner === epoch) {
+        adopt(value)
+        return value
+      }
     } catch (cause) {
       if (!disposed && owner === epoch) failure(cause)
     } finally {
       if (!disposed && owner === epoch) loading.value = false
     }
+    return null
   }
   watch(
     proposalId,
@@ -287,6 +291,8 @@ export function useCalendarProposalEditor(
       cause instanceof EditorInputError
         ? { message: cause.message, traceId: null, action: 'retry' }
         : actionRecovery(cause)
+    // 版本失效可能先于 GET 状态抵达；错误当下即锁定旧输入，不能继续保存或重复提交。
+    if (error.value.action === 'new_version') refreshRequired.value = true
   }
   /** 保存或确认后先采纳新版本，再 GET 重读 facts；GET 失败也不能回退 CAS 版本。 */
   async function mutate(payload: UpdateCalendarProposalInput): Promise<void> {

@@ -32,6 +32,7 @@ const {
   loading,
   error,
   canSubmit,
+  recipientSummary,
   generationRunning,
   generationFailed,
   generationConnection,
@@ -93,6 +94,7 @@ onMounted(() => {
         :draft="draft"
         :entries="entries"
         :disabled="locked"
+        :recipient-summary="recipientSummary"
       />
       <p
         v-if="dirty"

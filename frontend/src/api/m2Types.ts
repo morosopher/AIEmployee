@@ -251,6 +251,8 @@ export interface CalendarAvailability {
 /** 原始修改前快照与本次有界冲突读取分别声明完整性，空列表只代表已执行检查。 */
 export type CalendarEditorFacts = {
   restore_source: { event_id: string; snapshot_id: string } | null
+  /** 仅服务端证明的本人本地 update 来源；旧缓存必须先同步并显式重读。 */
+  reprepare_source: { event_id: string; requires_sync: boolean } | null
 } & (
   | { before_status: 'available'; before: CalendarPreviewFields }
   | { before_status: 'not_applicable' | 'unavailable'; before: null }

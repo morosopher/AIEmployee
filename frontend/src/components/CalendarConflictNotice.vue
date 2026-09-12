@@ -1,8 +1,13 @@
 <script setup lang="ts">
 import type { CalendarConflictPreview } from '@/api/types'
+import type { ConnectionCatalogEntry } from '@/composables/useConnectionCatalog'
+import MissingCalendarConnections from './MissingCalendarConnections.vue'
 
 /** 只呈现服务端本人日历事实；不把缺失来源或参会人可用性伪装成已验证。 */
-defineProps<{ conflicts: CalendarConflictPreview[] }>()
+defineProps<{
+  conflicts: CalendarConflictPreview[]
+  entries?: ConnectionCatalogEntry[]
+}>()
 </script>
 <template>
   <section
@@ -26,10 +31,12 @@ defineProps<{ conflicts: CalendarConflictPreview[] }>()
           当前安排位于工作时间外。
         </template>
         <template v-else>
-          部分来源缺失（{{
-            conflict.missing_connection_ids.length
-          }}
+          部分来源缺失（{{ conflict.missing_connection_ids.length }}
           个连接），冲突检查可能不完整。
+          <MissingCalendarConnections
+            :connection-ids="conflict.missing_connection_ids"
+            :entries="entries"
+          />
         </template>
       </li>
     </ul>

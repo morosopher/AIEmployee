@@ -21,6 +21,7 @@ from ai_employee.application.use_cases.calendar_proposals import (
     CalendarRestoreSourceProjection,
     validate_calendar_restore_source_projection,
 )
+from ai_employee.domain.actions import CalendarProposalStatus
 from ai_employee.domain.errors import StateConflictError
 
 type BeforeStatus = Literal["not_applicable", "available", "unavailable"]
@@ -34,6 +35,24 @@ class CalendarRestoreSource(BaseModel):
     snapshot_id: UUID
 
 
+class CalendarReprepareSource(BaseModel):
+    """原修改提案的本地重新准备入口；同步要求只是阻止重用已知过期缓存，不授予写权限。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    event_id: UUID
+    requires_sync: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarReprepareSourceProjection:
+    """短读中按本人及原连接/日历/供应商事件三元身份查询的最小来源证明。"""
+
+    event_id: UUID
+    current_etag: str | None
+    before_operation_id: UUID
+    before_source_event_ids: tuple[str, ...]
+
+
 class CalendarEditorFacts(BaseModel):
     """编辑 GET 的类型化事实；incomplete 绝不能显示为已检查且没有冲突。"""
 
@@ -43,6 +62,7 @@ class CalendarEditorFacts(BaseModel):
     conflict_status: Literal["incomplete", "checked"]
     conflicts: list[CalendarConflictPreview] | None
     restore_source: CalendarRestoreSource | None = None
+    reprepare_source: CalendarReprepareSource | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +74,7 @@ class CalendarEditorRead:
     before_status: BeforeStatus
     context: CalendarAvailabilityContext | None
     restore_source_projection: CalendarRestoreSourceProjection | None = None
+    reprepare_source_projection: CalendarReprepareSourceProjection | None = None
 
 
 class CalendarEditorPersistence(Protocol):
@@ -122,7 +143,48 @@ class CalendarEditorUseCase:
             conflict_status="checked" if checked else "incomplete",
             conflicts=conflicts,
             restore_source=_restore_source(loaded, observed_at=observed_at),
+            reprepare_source=_reprepare_source(loaded),
         )
+
+
+def _reprepare_source(loaded: CalendarEditorRead) -> CalendarReprepareSource | None:
+    """核实受认证的原来源，给可重新准备的 update 返回精确本地事件和同步要求。
+
+    Args:
+        loaded: 同一本人短事务取得的提案、原 before 及三元身份匹配的事件投影。
+
+    Returns:
+        仅 editing/stale/cancelled update 可获得入口；来源或 before 无法证明时返回空。
+        旧缓存只在 stale 时因相同 ETag 被阻断，其他状态相同 ETag 仍可建立独立新意图。
+    """
+    proposal, projection = loaded.proposal, loaded.reprepare_source_projection
+    if (
+        proposal.operation_kind != "update"
+        or proposal.status
+        not in {
+            CalendarProposalStatus.EDITING,
+            CalendarProposalStatus.STALE,
+            CalendarProposalStatus.CANCELLED,
+        }
+        or loaded.before_status != "available"
+        or projection is None
+        or projection.before_operation_id != proposal.content.operation_id
+        # 精确字符串比较同时拒绝 provider ID、非规范 UUID、多个来源及已认证但错绑的来源。
+        or proposal.content.source_event_ids != (str(projection.event_id),)
+        or projection.before_source_event_ids != proposal.content.source_event_ids
+    ):
+        return None
+    return CalendarReprepareSource(
+        event_id=projection.event_id,
+        requires_sync=(
+            not projection.current_etag
+            or not projection.current_etag.strip()
+            or (
+                proposal.status is CalendarProposalStatus.STALE
+                and projection.current_etag == proposal.base_etag
+            )
+        ),
+    )
 
 
 def _restore_source(

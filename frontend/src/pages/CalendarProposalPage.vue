@@ -5,6 +5,7 @@ import type { CalendarConfirmation } from '@/api/types'
 import { useConnectionCatalog } from '@/composables/useConnectionCatalog'
 import { useCalendarProposalEditor } from '@/features/calendar/useCalendarProposalEditor'
 import { useCalendarRestore } from '@/features/calendar/useCalendarRestore'
+import { useCalendarReprepare } from '@/features/calendar/useCalendarReprepare'
 import { useLocalActionCreation } from '@/features/actions/useLocalActionCreation'
 import {
   actionStatusLabel,
@@ -15,6 +16,8 @@ import CalendarProposalFields from '@/components/CalendarProposalFields.vue'
 import CalendarTargetFields from '@/components/CalendarTargetFields.vue'
 import CalendarFieldsComparison from '@/components/CalendarFieldsComparison.vue'
 import CalendarConflictNotice from '@/components/CalendarConflictNotice.vue'
+import MissingCalendarConnections from '@/components/MissingCalendarConnections.vue'
+import CalendarRepreparePanel from '@/components/CalendarRepreparePanel.vue'
 import EditorRecovery from '@/components/EditorRecovery.vue'
 import LinkedActionPanel from '@/components/LinkedActionPanel.vue'
 
@@ -35,7 +38,7 @@ const {
   form,
   loading,
   busy,
-  locked,
+  locked: proposalLocked,
   error,
   dirty,
   fieldsDirty,
@@ -60,6 +63,39 @@ const {
   prepare: prepareRestore,
 } = useCalendarRestore(proposal, busy, (taskId) =>
   router.push({ path: '/tasks', query: { task_id: taskId } }),
+)
+const {
+  eligible: reprepareEligible,
+  visible: reprepareVisible,
+  source: reprepareSource,
+  busy: reprepareBusy,
+  error: reprepareError,
+  canPrepare,
+  syncTaskId,
+  syncStatus,
+  syncRunning,
+  prepare: prepareVersion,
+  sync: syncReprepare,
+  refresh: refreshReprepare,
+} = useCalendarReprepare(
+  proposalId,
+  proposal,
+  computed(() => busy.value || restoreBusy.value),
+  computed(
+    () =>
+      route.query.recovery === 'new_version' ||
+      error.value?.action === 'new_version',
+  ),
+  reload,
+  (id) => router.push(`/calendar/proposals/${id}`),
+)
+// 恢复期间旧输入持续锁定；新路由没有恢复枚举，读取新 editing 后才能独立编辑。
+const locked = computed(
+  () =>
+    proposalLocked.value ||
+    reprepareVisible.value ||
+    reprepareBusy.value ||
+    restoreBusy.value,
 )
 const {
   newCalendar,
@@ -90,15 +126,21 @@ onMounted(() => {
       正在加载提案与日历目录…
     </p>
     <EditorRecovery
-      :error="error || restoreError || catalogError || creationError"
-      :busy="busy || restoreBusy || creating"
+      :error="
+        error || reprepareError || restoreError || catalogError || creationError
+      "
+      :busy="busy || reprepareBusy || restoreBusy || creating"
+      :new-version-available="
+        reprepareEligible && !!reprepareSource && !reprepareSource.requires_sync
+      "
       @reload="reload"
       @new-object="newCalendar"
+      @new-version="prepareVersion"
     />
     <button
       type="button"
       name="reload-editor"
-      :disabled="busy || restoreBusy"
+      :disabled="busy || restoreBusy || reprepareBusy"
       @click="reload"
     >
       重新加载提案
@@ -107,6 +149,20 @@ onMounted(() => {
       <p>
         版本 {{ proposal.version }} · {{ actionStatusLabel(proposal.status) }}
       </p>
+      <CalendarRepreparePanel
+        v-if="reprepareVisible"
+        :connection-id="proposal.connection_id"
+        :entries="entries"
+        :source="reprepareSource"
+        :busy="busy || reprepareBusy || restoreBusy"
+        :can-prepare="canPrepare"
+        :sync-task-id="syncTaskId"
+        :sync-status="syncStatus"
+        :sync-running="syncRunning"
+        @prepare="prepareVersion"
+        @sync="syncReprepare"
+        @refresh="refreshReprepare"
+      />
       <section
         v-if="
           proposal.operation_kind === 'update' && proposal.status === 'applied'
@@ -209,6 +265,7 @@ onMounted(() => {
         v-if="conflicts !== null"
         data-testid="calendar-conflicts"
         :conflicts="conflicts"
+        :entries="entries"
       />
       <p
         v-else
@@ -235,6 +292,11 @@ onMounted(() => {
           部分日历来源缺失（{{ candidates.missing_connections.length }}
           个连接）。
         </p>
+        <MissingCalendarConnections
+          v-if="candidates.completeness === 'partial'"
+          :connection-ids="candidates.missing_connections"
+          :entries="entries"
+        />
         <p>未检查参会人可用性。选择候选后仍需保存并确认。</p>
         <p v-if="!candidates.candidates.length">
           当前范围没有可用候选，可调整时间后重试。
@@ -272,7 +334,7 @@ onMounted(() => {
       <button
         type="button"
         name="submit-proposal"
-        :disabled="!canSubmit"
+        :disabled="!canSubmit || locked"
         @click="submit"
       >
         提交审批

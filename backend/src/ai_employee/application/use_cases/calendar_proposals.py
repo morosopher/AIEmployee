@@ -722,8 +722,16 @@ class CalendarProposalUseCase:
         event_id: UUID,
         changes: Mapping[str, object],
         idempotency_key: str | None = None,
+        requires_explicit_confirmation: bool = False,
     ) -> CalendarProposalView:
-        """从本地最新事件创建修改提案并保存加密 before snapshot。"""
+        """从本地最新事件创建修改提案并保存加密 before snapshot。
+
+        显式来源 shell 只复制输入值，四项确认留给用户独立完成；该语义只进入 desired 和
+        创建哈希，不改变原始 before。完整 update 与历史内部调用保留原确认语义。shell
+        必须携带独立请求键且不混入字段修改，避免同一意图跨初始化模式被隐式复用。
+        """
+        if requires_explicit_confirmation and (changes or idempotency_key is None):
+            raise ValueError("update shell requires an explicit creation key and no changes")
         binding = await self._calendar.get_proposal_event_binding(
             user_id=user_id,
             event_id=event_id,
@@ -753,8 +761,17 @@ class CalendarProposalUseCase:
         # 创建哈希明确排除随机 operation_id，因此先用零 UUID 形成规范请求，才能在
         # 重放路径上不消耗任何新 ID，同时仍对同键异载荷执行常量时间拒绝。
         hash_before = _content_from_local_event(event, operation_id=UUID(int=0))
+        desired_base = hash_before
+        if requires_explicit_confirmation:
+            shell_values = hash_before.model_dump(mode="python")
+            shell_values.update(
+                requires_explicit_confirmation=True,
+                required_confirmations=_SHELL_CONFIRMATIONS,
+                confirmed_fields=(),
+            )
+            desired_base = CalendarProposalContent.model_validate(shell_values)
         hash_desired = _apply_user_changes(
-            hash_before,
+            desired_base,
             changes,
             operation_kind="update",
             target=target,

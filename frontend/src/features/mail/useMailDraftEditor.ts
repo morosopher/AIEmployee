@@ -30,6 +30,13 @@ export interface MailEditorForm {
   body_text: string
 }
 
+/** 当前输入的即时规模；校验失败时不把原始项数当作已经确认的收件人数。 */
+export interface MailRecipientSummary {
+  count: number | null
+  inputCount: number | null
+  error: string | null
+}
+
 /**
  * @param draftId 路由中的已知本地草稿 ID。
  * @param submitted 只在服务端返回 task_id 后导航到权威操作快照。
@@ -161,6 +168,32 @@ export function useMailDraftEditor(
         : {}),
     }
   }
+  const recipientSummary = computed<MailRecipientSummary>(() => {
+    let inputCount: number | null = null
+    try {
+      // 与保存共用现有解析和跨字段校验；不额外猜测后端邮箱规范化或去重结果。
+      const groups = [
+        recipientList(form.to),
+        recipientList(form.cc),
+        recipientList(form.bcc),
+      ]
+      inputCount = groups.reduce(
+        (count, addresses) => count + addresses.length,
+        0,
+      )
+      validateRecipientGroups(...groups)
+      return { count: inputCount, inputCount, error: null }
+    } catch (cause) {
+      return {
+        count: null,
+        inputCount,
+        error:
+          cause instanceof EditorInputError
+            ? cause.message
+            : '请检查收件人输入。',
+      }
+    }
+  })
   const canSubmit = computed(() => {
     if (locked.value || dirty.value) return false
     try {
@@ -256,6 +289,7 @@ export function useMailDraftEditor(
     loading,
     error,
     canSubmit,
+    recipientSummary,
     generationRunning,
     generationFailed,
     generationConnection,

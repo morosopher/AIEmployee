@@ -8308,6 +8308,18 @@ composable 和小组件；Brief 使用真实来源和稳定 intent，Chat 同时
 creation key；缺失或篡改时返回null。恢复新提案仅通知策略待显式确认，先证明确认前提交
 被拒绝；覆盖同事件另一before、错误kind/status/marker、跨用户、错误意图及GET/SSE一致。
 
+**审查修复的已批准衔接（2026-09-12）：** 按规格 15.2/16.4 先补正式失败回归，再为编辑 GET
+增加可空 `reprepare_source:{event_id,requires_sync}`；只接受 editing/stale/cancelled update
+的可认证 before、单个规范本地来源和本人连接/日历/供应商事件精确绑定，其他状态或不可证明
+来源返回 null。固定有界读取当前 ETag，stale 旧缓存或无有效 ETag 必须先通过既有连接同步
+和真实任务状态引导，完成后显式重读。显式重新准备先 GET 复核再复用 update shell POST，
+未知回执重试保留同一意图，旧对象保持锁定，新对象独立核对/确认/审批。审批恢复链接仅传
+严格 `recovery=new_version` 枚举，覆盖生产错误码 `calendar_event_version_conflict`。
+真实 HTTP/DB 回归证明资格拒绝、旧缓存、同步后新 before/ETag、原对象不变和未自动审批；
+前端与原生浏览器覆盖失效入口、同步任务、重读、新 editing 对象、重复点击及晚到响应。
+同轮修复邮件当前人数与候选/冲突旁缺失账户身份，保留非法/重复地址校验和目录不可用事实；
+只对已清洗 Markdown 的有意 HTML sink 作窄范围 lint 说明，保留安全回归，不扩大里程碑。
+
 **Files:**
 - Create: `frontend/src/pages/MailDraftPage.vue`
 - Create: `frontend/src/pages/CalendarProposalPage.vue`

@@ -53,6 +53,7 @@ test('calendar candidates advance the saved version before four explicit confirm
     ...calendarProposal(),
     calendar_id: 'synthetic-google-calendar',
     editor_facts: {
+      reprepare_source: null,
       restore_source: null,
       before_status: 'not_applicable',
       before: null,
@@ -102,6 +103,7 @@ test('calendar candidates advance the saved version before four explicit confirm
             version: proposal.version + 1,
             availability: null,
             editor_facts: {
+              reprepare_source: null,
               restore_source: null,
               before_status: 'not_applicable',
               before: null,
@@ -129,7 +131,25 @@ test('calendar candidates advance the saved version before four explicit confirm
           ends_at: `2030-01-0${day}T02:00:00Z`,
         })),
       }
-      proposal = { ...proposal, version: 3, availability }
+      if (!proposal.editor_facts)
+        throw new Error('Synthetic editor facts missing')
+      proposal = {
+        ...proposal,
+        version: 3,
+        availability,
+        editor_facts: {
+          ...proposal.editor_facts,
+          conflict_status: 'checked',
+          conflicts: [
+            {
+              kind: 'partial_sources',
+              starts_at: null,
+              ends_at: null,
+              missing_connection_ids: availability.missing_connections,
+            },
+          ],
+        },
+      }
       await editorJson(route, availability)
     },
   )
@@ -233,6 +253,13 @@ test('calendar candidates advance the saved version before four explicit confirm
   await expect(
     page.getByRole('region', { name: '服务端候选时间' }),
   ).toContainText('未检查参会人可用性')
+  for (const region of [
+    page.getByRole('region', { name: '服务端候选时间' }),
+    page.getByTestId('calendar-conflicts'),
+  ]) {
+    await expect(region).toContainText('Microsoft')
+    await expect(region).toContainText(connection('microsoft').account_email)
+  }
   await page.locator('button[name="choose-candidate"]').first().click()
   await expect(page.locator('button[name="choose-candidate"]')).toHaveCount(0)
   await expect(page.getByTestId('calendar-conflicts')).toHaveCount(0)
@@ -292,11 +319,13 @@ test('calendar candidates advance the saved version before four explicit confirm
   expect(capture.pageErrors).toEqual([])
 })
 
-test('an update retains its original before value and exposes stale ETag recovery without replay', async ({
+test('a production event version conflict opens a new editable update while preserving the original', async ({
   page,
 }) => {
   const capture = await editorWorkspace(page)
   const before = calendarFields()
+  const eventId = '00000000-0000-0000-0000-000000000681'
+  const newId = '00000000-0000-0000-0000-000000000698'
   let proposal: CalendarProposal = {
     ...calendarProposal(),
     ...before,
@@ -311,6 +340,7 @@ test('an update retains its original before value and exposes stale ETag recover
     changed_fields: ['location'],
     field_diffs: [{ field: 'location', changed: true }],
     editor_facts: {
+      reprepare_source: { event_id: eventId, requires_sync: false },
       restore_source: null,
       before_status: 'available',
       before,
@@ -318,15 +348,55 @@ test('an update retains its original before value and exposes stale ETag recover
       conflicts: [],
     },
   }
-  await page.route(`**/api/v1/calendar/proposals/${PROPOSAL_ID}`, (route) =>
-    editorJson(route, proposal),
+  const freshBefore = { ...before, location: 'Synthetic synchronized room' }
+  const prepared: CalendarProposal = {
+    ...proposal,
+    ...freshBefore,
+    id: newId,
+    status: 'editing',
+    version: 1,
+    base_etag: 'synthetic-etag-refreshed',
+    before_snapshot_id: '00000000-0000-0000-0000-000000000697',
+    changed_fields: [],
+    field_diffs: [],
+    required_confirmations: [
+      'calendar',
+      'time',
+      'attendees',
+      'notification_policy',
+    ],
+    editor_facts: {
+      before_status: 'available',
+      before: freshBefore,
+      conflict_status: 'checked',
+      conflicts: [],
+      restore_source: null,
+      reprepare_source: { event_id: eventId, requires_sync: false },
+    },
+  }
+  let reads = 0
+  await page.route(`**/api/v1/calendar/proposals/${PROPOSAL_ID}`, (route) => {
+    reads += 1
+    return editorJson(route, proposal)
+  })
+  await page.route('**/api/v1/calendar/proposals', async (route) => {
+    expect(reads).toBeGreaterThanOrEqual(2)
+    expect(route.request().postDataJSON()).toEqual({
+      operation_kind: 'update',
+      initialization: 'shell',
+      event_id: eventId,
+    })
+    await editorJson(route, { ...prepared, editor_facts: null }, 201)
+  })
+  await page.route(`**/api/v1/calendar/proposals/${newId}`, (route) =>
+    editorJson(route, prepared),
   )
   await page.route(
     `**/api/v1/calendar/proposals/${PROPOSAL_ID}/submit`,
     async (route) => {
       expect(route.request().postDataJSON()).toEqual({ version: 1 })
       proposal = { ...proposal, status: 'stale' }
-      await editorProblem(route, 'calendar_etag_stale')
+      await editorProblem(route, 'calendar_event_version_conflict')
     },
   )
   await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
@@ -337,13 +407,22 @@ test('an update retains its original before value and exposes stale ETag recover
   await page.getByRole('button', { name: '提交审批', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('synthetic-editor-trace')
   await expect(page.getByRole('alert')).toContainText('创建新版本')
-  await page.getByRole('button', { name: '重新加载提案', exact: true }).click()
+  await expect(page.getByLabel('日程标题', { exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: '创建新版本', exact: true }).click()
+  await expect(page).toHaveURL(new RegExp(`/calendar/proposals/${newId}$`))
+  await expect(page.getByLabel('日程标题', { exact: true })).toBeEnabled()
+  await expect(page.getByText('待确认：4 项', { exact: true })).toBeVisible()
+  await expect(page.getByRole('table')).toContainText(freshBefore.location)
   await expect(
     page.getByRole('button', { name: '提交审批', exact: true }),
   ).toBeDisabled()
   expect(capture.mutations.map((item) => item.path)).toEqual([
     `/calendar/proposals/${PROPOSAL_ID}/submit`,
+    '/calendar/proposals',
   ])
+  expect(proposal.status).toBe('stale')
+  expect(proposal.editor_facts?.before).toEqual(before)
+  expect(proposal.base_etag).toBe('synthetic-etag-original')
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })

@@ -1104,6 +1104,22 @@ null），`before_status` 为 `not_applicable/available/unavailable`；`conflict
 `editor_facts` 为 null，
 编辑器保存或确认后重取 GET，并在未保存时间变化时立即废弃旧检查结果。
 
+`editor_facts.reprepare_source` 为 null 或精确 `{event_id:UUID, requires_sync:boolean}`。
+仅本人 update 的 editing/stale/cancelled 状态可以提供入口：原 before 必须仍可认证，
+受认证内容中的来源必须是精确单元素规范本地 UUID，并与本人当前事件、原提案的连接、
+日历和供应商事件三元身份一致。来源不可证明、多个来源、跨用户或不存在时均为 null；
+awaiting_approval/executing/needs_attention/applied 不提供该入口。stale 且本地 ETag 仍等于
+旧 base ETag，或当前缺少有效 ETag 时，`requires_sync=true`；其他合格状态不因 ETag 相等
+被永久锁定。本投影使用同一固定有界短读，不入队、不读取供应商，也不代表完整新鲜度证明。
+
+日程新版本恢复必须由用户显式触发：先 GET 复核当前入口，以其本地 UUID 和稳定新意图调用
+既有 update shell POST。需要同步时展示目标账户，衔接既有连接同步操作和真实异步任务状态，
+任务完成后允许显式重读；不能用原过期缓存再次准备。来源不可证明时提供可达的合法来源重选
+或连接同步引导，不能猜测供应商 ID、默认切换账户或用空白 create 替代 update。未知创建回执
+重试沿用同一来源/原提案意图，并发点击和路由切换隔离晚到响应。新 editing 提案重新读取合法
+本地 before/ETag；创建端口继续验证来源与能力，旧提案、审批、执行和 before 不变，用户仍需
+独立编辑、逐项确认并提交审批。
+
 `editor_facts.restore_source` 为 null 或精确 `{event_id:UUID, snapshot_id:UUID}`。只有本人
 已应用的 update 提案、仍可用的原 before 与本地事件三元身份通过现有恢复来源校验时，才
 提供该入口事实；供应商 `target_event_id` 不能当作本地事件 UUID。该投影不授予执行权限，
@@ -1210,6 +1226,8 @@ SSE 继续从 PostgreSQL 按游标重放，不携带凭据或重发供应商操�
 
 按命令类型展示结构化预览，不使用通用 JSON `<pre>` 作为正式体验。批准和拒绝期间禁用重复
 提交；过期、版本变化、哈希冲突和能力撤销统一展示可执行恢复动作。
+日程版本冲突包括生产稳定码 `calendar_event_version_conflict`。新版本入口以严格枚举
+`recovery=new_version` 指向原编辑页，落地后展示上述重新准备流程，仍需另行显式操作。
 
 ### 16.5 `needs_attention`
 

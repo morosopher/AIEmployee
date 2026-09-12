@@ -67,6 +67,7 @@ export function parseCalendarEditorFacts(value: unknown): CalendarEditorFacts {
     'conflict_status',
     'conflicts',
     'restore_source',
+    'reprepare_source',
   ]
   if (Object.keys(o).length !== keys.length || keys.some((key) => !(key in o)))
     throw new Error('Invalid editor facts fields')
@@ -88,6 +89,20 @@ export function parseCalendarEditorFacts(value: unknown): CalendarEditorFacts {
       snapshot_id: v.uuid(source.snapshot_id),
     }
   })
+  const reprepare_source = v.nullable(o.reprepare_source, (value) => {
+    const source = v.record(value)
+    if (
+      Object.keys(source).length !== 2 ||
+      !('event_id' in source) ||
+      !('requires_sync' in source)
+    )
+      throw new Error('Invalid reprepare source fields')
+    const event_id = v.uuid(source.event_id)
+    // 本地 UUID 必须保持服务端规范形式，不能把供应商 ID 或宽松别名当成原来源。
+    if (event_id !== event_id.toLowerCase())
+      throw new Error('Invalid canonical reprepare identifier')
+    return { event_id, requires_sync: v.boolean(source.requires_sync) }
+  })
   const before =
     beforeStatus === 'available'
       ? { before_status: beforeStatus, before: parseCalendarFields(o.before) }
@@ -103,6 +118,7 @@ export function parseCalendarEditorFacts(value: unknown): CalendarEditorFacts {
     return {
       ...before,
       restore_source,
+      reprepare_source,
       conflict_status: 'incomplete',
       conflicts: null,
     }
@@ -110,6 +126,7 @@ export function parseCalendarEditorFacts(value: unknown): CalendarEditorFacts {
   return {
     ...before,
     restore_source,
+    reprepare_source,
     conflict_status: 'checked',
     conflicts: v.array(o.conflicts, parseCalendarConflict),
   }
