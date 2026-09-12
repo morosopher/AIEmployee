@@ -45,6 +45,123 @@ function completeFields(proposal: CalendarProposal): CalendarPreviewFields {
   }
 }
 
+/** PATCH 回执只有新 CAS；原生页面必须等显式完整 GET 才能恢复前后事实与后续操作。 */
+for (const operation of ['save', 'last-confirmation'] as const) {
+  test(`calendar keeps version locked after ${operation} until failed facts read is explicitly recovered`, async ({
+    page,
+  }) => {
+    const capture = await editorWorkspace(page)
+    const before = { ...calendarFields(), location: 'Synthetic previous room' }
+    let proposal: CalendarProposal = {
+      ...calendarProposal(),
+      ...before,
+      location: 'Synthetic proposed room',
+      calendar_id: 'synthetic-google-calendar',
+      operation_kind: 'update',
+      target_event_id: 'synthetic-refresh-event',
+      base_etag: 'synthetic-refresh-etag',
+      before_snapshot_id: '00000000-0000-0000-0000-000000000682',
+      notification_policy: 'none',
+      required_confirmations:
+        operation === 'save' ? ['time'] : ['notification_policy'],
+      changed_fields: ['location'],
+      field_diffs: [{ field: 'location', changed: true }],
+      editor_facts: {
+        reprepare_source: null,
+        restore_source: null,
+        before_status: 'available',
+        before,
+        conflict_status: 'checked',
+        conflicts: [],
+      },
+    }
+    let reads = 0
+    await page.route(
+      `**/api/v1/calendar/proposals/${PROPOSAL_ID}`,
+      async (route) => {
+        if (route.request().method() === 'PATCH') {
+          const input = route
+            .request()
+            .postDataJSON() as UpdateCalendarProposalInput
+          expect(input.version).toBe(proposal.version)
+          if ('confirmation' in input && input.confirmation) {
+            const confirmation = input.confirmation
+            proposal = {
+              ...proposal,
+              version: input.version + 1,
+              required_confirmations: proposal.required_confirmations.filter(
+                (kind) => kind !== confirmation.kind,
+              ),
+            }
+          } else {
+            proposal = {
+              ...proposal,
+              ...input,
+              attendees: input.attendees ?? proposal.attendees,
+              version: input.version + 1,
+              changed_fields: ['location', 'title'],
+              field_diffs: [
+                { field: 'location', changed: true },
+                { field: 'title', changed: true },
+              ],
+            }
+          }
+          await editorJson(route, { ...proposal, editor_facts: null })
+          return
+        }
+        reads += 1
+        if (reads === 2) await editorProblem(route, 'service_unavailable', 503)
+        else await editorJson(route, proposal)
+      },
+    )
+    await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+    await expect(page.getByRole('table')).toContainText(before.location)
+    if (operation === 'save') {
+      await page
+        .getByLabel('日程标题', { exact: true })
+        .fill('Synthetic refreshed title')
+      await page.locator('button[name="save-proposal"]').click()
+    } else
+      await page.locator('button[name="confirm-notification_policy"]').click()
+
+    await expect(page.getByRole('alert')).toContainText(
+      'synthetic-editor-trace',
+    )
+    await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+    await expect(page.getByRole('table')).toHaveCount(0)
+    await expect(page.getByLabel('日程标题', { exact: true })).toBeDisabled()
+    await expect(page.locator('button[name="confirm-time"]')).toBeDisabled()
+    await expect(page.locator('button[name="submit-proposal"]')).toBeDisabled()
+    expect(reads).toBe(2)
+    expect(capture.mutations).toHaveLength(1)
+    expect(capture.mutations[0]?.method).toBe('PATCH')
+    expect(
+      capture.mutations.filter((item) => item.path.endsWith('/submit')),
+    ).toHaveLength(0)
+
+    await page.locator('button[name="reload-editor"]').click()
+    await expect(page.getByRole('table')).toContainText(before.location)
+    await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+    await expect(page.getByLabel('日程标题', { exact: true })).toBeEnabled()
+    expect(reads).toBe(3)
+    expect(capture.mutations).toHaveLength(1)
+    if (operation === 'save') {
+      await page.locator('button[name="confirm-time"]').click()
+      await expect(page.getByText('版本 3', { exact: false })).toBeVisible()
+      expect(capture.mutations[1]?.payload).toEqual({
+        version: 2,
+        confirmation: { kind: 'time' },
+      })
+    }
+    await expect(page.locator('button[name="submit-proposal"]')).toBeEnabled()
+    expect(
+      capture.mutations.filter((item) => item.path.endsWith('/submit')),
+    ).toHaveLength(0)
+    expect(capture.unexpected).toEqual([])
+    expect(capture.pageErrors).toEqual([])
+  })
+}
+
 test('calendar candidates advance the saved version before four explicit confirmations and approval', async ({
   page,
 }) => {

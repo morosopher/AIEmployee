@@ -11,6 +11,60 @@ import {
 import { connection, mailApproval } from '../src/test-support/editorFixtures'
 import { editorAction, editorJson, editorWorkspace } from './fixtures/editorApi'
 
+/** 邮箱身份只归一域名；真实输入控件、人数与保存请求必须保留用户给出的本地部分大小写。 */
+test('mailbox identity preserves local part case and original input through visible count and save', async ({
+  page,
+}) => {
+  const capture = await editorWorkspace(page)
+  const to = 'CaseUser@mail.example.test'
+  const duplicate = 'CaseUser@MAIL.EXAMPLE.TEST'
+  const distinct = 'caseUser@MAIL.EXAMPLE.TEST'
+  let draft: MailDraft = { ...mailDraft(), to: [to], cc: [], bcc: [] }
+  await page.route(`**/api/v1/mail/drafts/${DRAFT_ID}`, async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const input = route.request().postDataJSON() as UpdateMailDraftInput
+      expect(input).toEqual(
+        expect.objectContaining({
+          version: 1,
+          to: [to],
+          cc: [distinct],
+          bcc: [],
+        }),
+      )
+      draft = { ...draft, ...input, version: 2 }
+    }
+    await editorJson(route, draft)
+  })
+  await page.goto(`/mail/drafts/${DRAFT_ID}`)
+  const toInput = page.getByLabel('收件人 To', { exact: true })
+  const ccInput = page.getByLabel('抄送 CC', { exact: true })
+  await ccInput.fill(duplicate)
+  await expect(page.getByTestId('recipient-count')).toContainText(
+    '收件人地址重复',
+  )
+  await page.locator('button[name="save-draft"]').click()
+  await expect(page.getByRole('alert')).toContainText('收件人地址重复')
+  expect(capture.mutations).toHaveLength(0)
+  await expect(ccInput).toHaveValue(duplicate)
+
+  await ccInput.fill(distinct)
+  await expect(page.getByTestId('recipient-count')).toHaveText(
+    '当前收件人数：2 位',
+  )
+  await page.locator('button[name="save-draft"]').click()
+  await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+  await expect(page.getByTestId('recipient-count')).toHaveText(
+    '当前收件人数：2 位',
+  )
+  await expect(toInput).toHaveValue(to)
+  await expect(ccInput).toHaveValue(distinct)
+  expect(capture.mutations.map((item) => item.path)).toEqual([
+    `/mail/drafts/${DRAFT_ID}`,
+  ])
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
 /** 路由 fixture 验证浏览器交互与精确请求；后端持久化和供应商语义另由 HTTP/数据库测试证明。 */
 test('new mail stays local until explicit submission and can withdraw its frozen approval', async ({
   page,

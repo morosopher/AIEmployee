@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import TypeAdapter
 from sqlalchemy import func, select, update
 
 from ai_employee.application.commands import trusted_command_hash
@@ -18,13 +19,23 @@ from ai_employee.application.ports.calendar import (
     CalendarEvent,
     CalendarSyncPage,
 )
+from ai_employee.application.trusted_action_summary import TrustedActionStepSummary
+from ai_employee.application.use_cases.action_views import (
+    ActionListPage,
+    ActionSnapshot,
+    CalendarApprovalPreview,
+)
 from ai_employee.application.use_cases.sync_calendar import CalendarSyncStore, SyncCalendarUseCase
 from ai_employee.config import get_settings
 from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeProposalModel,
     CalendarChangeSnapshotModel,
 )
-from ai_employee.infrastructure.db.models.sources import CalendarEventModel, SyncCursorModel
+from ai_employee.infrastructure.db.models.sources import (
+    CalendarEventModel,
+    OAuthConnectionModel,
+    SyncCursorModel,
+)
 from ai_employee.infrastructure.db.models.tasks import (
     ApprovalRequestModel,
     AuditEventModel,
@@ -181,7 +192,7 @@ async def _seed_stale_history(clients: AuthenticatedApiClients, proposal_id: UUI
     """播种已确认命令遇到 ETag 冲突后的合成历史，不打开写入开关或调用执行器。
 
     命令从真实 HTTP 编辑/确认后的不可变内容形成并经过现有哈希与 AEAD 边界；历史行只供
-    验证重新准备不会改写原审批、执行和审计，不能作为真实执行成功的证据。
+    验证合法操作中心历史可读且重新准备不会改写原审批、执行和审计，不能作为真实执行成功的证据。
     """
     cipher = ActionPayloadCipher(AeadCipher.from_file(get_settings().app_master_key_file))
     task_id, step_id, approval_id, execution_id = (uuid4() for _ in range(4))
@@ -248,12 +259,11 @@ async def _seed_stale_history(clients: AuthenticatedApiClients, proposal_id: UUI
                 name="execute_calendar_update",
                 kind="trusted_action",
                 status="failed",
-                input_summary={
-                    "schema_version": "trusted_action_step.v1",
-                    "action": "calendar.update",
-                    "proposal_version": snapshot.current_version,
-                    "frozen_connection_id": str(snapshot.connection_id),
-                },
+                input_summary=TrustedActionStepSummary(
+                    action="calendar.update",
+                    proposal_version=snapshot.current_version,
+                    frozen_connection_id=snapshot.connection_id,
+                ).as_json(),
                 error_code="calendar_event_version_conflict",
             )
         )
@@ -346,6 +356,63 @@ async def _history_fingerprints(
             assert rows
             fingerprints.append(sha256(repr(sorted(map(repr, rows))).encode("utf-8")).hexdigest())
         return tuple(fingerprints)
+
+
+async def _history_projection(
+    clients: AuthenticatedApiClients,
+    *,
+    proposal_id: UUID,
+    task_id: UUID,
+    connection_id: UUID,
+    proposal_version: int,
+) -> tuple[str, str]:
+    """经真实详情和列表验证合成历史可读，并摘要比较冻结内容及其账户归属。
+
+    当前冲突是每次 GET 按本地同步结果重算的只读事实，不属于冻结历史；仅该字段不参与
+    前后投影摘要。其余详情、列表和独立的全部数据库列指纹必须保持不变，失败不输出内容。
+    """
+    detail = await clients.owner.get(f"/api/v1/actions/{task_id}")
+    listing = await clients.owner.get(
+        "/api/v1/actions",
+        params={"item_kind": "trusted_task", "provider": "google", "action": "calendar.update"},
+    )
+    assert listing.status_code == 200
+    assert (detail.status_code, [item["task_id"] for item in listing.json()["items"]]) == (
+        200,
+        [str(task_id)],
+    )
+    adapter = TypeAdapter(ActionSnapshot)
+    snapshot = adapter.validate_python(detail.json())
+    page = ActionListPage.model_validate(listing.json())
+    assert snapshot.task_id == task_id and snapshot.status == "failed"
+    assert snapshot.action == "calendar.update" and snapshot.provider == "google"
+    assert snapshot.local_action is not None and snapshot.local_action.id == proposal_id
+    assert snapshot.local_action.version == proposal_version
+    assert snapshot.approval is not None
+    assert snapshot.approval.proposal_version == proposal_version
+    assert snapshot.approval.content_status == "available"
+    preview = snapshot.approval.preview
+    assert isinstance(preview, CalendarApprovalPreview)
+    assert preview.operation == "update" and preview.provider == "google"
+    assert snapshot.execution is not None and snapshot.execution.status == "failed"
+    assert snapshot.execution.error_code == "calendar_event_version_conflict"
+    async with clients.session_factory() as session:
+        frozen_account = await session.scalar(
+            select(OAuthConnectionModel.account_email).where(
+                OAuthConnectionModel.id == connection_id,
+                OAuthConnectionModel.user_id == clients.owner_id,
+            )
+        )
+    assert frozen_account is not None
+    assert (
+        sha256(preview.account_email.encode()).digest() == sha256(frozen_account.encode()).digest()
+    )
+    return (
+        sha256(
+            adapter.dump_json(snapshot, exclude={"approval": {"preview": {"conflicts"}}})
+        ).hexdigest(),
+        sha256(page.model_dump_json().encode()).hexdigest(),
+    )
 
 
 @pytest.mark.parametrize(
@@ -573,6 +640,17 @@ async def test_reprepare_editor_syncs_then_creates_independent_before_and_etag(
         if history_task_id is not None
         else None
     )
+    history_projection = (
+        await _history_projection(
+            clients,
+            proposal_id=proposal_id,
+            task_id=history_task_id,
+            connection_id=connection_id,
+            proposal_version=original["version"],
+        )
+        if history_task_id is not None
+        else None
+    )
     assert old["editor_facts"]["reprepare_source"] == {
         "event_id": str(event_id),
         "requires_sync": True,
@@ -659,6 +737,16 @@ async def test_reprepare_editor_syncs_then_creates_independent_before_and_etag(
         assert (
             await _history_fingerprints(clients, proposal_id=proposal_id, task_id=history_task_id)
             == history
+        )
+        assert (
+            await _history_projection(
+                clients,
+                proposal_id=proposal_id,
+                task_id=history_task_id,
+                connection_id=connection_id,
+                proposal_version=original["version"],
+            )
+            == history_projection
         )
     async with clients.session_factory() as session:
         for model in (ApprovalRequestModel, ToolExecutionModel):

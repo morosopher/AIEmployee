@@ -118,6 +118,55 @@ async function renderPage(query = '') {
 }
 
 describe('MailDraftPage', () => {
+  it.each(['domain-case', 'local-case'] as const)(
+    'preserves recipient input and counts mailbox identity by %s before saving',
+    async (difference) => {
+      const to = 'CaseUser@mail.example.test'
+      const cc =
+        difference === 'domain-case'
+          ? 'CaseUser@MAIL.EXAMPLE.TEST'
+          : 'caseUser@MAIL.EXAMPLE.TEST'
+      current = { ...current, to: [to], cc: [], bcc: [] }
+      const { wrapper } = await renderPage()
+      await wrapper.get('input[aria-label="抄送 CC"]').setValue(cc)
+      const count = () => wrapper.get('[data-testid="recipient-count"]').text()
+      if (difference === 'domain-case') {
+        expect(count()).toContain('收件人数待核对')
+        expect(count()).toContain('收件人地址重复')
+      } else expect.soft(count()).toContain('当前收件人数：2 位')
+
+      // 以真实保存入口证明校验边界；去重只归一域名，人数反馈不能改写用户原始地址。
+      await wrapper.get('button[name="save-draft"]').trigger('click')
+      await flushPromises()
+      if (difference === 'domain-case') {
+        expect(mail.updateMailDraft).not.toHaveBeenCalled()
+        expect(
+          wrapper.get('button[name="submit-draft"]').attributes('disabled'),
+        ).toBeDefined()
+      } else {
+        expect.soft(mail.updateMailDraft).toHaveBeenCalledWith(
+          DRAFT_ID,
+          expect.objectContaining({
+            version: 1,
+            to: [to],
+            cc: [cc],
+            bcc: [],
+          }),
+        )
+        expect.soft(count()).toContain('当前收件人数：2 位')
+        expect.soft(wrapper.text()).toContain('版本 2')
+      }
+      expect(
+        wrapper.get('input[aria-label="收件人 To"]').element,
+      ).toHaveProperty('value', to)
+      expect(wrapper.get('input[aria-label="抄送 CC"]').element).toHaveProperty(
+        'value',
+        cc,
+      )
+      expect(mail.submitMailDraft).not.toHaveBeenCalled()
+    },
+  )
+
   it('shows the current recipient count across To CC and BCC before submission and after edits', async () => {
     current = {
       ...current,

@@ -113,7 +113,8 @@ export function useCalendarProposalEditor(
   )
   const candidates = computed(() => (fresh.value ? availability.value : null))
   let epoch = 0,
-    disposed = false
+    disposed = false,
+    minimumVersion = 0
   let submitIntent: { version: number; intent: RequestIntent } | null = null
   onUnmounted(() => {
     disposed = true
@@ -123,10 +124,21 @@ export function useCalendarProposalEditor(
     form.description = ''
   })
 
-  /** 完整服务端版本是唯一的确认与冲突来源；mutation 的 null facts 不能伪装成已检查。 */
-  function adopt(value: CalendarProposal): void {
+  /**
+   * @param value 已通过 API Schema 校验的当前对象；版本不能低于已确认的 PATCH/候选回执。
+   * @param factsLoaded 仅完整 GET 可解除刷新锁；mutation 只推进已知 CAS，不证明当前编辑事实。
+   * @throws Error 对象不匹配、版本倒退或 GET 缺少 facts 时保留原状态，等待显式重读。
+   */
+  function adopt(value: CalendarProposal, factsLoaded: boolean): void {
+    if (
+      value.id !== proposalId.value ||
+      value.version < minimumVersion ||
+      (factsLoaded && value.editor_facts === null)
+    )
+      throw new Error('Calendar editor facts are not current')
     proposal.value = value
-    refreshRequired.value = false
+    minimumVersion = value.version
+    refreshRequired.value = !factsLoaded
     const zone = value.timezone ?? 'UTC'
     Object.assign(form, {
       connection_id: value.connection_id,
@@ -150,8 +162,8 @@ export function useCalendarProposalEditor(
       notification_policy: value.notification_policy ?? '',
     })
     baseline.value = { ...form }
-    availability.value = value.availability
-    evidenceKey.value = currentKey.value
+    availability.value = factsLoaded ? value.availability : null
+    evidenceKey.value = factsLoaded ? currentKey.value : ''
   }
   /** 显式刷新原始 before 和当前冲突；只返回仍归属当前路由的已采纳版本，失败返回 null。 */
   async function reload(): Promise<CalendarProposal | null> {
@@ -163,11 +175,12 @@ export function useCalendarProposalEditor(
       return null
     }
     loading.value = true
+    refreshRequired.value = true
     error.value = null
     try {
       const value = await getCalendarProposal(id)
       if (!disposed && owner === epoch) {
-        adopt(value)
+        adopt(value, true)
         return value
       }
     } catch (cause) {
@@ -184,6 +197,7 @@ export function useCalendarProposalEditor(
       baseline.value = null
       pending.value = false
       refreshRequired.value = false
+      minimumVersion = 0
       submitIntent = null
       void reload()
     },
@@ -282,15 +296,25 @@ export function useCalendarProposalEditor(
       proposal.value.notification_policy !== null &&
       (proposal.value.operation_kind === 'create' ||
         proposal.value.changed_fields.length > 0) &&
-      proposal.value.editor_facts?.before_status !== 'unavailable',
+      proposal.value.editor_facts !== null &&
+      proposal.value.editor_facts.before_status !== 'unavailable',
   )
 
   /** 安全错误状态不包含供应商响应或用户描述。 */
   function failure(cause: unknown): void {
-    error.value =
+    const recovery: ActionRecovery =
       cause instanceof EditorInputError
         ? { message: cause.message, traceId: null, action: 'retry' }
         : actionRecovery(cause)
+    // 已确认的版本不能靠重发 PATCH 恢复；普通读取失败应只引导重新取得完整事实。
+    error.value =
+      refreshRequired.value && recovery.action === 'retry'
+        ? {
+            message: '提案事实尚未读取完整，请重新加载后继续编辑或提交。',
+            traceId: recovery.traceId,
+            action: 'reload',
+          }
+        : recovery
     // 版本失效可能先于 GET 状态抵达；错误当下即锁定旧输入，不能继续保存或重复提交。
     if (error.value.action === 'new_version') refreshRequired.value = true
   }
@@ -303,10 +327,10 @@ export function useCalendarProposalEditor(
     try {
       const updated = await updateCalendarProposal(id, payload)
       if (disposed || owner !== epoch) return
-      adopt(updated)
+      refreshRequired.value = true
+      adopt(updated, false)
       const read = await getCalendarProposal(id)
-      if (!disposed && owner === epoch && read.version >= updated.version)
-        adopt(read)
+      if (!disposed && owner === epoch) adopt(read, true)
     } catch (cause) {
       if (!disposed && owner === epoch) failure(cause)
     } finally {
@@ -364,21 +388,23 @@ export function useCalendarProposalEditor(
         key !== currentKey.value
       )
         throw new Error('Invalid calendar candidate version')
+      // 候选只返回版本回执；显式 reload 也必须保留这个下界，不能采用尚未追上的旧 GET。
+      minimumVersion = value.version
       const latest = await getCalendarProposal(id)
       if (disposed || owner !== epoch) return
       if (latest.version < value.version)
         throw new Error('Calendar candidate version is not yet readable')
       // 更晚的版本可能已清除候选，只展示该 GET 自身绑定的候选，不能把早先回执覆盖进去。
-      adopt(latest)
+      adopt(latest, true)
     } catch (cause) {
       if (!disposed && owner === epoch) {
         const recovery = actionRecovery(cause)
         error.value = refreshRequired.value
           ? {
-            message: '候选已保存，请重新加载最新提案后继续编辑。',
-            traceId: recovery.traceId,
-            action: 'reload',
-          }
+              message: '候选已保存，请重新加载最新提案后继续编辑。',
+              traceId: recovery.traceId,
+              action: 'reload',
+            }
           : recovery
       }
     } finally {

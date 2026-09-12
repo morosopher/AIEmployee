@@ -20,11 +20,22 @@ export function recipientList(text: string): string[] {
   return addresses
 }
 
-/** @param groups To/CC/BCC 的显式列表。 @throws EditorInputError 超过单封邮件限制或重复地址。 */
+/**
+ * 校验已解析邮箱的合计数量与重复项；日程参会人复用同一即时反馈边界。
+ * @param groups 经 recipientList 解析的显式 To/CC/BCC 或参会人列表，保留原始大小写。
+ * @throws EditorInputError 超过数量限制或出现仅域名大小写不同的重复地址。
+ */
 export function validateRecipientGroups(...groups: string[][]): void {
   const all = groups.flat()
   if (all.length > 50)
     throw new EditorInputError('To、CC、BCC 合计最多 50 位收件人。')
-  if (new Set(all.map((address) => address.toLowerCase())).size !== all.length)
+  const keys = all.map((address) => {
+    // 与服务端身份规则一致：本地部分区分大小写；规范键只用于比较，不能回写输入。
+    const domainStart = address.indexOf('@') + 1
+    return (
+      address.slice(0, domainStart) + address.slice(domainStart).toLowerCase()
+    )
+  })
+  if (new Set(keys).size !== all.length)
     throw new EditorInputError('收件人地址重复，请检查 To、CC、BCC。')
 }

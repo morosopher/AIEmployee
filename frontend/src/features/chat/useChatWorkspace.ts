@@ -32,7 +32,8 @@ export function useChatWorkspace() {
   const tasks = useTasksStore(),
     actions = useActionsStore()
   let epoch = 0,
-    disposed = false
+    disposed = false,
+    messageReadSequence = 0
   let sendIntent: {
     conversationId: string
     content: string
@@ -79,14 +80,19 @@ export function useChatWorkspace() {
     },
   )
 
-  /** 切换会话后拒绝旧响应；服务端完整消息覆盖临时结果，不能从 delta 推测执行结果。 */
+  /**
+   * 会话归属与消息读取次序分别校验：重连和终态可在同一会话交错，仅最新请求拥有结果及错误。
+   * 读取不推进会话 epoch，避免丢弃同会话已经接受的发送回执；切换和卸载仍由 epoch 隔离。
+   */
   async function reloadMessages(): Promise<void> {
     const id = conversation.value?.id,
       owner = epoch
     if (!id) return
+    const readSequence = ++messageReadSequence
     try {
       const result = await getConversation(id)
-      if (disposed || owner !== epoch) return
+      if (disposed || owner !== epoch || readSequence !== messageReadSequence)
+        return
       if (result.conversation.id !== id)
         throw new Error('Conversation identity changed')
       messages.value = result.messages
@@ -96,7 +102,8 @@ export function useChatWorkspace() {
             ?.task_id,
         )
     } catch (cause) {
-      if (!disposed && owner === epoch) error.value = actionRecovery(cause)
+      if (!disposed && owner === epoch && readSequence === messageReadSequence)
+        error.value = actionRecovery(cause)
     }
   }
   /** @param value 用户选择的服务端会话。 @returns 新会话只读内容，先关闭旧任务流。 */

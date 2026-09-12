@@ -8,7 +8,9 @@ import * as conversations from '@/api/conversations'
 import * as actions from '@/api/actions'
 import * as mail from '@/api/mail'
 import * as calendar from '@/api/calendar'
-import type { Message } from '@/api/types'
+import { ProblemError } from '@/api/client'
+import type { Message, TaskSnapshot } from '@/api/types'
+import type { useTaskEvents } from '@/composables/useTaskEvents'
 import { useTasksStore } from '@/stores/tasks'
 import {
   actionSnapshot,
@@ -41,8 +43,14 @@ vi.mock('@/api/calendar', async (original) => ({
   createCalendarProposal: vi.fn(),
   submitCalendarProposal: vi.fn(),
 }))
+const stream = vi.hoisted(() => ({
+  recover: undefined as (() => void) | undefined,
+}))
 vi.mock('@/composables/useTaskEvents', () => ({
-  useTaskEvents: () => ref('connected'),
+  useTaskEvents: (...args: Parameters<typeof useTaskEvents>) => {
+    stream.recover = args[2]
+    return ref('connected')
+  },
 }))
 const conversation = {
   id: '00000000-0000-0000-0000-000000000501',
@@ -54,6 +62,7 @@ let messages: Message[]
 let wrappers: ReturnType<typeof mount>[] = []
 beforeEach(() => {
   vi.clearAllMocks()
+  stream.recover = undefined
   messages = [
     {
       id: 'synthetic-message',
@@ -107,7 +116,231 @@ async function renderPage() {
   return { wrapper, router, tasks: useTasksStore(pinia) }
 }
 
+type MessageRead = Awaited<ReturnType<typeof conversations.getConversation>>
+
+/** 只控制端口完成顺序；真实页面、消息覆盖和任务终态 watch 均保持生产实现。 */
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (cause: Error) => void
+} {
+  let resolve: (value: T) => void = () => undefined
+  let reject: (cause: Error) => void = () => undefined
+  const promise = new Promise<T>((accept, fail) => {
+    resolve = accept
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+/** 重连必须走 composable 注册的恢复回调，不能在测试中直接替换页面消息。 */
+function recoverMessages(): void {
+  if (!stream.recover)
+    throw new Error('Task recovery callback was not registered')
+  stream.recover()
+}
+
+/** 构造与编辑链接一致的准备任务，不把普通聊天结果伪装为可信写入任务。 */
+function preparationTask(
+  kind: 'prepare_mail_draft' | 'prepare_calendar_proposal',
+  status: 'running' | 'queued' | 'succeeded',
+  cursor: string,
+): TaskSnapshot {
+  return {
+    id: TASK_ID,
+    kind,
+    status,
+    retry_of_task_id: null,
+    error_code: null,
+    event_cursor: cursor,
+    steps: [],
+  }
+}
+
+/** 返回完整的合成最终消息；链接只打开本地编辑器，不表示邮件已发送或日程已执行。 */
+function preparedMessage(path: string): Message {
+  return {
+    id: 'synthetic-prepared-result',
+    role: 'assistant',
+    content_markdown: `[打开准备结果](${path})`,
+    task_id: TASK_ID,
+    created_at: NOW,
+  }
+}
+
+/** 错误仅带非敏感追踪编号，便于核对哪次读取拥有当前恢复提示。 */
+function readFailure(traceId: string): ProblemError {
+  return new ProblemError({
+    type: 'about:blank',
+    title: 'Synthetic message read failure',
+    detail: '',
+    status: 503,
+    instance: '',
+    error_code: 'temporarily_unavailable',
+    trace_id: traceId,
+  })
+}
+
 describe('ChatPage', () => {
+  it.each([
+    ['prepare_mail_draft', `/mail/drafts/${DRAFT_ID}`],
+    ['prepare_calendar_proposal', `/calendar/proposals/${PROPOSAL_ID}`],
+  ] as const)(
+    'keeps the latest %s result when an older recovery read completes last',
+    async (kind, path) => {
+      const initialMessages = [...messages]
+      const { wrapper, tasks } = await renderPage()
+      tasks.setTask(preparationTask(kind, 'running', '1'))
+      await flushPromises()
+      const older = deferred<MessageRead>()
+      const latest = deferred<MessageRead>()
+      vi.mocked(conversations.getConversation)
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(latest.promise)
+
+      recoverMessages()
+      await flushPromises()
+      tasks.setTask(preparationTask(kind, 'succeeded', '2'))
+      await flushPromises()
+      expect(conversations.getConversation).toHaveBeenCalledTimes(3)
+      latest.resolve({
+        conversation,
+        messages: [...initialMessages, preparedMessage(path)],
+      })
+      await flushPromises()
+      expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(path)
+      older.resolve({ conversation, messages: initialMessages })
+      await flushPromises()
+      expect(wrapper.findAll('.markdown-message')).toHaveLength(2)
+      expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(path)
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+      expect(mail.submitMailDraft).not.toHaveBeenCalled()
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['older-error', 'latest-error'] as const)(
+    'keeps messages and errors owned by the latest read when receiving %s',
+    async (outcome) => {
+      const initialMessages = [...messages]
+      const { wrapper, tasks } = await renderPage()
+      tasks.setTask(preparationTask('prepare_mail_draft', 'running', '1'))
+      await flushPromises()
+      const older = deferred<MessageRead>()
+      const latest = deferred<MessageRead>()
+      vi.mocked(conversations.getConversation)
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(latest.promise)
+      recoverMessages()
+      await flushPromises()
+      tasks.setTask(preparationTask('prepare_mail_draft', 'succeeded', '2'))
+      await flushPromises()
+      expect(conversations.getConversation).toHaveBeenCalledTimes(3)
+      const result = {
+        conversation,
+        messages: [
+          ...initialMessages,
+          preparedMessage(`/mail/drafts/${DRAFT_ID}`),
+        ],
+      }
+      if (outcome === 'older-error') {
+        latest.resolve(result)
+        await flushPromises()
+        expect(wrapper.find('a[data-editor-link]').exists()).toBe(true)
+        older.reject(readFailure('synthetic-older-read'))
+        await flushPromises()
+        expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+        expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(
+          `/mail/drafts/${DRAFT_ID}`,
+        )
+      } else {
+        latest.reject(readFailure('synthetic-latest-read'))
+        await flushPromises()
+        expect(wrapper.get('[role="alert"]').text()).toContain(
+          'synthetic-latest-read',
+        )
+        older.resolve(result)
+        await flushPromises()
+        expect(wrapper.get('[role="alert"]').text()).toContain(
+          'synthetic-latest-read',
+        )
+        expect(wrapper.findAll('.markdown-message')).toHaveLength(1)
+        expect(wrapper.find('a[data-editor-link]').exists()).toBe(false)
+      }
+    },
+  )
+
+  it('retains an accepted send receipt while recovery reads the same conversation', async () => {
+    messages = []
+    const receipt = deferred<{ task_id: string }>()
+    vi.mocked(conversations.sendMessage).mockReturnValueOnce(receipt.promise)
+    const { wrapper, tasks } = await renderPage()
+    tasks.setTask(preparationTask('prepare_mail_draft', 'queued', '1'))
+    await wrapper
+      .get('textarea[aria-label="消息"]')
+      .setValue('请准备一封邮件草稿')
+    await wrapper.get('form').trigger('submit')
+    recoverMessages()
+    await flushPromises()
+    expect(conversations.getConversation).toHaveBeenCalledTimes(2)
+    expect(
+      wrapper.get('button[type="submit"]').attributes('disabled'),
+    ).toBeDefined()
+    receipt.resolve({ task_id: TASK_ID })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="chat-task-status"]').text()).toContain(
+      '排队',
+    )
+    expect(wrapper.get('textarea[aria-label="消息"]').element).toHaveProperty(
+      'value',
+      '',
+    )
+    expect(
+      wrapper.get('textarea[aria-label="消息"]').attributes('disabled'),
+    ).toBeUndefined()
+    expect(conversations.sendMessage).toHaveBeenCalledTimes(1)
+    expect(conversations.getConversation).toHaveBeenCalledTimes(3)
+  })
+
+  it.each(['success', 'error'] as const)(
+    'ignores an old conversation read %s after selection and preserves loading state',
+    async (outcome) => {
+      const other = {
+        ...conversation,
+        id: '00000000-0000-0000-0000-000000000502',
+        title: 'Synthetic other conversation',
+      }
+      vi.mocked(conversations.listConversations).mockResolvedValue([
+        conversation,
+        other,
+      ])
+      const { wrapper } = await renderPage()
+      const older = deferred<MessageRead>()
+      const latest = deferred<MessageRead>()
+      vi.mocked(conversations.getConversation)
+        .mockReturnValueOnce(older.promise)
+        .mockReturnValueOnce(latest.promise)
+      recoverMessages()
+      await flushPromises()
+      await wrapper
+        .get('[aria-label="会话历史"] > div:nth-child(2) button')
+        .trigger('click')
+      expect(wrapper.text()).toContain('正在加载会话')
+      expect(conversations.getConversation).toHaveBeenLastCalledWith(other.id)
+      latest.resolve({ conversation: other, messages: [] })
+      await flushPromises()
+      if (outcome === 'success') older.resolve({ conversation, messages })
+      else older.reject(readFailure('synthetic-old-conversation'))
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('正在加载会话')
+      expect(wrapper.findAll('.markdown-message')).toHaveLength(0)
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+      expect(
+        wrapper.get('textarea[aria-label="消息"]').attributes('disabled'),
+      ).toBeUndefined()
+    },
+  )
+
   it.each([
     `/api/v1/mail/drafts/${DRAFT_ID}`,
     `/mail/drafts/${DRAFT_ID}`,

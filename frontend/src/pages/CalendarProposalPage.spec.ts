@@ -138,7 +138,193 @@ async function renderPage() {
   return { wrapper, router }
 }
 
+/** 构造可核对原 before 的修改提案，使刷新测试能观察确认、CAS 与提交的真实页面约束。 */
+function useUpdateFixture(
+  required: CalendarProposal['required_confirmations'],
+): void {
+  current = {
+    ...current,
+    operation_kind: 'update',
+    target_event_id: 'synthetic-refresh-event',
+    base_etag: 'synthetic-refresh-etag',
+    before_snapshot_id: '00000000-0000-0000-0000-000000000502',
+    required_confirmations: required,
+    changed_fields: ['location'],
+    editor_facts: {
+      before_status: 'available',
+      before: { ...calendarFields(), location: 'Synthetic original place' },
+      conflict_status: 'checked',
+      conflicts: [],
+      reprepare_source: null,
+      restore_source: null,
+    },
+  }
+}
+
 describe('CalendarProposalPage', () => {
+  it.each(['domain-case', 'local-case'] as const)(
+    'preserves attendees and applies the shared mailbox identity rule for %s',
+    async (difference) => {
+      const attendees = [
+        'CaseUser@mail.example.test',
+        difference === 'domain-case'
+          ? 'CaseUser@MAIL.EXAMPLE.TEST'
+          : 'caseUser@MAIL.EXAMPLE.TEST',
+      ]
+      const { wrapper } = await renderPage()
+      const input = attendees.join(', ')
+      await wrapper.get('input[aria-label="参会人"]').setValue(input)
+      await wrapper.get('button[name="save-proposal"]').trigger('click')
+      await flushPromises()
+      // 邮件与日程共用同一即时校验；合法的不同本地部分必须原样进入 PATCH。
+      if (difference === 'domain-case') {
+        expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+        expect(wrapper.get('[role="alert"]').text()).toContain('收件人地址重复')
+      } else {
+        expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
+          PROPOSAL_ID,
+          expect.objectContaining({ version: 1, attendees }),
+        )
+        expect(wrapper.text()).toContain('版本 2')
+      }
+      expect(wrapper.get('input[aria-label="参会人"]').element).toHaveProperty(
+        'value',
+        input,
+      )
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['save', 'last-confirmation'] as const)(
+    'keeps the acknowledged version locked after %s when the facts read fails',
+    async (operation) => {
+      useUpdateFixture(
+        operation === 'save' ? ['time'] : ['notification_policy'],
+      )
+      const { wrapper } = await renderPage()
+      expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
+      expect(
+        wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
+      ).toBeDefined()
+      vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
+        new Error('Synthetic post-mutation read failure'),
+      )
+      if (operation === 'save') {
+        await wrapper
+          .get('input[aria-label="日程标题"]')
+          .setValue('Synthetic revised calendar title')
+        await wrapper.get('button[name="save-proposal"]').trigger('click')
+      } else
+        await wrapper
+          .get('button[name="confirm-notification_policy"]')
+          .trigger('click')
+      await flushPromises()
+
+      expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
+      expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
+        PROPOSAL_ID,
+        expect.objectContaining({ version: 1 }),
+      )
+      expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
+      expect(wrapper.text()).toContain('版本 2')
+      expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(false)
+      // PATCH 已成功，缺失事实期间必须同时锁住输入、后续确认与提交，不能重发旧版本。
+      expect
+        .soft(
+          wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
+        )
+        .toBeDefined()
+      expect
+        .soft(wrapper.get('button[name="confirm-time"]').attributes('disabled'))
+        .toBeDefined()
+      expect
+        .soft(
+          wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
+        )
+        .toBeDefined()
+      await wrapper.get('button[name="submit-proposal"]').trigger('click')
+      await flushPromises()
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+
+      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('版本 2')
+      expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
+      expect(
+        wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
+      ).toBeUndefined()
+      expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
+      if (operation === 'save') {
+        await wrapper.get('button[name="confirm-time"]').trigger('click')
+        await flushPromises()
+        expect(calendar.updateCalendarProposal).toHaveBeenLastCalledWith(
+          PROPOSAL_ID,
+          { version: 2, confirmation: { kind: 'time' } },
+        )
+      }
+      await wrapper.get('button[name="submit-proposal"]').trigger('click')
+      await flushPromises()
+      expect(calendar.submitCalendarProposal).toHaveBeenCalledTimes(1)
+      expect(calendar.submitCalendarProposal).toHaveBeenCalledWith(
+        PROPOSAL_ID,
+        operation === 'save' ? 3 : 2,
+        expect.objectContaining({ key: expect.any(String) }),
+      )
+    },
+  )
+
+  it.each(['older-version', 'other-object', 'missing-facts'] as const)(
+    'does not unlock or roll back an acknowledged version on a %s read',
+    async (invalidRead) => {
+      useUpdateFixture(['notification_policy'])
+      const { wrapper } = await renderPage()
+      const unreadable = async (): Promise<CalendarProposal> => {
+        if (invalidRead === 'older-version') return { ...current, version: 1 }
+        if (invalidRead === 'other-object')
+          return {
+            ...current,
+            id: '00000000-0000-0000-0000-000000000399',
+          }
+        return { ...current, editor_facts: null }
+      }
+      vi.mocked(calendar.getCalendarProposal).mockImplementationOnce(unreadable)
+      await wrapper
+        .get('button[name="confirm-notification_policy"]')
+        .trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('版本 2')
+      expect
+        .soft(
+          wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
+        )
+        .toBeDefined()
+      expect.soft(wrapper.find('[role="alert"]').exists()).toBe(true)
+
+      // 显式重新加载也必须遵守已确认的版本下界和同对象事实，不能借刷新回退 CAS。
+      vi.mocked(calendar.getCalendarProposal).mockImplementationOnce(unreadable)
+      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await flushPromises()
+      expect.soft(wrapper.text()).toContain('版本 2')
+      expect
+        .soft(
+          wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
+        )
+        .toBeDefined()
+      expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+
+      current = { ...current, version: 3 }
+      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('版本 3')
+      expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
+      expect(
+        wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
+      ).toBeUndefined()
+      expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
+    },
+  )
+
   it.each([
     'available',
     'capability-unavailable',
@@ -511,6 +697,17 @@ describe('CalendarProposalPage', () => {
     expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(0)
     expect(wrapper.text()).toContain('重新加载')
     expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+    // 候选回执已证明版本推进；显式刷新同样不能用较旧 GET 解除锁定。
+    vi.mocked(calendar.getCalendarProposal).mockResolvedValueOnce({
+      ...current,
+      version: 1,
+      availability: null,
+    })
+    await wrapper.get('button[name="reload-editor"]').trigger('click')
+    await flushPromises()
+    expect(
+      wrapper.get('button[name="confirm-time"]').attributes('disabled'),
+    ).toBeDefined()
     await wrapper.get('button[name="reload-editor"]').trigger('click')
     await flushPromises()
     expect(wrapper.text()).toContain('版本 2')
