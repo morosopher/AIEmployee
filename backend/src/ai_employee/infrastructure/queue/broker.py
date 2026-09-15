@@ -1,15 +1,14 @@
 """配置不保存业务结果的 Taskiq Redis Streams broker。"""
 
-from taskiq_redis import RedisStreamBroker
-
 from ai_employee.config import get_settings
+from ai_employee.infrastructure.queue.stream_broker import RedisTaskStreamBroker
 
 settings = get_settings()
 DEFAULT_RETRY_COUNT = 3
 
 # Redis Stream 只运输可从 PostgreSQL 重建的 task_id；所有延迟重试都由 PostgreSQL Outbox
 # 的 available_at 表达，不能交给 Taskiq SmartRetry 另行写 Redis 调度事实。
-broker = RedisStreamBroker(
+broker = RedisTaskStreamBroker(
     url=settings.redis_url,
     queue_name="ai_employee_tasks",
     consumer_group_name="ai_employee_workers",

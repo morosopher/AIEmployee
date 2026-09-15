@@ -652,42 +652,90 @@ async def test_submission_and_revocation_serialize_before_task_exists(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resource_kind", ["mail", "calendar"])
 @pytest.mark.parametrize("revocation", ["disable", "disconnect"])
+@pytest.mark.parametrize("pause_phase", ["connection-scope", "frozen"])
 async def test_submission_revocation_boundary_is_scoped_to_exact_connection(
     database_url: str,
     monkeypatch: pytest.MonkeyPatch,
     resource_kind: Literal["mail", "calendar"],
     revocation: Literal["disable", "disconnect"],
+    pause_phase: Literal["connection-scope", "frozen"],
 ) -> None:
-    """同用户其他连接的撤权可以完成，不能阻塞或取消当前连接正在冻结的资源。"""
+    """连接advisory只隔离精确连接；取得User锁后的同用户事务仍服从删除屏障。
+
+    connection-scope阶段在真实advisory后、User锁前暂停，另一连接撤权必须完成。
+    frozen阶段保留真实冻结后暂停，并用PG等待图证明另一连接仅等同一User事务，
+    释放后正常完成。两种情况均检查撤权只改变目标连接，当前审批与源连接保持有效。
+    """
+    from ai_employee.infrastructure.db.repositories import (
+        trusted_actions as trusted_actions_repository,
+    )
+
     seed = await _seed_pending_submission(database_url, resource_kind)
     sessions = build_session_factory(database_url)
     adapter = _ClaimAdapter()
     submission_paused, release_submission = asyncio.Event(), asyncio.Event()
     original_create = SqlAlchemyTrustedActionRepository.create_submission
+    original_scope = trusted_actions_repository.lock_connection_submission_scope
+    revoke_method = "disable_capability" if revocation == "disable" else "disconnect"
+    original_revoke = getattr(SqlAlchemyConnectionStore, revoke_method)
+    loop = asyncio.get_running_loop()
+    submission_pid: asyncio.Future[int] = loop.create_future()
+    revocation_pid: asyncio.Future[int] = loop.create_future()
     write_capability = (
         ConnectionCapability.MAIL_SEND
         if resource_kind == "mail"
         else ConnectionCapability.CALENDAR_WRITE
     )
 
+    async def pause_connection_scope(
+        session: AsyncSession, *, user_id: UUID, connection_id: UUID
+    ) -> None:
+        """保留原advisory真实调用，只在后续User/业务锁尚未取得时暂停指定阶段。"""
+        submission_pid.set_result(await _postgres_backend_pid(session))
+        await original_scope(session, user_id=user_id, connection_id=connection_id)
+        if pause_phase == "connection-scope":
+            submission_paused.set()
+            await release_submission.wait()
+
     async def pause_submission(self: SqlAlchemyTrustedActionRepository, submission: Any) -> None:
-        """保持当前连接的冻结事务打开，确保其他连接撤权不依赖其提交。"""
-        submission_paused.set()
-        await release_submission.wait()
+        """冻结后事务持有User锁，按规格允许另一连接等当前短事务结束。"""
+        if pause_phase == "frozen":
+            submission_paused.set()
+            await release_submission.wait()
         await original_create(self, submission)
 
+    async def observe_revocation(self: SqlAlchemyConnectionStore, **values: Any) -> Any:
+        """记录独立撤权会话，让等待断言来自真实PG阻塞边而非固定延迟。"""
+        revocation_pid.set_result(await _postgres_backend_pid(self._session))
+        return await original_revoke(self, **values)
+
+    monkeypatch.setattr(
+        trusted_actions_repository, "lock_connection_submission_scope", pause_connection_scope
+    )
     monkeypatch.setattr(SqlAlchemyTrustedActionRepository, "create_submission", pause_submission)
+    monkeypatch.setattr(SqlAlchemyConnectionStore, revoke_method, observe_revocation)
     submission_task: asyncio.Task[TrustedActionSubmissionResult] | None = None
+    revocation_task: asyncio.Task[None] | None = None
     try:
         other_connection_id = await _add_submission_connection(sessions, seed)
         submission_task = asyncio.create_task(_submit_pending_resource(sessions, seed, adapter))
         await asyncio.wait_for(submission_paused.wait(), timeout=5)
-        await asyncio.wait_for(
-            _revoke_pending_resource(sessions, seed, revocation, connection_id=other_connection_id),
-            timeout=5,
+        revocation_task = asyncio.create_task(
+            _revoke_pending_resource(sessions, seed, revocation, connection_id=other_connection_id)
         )
+        if pause_phase == "connection-scope":
+            await asyncio.wait_for(asyncio.shield(revocation_task), timeout=5)
+        else:
+            waiting_pid = await asyncio.wait_for(asyncio.shield(revocation_pid), timeout=5)
+            holding_pid = await asyncio.wait_for(asyncio.shield(submission_pid), timeout=5)
+            blockers = await _blockers_or_finished(
+                sessions, waiting_pid=waiting_pid, task=revocation_task
+            )
+            assert waiting_pid != holding_pid and holding_pid in blockers
         release_submission.set()
-        result = await asyncio.wait_for(submission_task, timeout=5)
+        result, _ = await asyncio.wait_for(
+            asyncio.gather(submission_task, revocation_task), timeout=5
+        )
         async with sessions() as session:
             approval = await session.get(ApprovalRequestModel, result.approval_id)
             task = await session.get(TaskRunModel, result.task_id)
@@ -704,18 +752,32 @@ async def test_submission_revocation_boundary_is_scoped_to_exact_connection(
                 if resource_kind == "mail"
                 else await session.get(CalendarChangeProposalModel, seed.resource_id)
             )
+            other_connection = await session.get(OAuthConnectionModel, other_connection_id)
+            other_capability = await session.scalar(
+                select(ConnectionCapabilityModel.status).where(
+                    ConnectionCapabilityModel.user_id == seed.user_id,
+                    ConnectionCapabilityModel.connection_id == other_connection_id,
+                    ConnectionCapabilityModel.capability == write_capability.value,
+                )
+            )
         assert approval is not None and approval.status == "pending"
         assert task is not None and task.status == "queued"
         assert local is not None and local.status == "awaiting_approval"
         assert connection is not None and connection.status == "connected"
         assert capability == CapabilityStatus.ENABLED.value
+        assert other_connection is not None
+        assert other_connection.status == (
+            "connected" if revocation == "disable" else "disconnected"
+        )
+        assert other_capability == ("disabled" if revocation == "disable" else "revoked")
         assert adapter.write_calls == 0
     finally:
         release_submission.set()
-        if submission_task is not None:
-            if not submission_task.done():
-                submission_task.cancel()
-            await asyncio.gather(submission_task, return_exceptions=True)
+        remaining = [task for task in (submission_task, revocation_task) if task is not None]
+        for task in remaining:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
         await sessions.dispose()
 
 

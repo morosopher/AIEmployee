@@ -642,6 +642,23 @@ def _sorted_capabilities(
     return tuple(sorted(capabilities, key=lambda item: item.value))
 
 
+def _required_capability_scopes(
+    adapter: OAuthProviderAdapter,
+    capabilities: frozenset[ConnectionCapability],
+) -> frozenset[str]:
+    """提取依赖闭包对应的资源权限，不把授权请求基础 scope 当作 token 回显要求。
+
+    Args:
+        adapter: 已装配的供应商中立 scope 映射；不在应用层解释供应商字符串。
+        capabilities: 调用方已验证的完整能力依赖闭包。
+
+    Returns:
+        必须出现在实际授权事实中的资源 scope。OIDC/账户身份仍由 adapter 独立验证；
+        基础离线 scope 只影响授权请求，不补造返回 scope 或代替 refresh token 验证。
+    """
+    return adapter.scopes_for(capabilities) - adapter.scopes_for(frozenset())
+
+
 class ConnectionsUseCase:
     """协调固定 OAuth adapter mapping、AEAD、能力规则与数据库事务。"""
 
@@ -862,7 +879,7 @@ class ConnectionsUseCase:
         Args:
             user_id: 当前已认证用户，所有连接和凭据读取均限定该归属。
             connection_id: 用户选择的既有 connected 连接。
-            capability: 本次请求的单项能力；请求范围包含依赖闭包和当前 enabled 能力。
+            capability: 本次请求的单项能力；保留 enabled 与证据完整的待重新授权能力。
 
         Returns:
             授权 URL 与实际请求的规范能力集合。S→T、OAuthAttempt 和恢复 started
@@ -890,7 +907,30 @@ class ConnectionsUseCase:
                 or connection.status != ConnectionStatus.CONNECTED.value
             ):
                 raise ConnectionNotFoundError
-            requested = validate_capability_enable(capability, enabled)
+            snapshot = await store.get_capability_snapshot(
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+            if snapshot is None:
+                raise ConnectionNotFoundError
+            adapter = self._adapter_for(connection.provider)
+            verified_pending: dict[ConnectionCapability, frozenset[ConnectionCapability]] = {}
+            for row in snapshot.capabilities:
+                if row.status != CapabilityStatus.AUTHORIZING or row.last_verified_at is None:
+                    continue
+                dependencies = validate_capability_enable(row.capability, frozenset())
+                required_scopes = _required_capability_scopes(adapter, dependencies)
+                # 前轮发起会保留历史字段；仅有时间不能证明权限，必须同时核对两份 scope。
+                if required_scopes.issubset(row.actual_scopes) and required_scopes.issubset(
+                    connection.scopes
+                ):
+                    verified_pending[row.capability] = dependencies
+            available = enabled | verified_pending.keys()
+            # 依赖闭包包含全部传递依赖，故不会借 pending 写能力复活 disabled/revoked 读能力。
+            preserved = frozenset(
+                item for item, dependencies in verified_pending.items() if dependencies <= available
+            )
+            requested = validate_capability_enable(capability, enabled | preserved)
             candidate: OAuthRecoveryCandidate | None = None
             if await store.get_refresh_events(user_id=user_id, connection_id=connection_id):
                 candidate = await self._rotation(store).recovery_candidate(
@@ -1351,7 +1391,9 @@ class ConnectionsUseCase:
                 connection.account_type,
             )
             and claim.snapshot.scopes.issubset(token.granted_scopes)
-            and adapter.scopes_for(requested_capabilities).issubset(token.granted_scopes)
+            and _required_capability_scopes(adapter, requested_capabilities).issubset(
+                token.granted_scopes
+            )
             and token.refresh_token is not None
             and not secrets.compare_digest(
                 claim.refresh_plaintext, token.refresh_token.encode("utf-8")
@@ -1468,7 +1510,9 @@ class ConnectionsUseCase:
         for capability in _sorted_capabilities(requested_capabilities):
             # 写 scope 不能单独证明回复读取、ETag 或结果核对所依赖的读取权限。
             required_capabilities = validate_capability_enable(capability, frozenset())
-            enabled = adapter.scopes_for(required_capabilities).issubset(token.granted_scopes)
+            enabled = _required_capability_scopes(adapter, required_capabilities).issubset(
+                token.granted_scopes
+            )
             await store.save_capability_state(
                 user_id=user_id,
                 connection_id=connection_id,
@@ -1537,11 +1581,11 @@ class ConnectionsUseCase:
     ) -> CapabilityDisableResult:
         """委托仓储在固定可信锁序内校验依赖并原子关闭能力。
 
-        Task 19 规定动作撤权沿 ``TaskRun → ApprovalRequest → ToolExecution → 本地动作 →
+        动作撤权先锁整批候选Task，再沿 ``User → ApprovalRequest → ToolExecution → 本地动作 →
         Connection → capability`` 顺序取得行锁；enabled 快照与依赖校验必须发生在同一事务、
         同一连接锁之后。这样渐进 OAuth callback 不能在快照与关闭之间提交写能力，且 claim
         与撤权不会形成 Connection→Task 的反向等待。仓储抛出的依赖冲突会回滚此前扫描的
-        生命周期写入，路由仍只看到稳定领域错误。
+        生命周期写入；inactive按既有资源隐藏语义拒绝，路由仍只看到稳定领域错误。
         """
         async with self._stores() as store:
             try:

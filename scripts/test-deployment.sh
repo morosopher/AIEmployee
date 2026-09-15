@@ -48,13 +48,75 @@ print("database operations profile contracts ok")
 '
 )
 
+# 验证开发覆盖层的实际合并结果：本机 OAuth 回调必须可达，私有 Secret 由宿主
+# 用户身份读取，数据库密码只来自文件，镜像虚拟环境不能被宿主源码挂载覆盖。
+check_development_runtime() (
+  export LOCAL_UID=12345 LOCAL_GID=23456
+  docker compose --env-file /dev/null -f compose.yaml -f compose.dev.yaml config --format json | python3 -c '
+import json, sys
+from urllib.parse import urlsplit
+
+config = json.load(sys.stdin)
+services = config["services"]
+api_ports = services["api"].get("ports", [])
+assert len(api_ports) == 1, "development API callback port missing"
+assert api_ports[0]["host_ip"] == "127.0.0.1", "development API must remain loopback-only"
+assert str(api_ports[0]["published"]) == "8000" and api_ports[0]["target"] == 8000, "development callback port mismatch"
+web_ports = services["caddy"]["ports"]
+assert len(web_ports) == 1 and web_ports[0]["host_ip"] == "127.0.0.1", "development frontend must replace public production ports"
+assert str(web_ports[0]["published"]) == "5173" and web_ports[0]["target"] == 5173, "development frontend port mismatch"
+for name in ("api", "worker", "scheduler"):
+    service = services[name]
+    assert service["user"] == "12345:23456", "development consumer cannot read owner-only Secret files"
+    for field in ("DATABASE_URL", "CHECKPOINT_DATABASE_URL"):
+        address = urlsplit(service["environment"][field])
+        assert address.username == "ai_employee_app" and address.password is None, "development database credentials must come from Secret"
+    assert "PGPASSWORD" in service["command"][-1] and "/run/secrets/app_database_password" in service["command"][-1], "development command does not load database Secret"
+    mounts = {item["target"]: item for item in service["volumes"]}
+    assert mounts["/app/backend/.venv"]["type"] == "volume", "host virtualenv shadows image dependencies"
+    assert mounts["/app/backend/.venv"]["source"] == "backend_venv", "backend consumers must share image dependencies"
+print("development runtime contracts ok")
+'
+  # 后端源挂载用独立卷保留镜像依赖；切换不可变镜像时必须创建新卷，不能复用旧依赖。
+  python3 - <<'PY'
+import json
+import os
+import subprocess
+
+names = []
+for project, tag in (("dev-a", "image-a"), ("dev-a", "image-b"), ("dev-b", "image-a")):
+    environment = dict(os.environ, COMPOSE_PROJECT_NAME=project, APP_IMAGE_TAG=tag)
+    result = subprocess.run(
+        ["docker", "compose", "--env-file", "/dev/null", "-f", "compose.yaml", "-f", "compose.dev.yaml", "config", "--format", "json"],
+        env=environment, text=True, capture_output=True, check=True,
+    )
+    configuration = json.loads(result.stdout)
+    names.append(configuration["volumes"]["backend_venv"]["name"])
+assert len(set(names)) == 3, "development backend dependencies survive an image or project change"
+print("development dependency volume isolation ok")
+PY
+)
+
 # 四个真实 API 启动命令均必须关闭原始 request-target 日志；注释中的 flag 不算证据。
-for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just scripts/run-e2e-backend.sh; do
+for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just; do
   if ! grep -Eq -- '^[[:space:]]*(command:|uv run).*uvicorn.*--no-access-log' "${api_entry}"; then
     printf 'OAuth access-log boundary missing: %s\n' "${api_entry}" >&2
     exit 1
   fi
 done
+# E2E 由受管 Python 生命周期生成 argv；验证实际返回的启动命令，不能继续在不再
+# 承载 Uvicorn 的 shell wrapper 中搜索旧文本。四入口真实 canary 另验证日志和持久审计。
+uv run --project backend python - <<'PY'
+import sys
+
+sys.path.insert(0, "backend")
+from tests.integration.e2e_backend import service_command
+
+assert service_command("api") == [
+    sys.executable, "-m", "uvicorn", "ai_employee.main:app", "--host", "127.0.0.1",
+    "--port", "8000", "--no-access-log",
+]
+PY
 
 [[ "${APP_IMAGE_TAG:-}" != latest ]] || { printf '%s\n' 'APP_IMAGE_TAG must not be latest' >&2; exit 1; }
 
@@ -168,7 +230,129 @@ overridden_development_config="$(
   render_overridden_compose -f compose.yaml -f compose.dev.yaml
 )"
 render_default_compose -f compose.yaml --profile observability >/dev/null
+check_development_runtime
 check_database_operations_profiles
+
+# 根 .env 只参与 Compose 插值，不能假定镜像内 Settings 会读取宿主文件。此矩阵实际
+# 展开官方 Compose，再用每个进程拿到的环境构造 Settings；所有 Secret 只来自本轮
+# 临时合成文件，配置或凭据均不回显，也不启动容器或访问供应商。
+uv run --project backend python - <<'PY'
+import base64
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from ai_employee.api.deps import get_connections_use_case
+from ai_employee.config import Settings
+from ai_employee.integrations.google.oauth import GoogleOAuthAdapter
+from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
+
+defaults = {
+    "GOOGLE_CLIENT_ID": "",
+    "GOOGLE_REDIRECT_URI": "http://localhost:8000/api/v1/connections/google/callback",
+    "MODEL_BASE_URL": "",
+    "MODEL_NAME": "",
+    "MODEL_SUPPORTS_JSON_SCHEMA": "true",
+    "MODEL_INPUT_COST_PER_MILLION_USD": "0",
+    "MODEL_OUTPUT_COST_PER_MILLION_USD": "0",
+    "MODEL_REDACTION_PATTERNS": "[]",
+}
+overrides = {
+    "GOOGLE_CLIENT_ID": "synthetic-compose-google-client",
+    "GOOGLE_REDIRECT_URI": "https://app.example.test/api/v1/connections/google/callback",
+    "MODEL_BASE_URL": "https://model.example.test/v1",
+    "MODEL_NAME": "synthetic-compose-model",
+    "MODEL_SUPPORTS_JSON_SCHEMA": "false",
+    "MODEL_INPUT_COST_PER_MILLION_USD": "1.25",
+    "MODEL_OUTPUT_COST_PER_MILLION_USD": "2.5",
+    "MODEL_REDACTION_PATTERNS": '["SYNTHETIC_PATTERN_[0-9]+"]',
+}
+
+
+def reject_io(*args: object, **kwargs: object) -> None:
+    """配置组合只能绑定依赖；若开始数据库或时钟操作，立即拒绝该测试。"""
+    raise AssertionError("configuration construction must not perform I/O")
+
+
+with TemporaryDirectory(prefix="ai-employee-compose-config-") as directory:
+    root = Path(directory)
+    for filename in ("compose.yaml", "compose.dev.yaml"):
+        shutil.copyfile(filename, root / filename)
+    master = root / "synthetic-master"
+    master.write_text(base64.urlsafe_b64encode(bytes(range(32))).decode(), encoding="ascii")
+    provider_secret = root / "synthetic-provider"
+    provider_secret.write_text("synthetic-compose-provider-secret", encoding="ascii")
+    os.chmod(master, 0o600)
+    os.chmod(provider_secret, 0o600)
+    # 只清除本合同输入和 Compose 自身选择器，防止宿主环境覆盖合成根 .env；不读取真实值。
+    child_environment = {
+        key: value for key, value in os.environ.items()
+        if key not in set(defaults) | {
+            "APP_IMAGE_TAG", "APP_DOMAIN", "MICROSOFT_CLIENT_ID", "MICROSOFT_REDIRECT_URI",
+            "EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED",
+            "WRITE_TEST_ACCOUNT_ALLOWLIST", "COMPOSE_FILE", "COMPOSE_PROFILES",
+        }
+    }
+    for mode, expected in (("defaults", defaults), ("overrides", overrides)):
+        fixture = {
+            "APP_IMAGE_TAG": "synthetic-config-v1",
+            "APP_DOMAIN": "app.example.test",
+        }
+        if mode == "overrides":
+            fixture.update(overrides)
+            fixture.update({
+                "MICROSOFT_CLIENT_ID": "synthetic-compose-microsoft-client",
+                "MICROSOFT_REDIRECT_URI": "https://app.example.test/api/v1/connections/microsoft/callback",
+            })
+        (root / ".env").write_text(
+            "".join(f"{key}={value}\n" for key, value in fixture.items()), encoding="utf-8"
+        )
+        for development in (False, True):
+            command = ["docker", "compose", "--env-file", str(root / ".env"), "-f", str(root / "compose.yaml")]
+            if development:
+                command.extend(["-f", str(root / "compose.dev.yaml")])
+            command.extend(["config", "--format", "json"])
+            rendered = subprocess.run(command, env=child_environment, capture_output=True, check=False)
+            assert rendered.returncode == 0, "synthetic Compose rendering failed"
+            services = json.loads(rendered.stdout)["services"]
+            for service in ("api", "worker", "scheduler"):
+                environment = services[service]["environment"]
+                label = f"{'development' if development else 'production'}/{mode}/{service}"
+                for key, value in expected.items():
+                    assert environment.get(key) == value, f"{label}: {key} missing or changed"
+                assert all(environment[key] == "false" for key in (
+                    "EXTERNAL_WRITES_ENABLED", "GOOGLE_WRITES_ENABLED", "MICROSOFT_WRITES_ENABLED"
+                )), f"{label}: default write gate changed"
+                with patch.dict(os.environ, environment, clear=True):
+                    settings = Settings(
+                        _env_file=None,
+                        app_master_key_file=master,
+                        google_client_secret_file=provider_secret,
+                        microsoft_client_secret_file=provider_secret,
+                    )
+                assert settings.google_client_id == expected["GOOGLE_CLIENT_ID"]
+                assert settings.google_redirect_uri == expected["GOOGLE_REDIRECT_URI"]
+                assert settings.model_base_url == expected["MODEL_BASE_URL"]
+                assert settings.model_name == expected["MODEL_NAME"]
+                assert settings.model_supports_json_schema is (mode == "defaults")
+                assert settings.model_redaction_patterns == json.loads(expected["MODEL_REDACTION_PATTERNS"])
+                assert settings.model_input_cost_per_million_usd == float(expected["MODEL_INPUT_COST_PER_MILLION_USD"])
+                assert settings.model_output_cost_per_million_usd == float(expected["MODEL_OUTPUT_COST_PER_MILLION_USD"])
+                if mode == "overrides":
+                    state = SimpleNamespace(
+                        auth_settings=settings, auth_session_factory=reject_io,
+                        connections_store_factory=reject_io, auth_clock=reject_io,
+                    )
+                    use_case = get_connections_use_case(SimpleNamespace(app=SimpleNamespace(state=state)))
+                    assert isinstance(use_case._adapters["google"], GoogleOAuthAdapter)
+                    assert isinstance(use_case._adapters["microsoft"], MicrosoftOAuthAdapter)
+print("Google/model root-env configuration matrix: 12 service cases passed")
+PY
 
 # 只检查渲染后的非秘密开关、Secret 名称与挂载路径，不读取或输出任何 Secret 文件内容。
 rendered_service_config() {

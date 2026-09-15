@@ -570,7 +570,7 @@ def build_calendar_router() -> APIRouter:
     async def list_calendar_proposals(
         authenticated: CurrentSession,
         response: Response,
-        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
+        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case, scope="function")],
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> CalendarProposalListResponse:
@@ -596,7 +596,7 @@ def build_calendar_router() -> APIRouter:
         payload: CreateProposalRequest,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
+        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case, scope="function")],
         idempotency_key: IdempotencyKeyHeader,
     ) -> CalendarProposalResponse:
         """幂等创建本地 create/update 提案，绝不写供应商日历。"""
@@ -664,7 +664,7 @@ def build_calendar_router() -> APIRouter:
         payload: UpdateProposalRequest | ConfirmProposalRequest,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
+        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case, scope="function")],
     ) -> CalendarProposalResponse:
         """以版本 CAS 保存下一不可变 desired snapshot。"""
         _set_no_store(response)
@@ -701,7 +701,7 @@ def build_calendar_router() -> APIRouter:
         proposal_id: UUID,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case)],
+        use_case: Annotated[CalendarProposalUseCase, Depends(get_calendar_proposal_use_case, scope="function")],
     ) -> CalendarProposalResponse:
         """取消纯本地未执行提案，不创建审批、任务或外部副作用。"""
         _set_no_store(response)

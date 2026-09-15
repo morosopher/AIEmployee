@@ -21,6 +21,7 @@ from ai_employee.domain.errors import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.integrations.google.errors import raise_if_google_api_disabled
 
 GOOGLE_CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 GOOGLE_CALENDAR_EVENTS_BASE_URL = "https://www.googleapis.com/calendar/v3/calendars"
@@ -187,7 +188,7 @@ class GoogleCalendarAdapter:
         *,
         url: str = CALENDAR_EVENTS_URL,
     ) -> object:
-        """执行只读请求，401 最多刷新并重试一次，其余暂态错误映射领域类型。"""
+        """执行只读请求；401 最多刷新一次，API 未启用与暂态故障分别映射领域错误。"""
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=3.0)) as client:
@@ -222,6 +223,7 @@ class GoogleCalendarAdapter:
                     message="Google Calendar is temporarily unavailable",
                     retry_after=self._retry_after(response),
                 )
+            raise_if_google_api_disabled(response)
             response.raise_for_status()
             return response.json()
         raise AssertionError("Calendar request retry loop exhausted")

@@ -20,38 +20,43 @@ services:
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
-    ports:
-      - "5173:5173"
+    # 开发环境只供本机访问；替换生产端口列表，避免合并后仍发布 80/443。
+    ports: !override
+      - "127.0.0.1:5173:5173"
 
   api:
+    # file Secret 保留宿主 inode 的 0600 权限，开发进程使用其所有者 UID/GID。
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
       <<: *m2-write-environment
       APP_ENV: development
       APP_BASE_URL: http://localhost:5173
-      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
-      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
-    # 开发环境也不允许把 OAuth code/state 的原始 query 写入 access log。
-    command: ["uvicorn", "ai_employee.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log"]
+    # 复用生产的不含密码 DSN，启动时读取应用角色 Secret；OAuth query 不进入 access log。
+    command: ["/bin/sh", "-ec", "export PGPASSWORD=\"$$(cat /run/secrets/app_database_password)\"; exec uvicorn ai_employee.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log"]
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./backend:/app/backend
+      # 宿主虚拟环境可能使用不同的 Python 路径，镜像依赖必须由独立卷保留。
+      - backend_venv:/app/backend/.venv
 
   worker:
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
       <<: *m2-write-environment
       APP_ENV: development
-      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
-      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
     volumes:
       - ./backend:/app/backend
+      - backend_venv:/app/backend/.venv
 
   scheduler:
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     environment:
       <<: *m2-write-environment
       APP_ENV: development
-      DATABASE_URL: postgresql+asyncpg://ai_employee_app:ai_employee@postgres:5432/ai_employee
-      CHECKPOINT_DATABASE_URL: postgresql://ai_employee_app:ai_employee@postgres:5432/ai_employee
     volumes:
       - ./backend:/app/backend
+      - backend_venv:/app/backend/.venv
 
 # 生产基线把 Secret 标为 external；开发层必须显式复位，避免合并后同时出现 external 与 file。
 secrets:
@@ -88,3 +93,6 @@ secrets:
 
 volumes:
   frontend_node_modules:
+  backend_venv:
+    # 空卷只在首次挂载时复制镜像依赖；按不可变标签换卷，避免升级后仍使用上一版依赖。
+    name: "${COMPOSE_PROJECT_NAME:-ai-employee}-backend-venv-${APP_IMAGE_TAG:?APP_IMAGE_TAG must name an immutable image tag}"

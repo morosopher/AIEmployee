@@ -5,12 +5,29 @@ from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
 from typing import Protocol
+from uuid import UUID
 
 from ai_employee.domain.errors import (
     PermanentProviderError,
     TransientProviderError,
     UserActionRequiredError,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarNotificationFacts:
+    """承载审批前当前事件的最小通知事实，不携带参会人地址或事件敏感内容。
+
+    来源查询须同时约束 user、connection、calendar 和 provider event；adapter 再将
+    ETag 与冻结命令比较。``has_attendees=None`` 表示当前名单无法确认，不能当作个人
+    日程使用。该投影只供表达能力预检，不能替代执行 GET 或授予写权限。
+    """
+
+    connection_id: UUID
+    calendar_id: str
+    provider_event_id: str
+    etag: str
+    has_attendees: bool | None
 
 
 @dataclass(frozen=True, slots=True)

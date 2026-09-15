@@ -1477,10 +1477,10 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
 ) -> None:
     """关闭读能力与渐进回调交错时，回调必须因授权代际变化而失效。
 
-    测试先让 disable 仓储沿 Task→Approval→ToolExecution→本地动作锁序完成扫描，再在
-    Connection 行锁之后读取 enabled 快照并暂停；随后让真实 PostgreSQL callback 尝试保存
-    写/读能力。若快照读取没有复用该连接锁，callback 会在窗口内提交，随后 disable 把
-    ``mail.read`` 置为 disabled，形成 ``mail.send=enabled`` 却缺少依赖的非法终态。
+    测试先让 callback 在真实事务中消费 state 并暂停于合成身份请求；disable 随后沿
+    全部 Task→User→Approval→ToolExecution→本地动作锁序扫描，在 Connection 行锁后读取
+    enabled 快照并暂停。释放身份请求后，callback 保存必须等待同一用户/连接屏障，并在
+    disable 提交后因代际变化而失效，不能形成缺少 ``mail.read`` 的 ``mail.send=enabled``。
     """
     session_factory = build_session_factory(database_url)
     cipher = AeadCipher(b"p" * 32)
@@ -1527,6 +1527,10 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
         )
         state = adapter.authorization_states[-1]
 
+        # state 消费本身也同步 User；先进入无事务的网络窗口，再与关闭结果保存制造交错。
+        callback_task = asyncio.create_task(use_case.callback(code="synthetic-code", state=state))
+        await asyncio.wait_for(fetch_started.wait(), timeout=5)
+
         original_get_enabled = SqlAlchemyConnectionStore.get_enabled_capabilities
 
         async def blocked_get_enabled(
@@ -1563,11 +1567,9 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
         )
         await asyncio.wait_for(enabled_read_observed.wait(), timeout=5)
 
-        callback_task = asyncio.create_task(use_case.callback(code="synthetic-code", state=state))
-        await asyncio.wait_for(fetch_started.wait(), timeout=5)
         release_fetch.set()
 
-        # 没有连接行锁的旧实现会在这里成功提交；加锁实现必须一直等到 disable 提交。
+        # 已在途的回调结果不能越过同事务用户/连接屏障，必须等待 disable 提交再检查代际。
         callback_completed_before_disable_release = False
         try:
             await asyncio.wait_for(asyncio.shield(callback_task), timeout=2)
@@ -1581,7 +1583,7 @@ async def test_disable_capability_cannot_race_progressive_callback_into_broken_d
 
         if callback_completed_before_disable_release:
             pytest.fail(
-                "progressive callback committed before disable released its connection lock"
+                "progressive callback committed before disable released its user and connection locks"
             )
         with pytest.raises(StateConflictError) as raised:
             await callback_task

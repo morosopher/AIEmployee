@@ -23,6 +23,11 @@ test-e2e:
 e2e-backend:
     bash scripts/run-e2e-backend.sh
 
+# 仅供新 CI job 显式准备其已登记 service；普通测试/产品启动不隐式 seed 或修补数据库。
+[group('quality')]
+prepare-ci-database:
+    uv run --project backend python scripts/prepare_ci_database.py
+
 [group('quality')]
 lint:
     uv run --project backend ruff check backend

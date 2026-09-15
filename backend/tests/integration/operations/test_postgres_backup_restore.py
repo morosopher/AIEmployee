@@ -10,6 +10,7 @@ import json
 import os
 import runpy
 import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1439,6 +1440,10 @@ def test_operations_host_refuses_invalid_target_or_changed_inputs_before_owner(
             state.symlink_to(dump.parent, target_is_directory=True)
         else:
             state.mkdir(mode=0o755)
+            # 权限反例必须显式落为 0755，避免私有入口的 umask 077 收紧为合规目录。
+            # 只调整本例新建的空目录；父级 pytest 临时根与真实恢复状态的权限保持不变。
+            state.chmod(0o755)
+            assert state.lstat().st_mode & 0o777 == 0o755
     elif mutation.startswith("running_"):
         probe.rows = [
             {
@@ -2549,25 +2554,43 @@ def test_generic_rejects_legacy_bytes_before_any_restore_child(tmp_path: Path) -
 
 
 def test_release_wrapper_explicitly_executes_fixed_audit_subprocess(tmp_path: Path) -> None:
-    """初始 release 门禁必须直接执行 audit 子进程，不能把 just ci 当作替代。"""
+    """完整 release 必须显式执行固定 audit，所有其他入口也用专用替身避免递归 CI。"""
     release = ROOT / "scripts/test-m2-release.sh"
     assert release.is_file(), "release wrapper has no explicit Task13 audit subprocess"
     commands = tmp_path / "commands"
     commands.mkdir(mode=0o700)
-    calls = tmp_path / "audit-called"
-    _executable(
-        commands / "bash",
-        "#!/usr/bin/env python3\n"
-        "import os, pathlib, sys\n"
-        'if sys.argv[1:] != ["scripts/test-calendar-aad-0019-audit.sh"]:\n'
+    calls = tmp_path / "commands-called"
+    # 使用当前解释器的绝对 shebang，使 python3 scanner 替身不会递归截获其他替身。
+    stub = (
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "name = pathlib.Path(sys.argv[0]).name\n"
+        "arguments = sys.argv[1:]\n"
+        "allowed = {\n"
+        '    "just": [["ci"]],\n'
+        '    "bash": [["scripts/test-calendar-aad-0019-audit.sh"],\n'
+        '             ["scripts/test-legacy-backup-conversion.sh"],\n'
+        '             ["scripts/test-deployment.sh"], ["scripts/test-tooling.sh"]],\n'
+        '    "python3": [["scripts/verify-m2-sensitive-output.py"]],\n'
+        '    "git": [["diff", "--check"]],\n'
+        "}\n"
+        'if name == "uv":\n'
+        '    valid = arguments[:4] == ["run", "--project", "backend", "pytest"]\n'
+        '    valid = valid and arguments[-1:] == ["-q"]\n'
+        "else:\n"
+        "    valid = arguments in allowed[name]\n"
+        "if not valid:\n"
         "    raise SystemExit(81)\n"
         "from urllib.parse import urlsplit\n"
         'url = urlsplit(os.environ.get("TEST_DATABASE_URL", ""))\n'
         "if (url.scheme, url.hostname, url.port, url.path) != "
         '("postgresql+asyncpg", "127.0.0.1", 55443, "/ai_employee_task13_test"):\n'
         "    raise SystemExit(82)\n"
-        'pathlib.Path(os.environ["TEST_CALLS"]).write_text("audit-executed")\n',
+        'with pathlib.Path(os.environ["TEST_CALLS"]).open("a") as stream:\n'
+        '    stream.write(json.dumps([name, *arguments]) + "\\n")\n'
     )
+    for command in ("just", "bash", "uv", "python3", "git"):
+        _executable(commands / command, stub)
     result = subprocess.run(
         ["/bin/bash", str(release)],
         cwd=ROOT,
@@ -2577,4 +2600,7 @@ def test_release_wrapper_explicitly_executes_fixed_audit_subprocess(tmp_path: Pa
         check=False,
     )
     assert result.returncode == 0
-    assert calls.read_text() == "audit-executed"
+    observed = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert len(observed) == 13
+    assert observed[0] == ["just", "ci"]
+    assert observed.count(["bash", "scripts/test-calendar-aad-0019-audit.sh"]) == 1

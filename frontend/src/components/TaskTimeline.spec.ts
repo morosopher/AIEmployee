@@ -16,6 +16,29 @@ const failedTask: TaskSnapshot = {
 }
 
 describe('TaskTimeline', () => {
+  it('explains how to enable Google APIs for a confirmed project configuration error', () => {
+    const wrapper = mount(TaskTimeline, {
+      props: {
+        task: { ...failedTask, kind: 'sync_mail', error_code: 'google_api_not_enabled' },
+        retry: vi.fn(),
+        follow: vi.fn(),
+      },
+    })
+
+    expect(wrapper.text()).toContain('Google Cloud')
+    expect(wrapper.text()).toContain('Gmail API')
+    expect(wrapper.text()).toContain('Google Calendar API')
+    expect(wrapper.text()).toContain('启用后重试同步')
+  })
+
+  it('does not suggest changing Google project configuration for unrelated failures', () => {
+    const wrapper = mount(TaskTimeline, {
+      props: { task: failedTask, retry: vi.fn(), follow: vi.fn() },
+    })
+
+    expect(wrapper.text()).not.toContain('Google Cloud')
+  })
+
   it('follows the replacement returned by retry without mutating the failed task', async () => {
     const retry = vi.fn().mockResolvedValue({
       ...failedTask,

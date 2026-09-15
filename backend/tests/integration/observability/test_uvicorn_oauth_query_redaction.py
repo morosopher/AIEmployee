@@ -35,6 +35,7 @@ from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.connections import SqlAlchemyConnectionStoreFactory
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker, build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from tests.integration.e2e_backend import service_command
 
 USER_ID = UUID("00000000-0000-0000-0000-000000000101")
 CONNECTION_ID = UUID("00000000-0000-0000-0000-000000000202")
@@ -124,15 +125,38 @@ async def _seed_attempts(
             )
 
 
-def _real_development_uvicorn_options() -> list[str]:
-    """从真实 dev recipe 继承日志参数，仅替换 reload/网络绑定以隔离测试进程。"""
-    candidates = [
-        line
-        for line in (ROOT / "justfiles/dev.just").read_text().splitlines()
-        if "uvicorn ai_employee.main:app" in line and not line.lstrip().startswith("#")
-    ]
-    assert len(candidates) == 1
-    words = shlex.split(candidates[0])
+def _real_uvicorn_options(launch_entry: str) -> list[str]:
+    """从四个真实入口读取 argv，仅去掉 reload/网络绑定以隔离 canary 进程。
+
+    Compose 的 command 本身是 JSON 流式数组，直接解码以保留引号语义。生产与开发命令的
+    Secret shell 都绝不执行，只读取 ``exec uvicorn`` 后的参数；E2E 则调用其实际 argv
+    构造器，避免 shell 薄入口与 Python 服务命令分离后只检测已不用的文本。
+    """
+    if launch_entry == "e2e":
+        words = service_command("api")
+    else:
+        relative_path = {
+            "compose": "compose.yaml",
+            "compose_dev": "compose.dev.yaml",
+            "just_dev": "justfiles/dev.just",
+        }[launch_entry]
+        candidates = [
+            line.strip()
+            for line in (ROOT / relative_path).read_text().splitlines()
+            if "uvicorn" in line and "ai_employee.main:app" in line
+            and not line.lstrip().startswith("#")
+        ]
+        assert len(candidates) == 1, "real Uvicorn entry is ambiguous"
+        if launch_entry == "just_dev":
+            words = shlex.split(candidates[0])
+        else:
+            words = json.loads(candidates[0].partition("command:")[2].strip())
+            if launch_entry in {"compose", "compose_dev"}:
+                assert words[:2] == ["/bin/sh", "-ec"] and len(words) == 3
+                shell_words = shlex.split(words[2])
+                exec_index = shell_words.index("exec")
+                assert shell_words[exec_index + 1] == "uvicorn"
+                words = shell_words[exec_index + 1 :]
     options = words[words.index("ai_employee.main:app") + 1 :]
     isolated: list[str] = []
     index = 0
@@ -149,11 +173,13 @@ def _real_development_uvicorn_options() -> list[str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("launch_entry", ["compose", "compose_dev", "just_dev", "e2e"])
 async def test_real_uvicorn_oauth_query_has_zero_log_matches_and_keeps_error_audit(
     database_url: str,
     tmp_path: Path,
+    launch_entry: str,
 ) -> None:
-    """真实 callback 经过 Uvicorn、路由、用例和数据库；分别使用合法 code/error 形状。"""
+    """四入口的真实日志 argv 都经过 callback、数据库与合法 code/error 形状。"""
     sessions = build_session_factory(database_url)
     await _seed_attempts(sessions)
     master = tmp_path / "master"
@@ -208,7 +234,7 @@ async def test_real_uvicorn_oauth_query_has_zero_log_matches_and_keeps_error_aud
                 "-m",
                 "uvicorn",
                 "task27a_canary_app:app",
-                *_real_development_uvicorn_options(),
+                *_real_uvicorn_options(launch_entry),
                 "--app-dir",
                 str(tmp_path),
                 "--fd",

@@ -34,6 +34,7 @@ from ai_employee.infrastructure.db.models.sources import (
 from ai_employee.infrastructure.db.repositories.historical_action_bindings import (
     preserve_historical_action_bindings,
 )
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
@@ -148,6 +149,12 @@ class SqlAlchemyMailDraftRepository:
             StateConflictError: 创建键已绑定到不同请求哈希，或既有正文已清除。
             ValueError: 时间无时区、模式类型错误或加密 JSON 非法。
         """
+        # 认证与连接读取已经结束；必须在当前事务先同步用户删除屏障，再插入父/版本。
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise StateConflictError(
+                error_code="mail_draft_not_editable",
+                message="mail draft is not editable",
+            )
         if type(mode) is not MailMode:
             raise TypeError("mail draft mode must be MailMode")
         normalized_retain_until = _as_utc(retain_until)
@@ -435,6 +442,9 @@ class SqlAlchemyMailDraftRepository:
         Raises:
             StateConflictError: expected version 陈旧，或草稿不在可编辑状态。
         """
+        # 新邮件重绑还会写历史步骤摘要，因此用户锁必须早于父行锁和所有CAS分支。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         if type(expected_version) is not int or expected_version <= 0:
             raise ValueError("expected_version must be a positive integer")
         original_connection_id = None
@@ -580,6 +590,9 @@ class SqlAlchemyMailDraftRepository:
             StateConflictError: 锁内状态不是精确 ``editing``；待审批与未知结果分别要求
                 走可信任务撤回或人工结果确认，执行中和终态由状态机拒绝。
         """
+        # 沿用不存在时的None语义，取消也不能在inactive屏障后改写本地状态。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         draft = await self._session.scalar(
             select(MailDraftModel)
             .where(

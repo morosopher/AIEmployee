@@ -12,6 +12,7 @@ import re
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from time import monotonic, sleep
 from typing import NoReturn, Self, cast
 
 from sqlalchemy import Connection, Engine, text
@@ -90,7 +91,15 @@ _CURRENT_ROLE_CAN_CREATE_DATABASE_SQL = (
     "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user"
 )
 
-_DATABASE_SESSION_COUNT_SQL = """SELECT count(*)
+_DATABASE_SESSION_COUNT_SQL = """SELECT
+    count(*) AS database_sessions,
+    count(*) FILTER (
+        WHERE activity.backend_type = 'autovacuum worker'
+    ) AS autovacuum_sessions
+FROM pg_stat_activity AS activity
+WHERE activity.datid = :target_database_oid"""
+
+_DATABASE_BACKEND_TYPES_SQL = """SELECT activity.backend_type AS backend_type
 FROM pg_stat_activity AS activity
 WHERE activity.datid = :target_database_oid"""
 
@@ -576,11 +585,47 @@ class DisposableDatabaseCleanupLease:
             value = _exact_scalar(self._connection.execute(text(query), {"role_oids": role_oids}))
             _zero_count(value)
 
+    def _wait_for_autovacuum(self, *, deadline: float) -> None:
+        """在最终清理检查前，最多等五秒让自有目标的 PostgreSQL vacuum 自行结束。
+
+        每次只读观察都先重验原 management session、锁、cluster、database OID 和角色
+        provenance。只允许 ``autovacuum worker`` 进入等待；客户端或未知类型立即拒绝。
+        此准备不执行 DDL、不终止会话，也不消费或重试清理失败；返回后仍执行原始全量
+        身份、角色和所有会话零计数检查，因此等待完成本身不产生任何删除 authority。
+
+        Args:
+            deadline: 整次清理准备共用的 monotonic 截止点，晚到 vacuum 不得重置预算。
+        """
+        while True:
+            self._assert_guard()
+            database = self._verify_database()
+            if self._roles is None:
+                if _read_role_rows(self._connection):
+                    _fail()
+            else:
+                self._verify_roles()
+            rows = _exact_mapping_rows(
+                self._connection.execute(
+                    text(_DATABASE_BACKEND_TYPES_SQL),
+                    {"target_database_oid": database.database_oid},
+                )
+            )
+            if monotonic() >= deadline:
+                _fail()
+            if not rows:
+                return
+            if any(row.get("backend_type") != "autovacuum worker" for row in rows):
+                _fail()
+            sleep(0.01)
+
     def cleanup(self) -> None:
         """按 provenance 顺序删除 database 与两个无依赖 fixed roles。
 
-        首个 ``DROP`` 前一次性重验 live session、lock、cluster、database OID 和两个
-        role OID/posture。database 删除后再重验 lock/cluster/role provenance 与六类
+        先只读等待已识别的后台 vacuum 自行结束，再在首个 ``DROP`` 前一次性重验
+        live session、lock、cluster、database OID 和两个 role OID/posture。最终全会话
+        数与其中 vacuum 数来自同一条 SQL；若准备后又出现了且仅出现 vacuum，继续在
+        原五秒预算内准备。客户端、未知类型及任何来源漂移立即拒绝，只有最终精确零
+        会话才执行删除。database 删除后再重验 lock/cluster/role provenance 与六类
         cluster 依赖，最后只执行两个无 ``CASCADE`` 的固定 ``DROP ROLE``。
         """
         if self._cleaned:
@@ -591,41 +636,54 @@ class DisposableDatabaseCleanupLease:
         if self._database is None:
             _fail()
 
-        if self._roles is None:
-            # typed role-bootstrap 之前或其事务性失败之后，lease 仍拥有已冻结 OID 的
-            # UUID database。只有再次证明 fixed roles 全部 absent 时才允许删该数据库；
-            # 任一同名角色出现都缺少 role OID provenance，必须在首个 DROP 前拒绝。
+        deadline = monotonic() + 5
+        while True:
+            self._wait_for_autovacuum(deadline=deadline)
+
+            # 准备观察与最终准入之间可能发生漂移；每次准备结束都重验完整来源，不能
+            # 因为此前已看见空会话集合，就沿用旧 session、OID、锁或角色 posture。
             self._assert_guard()
             database = self._verify_database()
-            if _read_role_rows(self._connection):
-                _fail()
-            database_sessions = _exact_scalar(
+            if self._roles is None:
+                # bootstrap 前或事务性失败后仅有 database authority，任何同名角色出现
+                # 都缺少本轮角色来源证明，必须在首个 DROP 前拒绝。
+                if _read_role_rows(self._connection):
+                    _fail()
+            else:
+                self._verify_roles()
+            rows = _exact_mapping_rows(
                 self._connection.execute(
                     text(_DATABASE_SESSION_COUNT_SQL),
                     {"target_database_oid": database.database_oid},
                 )
             )
-            _zero_count(database_sessions)
-            self._connection.execute(text(f"DROP DATABASE {self._quoted_database_name}"))
-            if _read_database_rows(self._connection, database_name=self._database_name):
+            if len(rows) != 1 or set(rows[0]) != {"database_sessions", "autovacuum_sessions"}:
                 _fail()
-            self._cleaned = True
-            return
-
-        self._assert_guard()
-        database = self._verify_database()
-        roles = self._verify_roles()
-        database_sessions = _exact_scalar(
-            self._connection.execute(
-                text(_DATABASE_SESSION_COUNT_SQL),
-                {"target_database_oid": database.database_oid},
-            )
-        )
-        _zero_count(database_sessions)
+            database_sessions = rows[0]["database_sessions"]
+            autovacuum_sessions = rows[0]["autovacuum_sessions"]
+            if (
+                type(database_sessions) is not int
+                or type(autovacuum_sessions) is not int
+                or database_sessions < 0
+                or autovacuum_sessions < 0
+                or autovacuum_sessions > database_sessions
+                or monotonic() >= deadline
+            ):
+                _fail()
+            if database_sessions > 0 and database_sessions == autovacuum_sessions:
+                # PostgreSQL 可在上一次空观察后启动后台 worker。仅同一快照已精确证明
+                # 全部都是 vacuum 才继续准备；不消费 _zero_count 或 DROP 的失败再重试。
+                sleep(0.01)
+                continue
+            _zero_count(database_sessions)
+            break
 
         self._connection.execute(text(f"DROP DATABASE {self._quoted_database_name}"))
         if _read_database_rows(self._connection, database_name=self._database_name):
             _fail()
+        if self._roles is None:
+            self._cleaned = True
+            return
 
         self._assert_guard()
         roles = self._verify_roles()

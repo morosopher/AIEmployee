@@ -21,15 +21,18 @@ from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
+    OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
+from ai_employee.integrations.mail_mime import message_id_for
 from ai_employee.integrations.microsoft.mail_write import (
     MICROSOFT_SEND_MAIL_URL,
     MICROSOFT_SENT_MESSAGES_URL,
     MicrosoftMailWriteAdapter,
 )
 from ai_employee.integrations.registry import ProviderAdapterRegistry, build_trusted_action_registry
+from tests.contract.microsoft.account_cases import MICROSOFT_ACCOUNT_CASES, MicrosoftAccountCase
 from tests.integration.m2.test_tool_execution_claim import _Seed, _seed_action, _settings
 
 pytestmark = pytest.mark.skipif(
@@ -110,17 +113,19 @@ async def test_registry_reentry_reconciles_without_second_graph_write() -> None:
 @respx.mock
 @pytest.mark.parametrize("mode", [MailMode.REPLY, MailMode.REPLY_ALL])
 @pytest.mark.parametrize("reply_to", ["", '"Synthetic, Reply" <reply@example.test>'])
+@pytest.mark.parametrize("account", MICROSOFT_ACCOUNT_CASES, ids=lambda case: case.account_type)
 async def test_production_registry_uses_exact_microsoft_reply_source(
     database_url: str,
     tmp_path: Path,
     mode: MailMode,
     reply_to: str,
+    account: MicrosoftAccountCase,
 ) -> None:
-    """生产解析器从本地已同步头字段派生 Graph 收件人，纯预检与直接回复均可用。"""
+    """两类规范账户经生产解析器派生真实回复来源，预检、直接回复及 Sent 核对可用。"""
     seed = _Seed()
-    seed.provider, seed.account_type = "microsoft", "work_school"
-    seed.provider_tenant_id = "synthetic-tenant"
-    seed.provider_account_id = "synthetic-tenant:synthetic-user"
+    seed.provider, seed.account_type = "microsoft", account.account_type
+    seed.provider_tenant_id = account.tenant
+    seed.provider_account_id = account.provider_account_id
     await _seed_action(database_url, seed)
     sessions = build_session_factory(database_url)
     root_file = tmp_path / "master"
@@ -129,7 +134,7 @@ async def test_production_registry_uses_exact_microsoft_reply_source(
         provider="microsoft", tenant=seed.provider_tenant_id, account=seed.provider_account_id
     ).model_copy(update={"app_master_key_file": root_file})
     encrypted = AeadCipher(b"x" * 32).encrypt(
-        b"synthetic-access",
+        account.access_token.encode("ascii"),
         f"{seed.user_id}:{seed.connection_id}:access_token".encode(),
     )
     thread_id, message_id = uuid4(), uuid4()
@@ -157,6 +162,10 @@ async def test_production_registry_uses_exact_microsoft_reply_source(
     )
     try:
         async with sessions.begin() as session:
+            connection = await session.get(OAuthConnectionModel, seed.connection_id)
+            assert connection is not None and connection.account_type == account.account_type
+            assert connection.provider_tenant_id == account.tenant
+            assert connection.provider_account_id == account.provider_account_id
             session.add(
                 EncryptedCredentialModel(
                     user_id=seed.user_id,
@@ -211,6 +220,26 @@ async def test_production_registry_uses_exact_microsoft_reply_source(
         result = await adapter.execute(command)
         assert result.kind is ProviderWriteOutcomeKind.UNKNOWN
         assert send.call_count == 1
+        sent = respx.get(MICROSOFT_SENT_MESSAGES_URL).respond(
+            200,
+            json={
+                "value": [
+                    {
+                        "id": "synthetic-sent-reply",
+                        "conversationId": "synthetic-source-thread",
+                        "internetMessageId": message_id_for(command.operation_id),
+                        "sentDateTime": "2030-01-01T00:00:00Z",
+                    }
+                ]
+            },
+        )
+        checked = await adapter.reconcile(command, _execution())
+        assert checked.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
+        assert sent.call_count == 1 and send.call_count == 1
+        assert all(
+            call.request.headers["Authorization"] == f"Bearer {account.access_token}"
+            for call in (*send.calls, *sent.calls)
+        )
 
         # 用户可编辑命令不能反向成为来源 proof；不同 source 四元绑定也不得借用此事实。
         for changed in (

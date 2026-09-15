@@ -2,12 +2,25 @@
 set -euo pipefail
 
 # 四个真实 API 启动命令均必须关闭原始 request-target 日志；注释中的 flag 不算证据。
-for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just scripts/run-e2e-backend.sh; do
+for api_entry in compose.yaml compose.dev.yaml justfiles/dev.just; do
   if ! grep -Eq -- '^[[:space:]]*(command:|uv run).*uvicorn.*--no-access-log' "${api_entry}"; then
     printf 'OAuth access-log boundary missing: %s\n' "${api_entry}" >&2
     exit 1
   fi
 done
+# E2E 的受管生命周期直接执行 Python argv；读取同一函数的实际返回值，不能把 shell
+# 注释中的 flag 当成启动证据。独立 Uvicorn canary 还会用这些 argv 启动真实子进程。
+uv run --project backend python - <<'PY'
+import sys
+
+sys.path.insert(0, "backend")
+from tests.integration.e2e_backend import service_command
+
+assert service_command("api") == [
+    sys.executable, "-m", "uvicorn", "ai_employee.main:app", "--host", "127.0.0.1",
+    "--port", "8000", "--no-access-log",
+]
+PY
 
 # 独立指标 listener 只允许每个 Worker 容器/进程组拥有一个 Taskiq 子进程；开发入口必须
 # 与生产及 E2E 保持同一约束，横向并发由多个容器提供。
@@ -74,6 +87,102 @@ mkdir -p "${sandbox_dir}/fake-bin" "${sandbox_dir}/scripts"
 mkdir -p "${sandbox_dir}/just-temp"
 cp scripts/run-calendar-aad-0019.py "${sandbox_dir}/scripts/"
 
+# 发布门禁必须实际执行所有直接证据命令，并在第一个子进程前一次性导出固定合成目标。
+# 在安装专用 Fake PATH 前捕获真实 Bash；Fake bash/just 只记录调用后退出，因此嵌套的
+# `just ci` 与 `bash scripts/test-tooling.sh` 永远不会递归执行当前测试。
+real_bash="$(command -v bash)"
+[[ "${real_bash}" == /* ]] || { printf 'release harness requires absolute Bash\n' >&2; exit 1; }
+release_fake_bin="${sandbox_dir}/release-fake-bin"
+mkdir -p "${release_fake_bin}"
+cp scripts/test-m2-release.sh "${sandbox_dir}/scripts/test-m2-release.sh"
+export TOOLING_RELEASE_LOG="${sandbox_dir}/release-commands.log"
+for release_child in just uv bash python3 git; do
+  printf '#!%s\n' "${real_bash}" >"${release_fake_bin}/${release_child}"
+  cat >>"${release_fake_bin}/${release_child}" <<'RELEASE_FAKE'
+set -euo pipefail
+{
+  printf '%s' "${0##*/}"
+  for argument in "$@"; do printf '\t%s' "${argument}"; done
+  if [[ "${TEST_DATABASE_URL-}" == 'postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test' ]]; then
+    printf '\tfixed\n'
+  else
+    printf '\tinvalid\n'
+  fi
+} >>"${TOOLING_RELEASE_LOG}"
+RELEASE_FAKE
+  chmod +x "${release_fake_bin}/${release_child}"
+done
+cat >"${sandbox_dir}/release-expected.txt" <<'RELEASE_COMMANDS'
+just ci
+bash scripts/test-calendar-aad-0019-audit.sh
+uv run --project backend pytest backend/tests/integration/faults/test_m2_write_recovery.py -q
+uv run --project backend pytest backend/tests/unit/application/test_calendar_event_aad.py backend/tests/unit/infrastructure/db/test_database_access.py backend/tests/unit/infrastructure/db/test_database_grants.py backend/tests/integration/db/test_migrations.py backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py -q
+uv run --project backend pytest backend/tests/unit/application/test_calendar_aad_digests.py backend/tests/unit/application/test_oauth_refresh_identity.py backend/tests/unit/application/test_oauth_refresh_coordinator.py backend/tests/unit/application/test_connection_capability_use_cases.py -q
+uv run --project backend pytest backend/tests/integration/m2/test_connection_capability_repository.py backend/tests/integration/m2/test_credential_rotation_repository.py backend/tests/integration/m2/test_oauth_refresh_coordinator.py backend/tests/integration/api/test_connections.py backend/tests/integration/google/test_oauth_flow.py backend/tests/integration/google/test_gmail_sync.py backend/tests/integration/google/test_calendar_sync.py backend/tests/integration/microsoft/test_oauth_flow.py backend/tests/integration/microsoft/test_mail_sync.py backend/tests/integration/microsoft/test_calendar_sync.py backend/tests/integration/operations/test_calendar_aad_0019_preflight.py -q
+uv run --project backend pytest backend/tests/integration/operations/test_database_maintenance_gate.py backend/tests/integration/operations/test_postgres_backup_restore.py backend/tests/integration/operations/test_calendar_aad_0019_deadline_restore.py -q
+uv run --project backend pytest backend/tests/integration/retention/test_m2_action_retention.py backend/tests/integration/privacy/test_source_cache_cleanup.py backend/tests/integration/privacy/test_all_data_deletion.py backend/tests/unit/application/test_privacy.py backend/tests/integration/workers/test_outbox_dispatch.py backend/tests/integration/workers/test_retry_recovery.py backend/tests/integration/m2/test_tool_execution_claim.py backend/tests/unit/workers/test_execution_lease.py backend/tests/integration/retention/test_role_permissions.py backend/tests/unit/test_init_db_roles_script.py -q
+bash scripts/test-legacy-backup-conversion.sh
+bash scripts/test-deployment.sh
+bash scripts/test-tooling.sh
+python3 scripts/verify-m2-sensitive-output.py
+git diff --check
+RELEASE_COMMANDS
+for release_environment_case in absent exact other production_like; do
+  : >"${TOOLING_RELEASE_LOG}"
+  release_status=0
+  (
+    case "${release_environment_case}" in
+      absent) unset TEST_DATABASE_URL ;;
+      exact) export TEST_DATABASE_URL='postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test' ;;
+      other) export TEST_DATABASE_URL='postgresql+asyncpg://synthetic:synthetic@127.0.0.1:55499/other_test' ;;
+      production_like) export TEST_DATABASE_URL='postgresql+asyncpg://synthetic:synthetic@db.example.test:5432/production' ;;
+    esac
+    cd "${sandbox_dir}"
+    PATH="${release_fake_bin}:${PATH}" "${real_bash}" scripts/test-m2-release.sh
+  ) >"${sandbox_dir}/release-output.log" 2>&1 || release_status=$?
+  python3 - "${sandbox_dir}" "${release_environment_case}" "${release_status}" <<'PY'
+import pathlib
+import shlex
+import sys
+
+root, case, status = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+calls = [line.split("\t") for line in (root / "release-commands.log").read_text().splitlines()]
+if case in {"absent", "exact"}:
+    expected = [shlex.split(line) + ["fixed"] for line in (root / "release-expected.txt").read_text().splitlines()]
+    if status != 0 or calls != expected:
+        raise SystemExit(f"release direct-command/environment contract failed: case={case}, status={status}, calls={len(calls)}")
+else:
+    if status == 0 or calls:
+        raise SystemExit(f"release target admission failed: case={case}, status={status}, calls={len(calls)}")
+    output = (root / "release-output.log").read_text()
+    if "postgresql" in output or "synthetic@" in output:
+        raise SystemExit("release target rejection leaked its input")
+PY
+done
+# 运行时序列证明执行事实；此补充只冻结计划要求的单一入口语法，防止逐命令环境前缀
+# 或后置 export 恰好让 Fake 见到正确值，从而绕过第一个子进程前的准入约束。
+python3 - "${sandbox_dir}/scripts/test-m2-release.sh" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+required = """#!/usr/bin/env bash
+set -euo pipefail
+
+readonly required_test_database_url='postgresql+asyncpg://ai_employee_test:synthetic-password@127.0.0.1:55443/ai_employee_task13_test'
+if [[ -v TEST_DATABASE_URL && "${TEST_DATABASE_URL}" != "${required_test_database_url}" ]]; then
+  printf 'M2 release test refused: TEST_DATABASE_URL must match the fixed Task13 database\\n' >&2
+  exit 1
+fi
+export TEST_DATABASE_URL="${required_test_database_url}"
+"""
+if not source.startswith(required) or "TEST_DATABASE_URL" in source[len(required):]:
+    raise SystemExit("release requires one initial fixed environment export")
+if any(marker in source for marker in ("SKIP_", "UNDER_TEST", "recursion_depth", "RECURSION_DEPTH")):
+    raise SystemExit("release must not contain a test-only bypass")
+PY
+printf 'release direct-command/order/environment contract ok: 4 cases, no recursion\n'
+
 command_log="${sandbox_dir}/fake-commands.log"
 uv_environment_log="${sandbox_dir}/fake-uv-environment.log"
 typed_database_name_log="${sandbox_dir}/fake-typed-database-name.log"
@@ -101,7 +210,12 @@ set -euo pipefail
   done
   printf '\n'
 } >>"${TOOLING_TEST_LOG}"
-if [[ "$*" == 'compose --profile operations config --format json' ]]; then
+if [[ "$*" == 'compose -f compose.yaml -f compose.dev.yaml exec -T api '* ]]; then
+  # 只核对 stdin 的合成输入；密码不得出现在容器命令参数或 recipe 输出中。
+  IFS= read -r supplied_password
+  [[ "${supplied_password}" == 'Synthetic admin password input' ]] || exit 1
+  : >"${TOOLING_TEST_ADMIN_STDIN_OK}"
+elif [[ "$*" == 'compose --profile operations config --format json' ]]; then
   cat "${TOOLING_TEST_COMPOSE_CONFIG}"
 elif [[ "$*" == 'compose ps --all --format json' ]]; then
   if [[ -f "${TOOLING_TEST_SCREEN_SEEN}" && "${TOOLING_TEST_SERVICE_AFTER_SCREEN-}" == yes ]]; then
@@ -389,6 +503,37 @@ if [[ -e "${admin_sentinel}" ]]; then
 fi
 assert_exact_line $'uv\trun\t--project\tbackend\tpython\t-m\tai_employee.cli.create_admin\t--email\t'"${admin_email}"$'\t--password-file\t'"${admin_password_file}" "${command_log}"
 assert_line_count 1 "${command_log}"
+
+# Compose 模式沿用同一个入口及 typed CLI，通过 stdin 提供本地密码，不发布数据库端口。
+clear_command_log
+printf '%s\n' 'Synthetic admin password input' >"${admin_password_file}"
+export TOOLING_TEST_ADMIN_STDIN_OK="${sandbox_dir}/admin-stdin-ok"
+if ! run_just_capture "${output_file}" just --yes create-admin "${admin_email}" "${admin_password_file}" compose; then
+  printf 'tooling behavior contract failed: compose create-admin invocation failed\n' >&2
+  exit 1
+fi
+[[ -f "${TOOLING_TEST_ADMIN_STDIN_OK}" && ! -e "${admin_sentinel}" ]] || exit 1
+assert_contains $'docker\tcompose\t-f\tcompose.yaml\t-f\tcompose.dev.yaml\texec\t-T\tapi\t' "${command_log}"
+assert_contains '--password-file /dev/stdin' "${command_log}"
+assert_contains $'\t--\t'"${admin_email}" "${command_log}"
+assert_not_contains 'Synthetic admin password input' "${command_log}"
+assert_not_contains 'Synthetic admin password input' "${output_file}"
+assert_line_count 1 "${command_log}"
+
+for invalid_admin_target in unknown 'compose; exit 0'; do
+  clear_command_log
+  if run_just_capture "${output_file}" just --yes create-admin "${admin_email}" "${admin_password_file}" "${invalid_admin_target}"; then
+    printf 'tooling behavior contract failed: unsupported admin runtime accepted\n' >&2
+    exit 1
+  fi
+  assert_no_fake_calls
+done
+clear_command_log
+if run_just_capture "${output_file}" just --yes create-admin "${admin_email}" "${sandbox_dir}/missing-password" compose; then
+  printf 'tooling behavior contract failed: missing admin password accepted\n' >&2
+  exit 1
+fi
+assert_no_fake_calls
 
 # just 只保留一个稳定入口，并把进程边界、suite lock 与 cleanup 交给 typed orchestrator。
 clear_command_log

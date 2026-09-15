@@ -144,7 +144,8 @@ async def lock_oauth_user(session: AsyncSession, *, user_id: UUID) -> bool:
 
     Returns:
         只有存在且活动的用户返回 True。调用方保留各自已有 active 拒绝与错误分类；
-        state 消费和失败关闭路径只复用同步，不把本函数当成新的授权或错误协议。
+        state 消费在锁后检查该值，以既有 state 拒绝协议阻断已提交删除屏障的用户；
+        其他失败关闭路径仍复用同一用户锁，不新增授权状态或错误类型。
 
     此锁与 claim/request-start 的 user FOR UPDATE 同强度，避免持 OAuth 资源后再被
     OAuthAttempt/AuditEvent 的 user 外键 KEY SHARE 阻塞。锁持续到原事务结束，不跨网络。
@@ -919,7 +920,10 @@ class SqlAlchemyCredentialRotationRepository:
         """
         # 此关闭路径不会经过 load_refresh_snapshot，且可由没有 session lease 的 error
         # callback 进入；必须独立在 connection/access/refresh/audit 之前同步 user。
-        await lock_oauth_user(self.session, user_id=authorization.user_id)
+        if not await lock_oauth_user(self.session, user_id=authorization.user_id):
+            # 当前 T 和 stale T 都不得在屏障后追加普通关闭事实；session lease 仅证明
+            # refresh 协调权，不能代替此短事务与删除赢家之间的用户行同步。
+            raise OAuthRefreshError("oauth_credential_state_conflict")
         connection = await self.session.scalar(
             select(OAuthConnectionModel)
             .where(

@@ -107,6 +107,7 @@ async def _prepare_restore(clients: AuthenticatedApiClients) -> _PreparedRestore
             action_cipher=ActionPayloadCipher(
                 AeadCipher.from_file(get_settings().app_master_key_file)
             ),
+            source_cipher=AeadCipher.from_file(get_settings().app_master_key_file),
             reader_resolver=_ReaderResolver(reader),
             clock=lambda: NOW,
         ).execute(

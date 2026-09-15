@@ -1501,6 +1501,11 @@ async def test_initial_mail_sync_excludes_deleted_and_junk_but_keeps_sent() -> N
 
 Add cases for initial seven-day filtering, pagination through `@odata.nextLink`, persisted `@odata.deltaLink`, tombstones with `@removed`, `Prefer: IdType="ImmutableId"` on every message read, folder-specific cursor expiry fallback, Sent coverage, one coordinator-claimed 401 refresh (no adapter-local retry; started/unknown re-entry has zero provider calls), 403 capability loss, 429 `Retry-After`, 5xx, and malformed fields. Fixtures must use `.example.test` addresses and synthetic bodies only.
 
+Directory fixtures must match Graph v1.0, which does not expose `wellKnownName`. Use the fixed
+`drafts`, `deleteditems`, `junkemail`, and `sentitems` GET aliases with `$select=id` to establish
+locale-independent IDs. Cover renamed/localized display names, alias lookup failures, duplicate alias IDs,
+and one shared refresh/byte budget across discovery and alias reads before any scope is returned.
+
 - [ ] **Step 2: Run tests and observe the expected failure**
 
 Run: `uv run --project backend pytest backend/tests/contract/microsoft/test_mail_adapter.py backend/tests/integration/microsoft/test_mail_sync.py -q`
@@ -1518,13 +1523,14 @@ class MicrosoftMailAdapter:
     async def list_sync_scopes(self) -> tuple[MailScope, ...]:
         payload = await self._get_json(
             "/me/mailFolders",
-            params={"includeHiddenFolders": "false", "$select": "id,displayName,wellKnownName"},
+            params={"includeHiddenFolders": "false", "$select": "id,displayName"},
         )
         scopes = tuple(self._normalize_scope(item) for item in self._items(payload))
+        known_ids = await self._well_known_folder_ids()
         return tuple(
-            scope
+            MailScope(scope.scope_key, scope.display_name, known_ids.get(scope.scope_key))
             for scope in scopes
-            if scope.well_known_name not in {"deleteditems", "junkemail"}
+            if known_ids.get(scope.scope_key) not in {"drafts", "deleteditems", "junkemail"}
         )
 
     def initial_pages(self, scope_key: str, *, since: datetime) -> AsyncIterator[MailSyncPage]:
@@ -1538,6 +1544,12 @@ class MicrosoftMailAdapter:
 ~~~
 
 Follow absolute `@odata.nextLink` only when its scheme/host/path exactly matches the expected Graph collection or folder Delta path; preserve its opaque query unchanged and reject same-host wrong-path links before making a request. Persist the final opaque `deltaLink` but never log it. Send `Prefer: IdType="ImmutableId"` on folder, Delta, source-message, and Sent-item reads so a move within the mailbox does not silently change the stored Graph message identity. Normalize `id`, `conversationId`, `internetMessageId`, sender/recipients, body text, dates, categories, `webLink`, removal facts, and `lastModifiedDateTime` as optional `provider_updated_at` into `MailMessage`.
+
+For Delta paths only, accept both `/me/mailFolders/{encoded_id}/messages/delta` and the exact
+OData string-key form `/me/mailFolders('{encoded_escaped_id}')/messages/delta`. The latter escapes
+single quotes as doubled quotes before URL encoding; Graph may retain Base64 padding `=` instead of `%3D`.
+Accept that precise encoding variant without changing any other ID character. Both forms retain the exact current folder,
+fixed `me`, host and suffix; reject other identities or routes before sending Bearer credentials.
 
 - [ ] **Step 4: Persist Microsoft messages through the shared repository**
 
@@ -1931,7 +1943,11 @@ stored directory provider cursor before HTTP, follows only validated `@odata.nex
 
 Use `/me/calendars/{id}/calendarView/delta?startDateTime={window_start}&endDateTime={window_end}` for
 initial event windows. Follow only validated event next/delta links and store each calendar's final
-deltaLink opaque. Delete the unused public `execute_request(url=...)` diagnostic entry point; every
+deltaLink opaque. Accept the exact same calendar's OData string-key form
+`/me/calendars('{encoded_escaped_id}')/calendarView/delta` as well as the slash form; escape the ID
+before URL encoding, allowing the same explicit Base64-padding variant as mail, without decoding the whole
+path, relaxing identity checks or rebuilding query tokens.
+Delete the unused public `execute_request(url=...)` diagnostic entry point; every
 outbound request must come from fixed collection/resource builders or validated Graph links, and tests
 must prove an attacker URL receives no request or Bearer header.
 
@@ -8413,12 +8429,31 @@ git commit -m "feat: add trusted action editors"
 
 ### Task 30: Prove crash safety, complete E2E, and freeze M2 release evidence
 
+验收状态（2026-09-15）：完整自动化门禁、已授权专用账户 12 项操作、当前候选镜像的原生部署/
+加密备份恢复/legacy 隔离转换和独立审查均已完成。实际发布分支为 fresh/zero-bootstrap，生产部署
+及非空生产 0019 维护窗口未执行。执行版本、失败处置和验证范围见
+[M2 发布证据](../../releases/2026-08-06-m2-release-evidence.md)；真实写开关已关闭。
+
 **Files:**
+- Create: `backend/tests/integration/ci_database.py` and `scripts/prepare_ci_database.py` — explicit tests-only
+  preparation of the fresh CI service's synthetic 0018 anchor using a separately owned donor, the existing typed
+  bootstrap/historical upgrade, snapshot-bound native dump, non-destructive single-transaction import and complete
+  schema/data/identity verification; no product restore branch or implicit orchestrator preparation.
+- Create: `backend/tests/unit/test_prepare_ci_database.py` — service binding, pristine-target, snapshot/CAS,
+  complete post-seed evidence and failure-preservation regressions.
+- Modify: `.github/workflows/ci.yml`, `justfiles/test.just`, `scripts/test-ci-workflow.sh`, and
+  `backend/tests/unit/test_ci_workflow_contract.py` — connect an explicit `just prepare-ci-database` step to the
+  exact job-created PostgreSQL service before `just ci`, preserving the existing regular/lifecycle suite.
 - Create: `backend/tests/integration/faults/test_m2_write_recovery.py`
 - Modify: `backend/tests/integration/faults/conftest.py`
 - Create: `frontend/e2e/m2-actions.spec.ts`
 - Modify: `backend/src/ai_employee/infrastructure/testing/scenarios.py`
-- Modify: `backend/src/ai_employee/infrastructure/testing/test_support.py`
+- Create: `backend/src/ai_employee/infrastructure/testing/m2_support.py`,
+  `backend/src/ai_employee/infrastructure/testing/m2_sources.py`,
+  `backend/src/ai_employee/infrastructure/testing/calendar_restore.py`, and
+  `backend/src/ai_employee/infrastructure/testing/trusted_actions.py` — split M2 support, source fixtures,
+  restore context, and Fake-write composition by responsibility; reuse the existing
+  `backend/src/ai_employee/infrastructure/testing/test_support.py` without modifying it.
 - Modify: `backend/src/ai_employee/api/routers/test_support.py`
 - Modify: `scripts/test-m2-release.sh` — at the start, before any subprocess, accept an externally supplied
   `TEST_DATABASE_URL` only when it exactly matches
@@ -8442,10 +8477,16 @@ git commit -m "feat: add trusted action editors"
   atomic-reopen restore, registry-scavenged legacy
   conversion, plus artifact-distinct sealed exact-image restore on the same restore primitive; it never
   performs production migration or restore.
-- Modify: `backend/tests/integration/db/test_migrations.py` — release evidence for candidate rejection,
+- Reuse unchanged: `backend/tests/integration/db/test_migrations.py` — release evidence for candidate rejection,
   role-bootstrap-first installation, four exact ACL/safe-role/membership postures, pre-step grant drift,
   per-step grant delta, transactional 0019 full rollback, exact 0016–0018 autocommit/concurrent-index resume
   candidates, fresh/zero/missing/Fake/final 0019 guard paths, and the outer schema-lifecycle exclusive lock.
+  `scripts/test-m2-release.sh` selects this existing matrix explicitly in its fourth command. The bound v6
+  execution is `task-30-resume-release-wrapper-v6.json`, source manifest
+  `61209728e74194e6a2a3af632387dfdd74a74099a372495c3fbee00a2bf45289`, complete log SHA256
+  `12b428da8515fb66580c035d05643ac4765716c6862d813e705472be24c1a2c2`; that mixed selection passed
+  307 regular and 90 lifecycle tests, not 397 migration-only tests. These results retain their original source
+  binding; a changed candidate must execute and bind the same explicit selection again.
 - Modify: `backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py` — release canary for all
   four launch entries and persisted sanitized audit.
 - Modify: `scripts/test-tooling.sh` — release-wrapper command/order/environment assertions, including deterministic
@@ -8481,7 +8522,27 @@ git commit -m "feat: add trusted action editors"
   before release acceptance.
 - Modify: `README.md`
 
-- [ ] **Step 1: Write the failing crash matrix and Playwright flows**
+- [x] **Step 0: Prepare a reproducible synthetic 0018 anchor on a fresh CI runner**
+
+The job must bind the full `job.services.postgres.id`, run/attempt/fixed-job labels, immutable PostgreSQL 17.5 image,
+loopback endpoint, data volume and server cluster/database/owner identity. `CI` or `GITHUB_ACTIONS` flags never
+authorize a target. Before any donor creation or import, prove the original target is wholly empty in public,
+has `datacl NULL`, absent fixed roles/maintenance facts, and no other clients or advisory locks. The real
+catalog check must verify PG17.5's exact default owner attributes, complete built-in membership tuples and public
+schema owner/ACL. A separate new UUID donor and volume use private synthetic Secrets and the same verified image;
+both container/volume fixture labels and the container name must match their pre-creation registration. Bootstrap and upgrade through
+the existing typed maintenance and `run_alembic_upgrade` helpers to real `20260809_0018`; never stamp a version,
+patch schema/grants or modify the historical maintenance expectations. Export the complete empty-business 0018
+schema/data from one live read-only snapshot to a new 0600 native custom archive. Recheck the exact target's
+original snapshot, then import only with `--single-transaction --exit-on-error --no-owner --no-privileges` and no
+clean/create/drop. Independently compare complete normalized schema/data/revision and recheck identity,
+`datacl NULL`, roles/facts/client/lock absence. Failures retain resources and private evidence without repair,
+retry or deletion. Only after every successful postcondition and fresh identity/quiet proof may the exact donor
+be stopped; its container, volume and archive remain preserved. This is synthetic test seeding, never product
+generic/sealed/legacy restore evidence. Cover negative bindings and all failed phases before implementing, then
+replay the workflow preparation on newly registered local resources and run the unchanged maintenance cases.
+
+- [x] **Step 1: Write the failing crash matrix and Playwright flows**
 
 The backend fault test must parameterize these exact crash points for every one of the four actions: before claim, after claim before request-start commit, after request start before response, after provider response before result commit, after result commit before queue acknowledgement, and during each reconciliation attempt. It must assert one ToolExecution, zero or one provider write according to the crash point, and final convergence to success, confirmed failure, or needs-attention without a fabricated result.
 
@@ -8521,7 +8582,7 @@ child, including `bash scripts/test-tooling.sh`. Therefore the outer real `scrip
 itself. Do not add `SKIP_*`, `UNDER_TEST`, recursion-depth, or any other production-visible bypass to
 `scripts/test-m2-release.sh`; absence of recursion must be proven entirely by the test harness.
 
-- [ ] **Step 2: Run focused fault/E2E tests and observe expected failures**
+- [x] **Step 2: Run focused fault/E2E tests and observe expected failures**
 
 Run: `uv run --project backend pytest backend/tests/integration/faults/test_m2_write_recovery.py -q`
 
@@ -8535,11 +8596,11 @@ Run: `bash scripts/test-tooling.sh`
 
 Expected: FAIL because Task 27D's initial release wrapper does not yet execute the complete Task 30 evidence matrix.
 
-- [ ] **Step 3: Add deterministic Fake-provider scenarios**
+- [x] **Step 3: Add deterministic Fake-provider scenarios**
 
 Extend test support with sanitized scenario enums for confirmed applied, confirmed not applied, timeout-after-accept, ambiguous 5xx, delayed reconciliation success, never-resolved, ETag conflict, capability revoked, and duplicate delivery. Scenario payloads contain only IDs/statuses and must be consumed atomically so tests can prove the expected call count.
 
-- [ ] **Step 4: Add auditable release and sensitive-output contracts**
+- [x] **Step 4: Add auditable release and sensitive-output contracts**
 
 `scripts/verify-m2-sensitive-output.py` must use two distinct checks. First, statically scan committed
 fixtures for real domains, credential formats, Authorization/Cookie values, raw provider payloads
@@ -8587,7 +8648,20 @@ The release script test must fail if the fixed export is absent/late, a differen
 any child loses or overrides the exported value, or the explicit audit command is removed, reordered behind a
 possible early success exit, or replaced with `just ci`; per-command prefixes and indirect coverage are not evidence.
 
-- [ ] **Step 5: Run the complete automated release gate**
+- [x] **Step 5: Run the complete automated release gate**
+
+The local OAuth acceptance regression must first prove that an `authorizing` capability can obtain a fresh
+authorization link after reload, the returned link receives focus, and capability labels follow a fresh server
+snapshot. Successful browser callbacks return only to configured `APP_BASE_URL/connections` without OAuth query
+parameters; programmatic callbacks keep the existing JSON contract and failures remain sanitized Problems. Use
+synthetic route/HTTP fixtures for these checks; no real provider consent belongs in the automated gate.
+Repeated authorization must preserve previously verified capabilities temporarily marked `authorizing`, using
+both row/current scope evidence and an intact enabled-or-verified-pending dependency closure in the same locked
+transaction. Negative cases must reject disabled, revoked, unverified, and scope-incomplete pending capabilities
+without relaxing the `enabled` requirement for real writes.
+Microsoft callback fixtures must also cover a token response without an echoed `offline_access` scope:
+resource permissions still enable their requested capabilities after identity verification, missing resource
+permissions remain blocked, and persisted scopes must equal the provider response without invented grants.
 
 Run: `bash scripts/test-m2-release.sh`
 
@@ -8687,9 +8761,48 @@ manifest. The sealed path adds owner-before-secret artifact/image/script validat
 then reuses the same restore/reconcile/verifier/reopen primitive under exact `sha256:`/no-pull rules.
 Deployment/tooling contracts, sensitive-output scan, and `git diff --check` also pass.
 
-- [ ] **Step 6: Pause for explicitly authorized provider-account E2E**
+- [x] **Step 6: Pause for explicitly authorized provider-account E2E**
 
 After the automated gate passes, stop before enabling real writes and request the user's explicit authorization plus out-of-band dedicated Google/Microsoft test-account configuration. Run the manual matrix only in a separate environment with the global/provider switches and exact account allowlist enabled. If authorization is not supplied, leave Task 30 incomplete and do not create a blank release-evidence document or claim M2 release completion.
+
+Microsoft calendar create → sync → update acceptance must preserve the approved plain description in the local
+event and new update before/desired; a Graph HTML wrapper is a read-boundary defect, not an acceptable mismatch.
+Use synthetic HTTP regressions in `backend/tests/contract/microsoft/test_calendar_adapter.py` before changing
+`backend/src/ai_employee/integrations/microsoft/calendar.py`: initial, next, delta and exact-event GET must send
+`Prefer: outlook.body-content-type="text"` and apply spec 12.2's explicit text/HTML normalization. Cover preserved
+plain newlines/tabs/empty values, Graph wrappers/entities, active/explicitly hidden nodes, unknown or malformed
+contentType, raw/extracted length and control rejection, and the actual update content conversion. Keep ETag,
+instants, cursor/scope, URL guards and error classification unchanged. Run the focused RED/GREEN plus calendar
+read/write and delta-URL contracts and scoped Ruff/mypy; record full outputs and both diff checks. Existing
+immutable before snapshots stay unchanged; after the authorized formal resync, acceptance uses a newly created
+proposal rather than rewriting an old snapshot. This concretizes the existing plain-text invariant without
+adding a cache-repair endpoint or any new write action.
+
+If an unresolved automatic refresh fence leaves a connected account's capability projection `enabled`, the
+connection page must still expose explicit re-consent on that account's capability row. Add failing Google and
+Microsoft UI regressions in `frontend/src/pages/ConnectionsPage.spec.ts` before changing
+`frontend/src/components/CapabilityRows.vue`, then extend `frontend/e2e/connections.spec.ts` with fully synthetic
+HTTP coverage for enabled capability → exact connection-bound enable POST → focused authorization link and
+reload recovery. Preserve busy/disconnected disabling, server-provided capability closure, and zero automatic
+authorization on page load. Do not require disable/disconnect, use targetless provider start, replay a refresh
+grant, or change the OAuth protocol. Run focused unit/browser tests, frontend lint/type-check/build and diff
+checks; the actual provider recovery remains an explicit user action after the entry point is ready.
+
+Before browser authorization, prepare the isolated Linux development runtime with owner-only file Secrets,
+explicit host UID/GID, loopback-only frontend/API ports, password-free application DSNs and a shared image-owned
+backend virtualenv volume scoped to the Compose project and immutable image tag. Preserve every existing OAuth
+Secret and keep the three write switches disabled. Extend the existing `just create-admin email password_file`
+entry with an optional `compose` target; stream the password file into the same container CLI via stdin, preserve
+the default host behavior, and verify argument quoting and fail-closed target/file validation in `scripts/test-tooling.sh`.
+Verify the merged configuration through `scripts/test-deployment.sh`; add
+`backend/tests/unit/api/test_readiness_dependencies.py` to prove connection refusal/timeout produces HTTP 503
+while Redis remains independently observable. Fix only those failure paths in `backend/src/ai_employee/main.py`,
+then verify actual database bootstrap, migration, process health and callback reachability before user login.
+When checking the configured model, verify a synthetic queued conversation as well as a direct structured call.
+Restore the existing versioned `conversation_intent_v1.md` as the system message before redacted user text in
+`classify_ambiguous_conversation_intent`; prove the outgoing request boundary with a failing regression test first.
+Keep deterministic command parsing, provider selection, timeouts and the existing safe failure result unchanged;
+read the persisted model invocation status before claiming the model workflow passed.
 
 If the target release environment has not yet applied 0019, the release operator must use the approved change
 window to execute the non-rolling `docs/operations.md` sequence before enabling real writes: record the original
@@ -8788,7 +8901,7 @@ successful rollout. Alembic downgrade, direct SQL,
 marker waiver, temporary
 OAuth-only service, or continuing provider E2E after restore verification failure is forbidden.
 
-- [ ] **Step 7: Write the completed release-evidence record**
+- [x] **Step 7: Write the completed release-evidence record**
 
 Create `docs/releases/2026-08-06-m2-release-evidence.md` only after the manual matrix is complete. Record actual date, operator, commit, environment, locally hashed dedicated-account identifiers, exact enabled switches, Google new/reply/reply-all/create/update/restore results, Microsoft parity results, alternate Microsoft account-type contract evidence, approval/ToolExecution audit IDs, scope review, backup/restore, crash drill, sensitive-output scan, and the final release decision.
 
@@ -9055,10 +9168,10 @@ as complete. Every row must contain evidence or an explicit failed result with d
 no blank field or future-action marker, and artifacts must contain no DSN, plaintext content, raw provider calendar
 ID, token, scope string, or credential material.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ~~~bash
-git add backend/tests/integration/faults/test_m2_write_recovery.py backend/tests/integration/faults/conftest.py backend/tests/integration/db/test_migrations.py backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py frontend/e2e/m2-actions.spec.ts backend/src/ai_employee/infrastructure/testing/scenarios.py backend/src/ai_employee/infrastructure/testing/test_support.py backend/src/ai_employee/api/routers/test_support.py scripts/test-m2-release.sh scripts/test-tooling.sh scripts/verify-m2-sensitive-output.py docs/releases/2026-08-06-m2-release-evidence.md docs/acceptance-checklist.md README.md
+git add backend/tests/integration/faults/test_m2_write_recovery.py backend/tests/integration/faults/conftest.py backend/tests/integration/observability/test_uvicorn_oauth_query_redaction.py frontend/e2e/m2-actions.spec.ts backend/src/ai_employee/infrastructure/testing/scenarios.py backend/src/ai_employee/infrastructure/testing/m2_support.py backend/src/ai_employee/infrastructure/testing/m2_sources.py backend/src/ai_employee/infrastructure/testing/calendar_restore.py backend/src/ai_employee/infrastructure/testing/trusted_actions.py backend/src/ai_employee/api/routers/test_support.py scripts/test-m2-release.sh scripts/test-tooling.sh scripts/verify-m2-sensitive-output.py docs/releases/2026-08-06-m2-release-evidence.md docs/acceptance-checklist.md README.md
 git commit -m "test: freeze M2 release evidence"
 ~~~
 

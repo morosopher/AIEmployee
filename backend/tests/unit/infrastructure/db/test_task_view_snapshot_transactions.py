@@ -102,7 +102,9 @@ async def test_cancel_reads_returned_snapshot_after_atomic_write_commits(
                 status=TaskStatus.QUEUED.value,
                 idempotency_key="cancel-snapshot",
                 input_payload={},
-            )
+            ),
+            # 取消事务先锁 Task 再复核 User；活动用户前提使本例仍聚焦提交后的快照边界。
+            True,
         ]
     )
     read_session = _ReadSession()

@@ -11,7 +11,8 @@ test('brief generation, version switching and settings use controllable API fixt
   await expect(page.getByRole('heading', { name: '今日简报' })).toBeVisible()
   await page.goto('/settings')
   await expect(page.getByRole('heading', { name: '设置' })).toBeVisible()
-  await expect(page.getByRole('combobox', { name: '时区', exact: true })).toHaveValue('Asia/Shanghai')
+  // 工作设置使用 IANA 时区标签；精确匹配可访问名称并继续验证合成设置已正确加载。
+  await expect(page.getByRole('combobox', { name: 'IANA 时区', exact: true })).toHaveValue('Asia/Shanghai')
   await expect(page.getByText('无法加载设置。', { exact: true })).toHaveCount(0)
 })
 

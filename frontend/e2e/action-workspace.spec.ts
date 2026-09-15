@@ -472,9 +472,10 @@ test('both provider capabilities and explicit work defaults are usable with boun
     'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
   )
   await microsoftCard.locator('button[name="enable-calendar.write"]').click()
+  // 提示只表示已生成授权链接；仍需用户继续供应商同意并经回调返回连接页。
   await expect(
     page.getByText(
-      '本次授权包含：calendar.read、calendar.write。完成后请刷新连接状态。',
+      '本次授权包含：calendar.read、calendar.write。请继续授权，完成后将返回连接页。',
       { exact: true },
     ),
   ).toBeVisible()

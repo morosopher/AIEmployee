@@ -90,6 +90,10 @@ function durationText(step: TaskStep): string {
       >
         错误代码：{{ task.error_code }}
       </p>
+      <!-- 仅使用服务端确认的配置错误码提供恢复指引，不显示供应商原始响应。 -->
+      <p v-if="task.error_code === 'google_api_not_enabled'">
+        请在 Google Cloud 中为当前 OAuth 应用所属项目启用对应的 Gmail API 或 Google Calendar API，启用后重试同步。
+      </p>
       <ol
         v-if="task.steps.length"
         aria-label="任务步骤"

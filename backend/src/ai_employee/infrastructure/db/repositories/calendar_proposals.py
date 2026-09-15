@@ -38,6 +38,7 @@ from ai_employee.infrastructure.db.models.sources import CalendarEventModel
 from ai_employee.infrastructure.db.repositories.historical_action_bindings import (
     preserve_historical_action_bindings,
 )
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import (
@@ -144,6 +145,12 @@ class SqlAlchemyCalendarProposalRepository:
             StateConflictError: 同一创建键已绑定不同规范请求哈希。
             ValueError: 操作类别、时间或 JSON 值不符合持久化边界。
         """
+        # target的active谓词只证明先前读取；当前用户锁须覆盖父行和desired的原子提交。
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise StateConflictError(
+                error_code="calendar_proposal_not_editable",
+                message="calendar proposal is not editable",
+            )
         normalized_operation = _operation_kind(operation_kind)
         prepared_snapshot = self._prepare_snapshot(
             snapshot_id=snapshot_id,
@@ -263,7 +270,9 @@ class SqlAlchemyCalendarProposalRepository:
         user_id: UUID,
         proposal_id: UUID,
     ) -> CalendarProposalSnapshot | None:
-        """锁定并取消当前用户仍可取消的本地提案。"""
+        """先同步用户屏障再锁定并取消本地提案；inactive沿用不存在时的None语义。"""
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel)
             .where(
@@ -310,6 +319,9 @@ class SqlAlchemyCalendarProposalRepository:
         Raises:
             StateConflictError: expected version 陈旧，或提案不在可编辑状态。
         """
+        # 编辑、显式确认和另开事务的建议保存共享入口，先user再父行/版本/历史摘要。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         if type(expected_version) is not int or expected_version <= 0:
             raise ValueError("expected_version must be a positive integer")
         if (connection_id is None) != (calendar_id is None):
@@ -442,6 +454,9 @@ class SqlAlchemyCalendarProposalRepository:
         Returns:
             新建或同哈希重放命中的 snapshot；跨用户或提案不存在时返回 ``None``。
         """
+        # 旧desired的重放可只补before，不能依赖create曾经持有的另一个事务的用户锁。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         return await self._save_snapshot_for_proposal(
             snapshot_id=snapshot_id,
             user_id=user_id,
@@ -620,6 +635,10 @@ class SqlAlchemyCalendarProposalRepository:
         Returns:
             锁定的最小非敏感事实；snapshot 或父 proposal 不存在/跨用户时返回 ``None``。
         """
+        # enqueue会在同事务创建Task并重获user锁。必须在source/event之前先取user，
+        # 与Prepare结果的Task→user→source排序一致；不能先锁source再等结果持有的user。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         row = (
             await self._session.execute(
                 select(

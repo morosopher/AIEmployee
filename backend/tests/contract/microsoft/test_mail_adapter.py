@@ -69,11 +69,38 @@ def _assert_immutable_request(request: httpx.Request) -> None:
     assert IMMUTABLE_ID_PREFER in request.headers["Prefer"]
 
 
+def _well_known_folder_routes(
+    router: respx.MockRouter = respx.mock,
+) -> dict[str, respx.Route]:
+    """模拟 Graph 固定别名返回的稳定 ID，不为目录补造不存在的供应商字段。"""
+    return {
+        alias: router.get(f"{MAIL_FOLDERS_URL}/{alias}", params={"$select": "id"}).respond(
+            200, json={"id": identifier}
+        )
+        for alias, identifier in (
+            ("drafts", "synthetic-folder-drafts"),
+            ("deleteditems", "synthetic-folder-deleted"),
+            ("junkemail", "synthetic-folder-junk"),
+            ("sentitems", "synthetic-folder-sent"),
+        )
+    }
+
+
 @pytest.mark.asyncio
-@respx.mock
-async def test_folder_discovery_uses_exact_query_and_filters_excluded_folders() -> None:
-    """目录读取保留 Sent，同时排除 Drafts/Deleted/Junk 并发送 ImmutableId header。"""
-    route = respx.get(MAIL_FOLDERS_URL).respond(200, json=_fixture("mail_folders.json"))
+@respx.mock(assert_all_called=False)
+async def test_folder_discovery_uses_exact_query_and_filters_excluded_folders(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """受支持的目录字段与别名 ID 共同保证 Sent 覆盖及 Drafts/Deleted/Junk 排除。"""
+
+    def graph_directory(request: httpx.Request) -> httpx.Response:
+        """复现真实 v1.0 对不存在的属性返回 400，所有数据仍使用合成 fixture。"""
+        if "wellKnownName" in request.url.params.get("$select", ""):
+            return httpx.Response(400, json={"error": {"code": "BadRequest"}})
+        return httpx.Response(200, json=_fixture("mail_folders.json"))
+
+    route = respx_mock.get(MAIL_FOLDERS_URL).mock(side_effect=graph_directory)
+    aliases = _well_known_folder_routes(respx_mock)
 
     scopes = await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
 
@@ -89,9 +116,128 @@ async def test_folder_discovery_uses_exact_query_and_filters_excluded_folders() 
     request = route.calls[0].request
     assert dict(request.url.params) == {
         "includeHiddenFolders": "false",
-        "$select": "id,displayName,wellKnownName",
+        "$select": "id,displayName",
     }
     _assert_immutable_request(request)
+    for alias_route in aliases.values():
+        assert alias_route.call_count == 1
+        _assert_immutable_request(alias_route.calls[0].request)
+
+
+@pytest.mark.asyncio
+@respx.mock(assert_all_called=False)
+async def test_folder_exclusion_uses_alias_ids_despite_localized_or_misleading_names(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """系统文件夹改名仍被排除，同名自建文件夹不能被误排除或信任额外字段。"""
+    respx_mock.get(MAIL_FOLDERS_URL).respond(
+        200,
+        json={
+            "value": [
+                {"id": "synthetic-folder-drafts", "displayName": "合成草稿"},
+                {"id": "synthetic-folder-deleted", "displayName": "Synthetic retained name"},
+                {"id": "synthetic-folder-junk", "displayName": "合成垃圾邮件"},
+                {"id": "synthetic-folder-sent", "displayName": "合成已发送"},
+                {
+                    "id": "synthetic-custom-folder",
+                    "displayName": "Drafts",
+                    "wellKnownName": "drafts",
+                },
+            ]
+        },
+    )
+    _well_known_folder_routes(respx_mock)
+
+    scopes = await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert [(scope.scope_key, scope.well_known_name) for scope in scopes] == [
+        ("synthetic-folder-sent", "sentitems"),
+        ("synthetic-custom-folder", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ("drafts", "deleteditems", "junkemail", "sentitems"))
+@respx.mock(assert_all_called=False)
+async def test_folder_discovery_rejects_missing_alias_identity(
+    alias: str, respx_mock: respx.MockRouter
+) -> None:
+    """任何必需别名缺少稳定 ID 都不能返回未完成过滤的同步 scope。"""
+    respx_mock.get(MAIL_FOLDERS_URL).respond(200, json=_fixture("mail_folders.json"))
+    aliases = _well_known_folder_routes(respx_mock)
+    aliases[alias].respond(200, json={"displayName": "Synthetic invalid identity"})
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_invalid_response"
+
+
+@pytest.mark.asyncio
+@respx.mock(assert_all_called=False)
+async def test_folder_discovery_rejects_ambiguous_alias_identities(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """两个固定类别返回相同 ID 时不能让后到别名覆盖排除事实。"""
+    respx_mock.get(MAIL_FOLDERS_URL).respond(200, json=_fixture("mail_folders.json"))
+    aliases = _well_known_folder_routes(respx_mock)
+    aliases["sentitems"].respond(200, json={"id": "synthetic-folder-drafts"})
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_invalid_response"
+
+
+@pytest.mark.asyncio
+@respx.mock(assert_all_called=False)
+async def test_folder_alias_lookup_shares_discovery_refresh_budget(
+    respx_mock: respx.MockRouter,
+) -> None:
+    """目录已刷新一次后，别名 401 必须停止，不能重新消费 refresh token。"""
+    refresh_calls = 0
+
+    async def refresh() -> str:
+        """只提供一次合成轮换结果，计数观测跨请求的刷新限制。"""
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return "synthetic-refreshed-token"
+
+    respx_mock.get(MAIL_FOLDERS_URL).mock(
+        side_effect=[httpx.Response(401), httpx.Response(200, json=_fixture("mail_folders.json"))]
+    )
+    aliases = _well_known_folder_routes(respx_mock)
+    aliases["drafts"].respond(401)
+
+    with pytest.raises(UserActionRequiredError) as raised:
+        await _adapter(refresh_access_token=refresh).list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_reauthorization_required"
+    assert refresh_calls == 1
+    assert aliases["drafts"].call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock(assert_all_called=False)
+async def test_folder_alias_lookup_shares_discovery_byte_budget(
+    monkeypatch, respx_mock: respx.MockRouter
+) -> None:
+    """目录与首个别名响应累计超限时失败，不能通过按别名重置预算绕过限制。"""
+    directory = httpx.Response(200, json=_fixture("mail_folders.json"))
+    alias_response = httpx.Response(200, json={"id": "synthetic-folder-drafts"})
+    monkeypatch.setattr(
+        _mail_module(),
+        "MICROSOFT_MAIL_MAX_CHAIN_BYTES",
+        len(directory.content) + len(alias_response.content) - 1,
+    )
+    respx_mock.get(MAIL_FOLDERS_URL).mock(return_value=directory)
+    aliases = _well_known_folder_routes(respx_mock)
+    aliases["drafts"].mock(return_value=alias_response)
+
+    with pytest.raises(PermanentProviderError) as raised:
+        await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
+
+    assert raised.value.error_code == "microsoft_mail_sync_budget_exceeded"
 
 
 @pytest.mark.asyncio
@@ -269,10 +415,11 @@ async def test_collection_next_link_preserves_opaque_query() -> None:
         MAIL_FOLDERS_URL,
         params={
             "includeHiddenFolders": "false",
-            "$select": "id,displayName,wellKnownName",
+            "$select": "id,displayName",
         },
     ).respond(200, json=payload)
     second = respx.get(opaque_next).respond(200, json={"value": []})
+    _well_known_folder_routes()
 
     scopes = await _adapter().list_sync_scopes()  # type: ignore[attr-defined]
 
@@ -543,6 +690,7 @@ async def test_401_refreshes_once_and_replays_read_with_immutable_id() -> None:
             httpx.Response(200, json=_fixture("mail_folders.json")),
         ]
     )
+    _well_known_folder_routes()
     adapter = _adapter(refresh_access_token=refresh)
 
     scopes = await adapter.list_sync_scopes()  # type: ignore[attr-defined]

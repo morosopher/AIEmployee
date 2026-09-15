@@ -13,10 +13,20 @@ x-backend-environment: &backend-environment
   CHECKPOINT_DATABASE_URL: "postgresql://ai_employee_app@postgres:5432/${POSTGRES_DB:-ai_employee}"
   REDIS_URL: redis://redis:6379/0
   APP_MASTER_KEY_FILE: /run/secrets/app_master_key
+  # 根 .env 仅用于插值；显式传给三个后端进程，避免容器内配置回退为空值。
+  GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
   GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_client_secret
+  GOOGLE_REDIRECT_URI: "${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/connections/google/callback}"
   MICROSOFT_CLIENT_ID: "${MICROSOFT_CLIENT_ID:-}"
   MICROSOFT_CLIENT_SECRET_FILE: /run/secrets/microsoft_client_secret
   MICROSOFT_REDIRECT_URI: "${MICROSOFT_REDIRECT_URI:-http://localhost:8000/api/v1/connections/microsoft/callback}"
+  # 模型路由、成本和本地清洗规则沿用 Settings 默认语义；凭据仍只经 Secret 文件注入。
+  MODEL_BASE_URL: "${MODEL_BASE_URL:-}"
+  MODEL_NAME: "${MODEL_NAME:-}"
+  MODEL_SUPPORTS_JSON_SCHEMA: "${MODEL_SUPPORTS_JSON_SCHEMA:-true}"
+  MODEL_INPUT_COST_PER_MILLION_USD: "${MODEL_INPUT_COST_PER_MILLION_USD:-0}"
+  MODEL_OUTPUT_COST_PER_MILLION_USD: "${MODEL_OUTPUT_COST_PER_MILLION_USD:-0}"
+  MODEL_REDACTION_PATTERNS: "${MODEL_REDACTION_PATTERNS:-[]}"
   MODEL_API_KEY_FILE: /run/secrets/model_api_key
   APP_DATABASE_PASSWORD_FILE: /run/secrets/app_database_password
 x-backend-common: &backend-common

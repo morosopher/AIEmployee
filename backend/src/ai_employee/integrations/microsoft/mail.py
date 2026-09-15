@@ -88,18 +88,19 @@ class MicrosoftMailAdapter(MailReader):
         self._chain_normalized_bytes = 0
 
     async def list_sync_scopes(self) -> tuple[MailScope, ...]:
-        """发现可访问 mailFolders，保留 Sent 并排除 Deleted/Junk。
+        """按稳定别名 ID 发现可同步目录，保留 Sent 并排除 Drafts/Deleted/Junk。
 
-        ``includeHiddenFolders=false`` 与固定 ``$select`` 是最小目录读取；目录自身也发送
-        ImmutableId，避免 provider object move 后本地 scope key 静默漂移。Graph 目录分页仍
-        受同一页数/URL/响应大小边界保护。
+        Graph v1.0 不提供 ``wellKnownName`` 属性；先完整读取 ``id,displayName``，再通过
+        固定别名解析分类 ID。展示名可能被本地化或改名，不能作为排除供应商草稿箱的依据。
+        全部请求发送 ImmutableId，共用本轮刷新次数和字节预算；只有目录及别名均验证成功
+        后才返回 scope，避免解析失败时意外同步应排除的文件夹。
         """
         self._reset_refresh_budget()
         values = await self._list_collection(
             f"{MICROSOFT_GRAPH_BASE_URL}/me/mailFolders",
             params={
                 "includeHiddenFolders": "false",
-                "$select": "id,displayName,wellKnownName",
+                "$select": "id,displayName",
             },
             expected_path="/v1.0/me/mailFolders",
         )
@@ -107,11 +108,38 @@ class MicrosoftMailAdapter(MailReader):
             scopes = tuple(self._normalize_scope(item) for item in values)
         except (TypeError, ValueError):
             raise self._invalid_response() from None
+        known_ids = await self._well_known_folder_ids()
         return tuple(
-            scope
+            MailScope(scope.scope_key, scope.display_name, known_ids.get(scope.scope_key))
             for scope in scopes
-            if scope.well_known_name not in {"deleteditems", "drafts", "junkemail"}
+            if known_ids.get(scope.scope_key) not in {"deleteditems", "drafts", "junkemail"}
         )
+
+    async def _well_known_folder_ids(self) -> Mapping[str, str]:
+        """只读解析四个必需类别的精确 ID，不重置目录发现的刷新或总字节预算。
+
+        Returns:
+            稳定文件夹 ID 到固定供应商无关类别的映射。
+
+        Raises:
+            PermanentProviderError: 别名响应缺少有效 ID，或不同类别给出同一个 ID。
+                HTTP 失败沿用 ``_get_json`` 的权限、暂态和永久错误分类。
+        """
+        known_ids: dict[str, str] = {}
+        for alias in ("drafts", "deleteditems", "junkemail", "sentitems"):
+            payload = await self._get_json(
+                f"{MICROSOFT_GRAPH_BASE_URL}/me/mailFolders/{alias}",
+                params={"$select": "id"},
+            )
+            try:
+                identifier = self._required_identifier(payload, "id")
+            except ValueError:
+                raise self._invalid_response() from None
+            # 分类冲突时必须停止，不能让后到的 Sent 类别覆盖先前的排除事实。
+            if identifier in known_ids:
+                raise self._invalid_response()
+            known_ids[identifier] = alias
+        return known_ids
 
     def initial_pages(self, scope_key: str, *, since: datetime) -> AsyncIterator[MailSyncPage]:
         """从显式 UTC 下界读取一个 folder 的受限七日 Delta 页面。"""
@@ -437,14 +465,10 @@ class MicrosoftMailAdapter(MailReader):
 
     @classmethod
     def _normalize_scope(cls, item: Mapping[str, object]) -> MailScope:
-        """把 Graph folder 条目收窄为安全 scope/display projection。"""
+        """收窄目录 ID 与展示名，类别仅由后续固定别名 GET 的 ID 证据建立。"""
         scope_key = cls._required_identifier(item, "id")
         display_name = cls._required_text(item, "displayName")
-        well_known = item.get("wellKnownName")
-        if well_known is not None and not isinstance(well_known, str):
-            raise cls._invalid_response()
-        normalized_well_known = well_known.casefold() if isinstance(well_known, str) else None
-        return MailScope(scope_key, display_name, normalized_well_known)
+        return MailScope(scope_key, display_name)
 
     @classmethod
     def _normalize_message(
@@ -727,14 +751,24 @@ class MicrosoftMailAdapter(MailReader):
 
     @classmethod
     def _validate_delta_url(cls, value: str, *, scope_key: str) -> str:
-        """验证 cursor 是当前 folder 的精确 Graph absolute URL。"""
+        """只接受当前 folder 的斜杠式或 OData 字符串键式 Delta URL。
+
+        Graph 可在响应中把 ``mailFolders/id`` 改写为 ``mailFolders('id')``。仅生成这两种
+        资源表示的精确预期 path，先按 OData 规则转义 ID 再编码；字符串键里的 Base64
+        填充 ``=`` 可原样保留。不解码整条路径，不改变账户、资源、主机或 opaque query，
+        避免把兼容逻辑变成任意 Graph URL 的放行入口。
+        """
         url = cls._validate_absolute_graph_url(
             value,
             error_code="microsoft_mail_invalid_delta_url",
             message="Microsoft mail delta URL is invalid",
         )
         expected_path = f"/v1.0/me/mailFolders/{quote(scope_key, safe='')}/messages/delta"
-        if urlsplit(url).path != expected_path:
+        odata_key = quote(cls._odata_literal(scope_key), safe="")
+        keyed_path = f"/v1.0/me/mailFolders('{odata_key}')/messages/delta"
+        padded_key = quote(cls._odata_literal(scope_key), safe="=")
+        padded_path = f"/v1.0/me/mailFolders('{padded_key}')/messages/delta"
+        if urlsplit(url).path not in {expected_path, keyed_path, padded_path}:
             raise PermanentProviderError(
                 error_code="microsoft_mail_invalid_delta_url",
                 message="Microsoft mail delta URL is invalid",

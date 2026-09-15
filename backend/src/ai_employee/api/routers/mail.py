@@ -235,7 +235,7 @@ def build_mail_router() -> APIRouter:
     async def list_mail_drafts(
         authenticated: CurrentSession,
         response: Response,
-        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> MailDraftListResponse:
@@ -259,7 +259,7 @@ def build_mail_router() -> APIRouter:
         payload: CreateMailDraftRequest,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
         idempotency_key: IdempotencyKeyHeader,
     ) -> MailDraftResponse:
         """幂等创建版本一，只写本地加密草稿且不触发供应商草稿或发送。"""
@@ -277,7 +277,7 @@ def build_mail_router() -> APIRouter:
         draft_id: UUID,
         authenticated: CurrentSession,
         response: Response,
-        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
     ) -> MailDraftResponse:
         """读取当前用户可解密的当前版本，不公开历史密文或持久化对象。"""
         try:
@@ -295,7 +295,7 @@ def build_mail_router() -> APIRouter:
         payload: UpdateMailDraftRequest,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
     ) -> MailDraftResponse:
         """以请求中的当前版本 CAS 保存下一不可变版本。"""
         try:
@@ -316,7 +316,7 @@ def build_mail_router() -> APIRouter:
         draft_id: UUID,
         authenticated: CsrfProtectedSession,
         response: Response,
-        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        use_case: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
     ) -> MailDraftResponse:
         """取消仍处于可编辑态的纯本地草稿，不创建外部副作用。"""
         try:
@@ -338,7 +338,7 @@ def build_mail_router() -> APIRouter:
         payload: Annotated[GenerateMailDraftRequest, Body()],
         authenticated: CsrfProtectedSession,
         tasks: Annotated[CreateTaskUseCase, Depends(get_create_task_use_case)],
-        drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
         idempotency_key: IdempotencyKeyHeader,
     ) -> AcceptedTaskResponse:
         """持久创建 body-only 模型草拟任务，并以客户端键复用 TaskRun。"""
@@ -395,7 +395,7 @@ def build_mail_router() -> APIRouter:
             SubmitMailDraftUseCase,
             Depends(get_submit_mail_draft_use_case),
         ],
-        drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case)],
+        drafts: Annotated[MailDraftUseCase, Depends(get_mail_draft_use_case, scope="function")],
         clock: Annotated[Clock, Depends(get_auth_clock)],
         idempotency_key: IdempotencyKeyHeader,
     ) -> AcceptedTaskResponse:

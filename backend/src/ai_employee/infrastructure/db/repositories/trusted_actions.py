@@ -88,6 +88,7 @@ from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
 from ai_employee.infrastructure.db.repositories.credential_rotation import load_refresh_snapshot
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.oauth_refresh_coordinator import (
     find_refresh_result,
@@ -235,6 +236,8 @@ class SqlAlchemyTrustedActionRepository:
 
         不加锁预定位只决定 advisory key；随后按用户、草稿及连接重新锁行。若等待期间
         绑定变化，返回缺失信号使提交整体拒绝，不能持有旧连接锁去冻结新连接命令。
+        新Task尚未存在，因此先取连接advisory，再锁User并复核active，最后锁本地动作；
+        该用户锁连续覆盖冻结及create_submission，避免插入Task时才在local后等待用户FK锁。
         """
         connection_id = await self._session.scalar(
             select(MailDraftModel.connection_id).where(
@@ -246,6 +249,8 @@ class SqlAlchemyTrustedActionRepository:
         await lock_connection_submission_scope(
             self._session, user_id=user_id, connection_id=connection_id
         )
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         draft = await self._session.scalar(
             select(MailDraftModel)
             .where(
@@ -327,6 +332,8 @@ class SqlAlchemyTrustedActionRepository:
 
         和邮件提交使用同一连接级屏障；预定位不持有本地行锁，锁行时重新匹配完整绑定，
         连接在等待期间变化时拒绝提交，不能把其他连接的授权当作旧连接的事实。
+        连接advisory后、提案行锁前同步User；inactive按原缺失语义退出，该锁同时
+        保护同事务随后创建Task/Step/Approval/Audit/Outbox，不跨请求缓存授权。
         """
         connection_id = await self._session.scalar(
             select(CalendarChangeProposalModel.connection_id).where(
@@ -339,6 +346,8 @@ class SqlAlchemyTrustedActionRepository:
         await lock_connection_submission_scope(
             self._session, user_id=user_id, connection_id=connection_id
         )
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         proposal = await self._session.scalar(
             select(CalendarChangeProposalModel)
             .where(
@@ -462,8 +471,9 @@ class SqlAlchemyTrustedActionRepository:
     async def create_submission(self, submission: TrustedActionSubmission) -> None:
         """在已锁定提交快照的同一事务写入 task/step/approval/audit/outbox。
 
-        调用方必须先经 lock_mail_draft/lock_calendar_proposal 取得本地对象及连接提交锁，
-        并验证授权快照；该事务结束前撤权不能扫描空候选后抢先返回成功。
+        调用方必须先经 lock_mail_draft/lock_calendar_proposal 按连接advisory→User→本地
+        对象取锁，锁后验证active与授权快照。这里继承同一事务持有的用户锁，不能在
+        已持local后才补取User；该事务结束前撤权不能扫描空候选后抢先返回成功。
         """
         task = TaskRunModel(
             id=submission.task_id,
@@ -635,10 +645,11 @@ class SqlAlchemyTrustedActionRepository:
     ) -> TrustedActionExecutionSnapshot | None:
         """按冻结锁序读取首次 claim 的全部授权事实。
 
-        锁序固定为 TaskRun → ApprovalRequest → ToolExecution → 本地动作 → User →
+        锁序固定为 TaskRun → User → ApprovalRequest → ToolExecution → 本地动作 →
         OAuthConnection → capability rows → ProviderCalendar。能力关闭先锁 connection 再写
         capability，claim 使用同一 connection-first 子序列，确保撤权提交后只能读取新状态，
         也避免保留/隐私清理、审批失效和并发 Worker 形成反向等待。
+        User 提前取锁，但仍返回同样的 inactive 投影，由应用层保持原有拒绝与终态优先级。
         """
         task = await self._session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
@@ -649,6 +660,9 @@ class SqlAlchemyTrustedActionRepository:
             or not _task_operation_matches(task, operation_id)
         ):
             return None
+        user = await self._session.scalar(
+            select(UserModel).where(UserModel.id == task.user_id).with_for_update()
+        )
         approval = await self._session.scalar(
             select(ApprovalRequestModel)
             .where(
@@ -671,9 +685,6 @@ class SqlAlchemyTrustedActionRepository:
         if binding is None:
             return None
         connection_id, calendar_id, _ = binding
-        user = await self._session.scalar(
-            select(UserModel).where(UserModel.id == task.user_id).with_for_update()
-        )
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -1086,13 +1097,22 @@ class SqlAlchemyTrustedActionRepository:
         """按固定锁序并以 PostgreSQL 权威时钟提交唯一 request-start。
 
         调用方时间可能在命令解密或行锁等待期间变旧，因此它绝不能授权外部写入。本事务
-        依次锁定 TaskRun、ApprovalRequest、ToolExecution、本地草稿/提案、User 与
+        依次锁定 TaskRun、User、ApprovalRequest、ToolExecution、本地草稿/提案与
         OAuthConnection、capability 与 ProviderCalendar，随后才读取 ``clock_timestamp()``。
         应用层 authorizer 在这些锁仍由同一短事务持有时重算全局/供应商开关与规范账户
         allowlist；只有全部事实仍成立，才能递增真实写尝试计数并推进到 ``executing``。
+        User 行提前取锁；inactive 分类仍在既有终态与重复 request-start 判断之后，
+        保持原来的 ABANDONED/RECONCILE 优先级，不凭 inactive 推断外部请求未应用。
         """
         task = await self._session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == snapshot.task_id).with_for_update()
+        )
+        user = (
+            await self._session.scalar(
+                select(UserModel).where(UserModel.id == snapshot.user_id).with_for_update()
+            )
+            if task is not None
+            else None
         )
         approval = await self._session.scalar(
             select(ApprovalRequestModel)
@@ -1134,9 +1154,6 @@ class SqlAlchemyTrustedActionRepository:
             await self._lock_action_binding(task=task, approval=approval)
             if task is not None and approval is not None
             else None
-        )
-        user = await self._session.scalar(
-            select(UserModel).where(UserModel.id == snapshot.user_id).with_for_update()
         )
         if user is not None and task.user_id == user.id and not user.is_active:
             # 已冻结的 claim 仍可能对应未知外部副作用；inactive 不是 confirmed-not-applied
@@ -1419,9 +1436,10 @@ class SqlAlchemyTrustedActionRepository:
         """以锁后数据库时间、live lease 与完整冻结绑定 CAS 提交 provider 结果。
 
         ``completed_at`` 仅保留应用端口兼容性，不能授权或决定持久时间；供应商网络等待
-        期间它可能已经陈旧。事务依次锁 Task、Approval、ToolExecution、本地动作、
-        Connection 与目标日历，最后读取 ``clock_timestamp()``，只有当前 owner 的租约
-        仍有效且全部冻结标识未换绑才允许写入结果。连接在请求发出后的正常断开、scope
+        期间它可能已经陈旧。事务依次锁 Task、User、Approval、ToolExecution、本地动作、
+        Connection 与目标日历，用户锁后先拒绝 inactive，最后读取 ``clock_timestamp()``，
+        只有当前 owner 的租约仍有效且全部冻结标识未换绑才允许写入结果。
+        连接在请求发出后的正常断开、scope
         撤销或目录 ``can_write`` 变化不会抹掉真实结果，因为本边界只核对目标身份，不重跑
         request-start 写授权策略。
         """
@@ -1435,12 +1453,14 @@ class SqlAlchemyTrustedActionRepository:
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
         )
+        if task is None or approval is None:
+            raise _trusted_action_unavailable()
         execution = await self._session.scalar(
             select(ToolExecutionModel)
             .where(ToolExecutionModel.id == snapshot.execution.execution_id)
             .with_for_update()
         )
-        if task is None or approval is None or execution is None:
+        if execution is None:
             raise _trusted_action_unavailable()
         try:
             status = ToolExecutionStatus(execution.status)
@@ -1799,9 +1819,10 @@ class SqlAlchemyTrustedActionRepository:
     ) -> None:
         """在唯一原请求绑定上完成 401 恢复 CAS，不改变任何既有终态。
 
-        未应用证明先由 persist_provider_outcome 提交；本事务按 Task→Approval→Execution
+        未应用证明先由 persist_provider_outcome 提交；本事务按 Task→User→Approval→Execution
         →本地动作→Connection→access→refresh 取锁，重读 matching OAuth result 与当前完整
-        credentials。仅 proof、current snapshot、live lease 均匹配时设置 retryable=true；
+        credentials。User 锁后 inactive 不得补写失败、租约或恢复结果；仅 proof、current
+        snapshot、live lease 均匹配时设置 retryable=true；
         状态、审计与幂等 Outbox 同事务提交，下一次真实写仍必须通过原
         mark_request_started 及撤权屏障。lease 竞争/凭据冲突结束为不可重试失败；
         lease 丢失/结果未知保留原写未应用事实，进入人工关注且禁止新增 provider 调用。
@@ -1809,6 +1830,8 @@ class SqlAlchemyTrustedActionRepository:
         task, approval = await self._locked_task_approval(
             task_id=snapshot.task_id, approval_id=snapshot.approval_id
         )
+        if task is None or approval is None:
+            raise _trusted_action_unavailable()
         execution = await self._session.scalar(
             select(ToolExecutionModel)
             .where(
@@ -1817,7 +1840,7 @@ class SqlAlchemyTrustedActionRepository:
             )
             .with_for_update()
         )
-        if task is None or approval is None or execution is None:
+        if execution is None:
             raise _trusted_action_unavailable()
         current = _execution_reference(execution=execution, approval_id=approval.id)
         if (
@@ -2000,8 +2023,8 @@ class SqlAlchemyTrustedActionRepository:
 
         自动核对不能复用通用 ``TaskExecutionStore.acquire``：后者会把任务推进到
         ``running``，并可能让普通 Runner 在节点返回后写入成功。这里沿用
-        Task→Approval→ToolExecution→本地动作→Connection 的固定锁序，仅在
-        ``reconciling`` 状态且调度到期时设置 owner，随后由专用 worker 调用
+        Task→User→Approval→ToolExecution→本地动作→Connection 的固定锁序，仅在
+        用户锁后仍active、``reconciling`` 状态且调度到期时设置 owner，随后由专用 worker 调用
         ``TrustedActionExecutionUseCase.reconcile``。
         """
         now = utc_instant(now, field="now")
@@ -2024,6 +2047,8 @@ class SqlAlchemyTrustedActionRepository:
                 and (task.lease_expires_at is None or task.lease_expires_at > now)
             )
         ):
+            return None
+        if not await lock_active_user(self._session, user_id=task.user_id):
             return None
         raw_approval_id = task.input_payload.get("approval_id")
         raw_operation_id = task.input_payload.get("operation_id")
@@ -2107,8 +2132,9 @@ class SqlAlchemyTrustedActionRepository:
         """在只读核对异常时安全释放专用租约并保留 ``reconciling`` 事实。
 
         只有仍绑定同一 owner 的任务可以被释放；若另一个 Worker 已经接管，旧异常路径
-        不得清除新租约。调度时间被压到 ``now``，让下一次 PostgreSQL 恢复扫描能够重新
-        投递，而不会把未确定结果误写成成功或普通失败。
+        不得清除新租约。Task 后锁 User；inactive 由隐私流程负责，普通异常 cleanup
+        不得改写租约或调度事实。活动用户的调度时间被压到 ``now``，让下一次 PostgreSQL
+        恢复扫描能够重新投递，而不会把未确定结果误写成成功或普通失败。
         """
         now = utc_instant(now, field="now")
         task = await self._session.scalar(
@@ -2120,6 +2146,8 @@ class SqlAlchemyTrustedActionRepository:
             or task.status != TaskStatus.RECONCILING.value
             or task.lease_owner != lease_owner
         ):
+            return False
+        if not await lock_active_user(self._session, user_id=task.user_id):
             return False
         task.lease_owner = None
         task.lease_expires_at = None
@@ -2234,12 +2262,14 @@ class SqlAlchemyTrustedActionRepository:
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
         )
+        if task is None or approval is None:
+            return False
         execution = await self._session.scalar(
             select(ToolExecutionModel)
             .where(ToolExecutionModel.id == snapshot.execution.execution_id)
             .with_for_update()
         )
-        if task is None or approval is None or execution is None:
+        if execution is None:
             return False
         binding = await self._lock_action_binding(task=task, approval=approval)
         connection = (
@@ -2345,12 +2375,14 @@ class SqlAlchemyTrustedActionRepository:
             task_id=snapshot.task_id,
             approval_id=snapshot.approval_id,
         )
+        if task is None or approval is None:
+            raise _trusted_action_unavailable()
         execution = await self._session.scalar(
             select(ToolExecutionModel)
             .where(ToolExecutionModel.id == snapshot.execution.execution_id)
             .with_for_update()
         )
-        if task is None or approval is None or execution is None:
+        if execution is None:
             raise _trusted_action_unavailable()
         if execution.request_started_at is not None:
             raise _trusted_action_unavailable()
@@ -2546,11 +2578,16 @@ class SqlAlchemyTrustedActionRepository:
         task_id: UUID,
         approval_id: UUID,
     ) -> tuple[TaskRunModel | None, ApprovalRequestModel | None]:
-        """复用 Task→Approval 固定锁序读取两个可信生命周期行。"""
+        """以 Task→User→Approval 锁序保护普通可信结果及失败事务。
+
+        User 锁必须先于审批、执行和本地对象锁；inactive 返回现有缺失语义，调用者
+        随即退出，不能追加普通审计、Outbox 或释放租约。锁与结果一起由外层事务提交，
+        不把网络前的活动状态当作回包授权，也不参与隐私核对赢家协议。
+        """
         task = await self._session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
         )
-        if task is None:
+        if task is None or not await lock_active_user(self._session, user_id=task.user_id):
             return None, None
         approval = await self._session.scalar(
             select(ApprovalRequestModel)
@@ -3059,6 +3096,8 @@ async def _recover_due_reconciliations_in_session(
     调度器只负责恢复 PostgreSQL 中已经存在的 ``reconciling`` 事实，并不读取冻结命令；
     因此这段 SQL 与含 AEAD 的可信动作 repository 分离成共享 helper。任务状态、核对
     次数和到期时间组成稳定去重边界，重复扫描只会看到已有未发布 ``task.execute`` 而跳过。
+    limit 前排除 inactive，防止不可行动前缀占满本轮名额；候选查询只锁 Task，随后
+    逐行锁 User 并再次复核，保护初筛后删除屏障提交的窗口及 malformed lease 清理。
     """
     now = utc_instant(now, field="now")
     if limit <= 0:
@@ -3078,7 +3117,9 @@ async def _recover_due_reconciliations_in_session(
         (
             await session.scalars(
                 select(TaskRunModel)
+                .join(UserModel, UserModel.id == TaskRunModel.user_id)
                 .where(
+                    UserModel.is_active.is_(True),
                     TaskRunModel.kind == "trusted_action",
                     TaskRunModel.status == TaskStatus.RECONCILING.value,
                     TaskRunModel.scheduled_for.is_not(None),
@@ -3095,12 +3136,14 @@ async def _recover_due_reconciliations_in_session(
                 )
                 .order_by(TaskRunModel.scheduled_for, TaskRunModel.id)
                 .limit(limit)
-                .with_for_update(skip_locked=True)
+                .with_for_update(of=TaskRunModel, skip_locked=True)
             )
         ).all()
     )
     recovered = 0
     for task in tasks:
+        if not await lock_active_user(session, user_id=task.user_id):
+            continue
         is_malformed_lease = task.lease_owner is not None and task.lease_expires_at is None
         if is_malformed_lease:
             # 该形状无法证明任何 Worker 仍持有有效租约。清除 owner/expiry 只改变本地
@@ -3153,9 +3196,9 @@ async def _converge_pre_request_reconciliation_in_session(
     """仅凭可信持久绑定安全终结撤权后零请求的核对分支。
 
     本方法属于后续只读核对，不属于 disable/disconnect 事务。它沿既有锁序重读
-    Task、Approval、ToolExecution、本地动作和 Connection，只有固定撤权原因、零请求、
+    Task、User、Approval、ToolExecution、本地动作和 Connection，只有固定撤权原因、零请求、
     零写次数且无在途核对租约时才确认未应用；不读取 Secret、命令明文或 OAuth token。
-    损坏绑定、已有请求、终态和重复投递均返回 False，不覆盖历史结论。
+    用户锁后 inactive、损坏绑定、已有请求、终态和重复投递均返回 False，不覆盖历史结论。
 
     Args:
         session: 调用方控制提交的短事务。
@@ -3168,6 +3211,8 @@ async def _converge_pre_request_reconciliation_in_session(
         select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
     )
     if task is None or task.kind != "trusted_action" or task.status != "reconciling":
+        return False
+    if not await lock_active_user(session, user_id=task.user_id):
         return False
     raw_approval = task.input_payload.get("approval_id")
     raw_operation = task.input_payload.get("operation_id")
@@ -3308,8 +3353,10 @@ async def invalidate_unclaimed_actions_for_connection(
 ) -> int:
     """原子失效连接的未认领可信动作，并将已认领动作移交只读核对。
 
-    查询候选只用于缩小锁集合，任何 mutation 前都会按 Task→Approval→ToolExecution→
-    本地对象的既有可信锁序重读。修改连接状态的调用方必须在本函数返回后、同一事务内
+    查询候选只用于缩小锁集合，先按UUID顺序锁定整批Task，再按 User→Approval→ToolExecution→
+    本地对象的可信锁序重读。必须先取得全部候选Task，避免持User后等待下一Task，
+    与该Task的claim形成反向等待。用户锁后inactive整批返回零，不新增普通业务事实。
+    修改连接状态的调用方必须在本函数返回后、同一事务内检查用户仍active，随后
     再锁 Connection 与 capability 行；这样 claim 与撤权只会有一个有效赢家，也不会
     形成 Connection→Task 的反向等待。开关扫描不修改连接行，只处理未认领动作。
     已由专用 claim 取得且在锁后数据库时间仍有效的只读租约保持不变，允许在途核对
@@ -3382,12 +3429,19 @@ async def invalidate_unclaimed_actions_for_connection(
             .order_by(TaskRunModel.id)
         )
     )
-    invalidated = 0
-    for task_id in candidate_ids:
-        task = await session.scalar(
-            select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
+    tasks = tuple(
+        await session.scalars(
+            select(TaskRunModel)
+            .where(TaskRunModel.id.in_(candidate_ids))
+            .order_by(TaskRunModel.id)
+            .with_for_update()
         )
-        if task is None or task.user_id != user_id or task.kind != "trusted_action":
+    )
+    if not await lock_active_user(session, user_id=user_id):
+        return 0
+    invalidated = 0
+    for task in tasks:
+        if task.user_id != user_id or task.kind != "trusted_action":
             continue
         approval = await session.scalar(
             select(ApprovalRequestModel)
@@ -3641,7 +3695,8 @@ class SqlAlchemyTrustedActionRevocationStore:
         """先过滤可行动候选再应用 limit，并沿可信锁序重读每个用户/连接绑定。
 
         所有候选 TaskRun 先按固定 UUID 顺序锁定；已形成 ToolExecution 的任务从候选中
-        排除，锁内仍会二次校验。返回实际失效数量，重复扫描自然成为 no-op。
+        排除，inactive也在limit前排除；公共失效入口在Task锁后重查User，初筛不能
+        替代删除屏障同步。返回实际失效数量，重复扫描自然成为 no-op。
         """
         if not providers or not providers <= {"google", "microsoft"}:
             raise ValueError("providers must contain supported names")
@@ -3656,6 +3711,7 @@ class SqlAlchemyTrustedActionRevocationStore:
                     select(
                         TaskRunModel.id, TaskRunModel.user_id, connection_id.label("connection_id")
                     )
+                    .join(UserModel, UserModel.id == TaskRunModel.user_id)
                     .join(ApprovalRequestModel, ApprovalRequestModel.task_id == TaskRunModel.id)
                     .outerjoin(
                         MailDraftModel,
@@ -3681,6 +3737,7 @@ class SqlAlchemyTrustedActionRevocationStore:
                         ),
                     )
                     .where(
+                        UserModel.is_active.is_(True),
                         TaskRunModel.kind == "trusted_action",
                         TaskRunModel.status.in_(("waiting_approval", "queued", "running")),
                         ApprovalRequestModel.status.in_(("pending", "approved")),
@@ -3851,11 +3908,17 @@ class SqlAlchemyTrustedActionTaskExecutionStore(SqlAlchemyTaskExecutionStore):
         failed_at: datetime,
         error_code: str,
     ) -> bool:
-        """在同一事务证明零写调用并收敛 Task、Approval、claim 与本地对象。"""
+        """在 Task→User 锁后证明零写调用并收敛审批、claim 与本地对象。
+
+        预请求失败也属于普通业务结果；删除屏障先提交时返回 False，不能补写失败
+        metadata、普通审计或 Outbox。活跃用户继续执行完整冻结绑定和 live lease 校验。
+        """
         task = await session.scalar(
             select(TaskRunModel).where(TaskRunModel.id == task_id).with_for_update()
         )
         if task is None or task.kind != "trusted_action":
+            return False
+        if not await lock_active_user(session, user_id=task.user_id):
             return False
         raw_approval_id = task.input_payload.get("approval_id")
         raw_operation_id = task.input_payload.get("operation_id")

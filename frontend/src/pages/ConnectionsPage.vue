@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { nextTick, ref, watch } from 'vue'
 import CapabilityRows from '@/components/CapabilityRows.vue'
 import { useConnections } from '@/features/connections/useConnections'
 import { providerLabel } from '@/features/actions/presentation'
@@ -20,6 +21,15 @@ const {
   sync,
   disconnect,
 } = useConnections()
+
+const authorizationLink = ref<HTMLAnchorElement | null>(null)
+// 用户可能在页面下方启用能力；等新链接渲染后移入焦点，使下一步进入视野和键盘顺序。
+// 这里只改变展示焦点，不自动跳转、保存授权 URL 或推断供应商已同意。
+watch(authorization, async (value) => {
+  if (!value) return
+  await nextTick()
+  authorizationLink.value?.focus()
+})
 </script>
 <template>
   <section class="connections-page">
@@ -76,6 +86,7 @@ const {
     </p>
     <a
       v-if="authorization"
+      ref="authorizationLink"
       data-testid="authorization-link"
       :href="authorization.url"
     >继续 {{ providerLabel(authorization.provider) }} 授权</a>

@@ -2,7 +2,7 @@
 
 import base64
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,10 +19,12 @@ from ai_employee.application.ports.oauth import (
     OAuthTokenSet,
 )
 from ai_employee.application.use_cases.connections import (
+    ConnectionCapabilitySnapshot,
     ConnectionsUseCase,
     ConsumedOAuthAttempt,
     OAuthAttemptInvalidatedError,
     OAuthStateRejectedError,
+    StoredCapability,
     StoredConnection,
     UnsupportedConnectionProviderError,
 )
@@ -60,11 +62,12 @@ class FakeOAuthAdapter:
     provider: OAuthProvider = OAuthProvider.GOOGLE
     requested_capabilities: frozenset[ConnectionCapability] = frozenset()
     authorization_request: object | None = None
+    base_scopes: frozenset[str] = frozenset()
 
     def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
         """返回可预测 scope，并记录用例传入的完整能力并集。"""
         self.requested_capabilities = capabilities
-        return frozenset(f"scope:{capability.value}" for capability in capabilities)
+        return self.base_scopes | frozenset(f"scope:{capability.value}" for capability in capabilities)
 
     def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
         """保存类型化请求并返回不含真实供应商或凭据的合成 URL。"""
@@ -108,6 +111,23 @@ class FakeConnectionStore:
     disabled: ConnectionCapability | None = None
     attempt: dict[str, Any] = field(default_factory=dict)
     disconnected: bool = False
+    authorization_generation: int = 0
+    granted_scopes: tuple[str, ...] = ()
+    capability_rows: dict[ConnectionCapability, StoredCapability] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """保留已验证 scope，并建立真实仓储在 authorizing 转换时会保留的历史字段。"""
+        self.granted_scopes = tuple(f"scope:{capability.value}" for capability in self.enabled)
+        self.capability_rows = {
+            capability: StoredCapability(
+                capability,
+                CapabilityStatus.ENABLED if capability in self.enabled else CapabilityStatus.DISABLED,
+                self.granted_scopes if capability in self.enabled else (),
+                FixedClock().now() if capability in self.enabled else None,
+                None,
+            )
+            for capability in ConnectionCapability
+        }
 
     async def get_refresh_events(self, **values: Any) -> tuple[()]:
         """本组领域编排 fixture 没有 refresh 历史；真实 fence/CAS 使用数据库测试覆盖。"""
@@ -131,9 +151,10 @@ class FakeConnectionStore:
             provider_tenant_id="",
             account_type="google",
             account_email="fake-account@example.test",
-            scopes=(),
+            scopes=self.granted_scopes,
             status="connected",
             last_error_code=None,
+            authorization_generation=self.authorization_generation,
         )
 
     async def get_connection_for_update(
@@ -160,10 +181,26 @@ class FakeConnectionStore:
         connection_id: UUID,
         capabilities: frozenset[ConnectionCapability],
     ) -> int:
-        """记录本次需要进入授权中的目标能力闭包。"""
+        """模拟真实状态转换：原 enabled 并集进入 authorizing，历史 scope 不被清空。"""
         assert user_id == self.user_id and connection_id == self.connection_id
         self.authorizing = capabilities
-        return 1
+        self.enabled = self.enabled - capabilities
+        self.authorization_generation += 1
+        for capability in capabilities:
+            self.capability_rows[capability] = replace(
+                self.capability_rows[capability], status=CapabilityStatus.AUTHORIZING
+            )
+        return self.authorization_generation
+
+    async def get_capability_snapshot(
+        self, *, user_id: UUID, connection_id: UUID
+    ) -> ConnectionCapabilitySnapshot | None:
+        """按归属返回完整状态事实，支持同一连接的连续授权尝试。"""
+        if user_id != self.user_id or connection_id != self.connection_id:
+            return None
+        return ConnectionCapabilitySnapshot(
+            self.connection_id, "google", tuple(self.capability_rows.values()), ()
+        )
 
     async def disable_capability(
         self,
@@ -487,6 +524,135 @@ async def test_enable_includes_all_currently_enabled_capabilities() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("calendar_write_enabled", [False, True])
+@pytest.mark.parametrize("request_only_base_scope", [False, True])
+async def test_reauthorization_preserves_verified_capabilities_after_pending_transition(
+    calendar_write_enabled: bool,
+    request_only_base_scope: bool,
+) -> None:
+    """首次请求改变状态后再重试，仍保留先前已验证的数据源，并创建新代际。"""
+    user_id, connection_id = uuid4(), uuid4()
+    initial = {ConnectionCapability.CALENDAR_READ}
+    if calendar_write_enabled:
+        initial.add(ConnectionCapability.CALENDAR_WRITE)
+    store = FakeConnectionStore(user_id, connection_id, enabled=frozenset(initial))
+
+    @asynccontextmanager
+    async def stores():
+        """两个请求独立进入用例事务，但共享模拟的持久状态。"""
+        yield store
+
+    adapter = FakeOAuthAdapter(
+        base_scopes=frozenset({"offline_access"}) if request_only_base_scope else frozenset()
+    )
+    use_case = ConnectionsUseCase(stores, AeadCipher(b"p" * 32), {"google": adapter}, FixedClock())
+    await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+    first_attempt_id = store.attempt["attempt_id"]
+    assert store.enabled == frozenset()
+    result = await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+
+    expected = {
+        ConnectionCapability.CALENDAR_READ,
+        ConnectionCapability.MAIL_READ,
+        ConnectionCapability.MAIL_SEND,
+    }
+    if calendar_write_enabled:
+        expected.add(ConnectionCapability.CALENDAR_WRITE)
+    assert frozenset(result.requested_capabilities) == frozenset(expected)
+    assert store.attempt["requested_capabilities"] == frozenset(expected)
+    assert store.attempt["target_authorization_generation"] == 2
+    assert store.attempt["attempt_id"] != first_attempt_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_proof",
+    ["disabled", "revoked", "action_required", "never_verified", "row_scope_missing", "current_scope_missing"],
+)
+async def test_reauthorization_does_not_revive_unproven_or_disabled_pending_write(
+    invalid_proof: str,
+) -> None:
+    """过去的验证时间不能单独授权；状态、行 scope 与当前凭据 scope 都必须有效。"""
+    user_id, connection_id = uuid4(), uuid4()
+    store = FakeConnectionStore(
+        user_id,
+        connection_id,
+        enabled=frozenset({ConnectionCapability.CALENDAR_READ, ConnectionCapability.CALENDAR_WRITE}),
+    )
+
+    @asynccontextmanager
+    async def stores():
+        """复用真实转换形状，负例只改变一项历史事实。"""
+        yield store
+
+    use_case = ConnectionsUseCase(
+        stores, AeadCipher(b"p" * 32), {"google": FakeOAuthAdapter()}, FixedClock()
+    )
+    await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+    previous = store.capability_rows[ConnectionCapability.CALENDAR_WRITE]
+    if invalid_proof in {"disabled", "revoked", "action_required"}:
+        previous = replace(previous, status=CapabilityStatus(invalid_proof))
+    elif invalid_proof == "never_verified":
+        previous = replace(previous, last_verified_at=None)
+    elif invalid_proof == "row_scope_missing":
+        previous = replace(previous, actual_scopes=("scope:calendar.read",))
+    else:
+        store.granted_scopes = ("scope:calendar.read",)
+    store.capability_rows[ConnectionCapability.CALENDAR_WRITE] = previous
+
+    result = await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+    assert result.requested_capabilities == (
+        ConnectionCapability.CALENDAR_READ,
+        ConnectionCapability.MAIL_READ,
+        ConnectionCapability.MAIL_SEND,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_status", [CapabilityStatus.DISABLED, CapabilityStatus.REVOKED])
+async def test_reauthorization_cannot_restore_a_pending_write_with_disabled_read_dependency(
+    read_status: CapabilityStatus,
+) -> None:
+    """即使写 scope 有历史证明，也不得借恢复闭包重新打开已关闭的读取依赖。"""
+    user_id, connection_id = uuid4(), uuid4()
+    store = FakeConnectionStore(
+        user_id,
+        connection_id,
+        enabled=frozenset({ConnectionCapability.CALENDAR_READ, ConnectionCapability.CALENDAR_WRITE}),
+    )
+
+    @asynccontextmanager
+    async def stores():
+        """模拟新请求前已经存在的精确本地状态。"""
+        yield store
+
+    use_case = ConnectionsUseCase(
+        stores, AeadCipher(b"p" * 32), {"google": FakeOAuthAdapter()}, FixedClock()
+    )
+    await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+    store.capability_rows[ConnectionCapability.CALENDAR_READ] = replace(
+        store.capability_rows[ConnectionCapability.CALENDAR_READ], status=read_status
+    )
+    result = await use_case.start_capability_enable(
+        user_id=user_id, connection_id=connection_id, capability=ConnectionCapability.MAIL_SEND
+    )
+    assert result.requested_capabilities == (
+        ConnectionCapability.MAIL_READ,
+        ConnectionCapability.MAIL_SEND,
+    )
+
+
+@pytest.mark.asyncio
 async def test_initial_start_accepts_only_non_empty_read_capabilities() -> None:
     """首次连接可只选一个读取数据源，但空集合或写能力必须 fail closed。"""
     user_id, connection_id = uuid4(), uuid4()
@@ -630,11 +796,12 @@ class CallbackOAuthAdapter:
     scope_requests: list[frozenset[ConnectionCapability]] = field(default_factory=list)
     failure_stage: str | None = None
     failure: Exception | None = None
+    base_scopes: frozenset[str] = frozenset()
 
     def scopes_for(self, capabilities: frozenset[ConnectionCapability]) -> frozenset[str]:
         """按能力返回逐项可核对的合成 scope。"""
         self.scope_requests.append(capabilities)
-        return frozenset(f"scope:{capability.value}" for capability in capabilities)
+        return self.base_scopes | frozenset(f"scope:{capability.value}" for capability in capabilities)
 
     def build_authorization_url(self, request: OAuthAuthorizationRequest) -> str:
         """callback 测试不发起新授权。"""
@@ -934,6 +1101,37 @@ async def test_callback_verifies_write_capabilities_with_dependency_closure(
             frozenset({ConnectionCapability.CALENDAR_READ, ConnectionCapability.CALENDAR_WRITE})
             in adapter.scope_requests
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("calendar_scope_returned", [False, True])
+async def test_callback_does_not_require_request_only_base_scopes_in_token_response(
+    calendar_scope_returned: bool,
+) -> None:
+    """离线访问请求 scope 不回显时仍按资源权限启用；真正缺少日历权限则保持阻断。"""
+    granted = {"openid", "scope:mail.read"}
+    if calendar_scope_returned:
+        granted.add("scope:calendar.read")
+    use_case, store, adapter = _callback_scenario(
+        requested_capabilities=frozenset(
+            {ConnectionCapability.MAIL_READ, ConnectionCapability.CALENDAR_READ}
+        ),
+        granted_scopes=frozenset(granted),
+    )
+    adapter.base_scopes = frozenset({"openid", "offline_access"})
+
+    await use_case.callback(code="synthetic-code", state=_VALID_OAUTH_STATE)
+
+    assert store.capability_states == {
+        ConnectionCapability.MAIL_READ: (CapabilityStatus.ENABLED, None),
+        ConnectionCapability.CALENDAR_READ: (
+            (CapabilityStatus.ENABLED, None)
+            if calendar_scope_returned
+            else (CapabilityStatus.ACTION_REQUIRED, "connection_scope_missing")
+        ),
+    }
+    assert store.saved_scopes == frozenset(granted)
+    assert "offline_access" not in store.saved_scopes
 
 
 @pytest.mark.asyncio

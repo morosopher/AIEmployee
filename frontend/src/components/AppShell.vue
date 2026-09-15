@@ -28,17 +28,62 @@ const retry = async (id: string) => { throw new Error(`请在任务页重试 ${i
     class="app-shell"
     :class="{ 'actions-shell': route.path === '/actions' }"
   >
-    <p v-if="alertsLoading" class="system-alert-state" role="status">正在检查系统告警</p><p v-if="alertsError" class="system-alert-state" role="alert">系统告警暂时无法刷新。</p><div v-if="alerts.length" class="overdue-alert" role="alert"><strong>每日简报已逾期</strong><RouterLink v-if="alerts[0]?.diagnostic_task_id" :to="{ path: '/tasks', query: { task_id: alerts[0].diagnostic_task_id } }">查看诊断任务</RouterLink></div>
+    <p
+      v-if="alertsLoading"
+      class="system-alert-state"
+      role="status"
+    >
+      正在检查系统告警
+    </p>
+    <p
+      v-if="alertsError"
+      class="system-alert-state"
+      role="alert"
+    >
+      系统告警暂时无法刷新。
+    </p>
+    <div
+      v-if="alerts.length"
+      class="overdue-alert"
+      role="alert"
+    >
+      <strong>每日简报已逾期</strong>
+      <RouterLink
+        v-if="alerts[0]?.diagnostic_task_id"
+        :to="{ path: '/tasks', query: { task_id: alerts[0].diagnostic_task_id } }"
+      >
+        查看诊断任务
+      </RouterLink>
+    </div>
     <nav aria-label="主导航">
-      <RouterLink to="/chat">新聊天</RouterLink><RouterLink to="/brief">今日简报</RouterLink>
+      <RouterLink to="/chat">
+        新聊天
+      </RouterLink>
+      <RouterLink to="/brief">
+        今日简报
+      </RouterLink>
       <RouterLink to="/actions">
         操作中心
       </RouterLink>
-      <RouterLink to="/tasks">任务历史</RouterLink><RouterLink to="/connections">连接</RouterLink><RouterLink to="/settings">设置</RouterLink>
+      <RouterLink to="/tasks">
+        任务历史
+      </RouterLink>
+      <RouterLink to="/connections">
+        连接
+      </RouterLink>
+      <RouterLink to="/settings">
+        设置
+      </RouterLink>
     </nav>
-    <main><RouterView /></main>
+    <main>
+      <RouterView />
+    </main>
     <aside v-if="route.path !== '/actions'">
-      <TaskTimeline :task="task" :retry="retry" :follow="(id) => undefined" />
+      <TaskTimeline
+        :task="task"
+        :retry="retry"
+        :follow="(id) => undefined"
+      />
     </aside>
   </div>
 </template>

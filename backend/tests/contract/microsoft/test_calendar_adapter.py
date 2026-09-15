@@ -9,12 +9,15 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs
+from uuid import UUID
 
 import httpx
 import pytest
 import respx
 
-from ai_employee.application.ports.calendar import CalendarCursorExpiredError
+from ai_employee.application.ports.calendar import CalendarCursorExpiredError, CalendarEvent
+from ai_employee.application.use_cases import calendar_proposals
+from ai_employee.domain.connections import CapabilityStatus, ConnectionStatus
 from ai_employee.domain.errors import (
     PermanentProviderError,
     TransientProviderError,
@@ -231,6 +234,409 @@ def test_body_keeps_line_breaks_but_rejects_unrepresentable_controls() -> None:
         body["content"] = invalid
         with pytest.raises(PermanentProviderError):
             _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+
+async def _read_body_event(*, entry: str, body: object) -> CalendarEvent:
+    """通过合成 HTTP 在四个真实读取入口返回事件，保留适配器完整请求与投影行为。"""
+    payload = _single_event_payload()
+    payload["body"] = body
+    adapter = _adapter()
+    if entry == "current":
+        respx.get(f"{CALENDARS_URL}/{CALENDAR_ID}/events/event-1").respond(200, json=payload)
+        event = await adapter.get_current_event(CALENDAR_ID, "event-1")
+        assert event is not None
+        return event
+
+    response = {"value": [payload], "@odata.deltaLink": FINAL_DELTA_URL}
+    if entry == "delta":
+        respx.get(FINAL_DELTA_URL).respond(200, json=response)
+        pages = await _collect(adapter.sync_pages(CALENDAR_ID, FINAL_DELTA_URL))
+    else:
+        initial_route = respx.get(
+            DELTA_URL,
+            params={
+                "startDateTime": "2030-01-08T00:00:00+08:00",
+                "endDateTime": "2030-02-08T00:00:00+08:00",
+            },
+        )
+        if entry == "next":
+            initial_route.respond(200, json={"value": [], "@odata.nextLink": NEXT_URL})
+            respx.get(NEXT_URL).respond(200, json=response)
+        else:
+            assert entry == "initial"
+            initial_route.respond(200, json=response)
+        pages = await _collect(adapter.initial_pages(CALENDAR_ID))
+    return pages[-1].events[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ("initial", "next", "delta", "current"))
+@respx.mock
+async def test_calendar_body_requests_plain_text_at_every_read_entry(entry: str) -> None:
+    """初始、分页、持久 Delta 与精确 GET 都声明纯文本偏好并保留已有文本。"""
+    event = await _read_body_event(
+        entry=entry,
+        body={"contentType": "text", "content": "  第一行\r\n\t第二行\n--\n> 日程引用  "},
+    )
+
+    assert event.description == "  第一行\r\n\t第二行\n--\n> 日程引用  "
+    assert all(
+        call.request.headers.get("Prefer") == 'outlook.body-content-type="text"'
+        for call in respx.calls
+    )
+    assert len(respx.calls) == (2 if entry == "next" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ("initial", "next", "delta", "current"))
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    (
+        pytest.param(
+            '<html><head><meta charset="utf-8"><style>div { color: black; }</style>'
+            "</head><body><div>合成描述 &amp; <span>讨论</span>&nbsp;流程"
+            "<br>--<br>&gt; 仍属于日程</div></body></html>",
+            "合成描述 & 讨论\u00a0流程\n--\n> 仍属于日程",
+            id="graph-wrapper",
+        ),
+        pytest.param(
+            "<div>第一行<div>第二行</div></div>",
+            "第一行\n第二行",
+            id="block-nested-start",
+        ),
+        pytest.param(
+            "<div>第一行<div>第二行</div>第三行</div><div>第四行</div>",
+            "第一行\n第二行\n第三行\n第四行",
+            id="block-nested-tail-and-sibling",
+        ),
+        pytest.param(
+            "<div><div>第一行</div></div><div><div>第二行</div></div>",
+            "第一行\n第二行",
+            id="block-nested-wrappers",
+        ),
+        pytest.param(
+            "第一<span>行</span><p>第<b>二</b>行</p>第三<i>行</i>",
+            "第一行\n第二行\n第三行",
+            id="block-between-inline-text",
+        ),
+        pytest.param(
+            "<div>第一行<br><br><div>\t第二行 &amp; 行内<span>连接</span></div></div>",
+            "第一行\n\n\t第二行 & 行内连接",
+            id="block-preserves-breaks-tabs-and-inline",
+        ),
+        pytest.param(
+            '可见<span style="display:/**/none">合成内容</span>',
+            "可见",
+            id="css-comment-before-display-value",
+        ),
+        pytest.param(
+            '可见<span style="visibility:/**/hidden">合成内容</span>',
+            "可见",
+            id="css-comment-before-visibility-value",
+        ),
+        pytest.param(
+            '可见<span style="display:none !/**/important">合成内容</span>',
+            "可见",
+            id="css-comment-in-important",
+        ),
+        pytest.param(
+            '可见<span style="color:black;/*;*/DISPLAY/**/:/**/none/**/!/**/important/**/;">'
+            "合成内容</span>",
+            "可见",
+            id="css-comments-at-token-boundaries",
+        ),
+        pytest.param(
+            '可见<span style="visibility:/*合成\n注释*/collapse">合成内容</span>',
+            "可见",
+            id="css-multiline-comment",
+        ),
+        pytest.param(
+            '可见<span style="display:n/**/one">合成内容</span>',
+            "可见合成内容",
+            id="css-comment-cannot-join-value-identifier",
+        ),
+        pytest.param(
+            '可见<span style="visibil/**/ity:hidden">合成内容</span>',
+            "可见合成内容",
+            id="css-comment-cannot-join-property-identifier",
+        ),
+        pytest.param(
+            '可见<span style="/*;display:none;*/color:black">合成内容</span>',
+            "可见合成内容",
+            id="css-commented-declaration-stays-visible",
+        ),
+        pytest.param(
+            "可见<span style=\"content:';display:/**/none;'\">合成内容</span>",
+            "可见合成内容",
+            id="css-quoted-comment-stays-visible",
+        ),
+        pytest.param(
+            "可见<span style=\"content:'/*';display:/**/none\">合成内容</span>",
+            "可见",
+            id="css-quoted-comment-start-cannot-hide-declaration",
+        ),
+        pytest.param(
+            '可见<span style=\'--start:"/*";display:none;--end:"*/"\'>合成内容</span>',
+            "可见",
+            id="css-comment-delimiters-in-strings-stay-opaque",
+        ),
+        pytest.param(
+            '可见<span style="--start:url(/*);display:none;--end:url(*/)">合成隐藏内容</span>',
+            "可见",
+            id="css-url-token-comment-delimiters",
+        ),
+        pytest.param(
+            '可见<span style="--start:URL(/*);display:none;--end:URL(*/)">合成隐藏内容</span>',
+            "可见",
+            id="css-url-uppercase-token",
+        ),
+        pytest.param(
+            r'可见<span style="--start:u\72 l(/*);display:none;--end:u\72 l(*/)">合成隐藏内容</span>',
+            "可见",
+            id="css-url-escaped-function-name",
+        ),
+        pytest.param(
+            '可见<span style="--info:func(/* );display:none; */);color:red">合成内容</span>',
+            "可见合成内容",
+            id="css-url-ordinary-function-comment",
+        ),
+        pytest.param(
+            '可见<span style="--info:url(synthetic;display:none;value);color:red">合成内容</span>',
+            "可见合成内容",
+            id="css-url-token-contains-no-declaration",
+        ),
+        pytest.param(
+            '可见<span style="--info:func(nested(value);display:none;value);color:red">合成内容</span>',
+            "可见合成内容",
+            id="css-url-ordinary-function-contains-no-declaration",
+        ),
+        pytest.param(
+            r'可见<span style="--info:url(synthetic\);display:none;value);color:red">合成内容</span>',
+            "可见合成内容",
+            id="css-url-escaped-close-stays-inside-token",
+        ),
+        pytest.param(
+            '可见<span style="--info:url(&quot;synthetic;display:none;value&quot;);color:red">'
+            "合成内容</span>",
+            "可见合成内容",
+            id="css-url-quoted-value-stays-opaque",
+        ),
+        pytest.param(
+            '可见<span style="--info:func(nested(url(/*)));display:none;--end:url(*/)">'
+            "合成隐藏内容</span>",
+            "可见",
+            id="css-url-nested-function-preserves-following-declaration",
+        ),
+        # hash/at-keyword 的名称不能重当作 URL；括号中的真实注释必须屏蔽伪声明。
+        pytest.param(
+            '可见<span style="--start:#url(/*);display:none;--end:url(*/)">合成内容</span>',
+            "可见合成内容",
+            id="css-url-prefix-hash-token-keeps-comment",
+        ),
+        pytest.param(
+            '可见<span style="--start:@url(/*);display:none;--end:url(*/)">合成内容</span>',
+            "可见合成内容",
+            id="css-url-prefix-at-keyword-keeps-comment",
+        ),
+        # 转义分号属于自定义属性值 token；仅未转义的顶层分号才能开启隐藏声明。
+        pytest.param(
+            r'可见<span style="--note:value\;display:none;">合成内容</span>',
+            "可见合成内容",
+            id="css-escaped-delimiter-display-stays-visible",
+        ),
+        pytest.param(
+            r'可见<span style="--note:value\;visibility:hidden;">合成内容</span>',
+            "可见合成内容",
+            id="css-escaped-delimiter-visibility-stays-visible",
+        ),
+        pytest.param(
+            '可见<span style="--note:value;display:none;">合成内容</span>',
+            "可见",
+            id="css-escaped-delimiter-real-semicolon-control",
+        ),
+    ),
+)
+@respx.mock
+async def test_calendar_html_body_stays_plain_in_update_before_and_desired(
+    entry: str, html: str, expected: str
+) -> None:
+    """块起止、行内连接与显式隐藏样式在真实 update before/desired 中保真，版本/时间不变。"""
+    event = await _read_body_event(
+        entry=entry,
+        body={"contentType": "html", "content": html},
+    )
+    assert event.starts_at == datetime(2030, 1, 2, 1, tzinfo=UTC)
+    assert event.ends_at == datetime(2030, 1, 2, 2, tzinfo=UTC)
+    assert event.etag == 'W/"synthetic-etag"'
+    assert event.change_key == "synthetic-change-key-1"
+    # 只把供应商中立字段复制到本地快照端口；实际 before 和编辑计算仍由应用层执行。
+    local_event = calendar_proposals.CalendarProposalEventSnapshot(
+        event_id=UUID(int=1),
+        connection_id=UUID(int=2),
+        calendar_id=event.calendar_id,
+        provider="microsoft",
+        provider_event_id=event.event_id,
+        title=event.title,
+        description=event.description,
+        location=event.location,
+        starts_at=event.starts_at,
+        ends_at=event.ends_at,
+        all_day=event.all_day,
+        timezone=event.timezone,
+        attendees=tuple(person["email"] for person in event.attendees),
+        recurring_event_id=event.recurring_event_id,
+        etag=event.etag,
+        status=event.status,
+        can_edit=True,
+    )
+    before = calendar_proposals._content_from_local_event(local_event, operation_id=UUID(int=3))
+    target = calendar_proposals.CalendarProposalTargetSnapshot(
+        connection_id=UUID(int=2),
+        provider="microsoft",
+        timezone="Asia/Shanghai",
+        connection_status=ConnectionStatus.CONNECTED,
+        read_capability_status=CapabilityStatus.ENABLED,
+        write_capability_status=CapabilityStatus.ENABLED,
+        write_capability_error_code=None,
+        calendar_id=CALENDAR_ID,
+        can_write=True,
+    )
+    desired = calendar_proposals._apply_user_changes(
+        before,
+        {"title": "合成修改标题"},
+        operation_kind="update",
+        target=target,
+        source_event_ids=(str(local_event.event_id),),
+    )
+
+    assert before.description == expected
+    assert desired.description == expected
+    assert desired.changed_fields == ("title",)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    (
+        (None, ""),
+        ({"contentType": "text"}, ""),
+        ({"contentType": "text", "content": ""}, ""),
+        ({"contentType": "TEXT", "content": "\t原样\n保留\r\n"}, "\t原样\n保留\r\n"),
+        ({"contentType": "text", "content": "<literal> &amp;"}, "<literal> &amp;"),
+        ({"contentType": "html", "content": ""}, ""),
+        ({"contentType": "HTML", "content": "<div>合成内容</div>"}, "合成内容"),
+        (
+            {"contentType": "html", "content": "<div>&amp;lt;原样&amp;gt;</div>"},
+            "&lt;原样&gt;",
+        ),
+        (
+            {
+                "contentType": "html",
+                "content": (
+                    "<head><title>hidden-head</title></head><div>可见 "
+                    "<strong>内容</strong><script>hidden-script()</script>"
+                    "<style>hidden-style</style><template>hidden-template</template>"
+                    "<noscript>hidden-noscript</noscript><iframe>hidden-frame</iframe>"
+                    "<object>hidden-object</object><span hidden>hidden-attribute</span>"
+                    '<span aria-hidden="true">hidden-aria</span>'
+                    '<span style="display: none !important">hidden-display</span>'
+                    '<span style="visibility: hidden">hidden-visibility</span>'
+                    "<!-- hidden-comment --></div>"
+                    "<blockquote>&gt; 引用保留</blockquote>"
+                    '<div class="signature">--<br>签名保留</div>'
+                ),
+            },
+            "可见 内容\n> 引用保留\n--\n签名保留",
+        ),
+        ({"contentType": "html", "content": "<div>第一行<br>第二行"}, "第一行\n第二行"),
+    ),
+)
+def test_calendar_body_normalization_preserves_only_declared_text(
+    body: object, expected: str
+) -> None:
+    """按显式类型提取一次实体和可见文本，保留普通文本以及日程签名/引用语义。"""
+    payload = _single_event_payload()
+    payload["body"] = body
+
+    assert _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID).description == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {},
+        {"content": "<div>synthetic-value</div>"},
+        {"contentType": None, "content": "synthetic-value"},
+        {"contentType": "", "content": "synthetic-value"},
+        {"contentType": "unknownFutureValue", "content": "synthetic-value"},
+        {"contentType": " text", "content": "synthetic-value"},
+        {"contentType": "text/html", "content": "synthetic-value"},
+        {"contentType": 1, "content": "synthetic-value"},
+        {"contentType": [], "content": "synthetic-value"},
+        {"contentType": {}, "content": "synthetic-value"},
+        {"contentType": "text", "content": None},
+        {"contentType": "html", "content": 1},
+    ),
+)
+def test_calendar_body_rejects_unknown_or_malformed_types(body: object) -> None:
+    """未知、缺失或畸形类型不能猜成纯文本，也不能把原始内容带入固定错误。"""
+    payload = _single_event_payload()
+    payload["body"] = body
+
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+    assert raised.value.error_code == "microsoft_calendar_invalid_response"
+    assert "synthetic-value" not in str(raised.value)
+
+
+@pytest.mark.parametrize("content_type", ("text", "html"))
+@pytest.mark.parametrize("control", ("\x00", "\x01", "\x7f"))
+def test_calendar_body_rejects_raw_controls_before_html_extraction(
+    content_type: str, control: str
+) -> None:
+    """即使控制字符藏在主动节点内，也必须保持原始描述边界的拒绝语义。"""
+    payload = _single_event_payload()
+    payload["body"] = {
+        "contentType": content_type,
+        "content": f"<script>{control}</script>合成内容",
+    }
+
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+    assert raised.value.error_code == "microsoft_calendar_invalid_response"
+
+
+@pytest.mark.parametrize("entity", ("&#1;", "&#11;", "&#31;", "&#127;"))
+def test_calendar_html_body_rejects_controls_decoded_from_entities(entity: str) -> None:
+    """HTML 实体解码的 C0/DEL 必须在 trim 前拒绝，不能被当作边缘空白丢弃。"""
+    payload = _single_event_payload()
+    payload["body"] = {"contentType": "html", "content": f"<div>{entity}</div>"}
+
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+    assert raised.value.error_code == "microsoft_calendar_invalid_response"
+
+
+@pytest.mark.parametrize("content_type", ("text", "html"))
+def test_calendar_body_keeps_original_length_limit(content_type: str) -> None:
+    """HTML 外壳也占用原始 16,384 字符预算，不因最终可见文本很短而绕过限制。"""
+    payload = _single_event_payload()
+    if content_type == "html":
+        content = "<div>" + "x" * (16_384 - 11) + "</div>"
+        expected = "x" * (16_384 - 11)
+    else:
+        content = "x" * 16_384
+        expected = content
+    payload["body"] = {"contentType": content_type, "content": content}
+    assert _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID).description == expected
+
+    payload["body"] = {"contentType": content_type, "content": content + "x"}
+    with pytest.raises(PermanentProviderError) as raised:
+        _adapter()._normalize_event(payload, calendar_id=CALENDAR_ID)
+
+    assert raised.value.error_code == "microsoft_calendar_invalid_response"
 
 
 @pytest.mark.parametrize(

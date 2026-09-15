@@ -186,14 +186,17 @@ class SqlAlchemyConnectionStore:
 
         预读只定位所属 user，不使用预读 attempt 状态作任何授权决定。等待 user 期间
         attempt 可能已被消费、失效或删除，因此下方必须按 state+user 重新读取全部守卫。
-        用户同步不新增 inactive 错误分类，消费、能力失败与失败审计仍由原事务原子提交。
+        user 锁也是全数据删除的串行屏障；已提交 inactive 时不得消费残留 attempt 或
+        追加普通 OAuth 失败审计。返回未命中，沿用既有 ``oauth_state_rejected`` 边界，
+        不新增回调协议或复活删除任务。活动用户的消费、能力失败与审计仍原子提交。
         """
         user_id = await self._session.scalar(
             select(OAuthAttemptModel.user_id).where(OAuthAttemptModel.state_hash == state_hash)
         )
         if user_id is None:
             return None
-        await lock_oauth_user(self._session, user_id=user_id)
+        if not await lock_oauth_user(self._session, user_id=user_id):
+            return None
         attempt = await self._session.scalar(
             select(OAuthAttemptModel)
             .where(
@@ -800,7 +803,7 @@ class SqlAlchemyConnectionStore:
         capabilities: frozenset[ConnectionCapability],
         error_code: str,
     ) -> RecoveryCapabilityTransition:
-        """在连接行锁与授权代际仍匹配时收敛失败能力，过时回调安全 no-op。
+        """在用户仍 active、连接行锁与授权代际匹配时收敛失败，迟到回调安全 no-op。
 
         失败 callback 可能与新一轮授权、能力关闭或断开并发。先锁定连接并检查
         ``connected``、用户归属和单调代际，再只更新仍为 ``authorizing`` 的本次能力；
@@ -812,7 +815,9 @@ class SqlAlchemyConnectionStore:
             raise ValueError("progressive authorization failure code is invalid")
         # 普通 error callback 已从 consume 取得 user；独立 unsatisfied 事务也从此入口
         # 开始，不能先锁 connection 再让后续失败审计的 user 外键造成反向等待。
-        await lock_oauth_user(self._session, user_id=user_id)
+        if not await lock_oauth_user(self._session, user_id=user_id):
+            # state 已消费并不授权网络后的新事务；删除屏障之后不能重建普通能力事实。
+            return "stale_target_noop"
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -891,7 +896,11 @@ class SqlAlchemyConnectionStore:
         connection_id: UUID,
         capability: ConnectionCapability,
     ) -> None:
-        """本地关闭能力并保留实际 scope 事实，供界面说明仍需重连才能缩权。"""
+        """在Task→User屏障后关闭能力，保留实际scope供界面说明仍需重连才能缩权。
+
+        公共失效入口的零计数不能区分空候选与inactive；本方法仍在同事务检查用户，
+        防止空候选或屏障拒绝后继续改写连接与能力。用户锁保持到整个关闭事务提交。
+        """
         # 先覆盖尚未创建 Task 的并发提交；行锁仍从 Task 开始，不能提前锁 Connection。
         await lock_connection_submission_scope(
             self._session, user_id=user_id, connection_id=connection_id
@@ -910,6 +919,8 @@ class SqlAlchemyConnectionStore:
             actions=affected_actions,
             reason="connection_capability_disabled",
         )
+        if not await lock_oauth_user(self._session, user_id=user_id):
+            raise ConnectionCredentialOwnershipError
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -920,7 +931,7 @@ class SqlAlchemyConnectionStore:
         )
         if connection is None:
             raise ConnectionCredentialOwnershipError
-        # scanner 已按 Task→Approval→ToolExecution→本地动作锁定并完成候选状态变更；
+        # scanner 已按全部Task→User→Approval→ToolExecution→本地动作完成候选状态变更；
         # 现在才在同一事务取得 Connection 锁后的能力快照。渐进 callback 必须先通过
         # 这把锁，因而不会在读取依赖与关闭能力之间提交新的写能力。
         enabled = await self.get_enabled_capabilities(
@@ -1100,6 +1111,8 @@ class SqlAlchemyConnectionStore:
         并防止旧 state 在断开后复活连接。渐进 callback 不锁定 attempt，而是锁定冻结的
         target connection 并校验 ``authorization_generation``；断开时的 targetless UPDATE
         不会命中它，代际变化仍会使旧渐进 callback fail closed。
+        在处理可信候选后复核同一User行锁；即使候选为空，inactive也不能失效attempt、
+        删除凭据或改写连接状态。窄revoke仍位于本地提交后的事务外。
         """
         # 共享提交屏障必须位于候选扫描和所有行锁之前，避免授权旧快照在断开后落库。
         await lock_connection_submission_scope(
@@ -1113,7 +1126,7 @@ class SqlAlchemyConnectionStore:
         )
         if provider is None:
             return (False, None)
-        # 断开连接会同时切断四种真实写动作；沿可信动作既有 Task→Approval→
+        # 断开连接会同时切断四种真实写动作；沿可信动作全部Task→User→Approval→
         # ToolExecution→本地对象锁序先失效尚未认领的工作，避免已排队消息在连接状态
         # 改变后继续进入 provider。已形成 ToolExecution 的动作由 scanner 保留并交给
         # reconciliation，不在这里伪造取消或结果。
@@ -1133,6 +1146,8 @@ class SqlAlchemyConnectionStore:
             # reason 也会写入未认领生命周期审计，便于操作中心按一个稳定码聚合。
             reason="connection_scope_missing",
         )
+        if not await lock_oauth_user(self._session, user_id=user_id):
+            return (False, None)
         # 同一用户/供应商的所有首次 state（包括已消费但尚未保存结果的 state）都必须
         # 原子标记；渐进授权 target_connection_id 非 NULL，交由授权代际单独控制。
         await self._session.execute(
@@ -1213,6 +1228,8 @@ class SqlAlchemyConnectionStore:
         它使用独立短事务写入 ``AuditEvent``，metadata 仅包含供应商、稳定错误码与连接
         标识；不会把 refresh token、供应商响应或异常正文转移到 PostgreSQL，也不创建
         Outbox/TaskRun，因此后续调度无法重建已删除凭据。
+        网络后的独立事务先锁User；删除屏障先提交时no-op，保留原网络错误传播，
+        不把断开前的活动状态当作追加普通审计的授权。
 
         Args:
             user_id: 连接所属用户，用于第二层归属校验。
@@ -1231,6 +1248,8 @@ class SqlAlchemyConnectionStore:
             raise ValueError("error_code must be a stable non-empty code")
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
+        if not await lock_oauth_user(self._session, user_id=user_id):
+            return
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(

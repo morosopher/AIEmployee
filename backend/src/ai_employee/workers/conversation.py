@@ -40,6 +40,7 @@ from ai_employee.infrastructure.db.repositories.calendar_proposals import (
     SqlAlchemyCalendarProposalRepository,
 )
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.repositories.tasks import SqlAlchemyTaskRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
@@ -51,6 +52,7 @@ from ai_employee.integrations.llm.fake import FakeModelGateway, build_model_gate
 
 class ConversationTaskStep:
     """处理简报与明确本地草稿意图，绝不提交审批或调用邮件供应商。"""
+
     name = "conversation_respond"
 
     def __init__(
@@ -126,6 +128,9 @@ class ConversationTaskStep:
                 )
                 if task_row is None or task_row.result_payload is not None:
                     return
+                # 遗留 marker 补写同样是普通业务提交，必须在 Task→user 锁内重检屏障。
+                if not await lock_active_user(session, user_id=task.user_id):
+                    return
                 existing = await session.scalar(
                     select(MessageModel.id).where(
                         MessageModel.user_id == task.user_id,
@@ -166,6 +171,9 @@ class ConversationTaskStep:
             if task_row is None:
                 # 分类 I/O 期间取消或换 owner 后，旧 Worker 不得写消息、草稿或模型元数据。
                 return
+            # 模型成功或分类失败都可能产生消息与调用元数据；在全部 DML 前同步删除屏障。
+            if not await lock_active_user(session, user_id=task.user_id):
+                return
             if task_row.result_payload is not None:
                 return
             existing = await session.scalar(
@@ -182,7 +190,11 @@ class ConversationTaskStep:
                 )
                 return
             if intent == "show_latest_brief":
-                brief = await session.scalar(select(DailyBriefModel).where(DailyBriefModel.user_id == task.user_id).order_by(DailyBriefModel.local_date.desc(), DailyBriefModel.version.desc()))
+                brief = await session.scalar(
+                    select(DailyBriefModel)
+                    .where(DailyBriefModel.user_id == task.user_id)
+                    .order_by(DailyBriefModel.local_date.desc(), DailyBriefModel.version.desc())
+                )
                 text = brief.markdown if brief is not None else "尚无可查看的每日简报。"
             elif intent == "generate_daily_brief":
                 generated = await SqlAlchemyTaskRepository(session).create_with_outbox(
@@ -221,9 +233,7 @@ class ConversationTaskStep:
                             CreateMailDraftInput(
                                 user_id=task.user_id,
                                 mode=MailMode.REPLY,
-                                idempotency_key=(
-                                    f"conversation-mail-draft:{task.task_id}"
-                                ),
+                                idempotency_key=(f"conversation-mail-draft:{task.task_id}"),
                                 source_thread_id=str(request.source_thread_id),
                             )
                         )
@@ -300,9 +310,7 @@ class ConversationTaskStep:
             return self._action_cipher
         if self._action_cipher_file is None:
             raise RuntimeError("action payload encryption is not configured")
-        self._action_cipher = ActionPayloadCipher(
-            AeadCipher.from_file(self._action_cipher_file)
-        )
+        self._action_cipher = ActionPayloadCipher(AeadCipher.from_file(self._action_cipher_file))
         return self._action_cipher
 
 
@@ -327,7 +335,10 @@ def _required_lease_owner(task: LeasedTask) -> str:
 
 
 def build_conversation_task_step(
-    *, session_factory: ManagedAsyncSessionMaker, settings: Settings | None = None, metrics: Metrics | None = None
+    *,
+    session_factory: ManagedAsyncSessionMaker,
+    settings: Settings | None = None,
+    metrics: Metrics | None = None,
 ) -> ConversationTaskStep:
     """构造供 DurableTaskRunner 注册的实际会话回复节点。"""
     if settings is None:

@@ -4,10 +4,11 @@ from datetime import datetime
 from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
+from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession
+from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession, get_auth_settings
 from ai_employee.application.ports.credential_rotation import RecoveryFailureCode
 from ai_employee.application.ports.oauth import OAuthProvider
 from ai_employee.application.use_cases.connections import (
@@ -19,6 +20,7 @@ from ai_employee.application.use_cases.connections import (
     OAuthStateRejectedError,
 )
 from ai_employee.application.use_cases.tasks import CreateTaskUseCase
+from ai_employee.config import Settings
 from ai_employee.domain.connections import CapabilityStatus, ConnectionCapability
 from ai_employee.domain.errors import PermanentProviderError
 from ai_employee.integrations.microsoft.oauth import classify_microsoft_callback_error
@@ -269,6 +271,28 @@ async def _complete_oauth_callback(
     return {"connection_id": str(connection_id)}
 
 
+def _oauth_success_response(
+    request: Request, result: dict[str, str], settings: Settings
+) -> Response:
+    """把已完成的 OAuth 结果映射为浏览器返回或兼容 JSON，不改变授权事实。
+
+    Args:
+        request: 仅使用 Fetch Metadata 区分浏览器导航，不信任 Host 或返回地址参数。
+        result: 用例已完成一次性消费和持久保存后返回的连接标识。
+        settings: 管理员配置的应用地址；浏览器只能返回其固定连接页面。
+
+    Returns:
+        禁止缓存且不传递 Referer 的 303 或 200 响应。失败不会到达此函数。
+    """
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if request.headers.get("sec-fetch-mode") == "navigate":
+        # 清除整段 OAuth query，防止 code/state 经跳转地址或 Referer 进入前端。
+        return RedirectResponse(
+            f"{settings.app_base_url.rstrip('/')}/connections", status_code=303, headers=headers
+        )
+    return JSONResponse(result, headers=headers)
+
+
 def build_connections_router() -> APIRouter:
     """构建连接路由；固定 ``/google/*`` 必须先于动态连接路径注册。"""
     from ai_employee.api.deps import get_connections_use_case, get_create_task_use_case
@@ -304,17 +328,23 @@ def build_connections_router() -> APIRouter:
         )
         return StartConnectionResponse(authorization_url=result.authorization_url)
 
-    @router.get("/google/callback")
+    @router.get(
+        "/google/callback",
+        response_model=dict[str, str],
+        responses={303: {"description": "Return browser navigation to the connections page"}},
+    )
     async def complete_google_connection(
+        request: Request,
         state_value: Annotated[str, Query(alias="state", min_length=1, max_length=512)],
         use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+        settings: Annotated[Settings, Depends(get_auth_settings)],
         code: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
         error: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         error_description: Annotated[str | None, Query(max_length=4096)] = None,
         error_codes: Annotated[str | None, Query(max_length=256)] = None,
-    ) -> dict[str, str]:
-        """Google 通过同一 shape/一次性消费边界处理 code 或安全分类的 error。"""
-        return await _complete_oauth_callback(
+    ) -> Response:
+        """Google 先完成一次性授权，再按导航或 API 请求返回；错误保留脱敏 Problem。"""
+        result = await _complete_oauth_callback(
             provider=OAuthProvider.GOOGLE,
             use_case=use_case,
             state_value=state_value,
@@ -323,6 +353,7 @@ def build_connections_router() -> APIRouter:
             error_description=error_description,
             error_codes=error_codes,
         )
+        return _oauth_success_response(request, result, settings)
 
     @router.post("/microsoft/start", response_model=StartConnectionResponse)
     async def start_microsoft_connection(
@@ -369,21 +400,27 @@ def build_connections_router() -> APIRouter:
         )
         return StartConnectionResponse(authorization_url=result.authorization_url)
 
-    @router.get("/microsoft/callback")
+    @router.get(
+        "/microsoft/callback",
+        response_model=dict[str, str],
+        responses={303: {"description": "Return browser navigation to the connections page"}},
+    )
     async def complete_microsoft_connection(
+        request: Request,
         state_value: Annotated[str, Query(alias="state", min_length=1, max_length=512)],
         use_case: Annotated[ConnectionsUseCase, Depends(get_connections_use_case)],
+        settings: Annotated[Settings, Depends(get_auth_settings)],
         code: Annotated[str | None, Query(min_length=1, max_length=4096)] = None,
         error: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
         error_description: Annotated[str | None, Query(max_length=4096)] = None,
         error_codes: Annotated[str | None, Query(max_length=256)] = None,
-    ) -> dict[str, str]:
+    ) -> Response:
         """消费 Microsoft callback state，并将管理员同意错误映射为稳定 Problem。
 
         ``error_description`` 仅作为分类输入，绝不进入异常消息、审计或响应；未知错误
-        统一收敛为不含供应商正文的永久失败。
+        统一收敛为不含供应商正文的永久失败。只有成功结果才按导航/API 契约返回。
         """
-        return await _complete_oauth_callback(
+        result = await _complete_oauth_callback(
             provider=OAuthProvider.MICROSOFT,
             use_case=use_case,
             state_value=state_value,
@@ -392,6 +429,7 @@ def build_connections_router() -> APIRouter:
             error_description=error_description,
             error_codes=error_codes,
         )
+        return _oauth_success_response(request, result, settings)
 
     @router.get(
         "/{connection_id}/capabilities",

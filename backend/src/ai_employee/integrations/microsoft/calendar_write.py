@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from ai_employee.application.commands import TrustedCommand
+from ai_employee.application.ports.calendar import CalendarNotificationFacts
 from ai_employee.application.ports.oauth import MAX_OAUTH_TOKEN_LENGTH
 from ai_employee.application.ports.trusted_actions import (
     ApprovalPreflightResult,
@@ -132,6 +133,8 @@ class MicrosoftCalendarWriteAdapter:
         connection_id: bearer token 所属的精确 Microsoft 连接；所有命令入口都必须与其
             恒等匹配，防止多连接场景把一个账户的凭据用于另一个账户的冻结命令。
         access_token: 已由外层 OAuth coordinator 解密并校验的短期 bearer token。
+        current_event_facts: 生产 registry 按用户/连接/日历/事件读取的当前通知证明；
+            条件写的 none 预检必须同时匹配版本并确认当前名单为空。
         client: 可选注入的 HTTPX client，主要供完全合成的契约测试使用。
         refresh_access_token: 统一组合签名保留项；adapter 绝不隐式调用它，以免 401 或
             未知写结果越过持久 refresh fence 后产生第二次外部写入。
@@ -144,6 +147,7 @@ class MicrosoftCalendarWriteAdapter:
         *,
         connection_id: UUID,
         access_token: str,
+        current_event_facts: CalendarNotificationFacts | None = None,
         client: httpx.AsyncClient | None = None,
         refresh_access_token: _RefreshAccessToken | None = None,
     ) -> None:
@@ -152,6 +156,7 @@ class MicrosoftCalendarWriteAdapter:
             raise TypeError("Microsoft Calendar connection_id must be UUID")
         self._connection_id = connection_id
         self._access_token = _require_token(access_token)
+        self._current_event_facts = current_event_facts
         self._client = client
         self._refresh_access_token = refresh_access_token
 
@@ -169,7 +174,8 @@ class MicrosoftCalendarWriteAdapter:
             无 warning 的固定预检结果；Graph 不支持的组合直接抛稳定冲突。
 
         Raises:
-            StateConflictError: 含参会人的 ``notification_policy=none`` 无法表达。
+            StateConflictError: 期望或当前事件含参会人，或缺少绑定的当前个人事件证明，
+                ``notification_policy=none`` 无法无损表达。
             TypeError: 命令不是精确日历命令类型。
             ValueError: 供应商标识或时间字段不能安全表达。
         """
@@ -178,6 +184,30 @@ class MicrosoftCalendarWriteAdapter:
             attendees=normalized.attendees,
             policy=normalized.notification_policy,
         )
+        if (
+            isinstance(normalized, (CalendarUpdateCommand, CalendarRestoreCommand))
+            and normalized.notification_policy is NotificationPolicy.NONE
+        ):
+            facts = self._current_event_facts
+            current_version = (
+                _normalize_graph_version(facts.etag, source="base") if facts is not None else None
+            )
+            base_version = _normalize_graph_version(normalized.base_etag, source="base")
+            if (
+                facts is None
+                or facts.connection_id != normalized.connection_id
+                or facts.calendar_id != normalized.calendar_id
+                or facts.provider_event_id != normalized.provider_event_id
+                or facts.has_attendees is not False
+                or current_version is None
+                or base_version is None
+                or current_version.canonical != base_version.canonical
+            ):
+                # desired 为空不证明当前是个人事件；已有会议清空最后参会人也有通知语义。
+                raise StateConflictError(
+                    error_code="calendar_notification_mapping_unsupported",
+                    message="Microsoft calendar notification policy cannot be mapped safely",
+                )
         # 映射函数同时验证 IANA -> Windows -> IANA 的无损往返；预检只需要建立
         # 表达能力证明，不把供应商名称写回冻结命令。
         to_windows_timezone(normalized.timezone)
@@ -921,7 +951,7 @@ def _current_event_precondition(
     payload: Mapping[str, object],
     command: CalendarCommand,
 ) -> tuple[str | None, _GraphVersion | None]:
-    """检查条件 PATCH 前的身份、可写事实与 canonical 版本绑定。
+    """检查条件 PATCH 前的身份、可写事实、canonical 版本及当前通知语义。
 
     Returns:
         ``(error_code, current_version)``；只有 error 为空且版本存在时调用方才可
@@ -945,6 +975,10 @@ def _current_event_precondition(
         return "microsoft_calendar_event_version_invalid", None
     if current_version.canonical != base_version.canonical:
         return "calendar_event_version_conflict", None
+    if command.notification_policy is NotificationPolicy.NONE and payload.get("attendees") != []:
+        # GET 后重新证明当前无参会人；缺失/畸形列表也不是可静默清空的依据。这里仍未
+        # 发送 PATCH，因此可明确返回未应用，但同一通知承诺不能自动重试为 all。
+        return "calendar_notification_mapping_unsupported", None
     return None, current_version
 
 

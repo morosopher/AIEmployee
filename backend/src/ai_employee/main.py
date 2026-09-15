@@ -77,9 +77,8 @@ def create_app(
     """创建并装配 AI Employee API 应用。
 
     Args:
-        readiness_probe: 可选依赖就绪探针。测试可注入确定性探针；未提供时使用
-            当前脚手架的默认成功结果，后续基础设施任务会接入真实 PostgreSQL 与
-            Redis 探测。
+        readiness_probe: 可选依赖就绪探针。测试可注入确定性探针；未提供时分别执行
+            PostgreSQL 最小只读查询与 Redis PING，任一依赖不可用都拒绝就绪。
 
     Returns:
         已注册系统状态与认证路由，并持有可释放数据库引擎的 FastAPI 应用实例。
@@ -192,14 +191,16 @@ def create_app(
     app.add_exception_handler(Exception, handle_unexpected_error)
 
     async def real_readiness_probe() -> dict[str, bool]:
-        """以最小 SQL 与 Redis PING 检查真实依赖，不返回连接或异常原文。"""
+        """独立检查两项依赖；连接错误只降低就绪状态，不公开异常或隐藏程序错误。"""
         postgres_healthy = False
         redis_healthy = False
         try:
             async with session_factory() as session:
                 await session.execute(text("SELECT 1"))
             postgres_healthy = True
-        except SQLAlchemyError:
+        except (SQLAlchemyError, OSError):
+            # asyncpg 的建连拒绝和超时可能直接抛出 OSError，未必被 SQLAlchemy 包装。
+            # 必须继续探测 Redis，才能让正式端点以 503 报告完整依赖状态。
             pass
         client = Redis.from_url(settings.redis_url)
         try:
@@ -237,10 +238,12 @@ def create_app(
             TestScenarioStore,
             build_test_support_router,
         )
+        from ai_employee.infrastructure.testing.m2_support import M2TestSupportService
         from ai_employee.infrastructure.testing.test_support import TestSupportFixtureService
         from ai_employee.workers.execute_task import build_task_runner_for_session
 
         app.state.test_scenario_store = TestScenarioStore(Redis.from_url(settings.redis_url))
+        app.state.m2_test_support = M2TestSupportService(session_factory, settings)
         # 测试同步执行复用 API 生命周期拥有的 session factory；lifespan 统一释放引擎，
         # 避免 E2E 每次请求经全局 Worker 缓存泄漏独立连接池。
         app.state.test_task_runner = build_task_runner_for_session(

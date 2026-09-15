@@ -11,12 +11,17 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
+from ai_employee.application.trusted_action_summary import TrustedActionStepSummary
 from ai_employee.application.use_cases.trusted_actions import validate_provider_url
 from ai_employee.infrastructure.db.models.actions import (
     CalendarChangeSnapshotModel,
     MailDraftVersionModel,
 )
-from ai_employee.infrastructure.db.models.tasks import ApprovalRequestModel, ToolExecutionModel
+from ai_employee.infrastructure.db.models.tasks import (
+    ApprovalRequestModel,
+    TaskStepModel,
+    ToolExecutionModel,
+)
 from ai_employee.workers.retention import RetentionCleanupWorker
 from tests.integration.api import test_connections as connection_cases
 from tests.integration.api.test_connections import AuthenticatedApiClients
@@ -70,12 +75,21 @@ async def test_task27e_real_retention_then_authenticated_action_api(
     )
     provider_url = f"https://provider.example.test/{kind}/synthetic"
     assert validate_provider_url(provider_url) == provider_url
+    expected_step_summary = TrustedActionStepSummary(
+        action="mail.send" if kind == "mail" else "calendar.update",
+        proposal_version=1,
+        frozen_connection_id=seed.connection_id,
+    ).as_json()
     original_facts: tuple[object, ...] | None = None
     async with sessions.begin() as session:
         approval = await session.get(ApprovalRequestModel, seed.approval_id)
         assert approval is not None and approval.payload_ciphertext is not None
-        # 纯 writer seed 无需预览风险列；认证 API fixture 必须补齐真实 M2 审批投影。
+        # 纯 retention writer seed 不读取展示索引；认证 API fixture 必须补齐 Task29
+        # 的冻结账户摘要与风险列。空字典不是合法历史格式，不能放宽 reader 来迁就 fixture。
         approval.risk_level = "high" if kind == "mail" else "medium"
+        step = await session.get(TaskStepModel, approval.step_id)
+        assert step is not None
+        step.input_summary = expected_step_summary
         if kind == "mail":
             version = await session.get(MailDraftVersionModel, seed.content_id)
             assert version is not None and version.body_ciphertext is not None
@@ -118,6 +132,8 @@ async def test_task27e_real_retention_then_authenticated_action_api(
             )
         )
         assert approval.payload_hash == "d" * 64
+        step = await session.get(TaskStepModel, approval.step_id)
+        assert step is not None and step.input_summary == expected_step_summary
         if kind == "mail":
             version = await session.get(MailDraftVersionModel, seed.content_id)
             assert version is not None

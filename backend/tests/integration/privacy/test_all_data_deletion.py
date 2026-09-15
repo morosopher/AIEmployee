@@ -1,5 +1,7 @@
 """验证全数据删除在撤销失败时仍完成本地不可逆清理。"""
 
+import base64
+import hashlib
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID, uuid4
 
@@ -19,6 +21,7 @@ from ai_employee.infrastructure.db.models.sources import (
     EmailMessageModel,
     EmailThreadModel,
     EncryptedCredentialModel,
+    OAuthAttemptModel,
     OAuthConnectionModel,
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
@@ -29,6 +32,70 @@ from ai_employee.infrastructure.db.repositories.task_execution import SqlAlchemy
 from ai_employee.infrastructure.db.session import build_session_factory
 from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.workers.privacy import AllDataDeletionCompleted, PrivacyDeletionWorker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["google", "microsoft"])
+async def test_task30_oauth_error_after_committed_deletion_barrier_has_no_effect(
+    database_url: str, provider: str
+) -> None:
+    """真实删除赢家已提交 inactive/started 后，迟到错误回调必须沿既有 state 错误拒绝。
+
+    attempt 在删除屏障前以完整合法形状创建，Worker 在 barrier 提交后崩溃，确保回调
+    遇到的是规格允许的中间现场。不能先删除 attempt 来制造无命中，也不能通过手工
+    inactive 标记替代真正的删除赢家事务。拒绝后原 attempt、赢家与审计必须逐项不变。
+    """
+    from ai_employee.application.use_cases.connections import (
+        ConnectionsUseCase,
+        OAuthStateRejectedError,
+    )
+    from ai_employee.infrastructure.db.repositories.connections import (
+        SqlAlchemyConnectionStoreFactory,
+    )
+
+    factory = build_session_factory(database_url)
+    cipher = AeadCipher(b"p" * 32)
+    state = base64.urlsafe_b64encode(b"s" * 32).rstrip(b"=").decode("ascii")
+    attempt_id = uuid4()
+    verifier = cipher.encrypt(b"v" * 43, f"{BARRIER_USER_ID}:{attempt_id}:pkce_verifier".encode("ascii"))
+    try:
+        await _seed_barrier_task(factory, change="zero_facts", active=True, live=True)
+        async with factory.begin() as session:
+            session.add(OAuthAttemptModel(
+                id=attempt_id, user_id=BARRIER_USER_ID, provider=provider,
+                state_hash=hashlib.sha256(state.encode("ascii")).digest(),
+                encrypted_pkce_verifier=verifier.ciphertext, nonce=verifier.nonce,
+                key_version=verifier.key_version, requested_capabilities=["mail.read"],
+                created_at=BARRIER_NOW, expires_at=BARRIER_NOW + timedelta(minutes=10),
+            ))
+        worker = _PhaseCrashWorker(factory, "barrier")
+        with pytest.raises(RuntimeError, match="synthetic deletion phase crash"):
+            await worker.execute(_barrier_lease())
+        assert worker.visited == ["barrier"]
+        async with factory() as session:
+            user = await session.get(UserModel, BARRIER_USER_ID)
+            assert user is not None and user.is_active is False
+            before = tuple((await session.execute(select(
+                AuditEventModel.id, AuditEventModel.event_type, AuditEventModel.event_metadata
+            ).where(AuditEventModel.user_id == BARRIER_USER_ID).order_by(AuditEventModel.id))).all())
+            assert [row.event_type for row in before] == ["privacy.deletion_started"]
+        use_case = ConnectionsUseCase(SqlAlchemyConnectionStoreFactory(factory), cipher, {}, _DeletionClock())
+        with pytest.raises(OAuthStateRejectedError):
+            await use_case.callback_error(provider=provider, state=state)
+        async with factory() as session:
+            attempt = await session.get(OAuthAttemptModel, attempt_id)
+            assert attempt is not None and attempt.consumed_at is None and attempt.invalidated_at is None
+            assert (attempt.encrypted_pkce_verifier, attempt.nonce, attempt.key_version) == (
+                verifier.ciphertext, verifier.nonce, verifier.key_version,
+            )
+            after = tuple((await session.execute(select(
+                AuditEventModel.id, AuditEventModel.event_type, AuditEventModel.event_metadata
+            ).where(AuditEventModel.user_id == BARRIER_USER_ID).order_by(AuditEventModel.id))).all())
+            task = await session.get(TaskRunModel, BARRIER_TASK_ID)
+            assert task is not None and task.status == "running"
+        assert after == before
+    finally:
+        await factory.dispose()
 
 
 class FailingRevoker:

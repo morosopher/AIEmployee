@@ -74,7 +74,9 @@ export function useConnections() {
           url: result.authorization_url,
           provider: connection.provider,
         }
-        notice.value = `本次授权包含：${result.requested_capabilities.join('、')}。完成后请刷新连接状态。`
+        notice.value = `本次授权包含：${result.requested_capabilities.join('、')}。请继续授权，完成后将返回连接页。`
+        // 发起会改变整个依赖闭包的状态；只读取服务端事实，不把 URL 的生成解释为启用成功。
+        await catalog.load()
       }
     })
   }

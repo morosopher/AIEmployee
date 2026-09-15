@@ -764,6 +764,7 @@ async def test_restore_provider_read_is_outside_transaction_and_result_is_atomic
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=lambda: NOW,
         )
@@ -874,6 +875,7 @@ async def test_restore_skips_provider_read_when_source_is_not_eligible(
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=lambda: NOW,
         )
@@ -928,6 +930,7 @@ async def test_restore_rolls_back_proposal_when_before_snapshot_persistence_fail
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=_ReaderResolver(reader),
             clock=lambda: NOW,
         )
@@ -970,6 +973,7 @@ async def test_restore_uses_persisted_task_input_instead_of_message_copy(
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=_ReaderResolver(reader),
             clock=lambda: NOW,
         )
@@ -1065,6 +1069,7 @@ async def test_restore_rejects_corrupt_persisted_input_before_resolver_or_reader
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=lambda: NOW,
         )
@@ -1106,6 +1111,7 @@ async def test_restore_accepts_arbitrary_valid_creation_key_without_route_prefix
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=lambda: NOW,
         )
@@ -1171,6 +1177,7 @@ async def test_restore_runner_loses_expired_lease_then_replacement_wins_once(
         restore_step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=clock,
         )
@@ -1249,6 +1256,7 @@ async def test_restore_skips_provider_read_without_a_current_persisted_lease(
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=resolver,
             clock=lambda: NOW,
         )
@@ -1306,6 +1314,7 @@ async def test_restore_discards_provider_result_when_lease_expires_during_get(
         step = PrepareCalendarRestoreTaskStep(
             session_factory,
             action_cipher=ACTION_CIPHER,
+            source_cipher=AeadCipher(b"r" * 32),
             reader_resolver=_ReaderResolver(reader),
             clock=lambda: now,
         )

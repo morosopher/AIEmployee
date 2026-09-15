@@ -82,11 +82,12 @@ function blockedDependency(capability: CapabilityName): CapabilityName | null {
         </p>
         <p>最近验证：{{ row.last_verified_at || '尚未验证' }}</p>
       </details>
+      <!-- 授权链接只在页面内存保存；刷新后允许显式创建新 attempt，旧链接由服务端代际拒绝。 -->
+      <!-- enabled 只表示已有 scope 验证事实，不能保证当前续期可用；保留原连接的显式重新授权入口。 -->
       <button
-        v-if="row.status !== 'enabled'"
         type="button"
         :name="`enable-${row.capability}`"
-        :disabled="busy || disconnected || row.status === 'authorizing'"
+        :disabled="busy || disconnected"
         @click="emit('enable', row.capability)"
       >
         {{ row.status === 'disabled' ? '启用' : '重新授权' }}

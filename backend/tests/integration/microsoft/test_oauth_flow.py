@@ -244,10 +244,12 @@ async def test_microsoft_start_rejects_write_capability(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("echo_offline_scope", [False, True])
 async def test_microsoft_success_callback_persists_tenant_graph_identity(
     microsoft_oauth_context: MicrosoftOAuthContext,
+    echo_offline_scope: bool,
 ) -> None:
-    """成功 callback 必须验签后写入 tenant:Graph ID 规范键与加密凭据。"""
+    """验签后保存规范身份，并按资源权限启用能力，不要求响应回显 offline_access。"""
     context = microsoft_oauth_context
     login = await context.client.post(
         "/api/v1/auth/login",
@@ -286,6 +288,10 @@ async def test_microsoft_success_callback_persists_tenant_graph_identity(
             / "openid_configuration.json"
         ).read_text(encoding="utf-8")
     )
+    returned_scopes = ["openid", "profile", "email", "User.Read"]
+    if echo_offline_scope:
+        returned_scopes.append("offline_access")
+    returned_scopes.extend(["Mail.Read", "Calendars.Read"])
     with respx.mock(assert_all_called=True) as mocked:
         mocked.post(MICROSOFT_TOKEN_URL).respond(
             200,
@@ -293,7 +299,7 @@ async def test_microsoft_success_callback_persists_tenant_graph_identity(
                 "access_token": "synthetic-microsoft-access",
                 "refresh_token": "synthetic-microsoft-refresh",
                 "expires_in": 3600,
-                "scope": "openid profile email User.Read offline_access Mail.Read Calendars.Read",
+                "scope": " ".join(returned_scopes),
                 "id_token": id_token,
             },
         )
@@ -320,15 +326,19 @@ async def test_microsoft_success_callback_persists_tenant_graph_identity(
     assert connection.provider_tenant_id == tenant
     assert connection.provider_account_id == f"{tenant}:graph-integration-user"
     assert connection.account_type == "work_school"
-    assert connection.scopes == [
-        "openid",
-        "profile",
-        "email",
-        "User.Read",
-        "offline_access",
-        "Mail.Read",
-        "Calendars.Read",
-    ]
+    assert connection.scopes == returned_scopes
+    capabilities = await context.client.get(
+        f"/api/v1/connections/{connection.id}/capabilities"
+    )
+    assert capabilities.status_code == 200
+    assert {
+        item["capability"]: item["status"] for item in capabilities.json()["capabilities"]
+    } == {
+        "mail.read": "enabled",
+        "calendar.read": "enabled",
+        "mail.send": "disabled",
+        "calendar.write": "disabled",
+    }
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,27 @@ from ai_employee.infrastructure.db.models.identity import UserModel, UserSession
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 
+async def lock_active_user(session: AsyncSession, *, user_id: UUID) -> bool:
+    """在普通业务短事务的首个用户同步点锁后复核删除屏障。
+
+    调用方必须在业务行锁、日期 advisory 和任何 DML 之前调用；任务结果事务先持有
+    对应 TaskRun，再调用本函数。行锁持续至调用方提交或回滚，不能把返回值跨事务缓存。
+    此函数只返回活动状态，由各入口沿用原有拒绝或 no-op 语义，不授予隐私赢家资格。
+
+    Args:
+        session: 调用方拥有的当前短事务，禁止跨网络持有。
+        user_id: 已由入口绑定的用户主键。
+
+    Returns:
+        用户行存在且锁后仍为 active 时返回 True；删除屏障或缺失行返回 False。
+    """
+    return (
+        await session.scalar(
+            select(UserModel.is_active).where(UserModel.id == user_id).with_for_update()
+        )
+    ) is True
+
+
 def _to_user_credential(model: UserModel) -> UserCredential:
     """把 ORM 用户收窄为不携带基础设施类型的认证领域对象。"""
     return UserCredential(

@@ -19,10 +19,14 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: ci-postgres-password
         options: >-
+          --label ai_employee.ci_run=${{ github.run_id }}
+          --label ai_employee.ci_attempt=${{ github.run_attempt }}
+          --label ai_employee.ci_job=verify
+          --label ai_employee.ci_role=target
           --health-cmd "pg_isready -U postgres -d ai_employee_test"
           --health-interval 10s --health-timeout 5s --health-retries 10
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
       redis:
         image: redis:7.4-alpine
         options: >-
@@ -55,10 +59,17 @@ jobs:
           pnpm --dir frontend install --frozen-lockfile
           pnpm --dir frontend exec playwright install --with-deps chromium
 
-      - name: Create synthetic secret files and database roles
+      - name: Create synthetic secret files and prepare database anchor
         shell: bash
+        # 精确服务 ID 和创建时标签共同绑定归属；CI 布尔标志不提供写入 authority。
+        env:
+          CI_DATABASE_CONTAINER_ID: ${{ job.services.postgres.id }}
+          CI_DATABASE_RUN_ID: ${{ github.run_id }}
+          CI_DATABASE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_DATABASE_JOB: verify
         run: |
           set -euo pipefail
+          umask 077
           secret_dir="${RUNNER_TEMP}/ai-employee-secrets"
           mkdir -p "${secret_dir}"
           printf '%s' 'ci-app-role-password' >"${secret_dir}/app_database_password"
@@ -68,13 +79,12 @@ jobs:
           printf '%s' 'ci-google-client-secret' >"${secret_dir}/google_client_secret"
           printf '%s' 'ci-model-api-key' >"${secret_dir}/model_api_key"
           printf '%s' 'ci-backup-passphrase' >"${secret_dir}/backup_passphrase"
-          export POSTGRES_DB=ai_employee_test
-          export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=ci-postgres-password
-          export APP_DATABASE_PASSWORD_FILE="${secret_dir}/app_database_password"
-          export RETENTION_DATABASE_PASSWORD_FILE="${secret_dir}/retention_database_password"
-          bash scripts/init-db-roles.sh
+          export TEST_DATABASE_URL=postgresql+asyncpg://postgres:ci-postgres-password@127.0.0.1:5432/ai_employee_test
+          export APP_MASTER_KEY_FILE="${secret_dir}/app_master_key"
+          # 独立 donor 的 typed bootstrap/0018 迁移产生精确空基线；target 必须保持 fixed roles absent。
+          just prepare-ci-database
           {
-            echo "TEST_DATABASE_URL=postgresql+asyncpg://postgres:ci-postgres-password@localhost:5432/ai_employee_test"
+            echo "TEST_DATABASE_URL=${TEST_DATABASE_URL}"
             echo "TEST_REDIS_URL=redis://localhost:6379/15"
             echo "E2E_ADMIN_EMAIL=ci-admin@example.test"
             echo "E2E_ADMIN_PASSWORD_FILE=${secret_dir}/app_database_password"

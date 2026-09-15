@@ -182,9 +182,15 @@ def test_microsoft_authorization_url_uses_common_v2_pkce_nonce_and_offline_scope
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("echo_offline_scope", [False, True])
 @respx.mock
-async def test_microsoft_token_exchange_normalizes_scope_and_id_token() -> None:
-    """token endpoint 返回值应收窄为 OAuthTokenSet，保留实际 scope 与 id_token。"""
+async def test_microsoft_token_exchange_normalizes_scope_and_id_token(
+    echo_offline_scope: bool,
+) -> None:
+    """保留实际 scope 与 id_token；有 refresh token 也不得补造未回显的离线 scope。"""
+    returned_scopes = {"openid", "profile", "email", "User.Read", "Mail.Read", "Mail.Send"}
+    if echo_offline_scope:
+        returned_scopes.add("offline_access")
     route = respx.post(MICROSOFT_TOKEN_URL).mock(
         return_value=httpx.Response(
             200,
@@ -192,7 +198,7 @@ async def test_microsoft_token_exchange_normalizes_scope_and_id_token() -> None:
                 "access_token": "synthetic-access",
                 "refresh_token": "synthetic-refresh",
                 "expires_in": 3600,
-                "scope": "openid profile email User.Read offline_access Mail.Read Mail.Send",
+                "scope": " ".join(sorted(returned_scopes)),
                 "id_token": "synthetic-id-token",
                 "token_type": "Bearer",
             },
@@ -200,7 +206,7 @@ async def test_microsoft_token_exchange_normalizes_scope_and_id_token() -> None:
     )
     token = await _adapter().exchange_code(code="synthetic-code", verifier="synthetic-verifier")
     assert route.called
-    assert token.granted_scopes == frozenset({*MICROSOFT_BASE_SCOPES, "Mail.Read", "Mail.Send"})
+    assert token.granted_scopes == frozenset(returned_scopes)
     assert token.refresh_token == "synthetic-refresh"
     assert token.id_token == "synthetic-id-token"
     request = route.calls[0].request

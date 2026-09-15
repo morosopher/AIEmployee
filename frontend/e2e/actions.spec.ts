@@ -8,6 +8,7 @@ import type {
 import {
   actionItems,
   actionSnapshot,
+  DRAFT_ID,
   NOW,
   TASK_ID,
 } from '../src/test-support/actionFixtures'
@@ -494,8 +495,10 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
     await expect(
       page.getByRole('region', { name: `${label} 1`, exact: true }),
     ).toBeVisible()
-  await expect(page.getByText('本地草稿', { exact: true })).toBeVisible()
-  await expect(page.locator('a[href^="/mail/drafts/"]')).toHaveCount(0)
+  // Task29 已提供本地编辑入口；同时校验可访问名称与合成草稿路径，避免放过错误目标。
+  const draftLink = page.getByRole('link', { name: '编辑本地草稿', exact: true })
+  await expect(draftLink).toBeVisible()
+  await expect(draftLink).toHaveAttribute('href', `/mail/drafts/${DRAFT_ID}`)
   await page.getByLabel('供应商筛选').selectOption('microsoft')
   await page.getByLabel('操作类型筛选').selectOption('calendar_proposal')
   await expect(page.getByText('当前页 1 项操作')).toBeVisible()
@@ -508,14 +511,19 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await page.keyboard.press('Enter')
   const detail = page.getByRole('complementary', { name: '操作详情与时间线' })
   await expect(detail).toBeFocused()
-  const providerLink = detail.getByRole('link', {
+  const providerLinks = detail.getByRole('link', {
     name: '在 Google 中检查结果',
+    exact: true,
   })
-  await expect(providerLink).toHaveAttribute(
-    'href',
-    'https://mail.google.com/mail/u/0/',
-  )
-  await expect(providerLink).toHaveAttribute('rel', 'noopener noreferrer')
+  // 详情和人工确认面板都提供检查入口，两个位置必须使用同一安全目标与新窗口隔离属性。
+  await expect(providerLinks).toHaveCount(2)
+  for (const providerLink of await providerLinks.all()) {
+    await expect(providerLink).toHaveAttribute(
+      'href',
+      'https://mail.google.com/mail/u/0/',
+    )
+    await expect(providerLink).toHaveAttribute('rel', 'noopener noreferrer')
+  }
   await expect(detail.locator('[aria-live="polite"]')).toContainText(
     '需要人工确认',
   )
@@ -541,8 +549,26 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await expect(trigger).toBeFocused()
   snapshot = { ...snapshot, provider_url: 'javascript:alert(1)' }
   await trigger.click()
-  await expect(detail.getByRole('link')).toHaveCount(0)
+  // 不安全供应商地址必须在两个位置都消失；本地编辑入口仍应精确绑定原草稿与任务。
+  await expect(providerLinks).toHaveCount(0)
+  await expect(detail.locator('a[href^="javascript:"]')).toHaveCount(0)
+  const editorLink = detail.getByRole('link', {
+    name: '打开邮件草稿',
+    exact: true,
+  })
+  await expect(editorLink).toBeVisible()
+  await expect(editorLink).toHaveAttribute(
+    'href',
+    `/mail/drafts/${DRAFT_ID}?task=${TASK_ID}`,
+  )
   await page.reload()
+  // task 查询参数让刷新恢复原详情；窄屏须显式返回列表后才显示原有分组计数。
+  await expect(detail).toBeVisible()
+  await expect(detail.locator('[aria-live="polite"]')).toContainText(
+    '需要人工确认',
+  )
+  await expect(page.getByRole('form', { name: '操作筛选' })).toBeHidden()
+  await page.getByRole('button', { name: '关闭操作详情' }).click()
   await expect(page.getByText('当前页 6 项操作')).toBeVisible()
   expect(
     await page.evaluate(() => [localStorage.length, sessionStorage.length]),

@@ -81,8 +81,28 @@ db-revision name:
     uv run --project backend alembic -c backend/alembic.ini revision --autogenerate -m "$1"
 
 [group('database')]
-create-admin email password_file:
-    uv run --project backend python -m ai_employee.cli.create_admin --email "$1" --password-file "$2"
+create-admin email password_file target='host':
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # host 保留原生开发入口；Compose 复用运行中的 API 身份和同一 CLI，不额外发布数据库。
+    case "$3" in
+      host)
+        exec uv run --project backend python -m ai_employee.cli.create_admin --email "$1" --password-file "$2"
+        ;;
+      compose)
+        [[ -f "$2" && -r "$2" ]] || { printf 'create-admin refused: password file must be readable\n' >&2; exit 1; }
+        # exec 不继承 API 启动 shell 的变量，需再次读取已有数据库 Secret。管理员密码只经 stdin；
+        # 邮箱作为独立位置参数传入容器，不能插入 shell 程序或解释为命令。
+        exec docker compose -f compose.yaml -f compose.dev.yaml exec -T api \
+          sh -ec 'export PGPASSWORD="$(cat /run/secrets/app_database_password)"; exec python -m ai_employee.cli.create_admin --email "$1" --password-file /dev/stdin' \
+          -- "$1" < "$2"
+        ;;
+      *)
+        printf 'create-admin refused: target must be host or compose\n' >&2
+        exit 1
+        ;;
+    esac
 
 [confirm]
 [group('database')]

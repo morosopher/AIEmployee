@@ -156,7 +156,7 @@ def build_settings_router() -> APIRouter:
     @router.get("", response_model=SettingsResponse)
     async def get_settings(
         authenticated: CurrentSession,
-        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case)],
+        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case, scope="function")],
     ) -> SettingsResponse:
         """返回当前用户已持久化且规范化的完整工作设置。"""
         return _settings_response(await use_case.get(user_id=authenticated.user.id))
@@ -165,7 +165,7 @@ def build_settings_router() -> APIRouter:
     async def patch_settings(
         payload: SettingsPatch,
         authenticated: CsrfProtectedSession,
-        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case)],
+        use_case: Annotated[UpdateUserSettings, Depends(get_settings_use_case, scope="function")],
     ) -> SettingsResponse:
         """原子更新提供字段，并写入只包含字段名的设置审计事件。"""
         value = await use_case.update(

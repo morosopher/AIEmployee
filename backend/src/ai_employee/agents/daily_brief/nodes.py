@@ -1,8 +1,11 @@
 """每日简报图节点：确定性规则先行，模型只处理脱敏歧义事实。"""
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from functools import lru_cache
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from ai_employee.application.ports.task_steps import TaskStepEvent
@@ -359,6 +362,20 @@ def classify_conversation_intent(text: str) -> dict[str, Any]:
     return {"intent": "explain_capabilities", "confidence": 0.5, "reason_code": "ambiguous_request"}
 
 
+@lru_cache(maxsize=1)
+def load_conversation_intent_prompt() -> str:
+    """读取并缓存随应用发布的分类规则，避免每次调用重复读取版本文件。
+
+    Returns:
+        只含既定能力边界的 system 提示词；用户内容不会进入缓存或日志。
+
+    Raises:
+        OSError: 发布产物缺少版本文件或文件不可读，不能退回无规则的模型调用。
+    """
+    path = Path(__file__).resolve().parents[2] / "prompts" / "conversation_intent_v1.md"
+    return path.read_text(encoding="utf-8")
+
+
 async def classify_ambiguous_conversation_intent(
     text: str,
     *,
@@ -369,17 +386,23 @@ async def classify_ambiguous_conversation_intent(
 ) -> ConversationIntent:
     """本地脱敏歧义文本后执行受限的三值意图模型分类。
 
-    确定性 allow/deny 规则仍优先；模型或输出校验失败时安全解释能力边界。
+    确定性 allow/deny 规则仍优先；版本化 system 规则与已脱敏 user 文本分开传入，
+    避免把受限分类误发为普通聊天。模型或输出校验失败时安全解释能力边界。
     """
     deterministic = classify_conversation_intent(text)
     if deterministic["reason_code"] != "ambiguous_request":
         return ConversationIntent.model_validate(deterministic)
     redacted = redact_for_model(text, configured_patterns=configured_patterns)
+    # 首次缓存填充包含文件读取，放到线程中，避免阻塞 Worker 的租约心跳与事件循环。
+    prompt = await asyncio.to_thread(load_conversation_intent_prompt)
     try:
         response = await model_gateway.complete(
             model_name=model_name,
             prompt_version="conversation_intent_v1",
-            messages=[{"role": "user", "content": redacted.text}],
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": redacted.text},
+            ],
             response_model=ConversationIntent,
         )
         if invocation_metadata is not None:

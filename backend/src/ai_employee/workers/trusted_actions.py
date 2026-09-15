@@ -32,6 +32,7 @@ from ai_employee.infrastructure.security.action_payloads import ActionPayloadCip
 from ai_employee.integrations.registry import (
     build_oauth_security_services,
     build_trusted_action_registry,
+    trusted_action_write_policy,
 )
 
 
@@ -255,7 +256,7 @@ def build_trusted_action_task_step(
     workflow = TrustedActionExecutionUseCase(
         transactions=SqlAlchemyTrustedActionRepositoryFactory(session_factory, command_cipher),
         adapters=registry,
-        write_policy=settings,
+        write_policy=trusted_action_write_policy(settings=settings, registry=registry),
         clock=lambda: datetime.now(UTC),
         observer=metrics,
     )

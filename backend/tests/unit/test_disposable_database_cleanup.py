@@ -213,6 +213,15 @@ class _FakeConnection:
             if self.database_session_error is not None:
                 raise self.database_session_error
             self.dependency_queries.add("database_sessions")
+            if "AS autovacuum_sessions" in sql:
+                return _FakeResult(
+                    rows=(
+                        {
+                            "database_sessions": self.dependencies["database_sessions"],
+                            "autovacuum_sessions": 0,
+                        },
+                    )
+                )
             return _FakeResult(scalar=self.dependencies["database_sessions"])
         if "activity.usesysid = ANY(:role_oids)" in sql:
             self.dependency_queries.add("active_sessions")
@@ -329,6 +338,431 @@ def _record_complete_provenance(
         RETENTION_RUNTIME_ROLE_NAME: _safe_role(RETENTION_RUNTIME_ROLE_NAME, 502),
     }
     lease.record_created_runtime_roles()
+
+
+class _BackgroundMaintenanceConnection(_FakeConnection):
+    """仅扩展后台会话观测；最终全会话计数、身份和角色检查仍由原 Fake 执行。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.background_rows: tuple[Mapping[str, object], ...] = (
+            {"backend_type": "autovacuum worker"},
+        )
+        self.dependencies["database_sessions"] = 1
+        self.after_background_quiet: Callable[[], None] | None = None
+
+    def execute(
+        self, statement: object, parameters: Mapping[str, object] | None = None
+    ) -> _FakeResult:
+        """按真实 pg_stat_activity 的 backend_type 返回合成观察，允许在等待后注入竞争。"""
+        sql = str(statement)
+        if "AS autovacuum_sessions" in sql:
+            assert parameters == {"target_database_oid": 401}
+            self.statements.append(sql)
+            self.dependency_queries.add("database_sessions")
+            if self.database_session_error is not None:
+                raise self.database_session_error
+            return _FakeResult(
+                rows=(
+                    {
+                        "database_sessions": self.dependencies["database_sessions"],
+                        "autovacuum_sessions": sum(
+                            row.get("backend_type") == "autovacuum worker"
+                            for row in self.background_rows
+                        ),
+                    },
+                )
+            )
+        if "activity.backend_type" in sql and "pg_stat_activity" in sql:
+            assert parameters == {"target_database_oid": 401}
+            self.statements.append(sql)
+            rows = self.background_rows
+            if not rows and self.after_background_quiet is not None:
+                callback, self.after_background_quiet = self.after_background_quiet, None
+                callback()
+            return _FakeResult(rows=rows)
+        return super().execute(statement, parameters)
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+def test_cleanup_waits_for_autovacuum_that_starts_after_preparation(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool
+) -> None:
+    """准备读到零后新 vacuum 进入时，仍须等待最终全会话归零才执行受 provenance 约束的删除。
+
+    真实 PostgreSQL 已证明后台 worker 能在准备观察与最终计数之间启动。这个时序不
+    代表客户端占用，也不能消费一次清理失败后重试；待测 helper 必须在首个 DROP 前
+    继续有界准备，并保留 database-only 与双角色分支的精确删除范围。
+    """
+    connection = _BackgroundMaintenanceConnection()
+    connection.background_rows = ()
+    connection.dependencies["database_sessions"] = 0
+    lease = _acquire(connection)
+    waits: list[float] = []
+
+    def start_vacuum_after_quiet() -> None:
+        """只改变外部会话事实，不改待测方法的返回值或准入结果。"""
+        assert connection.mutations == []
+        connection.background_rows = ({"backend_type": "autovacuum worker"},)
+        connection.dependencies["database_sessions"] = 1
+
+    def finish_late_vacuum(delay: float) -> None:
+        """模拟新到后台自行退出；不得在它仍活动时提前删除目标或角色。"""
+        assert connection.mutations == []
+        waits.append(delay)
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+
+    connection.after_background_quiet = start_vacuum_after_quiet
+    monkeypatch.setattr(disposable_database_module, "sleep", finish_late_vacuum)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        lease.cleanup()
+        assert len(waits) == 1 and 0 < waits[0] <= 0.05
+        assert connection.mutations == [f'DROP DATABASE "{_DATABASE_NAME}"'] + (
+            [f'DROP ROLE "{APP_RUNTIME_ROLE_NAME}"', f'DROP ROLE "{RETENTION_RUNTIME_ROLE_NAME}"']
+            if with_roles
+            else []
+        )
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize(
+    "backend_types",
+    (("client backend",), ("walsender",), (None,), ("autovacuum worker", "client backend")),
+)
+def test_cleanup_rejects_non_vacuum_that_enters_after_preparation(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, backend_types: tuple[str | None, ...]
+) -> None:
+    """准备后新客户端、未知类型或混合会话不能借用 vacuum 的等待资格。"""
+    connection = _BackgroundMaintenanceConnection()
+    connection.background_rows = ()
+    connection.dependencies["database_sessions"] = 0
+    lease = _acquire(connection)
+
+    def enter_after_quiet() -> None:
+        """以同一批实际会话同时构造分类与总数，避免不一致 Fake 掩盖混合会话。"""
+        connection.background_rows = tuple({"backend_type": kind} for kind in backend_types)
+        connection.dependencies["database_sessions"] = len(backend_types)
+
+    def forbidden_wait(delay: float) -> None:
+        """未知占用者必须在当前准入直接拒绝。"""
+        raise AssertionError(f"unexpected wait: {delay}")
+
+    connection.after_background_quiet = enter_after_quiet
+    monkeypatch.setattr(disposable_database_module, "sleep", forbidden_wait)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert connection.mutations == []
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize("drift", ("database", "cluster", "lock", "session", "roles", "new-client"))
+def test_cleanup_revalidates_provenance_after_late_vacuum_wait(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, drift: str
+) -> None:
+    """晚到 vacuum 引入的新等待之后，原身份、角色与占用条件仍须逐项重验。"""
+    connection = _BackgroundMaintenanceConnection()
+    connection.background_rows = ()
+    connection.dependencies["database_sessions"] = 0
+    lease = _acquire(connection)
+    waits: list[float] = []
+
+    def start_after_quiet() -> None:
+        """只在初始空观察后发布一个真实类别为 vacuum 的合成后端。"""
+        connection.background_rows = ({"backend_type": "autovacuum worker"},)
+        connection.dependencies["database_sessions"] = 1
+
+    def finish_and_drift(delay: float) -> None:
+        """在晚到后端退出时改变一项来源事实；任何 DROP 都必须仍未发生。"""
+        assert connection.mutations == []
+        waits.append(delay)
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+        if drift == "database":
+            connection.database_oid = 999
+        elif drift == "cluster":
+            connection.system_identifier += 1
+        elif drift == "lock":
+            connection.lock_held = False
+        elif drift == "session":
+            connection.closed = True
+        elif drift == "roles":
+            connection.roles[APP_RUNTIME_ROLE_NAME] = _safe_role(APP_RUNTIME_ROLE_NAME, 999)
+        else:
+            connection.dependencies["database_sessions"] = 1
+
+    connection.after_background_quiet = start_after_quiet
+    monkeypatch.setattr(disposable_database_module, "sleep", finish_and_drift)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert len(waits) == 1
+        assert connection.mutations == []
+    finally:
+        connection.closed = False
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize("finished_at", (5.0, 5.1))
+def test_cleanup_late_vacuum_uses_original_wait_deadline(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, finished_at: float
+) -> None:
+    """初始与晚到 vacuum 共用五秒预算，不能在新一轮准备时重新获得五秒。"""
+    connection = _BackgroundMaintenanceConnection()
+    lease = _acquire(connection)
+    clock = [0.0]
+    waits: list[float] = []
+
+    def start_second_vacuum() -> None:
+        """在第一个后端已退出的观察之后启动另一个后端。"""
+        connection.background_rows = ({"backend_type": "autovacuum worker"},)
+        connection.dependencies["database_sessions"] = 1
+
+    def finish_current_vacuum(delay: float) -> None:
+        """两个外部完成事件分别消耗4.9秒与剩余预算；不依赖真实时钟。"""
+        assert connection.mutations == []
+        waits.append(delay)
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+        clock[0] = 4.9 if len(waits) == 1 else finished_at
+        if len(waits) == 1:
+            connection.after_background_quiet = start_second_vacuum
+
+    monkeypatch.setattr(disposable_database_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(disposable_database_module, "sleep", finish_current_vacuum)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert len(waits) == 2 and clock[0] == finished_at
+        assert connection.mutations == []
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        (),
+        ({"database_sessions": 0, "autovacuum_sessions": 0},) * 2,
+        ({"database_sessions": False, "autovacuum_sessions": 0},),
+        ({"database_sessions": 0, "autovacuum_sessions": False},),
+        ({"database_sessions": -1, "autovacuum_sessions": 0},),
+        ({"database_sessions": 0, "autovacuum_sessions": -1},),
+        ({"database_sessions": 0, "autovacuum_sessions": 1},),
+        ({"database_sessions": 0},),
+        ({"database_sessions": 0, "autovacuum_sessions": 0, "unexpected": 0},),
+    ),
+    ids=(
+        "missing-row",
+        "extra-row",
+        "boolean-total",
+        "boolean-vacuum",
+        "negative-total",
+        "negative-vacuum",
+        "vacuum-exceeds-total",
+        "missing-field",
+        "extra-field",
+    ),
+)
+def test_cleanup_rejects_malformed_final_session_counts(
+    monkeypatch: pytest.MonkeyPatch, rows: tuple[Mapping[str, object], ...]
+) -> None:
+    """最终聚合必须是完整且自洽的精确整数事实；不完整驱动结果不能授予等待或删除权。"""
+
+    class MalformedCountsConnection(_FakeConnection):
+        """仅替换最终数据库结果，其余真实准入与状态转换继续执行。"""
+
+        def execute(
+            self, statement: object, parameters: Mapping[str, object] | None = None
+        ) -> _FakeResult:
+            """在同一数据库观测边界提供不可接受的聚合行。"""
+            if "AS autovacuum_sessions" in str(statement):
+                assert parameters == {"target_database_oid": 401}
+                return _FakeResult(rows=rows)
+            return super().execute(statement, parameters)
+
+    connection = MalformedCountsConnection()
+    lease = _acquire(connection)
+
+    def forbidden_wait(delay: float) -> None:
+        """无法分类的结果不能延迟到下一次读来替换当前失败事实。"""
+        raise AssertionError(f"unexpected wait: {delay}")
+
+    monkeypatch.setattr(disposable_database_module, "sleep", forbidden_wait)
+    try:
+        _record_complete_provenance(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert connection.mutations == []
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+def test_cleanup_waits_for_autovacuum_before_original_final_checks(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool
+) -> None:
+    """仅后台 vacuum 暂存时等待其退出；两条分支仍在全会话归零后执行原固定 DROP。"""
+    connection = _BackgroundMaintenanceConnection()
+    lease = _acquire(connection)
+    clock = [0.0]
+    waits: list[float] = []
+
+    def finish_vacuum(delay: float) -> None:
+        """模拟服务端完成后台维护；任何等待之前发生的 DDL 都是回归。"""
+        assert connection.mutations == []
+        waits.append(delay)
+        clock[0] += delay
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+
+    monkeypatch.setattr(disposable_database_module, "monotonic", lambda: clock[0], raising=False)
+    monkeypatch.setattr(disposable_database_module, "sleep", finish_vacuum, raising=False)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        lease.cleanup()
+        assert waits and all(0 < delay <= 0.05 for delay in waits)
+        assert connection.mutations == [f'DROP DATABASE "{_DATABASE_NAME}"'] + (
+            [f'DROP ROLE "{APP_RUNTIME_ROLE_NAME}"', f'DROP ROLE "{RETENTION_RUNTIME_ROLE_NAME}"']
+            if with_roles
+            else []
+        )
+        assert "database_sessions" in connection.dependency_queries
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize("backend_type", ("client backend", "walsender", None))
+def test_cleanup_never_waits_for_client_or_unknown_backend(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, backend_type: str | None
+) -> None:
+    """真实客户端和未知后台类型即使与 vacuum 并存也零等待、零 DDL 拒绝。"""
+    connection = _BackgroundMaintenanceConnection()
+    connection.background_rows += ({"backend_type": backend_type},)
+    lease = _acquire(connection)
+
+    def forbidden_wait(delay: float) -> None:
+        """未知使用者不能借等待窗口被当作已获准退出的后台维护。"""
+        raise AssertionError(f"unexpected wait: {delay}")
+
+    monkeypatch.setattr(disposable_database_module, "sleep", forbidden_wait, raising=False)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert connection.mutations == []
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+def test_cleanup_background_wait_has_a_fixed_deadline(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool
+) -> None:
+    """持续运行的 vacuum 最迟在固定五秒预算耗尽时拒绝，不执行 DDL 或终止会话。"""
+    connection = _BackgroundMaintenanceConnection()
+    lease = _acquire(connection)
+    clock = [0.0]
+    waits: list[float] = []
+
+    def advance_clock(delay: float) -> None:
+        """跳过真实等待，模拟每次观察期间时钟前进两秒。"""
+        waits.append(delay)
+        clock[0] += 2
+
+    monkeypatch.setattr(disposable_database_module, "monotonic", lambda: clock[0], raising=False)
+    monkeypatch.setattr(disposable_database_module, "sleep", advance_clock, raising=False)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert len(waits) == 3 and clock[0] == 6
+        assert connection.mutations == []
+    finally:
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize("drift", ("database", "cluster", "lock", "session", "roles", "new-client"))
+def test_cleanup_rechecks_all_original_guards_after_background_wait(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, drift: str
+) -> None:
+    """后台退出不授予删除权；随后身份、锁、角色或全会话事实变化仍须由原准入拒绝。"""
+    connection = _BackgroundMaintenanceConnection()
+    lease = _acquire(connection)
+    waits: list[float] = []
+
+    def drift_after_quiet() -> None:
+        """在准备观察已读到空集合后制造竞争，逼迫最终检查重新查询事实。"""
+        if drift == "database":
+            connection.database_oid = 999
+        elif drift == "cluster":
+            connection.system_identifier += 1
+        elif drift == "lock":
+            connection.lock_held = False
+        elif drift == "session":
+            connection.closed = True
+        elif drift == "roles":
+            connection.roles[APP_RUNTIME_ROLE_NAME] = _safe_role(APP_RUNTIME_ROLE_NAME, 999)
+        else:
+            connection.dependencies["database_sessions"] = 1
+
+    def finish_vacuum(delay: float) -> None:
+        """完成后台退出后安排单次后置漂移，不替代待测的准入逻辑。"""
+        waits.append(delay)
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+        connection.after_background_quiet = drift_after_quiet
+
+    monkeypatch.setattr(disposable_database_module, "sleep", finish_vacuum, raising=False)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert len(waits) == 1
+        assert connection.mutations == []
+    finally:
+        connection.closed = False
+        lease.release()
+
+
+@pytest.mark.parametrize("with_roles", (False, True), ids=("database-only", "runtime-roles"))
+@pytest.mark.parametrize("finished_at", (5.0, 5.1))
+def test_cleanup_rejects_vacuum_completion_at_or_after_deadline(
+    monkeypatch: pytest.MonkeyPatch, with_roles: bool, finished_at: float
+) -> None:
+    """即使下一快照已空，后台直到预算边界才完成也不能延长等待或执行 DDL。"""
+    connection = _BackgroundMaintenanceConnection()
+    lease = _acquire(connection)
+    clock = [0.0]
+
+    def complete_late(delay: float) -> None:
+        """将后台退出事实与超时同时发布，验证不是先看空集合再忽略已耗尽预算。"""
+        assert delay > 0
+        clock[0] = finished_at
+        connection.background_rows = ()
+        connection.dependencies["database_sessions"] = 0
+
+    monkeypatch.setattr(disposable_database_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(disposable_database_module, "sleep", complete_late)
+    try:
+        (_record_complete_provenance if with_roles else _record_database)(lease, connection)
+        with pytest.raises(DisposableDatabaseCleanupError):
+            lease.cleanup()
+        assert connection.mutations == []
+    finally:
+        lease.release()
 
 
 @pytest.mark.parametrize(

@@ -87,6 +87,12 @@ M2 开始实施前应将根 `AGENTS.md`、README 和验收文档中的「当前�
 「创建提案」或提交自然语言命令后，应用层才创建本地草稿或日程提案。用户完成编辑并点击
 「提交审批」后，系统才冻结精确命令。
 
+对话保持确定性规则优先。剩余歧义文本在本地脱敏后，必须与版本化
+`conversation_intent_v1.md` 分别作为 user 与 system 消息传入模型；不能只发送用户文本而遗漏
+分类规则。该提示词仍只分类简报生成、简报查看与能力说明，本地草稿和日程提案继续由明确
+命令解析控制。模型调用失败时保留既有能力说明降级，并如实记录失败，不能把任务落库成功
+等同于模型成功。
+
 ### 3.2 单操作审批
 
 一次审批只能包含以下一种操作：
@@ -609,6 +615,12 @@ Prompt 使用版本文件 `mail_draft_v1.md`，模型输出只包含正文候选
   delegated permission；个人账户与工作/学校账户均适用。
 - `offline_access`
 
+`offline_access` 用于请求 refresh token，不是邮件或日历的资源访问权限，token 响应的
+scope 可以不回显它。授权请求仍保留全部基础 scope；账户身份由 OIDC 和 Graph `/me`
+独立验证（`User.Read` 缺失时必须在 Graph 请求前拒绝）。能力验证使用该能力及其读取
+依赖的资源 scope，不以基础身份/离线 scope 是否回显判定资源权限。持久化只保存供应商
+实际返回的 scopes，不能为通过验证补造 `offline_access` 或其他授权事实。
+
 读取能力：
 
 - `Mail.Read`
@@ -656,6 +668,25 @@ parser 必须严格拒绝 malformed escape、小写 hex、对 unreserved 字符�
 - 回调后必须以实际返回 scope 更新能力；缺失 scope 的能力进入 `action_required`。
 - Token 响应没有新 refresh token 时保留仍有效的既有加密 refresh token，不能写空覆盖。
 - Microsoft 租户要求管理员同意时，界面显示稳定错误和管理员操作说明。
+- Google 项目未启用相应 API 的结构化 403 使用 `google_api_not_enabled`，提示启用对应服务
+  后重试；不得因此刷新 Token、撤销连接或把该配置错误表示为内部 Worker 故障。
+
+发起渐进授权后，连接页必须重新读取能力状态，并把焦点移到本次“继续授权”链接，避免用户
+误以为点击无效。授权 URL 只保留在页面内存；刷新、离开页面或链接过期后，`authorizing`
+能力仍允许用户显式重新授权，以新的 OAuthAttempt 和授权代际替换旧链接。不得自动重放旧
+state/code，也不得仅凭点击或页面刷新把能力显示为 `enabled`。
+
+重新授权的请求并集还必须保留因前一轮请求转为 `authorizing`、但此前已验证的能力。
+该判断与新 OAuthAttempt 位于同一 user→connection 锁定事务：能力须有验证时间，且该行
+actual scopes 与连接当前 scopes 都覆盖完整依赖；依赖行也必须处于 `enabled` 或满足同样
+保留条件的 `authorizing`。不得仅凭历史时间恢复缺少 scope 的能力，也不得恢复用户关闭、
+供应商撤销或尚未获授的能力。此保留只影响新授权请求，不改变真实写入对 `enabled` 的要求。
+
+成功回调若来自浏览器导航（`Sec-Fetch-Mode: navigate`），仅在用例完成后返回 HTTP 303，
+目标固定为受信任 `APP_BASE_URL` 下的 `/connections`，不复制回调参数或接收客户端返回地址。
+普通 API 调用保留 HTTP 200 和 `connection_id` JSON；两种成功响应均设置
+`Cache-Control: no-store` 与 `Referrer-Policy: no-referrer`。失败仍返回原有脱敏 Problem，
+不能通过跳转伪装为成功。
 
 Google 与 Microsoft callback 都必须要求 non-empty `state`，并且只接受互斥的 `code` 或 `error`。缺少
 state、同时出现 `code+error`、两者都缺失，或 error 为空/超出现有输入边界时，必须在消费 state 前拒绝。
@@ -688,6 +719,11 @@ matching `oauth.refresh_recovery_unsatisfied`，把仍匹配 `T` 的 requested c
 frozen pre-digest、old identity/固定 identity key version 与稳定 result code；其 `created_at` 严格晚于原
 automatic started。它不是第二个 `oauth.refresh_started`。callback 通过 `OAuthAttempt.id` 查询该关联，在
 交换授权码前取得同一 connection 的 coordinator lease，并继续使用现有 target-`T` anti-replay/CAS。
+
+连接页必须为 `enabled` 能力保留显式“重新授权”入口：已保存的 scope 状态不代表当前 refresh
+readiness。用户从原连接的能力行发起既有 connection-bound start，不必先关闭能力或断开连接，
+不得用无 target 的供应商首次连接入口代替恢复。页面加载或刷新不得自动发起授权；busy 或
+disconnected 时入口继续禁用，依赖闭包与一次性 state/code 仍由既有服务端流程校验。
 
 unknown fence 只阻断使用旧 refresh token 的自动 OAuth refresh grant；它不阻断用户明确发起、由一次性
 state/PKCE/OAuthAttempt 保护的 authorization-code exchange。每个 code 最多交换一次。missing/same refresh
@@ -735,6 +771,12 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
   按稳定 `scope_key` 顺序串行调用每个真实 folder 的独立同步；folder task 只用于显式恢复或
   人工维修。每个真实 folder 的 cursor 仍是增量同步事实，mailbox placeholder 不保存 Delta URL。
 - 初始读取最近 7 天的可访问邮件，排除 Deleted Items 和 Junk Email，并确保覆盖 Sent Items。
+- Graph v1.0 邮件目录只选择受支持的 `id,displayName`；不得请求不存在的 `wellKnownName`
+  属性。目录读取后通过固定 `drafts`、`deleteditems`、`junkemail`、`sentitems` 别名的只读
+  `GET /me/mailFolders/{alias}?$select=id` 建立精确 ID 分类，排除供应商草稿、已删除和垃圾
+  文件夹并保留 Sent。不能以可本地化或可重命名的展示名判断类别；任一别名解析失败、ID
+  畸形或不同别名返回相同 ID 时整轮目录发现失败，不返回未完成排除的 scope。别名读取共用
+  本轮刷新次数与总响应字节预算，不能逐别名重置预算。
 - 使用 Microsoft Graph Delta 保存每个真实 folder 的 `deltaLink`，不得用 connection 级游标覆盖多个
   folder；目录发现成功时间单独记录在 mailbox placeholder 的 `last_success_at`。
 - 规范化 Graph message ID、conversation ID、internetMessageId、参与者、主题、正文、时间、
@@ -749,6 +791,10 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
   并同时受页数和 item 数上限约束。必须流式读取、超限立即中止并关闭响应；不得把超限数据带入
   持久化事务或推进 cursor。`@odata.nextLink` 即使同主机也必须精确匹配预期 collection/folder
   path，错误 path 在发请求前拒绝，opaque query 原样转发。
+- Graph 邮件及日历 Delta 允许同一 `me`、同一资源 ID 的斜杠式与 OData 字符串键括号式
+  path。括号式只接受固定 collection/suffix 和正确转义、URL 编码后的精确 ID，Base64
+  填充字符 `=` 可保持原样或编码为 `%3D`；不能通过
+  放宽成任意 Graph URL、切换 `/users`、忽略 ID 大小写或解码整条 path 来兼容。
 
 ### 12.2 日历
 
@@ -769,6 +815,15 @@ Google `calendar.events` 和 Microsoft `Calendars.ReadWrite` 都是比 M2 动作
 - Google Sync Token 和 Microsoft Calendar View Delta 都按单个日历保存，不能用连接级游标覆盖
   多个日历。Microsoft CalendarView Delta 的初始请求、后续 `@odata.nextLink` 和最终
   `@odata.deltaLink` 必须始终绑定同一个真实 calendar ID；opaque query 原样保存和转发。
+- Microsoft 事件读取的初始页、next/delta 页和精确事件 GET 均声明
+  `Prefer: outlook.body-content-type="text"`。响应仍须按显式 `body.contentType` 规范化：
+  `text` 原样保留换行和制表；`html` 仅提取可见文本、解码一次实体并保留段落/换行，删除
+  head、script、style、template 等主动或非正文节点及显式隐藏节点，不套用邮件签名/引用截断。
+  body 缺失或为 `null` 时描述为空；body 存在时必须是对象，contentType 只接受忽略大小写的
+  `text`/`html`，缺失、未知或畸形类型返回固定 `microsoft_calendar_invalid_response`，不得猜测。
+  原始内容和 HTML 提取结果均遵守既有 16,384 字符上限及 C0/DEL 拒绝规则（仅允许换行、
+  回车和制表），不得把 HTML 外壳或主动内容存入 `CalendarEvent.description` 及后续修改提案
+  的 before/desired。此读取规范化不得改变 ETag、时间瞬间、游标、授权和安全 URL 边界。
 - Microsoft directory 的 404/410 是固定永久供应商错误，不能伪装成不存在的目录 cursor
   expiry；精确事件 GET 的 404 返回 `None`；已持久 CalendarView deltaLink 的后续请求遇到
   404/410 或 `syncStateNotFound` 时，只使对应 calendar scope 的 cursor 失效并执行受限窗口重建。
@@ -2702,6 +2757,16 @@ M2 采用以下已批准门禁，不要求 7 天或 14 天持续试用：
 任何一层关闭都阻止新写任务，并使尚未认领的相关审批失效。已认领操作只能完成核对。
 `APP_TEST_MODE` 只能注入 Fake 适配器。专用测试账户真实 API 验证使用独立环境、显式写入开关
 和账户允许列表；测试环境不得因误配连接其他账户。
+
+专用 Linux 本地验收环境沿用开发 Compose 覆盖层：前端只绑定本机
+`127.0.0.1:5173`，API OAuth 回调只绑定 `127.0.0.1:8000`，不继承生产公开端口。
+文件 Secret 保持宿主所有者独占读取，开发后端进程使用显式配置的宿主 UID/GID；
+数据库密码从 Secret 注入，不在开发 DSN 中保留示例密码。源码挂载不得覆盖镜像内虚拟环境；
+后端依赖卷必须随项目及不可变镜像标签隔离，保证重建后与 migration 使用相同版本的依赖。
+管理员创建沿用 `just create-admin` 及同一 CLI，Compose 模式通过 stdin 读取宿主密码文件，
+不把密码放入命令参数，不为管理操作公开数据库端口。
+API 就绪探针遇到数据库连接拒绝或超时时返回 HTTP 503，继续独立报告 Redis 状态；
+不把程序错误伪装成正常的依赖不可用。
 
 Task 27D 必须把每个新普通 PostgreSQL 备份发布为不可拆分的三件套：加密 custom dump、相邻
 `${dump}.sha256` 和相邻 `${dump}.manifest.json`。manifest 固定使用

@@ -16,6 +16,7 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
+from bs4 import BeautifulSoup
 
 from ai_employee.application.ports.calendar import (
     CalendarCursorExpiredError,
@@ -260,6 +261,9 @@ class MicrosoftCalendarAdapter(CalendarReader):
                         headers={
                             "Authorization": f"Bearer {self._access_token}",
                             "Accept": "application/json",
+                            # 偏好必须随初始、分页、精确 GET 和刷新后的重试一起发送；
+                            # Graph 仍可能返回 HTML，事件投影不能依赖 Header 代替类型检查。
+                            "Prefer": 'outlook.body-content-type="text"',
                         },
                     ) as response,
                 ):
@@ -493,6 +497,11 @@ class MicrosoftCalendarAdapter(CalendarReader):
             if not isinstance(content, str):
                 raise self._invalid_response()
             description = self._body_text(content)
+            content_type = body.get("contentType")
+            if not isinstance(content_type, str) or content_type.casefold() not in {"text", "html"}:
+                raise self._invalid_response()
+            if content_type.casefold() == "html":
+                description = self._html_body_text(description)
         location_value = item.get("location")
         location = ""
         if isinstance(location_value, Mapping):
@@ -765,6 +774,200 @@ class MicrosoftCalendarAdapter(CalendarReader):
         return value
 
     @classmethod
+    def _html_body_text(cls, value: str) -> str:
+        """把已通过原始长度/控制字符校验的 Graph HTML 描述降为纯文本。
+
+        Args:
+            value: 明确声明为 HTML 且受既有字符预算限制的合成或供应商正文。
+
+        Returns:
+            删除主动、非正文和显式隐藏节点后的文本，保留行内连接与块起止边界；
+            相邻结构边界只分隔一次，正文已有换行和制表不折叠。
+            实体只由 HTML parser 解码一次；日程中的签名和引用是正文，不能使用邮件清洗器。
+
+        Raises:
+            PermanentProviderError: 实体解码后仍有非法控制字符或结果超出既有字符上限。
+        """
+        soup = BeautifulSoup(value, "html.parser")
+        # 逆序先移除子节点，避免销毁父节点后再访问已失效的子节点属性。
+        for node in reversed(
+            soup.select(
+                "head, script, style, template, noscript, iframe, object, embed, "
+                "[hidden], [aria-hidden='true']"
+            )
+        ):
+            node.decompose()
+        for node in reversed(soup.select("[style]")):
+            style = node.get("style")
+            if not isinstance(style, str):
+                continue
+            style = cls._css_top_level_text(style)
+            if re.search(
+                r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))"
+                r"\s*(?:!\s*important\s*)?(?:;|$)",
+                style,
+                re.IGNORECASE,
+            ):
+                node.decompose()
+        for node in soup.find_all("br"):
+            node.replace_with("\n")
+        # 在插入内部边界标记前校验已解码正文，确保供应商不能用原始字符或实体伪造标记。
+        cls._body_text(soup.get_text())
+        block_separator = "\x00"
+        for node in soup.find_all(
+            ("div", "p", "li", "tr", "blockquote", "pre", "h1", "h2", "h3", "h4", "h5", "h6")
+        ):
+            node.insert_before(block_separator)
+            node.insert_after(block_separator)
+        parts: list[str] = []
+        for fragment in soup.get_text().split(block_separator):
+            if not fragment:
+                continue
+            # 只合并相邻的结构边界；不能对真实文本全局折叠换行，否则会吞掉连续 br。
+            if (
+                parts
+                and not parts[-1].endswith(("\n", "\r"))
+                and not fragment.startswith(("\n", "\r"))
+            ):
+                parts.append("\n")
+            parts.append(fragment)
+        # 先验证再 trim，避免边缘 C0 被 Python 当作空白吞掉。get_text 不返回注释/标签；
+        # 不能再次 unescape，否则原本可见的实体文本会被改写。
+        return cls._body_text("".join(parts)).strip()
+
+    @classmethod
+    def _css_top_level_text(cls, value: str) -> str:
+        """为既有隐藏声明判定保留顶层字面文本，屏蔽不透明 CSS 值。
+
+        Args:
+            value: 已受整个 HTML 字符预算约束的单个内联 style 属性。
+
+        Returns:
+            仅用于本地 display/visibility 匹配的文本，不保存或请求 URL。字符串、
+            URL token 和括号块以不透明标记代替；普通注释替换为空白，避免拼接标识符。
+            含转义名称同样保持不透明，只有顶层未转义分号能成为声明分隔符。
+            hash/at-keyword 连同前缀消费，名称后缀不能重新成为 URL token 起点。
+            扫描游标只向前移动，括号使用显式栈，恶意嵌套不会消耗 Python 递归深度。
+        """
+        parts: list[str] = []
+        closers: list[str] = []
+        index = 0
+        while index < len(value):
+            if value.startswith("/*", index):
+                end = value.find("*/", index + 2)
+                index = len(value) if end == -1 else end + 2
+                if not closers:
+                    parts.append(" ")
+                continue
+            character = value[index]
+            if character in {"'", '"'}:
+                quote_character = character
+                index += 1
+                while index < len(value):
+                    if value[index] == quote_character:
+                        index += 1
+                        break
+                    if value[index] in "\r\n\f":
+                        break
+                    if value[index] == "\\":
+                        _, index = cls._css_escape(value, index)
+                    else:
+                        index += 1
+                if not closers:
+                    parts.append('""')
+                continue
+            start = index
+            # #url / @url 的前缀属于当前 token；若先单独输出，会误把名称后缀当 URL。
+            # 连同名称消费可让后续括号按普通块处理，其中的真实注释仍然屏蔽伪声明。
+            prefixed_name = character in {"#", "@"}
+            if prefixed_name:
+                index += 1
+            name: list[str] = []
+            name_has_escape = False
+            while index < len(value):
+                character = value[index]
+                if character == "\\":
+                    name_has_escape = True
+                    decoded, index = cls._css_escape(value, index)
+                    name.append(decoded)
+                elif character.isalnum() or character in "_-" or ord(character) >= 128:
+                    name.append(character)
+                    index += 1
+                else:
+                    break
+            if index > start:
+                if (
+                    not prefixed_name
+                    and "".join(name).casefold() == "url"
+                    and value[index : index + 1] == "("
+                ):
+                    content_start = index + 1
+                    while content_start < len(value) and value[content_start] in " \t\r\n\f":
+                        content_start += 1
+                    if value[content_start : content_start + 1] not in {"'", '"'}:
+                        # 未加引号 URL 是独立 token；其中的注释形状只是 URL 内容。
+                        # 转义的右括号不能提前结束 token，也不能暴露其中的伪声明。
+                        index = content_start
+                        while index < len(value):
+                            if value[index] == ")":
+                                index += 1
+                                break
+                            if value[index] == "\\":
+                                _, index = cls._css_escape(value, index)
+                            else:
+                                index += 1
+                        if not closers:
+                            parts.append("[]")
+                        continue
+                if not closers:
+                    # URL 函数名已在上面识别；其余转义 token 不能重新暴露原始标点，
+                    # 否则被消费的 \; 会再次成为声明分隔符。未转义名称保持字面拼写。
+                    parts.append("[]" if name_has_escape else value[start:index])
+                continue
+            if character in "([{":
+                if not closers:
+                    parts.append("[]")
+                closers.append({"(": ")", "[": "]", "{": "}"}[character])
+            elif closers:
+                if character == closers[-1]:
+                    closers.pop()
+            else:
+                parts.append(character)
+            index += 1
+        return "".join(parts)
+
+    @staticmethod
+    def _css_escape(value: str, index: int) -> tuple[str, int]:
+        """消费一个 CSS 转义，返回函数名识别字符和严格前进的游标。
+
+        index 指向反斜线。十六进制转义最多消费六位及一个可选空白；
+        CRLF 作为同一个空白处理。非法或未完成转义返回替代字符，不能伪造 URL 名。
+        调用方也用新游标跳过字符串与 URL 内容中的转义，不会解释或加载其值。
+        """
+        index += 1
+        start = index
+        while index < len(value) and index - start < 6 and value[index] in "0123456789abcdefABCDEF":
+            index += 1
+        if index > start:
+            codepoint = int(value[start:index], 16)
+            decoded = (
+                chr(codepoint)
+                if 0 < codepoint <= 0x10FFFF and not 0xD800 <= codepoint <= 0xDFFF
+                else "\ufffd"
+            )
+            if value[index : index + 2] == "\r\n":
+                index += 2
+            elif index < len(value) and value[index] in " \t\r\n\f":
+                index += 1
+            return decoded, index
+        if value[index : index + 2] == "\r\n":
+            return "\ufffd", index + 2
+        if index < len(value):
+            character = value[index]
+            return ("\ufffd" if character in "\r\n\f" else character), index + 1
+        return "\ufffd", index
+
+    @classmethod
     def _safe_url(cls, value: object) -> str | None:
         """只接受绝对 HTTPS 展示链接；已出现的畸形值不得静默丢弃。"""
         if value is None or value == "":
@@ -960,10 +1163,20 @@ class MicrosoftCalendarAdapter(CalendarReader):
 
     @classmethod
     def _validate_delta_url(cls, value: str, calendar_id: str) -> str:
-        """验证事件 cursor host/path/calendar 精确绑定，并原样保留 query。"""
+        """接受同一日历的两种精确 Graph path，并原样保留 opaque query。
+
+        Graph 的 next/deltaLink 可使用 ``calendars('id')`` 字符串键表示。只把正确 OData
+        转义后 URL 编码的当前 ID 加入固定路径候选；Base64 填充 ``=`` 也可原样保留。
+        不解码整条 path，也不允许改用其他用户、日历或 collection；绝对 URL 的主机等
+        安全条件仍由原有校验负责。
+        """
         safe = cls._validate_absolute_graph_url(value, "microsoft_calendar_invalid_delta_url")
         expected = f"/v1.0/me/calendars/{quote(calendar_id, safe='')}/calendarView/delta"
-        if urlsplit(safe).path != expected:
+        odata_key = quote(calendar_id.replace("'", "''"), safe="")
+        keyed_path = f"/v1.0/me/calendars('{odata_key}')/calendarView/delta"
+        padded_key = quote(calendar_id.replace("'", "''"), safe="=")
+        padded_path = f"/v1.0/me/calendars('{padded_key}')/calendarView/delta"
+        if urlsplit(safe).path not in {expected, keyed_path, padded_path}:
             raise PermanentProviderError(
                 error_code="microsoft_calendar_invalid_delta_url",
                 message="Microsoft calendar delta URL is invalid",

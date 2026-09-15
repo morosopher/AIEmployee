@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from ai_employee.api.routers.test_support import TestScenarioStore
+from ai_employee.api.routers.test_support import TestScenarioStore as ScenarioStore
 from ai_employee.domain.briefs import EmailJudgement
 from ai_employee.domain.errors import TransientProviderError, UserActionRequiredError
 from ai_employee.integrations.google.fake import (
@@ -45,9 +45,11 @@ async def test_google_fake_consumes_each_user_scenario_once(
 ) -> None:
     """Google fake 首次读取施加暂态错误，第二次读取回到合成 fixture。"""
     user_id = uuid4()
-    store = TestScenarioStore(_Redis())
+    store = ScenarioStore(_Redis())
     await store.set(user_id=user_id, scenario=scenario)
-    fixture_name = "gmail_initial.json" if reader_type is FakeGmailReader else "calendar_initial.json"
+    fixture_name = (
+        "gmail_initial.json" if reader_type is FakeGmailReader else "calendar_initial.json"
+    )
     fixture = Path(__file__).parents[2] / "contract" / "fixtures" / fixture_name
     reader = reader_type(
         fixture,
@@ -66,7 +68,7 @@ async def test_google_fake_consumes_each_user_scenario_once(
 async def test_oauth_fake_consumes_revocation_once() -> None:
     """撤销场景只能让同一用户的第一笔 OAuth 读取要求重连。"""
     user_id = uuid4()
-    store = TestScenarioStore(_Redis())
+    store = ScenarioStore(_Redis())
     await store.set(user_id=user_id, scenario="oauth_revoked")
     oauth = FakeGoogleOAuthClient(
         scenario_consumer=lambda current_user_id: store.consume(user_id=current_user_id),
@@ -83,7 +85,7 @@ async def test_oauth_fake_consumes_revocation_once() -> None:
 async def test_model_fake_consumes_invalid_twice_scenario_and_preserves_repair_contract() -> None:
     """一次 Redis 场景令模型的初始与唯一修复调用均失败，之后恢复正常。"""
     user_id = uuid4()
-    store = TestScenarioStore(_Redis())
+    store = ScenarioStore(_Redis())
     await store.set(user_id=user_id, scenario="model_invalid_twice")
     gateway = FakeModelGateway(
         scenario_consumer=lambda current_user_id: store.consume(user_id=current_user_id),

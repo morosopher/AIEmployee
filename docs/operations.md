@@ -2,6 +2,71 @@
 
 本手册覆盖已交付的可信任务中心与每日办公简报 M1 基线，以及正在实施的 M2 邮件与日历助手目标发布契约。生产环境不连接测试账号，不以 Redis 作为业务事实来源；M2 真实写入仍必须遵守三层开关、连接能力和精确人工审批。
 
+## 本地 Compose 开发与专用账户验收
+
+以下操作在当前开发分支的仓库根目录执行，需要 Docker Engine、支持 `!override` 的 Compose
+2.24.4 或更新版本及 `just`；宿主工具链使用 Python 3.12/uv、Node.js/pnpm。目录中若已有 `.env`
+或 Secret，保留原值。新的 `.env` 从 `.env.example` 复制并设为 `0600`，
+`secrets/development` 目录设为 `0700`，其中的 Secret 文件设为 `0600`。
+
+开发覆盖层从该目录固定挂载以下文件；文件名与容器 `/run/secrets/` 下的名称相同：
+
+| 文件 | 内容与用途 |
+| --- | --- |
+| `app_master_key` | 32 个随机字节的 Base64URL 编码；已有加密数据后不得重新生成 |
+| `postgres_bootstrap_password`、`app_database_password`、`retention_database_password` | 各自独立的高强度随机密码，分别用于初始化、普通应用与保留清理角色 |
+| `retention_database_url` | 指向内部 `postgres:5432/ai_employee` 的 PostgreSQL URL，用户名为 `ai_employee_retention`，密码与对应 Secret 一致且正确 URL 编码 |
+| `google_client_secret`、`microsoft_client_secret` | 对应 OAuth 应用的 Secret **值**，每个文件只存该值 |
+| `model_api_key` | 所选模型供应商的真实 API Key；仅检查登录/OAuth 时可以是空文件，但不代表模型调用可用 |
+| `backup_passphrase`、`grafana_admin_password` | 独立随机口令；未启动可观测性 profile 时无需运行 Grafana |
+| `admin_password` | 本地应用管理员登录密码，仅由创建管理员命令从宿主读取，不挂载到服务 |
+
+在 `.env` 中将 `LOCAL_UID`、`LOCAL_GID` 分别设为 `id -u`、`id -g` 的结果，
+`APP_IMAGE_TAG` 使用本次构建的唯一标签。后端依赖卷按 Compose 项目和该标签隔离；依赖变化后
+使用新标签再执行 `just dev`，以免旧依赖覆盖新镜像。切勿通过删除数据库卷来刷新依赖。
+
+两家的 Client ID 写入 `.env`，`*_SECRET_FILE` 在 Compose 模式保持 `/run/secrets/...` 容器路径；
+供应商 Secret 实际放在上述宿主目录，通常无需改 Compose。供应商控制台登记的 Redirect URI
+必须与 `.env` 完全一致，默认完整地址分别是：
+
+- `http://localhost:8000/api/v1/connections/google/callback`
+- `http://localhost:8000/api/v1/connections/microsoft/callback`
+
+`http://localhost:8000` 本身不是回调路径。前端只绑定 `127.0.0.1:5173`，API 只绑定
+`127.0.0.1:8000`；数据库与 Redis 通过内部网络访问。开发服务读取应用数据库 Secret，
+不会使用 `.env.example` 中供宿主开发说明用的示例数据库密码。
+
+在一个终端执行 `just dev`。它沿用 `role-bootstrap → typed migrate` 初始化新库，再启动服务；
+另一个同目录终端执行 `just create-admin admin@example.test secrets/development/admin_password compose`
+和 `just health`。管理员命令通过 stdin 传递密码，拒绝覆盖已有管理员。确认健康后访问
+`http://localhost:5173` 登录，进入“连接与能力”发起 Google/Microsoft 只读授权。成功的浏览器
+回调会返回连接页并重新读取状态；程序化调用仍返回连接标识 JSON。只有实际完成授权与
+Token 交换，才能证明供应商接受配置。
+
+点击某项能力的“启用”或“重新授权”后，页面会聚焦“继续授权”链接；必须继续前往供应商
+完成同意。每轮返回连接页后再开始下一轮，不要连续发起多个链接。`authorizing` 只表示请求
+已经发起，只有 `enabled` 和实际授权范围才能证明能力已获得。刷新后链接不会被持久保留；
+可再次点击“重新授权”获取新链接，旧链接随授权代际变化失效。
+
+Google 的 OAuth 同意与项目 API 启用是两个条件。只读同步返回 `google_api_not_enabled`
+时，在 Google Cloud 中选择当前 Client ID 所属项目，进入“API 和服务 → 库”启用所需的
+Gmail API / Google Calendar API，再从连接页重试同步。该错误来自结构化
+`accessNotConfigured` / `SERVICE_DISABLED`，不表示已有账户授权已撤销。
+
+Microsoft 的 `MICROSOFT_CLIENT_ID` 必须是应用注册中的“应用程序(客户端) ID”，不能使用
+对象 ID、目录(租户) ID 或 Secret ID。个人 Outlook 账户需要应用支持个人 Microsoft 账户；
+同时支持两类账户时，`signInAudience` 为 `AzureADandPersonalMicrosoftAccount`，回调平台注册
+为 Web。`unauthorized_client` 且提示“not enabled for consumers”时，先核对这两项，参考
+[Microsoft 账户类型说明](https://learn.microsoft.com/en-us/entra/identity-platform/howto-modify-supported-accounts)。
+修改 `.env` 中的 Client ID 后，重新执行 `just dev` 让 Compose 更新进程环境，再从应用重新
+发起授权；浏览器旧链接和已有容器不会因文件保存而自动取得新值。
+
+常规自动化仍使用 Fake。另行授权的专用真实账户验收使用 `APP_TEST_MODE=false`，准备登录与
+OAuth 时保持三项写开关关闭；真实写入阶段再配置精确账户允许列表并统一启用相应开关，
+每次发送或日历写入仍须在应用内批准精确内容。模型任务另需有效的 `MODEL_BASE_URL`、
+`MODEL_NAME` 与 `model_api_key`；`MODEL_BASE_URL` 应包含供应商的兼容 API 根路径（通常为 `/v1`），
+适配器会在其后追加 `/chat/completions`。不得用占位凭据声称模型能力已就绪。
+
 ## 发布与回滚
 
 发布前为 `APP_IMAGE_TAG` 指定不可变镜像标签或摘要，严禁使用 `latest`。M2 目标数据库生命周期顺序固定为
@@ -385,6 +450,43 @@ Task 30 release evidence 还必须记录共享 coordinator 的 content-free 证�
 audit shell、deployment/tooling shell 等第一个 child process 前拒绝。随后所有子命令继承同一 export，
 禁止只给某一条 pytest/audit 命令添加前缀。自动化证据必须覆盖缺失环境的确定性 Task13 选择、精确外部
 值接受、每个 child 的继承，以及错误 DSN 下零 child calls。
+
+从仓库根目录运行 `bash scripts/test-m2-release.sh` 前，先准备上述固定 Task13 测试库、独立且
+已核验的 `TEST_REDIS_URL`（本地 DB15）、合成 Secret、已安装的浏览器和可用的 Docker Compose。
+脚本依次执行完整 `just ci`、显式 calendar-AAD audit、故障/迁移/OAuth/灾备/隐私恢复矩阵、legacy/
+deployment/tooling 合同、敏感输出扫描与 `git diff --check`；任一步失败都会保留非零退出。
+它不会执行生产迁移、恢复或真实供应商写入。
+
+GitHub 的全新 runner 在 `just ci` 前显式执行 `just prepare-ci-database`。该测试专用命令只接受
+workflow 传入的本 job PostgreSQL service 完整 ID、run/attempt/job 标签及经验证的 loopback 测试
+端点；普通开发环境或生产服务不能用环境布尔值冒充该身份。它先证明 service 的 public 全空、
+数据库 ACL 为原始 NULL、固定角色与维护事实不存在，并核对 PG17.5 默认 owner 属性、完整内建
+角色成员关系及 public owner/ACL。独立 UUID donor 的名称和容器/卷标签必须与创建前登记一致，
+再通过现有 typed bootstrap 和历史迁移生成真实 0018 基线。只读 snapshot 导出的私有 0600 native dump 只可通过
+无 clean/create/drop 的单事务导入进入原空 service，完整 schema/data/revision 与身份、ACL、
+角色、会话和锁的后验全部成功才继续门禁。既有 regular UUID 与 lifecycle 测试编排不改变。
+
+该准备命令会创建合成 donor 容器、卷和 `${RUNNER_TEMP}` 下的私有归档与诊断；失败不删除资源、
+修补状态或自动重试。成功后只停止已重新核验且空闲的精确 donor，容器、卷和归档由临时 runner
+最终回收，本地验证时保留。诊断和归档不上传公开 artifact，也不作为产品备份恢复成功证据。
+
+直接 pytest 集成命令先完成真实收集和选择，再按 regular/lifecycle 分为独立子会话；原 Task13
+数据库只做只读锚点校验，测试函数使用现有 provenance/lifecycle 管理的临时数据库。纯收集、空
+选择和收集失败不启动这些业务测试，父会话摘要只报告委派数量，实际通过/失败数以子会话为准。
+E2E 使用同一隔离生命周期，Worker 显式注册正式执行与调度模块；退出时回收自有进程组后才清理
+临时库。故障演练、E2E 与其他会清空 DB15 的测试必须串行运行。
+
+Worker 的 Stream 监听保持既有消息、consumer group 和 `when_executed` ACK 协议，以 Redis 原子
+`XAUTOCLAIM` 恢复自然到期的 pending。无过期时间的旧 autoclaim 辅助锁不参与准入，也不会被自动
+删除；业务执行仍由 PostgreSQL 租约、冻结审批和唯一 ToolExecution 裁决。进程故障测试只在启动
+前缩短现有租约与 Broker 等待参数，崩溃后不通过 SQL 改期限或手工 claim 来制造恢复条件。浏览器
+测试可以驱动正式 `execute_task`；队列重领和真实 ACK 的证据由独立 OS 进程演练提供。
+
+`python3 scripts/verify-m2-sensitive-output.py` 可单独运行同一敏感门禁。它独立检查合成 fixture
+schema/值，并在真实 API、浏览器及观测链注入十类随机 canary；等待进程组退出后扫描原始输出，
+再生成无敏感内容的哈希清单与结果。输入及原始产物只保存在 `0700` 目录/`0600` 文件，审查时
+不能公开 raw 日志、DOM 或 Secret，也不能把它们暂存提交。自动化通过后仍需独立审查与另行授权
+的专用账户矩阵；正式 release-evidence 文档只在该人工门禁完成后创建。
 
 0019 进入正常运行后只能通过新应用镜像前滚修复，其 Alembic downgrade 必须 fail closed；任何应用回滚目标也必须是只写 v2 的 0019-compatible 镜像。唯一例外是：若仍处于本次已封锁的维护窗口、通用服务从未在 0019 后启动且没有业务写入，且非空集合当前重算的 `effective_deadline` 已到或已经不能证明能在该截止时间前清完 marker，可使用本窗口指定的迁移前加密整库备份恢复到 revision 0018；这不是 Alembic downgrade，也不是直接 SQL。恢复前后必须核对 backup dump/checksum/manifest 三件套、原始与恢复后 `pre-migration` audit artifact 的无敏感摘要完全一致、Alembic revision=0018，再切回原记录的 0018-compatible immutable image 并运行健康检查；未完成这些核验不得启动任何通用服务。除此 sealed-window restore 外，不得删除事件或游标、移除 AAD 版本列或约束、恢复 v1 reader，亦不得让旧 writer 回流；禁止 OAuth-only 临时服务、跳过 marker 或迁移后直接清 marker。若有 scope 的有界重同步失败，保持真实写入开关关闭，按该精确 scope 排查连接能力、同步错误和供应商读取状态；当前重算的 `effective_deadline` 前仍可通过下一次显式 CLI 按既定 ordinal 规则重试，但不得通过扩大同步范围、删除事实或启用 legacy fallback 绕过故障。
 

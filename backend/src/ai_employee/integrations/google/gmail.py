@@ -19,6 +19,7 @@ from ai_employee.application.ports.gmail import (
     TransientProviderError,
     UserActionRequiredError,
 )
+from ai_employee.integrations.google.errors import raise_if_google_api_disabled
 
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 _RefreshAccessToken = Callable[[], Awaitable[str]]
@@ -109,6 +110,8 @@ class GmailAdapter:
 
         该方法是端口公开分页调用的唯一 HTTP 出口，保证不会出现调用方各自实现不同次数的
         401 重试。第二个 401 先写 ``expired`` 再抛用户可操作错误，防止后台任务无限重试。
+        结构化的 API 未启用 403 映射为 ``google_api_not_enabled``，不刷新 Token 或改变
+        已验证连接状态；其余 403 保留原有错误路径。
         """
         for attempt in range(2):
             try:
@@ -146,6 +149,7 @@ class GmailAdapter:
                     message="Google Gmail is temporarily unavailable",
                     retry_after=self._retry_after(response),
                 )
+            raise_if_google_api_disabled(response)
             response.raise_for_status()
             return response.json()
         raise AssertionError("Gmail request retry loop exhausted")

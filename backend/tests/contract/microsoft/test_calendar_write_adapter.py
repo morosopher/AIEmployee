@@ -14,6 +14,7 @@ import httpx
 import pytest
 import respx
 
+from ai_employee.application.ports.calendar import CalendarNotificationFacts
 from ai_employee.application.ports.trusted_actions import ExecutionReference
 from ai_employee.domain.actions import ProviderWriteOutcomeKind, ToolExecutionStatus
 from ai_employee.domain.calendar_actions import (
@@ -284,6 +285,90 @@ def test_validate_for_approval_is_pure_and_accepts_only_lossless_policies() -> N
     assert personal.warnings == ()
     assert invited.warnings == ()
     assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("operation", ("update", "restore"))
+@pytest.mark.parametrize(
+    "current_attendees", ([], [{"emailAddress": {"address": "old@example.test"}}], None)
+)
+@pytest.mark.parametrize("policy", (NotificationPolicy.NONE, NotificationPolicy.ALL))
+async def test_conditional_write_checks_current_attendees_before_clearing(
+    operation: str,
+    current_attendees: object,
+    policy: NotificationPolicy,
+) -> None:
+    """清空已有会议不能承诺无通知；明确 all 和已知个人日程保持可写。
+
+    合同使用真实条件 GET/PATCH；缺少当前参会人证明不能退化为已知空名单。拒绝时
+    确认未应用且不可重试，避免通过重试把同一冻结通知承诺变成不同的供应商行为。
+    """
+    command = replace(
+        _update() if operation == "update" else _restore(),
+        attendees=(),
+        notification_policy=policy,
+        changed_fields=("attendees",),
+    )
+    current = _current_event()
+    if current_attendees is None:
+        current.pop("attendees", None)
+    else:
+        current["attendees"] = current_attendees
+    desired = _fixture()
+    desired["attendees"] = []
+    get = respx.get(EVENT_URL).mock(return_value=httpx.Response(200, json=current))
+    patch = respx.patch(EVENT_URL).mock(return_value=httpx.Response(200, json=desired))
+
+    outcome = await _adapter().execute(command)
+
+    assert get.call_count == 1
+    if policy is NotificationPolicy.NONE and current_attendees != []:
+        assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_NOT_APPLIED
+        assert outcome.error_code == "calendar_notification_mapping_unsupported"
+        assert not outcome.retryable
+        assert patch.call_count == 0
+    else:
+        assert outcome.kind is ProviderWriteOutcomeKind.CONFIRMED_APPLIED
+        assert patch.call_count == 1
+        assert json.loads(patch.calls[0].request.content)["attendees"] == []
+
+
+@pytest.mark.parametrize("operation", ("update", "restore"))
+@pytest.mark.parametrize(
+    "variation",
+    ("exact", "missing", "unknown", "meeting", "connection", "calendar", "event", "version"),
+)
+def test_personal_notification_preflight_requires_exact_current_event_proof(
+    operation: str,
+    variation: str,
+) -> None:
+    """已知空名单也必须绑定同一连接、日历、事件和版本；未知事实不得许可 none。"""
+    command = replace(
+        _update() if operation == "update" else _restore(),
+        attendees=(),
+        notification_policy=NotificationPolicy.NONE,
+    )
+    facts = CalendarNotificationFacts(
+        connection_id=OTHER_CONNECTION_ID if variation == "connection" else CONNECTION_ID,
+        calendar_id="other-calendar" if variation == "calendar" else CALENDAR_ID,
+        provider_event_id="other-event" if variation == "event" else EVENT_ID,
+        etag='W/"other-version"' if variation == "version" else "etag-1",
+        has_attendees=None if variation == "unknown" else variation == "meeting",
+    )
+    adapter = MicrosoftCalendarWriteAdapter(
+        connection_id=CONNECTION_ID,
+        access_token="synthetic-access-token",
+        current_event_facts=None if variation == "missing" else facts,
+    )
+    with respx.mock:
+        if variation == "exact":
+            assert adapter.validate_for_approval(command).warnings == ()
+        else:
+            with pytest.raises(StateConflictError) as raised:
+                adapter.validate_for_approval(command)
+            assert raised.value.error_code == "calendar_notification_mapping_unsupported"
+        assert len(respx.calls) == 0
 
 
 @pytest.mark.asyncio

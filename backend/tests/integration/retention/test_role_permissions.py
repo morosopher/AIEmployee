@@ -343,7 +343,7 @@ def migrated_database() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 async def isolated_database() -> AsyncIterator[None]:
-    """覆盖全局 TRUNCATE fixture；临时数据库由模块 fixture 整体隔离并最终删除。"""
+    """覆盖全局 TRUNCATE fixture；每例的临时数据库由其 provenance lease 整体回收。"""
     yield
 
 
@@ -395,16 +395,17 @@ class _DisposableRoleDatabase:
             owner_engine.dispose()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def disposable_role_database(
     database_url: ValidatedDatabaseUrl,
 ) -> Iterator[_DisposableRoleDatabase]:
-    """创建 UUID disposable database，并精确初始化到 0018 source revision。
+    """为每例创建 UUID disposable database，并精确初始化到 0018 source revision。
 
     ``TEST_DATABASE_URL`` 只作为通过 loopback/显式端口/``_test`` 校验的 management
     anchor。首写前同时证明随机数据库和两个 fixed roles 均 absent；任一预存角色都会
     fail closed，禁止轮换未知密码。setup 成功后 app/retention 登录及 0018/0019 权限断言
-    全部指向临时数据库；``finally`` 精确复核 database=0、roles=0。
+    全部指向临时数据库；``finally`` 精确复核 database=0、roles=0。每例单独持有本库和
+    角色的 provenance，防止拒绝场景故意留下的非法任务/隐私事实污染后续真实 Worker。
     """
     validated = validate_test_database_url(database_url)
     database_name = f"ai_employee_retention_{uuid4().hex}_test"

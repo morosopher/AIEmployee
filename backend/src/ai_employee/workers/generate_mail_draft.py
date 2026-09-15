@@ -29,6 +29,7 @@ from ai_employee.domain.tasks import TaskStatus
 from ai_employee.infrastructure.db.models.briefs import LLMInvocationModel
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel, TaskRunModel
 from ai_employee.infrastructure.db.repositories.email import SqlAlchemyMailSyncRepository
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.repositories.mail_drafts import SqlAlchemyMailDraftRepository
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
@@ -393,7 +394,10 @@ class GenerateMailDraftTaskStep:
         body_text: str | None,
         metadata: MailDraftGenerationMetadata,
     ) -> None:
-        """在一个短事务内幂等保存版本、LLMInvocation、任务摘要和无内容审计。"""
+        """按 Task→user 锁后重检 active，再原子保存版本、调用元数据、marker 和审计。
+
+        守卫位于正文存在性与 StateConflict 分类之前；删除屏障后失败元数据也必须丢弃。
+        """
         if task.user_id is None:
             raise ValueError("mail draft generation requires user_id")
         lease_owner = _required_lease_owner(
@@ -413,6 +417,8 @@ class GenerateMailDraftTaskStep:
             )
             if task_row is None:
                 # 模型 I/O 期间取消或换 owner 后，旧 Worker 不得留下任何业务或审计事实。
+                return
+            if not await lock_active_user(session, user_id=task.user_id):
                 return
             existing = await session.scalar(
                 select(LLMInvocationModel.id).where(
@@ -524,7 +530,9 @@ def _sanitize_mail_body(text: str, *, configured_patterns: tuple[str, ...]) -> s
             pattern.match(stripped) for pattern in _QUOTED_HISTORY_PATTERNS
         ):
             break
-        if kept_lines and any(stripped.casefold().startswith(prefix) for prefix in _SIGNATURE_PREFIXES):
+        if kept_lines and any(
+            stripped.casefold().startswith(prefix) for prefix in _SIGNATURE_PREFIXES
+        ):
             break
         kept_lines.append(line.rstrip())
     compact = "\n".join(kept_lines).strip()
@@ -605,11 +613,7 @@ def _mask_mailbox_addresses(text: str) -> str:
             continue
 
         if character == "@":
-            local_start = (
-                closed_quoted_start
-                if closed_quoted_start is not None
-                else unquoted_start
-            )
+            local_start = closed_quoted_start if closed_quoted_start is not None else unquoted_start
             closed_quoted_start = None
             unquoted_start = None
             if local_start is not None and local_start >= copied_until:
@@ -619,9 +623,7 @@ def _mask_mailbox_addresses(text: str) -> str:
                     at_index=index,
                 )
                 if end is not None:
-                    pieces.extend(
-                        (text[copied_until:local_start], _ADDRESS_REPLACEMENT)
-                    )
+                    pieces.extend((text[copied_until:local_start], _ADDRESS_REPLACEMENT))
                     copied_until = end
                     # 域字符已由验证器访问，直接跳到 span 末尾，避免主循环再次扫描。
                     index = end
@@ -683,8 +685,7 @@ def _domain_end(text: str, start: int) -> int | None:
 def _is_unquoted_local_character(character: str) -> bool:
     """判断字符是否可组成无需空白边界的 ASCII/SMTPUTF8 local-part 候选。"""
     return (
-        character.isascii()
-        and (character.isalnum() or character in _ASCII_LOCAL_CHARACTERS)
+        character.isascii() and (character.isalnum() or character in _ASCII_LOCAL_CHARACTERS)
     ) or category(character)[0] in {"L", "M", "N"}
 
 

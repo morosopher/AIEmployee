@@ -22,7 +22,7 @@ from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.observability.metrics import Metrics
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 from ai_employee.infrastructure.security.encryption import AeadCipher
-from ai_employee.integrations.registry import ProviderAdapterRegistry
+from ai_employee.integrations.registry import ProviderAdapterRegistry, trusted_action_write_policy
 from ai_employee.workers.trusted_actions import converge_revoked_pre_request_action
 
 
@@ -140,10 +140,11 @@ async def execute_reconciliation_task(
     if snapshot is None:
         return False
 
+    registry = adapters if adapters is not None else ProviderAdapterRegistry()
     workflow = TrustedActionExecutionUseCase(
         transactions=transactions,
-        adapters=adapters if adapters is not None else ProviderAdapterRegistry(),
-        write_policy=settings,
+        adapters=registry,
+        write_policy=trusted_action_write_policy(settings=settings, registry=registry),
         # 同一轮核对使用调用方注入的固定瞬间；持久结果时间仍由 repository 在锁内
         # 读取 PostgreSQL clock_timestamp() 决定。
         clock=lambda: current,

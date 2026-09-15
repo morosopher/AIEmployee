@@ -27,6 +27,7 @@ from ai_employee.application.oauth_refresh_identity import (
 from ai_employee.application.ports.calendar import (
     CalendarDirectoryPage,
     CalendarEvent,
+    CalendarNotificationFacts,
     CalendarReader,
     CalendarSyncPage,
 )
@@ -46,13 +47,16 @@ from ai_employee.application.ports.trusted_actions import (
     ExecutionReference,
     ProviderWriteOutcome,
     TrustedActionAdapter,
+    TrustedActionAdapterRegistry,
     TrustedActionDispatchSnapshot,
     TrustedActionPreflight,
+    TrustedActionWritePolicy,
     durable_retry_summary_is_valid,
     oauth_retry_pending_is_valid,
     oauth_write_refresh_attempt_id,
 )
 from ai_employee.config import Settings
+from ai_employee.domain.calendar_actions import CalendarRestoreCommand, CalendarUpdateCommand
 from ai_employee.domain.connections import ConnectionCapability
 from ai_employee.domain.errors import (
     InternalInvariantError,
@@ -65,6 +69,7 @@ from ai_employee.domain.mail_actions import (
     normalize_mail_recipients,
     normalize_mailbox_address,
 )
+from ai_employee.infrastructure.db.repositories.calendar import SqlAlchemyCalendarSyncRepository
 from ai_employee.infrastructure.db.repositories.email import (
     MailConnectionCredentials,
     MailReplySourceHeaders,
@@ -562,6 +567,7 @@ class CredentialBoundProviderRegistry(ProviderAdapterRegistry):
         )
         account_email = credentials.account_email
         source: MailReplySourceHeaders | None = None
+        calendar_facts: CalendarNotificationFacts | None = None
         if (
             provider == "microsoft"
             and isinstance(command, MailSendCommand)
@@ -576,6 +582,21 @@ class CredentialBoundProviderRegistry(ProviderAdapterRegistry):
                     provider=provider,
                     source_thread_id=command.source_thread_id,
                     source_message_id=command.source_message_id,
+                )
+        if provider == "microsoft" and isinstance(
+            command, (CalendarUpdateCommand, CalendarRestoreCommand)
+        ):
+            # 和回复来源证明一样，只接受本次认证用户及冻结目标的当前持久事实；预检
+            # 内再比较 ETag，防止提交读取后缓存换版或其他日历的空名单被错误复用。
+            async with self._sessions() as session:
+                calendar_facts = await SqlAlchemyCalendarSyncRepository(
+                    session
+                ).get_notification_facts(
+                    user_id=user_id,
+                    connection_id=command.connection_id,
+                    provider=provider,
+                    calendar_id=command.calendar_id,
+                    provider_event_id=command.provider_event_id,
                 )
         security = await self._security()
         try:
@@ -602,7 +623,9 @@ class CredentialBoundProviderRegistry(ProviderAdapterRegistry):
                 access_token=access, account_email=account_email, reply_recipient_facts=facts
             )
         return MicrosoftCalendarWriteAdapter(
-            connection_id=command.connection_id, access_token=access
+            connection_id=command.connection_id,
+            access_token=access,
+            current_event_facts=calendar_facts,
         )
 
     async def refresh_after_rejection(
@@ -665,8 +688,32 @@ class CredentialBoundProviderRegistry(ProviderAdapterRegistry):
 def build_trusted_action_registry(
     *, session_factory: ManagedAsyncSessionMaker, settings: Settings
 ) -> CredentialBoundProviderRegistry:
-    """构造 API/Worker 共用的固定生产 registry；调用本函数及 slot 检查均无 I/O。"""
+    """构造共享固定 registry；只有双测试开关选择无网络的合成实现，构造均无 I/O。"""
+    if settings.app_env == "test" and settings.app_test_mode:
+        from ai_employee.infrastructure.testing.trusted_actions import (
+            SyntheticTrustedActionRegistry,
+        )
+
+        return SyntheticTrustedActionRegistry(session_factory=session_factory, settings=settings)
     return CredentialBoundProviderRegistry(session_factory=session_factory, settings=settings)
+
+
+def trusted_action_write_policy(
+    *, settings: Settings, registry: TrustedActionAdapterRegistry
+) -> TrustedActionWritePolicy:
+    """将合成策略绑定到确切 Fake 类型及同一配置实例；真实 registry 始终使用 Settings。
+
+    该选择只存在于组合根，不由 HTTP、任务载荷或动态注册控制。即使测试替换了 registry，
+    普通/真实 adapter 也不能继承合成授权，必须通过原三层真实写门禁和账户允许列表。
+    """
+    if settings.app_env == "test" and settings.app_test_mode:
+        from ai_employee.infrastructure.testing.trusted_actions import (
+            SyntheticTrustedActionRegistry,
+        )
+
+        if type(registry) is SyntheticTrustedActionRegistry and registry.bound_to(settings):
+            return registry
+    return settings
 
 
 def _microsoft_reply_facts(

@@ -345,12 +345,14 @@ def test_two_phase_orchestration_routes_urls_and_hides_secrets_from_argv() -> No
         "-m",
         "pytest",
         *build_regular_pytest_arguments(),
+        "--ai-employee-integration-child=regular",
     )
     assert lifecycle.argv == (
         "/synthetic/python",
         "-m",
         "pytest",
         *build_lifecycle_pytest_arguments(),
+        "--ai-employee-integration-child=lifecycle",
     )
     assert regular.environment["TEST_DATABASE_URL"] == _REGULAR_URL
     assert regular.environment["DATABASE_URL"] == _REGULAR_URL

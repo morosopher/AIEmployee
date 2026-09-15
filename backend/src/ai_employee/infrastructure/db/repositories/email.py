@@ -37,6 +37,7 @@ from ai_employee.infrastructure.db.models.sources import (
 )
 from ai_employee.infrastructure.db.models.tasks import AuditEventModel
 from ai_employee.infrastructure.db.repositories.credential_rotation import credential_snapshot
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.encryption import AeadCipher, EncryptedValue
 
@@ -107,6 +108,8 @@ class SqlAlchemyMailSyncRepository:
         Returns:
             连接及 ``mail.read`` 能力有效时的 provider/scoped 游标；否则返回 ``None``。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .join(
@@ -151,7 +154,13 @@ class SqlAlchemyMailSyncRepository:
         scope_key: str,
         expected_cursor: str,
     ) -> None:
-        """在游标失效后只以 CAS 清除同一个邮件 scope 的恢复位置。"""
+        """网络后先按 user→业务锁复核活动状态，再以 CAS 清除同一 scope 的恢复位置。"""
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise TransientProviderError(
+                error_code="mail_sync_cursor_conflict",
+                message="Mail sync cursor changed during provider read",
+                retry_after=1,
+            )
         cursor = await self._session.scalar(
             select(SyncCursorModel)
             .join(OAuthConnectionModel, OAuthConnectionModel.id == SyncCursorModel.connection_id)
@@ -207,6 +216,11 @@ class SqlAlchemyMailSyncRepository:
             raise StateConflictError(
                 error_code="mail_directory_scopes_invalid",
                 message="Mail directory scopes are not validated and stably sorted",
+            )
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise StateConflictError(
+                error_code="mail_connection_not_syncable",
+                message="Mail connection is no longer available for discovery",
             )
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
@@ -515,9 +529,7 @@ class SqlAlchemyMailSyncRepository:
             if len(candidate_connections) != 1:
                 # provider ID 只在连接内唯一；缺少连接且出现多个候选时不得按时间猜账户。
                 return None
-            statement = statement.where(
-                EmailMessageModel.connection_id == candidate_connections[0]
-            )
+            statement = statement.where(EmailMessageModel.connection_id == candidate_connections[0])
         row = (await self._session.execute(statement.limit(1))).one_or_none()
         if row is None:
             return None
@@ -681,8 +693,7 @@ class SqlAlchemyMailSyncRepository:
                     message.body_key_version,
                 ),
                 (
-                    f"{message.user_id}:{message.connection_id}:"
-                    f"{message.provider_message_id}:body"
+                    f"{message.user_id}:{message.connection_id}:{message.provider_message_id}:body"
                 ).encode("ascii"),
             ).decode("utf-8")
         return MailDraftSourceMessage(
@@ -713,8 +724,14 @@ class SqlAlchemyMailSyncRepository:
         conversation 投影变化后仍代表同一消息，因此冲突更新必须同步切换 ``thread_id``、
         scope、规范元数据与新密文，不能制造第二个事实行或保留原始 MIME/附件。online
         迁移期间 conflict target 由当前事务的真实 PostgreSQL catalog 决定，不能假设 0017
-        已经完成，也不能把供应商网络 I/O 带入这里。
+        已经完成，也不能把供应商网络 I/O 带入这里。先持用户行锁复核 active，锁持续覆盖
+        全页及最终游标提交，屏障后的在途响应不得重建线程、消息或密文。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise StateConflictError(
+                error_code="mail_connection_not_syncable",
+                message="Mail connection is no longer available for sync",
+            )
         conflict_target = await self._message_identity_conflict_target()
         if conflict_target == _MailMessageConflictTarget.LEGACY_CONSTRAINT:
             # 0016 尚无连接级唯一索引。锁定同一连接可串行化短暂部署窗口内的 folder
@@ -846,9 +863,7 @@ class SqlAlchemyMailSyncRepository:
                 set_=update_values,
                 where=message_is_newer,
             )
-        applied_id = await self._session.scalar(
-            conflict_statement.returning(EmailMessageModel.id)
-        )
+        applied_id = await self._session.scalar(conflict_statement.returning(EmailMessageModel.id))
         return (
             MailMessageUpsertResult.APPLIED
             if applied_id is not None
@@ -939,9 +954,7 @@ class SqlAlchemyMailSyncRepository:
             if not bool(new_index_row[3]):
                 # 精确目标索引尚未 valid 时，0016 legacy constraint 仍是安全可用的
                 # conflict target。先完整验证 legacy，拒绝把恶意同名约束当作降级入口。
-                legacy_constraints = await self._constraint_catalog_rows(
-                    _LEGACY_MESSAGE_IDENTITY
-                )
+                legacy_constraints = await self._constraint_catalog_rows(_LEGACY_MESSAGE_IDENTITY)
                 if len(legacy_constraints) != 1 or not self._is_exact_identity_constraint(
                     legacy_constraints[0],
                     expected_columns=("thread_id", "provider_message_id"),
@@ -1108,9 +1121,7 @@ class SqlAlchemyMailSyncRepository:
             ).all()
         )
         if len(rows) > 1:
-            raise RuntimeError(
-                "mail message connection-level duplicate requires manual repair"
-            )
+            raise RuntimeError("mail message connection-level duplicate requires manual repair")
         if not rows:
             return None
         stored = rows[0]
@@ -1181,6 +1192,9 @@ class SqlAlchemyMailSyncRepository:
         即使供应商重复投递同一 tombstone，或另一连接拥有相同 ID，也不会扩大删除范围。
         空线程暂时保留其无敏感正文的索引元数据，避免墓碑与分析/审计外键形成级联副作用。
         """
+        # 仅含墓碑的页面同样是普通同步事务；不能借删除动作越过 inactive 屏障。
+        if not await lock_active_user(self._session, user_id=user_id):
+            return
         statement = delete(EmailMessageModel).where(
             EmailMessageModel.user_id == user_id,
             EmailMessageModel.connection_id == connection_id,
@@ -1210,6 +1224,12 @@ class SqlAlchemyMailSyncRepository:
         否则更晚同步已经提交，当前事务连同邮件写入一起回滚并交给 Durable Worker 重试。
         审计 metadata 只保存聚合计数和本地 scope key，不复制正文或 opaque 游标。
         """
+        # 空页面也会推进 cursor 和审计，因此不能仅依赖 upsert_message 的用户锁。
+        if not await lock_active_user(self._session, user_id=user_id):
+            raise StateConflictError(
+                error_code="mail_connection_not_syncable",
+                message="Mail connection is no longer available for sync",
+            )
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .join(
@@ -1281,6 +1301,8 @@ class SqlAlchemyMailSyncRepository:
         Mail 与 Calendar 暂时共用此凭据仓储；因此这里是两类只读资源发生永久授权失败时
         的唯一事实写入点，连接列表能够以稳定错误码提示用户重新授权。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            return
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -1306,6 +1328,8 @@ class SqlAlchemyMailSyncRepository:
         ``status != enabled`` 停止该 folder 的新任务；原有 folder cursor 保留供重新授权后
         继续使用。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            return
         capability = await self._session.scalar(
             select(ConnectionCapabilityModel)
             .join(

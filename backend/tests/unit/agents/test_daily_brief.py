@@ -118,7 +118,8 @@ async def test_ambiguous_intent_redacts_before_model() -> None:
         "what can you do? Bearer secret-value", model_gateway=fake, model_name="fake"
     )
     assert result.intent == "generate_daily_brief"
-    assert "secret-value" not in fake.calls[0][0]["content"]
+    user_message = next(message for message in fake.calls[0] if message["role"] == "user")
+    assert "secret-value" not in user_message["content"]
 
 
 @pytest.mark.asyncio

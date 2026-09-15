@@ -213,6 +213,16 @@ class SqlAlchemyApprovalStore:
             )
 
     async def expire_overdue(self, *, now: datetime, limit: int) -> int:
+        """维护任务按既有全局有界扫描执行到期，保留统一锁序、审计和状态转换。"""
+        return await self._expire_pending(now=now, limit=limit, owned_task=None)
+
+    async def expire_for_task(self, *, user_id: UUID, task_id: UUID, now: datetime) -> int:
+        """仅扫描精确用户任务；测试时间推进不能顺带改变其他已经到期的审批。"""
+        return await self._expire_pending(now=now, limit=1, owned_task=(user_id, task_id))
+
+    async def _expire_pending(
+        self, *, now: datetime, limit: int, owned_task: tuple[UUID, UUID] | None,
+    ) -> int:
         """按 TaskRun→ApprovalRequest 固定锁序终止有界数量的过期审批。
 
         候选查询只对关联 ``TaskRun`` 使用 ``FOR UPDATE ... SKIP LOCKED``，避免先锁
@@ -222,18 +232,22 @@ class SqlAlchemyApprovalStore:
         """
         expired_actions: list[str] = []
         async with self._session_factory.begin() as session:
+            query = (
+                select(TaskRunModel, ApprovalRequestModel.id)
+                .join(ApprovalRequestModel, ApprovalRequestModel.task_id == TaskRunModel.id)
+                .where(
+                    ApprovalRequestModel.status == ApprovalStatus.PENDING.value,
+                    ApprovalRequestModel.expires_at <= now,
+                )
+            )
+            if owned_task is not None:
+                query = query.where(
+                    TaskRunModel.user_id == owned_task[0], TaskRunModel.id == owned_task[1],
+                )
             candidates = tuple(
                 (
                     await session.execute(
-                        select(TaskRunModel, ApprovalRequestModel.id)
-                        .join(
-                            ApprovalRequestModel,
-                            ApprovalRequestModel.task_id == TaskRunModel.id,
-                        )
-                        .where(
-                            ApprovalRequestModel.status == ApprovalStatus.PENDING.value,
-                            ApprovalRequestModel.expires_at <= now,
-                        )
+                        query
                         .order_by(ApprovalRequestModel.expires_at, ApprovalRequestModel.id)
                         .limit(limit)
                         .with_for_update(of=TaskRunModel, skip_locked=True)

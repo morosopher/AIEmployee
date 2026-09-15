@@ -62,6 +62,7 @@ from ai_employee.integrations.google.oauth import (
 from ai_employee.integrations.microsoft.oauth import MicrosoftOAuthAdapter
 
 if TYPE_CHECKING:
+    from ai_employee.application.ports.trusted_actions import TrustedActionWritePolicy
     from ai_employee.application.use_cases.calendar_editor import CalendarEditorUseCase
     from ai_employee.application.use_cases.calendar_proposals import (
         CalendarProposalUseCase,
@@ -440,6 +441,8 @@ async def get_mail_draft_use_case(request: Request) -> AsyncIterator["MailDraftU
     加密器不能在 ``create_app`` 或模块导入阶段构造，否则只生成 OpenAPI 的进程也会
     被迫读取部署 Secret。依赖进入请求后才读取密钥，并让同一 SQLAlchemy 事务同时
     承担草稿 CAS、连接能力与本地来源查询；正常返回提交，异常统一回滚。
+    路由显式使用 ``scope="function"``，必须先完成提交才能发送成功版本；否则请求级
+    yield 清理晚于响应，会让客户端把尚未提交或已回滚的版本误认为已保存。
 
     Yields:
         绑定当前请求事务、记录级 AEAD 与显式 UTC 时钟的 ``MailDraftUseCase``。
@@ -475,6 +478,8 @@ async def get_calendar_proposal_use_case(
 
     Secret 在请求进入后才读取；本依赖只用于创建、读取、编辑和取消。候选计算使用独立
     ``get_calendar_availability_use_case``，避免在纯 CPU 算法期间持有数据库事务。
+    路由必须声明 ``Depends(..., scope="function")``，在发送成功响应前退出并提交；
+    默认 request scope 会使立即 GET 读到旧版本，且 commit 失败后无法撤回已发送的成功。
     """
     from ai_employee.application.use_cases.calendar_proposals import CalendarProposalUseCase
     from ai_employee.infrastructure.db.repositories.calendar import (
@@ -584,7 +589,11 @@ def get_calendar_restore_enqueue_use_case(
 async def get_settings_use_case(
     request: Request,
 ) -> AsyncIterator["UpdateUserSettings"]:
-    """为设置 GET/PATCH 创建一个由请求拥有的短事务用例。"""
+    """为设置 GET/PATCH 创建短事务；路由以 function scope 在响应前提交。
+
+    设置与审计必须一起提交后才可返回成功，避免紧随的日程冲突查询读取旧工作时间，
+    也避免 commit 失败后客户端已经收到无法撤回的200。
+    """
     from ai_employee.application.use_cases.settings import UpdateUserSettings
     from ai_employee.infrastructure.db.repositories.settings import (
         SqlAlchemySettingsRepository,
@@ -597,10 +606,10 @@ async def get_settings_use_case(
 def get_submit_mail_draft_use_case(request: Request) -> "SubmitMailDraftUseCase":
     """惰性组合原子邮件提交用例，并固定使用启动时冻结的 preflight registry。
 
-    Secret 只在真实 submit 请求到达后读取；默认 registry 不含任何写适配器。用例会先
-    检查全局、供应商与账户门禁，因此默认关闭写入时必定在 preflight、ID 和密文产生前
-    返回 ``external_writes_disabled``。测试只能在首个请求前替换整个不可变 registry，
-    API 不提供运行时注册动作或扩展供应商的入口。
+    Secret 只在 submit 请求到达后读取；生产用例先检查全局、供应商与账户门禁，默认
+    关闭时在 preflight、ID 和密文产生前返回 ``external_writes_disabled``。双测试开关
+    只把封闭 Fake 与合成账户策略配对，Settings 的真实开关保持不变；API 不提供运行时
+    注册动作或扩展供应商的入口。
     """
     from ai_employee.application.use_cases.trusted_actions import SubmitMailDraftUseCase
     from ai_employee.infrastructure.db.repositories.trusted_actions import (
@@ -617,7 +626,7 @@ def get_submit_mail_draft_use_case(request: Request) -> "SubmitMailDraftUseCase"
             command_cipher,
         ),
         preflights=request.app.state.trusted_action_preflight_registry,
-        write_policy=settings,
+        write_policy=_trusted_write_policy(request),
         command_cipher=command_cipher,
     )
 
@@ -643,8 +652,17 @@ def get_submit_calendar_proposal_use_case(
             command_cipher,
         ),
         preflights=request.app.state.trusted_action_preflight_registry,
-        write_policy=settings,
+        write_policy=_trusted_write_policy(request),
         command_cipher=command_cipher,
+    )
+
+
+def _trusted_write_policy(request: Request) -> "TrustedActionWritePolicy":
+    """从同一启动 registry 选取配对策略，只有双开关的封闭 Fake 可使用合成授权。"""
+    from ai_employee.integrations.registry import trusted_action_write_policy
+
+    return trusted_action_write_policy(
+        settings=get_auth_settings(request), registry=request.app.state.trusted_action_preflight_registry,
     )
 
 

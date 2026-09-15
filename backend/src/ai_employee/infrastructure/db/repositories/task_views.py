@@ -27,6 +27,7 @@ from ai_employee.infrastructure.db.models.tasks import (
 from ai_employee.infrastructure.db.repositories.calendar_restore_results import (
     load_calendar_restore_result,
 )
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 from ai_employee.infrastructure.security.action_payloads import ActionPayloadCipher
 
@@ -147,6 +148,8 @@ class SqlAlchemyTaskViewStore:
         Worker 的最终业务事务会在仍为 ``running`` 时写入无敏感内容的 ``result_payload``
         marker；取消拿到同一行锁后若看到 marker，说明外部可见结果已经提交，只能让 Runner
         继续以 owner CAS 收敛为成功，不能再把已完成事实改写为取消。
+        Task之后先锁User并重查active；删除屏障先提交时按缺失返回，不补写取消、
+        审批失效、普通审计或Outbox，可信撤回继承本事务的同一用户锁。
         """
         async with self._session_factory.begin() as session:
             task = await session.scalar(
@@ -154,7 +157,7 @@ class SqlAlchemyTaskViewStore:
                 .where(TaskRunModel.id == task_id, TaskRunModel.user_id == user_id)
                 .with_for_update()
             )
-            if task is None:
+            if task is None or not await lock_active_user(session, user_id=user_id):
                 return None
             current_status = TaskStatus(task.status)
             if task.kind == "trusted_action":
@@ -214,7 +217,7 @@ class SqlAlchemyTaskViewStore:
     ) -> None:
         """撤回尚未认领的可信审批，并让绑定本地对象回到编辑态。
 
-        锁序由调用方已取得 TaskRun 开始，随后固定为 ApprovalRequest、ToolExecution 检查、
+        调用方已经按 TaskRun→User 取锁并验证active，随后固定为 ApprovalRequest、ToolExecution 检查、
         绑定草稿/提案。任何 ToolExecution 行都证明执行边界已经被认领，此时取消可能掩盖
         已发生或未知的外部副作用，必须拒绝而不能只检查其当前状态。
 

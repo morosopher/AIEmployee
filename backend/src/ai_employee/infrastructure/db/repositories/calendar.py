@@ -16,6 +16,7 @@ from ai_employee.application.calendar_event_aad import calendar_event_field_aad_
 from ai_employee.application.ports.calendar import (
     CalendarConnectionState,
     CalendarEvent,
+    CalendarNotificationFacts,
     ProviderCalendar,
 )
 from ai_employee.application.ports.encryption import (
@@ -53,6 +54,7 @@ from ai_employee.infrastructure.db.repositories.calendar_aad_recovery import (
     lock_calendar_aad_scope,
     require_calendar_aad_task,
 )
+from ai_employee.infrastructure.db.repositories.identity import lock_active_user
 from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
 
 _AVAILABILITY_FRESHNESS = timedelta(minutes=15)
@@ -195,6 +197,46 @@ class SqlAlchemyCalendarSyncRepository:
         self._session = session
         self._field_cipher = field_cipher
         self._calendar_permissions: dict[tuple[UUID, UUID, str], tuple[str, bool] | None] = {}
+
+    async def get_notification_facts(
+        self,
+        *,
+        user_id: UUID,
+        connection_id: UUID,
+        provider: str,
+        calendar_id: str,
+        provider_event_id: str,
+    ) -> CalendarNotificationFacts | None:
+        """只读精确当前事件的版本及名单存在性，供生产 registry 注入纯预检。
+
+        不读取 desired/历史 before snapshot，也不解密正文。ETag 由适配器按供应商
+        规则绑定冻结 base；列表缺失或形状未知时保留未知，非空列表一律视为已有参会人，
+        避免过滤坏地址后误判为可静默清空的个人日程。
+        """
+        row = await self._session.scalar(
+            select(CalendarEventModel)
+            .join(
+                OAuthConnectionModel,
+                (OAuthConnectionModel.id == CalendarEventModel.connection_id)
+                & (OAuthConnectionModel.user_id == CalendarEventModel.user_id),
+            )
+            .where(
+                CalendarEventModel.user_id == user_id,
+                CalendarEventModel.connection_id == connection_id,
+                CalendarEventModel.calendar_id == calendar_id,
+                CalendarEventModel.provider_event_id == provider_event_id,
+                OAuthConnectionModel.provider == provider,
+            )
+        )
+        if row is None or not row.etag:
+            return None
+        return CalendarNotificationFacts(
+            connection_id=connection_id,
+            calendar_id=calendar_id,
+            provider_event_id=provider_event_id,
+            etag=row.etag,
+            has_attendees=bool(row.attendees) if isinstance(row.attendees, list) else None,
+        )
 
     async def get_default_proposal_target(
         self,
@@ -421,7 +463,8 @@ class SqlAlchemyCalendarSyncRepository:
                     select(
                         ProviderCalendarModel.connection_id,
                         ProviderCalendarModel.provider_calendar_id,
-                    ).where(ProviderCalendarModel.user_id == user_id)
+                    )
+                    .where(ProviderCalendarModel.user_id == user_id)
                     .order_by(
                         ProviderCalendarModel.connection_id,
                         ProviderCalendarModel.provider_calendar_id,
@@ -511,9 +554,7 @@ class SqlAlchemyCalendarSyncRepository:
         # Query 5: 只投影算法所需五列；即使没有可用连接也执行同一条 SELECT，保持
         # query-count 与连接数量无关，并且绝不在 SQL 层 LIMIT 截断事件集合。
         window_end = normalized_start + timedelta(days=horizon_days + 1)
-        window_start = normalized_start - timedelta(
-            minutes=user_row.meeting_buffer_minutes
-        )
+        window_start = normalized_start - timedelta(minutes=user_row.meeting_buffer_minutes)
         event_rows = tuple(
             (
                 await self._session.execute(
@@ -570,11 +611,7 @@ class SqlAlchemyCalendarSyncRepository:
         values = (ciphertext, nonce, key_version, aad_version)
         if all(value is None for value in values):
             return ""
-        if (
-            self._field_cipher is None
-            or any(value is None for value in values)
-            or aad_version != 2
-        ):
+        if self._field_cipher is None or any(value is None for value in values) or aad_version != 2:
             raise StateConflictError(
                 error_code="calendar_event_resync_required",
                 message="Calendar event requires resynchronization",
@@ -610,13 +647,14 @@ class SqlAlchemyCalendarSyncRepository:
         user_id: UUID,
         connection_id: UUID,
     ) -> OAuthConnectionModel | None:
-        """按固定 connection→capability 顺序锁定并验证日历读取前提。
+        """按固定 user→connection→capability 顺序锁定并验证普通日历同步前提。
 
         PostgreSQL 无需保证多表 ``JOIN ... FOR UPDATE`` 的 rowmark 锁顺序与 SQL 书写顺序
         一致；各同步入口若各自依赖 JOIN，仍可能交错锁定 connection、capability 与 cursor。
-        因此所有状态读取、目录提交、游标清理和同步完成都复用本方法：先按所有权与 connected
-        状态锁住唯一 connection，再锁定同用户的 enabled ``calendar.read`` 行，调用方随后
-        才能获取目录、日历或精确 cursor 锁。
+        因此所有普通状态读取、目录提交、游标清理和同步完成都复用本方法：先持用户锁重检
+        active，再按所有权与 connected 状态锁住唯一 connection，最后锁定 enabled
+        ``calendar.read`` 行，调用方随后才能获取目录、日历或精确 cursor 锁。普通事件
+        upsert 同样由网络后的 get_state 持续持有本锁；0019 marked 恢复保留专用协议。
 
         Args:
             user_id: 当前管理员用户。
@@ -625,6 +663,8 @@ class SqlAlchemyCalendarSyncRepository:
         Returns:
             连接与读取能力均存在且已按固定顺序锁定时返回连接行，否则返回 ``None``。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            return None
         connection = await self._session.scalar(
             select(OAuthConnectionModel)
             .where(
@@ -1167,7 +1207,7 @@ class SqlAlchemyCalendarSyncRepository:
         scope_key: str,
         expected_cursor: str,
     ) -> None:
-        """按 connection→capability→cursor 固定锁序执行单 scope 失效 CAS。"""
+        """按 user→connection→capability→cursor 固定锁序执行单 scope 失效 CAS。"""
         connection = await self._lock_syncable_connection(
             user_id=user_id,
             connection_id=connection_id,
@@ -1276,6 +1316,8 @@ class SqlAlchemyCalendarSyncRepository:
         也不能清除其它日历或邮件的恢复位置。通过同用户/连接组合条件加锁，避免跨用户
         capability 被错误修改。
         """
+        if not await lock_active_user(self._session, user_id=user_id):
+            return
         capability = await self._session.scalar(
             select(ConnectionCapabilityModel)
             .join(

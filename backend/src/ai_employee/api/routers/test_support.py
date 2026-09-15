@@ -1,13 +1,15 @@
 """仅供受控测试环境注入合成故障场景的 API 路由。"""
 
-from typing import Protocol
+from datetime import datetime
+from typing import Literal, Protocol
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request, Response, status
+from pydantic import BaseModel, ConfigDict
 
-from ai_employee.api.deps import ApiProblem, CsrfProtectedSession
+from ai_employee.api.deps import ApiProblem, CsrfProtectedSession, CurrentSession
 from ai_employee.config import Settings
+from ai_employee.infrastructure.testing.scenarios import TestScenario
 
 TEST_SCENARIO_TTL_SECONDS = 600
 
@@ -25,13 +27,51 @@ class RedisScenarioClient(Protocol):
 class TestScenarioRequest(BaseModel):
     """限制 test-only 注入值，禁止把任意供应商载荷塞进 Redis。"""
 
-    scenario: str = Field(pattern=r"^(oauth_revoked|gmail_429|calendar_5xx|model_invalid_twice|partial_source)$")
+    model_config = ConfigDict(extra="forbid")
+
+    scenario: TestScenario
 
 
 class ExecuteTestTaskRequest(BaseModel):
     """限制 test-only 同步执行入口只能接收已经持久化的任务标识。"""
 
+    model_config = ConfigDict(extra="forbid")
+
     task_id: UUID
+
+
+class SeedM2SourceRequest(BaseModel):
+    """只允许选择两家固定 Fake，不接收账户、Token 或供应商原始载荷。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["google", "microsoft"]
+
+
+class SeedM2SourceResponse(BaseModel):
+    """合成来源的标识符响应，供生产编辑器绑定本例的精确连接和对象。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    connection_id: UUID
+    calendar_id: str
+    thread_id: UUID
+    message_id: UUID
+    event_id: UUID
+    starts_at: datetime
+    ends_at: datetime
+
+
+class M2EvidenceResponse(BaseModel):
+    """无内容的数据库/外部 Fake 计数，独立验证一次写入与 Checkpoint。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    execution_count: int
+    write_calls: int
+    reconcile_calls: int
+    checkpoint_count: int
+    real_writes_enabled: bool
 
 
 class GenerateTestBriefRequest(BaseModel):
@@ -119,6 +159,47 @@ def build_test_support_router() -> APIRouter:
         )
         return SeedGoogleSourceResponse(connection_id=connection_id)
 
+    @router.post("/seed-m2-source", response_model=SeedM2SourceResponse)
+    async def seed_m2_source(
+        payload: SeedM2SourceRequest, authenticated: CsrfProtectedSession, request: Request,
+    ) -> SeedM2SourceResponse:
+        """创建当前用户的合成来源；不写入草稿、审批、ToolExecution 或任务结果。"""
+        from ai_employee.infrastructure.testing.m2_sources import seed_m2_source as seed
+
+        source = await seed(
+            sessions=request.app.state.auth_session_factory,
+            master_key_file=request.app.state.auth_settings.app_master_key_file,
+            user_id=authenticated.user.id, provider=payload.provider,
+        )
+        return SeedM2SourceResponse.model_validate(source)
+
+    @router.get("/m2-evidence/{task_id}", response_model=M2EvidenceResponse)
+    async def m2_evidence(
+        task_id: UUID, authenticated: CurrentSession, request: Request, response: Response,
+    ) -> M2EvidenceResponse:
+        """只读取同用户的计数；任务不属于当前用户时统一 404，响应不缓存。"""
+        evidence = await request.app.state.m2_test_support.evidence(user_id=authenticated.user.id, task_id=task_id)
+        if evidence is None:
+            raise ApiProblem(404, "task_not_found", "Task not found", "The requested task is not available for this user.")
+        response.headers["Cache-Control"] = "no-store"
+        return M2EvidenceResponse.model_validate(evidence)
+
+    @router.post("/expire-approval", status_code=status.HTTP_204_NO_CONTENT)
+    async def expire_approval(
+        payload: ExecuteTestTaskRequest, authenticated: CsrfProtectedSession, request: Request,
+    ) -> None:
+        """推进本用户精确待审批的测试截止时间，正式 store 负责到期收敛。"""
+        if not await request.app.state.m2_test_support.expire_approval(user_id=authenticated.user.id, task_id=payload.task_id):
+            raise ApiProblem(404, "approval_not_found", "Approval not found", "The requested approval is not available for this user.")
+
+    @router.post("/reconcile-task", status_code=status.HTTP_204_NO_CONTENT)
+    async def reconcile_task(
+        payload: ExecuteTestTaskRequest, authenticated: CsrfProtectedSession, request: Request,
+    ) -> None:
+        """驱动本用户任务的专用只读 Worker；禁止接受写命令或人工结果。"""
+        if not await request.app.state.m2_test_support.reconcile(user_id=authenticated.user.id, task_id=payload.task_id):
+            raise ApiProblem(404, "task_not_found", "Task not found", "The requested task is not available for this user.")
+
     @router.post(
         "/generate-brief",
         status_code=status.HTTP_202_ACCEPTED,
@@ -171,6 +252,10 @@ def build_test_support_router() -> APIRouter:
                 "Task not found",
                 "The requested task is not available for this user.",
             )
+        if await request.app.state.m2_test_support.run_trusted_task(
+            user_id=authenticated.user.id, task_id=payload.task_id,
+        ):
+            return
         await request.app.state.test_task_runner.run(
             payload.task_id,
             lease_owner=f"test-support:{uuid4()}",

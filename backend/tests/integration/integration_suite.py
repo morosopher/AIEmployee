@@ -8,6 +8,8 @@ pytest session 可靠共存，因此本模块只在测试侧建立显式进程�
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -312,6 +314,25 @@ class PytestInvocation:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectedPytestPlan:
+    """冻结直接 pytest 已完成收集的有序分区，原参数与工作目录保持不变。
+
+    只有测试侧 hook 创建此计划；数据库、角色与 guard 仍由既有 suite 资源管理。
+    每个 child 在 fixture 开始前重新收集并核对节点摘要，防止重新解释参数丢失用例。
+    """
+
+    arguments: tuple[str, ...]
+    cwd: Path
+    regular_nodes: tuple[str, ...]
+    lifecycle_nodes: tuple[str, ...]
+
+
+def selection_digest(nodes: Sequence[str]) -> str:
+    """以有序 nodeid 列表的规范 JSON 绑定子进程实际选择，不输出业务数据。"""
+    return hashlib.sha256(json.dumps(list(nodes), separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class AnchorSnapshot:
     """保存 Task 13 anchor 的 content-free 逻辑 catalog 与数据指纹。"""
 
@@ -559,6 +580,7 @@ def _build_invocation(
     base_environment: Mapping[str, str],
     python_executable: str,
     repository_root: Path,
+    selected: SelectedPytestPlan | None = None,
 ) -> PytestInvocation:
     """构造 list argv child 调用，Secret 只存在于隐藏的 environment 字段。"""
     arguments = (
@@ -566,11 +588,15 @@ def _build_invocation(
         if phase == "regular"
         else build_lifecycle_pytest_arguments()
     )
+    if selected is not None:
+        nodes = selected.regular_nodes if phase == "regular" else selected.lifecycle_nodes
+        arguments = (*selected.arguments, f"--ai-employee-integration-selection={selection_digest(nodes)}")
     return PytestInvocation(
         phase=phase,
-        argv=(python_executable, "-m", "pytest", *arguments),
+        argv=(python_executable, "-m", "pytest", *arguments,
+              f"--ai-employee-integration-child={phase}"),
         environment=_phase_environment(base_environment, database_url=database_url),
-        cwd=repository_root,
+        cwd=repository_root if selected is None else selected.cwd,
     )
 
 
@@ -582,6 +608,7 @@ def orchestrate_integration_tests(
     run_child: ChildRunner,
     python_executable: str,
     repository_root: Path,
+    selected: SelectedPytestPlan | None = None,
 ) -> int:
     """按 regular cleanup → lifecycle 的固定顺序执行两个 pytest session。
 
@@ -592,6 +619,7 @@ def orchestrate_integration_tests(
         run_child: 接受 list argv invocation 与同线程 suite lease 的 child 执行器。
         python_executable: 当前 uv 环境的 Python，可保证两个 child 使用相同 lockfile 环境。
         repository_root: child pytest 的固定工作目录。
+        selected: 可选直接调用的冻结选择；原完整 suite 不传，行为与选择集合保持不变。
 
     Returns:
         第一个失败 child 的原始退出码；两个 phase 均成功时返回零。
@@ -616,6 +644,7 @@ def orchestrate_integration_tests(
                             base_environment=base_environment,
                             python_executable=python_executable,
                             repository_root=repository_root,
+                            selected=selected,
                         ),
                         suite_lease,
                     )
@@ -648,6 +677,11 @@ def orchestrate_integration_tests(
                 # pytest 的原始非零 code；context 外立即恢复该 code。
                 raise _ChildExitCode(regular_code)
 
+            if selected is not None and not selected.lifecycle_nodes:
+                # parent 的实际 collection 已证明没有 lifecycle 节点；不启动一个必然
+                # 返回5的空子进程，也不把任何实际 child 的非零退出改写为成功。
+                return 0
+
             suite_lease.verify()
             lifecycle_code = run_child(
                 _build_invocation(
@@ -656,6 +690,7 @@ def orchestrate_integration_tests(
                     base_environment=base_environment,
                     python_executable=python_executable,
                     repository_root=repository_root,
+                    selected=selected,
                 ),
                 suite_lease,
             )
