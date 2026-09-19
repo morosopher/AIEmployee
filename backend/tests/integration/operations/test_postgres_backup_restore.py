@@ -2591,10 +2591,14 @@ def test_release_wrapper_explicitly_executes_fixed_audit_subprocess(tmp_path: Pa
     )
     for command in ("just", "bash", "uv", "python3", "git"):
         _executable(commands / command, stub)
+    # 本 pytest session 自身的 TEST_DATABASE_URL（CI anchor 或本地 UUID 库）不是固定 Task13
+    # 目标；release 准入会在第一个子进程前拒绝任何其他 DSN。这里覆盖“外部未设置”场景，
+    # 由 wrapper 自行导出固定值，替身再逐个子进程核对该 export 的继承。
+    environment = {key: value for key, value in os.environ.items() if key != "TEST_DATABASE_URL"}
     result = subprocess.run(
         ["/bin/bash", str(release)],
         cwd=ROOT,
-        env={**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "TEST_CALLS": str(calls)},
+        env={**environment, "PATH": f"{commands}:{os.environ['PATH']}", "TEST_CALLS": str(calls)},
         capture_output=True,
         text=True,
         check=False,
