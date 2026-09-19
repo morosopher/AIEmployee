@@ -70,3 +70,38 @@ Token、Cookie、OAuth 凭据、Secret、原始允许列表身份键、完整邮
 - [x] 对本轮实际构建的不可变后端镜像核对受管运维脚本及全部运行源码摘要；原生部署和备份/恢复证据绑定该镜像，历史镜像的通过结果保留各自范围。暂存区不得包含 `.env`、Secret、dump、coverage、浏览器报告或生成的私有发布产物。
 - [x] 汇总 scope 审计、敏感输出扫描、专用 Google/Microsoft 账户 E2E、唯一 ToolExecution 审计与调用后崩溃恢复证据；保留用户逐命令应用内批准及控制器逐项只读核对结果，不把控制器核对写成用户代批。
 - [x] 自动化和独立审查通过后，才请求专用 Google/Microsoft 账户及带外配置授权；真实新邮件/回复/全部回复/创建/修改/恢复矩阵和 Microsoft 另一账户类型的合同证据齐全后，才创建正式 release-evidence 文档并作发布决定。未授权时保持 Task30/M2 未完成。
+
+# M2.1 验收清单
+
+本段对应已批准的 M2.1「前端组件库重构」，事实来源为
+[M2.1 设计](superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md) 与
+[实施计划](superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md)。M2.1 只替换前端
+展示层，不重新打开上文 M2 验收项，也不改变 M2 发布证据。勾选前必须有本轮新鲜命令输出，
+证据写入 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`；未完成任一项不得宣称
+M2.1 完成。
+
+## 选型、许可与只读边界
+
+- [ ] `frontend/pnpm-lock.yaml` 中 `primevue`、`@primevue/forms`、`@primevue/auto-import-resolver`、`@primevue/core`、`@primevue/icons` 均为精确 `4.5.5`，`@primeuix/themes` 为 2.x，不存在 `primevue@5`、`@primeui/*` 或 `@primeuix/themes@3`；保存 `scripts/check-frontend-licenses.sh` 的完整输出，生产依赖只含 MIT/ISC/BSD/Apache-2.0。
+- [ ] 以 `git diff <M2.1 起点>..HEAD --stat` 证明 `src/api/**`、`src/stores/**`、`src/composables/**`、`src/router/**` 及 `src/features/**` 中非 `schema.ts`/`presentation.ts` 文件未被视觉重构提交修改；行为层修复若存在，均为独立 `fix:` 提交并附回归测试。
+- [ ] 审计全部页面与组件，确认没有新增 M2 范围外的可操作入口或占位 UI，没有暗色模式、多语言或主题切换。
+
+## 设计系统与样式清理
+
+- [ ] `bash scripts/check-frontend-styles.sh --strict` 退出码为 0：`src/**/*.vue` 不含十六进制颜色字面量与 `@media` 查询，残留 scoped 样式均有注释说明且不含颜色与断点。
+- [ ] `src/design/tokens.spec.ts` 证明现有 12 种颜色全部映射为语义 token，且文字/背景与白字/主色、白字/危险色对比度不低于 4.5。
+- [ ] 保存 375、900、1400 三种视口的 Playwright 截图，证明单栏抽屉、双栏折叠时间线、三栏布局，以及操作中心在任何视口都不显示全局时间线栏。
+
+## 无障碍与交互
+
+- [ ] `e2e/accessibility.spec.ts` 对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图的 axe 结果 `serious`/`critical` 为零，保存原始报告哈希。
+- [ ] `src/test-support/liveRegionInventory.spec.ts` 证明 `role="status"`、`role="alert"`、`role="dialog"` 数量与迁移前冻结值一致，或每次增减都有提交说明记录。
+- [ ] 所有 `Dialog`/`Drawer` 有组件测试证明键盘打开、Esc 关闭、关闭后焦点返回触发元素、背景 `inert`。
+- [ ] 表单字段错误由服务端 `error_code` 映射，`features/forms/problemFields.spec.ts` 覆盖每个已知错误码；zod schema 只含格式级规则。
+- [ ] 既有零浏览器存储断言、SSE 重放测试、Markdown 清洗测试在最终提交上原样通过。
+
+## 门禁与体积
+
+- [ ] 保存 Task 1 记录的构建体积基线与最终 `bash scripts/report-frontend-bundle.sh --budget` 输出，首屏 JS gzip 增量不超过 200 KB、CSS gzip 不超过 60 KB；超预算须有用户确认记录。
+- [ ] 最终提交上 `just check` 与 `just ci` 均退出码 0，读取完整输出并记录起止时间、后端/前端测试数与 E2E 数。
+- [ ] `frontend/AGENTS.md`、根 `AGENTS.md`、README 的技术栈、浏览器基线和门禁描述与实现一致。

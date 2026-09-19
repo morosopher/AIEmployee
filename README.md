@@ -2,7 +2,10 @@
 
 AI Employee 是面向单管理员长期使用的可信办公助手。M1「可信任务中心 + 每日办公简报」已经
 交付；M2「可执行邮件与日历助手」已于 2026-09-15 完成验收，详见
-[发布证据](docs/releases/2026-08-06-m2-release-evidence.md)。M2 保留 PostgreSQL 业务事实、
+[发布证据](docs/releases/2026-08-06-m2-release-evidence.md)。当前实施目标是 M2.1「前端组件库
+重构」：用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 重建前端展示层，不改动后端与 M2 范围，
+规格见 [M2.1 设计](docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md)。
+M2 保留 PostgreSQL 业务事实、
 任务审计、Outbox、Checkpoint、SSE 重放和崩溃恢复底座，并增加 Google 与 Microsoft 邮件/日历
 连接、只读增量同步、本地草稿与提案，以及受控的真实写入。
 
@@ -80,6 +83,16 @@ FastAPI API、Taskiq Worker 和 Scheduler 是独立进程；应用层协调领�
 PostgreSQL 是连接、任务、审批、ToolExecution、审计、Outbox 与 Checkpoint 的唯一事实来源，Redis
 仅承载队列、通知和可重建协调数据。Google 与 Microsoft OAuth 按连接渐进申请 `mail.read`、
 `mail.send`、`calendar.read`、`calendar.write` 最小委托 scope，Token 以版本化 AEAD 密文保存。
+
+## 前端技术栈
+
+前端是 Vue 3 + TypeScript + Vite 单页应用，状态用 Pinia，路由用 vue-router，服务端通信统一经
+`frontend/src/api/`。已批准的 M2.1 把 UI 技术栈固定为 PrimeVue 4.5.5（styled 模式 + 定制 Aura
+预设）、PrimeVue Forms + zod、Tailwind CSS 4 与 `tailwindcss-primeui`；PrimeVue 5 及 `@primeui/*`
+包采用商业许可，M2.1 将以许可证检查拒绝引入。Tailwind 4 会把浏览器基线提升到 Chrome 111、
+Safari 16.4、Firefox 128 及以上。按 M2.1 实施计划，`just check` 将增加前端许可证与样式 token
+检查，`just ci` 将报告并限制首屏包体积，E2E 将包含 axe 无障碍扫描与三种视口布局检查；这些
+门禁在对应任务提交后才生效，以 `justfiles/test.just` 的实际内容为准。
 
 ## M2 范围边界
 
