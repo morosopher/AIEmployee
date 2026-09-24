@@ -3,6 +3,10 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "noEmit": true,
     "strict": true,
+    // 只跳过第三方 .d.ts 的独立校验，vite.config.ts 仍按 strict 检查。unplugin-vue-components
+    // 依赖的 unplugin 声明引用 webpack、rspack、rsbuild 等未安装的可选 peer 类型，不跳过
+    // 则 vue-tsc -b 无法通过。
+    "skipLibCheck": true,
     "target": "ES2022",
     "noUncheckedIndexedAccess": true,
     "composite": true,

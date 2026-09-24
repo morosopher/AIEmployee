@@ -43,13 +43,19 @@ typecheck:
     uv run --project backend mypy backend/src
     pnpm --dir frontend type-check
 
+# 样式字面量检查在 M2.1 迁移期间只告警，由实施计划 Task 16 改为 --strict。
+# 本地提交前门禁：lint、typecheck、单测通过后核对前端许可证与 PrimeVue 主版本，并告警样式字面量。
 [group('quality')]
 check: lint typecheck test
+    bash scripts/check-frontend-licenses.sh
+    bash scripts/check-frontend-styles.sh
 
+# 构建后立即报告首屏 gzip 体积并写入 CI 日志；预算强制（--budget）由 Task 16 开启。
 [group('quality')]
 ci: check test-integration
     bash scripts/test-tooling.sh
     bash scripts/test-run-e2e-backend.sh
     bash scripts/test-ci-workflow.sh
     pnpm --dir frontend build
+    bash scripts/report-frontend-bundle.sh
     pnpm --dir frontend test:e2e

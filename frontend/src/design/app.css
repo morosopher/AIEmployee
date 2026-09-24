@@ -1,0 +1,42 @@
+/*
+ * 全局样式入口：只负责级联层顺序、Tailwind 与 PrimeVue token 工具类、字体栈和减少动效。
+ * 颜色、间距、圆角、断点一律来自 src/design/tokens.ts 的 Aura 预设与 Tailwind 工具类，
+ * 本文件不定义任何颜色或组件样式。
+ */
+
+/*
+ * 层优先级由文档中首次出现的声明决定，必须先于 Tailwind 导入声明完整顺序，并与
+ * src/design/primevue.ts 的 cssLayer.order 逐字一致（PrimeVue 运行时会把同一条声明
+ * prepend 到 <head> 最前）：Tailwind 的 @property 兜底（properties）< 设计变量（theme）
+ * < 预检（base）< PrimeVue 组件样式 < 自定义组件层 < 工具类，工具类因此可以直接覆盖
+ * 组件默认外观，无需 `!important`。tailwindcss-primeui 的 keyframes 层只含 @keyframes，
+ * 按首次出现排在最后。
+ */
+@layer properties, theme, base, primevue, components, utilities;
+
+@import "tailwindcss";
+@import "tailwindcss-primeui";
+
+/* 系统 UI 字体栈，中文字体优先；不加载任何 Web 字体文件。 */
+@theme {
+  --font-sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+}
+
+/*
+ * 尊重系统“减少动态效果”设置：PrimeVue 已关闭 ripple，这里再把其余过渡与动画压到
+ * 近乎瞬时。生效依靠 !important：重要声明压过所有普通声明，包括各层组件样式与工具类、
+ * 未分层的 primeicons 旋转动画以及元素内联样式。注意未分层的 !important 是最弱的重要
+ * 声明，任一层内的 !important（如 Tailwind 的 `!` 工具类）仍会覆盖它；PrimeVue 没有带
+ * !important 的动画或过渡规则，因此可以接受，动效相关样式也不要使用 `!` 工具类。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

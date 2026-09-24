@@ -50,6 +50,88 @@ grep -Fq 'scripts/run_integration_tests.py' <<<"${integration_definition}"
 ! grep -Fq 'pytest backend/tests/integration backend/tests/contract backend/tests/evals' \
   <<<"${integration_definition}"
 
+# M2.1 前端门禁脚本必须随仓库以可执行位提交，并真正接入统一入口：check 执行许可证与
+# PrimeVue 主版本检查及样式字面量检查，ci 在生产构建后报告首屏体积。只核对 recipe 展开
+# 内容，注释中的命令不算接线证据。
+for frontend_gate in check-frontend-licenses.sh check-frontend-styles.sh report-frontend-bundle.sh; do
+  if [[ ! -f "scripts/${frontend_gate}" || ! -x "scripts/${frontend_gate}" ]]; then
+    printf 'frontend gate script missing or not executable: scripts/%s\n' "${frontend_gate}" >&2
+    exit 1
+  fi
+done
+check_definition="$(just --show check)"
+for check_gate in 'bash scripts/check-frontend-licenses.sh' 'bash scripts/check-frontend-styles.sh'; do
+  if ! grep -Eq "^[[:space:]]+${check_gate}([[:space:]]|$)" <<<"${check_definition}"; then
+    printf 'check recipe does not run: %s\n' "${check_gate}" >&2
+    exit 1
+  fi
+done
+ci_definition="$(just --show ci)"
+if ! grep -A1 -E '^[[:space:]]+pnpm --dir frontend build$' <<<"${ci_definition}" |
+  grep -Eq '^[[:space:]]+bash scripts/report-frontend-bundle\.sh([[:space:]]|$)'; then
+  printf 'ci recipe must report the frontend bundle right after the production build\n' >&2
+  exit 1
+fi
+
+# 门禁脚本按自身位置定位 frontend/，因此复制到临时目录后配合合成输入即可验证失败路径：
+# Fake pnpm 只输出合成许可证清单，锁文件与 .vue 源码均为合成样例。子 shell 自带清理 trap，
+# 不影响后文统一的 sandbox 生命周期。
+(
+  gate_sandbox="$(mktemp -d "${TMPDIR:-/tmp}/ai-employee-frontend-gates.XXXXXX")"
+  trap 'rm -rf -- "${gate_sandbox}"' EXIT
+  gate_fail() {
+    printf 'frontend gate regression failed: %s\n' "$1" >&2
+    exit 1
+  }
+  mkdir -p "${gate_sandbox}/scripts" "${gate_sandbox}/frontend/src/components" "${gate_sandbox}/bin"
+  cp scripts/check-frontend-licenses.sh scripts/check-frontend-styles.sh "${gate_sandbox}/scripts/"
+  cat >"${gate_sandbox}/bin/pnpm" <<'FAKE_PNPM'
+#!/usr/bin/env bash
+# 只模拟 `pnpm licenses list --prod|--dev --json`，按参数输出预先写好的合成清单。
+for argument in "$@"; do
+  case "${argument}" in
+    --prod) cat "${GATE_PROD_LICENSES}" ;;
+    --dev) cat "${GATE_DEV_LICENSES}" ;;
+  esac
+done
+FAKE_PNPM
+  chmod +x "${gate_sandbox}/bin/pnpm"
+  printf '%s' '{"MIT":[{"name":"primevue","versions":["4.5.5"]}]}' >"${gate_sandbox}/prod.json"
+  printf '%s' '{"MIT":[{"name":"vitest","versions":["4.1.10"]}]}' >"${gate_sandbox}/dev.json"
+  printf '%s' '{}' >"${gate_sandbox}/empty.json"
+  printf '%s' '{"dependencies":{"primevue":"4.5.5","@primevue/forms":"4.5.5","@primeuix/themes":"~2.0.3"},"devDependencies":{"@primevue/auto-import-resolver":"4.5.5"}}' \
+    >"${gate_sandbox}/frontend/package.json"
+  printf "lockfileVersion: '9.0'\n\npackages:\n\n  primevue@4.5.5:\n    resolution: {}\n" \
+    >"${gate_sandbox}/frontend/pnpm-lock.yaml"
+  run_licence_gate() {
+    GATE_PROD_LICENSES="${gate_sandbox}/$1" GATE_DEV_LICENSES="${gate_sandbox}/$2" \
+      PATH="${gate_sandbox}/bin:${PATH}" bash "${gate_sandbox}/scripts/check-frontend-licenses.sh" \
+      >"${gate_sandbox}/licence.log" 2>&1
+  }
+  run_licence_gate prod.json dev.json || {
+    cat "${gate_sandbox}/licence.log" >&2
+    gate_fail 'licence gate rejected valid synthetic inputs'
+  }
+  # 空清单通常意味着依赖未安装或 pnpm 输出异常，必须失败而不是“0 个包全部合规”。
+  ! run_licence_gate empty.json dev.json || gate_fail 'licence gate accepted an empty prod listing'
+  ! run_licence_gate prod.json empty.json || gate_fail 'licence gate accepted an empty dev listing'
+  printf '\n  primevue@5.0.0:\n    resolution: {}\n' >>"${gate_sandbox}/frontend/pnpm-lock.yaml"
+  ! run_licence_gate prod.json dev.json || gate_fail 'licence gate accepted primevue@5.0.0 in the lockfile'
+
+  # 样式门禁：8 位 #rrggbbaa 必须计入，HTML 实体 &#8212; 不是颜色；工具类中的颜色照样命中。
+  printf '%s\n' '<template><p class="bg-[#fff]">&#8212;</p></template>' \
+    '<style scoped>.probe { color: #11223344; }</style>' \
+    >"${gate_sandbox}/frontend/src/components/Probe.vue"
+  styles_output="$(bash "${gate_sandbox}/scripts/check-frontend-styles.sh")" ||
+    gate_fail 'styles gate must only warn without --strict'
+  grep -Fq '2 hex colour literal(s) (2 distinct)' <<<"${styles_output}" ||
+    gate_fail "styles gate miscounted colour literals: ${styles_output}"
+  grep -Fq '#11223344' <<<"${styles_output}" || gate_fail 'styles gate missed an 8-digit colour'
+  ! grep -Fq '#8212' <<<"${styles_output}" || gate_fail 'styles gate flagged an HTML entity'
+  ! bash "${gate_sandbox}/scripts/check-frontend-styles.sh" --strict >/dev/null 2>&1 ||
+    gate_fail 'styles gate --strict accepted colour literals'
+)
+
 # 所有普通数据库生命周期入口必须路由 typed CLI；recipe 不得保留 shell Alembic、
 # direct drop/create 或任何 obsolete-0019 repair/stamp/downgrade/revision rewrite。
 db_upgrade_definition="$(just --show db-upgrade)"

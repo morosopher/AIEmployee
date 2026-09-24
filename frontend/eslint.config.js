@@ -4,9 +4,12 @@ import globals from 'globals'
 import tseslint from 'typescript-eslint'
 import vueParser from 'vue-eslint-parser'
 
-/** 仅忽略构建和测试生成物，业务源码保持严格静态检查。 */
+/**
+ * 仅忽略构建和测试生成物，业务源码保持严格静态检查。`components.d.ts` 由
+ * unplugin-vue-components 自动生成且已被 git 忽略，不属于可手工维护的源码。
+ */
 export default tseslint.config(
-  { ignores: ['dist', 'coverage', 'playwright-report'] },
+  { ignores: ['dist', 'coverage', 'playwright-report', 'components.d.ts'] },
   js.configs.recommended,
   ...pluginVue.configs['flat/recommended'],
   ...tseslint.configs.recommended,

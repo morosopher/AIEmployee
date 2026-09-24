@@ -38,6 +38,8 @@ coverage/
 frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
+# unplugin-vue-components 在开发、测试与构建时按需生成的全局组件类型声明。
+frontend/components.d.ts
 pnpm-debug.log*
 
 # Runtime data
