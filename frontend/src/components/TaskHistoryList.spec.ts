@@ -76,6 +76,35 @@ describe('TaskHistoryList', () => {
     )
   })
 
+  it.each([
+    ['普通主按钮', {}, true],
+    ['Ctrl', { ctrlKey: true }, false],
+    ['Cmd', { metaKey: true }, false],
+    ['Shift', { shiftKey: true }, false],
+    ['Alt', { altKey: true }, false],
+    ['中键', { button: 1 }, false],
+    ['右键', { button: 2 }, false],
+  ] as const)('任务及重试来源链接保留%s点击语义', async (_name, options, intercepted) => {
+    const source = '20000000-0000-0000-0000-000000000001'
+    const view = await renderWithPlugins(TaskHistoryList, {
+      props: {
+        ...props,
+        page: { ...page, items: [{ ...first, retry_of_task_id: source }] },
+        // 使用同文档链接验证默认动作，避免 jsdom 不支持跨文档导航的噪声。
+        taskHref: (id: string) => `#scope=all&task_id=${id}`,
+      },
+    })
+    // 两种入口共用页面导航，但修饰键及非主按钮必须交给浏览器处理。
+    for (const [name, id] of [[`查看任务 ${first.id}`, first.id], [`查看重试来源 ${source}`, source]]) {
+      const link = view.getByRole('link', { name })
+      expect(link).toHaveAttribute('href', `#scope=all&task_id=${id}`)
+      const event = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, ...options })
+      await fireEvent(link, event)
+      expect(event.defaultPrevented).toBe(intercepted)
+    }
+    expect(view.emitted().select).toEqual(intercepted ? [[first.id], [source]] : undefined)
+  })
+
   it('emits exact background failure scope independent of business status and preserves civil dates', async () => {
     const view = await renderWithPlugins(TaskHistoryList, {
       props: {

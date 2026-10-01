@@ -121,6 +121,16 @@ function taskKindLabel(kind: string): string {
 function linkHref(id: string): string {
   return props.taskHref?.(id) ?? `/tasks?task_id=${encodeURIComponent(id)}`
 }
+/**
+ * 仅普通主按钮点击交给页面选择；其余点击保留 href 的浏览器原生导航。
+ * @param event 原始鼠标点击，修饰键可用于新标签页、新窗口或下载。
+ * @param id 完整任务身份；不从摘要推断执行权限。
+ */
+function selectTask(event: MouseEvent, id: string): void {
+  if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return
+  event.preventDefault()
+  emit('select', id)
+}
 /** 创建/读取时间始终显式使用响应中的用户时区，格式失败不退回宿主时区。 */
 function timeText(value: string): string {
   try {
@@ -319,7 +329,7 @@ function durationText(item: TaskHistoryItem): string {
                 :href="linkHref(item.id)"
                 :aria-label="`查看任务 ${item.id}`"
                 class="rounded text-primary underline focus-visible:outline-2"
-                @click.prevent="emit('select', item.id)"
+                @click="selectTask($event, item.id)"
               >{{ taskKindLabel(item.kind) }}</a>
               <StatusTag
                 kind="task"
@@ -340,7 +350,7 @@ function durationText(item: TaskHistoryItem): string {
               :href="linkHref(item.retry_of_task_id)"
               :aria-label="`查看重试来源 ${item.retry_of_task_id}`"
               class="rounded text-primary underline focus-visible:outline-2"
-              @click.prevent="emit('select', item.retry_of_task_id)"
+              @click="selectTask($event, item.retry_of_task_id)"
             >重试自 {{ item.retry_of_task_id.slice(0, 8) }}</a>
           </li>
         </ul>
