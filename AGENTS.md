@@ -42,6 +42,8 @@ M2.1 已批准的展示层执行口径：
 - Task 8 前允许独立 `fix:` 修改 `frontend/src/features/connections/useConnections.ts` 并新增对应 `useConnections.spec.ts`，仅注入并等待异步 UI 确认回调，保留断开文案、取消零请求、忙碌互斥、断开请求及刷新/卸载规则；页面用 `ConfirmDialog`。计划显式新增 schema、`schema.spec.ts`、`problemFields.ts` 及其测试不开放其他既有 feature 行为层。
 - `just check` 保持快速许可/版本/样式等检查，`just ci` 构建后报告并检查体积预算；最终文档提交后追加 CI 留档，不循环修改自引用 SHA。
 
+用户于 2026-10-01 明确批准任务历史验收中的限定缺陷修复并同步规格、计划和规则：仅允许在 `backend/src/ai_employee/api/sse.py` 的有限数据库读取边界适配断线取消并保证连接清理，及其单元／真实 PostgreSQL 回归。根因是 AnyIO 重复取消中断 SQLAlchemy pre_ping 失效归还；不修改 SSE 事件协议、任务状态、审批／执行、全局 Session 工厂或第三方依赖，不关闭 pre_ping、不吞取消、不屏蔽告警。详见完整任务历史补充规格 §8、§9 和补充计划 Task 9；其他 M2.1 后端边界不变。
+
 ## 目标目录与职责
 
 ```text

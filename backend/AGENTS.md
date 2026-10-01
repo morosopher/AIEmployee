@@ -6,6 +6,8 @@
 
 当前前端重构 M2.1 的完整任务历史补充已由用户确认设计，见 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`。补充规格已复核，执行 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 时仅按规格第 8 节增加用户隔离的只读列表查询、专用游标编码及必要索引；不改变 TaskRun 状态机、任务创建／执行／重试、Outbox、Checkpoint、保留清理或供应商写入。其余后端路径仍遵守根规则的 M2.1 只读边界。
 
+用户于 2026-10-01 明确批准任务历史验收中的限定缺陷修复并同步规格、计划和规则：仅允许在 `backend/src/ai_employee/api/sse.py` 的有限数据库读取边界适配断线取消并保证连接清理，及其单元／真实 PostgreSQL 回归。根因是 AnyIO 重复取消中断 SQLAlchemy pre_ping 失效归还；不修改 SSE 事件协议、任务状态、审批／执行、全局 Session 工厂或第三方依赖，不关闭 pre_ping、不吞取消、不屏蔽告警。详见完整任务历史补充规格 §8、§9 和补充计划 Task 9；其他 M2.1 后端边界不变。
+
 ## 后端定位与目录边界
 
 后端负责身份与会话、REST/SSE 接口、可信任务与操作状态、领域规则、Google/Microsoft 邮件和日历同步、类型化真实写入、结果核对、模型调用、任务编排、持久化和后台进程。目标结构：

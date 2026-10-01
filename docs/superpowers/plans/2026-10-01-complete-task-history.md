@@ -747,6 +747,12 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 
 对14项逐一写出代码、测试文件、命令、输出与commit依据。不能以“单测全绿”代替双向分页／跨用户／迁移／真实API浏览器证据。补充所有发现的失败重现和最小修复，仍按独立fix+复审，不改范围以求通过。
 
+- [ ] **Step 1a: 限定修复 SSE 取消清理缺陷（2026-10-01 用户已批准）**
+
+先将真实 PostgreSQL 诊断转为正常退出的回归，保留 pre_ping 期间断线导致 checkedout 未归零、GC warning 和 terminate error 的 RED。仅在 `backend/src/ai_employee/api/sse.py` 三种有限数据库读取边界适配 AnyIO 与 asyncio 取消，明确资源所有者和有界清理；不得关闭 pre_ping、吞取消、过滤 warning 或丢弃后台任务。保持用户隔离及同一 REPEATABLE READ 快照，不修改事件协议／任务状态／审批／执行或共享会话工厂。对应修复与规格 §8.1、根／后端规则同步为独立 `fix:` 提交，不混入前端导航修复。
+
+测试覆盖三种读取与复用 pre_ping 的真实 EventSourceResponse 断线、正常读取、单次取消、重复外层取消和收尾预算；确认池回到基线、没有依赖 GC 的归还或残留读取任务。通过受管选集入口运行新回归及原 SSE 12 项，再串行运行任务历史／reconnect 相关 E2E 和 `just check`；完整 `just ci` 仍由后续门禁执行，不能以聚焦结果替代。
+
 - [ ] **Step 2: 执行完整门禁**
 
 ```bash

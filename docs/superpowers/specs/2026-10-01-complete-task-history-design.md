@@ -157,11 +157,21 @@ URL 只保存公开的过滤参数、opaque 游标和 task_id，不保存正文�
 
 禁止修改任务创建事务、TaskRun 状态机、Worker、Scheduler、Taskiq 投递、Outbox、Checkpoint、清理器、真实供应商调用、审批／幂等规则及现有 SSE 协议。本规格的后台分类不要求修改每个任务创建点或添加 origin 字段。
 
+### 8.1 验收发现的 SSE 取消清理限定修复
+
+用户于 2026-10-01 批准“限定修复并同步规格、计划和规则”。真实 PostgreSQL 复现证实：SSE 断线触发 AnyIO 重复取消，在 SQLAlchemy 连接复用 pre_ping 失败后的 invalidate/terminate 期间再次取消，跳过池归还，导致连接依赖 GC 才释放。普通单次 asyncio 取消对照能归还连接；这不是历史列表查询忘记关闭 session。
+
+仅开放 `backend/src/ai_employee/api/sse.py` 的 oldest_event_id、events_after、snapshot_and_max 有限数据库读取与收尾边界及必要测试。每次读取必须有明确的任务和连接资源所有者，断线立即通知取消；只保护已取消操作的必要清理，清理必须有界且不丢弃未收尾任务。继续启用 pre_ping，保留取消传播及真实错误／warning 观测，不修改全局 Session 工厂或第三方包。快照和最大游标仍来自同一 REPEATABLE READ 事务，用户条件和原回放语义不变。
+
+清理策略限定在单次读取所有者内：保留公开 AsyncConnection，直接关闭 Session 并设五秒预算；关闭超时或异常后对该确切连接 invalidate，再归还。当前锁定 SQLAlchemy/asyncpg 适配器的失效关闭包含两秒优雅关闭上限及强制关闭回退；不能仅在 timeout 后丢弃任务，也不能只依赖已经移除 SessionTransaction 的 session.invalidate。失效失败仍在五秒预算内尝试 close，错误不可静默：正常读取传播收尾错误；已经断线时记录固定安全错误日志并保留原 CancelledError。只对支持的驱动取消／关闭路径提供有界清理，不声称任意驱动故障均保证归还。正常查询收到断线即取消，不屏蔽整段查询；该策略不新增全局超时、后台清理注册表或共享引擎行为。
+
+不更改 SSE 事件／心跳／重放协议、TaskRun、任务动作、审批／幂等、Outbox、Worker 或列表 reader。真实 PostgreSQL 回归须覆盖预检查及三种读取期间的断线，断线后连接回到基线、不依赖 GC、无终止错误；原 SSE 和相关浏览器回归继续通过。测试不得用 SIGINT 退出代替成功收尾。
+
 ## 9. 与 M2.1 的接续
 
 本补充的查询、迁移、前端列表状态与契约按独立任务及提交实施；M2.1 Task 7 在这些接口通过后迁移 DataView、StatusTag、Timeline 并集成列表。两份实施计划须在开始代码前明确文件归属，避免同时迁移同一页面；不以本补充重做 Task 1～6。
 
-M2.1 对其他 API、Store、composable、router 和后端路径的只读要求继续有效。本例外仅覆盖本规格 §8 的只读任务历史能力及索引，不是对全部后端或行为层的开放。
+M2.1 对其他 API、Store、composable、router 和后端路径的只读要求继续有效。本例外仅覆盖本规格 §8 的只读任务历史能力及索引，以及 §8.1 用户批准的 SSE 取消清理修复，不是对全部后端或行为层的开放。
 
 原 Task 8 异步确认前置修复以及 Task 8～17 继续按原顺序。M2.2 仍未批准，不实施部署、CSP、TLS 或新产品能力。最终 M2.1 验收应同时包含本补充的查询、安全和分页证据，不用 UI 绿色替代后端验证。
 

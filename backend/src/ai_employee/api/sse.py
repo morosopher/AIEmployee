@@ -4,16 +4,18 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID
 
+from anyio import CancelScope
 from redis.asyncio import Redis
 from redis.asyncio.client import PubSub
 from redis.exceptions import RedisError
 from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from ai_employee.application.use_cases.action_views import public_action_event_payload
@@ -27,6 +29,7 @@ from ai_employee.infrastructure.observability.metrics import Metrics
 HEARTBEAT_SECONDS = 15
 REDIS_OPERATION_TIMEOUT_SECONDS = 1.0
 REDIS_PUBSUB_POLL_SECONDS = 0.25
+SSE_DATABASE_CLOSE_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +153,78 @@ class TaskEventStore:
         self._session_factory = session_factory
         self._task_store = task_store
 
+    async def _read_database[T](self, read: Callable[[AsyncSession], Awaitable[T]]) -> T:
+        """由一个 asyncio 任务完整拥有单次读取及连接，适配 SSE 的重复取消。
+
+        Args:
+            read: 仅执行本类有限只读查询的回调，不启动任务或捕获取消。
+
+        Returns:
+            已关闭会话后的只读结果，不转移 Session 或连接所有权。
+
+        Raises:
+            asyncio.CancelledError: 外层取消立即单次传给读取任务，收尾后原样传播。
+            TimeoutError: 会话关闭超过五秒；确切连接失效及归还后传播。
+
+        不能直接等待 SQLAlchemy 的 session 上下文退出：它会启动隐式 close 任务。
+        本处直接 close 并限定五秒；超时/异常时仍持有公开 AsyncConnection，避免
+        SessionTransaction 已移除自身后失去资源引用。当前 asyncpg 适配器 invalidate
+        最多优雅关闭两秒，然后 force-close；失效后 close 不再等待数据库 rollback。
+        invalidate 失败仍尝试有界 close 并保留错误；不承诺驱动任意异常下必然归还。
+        已断线时收尾异常记录固定安全日志，外层仍抛原取消；未断线则传播收尾异常。
+        pre_ping 尚未返回连接时，单次取消让驱动失效路径完成池归还。正常查询不屏蔽
+        断线；仅已取消后的收尾屏蔽 AnyIO level cancellation，不登记后台清理任务。
+        """
+        async def owned_read() -> T:
+            """局部所有者保留连接直到查询及所有收尾均完成，不向调用方返回资源。"""
+            session = self._session_factory()
+            connection: AsyncConnection | None = None
+            try:
+                connection = await session.connection()
+                return await read(session)
+            finally:
+                try:
+                    async with asyncio.timeout(SSE_DATABASE_CLOSE_SECONDS):
+                        await session.close()
+                except BaseException:
+                    # close 可能先移除 SessionTransaction，不能仅再调 session.invalidate。
+                    if connection is not None:
+                        try:
+                            await connection.invalidate()
+                        finally:
+                            # 失效异常不能跳过关闭；该异常路径也不允许无界 rollback。
+                            async with asyncio.timeout(SSE_DATABASE_CLOSE_SECONDS):
+                                await connection.close()
+                    raise
+
+        task = asyncio.create_task(owned_read())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            with CancelScope(shield=True):
+                # 外层普通 Task.cancel 也可能再次到达；只等待原所有者，不能再次取消它。
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 - 下方统一观察子任务异常，保留原取消。
+                        break
+                if not task.cancelled():
+                    try:
+                        task.result()
+                    except Exception:  # noqa: BLE001 - DBAPI 收尾边界只记录固定错误，禁止载荷外泄。
+                        # 不泄漏 DBAPI 异常正文；清理错误必须可见，外层仍保留断线取消。
+                        logger.error("task event database cleanup failed")
+            raise
+
     async def events_after(
         self, *, task_id: UUID, user_id: UUID, after_id: int
     ) -> tuple[DurableTaskEvent, ...]:
         """读取大于游标的有序审计行；用户条件是第二道隔离防线。"""
-        async with self._session_factory() as session:
+        async def read(session: AsyncSession) -> tuple[DurableTaskEvent, ...]:
+            """同一短会话读取摘要，再转换为不持有 ORM 的事件。"""
             rows = tuple(
                 (
                     await session.scalars(
@@ -168,26 +238,31 @@ class TaskEventStore:
                     )
                 ).all()
             )
-        return tuple(
-            DurableTaskEvent(
-                id=row.id,
-                task_id=task_id,
-                event=row.event_type,
-                occurred_at=row.created_at,
-                step_id=_step_id(row.event_metadata),
-                payload=row.event_metadata,
+            return tuple(
+                DurableTaskEvent(
+                    id=row.id,
+                    task_id=task_id,
+                    event=row.event_type,
+                    occurred_at=row.created_at,
+                    step_id=_step_id(row.event_metadata),
+                    payload=row.event_metadata,
+                )
+                for row in rows
             )
-            for row in rows
-        )
+
+        return await self._read_database(read)
 
     async def oldest_event_id(self, *, task_id: UUID, user_id: UUID) -> int | None:
         """返回当前保留区间起点，用于判断 Last-Event-ID 回放间隙。"""
-        async with self._session_factory() as session:
+        async def read(session: AsyncSession) -> int | None:
+            """保留用户隔离与原最小游标查询，取消由会话所有者统一处理。"""
             return await session.scalar(
                 select(func.min(AuditEventModel.id)).where(
                     AuditEventModel.task_id == task_id, AuditEventModel.user_id == user_id
                 )
             )
+
+        return await self._read_database(read)
 
     async def snapshot_and_max(
         self, *, task_id: UUID, user_id: UUID
@@ -197,18 +272,21 @@ class TaskEventStore:
 
         if not isinstance(self._task_store, SqlAlchemyTaskViewStore):
             raise TypeError("task event store requires SQL task store")
-        async with self._session_factory.begin() as session:
+        task_store = self._task_store
+
+        async def read(session: AsyncSession) -> tuple[TaskSnapshot | None, int]:
+            """全部读取复用同一事务；退出只回滚只读事务，不产生提交通知。"""
             # 首条 SQL 在任何快照读取前设置隔离级别，确保任务、步骤和最大事件来自同一视图。
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            snapshot = await self._task_store._get_in_session(
-                session, task_id=task_id, user_id=user_id
-            )
+            snapshot = await task_store._get_in_session(session, task_id=task_id, user_id=user_id)
             maximum = await session.scalar(
                 select(func.max(AuditEventModel.id)).where(
                     AuditEventModel.task_id == task_id, AuditEventModel.user_id == user_id
                 )
             )
-        return snapshot, maximum or 0
+            return snapshot, maximum or 0
+
+        return await self._read_database(read)
 
 
 def _step_id(metadata: dict[str, JsonValue]) -> UUID | None:
