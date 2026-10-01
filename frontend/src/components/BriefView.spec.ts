@@ -1,4 +1,6 @@
-import { mount } from '@vue/test-utils'
+/** 通过可见动作名称、来源标签与正文查询简报；不依赖链接或按钮的渲染顺序。 */
+import { fireEvent } from '@testing-library/vue'
+import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import { describe, expect, it, vi } from 'vitest'
 import BriefView from './BriefView.vue'
 import type { Brief } from '@/api/types'
@@ -39,15 +41,25 @@ describe('BriefView', () => {
         ],
       }
       const propose = vi.fn()
-      const wrapper = mount(BriefView, { props: { brief, propose } })
+      const { getAllByRole, getByRole } = await renderWithPlugins(BriefView, {
+        props: { brief, propose },
+      })
       expect(propose).not.toHaveBeenCalled()
-      expect(wrapper.findAll('button')).toHaveLength(2)
-      await wrapper.findAll('button')[1]?.trigger('click')
+      const actionLabel =
+        kind === 'mail.reply' ? '创建回复草稿' : '创建修改提案'
+      expect(
+        getAllByRole('button', {
+          name: new RegExp(`^${actionLabel}（来源 [12]）$`),
+        }),
+      ).toHaveLength(2)
+      await fireEvent.click(
+        getByRole('button', { name: `${actionLabel}（来源 2）` }),
+      )
       expect(propose).toHaveBeenCalledWith(kind, sources[1])
     },
   )
 
-  it('does not make unknown actions or nonlocal source IDs executable', () => {
+  it('does not make unknown actions or nonlocal source IDs executable', async () => {
     const brief: Brief = {
       id: 'brief',
       task_id: 'task',
@@ -77,11 +89,13 @@ describe('BriefView', () => {
         },
       ],
     }
-    const wrapper = mount(BriefView, { props: { brief, propose: vi.fn() } })
-    expect(wrapper.find('button').exists()).toBe(false)
+    const { queryByRole } = await renderWithPlugins(BriefView, {
+      props: { brief, propose: vi.fn() },
+    })
+    expect(queryByRole('button', { name: '创建回复草稿' })).toBeNull()
   })
-  it('renders completeness, cutoff, warnings and source links', () => {
-    const wrapper = mount(BriefView, {
+  it('renders completeness, cutoff, warnings and source links', async () => {
+    const { getByText, getByRole } = await renderWithPlugins(BriefView, {
       props: {
         brief: {
           id: 'b1',
@@ -114,9 +128,11 @@ describe('BriefView', () => {
         },
       },
     })
-    expect(wrapper.text()).toContain('partial')
-    expect(wrapper.text()).toContain('Calendar unavailable')
-    expect(wrapper.text()).toContain('2026-08-04T08:00:00Z')
-    expect(wrapper.find('a').attributes('href')).toContain('mail.google.com')
+    expect(getByText(/完整性：partial/)).toBeVisible()
+    expect(getByText('Calendar unavailable')).toBeVisible()
+    expect(getByText(/2026-08-04T08:00:00Z/)).toBeVisible()
+    expect(
+      getByRole('link', { name: 'gmail 来源' }).getAttribute('href'),
+    ).toContain('mail.google.com')
   })
 })
