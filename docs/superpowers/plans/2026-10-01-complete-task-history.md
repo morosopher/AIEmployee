@@ -672,8 +672,10 @@ git commit -m "feat: manage task history navigation and refresh"
 - Modify: `frontend/src/pages/TasksPage.vue`、`TasksPage.spec.ts`
 - Modify: `frontend/src/components/TaskTimeline.vue`、`TaskTimeline.spec.ts`
 - Create: `frontend/src/components/TaskHistoryList.vue`、`TaskHistoryList.spec.ts`
+- Modify（任务页自有详情去重）: `frontend/src/components/AppShell.vue`、`AppShell.spec.ts`
+- Modify（对应布局事实）: `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`、`docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md`
 - Create: `frontend/e2e/task-history.spec.ts`
-- Modify（仅必要语义选择器）: `frontend/e2e/reconnect.spec.ts`、`action-workspace.spec.ts`、`calendar-restore.spec.ts`
+- Modify（仅必要语义选择器与新增只读 GET 的精确契约 fixture）: `frontend/e2e/reconnect.spec.ts`、`action-workspace.spec.ts`、`calendar-restore.spec.ts`；原未知请求、写入、审批和 SSE 断言保留
 - Modify: `docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md`（Task7完成记录/交接，不更改其他任务）
 
 **Interfaces:** TaskHistoryList接收page/filters/loading/error/newTaskHint；只emit过滤、翻页、刷新和select(id)，不调用API。TasksPage组合useTaskHistory和原选中任务详情；TaskTimeline保持既有task/retry/follow Props。本任务就是原M2.1 Task7，不另派第二个Task7实现者。

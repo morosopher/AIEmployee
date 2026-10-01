@@ -13,18 +13,16 @@ import AppShell from './AppShell.vue'
 import { getSystemAlerts } from '@/api/system'
 
 vi.mock('@/api/system', () => ({
-  getSystemAlerts: vi
-    .fn()
-    .mockResolvedValue({
-      alerts: [
-        {
-          code: 'daily_brief_overdue',
-          severity: 'critical',
-          local_date: '2026-08-04',
-          diagnostic_task_id: 'diag-1',
-        },
-      ],
-    }),
+  getSystemAlerts: vi.fn().mockResolvedValue({
+    alerts: [
+      {
+        code: 'daily_brief_overdue',
+        severity: 'critical',
+        local_date: '2026-08-04',
+        diagnostic_task_id: 'diag-1',
+      },
+    ],
+  }),
 }))
 
 describe('AppShell', () => {
@@ -131,14 +129,18 @@ describe('AppShell', () => {
 
 /** 全局展示只读取任务连接投影，不建立第二条 SSE。 */
 describe('AppShell responsive feedback', () => {
-  it.each([600, 1000, 1400])(
-    'hides the timeline on actions at %i pixels',
-    async (width) => {
+  it.each(
+    [600, 1000, 1400].flatMap((width) =>
+      ['/actions', '/tasks'].map((route) => ({ width, route })),
+    ),
+  )(
+    'hides the global timeline on $route at $width pixels',
+    async ({ width, route }) => {
       setViewport(width)
       vi.mocked(getSystemAlerts).mockResolvedValue({ alerts: [] })
-      const view = await renderWithPlugins(AppShell, { route: '/actions' })
+      const view = await renderWithPlugins(AppShell, { route })
       expect(
-        view.queryByRole('complementary', { name: '执行时间线' }),
+        view.queryByRole('complementary', { name: '任务时间线' }),
       ).toBeNull()
       expect(view.queryByRole('button', { name: /任务时间线/ })).toBeNull()
     },

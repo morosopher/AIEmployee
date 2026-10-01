@@ -65,6 +65,8 @@
 
 ### 4.2 详情与原动作
 
+任务历史页拥有自己的详情与唯一可操作时间线：AppShell 在 `/tasks` 与 `/actions` 不挂载全局 TimelineDrawer，也不预留额外第三列。桌面任务页内部为列表与详情两列，窄屏为内联详情并提供返回列表及焦点恢复；其他页面继续使用原全局时间线抽屉。该限定去重避免展示无法执行的占位重试按钮，不引入跨组件动作框架。
+
 点击行设置既有 `task_id`，保留当前筛选和游标。浏览器刷新、前进／后退及站内任务链接仍能打开该任务；即使任务不在当前筛选结果内，也正常读取其详情，不强行清空筛选。
 
 取消、重试仅在详情执行，继续走原 API、CSRF、幂等键、服务端状态校验及 replacement 跟随。列表不凭摘要推导操作授权；trusted_action 的审批／结果确认仍留在原可信操作界面。
@@ -148,6 +150,7 @@ URL 只保存公开的过滤参数、opaque 游标和 task_id，不保存正文�
 - `frontend/src/api/taskHistory.ts` 及其契约测试：独立严格摘要解析，不降低现有 API 校验。
 - `frontend/src/features/tasks/useTaskHistory.ts` 及测试：独立列表状态与可见性探测。
 - `frontend/src/pages/TasksPage.vue`、对应测试及必要列表展示组件：组合真实列表和现有详情。
+- `frontend/src/components/AppShell.vue` 及测试：仅在任务页排除全局时间线副本及额外布局列，保留其他页面抽屉；reconnect 抽屉键盘用例改在非自有详情页运行，原 SSE 用例不变。
 - 后端单元／集成／API 契约测试、前端单测／E2E、相关规则和验收文档。
 
 索引迁移必须通过既有 Alembic、schema lifecycle 和 schema/ACL 审计流程，不添加角色或权限，不绕过迁移守卫。不得未经证据就声称 `CREATE INDEX CONCURRENTLY` 原子回滚；具体索引部署步骤在实施计划中按现有迁移框架落实并测试。

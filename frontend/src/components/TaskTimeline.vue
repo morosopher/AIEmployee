@@ -1,5 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import Button from 'primevue/button'
+import Message from 'primevue/message'
+import Timeline from 'primevue/timeline'
+import StatusTag from './StatusTag.vue'
 
 import { ProblemError } from '@/api/client'
 import type { TaskSnapshot, TaskStep } from '@/api/types'
@@ -69,91 +73,83 @@ function durationText(step: TaskStep): string {
 
 <template>
   <aside
-    class="task-timeline"
+    class="min-w-0"
     aria-label="执行时间线"
   >
-    <p
+    <Message
       v-if="!task"
       role="status"
+      aria-live="polite"
+      severity="info"
     >
       请选择一个任务查看执行时间线。
-    </p>
+    </Message>
     <template v-else>
       <header>
         <h2>执行时间线</h2>
-        <p>任务状态：{{ task.status }}</p>
+        <p>
+          <span>任务状态：{{ task.status }}</span>
+          <StatusTag
+            kind="task"
+            :value="task.status"
+          />
+        </p>
       </header>
-      <p
+      <Message
         v-if="task.error_code"
-        class="error"
+        severity="error"
         role="alert"
       >
         错误代码：{{ task.error_code }}
-      </p>
+      </Message>
       <!-- 仅使用服务端确认的配置错误码提供恢复指引，不显示供应商原始响应。 -->
       <p v-if="task.error_code === 'google_api_not_enabled'">
-        请在 Google Cloud 中为当前 OAuth 应用所属项目启用对应的 Gmail API 或 Google Calendar API，启用后重试同步。
+        请在 Google Cloud 中为当前 OAuth 应用所属项目启用对应的 Gmail API 或
+        Google Calendar API，启用后重试同步。
       </p>
-      <ol
+      <Timeline
         v-if="task.steps.length"
+        :value="task.steps"
+        data-key="id"
         aria-label="任务步骤"
+        :pt="{
+          eventOpposite: { class: 'hidden' },
+          eventContent: { class: 'min-w-0 pb-4' },
+        }"
       >
-        <li
-          v-for="step in task.steps"
-          :key="step.id"
-        >
-          <strong>{{ step.name }}</strong>
-          <span>状态：{{ step.status }}</span>
-          <span>{{ durationText(step) }}</span>
-          <span
-            v-if="step.error_code"
-            class="error"
-          >错误代码：{{ step.error_code }}</span>
-          <details>
-            <summary>查看摘要</summary>
-            <pre>{{ summaryText(step.output_summary) }}</pre>
-          </details>
-        </li>
-      </ol>
+        <template #content="{ item: step }: { item: TaskStep }">
+          <div class="flex min-w-0 flex-col gap-1">
+            <strong>{{ step.name }}</strong>
+            <span>状态：{{ step.status }}</span>
+            <span>{{ durationText(step) }}</span>
+            <span
+              v-if="step.error_code"
+              class="text-red-700"
+            >错误代码：{{ step.error_code }}</span>
+            <details>
+              <summary>查看摘要</summary>
+              <pre class="overflow-auto whitespace-pre-wrap break-words">{{
+                summaryText(step.output_summary)
+              }}</pre>
+            </details>
+          </div>
+        </template>
+      </Timeline>
       <p v-else>
         暂时没有可展示的步骤。
       </p>
-      <button
+      <Button
         v-if="canRetry"
-        type="button"
+        label="重试任务"
         @click="retryTask"
-      >
-        重试任务
-      </button>
-      <p
+      />
+      <Message
         v-if="retryError"
-        class="error"
+        severity="error"
         role="alert"
       >
         {{ retryError }}
-      </p>
+      </Message>
     </template>
   </aside>
 </template>
-
-<style scoped>
-.task-timeline {
-  padding: 1rem;
-  border-left: 1px solid #d7dce5;
-}
-ol {
-  padding-left: 1.25rem;
-}
-li {
-  display: grid;
-  gap: 0.25rem;
-  margin-bottom: 1rem;
-}
-pre {
-  overflow: auto;
-  white-space: pre-wrap;
-}
-.error {
-  color: #a61b1b;
-}
-</style>

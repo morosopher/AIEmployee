@@ -191,8 +191,7 @@ test('page reload restores durable snapshot and deduplicates replayed task event
       await expect(page.getByText('当前状态：running')).toBeVisible()
       await expect(
         page
-          .getByRole('main')
-          .last()
+          .getByRole('list', { name: '任务步骤' })
           .getByRole('listitem')
           .filter({ hasText: 'persist' }),
       ).toHaveCount(1)
@@ -237,8 +236,7 @@ test('page reload restores durable snapshot and deduplicates replayed task event
   await expect(page.getByText('当前状态：succeeded')).toBeVisible()
   await expect(
     page
-      .getByRole('main')
-      .last()
+      .getByRole('list', { name: '任务步骤' })
       .getByRole('listitem')
       .filter({ hasText: 'persist' }),
   ).toHaveCount(1)
@@ -263,8 +261,9 @@ test('mobile shell traps focus and restores interactive background after each dr
   await page.route('**/api/v1/tasks/task-1', (route) =>
     route.fulfill({ json: terminalSnapshot }),
   )
-  await page.goto('/tasks?task_id=task-1')
-  await expect(page.getByText('当前状态：succeeded')).toBeVisible()
+  await page.route('**/api/v1/briefs/today', (route) => route.fulfill({ status: 404, json: { type: 'about:blank', title: 'Not found', status: 404, detail: '', instance: '', error_code: 'brief_not_found', trace_id: 'synthetic-brief' } }))
+  await page.goto('/brief')
+  await expect(page.getByRole('heading', { name: '今日简报', level: 1 })).toBeVisible()
 
   for (const [triggerName, dialogName] of [
     ['打开导航', '主导航'],

@@ -85,6 +85,23 @@ test('calendar restore follows preparation, reloads its exact result and require
     },
   )
   let prepared = false
+  let historyReads = 0
+  // 任务历史页新增的只读入口：精确验证参数，未知请求和所有写入仍由原捕获器拒绝。
+  // 不固定总次数，慢 CI 中已批准的 30 秒可见探测可合法重复同一 GET。
+  await page.route('**/api/v1/tasks?*', async (route) => {
+    expect(route.request().method()).toBe('GET')
+    expect([...new URL(route.request().url()).searchParams.entries()].sort()).toEqual([
+      ['limit', '20'], ['scope', 'business'],
+    ])
+    historyReads += 1
+    await editorJson(route, {
+      items: [{ id: PREPARE_TASK_ID, kind: 'calendar.restore.prepare', category: 'business',
+        status: prepared ? 'succeeded' : 'queued', created_at: '2030-01-01T00:00:00.000000Z',
+        started_at: null, finished_at: null, error_code: null, retry_of_task_id: null }],
+      next_cursor: null, previous_cursor: null, server_time: '2030-01-01T00:00:00.000000Z',
+      filter_timezone: 'Asia/Shanghai', background_failed_count: 0,
+    })
+  })
   await page.route(`**/api/v1/tasks/${PREPARE_TASK_ID}`, (route) =>
     editorJson(route, {
       id: PREPARE_TASK_ID,
@@ -204,7 +221,10 @@ test('calendar restore follows preparation, reloads its exact result and require
     'href',
     `/calendar/proposals/${RESTORE_ID}`,
   )
+  expect(historyReads).toBeGreaterThanOrEqual(1)
+  const readsBeforeReload = historyReads
   await page.reload()
+  await expect.poll(() => historyReads).toBeGreaterThan(readsBeforeReload)
   await expect(page.getByTestId('restore-result')).toHaveAttribute(
     'href',
     `/calendar/proposals/${RESTORE_ID}`,

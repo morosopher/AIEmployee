@@ -443,11 +443,18 @@ git commit -m "feat: migrate chat page to PrimeVue"
 
 ### Task 7: 迁移任务历史与时间线
 
-**前置条件：** 完整任务历史规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 已获用户复核。先执行 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 1～7，交付受用户隔离的真实任务列表查询与前端列表状态；该补充计划 Task 8 同时执行本任务的展示迁移与集成，不重复实现。现有前后端没有历史列表接口，禁止以单个选中任务或 Pinia 缓存替代完整历史。补充计划必须划清 TasksPage 与本任务的文件／验证归属；新增能力仅限补充规格第 8 节，其余行为层继续只读。
+**前置条件：** 完整任务历史规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 已获用户复核。先执行 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 1～7，交付受用户隔离的真实任务列表查询与前端列表状态；该补充计划 Task 8 同时执行本任务的展示迁移与集成，不重复实现。迁移前的前后端没有历史列表接口，禁止以单个选中任务或 Pinia 缓存替代完整历史。补充计划必须划清 TasksPage 与本任务的文件／验证归属；新增能力仅限补充规格第 8 节，其余行为层继续只读。
+
+**实施交接（2026-10-01）：** 补充计划 Task 8 已完成真实列表与本任务的同一次展示迁移，提交主题为 `feat: migrate task history and timeline to PrimeVue`。本任务不再安排第二次迁移；两计划的最终完成标记由独立审查后统一关闭。功能使用 PostgreSQL 摘要 API 与独立列表状态，摘要不写入完整 Task Store；取消、重试幂等及恢复提案审批保持原契约。最小范围补充为 AppShell 在 `/tasks` 排除全局时间线副本／第三布局列，其他页面保留原抽屉。
+
+验证：旧 11 项组件安全网和 10 项相关 E2E 先绿色，新列表／接线／Timeline／AppShell／分页焦点均有 RED；最终 `just check` 通过（后端 2725、前端 41 文件 450 测试），相关 E2E 12 项通过，含真实认证与既有 POST 创建 25 条未访问任务后跨页找回。恢复提案原精确文案、审批及写入断言未降低；仅登记新增 GET `/tasks` 的精确参数契约，并允许合法可见性探测。
+
+Live region：TasksPage 的 3 status／2 alert、TaskTimeline 的 1 status／2 alert 静态语义与旧文案全部保留，改由显式 role 的 Message 承载；TaskHistoryList 新增 2 status（加载／新任务）及 1 alert（安全错误）。DataView／Timeline 不新增播报；任务页移除外壳重复时间线，避免同一错误或空提示重复播报。角色运行时、窄屏焦点、旧 SSE 重放及恢复入口均有本轮测试证据。详细日志见补充计划私有执行目录 `task-8-*.log`；未将此次 UI 集成称为 M2.1 发布验收。
 
 **Files:**
 - Modify: `frontend/src/pages/TasksPage.vue`、`frontend/src/pages/TasksPage.spec.ts`
 - Modify: `frontend/src/components/TaskTimeline.vue`、`frontend/src/components/TaskTimeline.spec.ts`
+- 同次集成补充文件由完整任务历史计划 Task 8 列出，包含 TaskHistoryList、AppShell 去重与必要 E2E 契约 fixture。
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 

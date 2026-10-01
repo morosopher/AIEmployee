@@ -13,6 +13,8 @@ import { useRoute } from 'vue-router'
 import { useTasksStore } from '@/stores/tasks'
 import { getSystemAlerts, type SystemAlert } from '@/api/system'
 const route = useRoute()
+/** 自有详情页不再挂全局时间线，避免第二个无真实动作回调的重试入口。 */
+const hasGlobalTimeline = computed(() => route.path !== '/actions' && route.path !== '/tasks')
 const tasks = useTasksStore()
 const task = computed(() =>
   typeof route.query.task_id === 'string'
@@ -117,7 +119,7 @@ watch(
     :inert="modalOpen || undefined"
     class="grid min-h-screen grid-cols-1 content-start bg-surface-50 text-color md:grid-cols-[14rem_minmax(0,1fr)]"
     :class="{
-      'xl:grid-cols-[14rem_minmax(0,1fr)_20rem]': route.path !== '/actions',
+      'xl:grid-cols-[14rem_minmax(0,1fr)_20rem]': hasGlobalTimeline,
     }"
   >
     <div class="col-span-full">
@@ -140,7 +142,7 @@ watch(
       <RouterView />
     </main>
     <TimelineDrawer
-      v-if="route.path !== '/actions'"
+      v-if="hasGlobalTimeline"
       @modal-change="timelineOpen = $event"
     >
       <TaskTimeline
