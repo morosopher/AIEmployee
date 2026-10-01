@@ -112,11 +112,60 @@ FAKE_PNPM
     cat "${gate_sandbox}/licence.log" >&2
     gate_fail 'licence gate rejected valid synthetic inputs'
   }
+  # 用户批准的基线只覆盖精确包/版本/许可组合。逐个使用合成清单验证放行与拒绝，
+  # 避免把整类宽松许可放开；生产例外在开发树仍可使用，反向则必须拒绝。
+  while read -r exception_scope exception_name exception_version exception_license; do
+    printf '{"%s":[{"name":"%s","versions":["%s"]}]}' \
+      "${exception_license}" "${exception_name}" "${exception_version}" >"${gate_sandbox}/exception.json"
+    if [[ "${exception_scope}" == prod ]]; then
+      run_licence_gate exception.json dev.json || gate_fail "rejected approved prod ${exception_name}@${exception_version}"
+    else
+      ! run_licence_gate exception.json dev.json || gate_fail "accepted dev exception in prod: ${exception_name}"
+    fi
+    run_licence_gate prod.json exception.json || gate_fail "rejected approved dev ${exception_name}@${exception_version}"
+
+    # 与批准版本同组报告未知版本时也必须拒绝，不能只检查 versions 数组首项。
+    printf '{"%s":[{"name":"%s","versions":["%s","99.0.0"]}]}' \
+      "${exception_license}" "${exception_name}" "${exception_version}" >"${gate_sandbox}/different-version.json"
+    ! run_licence_gate prod.json different-version.json || gate_fail "accepted unapproved version: ${exception_name}@99.0.0"
+    if [[ "${exception_scope}" == prod ]]; then
+      ! run_licence_gate different-version.json dev.json || gate_fail "accepted unapproved prod version: ${exception_name}@99.0.0"
+    fi
+    # 使用默认白名单外的另一许可，确保失败来自例外原文校验而非其他门禁。
+    printf '{"GPL-3.0-only":[{"name":"%s","versions":["%s"]}]}' \
+      "${exception_name}" "${exception_version}" >"${gate_sandbox}/different-license.json"
+    ! run_licence_gate prod.json different-license.json || gate_fail "accepted unapproved license: ${exception_name}"
+    if [[ "${exception_scope}" == prod ]]; then
+      ! run_licence_gate different-license.json dev.json || gate_fail "accepted unapproved prod license: ${exception_name}"
+    fi
+  done <<'APPROVED_BASELINE_FIXTURE'
+prod argparse 2.0.1 Python-2.0
+dev @csstools/color-helpers 6.1.0 MIT-0
+dev @csstools/css-syntax-patches-for-csstree 1.1.7 MIT-0
+dev jackspeak 3.4.3 BlueOak-1.0.0
+dev lru-cache 11.5.2 BlueOak-1.0.0
+dev minimatch 10.2.6 BlueOak-1.0.0
+dev minipass 7.1.3 BlueOak-1.0.0
+dev package-json-from-dist 1.0.1 BlueOak-1.0.0
+dev path-scurry 1.11.1 BlueOak-1.0.0
+dev mdn-data 2.27.1 CC0-1.0
+APPROVED_BASELINE_FIXTURE
   # 空清单通常意味着依赖未安装或 pnpm 输出异常，必须失败而不是“0 个包全部合规”。
   ! run_licence_gate empty.json dev.json || gate_fail 'licence gate accepted an empty prod listing'
   ! run_licence_gate prod.json empty.json || gate_fail 'licence gate accepted an empty dev listing'
   printf '\n  primevue@5.0.0:\n    resolution: {}\n' >>"${gate_sandbox}/frontend/pnpm-lock.yaml"
   ! run_licence_gate prod.json dev.json || gate_fail 'licence gate accepted primevue@5.0.0 in the lockfile'
+
+  # 版本锁定比较完整版本：预发布不能借正式版通过，pnpm peer-context 不属于版本。
+  for locked_package in 'primevue@4.5.5-beta.1' '@primevue/core@4.5.5-rc.1'; do
+    printf "lockfileVersion: '9.0'\n\npackages:\n\n  primevue@4.5.5:\n    resolution: {}\n  '%s':\n    resolution: {}\n" \
+      "${locked_package}" >"${gate_sandbox}/frontend/pnpm-lock.yaml"
+    ! run_licence_gate prod.json dev.json || gate_fail "accepted prerelease in lockfile: ${locked_package}"
+  done
+  # 只留带 peer-context 的正式版条目，确保识别与精确匹配都实际发生。
+  printf "lockfileVersion: '9.0'\n\nsnapshots:\n\n  'primevue@4.5.5(vue@3.5.0)':\n  '@primevue/core@4.5.5(vue@3.5.0)':\n" \
+    >"${gate_sandbox}/frontend/pnpm-lock.yaml"
+  run_licence_gate prod.json dev.json || gate_fail 'rejected stable versions with peer context'
 
   # 样式门禁：8 位 #rrggbbaa 必须计入，HTML 实体 &#8212; 不是颜色；工具类中的颜色照样命中。
   printf '%s\n' '<template><p class="bg-[#fff]">&#8212;</p></template>' \

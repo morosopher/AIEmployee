@@ -30,7 +30,7 @@ frontend/
 本节引用的 `src/design/`、`src/test-support/renderWithPlugins.ts`、`src/test-support/liveRegionInventory.spec.ts`、`e2e/accessibility.spec.ts`、`e2e/layout.spec.ts` 与 `scripts/check-frontend-*.sh`、`scripts/report-frontend-bundle.sh` 由 M2.1 实施计划的 Task 1、2、16 建立；对应任务提交前，以实施计划为准，不得把尚未落地的门禁描述为已生效。
 
 - UI 技术栈固定为 PrimeVue `4.5.5`（styled 模式 + 定制 Aura 预设）、`@primevue/forms` `4.5.5`、`@primeuix/themes` 2.x、`primeicons` 7、Tailwind CSS 4、`tailwindcss-primeui`、`@vueuse/core`、`zod`。引入其他 UI 库、图标库、CSS 体系、状态库、请求库，或升级 PrimeVue 主版本，必须先获 ADR 批准。
-- 禁止安装 PrimeVue 5、任何 `@primeui/*` 包或 `@primeuix/themes` 3.x：它们采用 PrimeUI 商业许可并含许可 Key 机制。`scripts/check-frontend-licenses.sh` 会在 `just check` 中拒绝这些包和非 MIT/ISC/BSD/Apache-2.0 的生产依赖。
+- 禁止安装 PrimeVue 5、任何 `@primeui/*` 包或 `@primeuix/themes` 3.x：它们采用 PrimeUI 商业许可并含许可 Key 机制。`scripts/check-frontend-licenses.sh` 会在 `just check` 中拒绝这些包，以及默认 MIT/ISC/BSD/Apache-2.0 白名单以外且未匹配已批准基线例外的生产依赖。基线例外唯一完整清单见 M2.1 规格 §3.2：包名、精确版本与许可证原文必须同时匹配；生产例外可用于开发树，开发例外不得用于生产树，升级不继承例外。新增例外须先获用户批准并同步规格、计划、规则和测试。
 - M2.1 只替换展示层。`src/api/**`、`src/stores/**`、`src/composables/**`、`src/router/**` 以及 `src/features/**` 中除 `schema.ts`/`presentation.ts` 以外的文件在 M2.1 视为只读；发现行为层缺陷时以独立 `fix:` 提交修复并附回归测试，不混入视觉重构。
 - 颜色、间距、圆角、断点和动效只能来自 `src/design/tokens.ts` 导出的 token 与 Tailwind 工具类；`.vue` 文件中不得出现十六进制颜色字面量或 `@media` 查询，`scripts/check-frontend-styles.sh` 负责检查。
 - 表单使用 PrimeVue Forms + zod 只做格式级校验；收件人数量、工作时间、冲突、版本、能力和审批有效性以服务端 Problem Details 为准，字段错误通过 `features/forms/problemFields.ts` 按 `error_code` 映射。

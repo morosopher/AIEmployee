@@ -107,10 +107,31 @@ Task 1 的提交说明。`@primeuix/themes` 3.x 和 `@primeuix/*` 1.x 系列已�
 - `package.json` 中 PrimeVue 相关包使用精确版本，不使用范围符号。
 - 新增 CI 检查：解析 `pnpm-lock.yaml`，若出现 `primevue@5`、`@primeui/*` 或
   `@primeui/license-manager` 即失败。
-- 新增许可证检查：`pnpm licenses list --json` 的生产依赖只允许 MIT、ISC、BSD-2/3、
-  Apache-2.0；开发依赖额外允许 MPL-2.0。出现 `SEE LICENSE IN` 或未知许可即失败。
+- 新增许可证检查：`pnpm licenses list --json` 的生产依赖默认只允许 MIT、ISC、BSD-2/3、
+  Apache-2.0；开发依赖额外允许 MPL-2.0。仅下表已批准的基线例外可超出默认白名单，
+  必须同时匹配包名、精确版本和 pnpm 报告的许可证原文。出现 `SEE LICENSE IN` 或未知许可即失败。
 - 4.x 停止安全修复或出现无法修复的漏洞时，由新的 ADR 决定迁移路线；候选路线是
   PrimeVue 5 Community License 或 Reka UI + shadcn-vue。本规格不预建任何兼容层。
+
+#### 已批准的基线许可证例外
+
+本表是基线例外的唯一完整授权清单。生产例外同样适用于开发依赖树；开发例外只适用于
+开发依赖树。相同包的其他版本不继承例外，许可原文变化也不得借用例外；任何新增例外
+必须先获得用户批准并同步本表、实施计划、协作规则和门禁回归测试。默认白名单及
+PrimeVue 商业产品线禁令保持不变。
+
+| scope | 包名 | 精确版本 | 许可证原文 |
+|---|---|---|---|
+| prod | `argparse` | `2.0.1` | `Python-2.0` |
+| dev | `@csstools/color-helpers` | `6.1.0` | `MIT-0` |
+| dev | `@csstools/css-syntax-patches-for-csstree` | `1.1.7` | `MIT-0` |
+| dev | `jackspeak` | `3.4.3` | `BlueOak-1.0.0` |
+| dev | `lru-cache` | `11.5.2` | `BlueOak-1.0.0` |
+| dev | `minimatch` | `10.2.6` | `BlueOak-1.0.0` |
+| dev | `minipass` | `7.1.3` | `BlueOak-1.0.0` |
+| dev | `package-json-from-dist` | `1.0.1` | `BlueOak-1.0.0` |
+| dev | `path-scurry` | `1.11.1` | `BlueOak-1.0.0` |
+| dev | `mdn-data` | `2.27.1` | `CC0-1.0` |
 
 ### 3.3 不引入的库
 

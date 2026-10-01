@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 前端依赖许可证与 PrimeVue 主版本门禁（M2.1 规格 §3.1、§3.2）：生产依赖只允许 MIT、ISC、
+# 前端依赖许可证与 PrimeVue 主版本门禁（M2.1 规格 §3.1、§3.2）：生产依赖默认只允许 MIT、ISC、
 # BSD-2-Clause、BSD-3-Clause、Apache-2.0，开发依赖额外允许 MPL-2.0；PrimeVue 相关包必须精确
-# 锁定 4.5.5，并拒绝 PrimeVue 5、@primeui/* 与 @primeuix 商业许可产品线。
+# 锁定 4.5.5；默认白名单外仅允许规格 §3.2 明确授权的精确基线例外，并拒绝 PrimeVue 5、
+# @primeui/* 与 @primeuix 商业许可产品线。
 # 只读取 package.json、pnpm-lock.yaml 和 pnpm 对已安装依赖的许可证清单：不安装、不联网、
 # 不修改文件；需先执行 `pnpm --dir frontend install --frozen-lockfile`。可在任意目录运行。
 set -euo pipefail
@@ -41,26 +42,27 @@ const PROD_ALLOWED = new Set(['MIT', 'ISC', 'BSD-2-Clause', 'BSD-3-Clause', 'Apa
 const DEV_ALLOWED = new Set([...PROD_ALLOWED, 'MPL-2.0'])
 
 /**
- * M2.1 之前（提交 4ce84ae）就已存在的许可证例外，按“包名 + pnpm 报告的许可证原文”精确
- * 匹配；新增依赖不得借用。生产例外同样适用于开发依赖树，开发例外只适用于开发依赖树。
+ * M2.1 之前（提交 4ce84ae）就已存在的许可证例外，按规格 §3.2 授权表的
+ * “包名 + 精确版本 + pnpm 报告的许可证原文”匹配；新增版本不得继承旧版本例外。
+ * 生产例外同样适用于开发依赖树，开发例外只适用于开发依赖树。
  */
 const PROD_EXCEPTIONS = [
   // markdown-it 的传递依赖，Python-2.0 为宽松许可（OSI 批准），仅用于解析命令行参数。
-  { name: 'argparse', license: 'Python-2.0' },
+  { name: 'argparse', version: '2.0.1', license: 'Python-2.0' },
 ]
 const DEV_EXCEPTIONS = [
   // jsdom/CSS 解析链的传递依赖，MIT-0 是去掉署名要求的 MIT，比 MIT 更宽松。
-  { name: '@csstools/color-helpers', license: 'MIT-0' },
-  { name: '@csstools/css-syntax-patches-for-csstree', license: 'MIT-0' },
+  { name: '@csstools/color-helpers', version: '6.1.0', license: 'MIT-0' },
+  { name: '@csstools/css-syntax-patches-for-csstree', version: '1.1.7', license: 'MIT-0' },
   // glob/minimatch 工具链的传递依赖，BlueOak-1.0.0 是 OSI 批准的宽松许可。
-  { name: 'jackspeak', license: 'BlueOak-1.0.0' },
-  { name: 'lru-cache', license: 'BlueOak-1.0.0' },
-  { name: 'minimatch', license: 'BlueOak-1.0.0' },
-  { name: 'minipass', license: 'BlueOak-1.0.0' },
-  { name: 'package-json-from-dist', license: 'BlueOak-1.0.0' },
-  { name: 'path-scurry', license: 'BlueOak-1.0.0' },
+  { name: 'jackspeak', version: '3.4.3', license: 'BlueOak-1.0.0' },
+  { name: 'lru-cache', version: '11.5.2', license: 'BlueOak-1.0.0' },
+  { name: 'minimatch', version: '10.2.6', license: 'BlueOak-1.0.0' },
+  { name: 'minipass', version: '7.1.3', license: 'BlueOak-1.0.0' },
+  { name: 'package-json-from-dist', version: '1.0.1', license: 'BlueOak-1.0.0' },
+  { name: 'path-scurry', version: '1.11.1', license: 'BlueOak-1.0.0' },
   // css-tree 的 CSS 规范数据集，CC0-1.0 为公有领域贡献，只在测试环境使用。
-  { name: 'mdn-data', license: 'CC0-1.0' },
+  { name: 'mdn-data', version: '2.27.1', license: 'CC0-1.0' },
 ]
 
 const failures = []
@@ -122,7 +124,7 @@ function checkScope(label, path, allowed, exceptions) {
         const id = `${pkg.name}@${version}`
         if (spdxAllowed(license, allowed)) {
           counts.set(license, (counts.get(license) ?? 0) + 1)
-        } else if (exceptions.some((entry) => entry.name === pkg.name && entry.license === license)) {
+        } else if (exceptions.some((entry) => entry.name === pkg.name && entry.version === version && entry.license === license)) {
           usedExceptions.push(`${id} (${license})`)
         } else {
           failures.push(`${label} dependency ${id} has disallowed license: ${license}`)
@@ -178,10 +180,12 @@ const lock = fs.readFileSync(lockPath, 'utf8')
 const resolved = new Set()
 const lockFailures = new Set()
 for (const line of lock.split('\n')) {
-  const match = /^ {2}'?((?:@[^/@'\s]+\/)?[^@'\s/]+)@(\d+)\.(\d+)\.(\d+)[^'\s:]*'?:\s*$/.exec(line)
+  // 保留预发布与 build metadata 参与精确比较；只剥离 pnpm 括号中的 peer-context，
+  // 避免 4.5.5-beta.1 被截断为 4.5.5 后绕过批准版本锁定。
+  const match = /^ {2}'?((?:@[^/@'\s]+\/)?[^@'\s/]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?:\([^'\s]*\))?'?:\s*$/.exec(line)
   if (!match) continue
-  const [, name, major, minor, patch] = match
-  const version = `${major}.${minor}.${patch}`
+  const [, name, version] = match
+  const [major, minor] = version.split('.')
   resolved.add(`${name}@${version}`)
   const reason = forbiddenReason(name, Number(major), Number(minor), version)
   if (reason) lockFailures.add(`pnpm-lock.yaml resolves forbidden ${name}@${version}: ${reason}`)

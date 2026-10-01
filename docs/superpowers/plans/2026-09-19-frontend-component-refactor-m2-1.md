@@ -20,6 +20,7 @@
 - 组件测试新增内容使用 `@testing-library/vue`；需要断言 Emits/Props 的既有 Vue Test Utils 测试可保留，同一文件不混用两种风格。
 - 不新增任何 `localStorage`/`sessionStorage`/`document.cookie` 写入；不引入 CDN 资源；不使用 `v-html` 或 `escape=false` 渲染 API 返回的字符串。
 - 不出现 M2 范围外的可操作入口或占位 UI；不实现暗色模式、多语言、主题切换。
+- 许可证默认白名单以规格 §3.2 为准；基线例外仅限该节授权表的包名、精确版本和许可证原文组合，保留生产/开发 scope 隔离，升级不继承例外。新增例外须先获用户批准并同步事实来源与测试。
 - PrimeVue 相关包固定精确版本 `4.5.5`；出现 `primevue@5`、`@primeui/*`、`@primeuix/themes@3` 即视为违规。
 - 每个任务的提交只包含该任务列出的文件，提交信息使用任务末尾给定的文本。
 - Task 16 之前 `just check` 中的样式检查为警告模式；Task 16 之后转为失败模式。Task 17 之前必须运行完整 `just ci` 并读取完整输出。
@@ -122,7 +123,7 @@ Expected: FAIL，`src/design` 模块不存在。
 
 在 `frontend/` 执行 `pnpm add primevue@4.5.5 @primevue/forms@4.5.5 @primeuix/themes@2 primeicons@7 tailwindcss@4 @tailwindcss/vite@4 tailwindcss-primeui@0.6 @vueuse/core@15 zod@4` 与 `pnpm add -D @primevue/auto-import-resolver@4.5.5 unplugin-vue-components@32 @testing-library/vue@8 @testing-library/jest-dom @axe-core/playwright`。随后把 `package.json` 中四个 PrimeVue 包改为精确版本 `4.5.5`，`@primeuix/themes` 改为 `~2.x` 当前次版本。`pnpm-workspace.yaml` 的 `allowBuilds` 只在实际需要时新增条目，并在注释中说明原因。
 
-记录 `pnpm licenses list --prod --json` 与 `pnpm audit` 输出摘要，写入提交说明正文；出现非 MIT/ISC/BSD/Apache-2.0 的生产依赖即停止。
+记录 `pnpm licenses list --prod --json` 与 `pnpm audit` 输出摘要，写入提交说明正文；出现默认白名单以外且不精确匹配规格 §3.2 授权基线例外的生产依赖即停止。
 
 - [ ] **Step 4: 建立设计 token、状态映射、locale 与 PrimeVue 配置**
 
@@ -134,7 +135,9 @@ Expected: FAIL，`src/design` 模块不存在。
 
 - [ ] **Step 5: 添加许可证、主版本、样式与体积门禁**
 
-`scripts/check-frontend-licenses.sh`：读取 `pnpm licenses list --prod --json`，允许 MIT、ISC、BSD-2-Clause、BSD-3-Clause、Apache-2.0，开发依赖额外允许 MPL-2.0；扫描 `pnpm-lock.yaml`，出现 `primevue@5`、`/@primeui/`、`@primeuix/themes@3` 即 exit 1。
+`scripts/check-frontend-licenses.sh`：读取 `pnpm licenses list --prod --json`，允许 MIT、ISC、BSD-2-Clause、BSD-3-Clause、Apache-2.0，开发依赖额外允许 MPL-2.0；基线例外严格匹配规格 §3.2 授权表的包名、精确版本和许可证原文，生产例外可用于开发树，开发例外不得用于生产树，同包升级不继承例外；扫描 `pnpm-lock.yaml`，出现 `primevue@5`、`/@primeui/`、`@primeuix/themes@3` 即 exit 1。
+
+在 `scripts/test-tooling.sh` 的合成 Fake 中先覆盖精确版本通过、同名不同版本失败、不同许可失败、开发例外进入生产失败，并观察 RED 后实现 GREEN。
 
 `scripts/check-frontend-styles.sh`：扫描 `frontend/src/**/*.vue`，报告 `#[0-9a-fA-F]{3,6}\b` 颜色字面量与 `@media` 出现次数；`--strict` 时非零即 exit 1，默认只打印警告。
 
