@@ -290,7 +290,7 @@ mac = hmac.new(signing_key, payload_bytes, hashlib.sha256).digest()
 
 格式 `v1.<base64url-no-padding(canonical-json)>.<base64url-no-padding(mac)>`。JSON 固定键 `v,user_id,filters_hash,direction,upper,anchor,issued_at`；key 对象固定 `created_at,task_id`。JSON 使用 sort_keys、紧凑分隔符、UTF8；时间用 Task1 六位微秒 UTC 编码。解码前限长，验证版本/base64签名后严格JSON类型及重复键，再验证归属、筛选、排序界和时效。使用 compare_digest；捕获仅预期解码／验证异常，禁止吞掉未知系统异常。
 
-from_file 兼容现有32字节Base64URL主密钥文件；不访问 AeadCipher 私有属性，不改变 encryption.py 或 OAuth/命令加密。文件读取只发生在受认证查询需要游标 codec 时，不在模块 import 或 create_app 时提前读取 Secret。
+from_file 兼容现有32字节标准Base64和Base64URL主密钥文件（CI使用openssl rand -base64）；Secret文件读取与外部游标严格URLsafe解码分开；不访问 AeadCipher 私有属性，不改变 encryption.py 或 OAuth/命令加密。文件读取只发生在受认证查询需要游标 codec 时，不在模块 import 或 create_app 时提前读取 Secret。
 
 - [ ] **Step 4: GREEN、`just check`、diff检查**
 
@@ -317,7 +317,7 @@ git commit -m "feat: add signed task history cursors"
 
 - [ ] **Step 1: 写迁移准入与目录失败回归**
 
-在现有 migration lifecycle 单测 fixture 中加入0020链，断言：published head由真实新脚本派生；0020两个phase的完整表／列／序列权限与0019完全相同；跨越0019仍绑定同一真实AAD guard并执行原before/after检查；0019→0020不重新执行AAD变更；缺guard不能从0018跨过0019。
+在现有 migration lifecycle 单测 fixture 中加入0020链，断言：published head由真实新脚本派生；0020两个phase的完整表／列／序列权限与0019完全相同；跨越0019仍绑定同一真实AAD guard并执行原before/after检查；0019→0020不重新执行AAD变更；缺显式guard且affected集合非空时不能从0018跨过0019；缺显式guard但affected为空时必须调用原内置strict-empty守卫的两个阶段，允许既有受管空库升级。显式注入错误类型／空值仍拒绝，不能把“没有显式attribute”误当成“没有守卫”。
 
 集成测试复用 `cycle5_regular_database_url`／受管临时迁移 fixture，执行目录查询：
 
@@ -428,7 +428,7 @@ statement = select(*columns).where(TaskRunModel.user_id == filters.user_id)
 
 用同一事务的EXISTS判断可见页首之前／页末之后是否还有记录，生成previous/next anchor。COUNT只对当前用户、日期区间、kind不在BUSINESS_KINDS、status=failed，不套用业务kind/status或翻页upper。禁止SELECT整个ORM或N+1。
 
-当前窗口为空时返回空items，检查输入anchor的反方向是否仍有记录：older空页且有key>anchor时以原anchor返回previous；newer空页且有key<anchor时以原anchor返回next；对应seek方向确实不存在才返回null。不依赖被删除边界行，不制造虚构anchor；前端始终提供重新加载首页，方向查询不得返回同一空窗口造成自动循环。保留期／状态变化不是500，不能为了固定分页去锁业务行。用例用同一clock时间验证／签发cursor，分别编码older/newer，仅有anchor时调用codec；所有字段都从固定DTO构造。
+当前窗口为空时返回空items，检查输入anchor的反方向是否仍有记录：older空页且有key>anchor时以原anchor返回previous；newer空页且有key<anchor时以原anchor返回next；对应seek方向确实不存在才返回null。不依赖被删除边界行，不制造虚构anchor；前端始终提供重新加载首页，方向查询不得返回同一空窗口造成自动循环。保留期／状态变化不是500，不能为了固定分页去锁业务行。用例用同一clock时间验证／签发cursor；需要解码或有方向anchor需签发时，通过 asyncio.to_thread 调用同步codec_factory，每次execute最多构造一次并复用，避免Secret文件I/O阻塞事件循环；分别编码older/newer，仅有anchor时编码；所有字段都从固定DTO构造。
 
 - [ ] **Step 4: GREEN、SQL证据与提交检查**
 
