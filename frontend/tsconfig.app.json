@@ -17,9 +17,10 @@
     "paths": { "@/*": ["./src/*"] },
     "types": ["vite/client", "vitest/globals"]
   },
-  // components.d.ts 是 unplugin-vue-components 生成的自动导入登记表，已被 git 忽略；PrimeVue
-  // 组件的模板类型来自 `primevue/config` 引入的 GlobalComponents 声明，并不依赖它。include
-  // 在文件存在时顺带收录，全新检出尚未生成时不命中也不报错，因此不能改用必须存在的 files
-  // 或 `/// <reference path>`。
+  // components.d.ts 是 unplugin-vue-components 生成的自动导入登记表，已被 git 忽略；模板类型
+  // 并不依赖它：PrimeVue 核心组件的 GlobalComponents 声明来自 `primevue/config`，PrimeVue
+  // Forms 组件的来自 src/env.d.ts 对 `@primevue/forms` 的显式引用。include 在文件存在时顺带
+  // 收录，全新检出尚未生成时不命中也不报错，因此不能改用必须存在的 files 或
+  // `/// <reference path>`。
   "include": ["src/**/*.ts", "src/**/*.vue", "components.d.ts"]
 }

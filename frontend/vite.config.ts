@@ -17,8 +17,9 @@ const apiProxyTarget = process.env.API_BASE_URL ?? 'http://127.0.0.1:8000'
  * - `@tailwindcss/vite` 在构建期生成工具类，样式随产物本地打包，不引用 CDN。
  * - `unplugin-vue-components` 只解析 PrimeVue 组件（`dirs: []`），本地
  *   `src/components` 继续显式 import；Vitest 复用同一插件链，组件测试与构建一致。
- *   生成的 `components.d.ts` 只是自动导入登记表（已加入 .gitignore）；模板类型检查依赖
- *   PrimeVue 经 `primevue/config` 引入的 GlobalComponents 声明，不依赖该文件。
+ *   生成的 `components.d.ts` 只是自动导入登记表（已加入 .gitignore）；模板类型检查依赖各包
+ *   自带的 GlobalComponents 声明：PrimeVue 核心组件经 `primevue/config` 引入，PrimeVue Forms
+ *   组件经 src/env.d.ts 对 `@primevue/forms` 的显式引用引入，不依赖该文件。
  * - `build.reportCompressedSize` 让构建日志输出 gzip 体积，供体积门禁与 CI 留档。
  * - `test.css.include`：Vitest 默认把未列入的样式模块（连同 `?raw` 查询）替换为空字符串；
  *   仅放行全局样式入口 `src/design/app.css`，使 `primevue.spec.ts` 能以 `?raw` 读取原文，
