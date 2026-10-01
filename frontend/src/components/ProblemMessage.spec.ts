@@ -6,6 +6,29 @@ import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import ProblemMessage from './ProblemMessage.vue'
 
 describe('ProblemMessage', () => {
+  it('renders a controlled local explanation without exposing the remote title', async () => {
+    const problem = new ProblemError({
+      type: 'about:blank',
+      title: '<b>private</b>',
+      status: 401,
+      detail: 'private detail',
+      instance: '',
+      trace_id: 'login-trace',
+      error_code: 'invalid_credentials',
+    })
+    const view = await renderWithPlugins(ProblemMessage, {
+      props: {
+        problem,
+        description: 'Invalid credentials，请检查邮箱和密码后重试。',
+      },
+    })
+    expect(view.getByRole('alert')).toHaveTextContent(
+      'Invalid credentials，请检查邮箱和密码后重试。',
+    )
+    expect(view.getAllByRole('alert')).toHaveLength(1)
+    expect(view.queryByText(/private/)).toBeNull()
+  })
+
   it('announces one safe error with a trace ID and optional recovery action', async () => {
     const problem = new ProblemError({
       type: 'about:blank',

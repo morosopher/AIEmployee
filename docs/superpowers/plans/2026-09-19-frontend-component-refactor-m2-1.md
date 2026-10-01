@@ -323,17 +323,20 @@ git commit -m "feat: add shared PrimeVue presentation components"
 **Files:**
 - Modify: `frontend/src/pages/LoginPage.vue`
 - Create: `frontend/src/pages/LoginPage.spec.ts`
+- Modify: `frontend/src/components/ProblemMessage.vue`、`frontend/src/components/ProblemMessage.spec.ts`（最小受控本地说明接口及回归）
 - Modify: `frontend/e2e/daily-brief.spec.ts`（登录步骤选择器）
 
-- [ ] **Step 1: 为登录页补齐角色选择器测试并在旧实现上确认通过**
+- [x] **Step 1: 为登录页补齐角色选择器测试并在旧实现上确认通过**
 
-写 `LoginPage.spec.ts` 覆盖：邮箱与密码有程序化 label、提交中禁用按钮、401 时 `role="alert"` 显示可执行提示且不清空邮箱、成功后按 `redirect` 跳转。
+真实旧实现的 401 文案为 `Invalid credentials`，尚无中文恢复说明；Step 1 保留该事实，Step 2 再增加中文恢复说明的失败断言。`ProblemMessage` 允许可选受控本地说明 Prop，仅接收固定或已映射文案，不透传任意服务端 title/detail；登录 401 保留已知原文并补充「请检查邮箱和密码后重试。」，非 ProblemError 保留「登录暂时不可用，请稍后重试。」。
+
+写 `LoginPage.spec.ts` 覆盖：邮箱与密码有程序化 label、提交中禁用按钮、401 时 `role="alert"` 显示真实既有提示且不清空邮箱、成功后按 `redirect` 跳转。
 
 Run: `pnpm --dir frontend test:unit --run src/pages/LoginPage.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 增加迁移后才成立的断言并观察失败**
+- [x] **Step 2: 增加迁移后才成立的断言并观察失败**
 
 新增断言：密码输入框有「显示密码」切换按钮且 `aria-pressed` 正确；表单位于 `role="form"` 并有 `aria-labelledby`。
 
@@ -341,20 +344,20 @@ Run: `pnpm --dir frontend test:unit --run src/pages/LoginPage.spec.ts`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 用 Card、InputText、Password、Button、Message 重建登录页**
+- [x] **Step 3: 用 Card、InputText、Password、Button、Message 重建登录页**
 
 `Password` 关闭 `feedback`，开启 `toggleMask`；错误使用 `ProblemMessage`；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/LoginPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/daily-brief.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/pages/LoginPage.vue frontend/src/pages/LoginPage.spec.ts frontend/e2e/daily-brief.spec.ts
+git add frontend/src/pages/LoginPage.vue frontend/src/pages/LoginPage.spec.ts frontend/e2e/daily-brief.spec.ts frontend/src/components/ProblemMessage.vue frontend/src/components/ProblemMessage.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate login page to PrimeVue"
 ~~~
 
