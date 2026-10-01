@@ -162,13 +162,13 @@ class TaskHistoryCursorCodec:
 
     @classmethod
     def from_file(cls, path: Path) -> "TaskHistoryCursorCodec":
-        """显式调用时读取现有 Base64URL 主密钥，不在导入或应用创建时访问 Secret。
+        """显式调用时读取现有 Base64/Base64URL 主密钥，不在导入时访问 Secret。
 
         Args:
             path: 组合根提供的现有 Secret 路径；异步调用方应在线程中读取。
 
         Returns:
-            已派生专用签名材料的编码器，兼容文件首尾空白及标准填充。
+            已派生专用签名材料的编码器，兼容两种字母表、首尾空白及标准填充。
 
         Raises:
             OSError: 原样传播文件系统故障，不能伪装成客户端游标错误。
@@ -179,7 +179,11 @@ class TaskHistoryCursorCodec:
             unpadded = encoded.rstrip("=")
             if encoded not in (unpadded, unpadded + "=" * (-len(unpadded) % 4)):
                 raise ValueError(_KEY_ERROR)
-            key = _b64decode(unpadded)
+            # CI 的 openssl 生成标准 Base64，既有 AEAD loader 也接受它；
+            # Secret 使用独立解码边界，不能放宽外部游标的规范 URLsafe 规则。
+            key = base64.b64decode(
+                unpadded + "=" * (-len(unpadded) % 4), altchars=b"-_", validate=True
+            )
             return cls(key)
         except (ValueError, UnicodeError):
             raise ValueError(_KEY_ERROR) from None

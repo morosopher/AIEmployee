@@ -20,6 +20,7 @@ from ai_employee.application.task_history import (
     normalize_history_filters,
 )
 from ai_employee.domain.tasks import TaskStatus
+from ai_employee.infrastructure.security.encryption import AeadCipher
 from ai_employee.infrastructure.security.task_history_cursor import TaskHistoryCursorCodec
 
 NOW = datetime(2026, 10, 1, 0, 0, 0, 123456, tzinfo=UTC)
@@ -253,3 +254,24 @@ def test_invalid_keys_and_file_errors(tmp_path: Path) -> None:
             TaskHistoryCursorCodec.from_file(path)
     with pytest.raises(FileNotFoundError):
         TaskHistoryCursorCodec.from_file(tmp_path / "missing")
+
+
+@pytest.mark.parametrize("urlsafe", [False, True])
+@pytest.mark.parametrize("padding", [True, False])
+def test_secret_alphabets_match_existing_loader(
+    tmp_path: Path, urlsafe: bool, padding: bool
+) -> None:
+    """同一合成字节覆盖 +/ 与 -_；Secret 兼容不改变外部游标规则。"""
+    key = bytes([251]) * 32
+    encode = base64.urlsafe_b64encode if urlsafe else base64.b64encode
+    encoded = encode(key).decode("ascii")
+    # 固定 fixture 必须实际含两种区别字符，防止退化成无差别字母表测试。
+    assert all(character in encoded for character in ("-_" if urlsafe else "+/"))
+    path = tmp_path / "synthetic-alphabet-key"
+    path.write_text(" \n" + encoded + "\n ", encoding="utf-8")
+    assert AeadCipher.from_file(path).key_version == 1
+    if not padding:
+        path.write_text(" \n" + encoded.rstrip("=") + "\n ", encoding="utf-8")
+    codec = TaskHistoryCursorCodec.from_file(path)
+    reference = TaskHistoryCursorCodec(key)
+    assert codec.decode(reference.encode(STATE), filters=FILTERS, now=NOW) == STATE
