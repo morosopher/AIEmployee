@@ -190,7 +190,11 @@ test('page reload restores durable snapshot and deduplicates replayed task event
     if (eventRequests === 2) {
       await expect(page.getByText('当前状态：running')).toBeVisible()
       await expect(
-        page.getByRole('main').last().getByRole('listitem').filter({ hasText: 'persist' }),
+        page
+          .getByRole('main')
+          .last()
+          .getByRole('listitem')
+          .filter({ hasText: 'persist' }),
       ).toHaveCount(1)
       expect(snapshotRequests).toBeGreaterThanOrEqual(2)
       await route.fulfill({
@@ -232,8 +236,80 @@ test('page reload restores durable snapshot and deduplicates replayed task event
 
   await expect(page.getByText('当前状态：succeeded')).toBeVisible()
   await expect(
-    page.getByRole('main').last().getByRole('listitem').filter({ hasText: 'persist' }),
+    page
+      .getByRole('main')
+      .last()
+      .getByRole('listitem')
+      .filter({ hasText: 'persist' }),
   ).toHaveCount(1)
   await expect.poll(() => eventRequests).toBe(2)
   expect(snapshotRequests).toBeGreaterThanOrEqual(3)
+})
+
+/**
+ * 外壳的真实浏览器键盘回归：inert 必须阻止背景获取焦点，Tab 始终留在抽屉；
+ * Esc 与路由导航关闭后必须恢复触发按钮。数据仍使用本文件合成快照。
+ */
+test('mobile shell traps focus and restores interactive background after each drawer closes', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 600, height: 900 })
+  await page.route('**/api/v1/auth/me', (route) =>
+    route.fulfill({ json: user }),
+  )
+  await page.route('**/api/v1/system/alerts', (route) =>
+    route.fulfill({ json: { alerts: [] } }),
+  )
+  await page.route('**/api/v1/tasks/task-1', (route) =>
+    route.fulfill({ json: terminalSnapshot }),
+  )
+  await page.goto('/tasks?task_id=task-1')
+  await expect(page.getByText('当前状态：succeeded')).toBeVisible()
+
+  for (const [triggerName, dialogName] of [
+    ['打开导航', '主导航'],
+    ['打开任务时间线', '任务时间线'],
+  ] as const) {
+    const trigger = page.getByRole('button', { name: triggerName })
+    await trigger.click()
+    const dialog = page.getByRole('dialog', { name: dialogName })
+    await expect(dialog).toBeVisible()
+    // 选择器使用稳定角色；evaluate 仅检查标准 DOM inert/focus 行为。
+    await expect
+      .poll(() =>
+        page
+          .getByRole('main', { includeHidden: true })
+          .first()
+          .evaluate((element) => element.closest('[inert]') !== null),
+      )
+      .toBe(true)
+    for (let index = 0; index < 10; index += 1) {
+      await page.keyboard.press(index % 2 === 0 ? 'Tab' : 'Shift+Tab')
+      await expect
+        .poll(() =>
+          dialog.evaluate((element) =>
+            element.contains(document.activeElement),
+          ),
+        )
+        .toBe(true)
+    }
+    await page.keyboard.press('Escape')
+    await expect(dialog).toBeHidden()
+    await expect(trigger).toBeFocused()
+    await expect
+      .poll(() =>
+        page
+          .getByRole('main')
+          .first()
+          .evaluate((element) => element.closest('[inert]') === null),
+      )
+      .toBe(true)
+  }
+
+  const navigationTrigger = page.getByRole('button', { name: '打开导航' })
+  await navigationTrigger.click()
+  await page.getByRole('link', { name: '任务历史' }).click()
+  await expect(page).toHaveURL(/\/tasks$/)
+  await expect(page.getByRole('dialog', { name: '主导航' })).toBeHidden()
+  await expect(navigationTrigger).toBeFocused()
 })

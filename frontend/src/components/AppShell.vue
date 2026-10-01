@@ -1,90 +1,168 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router'
+import { RouterView } from 'vue-router'
+import AppNavigation from './AppNavigation.vue'
+import SystemAlertBanner from './SystemAlertBanner.vue'
+import TimelineDrawer from './TimelineDrawer.vue'
+import Toast from 'primevue/toast'
+import ConfirmDialog from 'primevue/confirmdialog'
+import Message from 'primevue/message'
+import { useToast } from 'primevue/usetoast'
 import TaskTimeline from './TaskTimeline.vue'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useTasksStore } from '@/stores/tasks'
 import { getSystemAlerts, type SystemAlert } from '@/api/system'
-const route = useRoute(); const tasks = useTasksStore(); const task = computed(() => typeof route.query.task_id === 'string' ? tasks.tasks[route.query.task_id] ?? null : null)
+const route = useRoute()
+const tasks = useTasksStore()
+const task = computed(() =>
+  typeof route.query.task_id === 'string'
+    ? (tasks.tasks[route.query.task_id] ?? null)
+    : null,
+)
 const alerts = ref<SystemAlert[]>([])
 const alertsLoading = ref(true)
 const alertsError = ref(false)
 let alertTimer: ReturnType<typeof setInterval> | null = null
 let alertRequest = 0
-async function loadAlerts(): Promise<void> { const request = ++alertRequest; alertsLoading.value = true; try { const result = await getSystemAlerts(); if (request !== alertRequest) return; alerts.value = result.alerts; alertsError.value = false } catch { if (request === alertRequest) alertsError.value = true /* 旧轮询失败不得覆盖更新快照。 */ } finally { if (request === alertRequest) alertsLoading.value = false } }
-onMounted(() => { void loadAlerts(); alertTimer = setInterval(() => void loadAlerts(), 60_000) })
-onUnmounted(() => { if (alertTimer !== null) clearInterval(alertTimer) })
+/** 拉取告警快照；递增请求序号拒绝旧轮询覆盖新响应，失败保留最后可用告警。 */
+async function loadAlerts(): Promise<void> {
+  const request = ++alertRequest
+  alertsLoading.value = true
+  try {
+    const result = await getSystemAlerts()
+    if (request !== alertRequest) return
+    alerts.value = result.alerts
+    alertsError.value = false
+  } catch {
+    if (request === alertRequest)
+      alertsError.value = true /* 旧轮询失败不得覆盖更新快照。 */
+  } finally {
+    if (request === alertRequest) alertsLoading.value = false
+  }
+}
+onMounted(() => {
+  void loadAlerts()
+  alertTimer = setInterval(() => void loadAlerts(), 60_000)
+})
+onUnmounted(() => {
+  if (alertTimer !== null) clearInterval(alertTimer)
+})
 watch(
-  () => Object.values(tasks.tasks).map((item) => `${item.id}:${item.status}`).join(','),
+  () =>
+    Object.values(tasks.tasks)
+      .map((item) => `${item.id}:${item.status}`)
+      .join(','),
   (current, previous) => {
     // 任务进入终态后立即刷新派生告警，避免用户等待下一次固定轮询。
-    if (current !== previous && /:(succeeded|failed|cancelled)(,|$)/.test(current)) void loadAlerts()
+    if (
+      current !== previous &&
+      /:(succeeded|failed|cancelled)(,|$)/.test(current)
+    )
+      void loadAlerts()
   },
 )
-const retry = async (id: string) => { throw new Error(`请在任务页重试 ${id}`) }
+const retry = async (id: string) => {
+  throw new Error(`请在任务页重试 ${id}`)
+}
+
+/** 只读消费 useTaskEvents 已维护的连接投影；卸载造成的 disconnected 不视为恢复。 */
+const toast = useToast()
+const disconnected = computed(() =>
+  Object.values(tasks.connections).some((state) => state === 'reconnecting'),
+)
+watch(
+  () => ({ ...tasks.connections }),
+  (current, previous) => {
+    if (
+      Object.entries(current).some(
+        ([id, state]) =>
+          state === 'connected' && previous[id] === 'reconnecting',
+      )
+    ) {
+      toast.add({ severity: 'success', summary: '任务连接已恢复', life: 4000 })
+    }
+  },
+)
+/** 两个互斥抽屉与确认框共用背景隔离；Portal 浮层位于外壳之外。 */
+const navigationOpen = ref(false)
+const timelineOpen = ref(false)
+const confirmationOpen = ref(false)
+let confirmationTrigger: HTMLElement | null = null
+/** 确认框显示前保存焦点，Dialog 原生归还焦点时背景可能仍处于更新中的 inert。 */
+function showConfirmation(): void {
+  confirmationTrigger =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+  confirmationOpen.value = true
+}
+/** 等 Vue 把 inert 属性移除后再次归还焦点，兼容浏览器原生隔离。 */
+async function hideConfirmation(): Promise<void> {
+  confirmationOpen.value = false
+  await nextTick()
+  if (confirmationTrigger?.isConnected) confirmationTrigger.focus()
+}
+const modalOpen = computed(
+  () => navigationOpen.value || timelineOpen.value || confirmationOpen.value,
+)
+watch(
+  () => route.path,
+  () => {
+    timelineOpen.value = false
+  },
+)
 </script>
 <template>
   <div
-    class="app-shell"
-    :class="{ 'actions-shell': route.path === '/actions' }"
+    :inert="modalOpen || undefined"
+    class="grid min-h-screen grid-cols-1 content-start bg-surface-50 text-color md:grid-cols-[14rem_minmax(0,1fr)]"
+    :class="{
+      'xl:grid-cols-[14rem_minmax(0,1fr)_20rem]': route.path !== '/actions',
+    }"
   >
-    <p
-      v-if="alertsLoading"
-      class="system-alert-state"
-      role="status"
-    >
-      正在检查系统告警
-    </p>
-    <p
-      v-if="alertsError"
-      class="system-alert-state"
-      role="alert"
-    >
-      系统告警暂时无法刷新。
-    </p>
-    <div
-      v-if="alerts.length"
-      class="overdue-alert"
-      role="alert"
-    >
-      <strong>每日简报已逾期</strong>
-      <RouterLink
-        v-if="alerts[0]?.diagnostic_task_id"
-        :to="{ path: '/tasks', query: { task_id: alerts[0].diagnostic_task_id } }"
+    <div class="col-span-full">
+      <SystemAlertBanner
+        :loading="alertsLoading"
+        :error="alertsError"
+        :alerts="alerts"
+      />
+      <Message
+        v-if="disconnected"
+        severity="warn"
+        role="status"
+        aria-live="polite"
       >
-        查看诊断任务
-      </RouterLink>
+        任务连接已断开，正在尝试恢复。
+      </Message>
     </div>
-    <nav aria-label="主导航">
-      <RouterLink to="/chat">
-        新聊天
-      </RouterLink>
-      <RouterLink to="/brief">
-        今日简报
-      </RouterLink>
-      <RouterLink to="/actions">
-        操作中心
-      </RouterLink>
-      <RouterLink to="/tasks">
-        任务历史
-      </RouterLink>
-      <RouterLink to="/connections">
-        连接
-      </RouterLink>
-      <RouterLink to="/settings">
-        设置
-      </RouterLink>
-    </nav>
-    <main>
+    <AppNavigation @modal-change="navigationOpen = $event" />
+    <main class="min-w-0 p-4 md:p-6">
       <RouterView />
     </main>
-    <aside v-if="route.path !== '/actions'">
+    <TimelineDrawer
+      v-if="route.path !== '/actions'"
+      @modal-change="timelineOpen = $event"
+    >
       <TaskTimeline
         :task="task"
         :retry="retry"
         :follow="(id) => undefined"
       />
-    </aside>
+    </TimelineDrawer>
   </div>
+  <!-- 覆盖 Toast 默认 assertive：普通结果礼貌播报，错误仍立即播报。 -->
+  <Toast
+    :inert="modalOpen || undefined"
+    :pt="{
+      message: ({ props }) => ({
+        role: props.message?.severity === 'error' ? 'alert' : 'status',
+        'aria-live':
+          props.message?.severity === 'error' ? 'assertive' : 'polite',
+      }),
+    }"
+  />
+  <ConfirmDialog
+    @show="showConfirmation"
+    @hide="hideConfirmation"
+  />
 </template>
-<style scoped>.app-shell{display:grid;grid-template-columns:12rem minmax(0,1fr) 20rem;min-height:100vh}/* 操作中心自有独立详情区域，避免在全局时间线旁叠出第四栏。 */.actions-shell{grid-template-columns:12rem minmax(0,1fr)}/* 告警加载或失败同样属于全局横幅，不能占用正文 Grid 单元并挤压任务中心。 */.system-alert-state{grid-column:1/-1;margin:0;padding:.75rem 1rem}.overdue-alert{grid-column:1/-1;background:#a61b1b;color:#fff;padding:.75rem 1rem;display:flex;gap:1rem}.overdue-alert a{color:#fff}nav{display:flex;flex-direction:column;gap:1rem;padding:1rem;border-right:1px solid #ddd}main{padding:1.5rem}@media(max-width:800px){.app-shell{display:block}.overdue-alert{position:sticky;top:0;z-index:2}nav{flex-direction:row;overflow:auto}.app-shell>aside{display:none}}</style>
