@@ -111,11 +111,20 @@ for (const kind of ['mail.reply', 'calendar.update'] as const) {
       editorJson(route, proposal),
     )
     await page.goto('/brief')
+    // 折叠仅改变展示；Enter/Space 切换后原来源动作仍可见，不能触发创建请求。
+    const sources = page.getByRole('button', { name: 'Synthetic title source suggestion：来源引用' })
+    await expect(sources).toHaveAttribute('aria-expanded', 'true')
+    await sources.focus()
+    await sources.press('Enter')
+    await expect(sources).toHaveAttribute('aria-expanded', 'false')
+    await sources.press('Space')
+    await expect(sources).toHaveAttribute('aria-expanded', 'true')
+    await expect(sources).toBeFocused()
     await expect(
-      page.locator('button[name="prepare-source-action"]'),
+      page.getByRole('button', { name: kind === 'mail.reply' ? '创建回复草稿' : '创建修改提案' }),
     ).toHaveCount(1)
     expect(capture.mutations).toHaveLength(0)
-    await page.locator('button[name="prepare-source-action"]').click()
+    await page.getByRole('button', { name: kind === 'mail.reply' ? '创建回复草稿' : '创建修改提案' }).click()
     const editorPath =
       kind === 'mail.reply'
         ? `/mail/drafts/${DRAFT_ID}`

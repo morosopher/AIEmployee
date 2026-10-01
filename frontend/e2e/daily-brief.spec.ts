@@ -8,7 +8,7 @@ test('brief generation, version switching and settings use controllable API fixt
   await page.route('**/api/v1/settings', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(userSettings()) }))
   await page.route('**/api/v1/auth/sessions', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '[]' }))
   await page.goto('/brief')
-  await expect(page.getByRole('heading', { name: '今日简报' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '今日简报', level: 1 })).toBeVisible()
   await page.goto('/settings')
   await expect(page.getByRole('heading', { name: '设置' })).toBeVisible()
   // 工作设置使用 IANA 时区标签；精确匹配可访问名称并继续验证合成设置已正确加载。

@@ -130,6 +130,13 @@ describe('BriefView', () => {
     })
     expect(getByText(/完整性：partial/)).toBeVisible()
     expect(getByText('Calendar unavailable')).toBeVisible()
+    expect(getByRole('alert')).toHaveTextContent('最后同步时间：未提供')
+    const sources = getByRole('button', { name: '跟进：来源引用' })
+    expect(sources).toHaveAttribute('aria-expanded', 'true')
+    await fireEvent.click(sources)
+    expect(sources).toHaveAttribute('aria-expanded', 'false')
+    await fireEvent.click(sources)
+    expect(sources).toHaveAttribute('aria-expanded', 'true')
     expect(getByText(/2026-08-04T08:00:00Z/)).toBeVisible()
     expect(
       getByRole('link', { name: 'gmail 来源' }).getAttribute('href'),
