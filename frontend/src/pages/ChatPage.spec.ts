@@ -1,7 +1,6 @@
-import { flushPromises, mount } from '@vue/test-utils'
-import { createPinia } from 'pinia'
+import { fireEvent, screen, waitFor } from '@testing-library/vue'
+import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import { ref } from 'vue'
-import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ChatPage from './ChatPage.vue'
 import * as conversations from '@/api/conversations'
@@ -45,11 +44,13 @@ vi.mock('@/api/calendar', async (original) => ({
 }))
 const stream = vi.hoisted(() => ({
   recover: undefined as (() => void) | undefined,
+  connection: undefined as ReturnType<typeof ref<string>> | undefined,
 }))
 vi.mock('@/composables/useTaskEvents', () => ({
   useTaskEvents: (...args: Parameters<typeof useTaskEvents>) => {
     stream.recover = args[2]
-    return ref('connected')
+    stream.connection = ref('connected')
+    return stream.connection
   },
 }))
 const conversation = {
@@ -59,15 +60,23 @@ const conversation = {
   updated_at: NOW,
 }
 let messages: Message[]
-let wrappers: ReturnType<typeof mount>[] = []
 beforeEach(() => {
   vi.clearAllMocks()
+  // jsdom 无布局观察器；保留真实组件，仅替换浏览器尺寸通知端口。
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  )
   stream.recover = undefined
   messages = [
     {
       id: 'synthetic-message',
       role: 'assistant',
-      content_markdown: '',
+      content_markdown: '合成初始消息',
       task_id: TASK_ID,
       created_at: NOW,
     },
@@ -77,7 +86,9 @@ beforeEach(() => {
     conversation,
     messages,
   }))
-  vi.mocked(conversations.sendMessage).mockResolvedValue({ task_id: TASK_ID })
+  vi.mocked(conversations.sendMessage)
+    .mockReset()
+    .mockResolvedValue({ task_id: TASK_ID })
   vi.mocked(actions.getAction).mockResolvedValue(
     actionSnapshot({
       status: 'waiting_approval',
@@ -86,34 +97,22 @@ beforeEach(() => {
     }),
   )
 })
-afterEach(() => {
-  wrappers.forEach((wrapper) => wrapper.unmount())
-  wrappers = []
-})
+afterEach(() => vi.unstubAllGlobals())
 
-/** 保留真实路由和任务 Store，使模型文字与持久任务状态的边界可以被直接断言。 */
+/** 使用统一插件渲染真实页面；最终消息与任务 Store 保持生产实现。 */
 async function renderPage() {
-  const router = createRouter({
-    history: createMemoryHistory(),
-    routes: [
-      { path: '/chat', component: ChatPage },
-      {
-        path: '/mail/drafts/:draftId',
-        component: { template: '<p>编辑草稿</p>' },
-      },
-      {
-        path: '/calendar/proposals/:proposalId',
-        component: { template: '<p>编辑提案</p>' },
-      },
-      { path: '/actions', component: { template: '<p>操作中心</p>' } },
-    ],
+  const { router, pinia } = await renderWithPlugins(ChatPage, {
+    route: '/chat',
   })
-  await router.push('/chat')
-  const pinia = createPinia()
-  const wrapper = mount(ChatPage, { global: { plugins: [pinia, router] } })
-  wrappers.push(wrapper)
-  await flushPromises()
-  return { wrapper, router, tasks: useTasksStore(pinia) }
+  await waitFor(() =>
+    expect(screen.queryByText('正在加载会话…')).not.toBeInTheDocument(),
+  )
+  return { router, tasks: useTasksStore(pinia) }
+}
+
+/** 排空已完成端口的微任务，保留原有竞态测试显式控制的读取顺序。 */
+async function flushPromises(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
 type MessageRead = Awaited<ReturnType<typeof conversations.getConversation>>
@@ -182,6 +181,137 @@ function readFailure(traceId: string): ProblemError {
 }
 
 describe('ChatPage', () => {
+  it('sends with Enter once and exposes a busy disabled send control until REST accepts', async () => {
+    messages = []
+    const receipt = deferred<{ task_id: string }>()
+    vi.mocked(conversations.sendMessage).mockReturnValueOnce(receipt.promise)
+    await renderPage()
+    const input = screen.getByRole('textbox', { name: '消息' })
+    await fireEvent.update(input, '合成键盘消息')
+    await fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '正在发送…' })).toBeDisabled(),
+    )
+    expect(screen.getByRole('button', { name: '正在发送…' })).toHaveAttribute(
+      'aria-busy',
+      'true',
+    )
+    expect(input).toBeDisabled()
+    await fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+    expect(conversations.sendMessage).toHaveBeenCalledTimes(1)
+    receipt.resolve({ task_id: TASK_ID })
+    await waitFor(() => expect(input).toHaveValue(''))
+  })
+
+  it('keeps Shift+Enter and IME confirmation available without sending', async () => {
+    await renderPage()
+    const input = screen.getByRole('textbox', { name: '消息' })
+    await fireEvent.update(input, '合成输入')
+    const newline = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    await fireEvent(input, newline)
+    expect(newline.defaultPrevented).toBe(false)
+    await fireEvent.compositionStart(input)
+    await fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' })
+    await fireEvent.compositionEnd(input)
+    await fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    await fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 })
+    expect(conversations.sendMessage).not.toHaveBeenCalled()
+    expect(input).toHaveValue('合成输入')
+  })
+
+  it('grows the message textarea with content without using an internal component selector', async () => {
+    await renderPage()
+    const input = screen.getByRole('textbox', { name: '消息' })
+    // jsdom 不提供布局：只模拟公开浏览器尺寸，让真实 Textarea 的 autoResize 执行。
+    Object.defineProperty(input, 'offsetParent', {
+      configurable: true,
+      value: document.body,
+    })
+    Object.defineProperty(input, 'scrollHeight', {
+      configurable: true,
+      value: 240,
+    })
+    await fireEvent.update(input, '合成第一行\n合成第二行')
+    expect(input.style.height).toBe('240px')
+  })
+
+  it('preserves one polite task status while disconnected and keeps the persisted task running', async () => {
+    const { tasks } = await renderPage()
+    tasks.setTask(preparationTask('prepare_mail_draft', 'running', '1'))
+    if (stream.connection) stream.connection.value = 'reconnecting'
+    await flushPromises()
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '任务：执行中 · 正在恢复实时连接',
+    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(tasks.tasks[TASK_ID]?.status).toBe('running')
+  })
+
+  it('creates the initial local conversation only when the server list is empty', async () => {
+    vi.mocked(conversations.listConversations).mockResolvedValueOnce([])
+    vi.mocked(conversations.createConversation).mockResolvedValueOnce(
+      conversation,
+    )
+    await renderPage()
+    expect(
+      screen.getByRole('button', { name: conversation.title }),
+    ).toBeVisible()
+    expect(conversations.createConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves confirmation before deleting a conversation', async () => {
+    const confirm = vi
+      .spyOn(window, 'confirm')
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+    await renderPage()
+    await fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    expect(conversations.deleteConversation).not.toHaveBeenCalled()
+    await fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: conversation.title }),
+      ).not.toBeInTheDocument(),
+    )
+    expect(confirm).toHaveBeenCalledWith('确定删除会话？')
+    expect(conversations.deleteConversation).toHaveBeenCalledWith(
+      conversation.id,
+    )
+    confirm.mockRestore()
+  })
+
+  it('preserves the action snapshot error alert and the separate task status', async () => {
+    vi.mocked(actions.getAction).mockRejectedValueOnce(
+      readFailure('synthetic-snapshot'),
+    )
+    const { tasks } = await renderPage()
+    tasks.setTask({
+      ...preparationTask('prepare_mail_draft', 'running', '1'),
+      kind: 'trusted_action',
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        '操作快照读取失败，请在操作中心重新加载。',
+      ),
+    )
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByRole('status')).toHaveLength(1)
+  })
+
+  it('links the action centre only to the existing workspace', async () => {
+    await renderPage()
+    expect(screen.getByRole('link', { name: '操作中心' })).toHaveAttribute(
+      'href',
+      '/actions',
+    )
+  })
+
   it.each([
     ['prepare_mail_draft', `/mail/drafts/${DRAFT_ID}`],
     ['prepare_calendar_proposal', `/calendar/proposals/${PROPOSAL_ID}`],
@@ -189,7 +319,7 @@ describe('ChatPage', () => {
     'keeps the latest %s result when an older recovery read completes last',
     async (kind, path) => {
       const initialMessages = [...messages]
-      const { wrapper, tasks } = await renderPage()
+      const { tasks } = await renderPage()
       tasks.setTask(preparationTask(kind, 'running', '1'))
       await flushPromises()
       const older = deferred<MessageRead>()
@@ -208,12 +338,17 @@ describe('ChatPage', () => {
         messages: [...initialMessages, preparedMessage(path)],
       })
       await flushPromises()
-      expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(path)
+      expect(
+        screen.getByRole('link', { name: '打开准备结果' }).getAttribute('href'),
+      ).toBe(path)
       older.resolve({ conversation, messages: initialMessages })
       await flushPromises()
-      expect(wrapper.findAll('.markdown-message')).toHaveLength(2)
-      expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(path)
-      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+      expect(screen.getByText('合成初始消息')).toBeVisible()
+      expect(screen.getByRole('link', { name: '打开准备结果' })).toBeVisible()
+      expect(
+        screen.getByRole('link', { name: '打开准备结果' }).getAttribute('href'),
+      ).toBe(path)
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
       expect(mail.submitMailDraft).not.toHaveBeenCalled()
       expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
     },
@@ -223,7 +358,7 @@ describe('ChatPage', () => {
     'keeps messages and errors owned by the latest read when receiving %s',
     async (outcome) => {
       const initialMessages = [...messages]
-      const { wrapper, tasks } = await renderPage()
+      const { tasks } = await renderPage()
       tasks.setTask(preparationTask('prepare_mail_draft', 'running', '1'))
       await flushPromises()
       const older = deferred<MessageRead>()
@@ -246,26 +381,30 @@ describe('ChatPage', () => {
       if (outcome === 'older-error') {
         latest.resolve(result)
         await flushPromises()
-        expect(wrapper.find('a[data-editor-link]').exists()).toBe(true)
+        expect(screen.getByRole('link', { name: '打开准备结果' })).toBeVisible()
         older.reject(readFailure('synthetic-older-read'))
         await flushPromises()
-        expect(wrapper.find('[role="alert"]').exists()).toBe(false)
-        expect(wrapper.get('a[data-editor-link]').attributes('href')).toBe(
-          `/mail/drafts/${DRAFT_ID}`,
-        )
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+        expect(
+          screen
+            .getByRole('link', { name: '打开准备结果' })
+            .getAttribute('href'),
+        ).toBe(`/mail/drafts/${DRAFT_ID}`)
       } else {
         latest.reject(readFailure('synthetic-latest-read'))
         await flushPromises()
-        expect(wrapper.get('[role="alert"]').text()).toContain(
+        expect(screen.getByRole('alert').textContent).toContain(
           'synthetic-latest-read',
         )
         older.resolve(result)
         await flushPromises()
-        expect(wrapper.get('[role="alert"]').text()).toContain(
+        expect(screen.getByRole('alert').textContent).toContain(
           'synthetic-latest-read',
         )
-        expect(wrapper.findAll('.markdown-message')).toHaveLength(1)
-        expect(wrapper.find('a[data-editor-link]').exists()).toBe(false)
+        expect(screen.getByText('合成初始消息')).toBeVisible()
+        expect(
+          screen.queryByRole('link', { name: '打开准备结果' }),
+        ).not.toBeInTheDocument()
       }
     },
   )
@@ -274,30 +413,31 @@ describe('ChatPage', () => {
     messages = []
     const receipt = deferred<{ task_id: string }>()
     vi.mocked(conversations.sendMessage).mockReturnValueOnce(receipt.promise)
-    const { wrapper, tasks } = await renderPage()
+    const { tasks } = await renderPage()
     tasks.setTask(preparationTask('prepare_mail_draft', 'queued', '1'))
-    await wrapper
-      .get('textarea[aria-label="消息"]')
-      .setValue('请准备一封邮件草稿')
-    await wrapper.get('form').trigger('submit')
+    await fireEvent.update(
+      screen.getByRole('textbox', { name: '消息' }),
+      '请准备一封邮件草稿',
+    )
+    await fireEvent.click(screen.getByRole('button', { name: '发送' }))
     recoverMessages()
     await flushPromises()
     expect(conversations.getConversation).toHaveBeenCalledTimes(2)
     expect(
-      wrapper.get('button[type="submit"]').attributes('disabled'),
+      screen
+        .getByRole('button', { name: '正在发送…' })
+        .getAttribute('disabled'),
     ).toBeDefined()
     receipt.resolve({ task_id: TASK_ID })
     await flushPromises()
-    expect(wrapper.get('[data-testid="chat-task-status"]').text()).toContain(
-      '排队',
-    )
-    expect(wrapper.get('textarea[aria-label="消息"]').element).toHaveProperty(
+    expect(screen.getByTestId('chat-task-status').textContent).toContain('排队')
+    expect(screen.getByRole('textbox', { name: '消息' })).toHaveProperty(
       'value',
       '',
     )
     expect(
-      wrapper.get('textarea[aria-label="消息"]').attributes('disabled'),
-    ).toBeUndefined()
+      screen.getByRole('textbox', { name: '消息' }).getAttribute('disabled'),
+    ).toBeNull()
     expect(conversations.sendMessage).toHaveBeenCalledTimes(1)
     expect(conversations.getConversation).toHaveBeenCalledTimes(3)
   })
@@ -314,7 +454,7 @@ describe('ChatPage', () => {
         conversation,
         other,
       ])
-      const { wrapper } = await renderPage()
+      await renderPage()
       const older = deferred<MessageRead>()
       const latest = deferred<MessageRead>()
       vi.mocked(conversations.getConversation)
@@ -322,22 +462,20 @@ describe('ChatPage', () => {
         .mockReturnValueOnce(latest.promise)
       recoverMessages()
       await flushPromises()
-      await wrapper
-        .get('[aria-label="会话历史"] > div:nth-child(2) button')
-        .trigger('click')
-      expect(wrapper.text()).toContain('正在加载会话')
+      await fireEvent.click(screen.getByRole('button', { name: other.title }))
+      expect(screen.getByText('正在加载会话…')).toBeVisible()
       expect(conversations.getConversation).toHaveBeenLastCalledWith(other.id)
       latest.resolve({ conversation: other, messages: [] })
       await flushPromises()
       if (outcome === 'success') older.resolve({ conversation, messages })
       else older.reject(readFailure('synthetic-old-conversation'))
       await flushPromises()
-      expect(wrapper.text()).not.toContain('正在加载会话')
-      expect(wrapper.findAll('.markdown-message')).toHaveLength(0)
-      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+      expect(screen.queryByText('正在加载会话…')).not.toBeInTheDocument()
+      expect(screen.queryByText('合成初始消息')).not.toBeInTheDocument()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
       expect(
-        wrapper.get('textarea[aria-label="消息"]').attributes('disabled'),
-      ).toBeUndefined()
+        screen.getByRole('textbox', { name: '消息' }).getAttribute('disabled'),
+      ).toBeNull()
     },
   )
 
@@ -353,10 +491,10 @@ describe('ChatPage', () => {
         ...(messages[0] as Message),
         content_markdown: `[打开本地对象](${path})`,
       }
-      const { wrapper, router } = await renderPage()
-      const link = wrapper.get('a[data-editor-link]')
-      expect(link.attributes('href')).toBe(path.replace('/api/v1', ''))
-      await link.trigger('click')
+      const { router } = await renderPage()
+      const link = screen.getByRole('link', { name: '打开本地对象' })
+      expect(link.getAttribute('href')).toBe(path.replace('/api/v1', ''))
+      await fireEvent.click(link)
       await flushPromises()
       expect(router.currentRoute.value.path).toBe(path.replace('/api/v1', ''))
       expect(mail.createMailDraft).not.toHaveBeenCalled()
@@ -378,22 +516,22 @@ describe('ChatPage', () => {
         ...(messages[0] as Message),
         content_markdown: `[不可信链接](${path})`,
       }
-      const { wrapper } = await renderPage()
+      await renderPage()
       // 被拒绝的 Markdown 可被 linkify 识别出普通 HTTPS 文本；不能把它当作编辑链接。
-      expect(
-        wrapper.find('.markdown-message a[data-editor-link]').exists(),
-      ).toBe(false)
-      const links = wrapper.findAll('.markdown-message a')
+      expect(screen.queryByRole('link', { name: '不可信链接' })).toBeNull()
+      const links = screen
+        .queryAllByRole('link')
+        .filter((link) => link.textContent !== '操作中心')
       expect(
         links.every((link) =>
-          /^https?:\/\//i.test(link.attributes('href') ?? ''),
+          /^https?:\/\//i.test(link.getAttribute('href') ?? ''),
         ),
       ).toBe(true)
       expect(
         links.every(
           (link) =>
-            link.attributes('target') === '_blank' &&
-            link.attributes('rel') === 'noopener noreferrer',
+            link.getAttribute('target') === '_blank' &&
+            link.getAttribute('rel') === 'noopener noreferrer',
         ),
       ).toBe(true)
     },
@@ -401,11 +539,12 @@ describe('ChatPage', () => {
 
   it('sends explicit preparation text only through chat and renders queued progress from the task', async () => {
     messages = []
-    const { wrapper, tasks } = await renderPage()
-    await wrapper
-      .get('textarea[aria-label="消息"]')
-      .setValue('请准备一封邮件草稿')
-    await wrapper.get('form').trigger('submit')
+    const { tasks } = await renderPage()
+    await fireEvent.update(
+      screen.getByRole('textbox', { name: '消息' }),
+      '请准备一封邮件草稿',
+    )
+    await fireEvent.click(screen.getByRole('button', { name: '发送' }))
     await flushPromises()
     expect(conversations.sendMessage).toHaveBeenCalledWith(
       conversation.id,
@@ -422,19 +561,19 @@ describe('ChatPage', () => {
       steps: [],
     })
     await flushPromises()
-    expect(wrapper.get('[data-testid="chat-task-status"]').text()).toContain(
-      '排队',
+    expect(screen.getByTestId('chat-task-status').textContent).toContain('排队')
+    expect(screen.getByTestId('chat-task-status').textContent).not.toContain(
+      '已发送',
     )
-    expect(
-      wrapper.get('[data-testid="chat-task-status"]').text(),
-    ).not.toContain('已发送')
     expect(mail.createMailDraft).not.toHaveBeenCalled()
     expect(actions.getAction).not.toHaveBeenCalled()
-    expect(wrapper.find('[aria-label="人工审批"]').exists()).toBe(false)
+    expect(
+      screen.queryByRole('region', { name: '人工审批' }),
+    ).not.toBeInTheDocument()
   })
 
   it('loads action editor_url and approval only after a genuine trusted task snapshot is recovered', async () => {
-    const { wrapper, tasks } = await renderPage()
+    const { tasks } = await renderPage()
     expect(actions.getAction).not.toHaveBeenCalled()
     tasks.setTask({
       id: TASK_ID,
@@ -447,11 +586,10 @@ describe('ChatPage', () => {
     })
     await flushPromises()
     expect(actions.getAction).toHaveBeenCalledWith(TASK_ID)
-    expect(
-      wrapper
-        .find(`a[href="/mail/drafts/${DRAFT_ID}?task=${TASK_ID}"]`)
-        .exists(),
-    ).toBe(true)
-    expect(wrapper.find('[aria-label="人工审批"]').exists()).toBe(true)
+    expect(screen.getByRole('link', { name: '打开邮件草稿' })).toHaveAttribute(
+      'href',
+      `/mail/drafts/${DRAFT_ID}?task=${TASK_ID}`,
+    )
+    expect(screen.getByRole('region', { name: '人工审批' })).toBeVisible()
   })
 })

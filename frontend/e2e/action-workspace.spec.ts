@@ -277,7 +277,7 @@ for (const kind of [
     // 先观察首段真实快照，再开放同一原生流的第二次响应；不用拦截器请求头推断是否已消费事件。
     await expect(page.getByTestId('chat-task-status')).toContainText('执行中')
     releaseReconnect()
-    const link = page.locator('a[data-editor-link]')
+    const link = page.getByRole('link', { name: '打开准备结果', exact: true })
     await expect(link).toHaveAttribute('href', editorPath)
     await expect(page.getByTestId('chat-task-status')).toContainText('已完成')
     expect(reads).toBe(3)
@@ -299,7 +299,15 @@ for (const kind of [
         }),
     )
     expect(completedReads).toEqual([1, 3, 2])
-    await expect(page.locator('.markdown-message')).toHaveCount(2)
+    await expect(
+      page.getByText(
+        kind === 'prepare_mail_draft' ? '合成邮件准备请求' : '合成日程准备请求',
+        { exact: true },
+      ),
+    ).toBeVisible()
+    await expect(
+      page.getByRole('link', { name: '打开准备结果', exact: true }),
+    ).toHaveCount(1)
     await expect(link).toHaveAttribute('href', editorPath)
     await expect(page.getByRole('alert')).toHaveCount(0)
     await page.getByRole('link', { name: '打开准备结果', exact: true }).click()
@@ -375,21 +383,39 @@ test('chat follows a prepared local API link and rejects arbitrary paths without
     editorJson(route, mailDraft()),
   )
   await page.goto('/chat')
-  await page.getByLabel('消息', { exact: true }).fill('请准备一封邮件草稿')
+  const input = page.getByRole('textbox', { name: '消息', exact: true })
+  await input.fill('请准备一封邮件草稿')
+  await input.press('Shift+Enter')
+  await expect(input).toHaveValue('请准备一封邮件草稿\n')
+  await input.dispatchEvent('compositionstart')
+  await input.press('Enter')
   expect(capture.mutations).toHaveLength(0)
-  await page.getByRole('button', { name: '发送', exact: true }).click()
-  await expect(page.locator('a[data-editor-link]')).toHaveCount(1)
-  await expect(page.locator('a[data-editor-link]')).toHaveAttribute(
-    'href',
-    `/mail/drafts/${DRAFT_ID}`,
+  await input.dispatchEvent('compositionend')
+  // 浏览器真实布局证明 Textarea 随多行内容增长，随后恢复原业务请求文本。
+  const initialHeight = await input.evaluate(
+    (element) => element.getBoundingClientRect().height,
   )
+  await input.fill(Array.from({ length: 12 }, () => '合成多行输入').join('\n'))
+  await expect
+    .poll(() =>
+      input.evaluate((element) => element.getBoundingClientRect().height),
+    )
+    .toBeGreaterThan(initialHeight)
+  await input.fill('请准备一封邮件草稿')
+  await input.press('Enter')
+  await expect(
+    page.getByRole('link', { name: '打开本地草稿', exact: true }),
+  ).toHaveCount(1)
+  await expect(
+    page.getByRole('link', { name: '打开本地草稿', exact: true }),
+  ).toHaveAttribute('href', `/mail/drafts/${DRAFT_ID}`)
   await expect(page.getByTestId('chat-task-status')).not.toContainText('已发送')
   await expect(page.getByRole('region', { name: '人工审批' })).toHaveCount(0)
   const external = page.getByRole('link', { name: '外部资料' })
   await expect(external).toHaveAttribute('target', '_blank')
   await expect(external).toHaveAttribute('rel', 'noopener noreferrer')
   await expect(
-    page.locator('.markdown-message a[href^="javascript:"]'),
+    page.getByRole('link', { name: '脚本', exact: true }),
   ).toHaveCount(0)
   await page.getByRole('link', { name: '打开本地草稿' }).click()
   await expect(page).toHaveURL(new RegExp(`/mail/drafts/${DRAFT_ID}$`))
