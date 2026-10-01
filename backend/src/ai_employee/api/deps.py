@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from ai_employee.application.use_cases.connections import ConnectionsUseCase
     from ai_employee.application.use_cases.mail_drafts import MailDraftUseCase
     from ai_employee.application.use_cases.settings import UpdateUserSettings
+    from ai_employee.application.use_cases.task_history import ListTaskHistoryUseCase
     from ai_employee.application.use_cases.trusted_actions import (
         SubmitCalendarProposalUseCase,
         SubmitMailDraftUseCase,
@@ -243,7 +244,10 @@ def _problem_response(request: Request, problem_error: ApiProblem) -> JSONRespon
     headers: dict[str, str] = {}
     # 日历/动作响应可能包含标题、地点、时间或历史错误上下文；即使由统一异常处理器
     # 重新构造 Problem Details，也必须继承路由成功响应的 no-store 隔离策略。
-    if request.url.path.startswith(("/api/v1/calendar/", "/api/v1/actions")):
+    # 历史列表仅匹配GET精确路径，认证前401也生效，旧创建/详情/SSE语义保持原样。
+    if request.url.path.startswith(("/api/v1/calendar/", "/api/v1/actions")) or (
+        request.method == "GET" and request.url.path == "/api/v1/tasks"
+    ):
         headers["Cache-Control"] = "no-store"
     if isinstance(problem_error, _TransientApiProblem) and problem_error.retry_after is not None:
         headers["Retry-After"] = str(int(problem_error.retry_after))
@@ -933,3 +937,27 @@ def get_revoke_session_use_case(
 
 CurrentSession = Annotated[AuthenticatedSession, Depends(get_authenticated_session)]
 CsrfProtectedSession = Annotated[AuthenticatedSession, Depends(require_csrf_authenticated_session)]
+
+
+def get_task_history_use_case(request: Request) -> "ListTaskHistoryUseCase":
+    """组装认证列表的只读适配器，构造阶段不读取Secret。
+
+    Args:
+        request: 提供已验证配置、受管会话工厂和可替换认证时钟的请求。
+    Returns:
+        无执行副作用的列表用例；仅在验证或签发游标时在线程中加载现有主密钥。
+    """
+    from ai_employee.application.use_cases.task_history import ListTaskHistoryUseCase
+    from ai_employee.infrastructure.db.repositories.task_history_views import (
+        SqlAlchemyTaskHistoryReader,
+    )
+    from ai_employee.infrastructure.db.session import ManagedAsyncSessionMaker
+    from ai_employee.infrastructure.security.task_history_cursor import TaskHistoryCursorCodec
+
+    settings = get_auth_settings(request)
+    factory = cast(ManagedAsyncSessionMaker, request.app.state.auth_session_factory)
+    return ListTaskHistoryUseCase(
+        SqlAlchemyTaskHistoryReader(factory),
+        lambda: TaskHistoryCursorCodec.from_file(settings.app_master_key_file),
+        get_auth_clock(request),
+    )
