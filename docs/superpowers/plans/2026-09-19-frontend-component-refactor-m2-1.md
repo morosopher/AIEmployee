@@ -15,7 +15,7 @@
 - 事实来源是 `docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md`。若实现证据与规格的选型、许可、只读边界、无障碍或安全约束冲突，停止并向用户说明。
 - 每个任务按红—绿—重构执行：先新增或调整聚焦测试并运行观察预期失败，再实现，再运行聚焦测试、`pnpm --dir frontend type-check`、`pnpm --dir frontend lint`，最后提交。
 - 页面迁移任务（Task 4～15）在动模板前必须先把该页面既有单测和相关 E2E 的选择器改为 `getByRole`/`getByLabelText`/`getByText`，并在旧实现上确认通过；这一步与迁移本身在同一任务内但作为 Step 1 单独完成。
-- 行为层文件（`src/api/**`、`src/stores/**`、`src/composables/**`、`src/features/**` 中非 `schema.ts`/`presentation.ts` 的文件、`src/router/**`）在 M2.1 不得修改。若迁移暴露行为层缺陷，先停止当前任务，以独立 `fix:` 提交修复并附回归测试，再继续。
+- 行为层文件（`src/api/**`、`src/stores/**`、`src/composables/**`、`src/features/**` 中既有非 `schema.ts`/`presentation.ts` 的文件、`src/router/**`）在 M2.1 视为只读。显式新增的 `schema.spec.ts`、`features/forms/problemFields.ts` 及其测试属于本计划文件清单许可；Task 8 前的 `useConnections.ts` 异步确认端口及对应回归仅按独立 fix 执行，其他既有行为层仍只读。若迁移暴露行为层缺陷，先停止当前任务，以独立 `fix:` 提交修复并附回归测试，再继续。
 - 测试禁止依赖 PrimeVue 内部 class（`p-*`）、内部 DOM 层级或 `data-pc-*` 属性；只依赖角色、label、可见文本和自有 `data-testid`。
 - 组件测试新增内容使用 `@testing-library/vue`；需要断言 Emits/Props 的既有 Vue Test Utils 测试可保留，同一文件不混用两种风格。
 - 不新增任何 `localStorage`/`sessionStorage`/`document.cookie` 写入；不引入 CDN 资源；不使用 `v-html` 或 `escape=false` 渲染 API 返回的字符串。
@@ -23,7 +23,10 @@
 - 许可证默认白名单以规格 §3.2 为准；基线例外仅限该节授权表的包名、精确版本和许可证原文组合，保留生产/开发 scope 隔离，升级不继承例外。新增例外须先获用户批准并同步事实来源与测试。
 - PrimeVue 相关包固定精确版本 `4.5.5`；出现 `primevue@5`、`@primeui/*`、`@primeuix/themes@3` 即视为违规。
 - 每个任务的提交只包含该任务列出的文件，提交信息使用任务末尾给定的文本。
-- Task 16 之前 `just check` 中的样式检查为警告模式；Task 16 之后转为失败模式。Task 17 之前必须运行完整 `just ci` 并读取完整输出。
+- Task 16 之前 `just check` 中的样式检查为警告模式；Task 16 之后转为失败模式。`check` 保持快速许可/版本/样式等检查；`ci` 在构建后生成体积报告并检查预算。Task 17 提交前及最终文档提交后均运行完整 `just ci`，读取并留档输出。
+- Task 2 迁移前核对并冻结真实 live region 清单（触发场景、语义、文案）。2026-10-01 的迁移前源码清点为 status 43 / alert 32 / dialog 1，基准提交为 `4ce84ae`，可从该提交的 `frontend/src/**/*.vue` 按单双引号 `role` 属性重新清点；本地执行产物 `.superpowers/sdd/2026-09-19-frontend-component-refactor-m2-1/live-region-baseline.json` 仅作辅助，不作为唯一事实来源。该计数不包含运行时组件内置 role。Task 2～15 逐项保留旧语义/文案，组件抽取、内置 role、新抽屉导致的数量变化在同一提交记录并补运行时测试；禁止空 role 凑数。Task 16 汇总清单及运行时证据。
+- Forms + zod 仅用于工作设置、邮件与日程；登录聊天保留提交逻辑。时区沿用本地 Intl IANA + UTC，保留服务端当前值及显式合法 IANA，不新增列表接口或推断用户时区。
+- 页面相关 E2E 在旧实现和迁移后都必须运行；Task 6/7 补跑 daily-brief、action-workspace、reconnect，Task 9 补跑 settings。共享编辑器组件变更覆盖 calendar/actions/brief 消费者；因 DOM 调整需扩充 E2E 文件名单时先记录差异，业务断言不变。
 - 所有测试数据使用 `src/test-support/` 既有合成 fixture；不复制真实邮件、姓名或地址。
 
 ## 文件地图
@@ -51,6 +54,7 @@
 - 修改：`frontend/src/components/` 中其余 M2 组件及其 `*.spec.ts`
 - 创建：`frontend/src/features/settings/schema.ts`、`frontend/src/features/mail/schema.ts`、`frontend/src/features/calendar/schema.ts` 及对应 `schema.spec.ts`
 - 创建：`frontend/src/features/forms/problemFields.ts`、`frontend/src/features/forms/problemFields.spec.ts`
+- Task 8 前独立 fix：修改 `frontend/src/features/connections/useConnections.ts`，创建 `frontend/src/features/connections/useConnections.spec.ts`（仅确认端口回归）。
 
 ### E2E 与验收
 
@@ -190,31 +194,31 @@ Expected: PASS。
 
 ~~~typescript
 it('marks the current route in the primary navigation', async () => {
-  const { getByRole } = renderWithPlugins(AppShell, { route: '/actions' })
+  const { getByRole } = await renderWithPlugins(AppShell, { route: '/actions' })
   expect(getByRole('link', { name: '操作中心' })).toHaveAttribute('aria-current', 'page')
 })
 
 it('opens the navigation drawer from the menu button on narrow screens and returns focus on close', async () => {
   setViewport(600)
-  const { getByRole, queryByRole } = renderWithPlugins(AppShell)
+  const { getByRole, queryByRole } = await renderWithPlugins(AppShell)
   const trigger = getByRole('button', { name: '打开导航' })
   await fireEvent.click(trigger)
-  expect(getByRole('dialog', { name: '主导航' })).toBeVisible()
-  await fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
-  expect(queryByRole('dialog', { name: '主导航' })).toBeNull()
-  expect(trigger).toHaveFocus()
+  await waitFor(() => expect(getByRole('dialog', { name: '主导航' })).toBeVisible())
+  await fireEvent.keyDown(getByRole('dialog', { name: '主导航' }), { key: 'Escape', code: 'Escape' })
+  await waitFor(() => expect(queryByRole('dialog', { name: '主导航' })).toBeNull())
+  await waitFor(() => expect(trigger).toHaveFocus())
 })
 
 it('keeps the overdue brief alert as role=alert with the diagnostic link', async () => {
   vi.mocked(getSystemAlerts).mockResolvedValue({ alerts: [{ kind: 'brief_overdue', diagnostic_task_id: TASK_ID }] })
-  const { findByRole } = renderWithPlugins(AppShell)
+  const { findByRole } = await renderWithPlugins(AppShell)
   const alert = await findByRole('alert')
   expect(within(alert).getByRole('link', { name: '查看诊断任务' })).toHaveAttribute('href', `/tasks?task_id=${TASK_ID}`)
 })
 
-it('hides the global timeline column on /actions at every breakpoint', () => {
+it('hides the global timeline column on /actions at every breakpoint', async () => {
   setViewport(1400)
-  const { queryByRole } = renderWithPlugins(AppShell, { route: '/actions' })
+  const { queryByRole } = await renderWithPlugins(AppShell, { route: '/actions' })
   expect(queryByRole('complementary', { name: '任务时间线' })).toBeNull()
 })
 ~~~
@@ -262,28 +266,28 @@ git commit -m "feat: rebuild app shell with PrimeVue layout"
 - [ ] **Step 1: 写失败的基础组件测试**
 
 ~~~typescript
-it('renders an empty state with icon hidden from assistive technology and an optional action', () => {
-  const { getByText, getByRole, container } = renderWithPlugins(EmptyState, { props: { title: '暂无草稿', actionLabel: '新建草稿' } })
+it('renders an empty state with icon hidden from assistive technology and an optional action', async () => {
+  const { getByText, getByRole, container } = await renderWithPlugins(EmptyState, { props: { title: '暂无草稿', actionLabel: '新建草稿' } })
   expect(container.querySelector('[aria-hidden="true"]')).not.toBeNull()
   expect(getByRole('button', { name: '新建草稿' })).toBeEnabled()
 })
 
-it('renders a status tag with text and never relies on colour alone', () => {
-  const { getByText } = renderWithPlugins(StatusTag, { props: { kind: 'task', value: 'reconciling' } })
+it('renders a status tag with text and never relies on colour alone', async () => {
+  const { getByText } = await renderWithPlugins(StatusTag, { props: { kind: 'task', value: 'reconciling' } })
   expect(getByText('核对中')).toBeVisible()
 })
 
-it('shows a problem with recovery action and trace id without stack or raw html', () => {
+it('shows a problem with recovery action and trace id without stack or raw html', async () => {
   const problem = new ProblemError({ type: 'about:blank', title: 'Conflict', status: 409, detail: '<b>x</b>', instance: '', trace_id: 'trace-1', error_code: 'approval_version_conflict' })
-  const { getByRole, getByText, queryByText } = renderWithPlugins(ProblemMessage, { props: { problem, actionLabel: '重新加载' } })
+  const { getByRole, getByText, queryByText } = await renderWithPlugins(ProblemMessage, { props: { problem, actionLabel: '重新加载' } })
   expect(getByRole('alert')).toBeVisible()
   expect(getByText('trace-1')).toBeVisible()
   expect(queryByText('x')).toBeNull()
   expect(getByRole('button', { name: '重新加载' })).toBeEnabled()
 })
 
-it('keeps sanitized markdown output and external link attributes', () => {
-  const { getByRole } = renderWithPlugins(MarkdownMessage, { props: { source: '[a](https://example.test) <script>x</script>' } })
+it('keeps sanitized markdown output and external link attributes', async () => {
+  const { getByRole } = await renderWithPlugins(MarkdownMessage, { props: { content: '[a](https://example.test) <script>x</script>' } })
   expect(getByRole('link', { name: 'a' })).toHaveAttribute('rel', 'noopener noreferrer')
   expect(document.querySelector('script')).toBeNull()
 })
@@ -409,7 +413,7 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的迁移断言**
 
-覆盖：输入框为 `Textarea autoResize` 且 Enter 发送、Shift+Enter 换行；发送中按钮 `loading`；流式 delta 仍以 `aria-live="polite"` 区域更新；最终消息替换临时消息后 DOM 中只有一条；断线时显示 `Message warn` 且不把任务标为失败；行动建议按钮只链接到既有 `/actions` 入口。
+覆盖：输入框为 `Textarea autoResize` 且 Enter 发送、Shift+Enter 换行；发送中按钮 `loading`；现有 REST 最终消息、重连重读与实时任务持久状态正确呈现，不增加当前不存在的临时 delta 投影；断线时显示 `Message warn` 且不把任务标为失败；保留可信本地邮件/日程编辑器链接及打开行为，操作中心按钮仍只指向既有 `/actions`，不新增入口。登录与聊天提交逻辑保持，Enter 处理尊重 IME composition。
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ChatPage.spec.ts`
 
@@ -473,6 +477,25 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 
 ---
 
+### Task 8 前置独立修复：异步确认展示端口
+
+**Files:**
+- Modify: `frontend/src/features/connections/useConnections.ts`
+- Create: `frontend/src/features/connections/useConnections.spec.ts`
+
+先写并运行失败回归：异步确认未完成或被取消时零断开请求；等待确认与执行期间忙碌互斥；确认后只调用一次 `disconnectConnection(connection.id)`，按既有规则 `catalog.load()`，失败及卸载保护不变。逐字保留「确定断开此连接？未认领操作会停止；已执行的邮件或日程不会撤回。」。
+
+最小实现为可注入并 await 的异步确认回调，默认保留既有确认语义；不全局替换 `window.confirm`，不在页面复制 API 请求路径。该端口不改变外部写入和审批规则。Task 8 页面通过 `ConfirmDialog` 提供回调，只有一次确认。
+
+Run: `pnpm --dir frontend test:unit --run src/features/connections/useConnections.spec.ts src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/connections.spec.ts`
+
+读取完整输出，通过 `just check` 并审阅 diff 后独立提交：
+
+~~~bash
+git add frontend/src/features/connections/useConnections.ts frontend/src/features/connections/useConnections.spec.ts
+git commit -m "fix: inject async connection disconnect confirmation"
+~~~
+
 ### Task 8: 迁移连接页与能力行
 
 **Files:**
@@ -488,7 +511,7 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的迁移断言**
 
-覆盖：每个连接为 `Card`，能力为 `DataTable` 且列头有 `scope`；`ToggleSwitch` 有程序化 label 且切换中禁用；「启用」「继续授权」「重新授权」「管理员同意」保持独立按钮且只在服务端能力状态允许时可用；能力降级用 `Message warn`；默认发送账户与默认日历用 `Select`；断开连接走 `ConfirmDialog` 且焦点返回。
+覆盖：每个连接为 `Card`，能力为 `DataTable` 且列头有 `scope`；`ToggleSwitch` 有程序化 label 且切换中禁用；「启用」「继续授权」「重新授权」「管理员同意」保持独立按钮且只在服务端能力状态允许时可用；能力降级用 `Message warn`；仅保留既有去设置入口（默认账户/日历 `Select` 属于 Task 9）；断开连接走 `ConfirmDialog` 且焦点返回。
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts`
 
@@ -529,26 +552,11 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的 schema 与错误映射测试**
 
-~~~typescript
-it('rejects a working-hours end that is not after start at format level only', () => {
-  expect(workSettingsSchema.safeParse({ ...validSettings, work_end: '09:00', work_start: '10:00' }).success).toBe(false)
-})
+测试使用既有合成 `UserSettings` fixture 和完整 `working_hours`（monday 至 sunday，每日零到多个 `{ start, end }` 区间）：逐日逐区间构造结束不晚于开始的失败用例，同时覆盖合法多区间与空日。不得引入 `work_start`/`work_end` 第二套字段。
 
-it('accepts any IANA timezone from the server-provided list without validating business rules', () => {
-  expect(workSettingsSchema.safeParse(validSettings).success).toBe(true)
-})
+时区测试覆盖本地 `Intl.supportedValuesOf('timeZone')` 加 `UTC`、服务端当前值，以及未出现在有限 fallback 但显式合法的 IANA；不读取不存在的服务端列表，也不按宿主时区自动选择。
 
-it('maps a server validation problem to form fields by error_code, never by message text', () => {
-  const problem = new ProblemError({ ..., error_code: 'validation_error', errors: [{ field: 'work_start', code: 'invalid_time' }] })
-  expect(problemToFieldErrors(problem)).toEqual({ work_start: '时间格式无效' })
-})
-
-it('returns an empty map for problems without field errors', () => {
-  expect(problemToFieldErrors(new ProblemError({ ..., status: 409, error_code: 'settings_version_conflict' }))).toEqual({})
-})
-~~~
-
-`errors` 字段形状以 `src/api/client.ts` 既有 Problem Details 解析为准；若解析器未暴露字段错误，则映射函数只依据 `error_code` 给出表单级错误，不改动 `api/`。
+错误映射测试直接使用现有七字段 `ProblemDetails` fixture：逐个已知 `error_code` 映射安全中文表单级错误，未知码得到安全 fallback；改变 `title`/`detail` 不影响映射，也不显示原文。字段格式错误由 zod 提供；不制造 `errors` 数组或扩展 API 解析。
 
 - [ ] **Step 3: 运行并观察预期失败**
 
@@ -558,7 +566,7 @@ Expected: FAIL，模块不存在。
 
 - [ ] **Step 4: 实现 schema、映射与设置页**
 
-`problemFields.ts` 导出 `problemToFieldErrors` 与 `error_code` 到中文说明的冻结映射表；`settings/schema.ts` 导出 zod schema 与 `zodResolver`。`WorkSettingsForm.vue` 改用 `Form`，字段用 `Select filter`（时区）、`DatePicker timeOnly`（工作时间）、`InputNumber`（会议缓冲）、`ToggleSwitch`；提交中 `loading`；409 显示 `EditorRecovery` 风格恢复动作且不清空输入。「删除全部数据」入口沿用既有 `DELETE ALL DATA` 输入确认，改为 `Dialog modal`，说明文案不变。删除 scoped CSS。
+`problemFields.ts` 导出 `problemToFormError` 与已知 `error_code` 到安全中文表单级说明的冻结映射表；`settings/schema.ts` 导出 zod schema 与 `zodResolver`。`WorkSettingsForm.vue` 改用 `Form`，字段用 `Select filter`（时区）、`DatePicker timeOnly`（工作时间）、`InputNumber`（会议缓冲）、`ToggleSwitch`；默认发送账户、默认日历账户与默认日历使用 `Select`，保留失效原值与明确重选提示；七日多区间模型与提交参数不变；提交中 `loading`；409 显示 `EditorRecovery` 风格恢复动作且不清空输入。「删除全部数据」入口沿用既有 `DELETE ALL DATA` 输入确认，改为 `Dialog modal`，说明文案不变。删除 scoped CSS。
 
 - [ ] **Step 5: 运行聚焦检查**
 
@@ -590,7 +598,7 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的迁移断言**
 
-覆盖：六个分组为 `Tabs`，Tab 键盘可切换且 `aria-selected` 正确；列表为 `DataTable`，列头 `scope="col"`，状态列用 `StatusTag`；供应商/类型/状态筛选为带 label 的 `Select`，变更后调用的 API 参数与旧实现完全一致（用 `vi.mocked(listActions).mock.calls` 比对）；`Paginator` 触发的 `page`/`page_size` 参数不变；详情在 `≥ xl` 为 `Splitter` 右栏、`< md` 为独立区域；内容到期时显示「内容已过期」历史状态；聚焦与重连后重读快照的既有测试不动；零浏览器存储断言保留。
+覆盖：六个分组为 `Tabs`，Tab 键盘可切换且 `aria-selected` 正确；列表为 `DataTable`，列头 `scope="col"`，状态列用 `StatusTag`；供应商/类型/状态筛选为带 label 的 `Select`，变更后调用的 API 参数与旧实现完全一致（用 `vi.mocked(listActions).mock.calls` 比对）；`Paginator` 的 `first`/`rows` 仅在展示层映射为既有 `offset`/`limit`，API 参数不变；详情在 `≥ xl` 为 `Splitter` 右栏、`< md` 为独立区域；内容到期时显示「内容已过期」历史状态；聚焦与重连后重读快照的既有测试不动；零浏览器存储断言保留。
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts`
 
@@ -672,7 +680,7 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的 schema 与迁移断言**
 
-schema 只校验：标题非空、开始/结束为合法时间且结束晚于开始、时区在服务端列表内、参会人地址格式。断言：时间字段为 `DatePicker showTime` 且提交值仍是既有 ISO 格式与 IANA 时区（比对 API mock 参数）；时区 `Select` 明示且无自动推断；修改任一时间字段后旧冲突结果被清除并重新计算（既有逻辑，只改断言选择器）；冲突提示 `Message warn` 最多三个候选时间按钮，选择后回填字段；工作时间外警告可见；参会人 `Chip` 列表；无删除/取消/重复日程/会议链接控件；ETag 冲突显示恢复动作。
+schema 只校验：标题非空、开始/结束为合法时间且结束晚于开始、时区为显式合法 IANA（本地 Intl 列表 + UTC，保留服务端当前值，不以有限 fallback 排除合法值）、参会人地址格式。断言：全天字段用日期分支，定时字段用 `DatePicker showTime` 墙上时间分支；沿用既有全天日期转换与 `features/calendar/time.ts`、DST 歧义拒绝，提交值仍是既有日期或 ISO 格式与 IANA 时区（比对 API mock 参数），不得直接 `Date.toISOString()` 推断宿主机时区；时区 `Select` 明示且无自动推断；修改任一时间字段后旧冲突结果被清除并重新计算（既有逻辑，只改断言选择器）；冲突提示 `Message warn` 最多三个候选时间按钮，选择后回填字段；工作时间外警告可见；参会人 `Chip` 列表；无删除/取消/重复日程/会议链接控件；ETag 冲突显示恢复动作。
 
 Run: `pnpm --dir frontend test:unit --run src/features/calendar src/pages/CalendarProposalPage.spec.ts`
 
@@ -823,7 +831,7 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 
 - [ ] **Step 1: 写失败的门禁与 E2E**
 
-`liveRegionInventory.spec.ts`：用 `import.meta.glob` 读取全部 `.vue` 源码，断言 `role="status"`、`role="alert"`、`role="dialog"` 计数等于迁移前冻结值（46/40/4，若 Task 2～15 有正当增减则在该任务提交说明中记录并更新此处），并断言不含 `#[0-9a-fA-F]{3,6}\b` 与 `@media`。
+`liveRegionInventory.spec.ts`：汇总 Task 2 前核对冻结的真实基线（源码 status 43 / alert 32 / dialog 1），逐项对照既有 `status`、`alert`、`dialog` 的触发场景、语义与文案；源码扫描只辅助清单，不能机械计数代替运行时验收。组件抽取、PrimeVue 内置 role、新抽屉造成的数量变化须有同提交的逐项原因与运行时测试，证明无漏报/重复播报；禁止空 role 凑数。样式断言沿用 Task 1 已落地的颜色检测（含八位颜色并排除 HTML 实体）及 `@media` 检查。
 
 `accessibility.spec.ts`：对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图运行 axe，`serious`/`critical` 为零。`layout.spec.ts`：在 375、900、1400 三个宽度截图并断言导航、时间线的呈现形式。`playwright.config.ts` 增加 `tablet` 与 `mobile` project，仅这两个新 spec 在三种 project 运行。
 
@@ -872,7 +880,7 @@ Expected: PASS，读取完整输出；记录后端/前端测试数、E2E 数、a
 
 - [ ] **Step 2: 写验收记录**
 
-`docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md` 记录：验证基准 HEAD、`just ci` 起止时间与退出码、前端单测/E2E 通过数、axe 七视图结果、三种布局截图哈希、live region 计数比对、`pnpm-lock.yaml` 中 PrimeVue 版本与许可证检查输出、体积基线与最终值、浏览器基线声明、未覆盖项。不记录任何真实数据。
+`docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md` 记录：验证基准 HEAD、`just ci` 起止时间与退出码、前端单测/E2E 通过数、axe 七视图结果、三种布局截图哈希、live region 基线逐项语义/文案比对、数量变化原因与运行时测试结果、`pnpm-lock.yaml` 中 PrimeVue 版本与许可证检查输出、体积基线与最终值、浏览器基线声明、未覆盖项。不记录任何真实数据。
 
 - [ ] **Step 3: 同步文档**
 
@@ -884,3 +892,9 @@ README：技术栈段落写明 PrimeVue 4.5.5 + Tailwind 4、浏览器基线、`
 git add frontend/AGENTS.md AGENTS.md CLAUDE.md README.md docs/acceptance-checklist.md docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md
 git commit -m "docs: freeze M2.1 frontend refactor evidence"
 ~~~
+
+- [ ] **Step 5: 在最终文档提交上追加完整门禁并留档**
+
+Run: `just ci`
+
+Expected: PASS，读取完整输出并将最终 HEAD、起止时间、退出码与完整日志另行留档。Step 2 证据正文保留构建基准 HEAD，不为了写入自身提交 SHA 循环修改文档。只有最终文档提交的 CI 通过后才报告 M2.1 完成；失败先定位修复，并对新的最终提交重新验证。

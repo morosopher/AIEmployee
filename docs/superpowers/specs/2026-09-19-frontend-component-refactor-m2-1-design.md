@@ -35,7 +35,7 @@ M2.1 的目标是**只替换展示层**：用成熟的组件库和统一的设�
   页面或一组基础组件；里程碑结束时不允许两套样式体系并存。
 - `api/`、`stores/`、`composables/useTaskEvents`、`features/` 中的领域投影逻辑、
   Markdown 清洗和路由守卫**不在本里程碑修改**；如迁移过程中发现这些层的缺陷，单独
-  记录并按 `fix:` 提交，不混入视觉重构。
+  记录并按 `fix:` 提交，不混入视觉重构。Task 8 前已批准的唯一确认端口例外见 §7。
 - 前端 `AGENTS.md` 中「未获批准不要引入新的 UI 框架或 CSS 体系」的规则由本规格批准
   修订为明确的技术栈清单。
 
@@ -53,8 +53,8 @@ M2.1 的目标是**只替换展示层**：用成熟的组件库和统一的设�
   导航和抽屉时间线。
 - 逐页重构登录、今日简报、对话、任务历史、连接、设置、操作中心、邮件编辑器、日程
   编辑器、日程重新准备、审批预览和 `needs_attention` 面板的展示层。
-- 表单统一使用 PrimeVue Forms 与 zod 做**格式级**校验和错误呈现；领域规则仍以服务端
-  Problem Details 为准。
+- 工作设置、邮件与日程编辑表单统一使用 PrimeVue Forms 与 zod 做**格式级**校验；
+  登录与聊天换用 PrimeVue 输入控件并保留现有提交逻辑。领域规则仍以服务端 Problem Details 为准。
 - 用 Toast、内联 Message、Skeleton、空状态组件统一加载、空、失败、部分成功、断线和
   恢复状态的呈现。
 - 建立可自动化的无障碍门禁：关键页面在 Playwright 中执行 axe 扫描，组件测试覆盖
@@ -225,17 +225,17 @@ PrimeVue 商业产品线禁令保持不变。
 | `components/AppShell.vue` | `Menu`、`Drawer`、`Message`、`Toast`、`ConfirmDialog` | 见第 5 节 |
 | `pages/TodayBriefPage.vue`、`components/BriefView.vue` | `Card`、`Tag`、`Skeleton`、`Message`、`Accordion` | 来源引用与数据截止时间保持可见 |
 | `components/SourceLink.vue` | `Button link` | 保留 `rel="noopener noreferrer"` |
-| `pages/ChatPage.vue` | `Textarea autoResize`、`Button`、`ScrollPanel` | 流式 delta 渲染逻辑不变 |
+| `pages/ChatPage.vue` | `Textarea autoResize`、`Button`、`ScrollPanel` | 保留既有最终消息、可信本地编辑器链接与实时任务状态，不新增临时 delta 投影 |
 | `components/MarkdownMessage.vue` | 无 | 保留 DOMPurify 清洗，仅调整排版类 |
 | `pages/TasksPage.vue`、`components/TaskTimeline.vue` | `DataView`、`Timeline`、`Tag`、`Button` | 时间线事件文案不变 |
 | `pages/ConnectionsPage.vue`、`components/CapabilityRows.vue` | `Card`、`DataTable`、`ToggleSwitch`、`Tag`、`Button` | 「启用」「继续授权」「重新授权」保持独立按钮 |
-| `pages/SettingsPage.vue`、`components/WorkSettingsForm.vue`、`components/WorkingHoursFields.vue` | `Form`、`Select`、`DatePicker timeOnly`、`InputNumber`、`ToggleSwitch`、`Button` | 时区选择用 `Select filter`，选项来自现有 IANA 列表 |
+| `pages/SettingsPage.vue`、`components/WorkSettingsForm.vue`、`components/WorkingHoursFields.vue` | `Form`、`Select`、`DatePicker timeOnly`、`InputNumber`、`ToggleSwitch`、`Button` | 时区选择用 `Select filter`，选项来自本地 IANA 数据并保留服务端当前值及显式合法 IANA 值（见第 7 节） |
 | `pages/ActionsPage.vue` | `Tabs`、`DataTable`、`Select`、`Paginator`、`Tag`、`Splitter` | 筛选、分页参数与服务端契约不变 |
 | `components/ActionDetail.vue`、`components/LinkedActionPanel.vue` | `Panel`、`Timeline`、`Tag`、`Button link` | 窄屏以独立区域展示 |
 | `pages/MailDraftPage.vue`、`components/MailDraftFields.vue`、`components/LocalEditorFrame.vue` | `Form`、`AutoComplete multiple`（收件人）、`InputText`、`Textarea`、`Message`、`Button` | 仅纯文本正文；不出现附件或格式工具栏 |
 | `components/EditorConnectionSelect.vue` | `Select` | 选项展示供应商与能力状态 |
 | `components/EditorRecovery.vue` | `Message`、`Button` | 版本冲突与刷新恢复文案不变 |
-| `pages/CalendarProposalPage.vue`、`components/CalendarProposalFields.vue`、`components/CalendarTargetFields.vue` | `Form`、`DatePicker showTime`、`Select`、`Chip`、`Message` | 时区以 `Select` 明示，不做自动推断 |
+| `pages/CalendarProposalPage.vue`、`components/CalendarProposalFields.vue`、`components/CalendarTargetFields.vue` | `Form`、`DatePicker`、`Select`、`Chip`、`Message` | 全天日期与定时墙上时间分支保留，只有定时分支用 showTime；时区明示，不做自动推断 |
 | `components/CalendarConflictNotice.vue` | `Message warn`、`Button` | 最多三个候选时间以按钮列表呈现 |
 | `components/CalendarRepreparePanel.vue`、`components/CalendarFieldsComparison.vue` | `Panel`、`DataTable`（字段对比） | 前后差异逐字段高亮 |
 | `components/MissingCalendarConnections.vue` | `Message info`、`Button link` | 无 |
@@ -245,15 +245,34 @@ PrimeVue 商业产品线禁令保持不变。
 
 ## 7. 表单与校验
 
-- 所有表单使用 `@primevue/forms` 的 `Form` 与 `zodResolver`；schema 位于对应
-  `features/*/schema.ts`，只表达格式约束：必填、邮箱格式、长度上限、时间先后、时区枚举。
-- 收件人数量、工作时间、冲突、版本、能力和审批有效性**不在前端校验**；服务端
-  Problem Details 的字段错误通过 `api/validation.ts` 映射到表单字段，映射表使用
-  `error_code` 而非文案匹配。
+- 工作设置、邮件与日程编辑表单使用 `@primevue/forms` 的 `Form` 与 `zodResolver`；
+  登录与聊天只换 PrimeVue 输入控件，保留提交逻辑，不引入新的 schema。schema 位于对应
+  `features/*/schema.ts`，只表达格式约束：必填、邮箱格式、长度上限、时间先后、合法 IANA 时区。
+- 工作时间沿用 `working_hours` 七日多区间模型，格式校验逐一区间检查时间先后；
+  收件人数量、工作时间领域规则、冲突、版本、能力和审批有效性仍由服务端裁决。
+  现有 Problem Details 只提供 `error_code` 等基本字段，没有字段错误数组契约；
+  `features/forms/problemFields.ts` 按已知 `error_code` 映射安全中文表单级错误，未知码使用
+  安全 fallback，不匹配服务端文案，不渲染原始 detail。字段格式错误由 zod 提供，
+  不伪造 `errors` fixture，不修改 `api/validation.ts` 或其他 API 解析。
+- 时区选项沿用本地 `Intl.supportedValuesOf('timeZone')` 加 `UTC`，保留服务端快照当前值
+  与用户显式输入的合法 IANA 时区；有限 fallback 不得误拒已有值。不新增服务端列表接口，
+  不从宿主机推断用户时区。日程保留全天日期及定时墙上时间转换、既有 `time.ts` 与 DST
+  歧义拒绝，不直接用 `Date.toISOString()` 把本地选值解释为宿主机时区。
+- 默认发送账户、默认日历账户及默认日历的 `Select` 属于 Task 9 设置页；Task 8 连接页
+  只保留既有前往设置入口，不复制默认值写操作。
 - 提交按钮在请求进行中 `loading`，请求完成前禁止重复提交；409 冲突显示
   `EditorRecovery` 提供的恢复动作，不清空用户输入。
 - 表单不做自动保存到浏览器存储；离开页面前的未保存提示使用 `ConfirmDialog`，
-  内容不包含正文摘录。
+  内容不包含正文摘录；路由离开提示在页面实现，浏览器卸载遵守原生能力边界。
+- Task 8 前以独立 `fix:` 提交为 `features/connections/useConnections.ts` 注入并等待异步
+  确认回调，附 `features/connections/useConnections.spec.ts` 回归测试；这是 UI 确认端口的
+  最小只读例外，不改领域规则。默认保留既有确认语义，断开文案逐字保留，取消零请求，
+  等待确认及执行期间保持忙碌互斥；实际 `disconnectConnection` 请求与 `catalog.load`
+  刷新、卸载保护规则不变。Task 8 页面用 `ConfirmDialog` 提供回调，不叠加原生确认。
+- 显式新增文件为 `features/settings/schema.ts`、`features/mail/schema.ts`、
+  `features/calendar/schema.ts` 及各自 `schema.spec.ts`，以及
+  `features/forms/problemFields.ts`、`features/forms/problemFields.spec.ts`；这些展示校验
+  与测试文件不等于开放既有 feature 行为层，其他既有行为文件继续只读。
 
 ## 8. 反馈与状态呈现
 
@@ -268,8 +287,10 @@ PrimeVue 商业产品线禁令保持不变。
 | 操作结果 | 非阻断结果使用 `Toast`；审批结果、`needs_attention` 结果仍以内联持久 `Message` 为准 |
 
 `Toast` 是临时提示，不承载必须阅读的信息；任何需要用户决定的内容都使用内联 `Message`
-或 `Dialog`。现有 `role="status"` 与 `role="alert"` 语义逐一保留，迁移前后由测试断言
-数量与文案不变。
+或 `Dialog`。迁移前先核对并冻结真实 live region 清单，逐项记录触发场景、语义及文案。
+现有 `status`、`alert`、`dialog` 语义和文案逐一保留；源码计数仅为清单辅助，不能替代运行时
+验收。组件抽取、PrimeVue 内置 role、新增导航或时间线抽屉引起的数量变化，必须逐项在
+同一提交记录原因，并用运行时测试证明没有漏报或重复播报。禁止添加空 role 凑数。
 
 ## 9. 无障碍与键盘
 
@@ -330,8 +351,8 @@ PrimeVue 商业产品线禁令保持不变。
 
 ### 12.3 门禁
 
-- `just check` 增加：许可证检查、PrimeVue 主版本检查、硬编码颜色与 `@media` 检查、
-  包体积报告。
+- `just check` 增加快速检查：许可证、PrimeVue 主版本、硬编码颜色与 `@media`。
+- `just ci` 在生产构建后生成包体积报告并检查预算；报告与预算不要求加入快速 `check`。
 - `just test-e2e` 增加 axe 扫描步骤。
 - M2.1 完成前运行完整 `just ci`。
 
@@ -349,7 +370,7 @@ PrimeVue 商业产品线禁令保持不变。
 5. **今日简报**与 `BriefView`。
 6. **对话页**。
 7. **任务历史**与 `TaskTimeline`。
-8. **连接页**与 `CapabilityRows`。
+8. **连接页**与 `CapabilityRows`；先独立提交第 7 节确认端口修复及回归，再接入 `ConfirmDialog`。
 9. **设置页**、`WorkSettingsForm`、`WorkingHoursFields`（首个 Forms + zod 表单）。
 10. **操作中心**、`ActionDetail`、`LinkedActionPanel`。
 11. **邮件编辑器**及其字段、连接选择、恢复组件。
@@ -381,13 +402,15 @@ PrimeVue 商业产品线禁令保持不变。
       `@primeui/*` 包；许可证检查通过。
 - [ ] 桌面三栏、平板双栏、手机单栏三种布局各有 Playwright 截图与 axe 零 serious/critical
       结果。
-- [ ] 现有 `role="status"`、`role="alert"`、`role="dialog"` 数量与文案在迁移前后一致，
-      有测试断言。
+- [ ] 真实 live region 基线已冻结，既有 `status`、`alert`、`dialog` 语义与文案逐项保留；
+      数量变化逐项记录原因，运行时测试证明无漏报/重复播报，禁止空 role 凑数。
 - [ ] 所有 `Dialog`/`Drawer` 通过键盘打开、关闭并返回焦点，有组件测试。
-- [ ] 表单字段错误由服务端 `error_code` 映射，有单测覆盖每个已知错误码。
+- [ ] 服务端 `error_code` 映射安全表单级错误，单测覆盖表单已知码及未知码 fallback；
+      zod 提供字段格式错误，不新增或伪造 `errors` 契约。
 - [ ] 零浏览器存储写入断言继续通过。
 - [ ] 首屏 JS gzip 增量与 CSS gzip 在第 11 节预算内，CI 日志留有记录。
-- [ ] `just ci` 在最终提交上通过，输出留档。
+- [ ] 最终文档提交后追加运行 `just ci` 并留档输出；证据正文记录构建基准 HEAD，
+      最终提交的 CI 日志另存，不循环修改自引用 SHA。
 - [ ] 前端 `AGENTS.md`、`CLAUDE.md`、README、验收清单已更新。
 
 ## 16. 风险与控制

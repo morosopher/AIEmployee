@@ -32,6 +32,14 @@ M2 明确不包含供应商草稿箱同步、邮件转发、附件、HTML/富文
 
 规格定义“为什么和必须满足什么”，实施计划定义“按什么顺序落地”。两者不一致时应停止并向用户说明，而不是自行选择。
 
+M2.1 已批准的展示层执行口径：
+
+- 逐项保留既有 live region 语义与文案；真实基线先冻结，组件抽取、内置 role、新抽屉导致的数量变化同提交记录并以运行时测试验证，禁止空 role 凑数。
+- Forms + zod 仅覆盖工作设置、邮件与日程；服务端 `error_code` 经 `features/forms/problemFields.ts` 映射安全表单级错误，字段格式错误来自 zod，不新增 `errors` 契约。登录与聊天保留提交逻辑。
+- 时区沿用本地 Intl IANA + UTC 并保留服务端当前值及显式合法 IANA，不新增接口或推断时区；保留七日多区间工作时间、全天/定时日程转换。聊天保留可信本地编辑器链接、最终消息和实时任务状态，不新增 delta 投影；默认账户与日历归设置页。
+- Task 8 前允许独立 `fix:` 修改 `frontend/src/features/connections/useConnections.ts` 并新增对应 `useConnections.spec.ts`，仅注入并等待异步 UI 确认回调，保留断开文案、取消零请求、忙碌互斥、断开请求及刷新/卸载规则；页面用 `ConfirmDialog`。计划显式新增 schema、`schema.spec.ts`、`problemFields.ts` 及其测试不开放其他既有 feature 行为层。
+- `just check` 保持快速许可/版本/样式等检查，`just ci` 构建后报告并检查体积预算；最终文档提交后追加 CI 留档，不循环修改自引用 SHA。
+
 ## 目标目录与职责
 
 ```text
