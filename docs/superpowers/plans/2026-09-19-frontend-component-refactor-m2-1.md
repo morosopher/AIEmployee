@@ -443,6 +443,8 @@ git commit -m "feat: migrate chat page to PrimeVue"
 
 ### Task 7: 迁移任务历史与时间线
 
+**前置条件：** 完整任务历史规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 已获用户复核。先执行 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 1～7，交付受用户隔离的真实任务列表查询与前端列表状态；该补充计划 Task 8 同时执行本任务的展示迁移与集成，不重复实现。现有前后端没有历史列表接口，禁止以单个选中任务或 Pinia 缓存替代完整历史。补充计划必须划清 TasksPage 与本任务的文件／验证归属；新增能力仅限补充规格第 8 节，其余行为层继续只读。
+
 **Files:**
 - Modify: `frontend/src/pages/TasksPage.vue`、`frontend/src/pages/TasksPage.spec.ts`
 - Modify: `frontend/src/components/TaskTimeline.vue`、`frontend/src/components/TaskTimeline.spec.ts`

@@ -10,6 +10,8 @@
 
 AI Employee 是面向个人长期使用的智能办公助手。M1「可信任务中心 + 每日办公简报」已经完成，M2「可执行邮件与日历助手」已于 2026-09-15 验收通过（见 `docs/releases/2026-08-06-m2-release-evidence.md`）。当前实施目标是已批准的 **M2.1：前端组件库重构**，它只用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 替换前端展示层，不改动服务端契约、状态管理、SSE 行为、安全清洗和下列 M2 范围边界。M2.1 之后的 M2.2「上线收尾」尚未起草规格，不得提前实施。
 
+任务历史的限定补充：用户已于 2026-10-01 确认完整任务历史列表设计，见 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`。它是 Task 7 的独立功能前置，仅允许该规格第 8 节列出的只读列表查询、必要索引及前端列表状态；不开放其他后端、API、Store、SSE 或执行逻辑。规格已复核；执行独立计划 `docs/superpowers/plans/2026-10-01-complete-task-history.md`，其 Task 8 同时完成原 Task 7；M2.1 其余任务边界不变。
+
 M2 已交付并在 M2.1 中必须原样保留的能力：
 
 - 保留单管理员登录、安全 Cookie 会话、每日简报、对话、任务历史、执行时间线、Taskiq、LangGraph Checkpoint、Outbox、SSE、审计和崩溃恢复等 M1 能力。

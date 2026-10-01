@@ -43,6 +43,8 @@ frontend/
 - `just check` 运行快速许可证、版本、样式等检查；`just ci` 在构建后报告体积并检查预算。最终验收文档提交后追加 `just ci` 并另行留档输出，正文保留构建基准 HEAD，不循环修改自引用 SHA。
 - 首屏 JS gzip 增量预算 200 KB、CSS gzip 预算 60 KB，由 `scripts/report-frontend-bundle.sh --budget` 在 `just ci` 中检查。
 
+完整任务历史补充规格为 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`：用户已确认新增独立的摘要 API 客户端、列表状态及 Task 7 页面集成。该限定例外不允许以摘要覆盖 `stores/tasks.ts` 的完整快照／SSE 游标，不修改认证路由守卫，不增加每行 SSE。规格已复核，按 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 执行；其他行为层继续只读。
+
 ## 开发与验证命令
 
 优先从仓库根目录运行：
