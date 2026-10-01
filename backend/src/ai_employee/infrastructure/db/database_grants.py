@@ -676,6 +676,7 @@ _REVISION_ORDER = (
     "20260808_0017",
     "20260809_0018",
     "20260809_0019",
+    "20261001_0020",
 )
 
 _EMAIL_MESSAGES_0016_OWNED_COLUMNS = (
@@ -1071,6 +1072,7 @@ _TABLES_BY_REVISION: dict[str, frozenset[str]] = {
     "20260808_0017": _ALL_TABLES,
     "20260809_0018": _ALL_TABLES,
     "20260809_0019": _ALL_TABLES,
+    "20261001_0020": _ALL_TABLES,
 }
 
 _SEQUENCES_BY_REVISION: dict[str, frozenset[str]] = {
@@ -1235,7 +1237,8 @@ def _build_inventory_policy(revision: str) -> _InventoryPolicy:
     tables = _TABLES_BY_REVISION[revision]
     sequences = _SEQUENCES_BY_REVISION[revision]
     retention_sequences: tuple[str, ...]
-    if revision == "20260809_0019":
+    # 0020仅增加索引，显式沿用0019最终权限；未来revision不得自动继承例外。
+    if revision in {"20260809_0019", "20261001_0020"}:
         retention_tables = {
             table: privileges
             for table, privileges in _FINAL_RETENTION_TABLE_PRIVILEGES.items()

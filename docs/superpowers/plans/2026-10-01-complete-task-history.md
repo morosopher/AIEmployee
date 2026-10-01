@@ -310,7 +310,10 @@ git commit -m "feat: add signed task history cursors"
 - Modify: `backend/src/ai_employee/infrastructure/db/models/tasks.py`
 - Modify: `backend/src/ai_employee/infrastructure/db/database_grants.py`
 - Modify: `backend/migrations/env.py`
+- Modify: `backend/src/ai_employee/infrastructure/db/alembic.py`（跨0019的双阶段守卫最终检查延至实际target callback）
+- Test/Modify: `backend/tests/integration/db/test_migrations.py`（保留历史0019专项，增加0020最终守卫与根事务回滚证据）
 - Test/Modify: `backend/tests/unit/infrastructure/db/test_alembic_migration_lifecycle.py`
+- Test/Modify: `backend/tests/unit/cli/test_calendar_aad_revision_cli.py`（区分当前 head 与冻结 0019 历史场景，保留专用 CLI 零连接拒绝后继镜像）
 - Create: `backend/tests/integration/db/test_task_history_index.py`
 
 **Interfaces:** 新 revision=`20261001_0020`，down_revision=`20260809_0019`；索引名 `ix_task_runs_user_created_id`，列 `(user_id, created_at, id)`。不增加表／列／角色／grant，不修改旧 revision 文件。
@@ -359,7 +362,7 @@ def downgrade() -> None:
 
 使用普通事务型创建，避免引入新的并发索引部分提交协议；仅测试受管非生产升级，不运行生产迁移或破坏性回滚。ORM登记同名同列Index。权限registry增加0020，显式继承0019的最终权限策略；现有 `if revision == 0019` 分支不能令0020退回旧权限。
 
-env.py原先只在expected_target_revision==0019时绑定guard。保留该既有条件，并额外按已验证的线性迁移路径是否跨过0019这一步判定（source位置 < 0019位置 <= target位置），不根据字符串大小／任意revision猜测；保留同一guard identity、锁顺序及原after-step断言。0019专用CLI仍保留其版本限制，不能借新增历史索引放宽恢复／重同步准入。若既有测试曾将发布head固定写成0019，只更新“当前head”断言；历史0019场景仍精确验证0019。
+env.py原先只在expected_target_revision==0019时绑定guard。保留该既有条件，并额外按已验证的线性迁移路径是否跨过0019这一步判定（source位置 < 0019位置 <= target位置），不根据字符串大小／任意revision猜测；保留同一guard identity、锁顺序及原after-step断言。实际经过0019时，before_mutation仍由原revision执行，before_commit在最终target步骤完整权限核验后作为最终callback检查执行；总共两个阶段，目标0019保持原行为，0019→0020不重新触发AAD。真实artifact guard及专用CLI仍精确绑定0018/0019，不扩大准入。0019专用CLI仍保留其版本限制，不能借新增历史索引放宽恢复／重同步准入。若既有测试曾将发布head固定写成0019，只更新“当前head”断言；历史0019场景仍精确验证0019。
 
 - [ ] **Step 4: GREEN 与迁移回归**
 
@@ -368,7 +371,7 @@ Run: 本任务单元／集成，再 `uv run --project backend pytest backend/tes
 - [ ] **Step 5: 提交**
 
 ```bash
-git add backend/migrations/versions/20261001_0020_task_history_index.py backend/src/ai_employee/infrastructure/db/models/tasks.py backend/src/ai_employee/infrastructure/db/database_grants.py backend/migrations/env.py backend/tests/unit/infrastructure/db/test_alembic_migration_lifecycle.py backend/tests/integration/db/test_task_history_index.py
+git add docs/superpowers/plans/2026-10-01-complete-task-history.md backend/src/ai_employee/infrastructure/db/alembic.py backend/tests/integration/db/test_migrations.py backend/migrations/versions/20261001_0020_task_history_index.py backend/src/ai_employee/infrastructure/db/models/tasks.py backend/src/ai_employee/infrastructure/db/database_grants.py backend/migrations/env.py backend/tests/unit/infrastructure/db/test_alembic_migration_lifecycle.py backend/tests/integration/db/test_task_history_index.py backend/tests/unit/cli/test_calendar_aad_revision_cli.py
 git commit -m "feat: index task history with guarded schema upgrade"
 ```
 

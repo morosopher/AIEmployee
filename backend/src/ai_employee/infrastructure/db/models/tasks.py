@@ -39,6 +39,8 @@ class TaskRunModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "task_runs"
     __table_args__ = (
+        # 用户隔离后按创建时间与ID确定性seek；普通B-tree支持整组倒序扫描。
+        Index("ix_task_runs_user_created_id", "user_id", "created_at", "id"),
         Index(
             "ix_task_runs_approval_checkpoint_recovery",
             "approval_checkpoint_recovery_at",

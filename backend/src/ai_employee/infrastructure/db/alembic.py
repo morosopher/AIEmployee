@@ -272,6 +272,7 @@ class MigrationGrantLifecycle:
         init=False,
         repr=False,
     )
+    _calendar_aad_crossed: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -291,7 +292,7 @@ class MigrationGrantLifecycle:
             _fail()
 
     def bind_calendar_aad_guard(self, guard: CalendarAadMigrationGuard) -> None:
-        """在 Alembic configure 前冻结 0019 最终回调使用的唯一 guard 实例。
+        """在 Alembic configure 前冻结跨0019迁移最终target回调使用的唯一guard实例。
 
         Args:
             guard: 已由唯一 Config resolver 验证的双阶段迁移守卫。
@@ -406,11 +407,16 @@ class MigrationGrantLifecycle:
         self._current_revision = destination_revision
         self._snapshot = destination_snapshot
         if destination_revision == "20260809_0019":
+            if self._calendar_aad_guard is None:
+                _fail()
+            self._calendar_aad_crossed = True
+        if self._calendar_aad_crossed and destination_revision == self.expected_target_revision:
             calendar_aad_guard = self._calendar_aad_guard
             if calendar_aad_guard is None:
                 _fail()
-            # destination grant inventory 已完整验证；最终 guard 必须是本 callback 的最后一个
-            # 可失败动作，确保拒绝会回滚 DDL/DML、version row 与授权 delta。
+            # 只有本次实际经过0019才复核AAD；后继索引与权限必须先完成，避免在过早的
+            # 0019 callback核验后继续执行DDL。最终guard仍是target callback最后的可失败
+            # 动作，拒绝会回滚同根事务的全部DDL/DML、version row与授权delta。
             invoke_calendar_aad_migration_guard(
                 lambda: calendar_aad_guard.verify(
                     connection=self.connection,

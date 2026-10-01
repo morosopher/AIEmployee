@@ -101,7 +101,13 @@ def do_run_migrations(authority: OnlineMigrationAuthority) -> None:
     """
     connection = authority.connection
     lifecycle = authority.grant_lifecycle
-    if authority.expected_target_revision == "20260809_0019":
+    # authority 已按真实脚本验证唯一线性链；仅跨过0019才为后继目标绑定同一守卫，
+    # 避免0019→0020重复AAD处理，也不靠revision文本大小推断迁移顺序。
+    revisions = authority.published_authority.revisions
+    crosses_calendar_aad = "20260809_0019" in revisions and revisions.index(
+        authority.expected_current_revision
+    ) < revisions.index("20260809_0019") <= revisions.index(authority.expected_target_revision)
+    if authority.expected_target_revision == "20260809_0019" or crosses_calendar_aad:
         calendar_guard = resolve_calendar_aad_migration_guard(config)
         # revision 与 final callback 都只读取这一已解析实例；即使 migration operation 修改
         # Config attribute，lifecycle 内仍保留同一 identity。

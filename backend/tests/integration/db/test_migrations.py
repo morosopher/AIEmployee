@@ -1189,9 +1189,9 @@ def test_calendar_aad_0019_official_stamp_fails_closed_and_rolls_back(
         assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
         assert guard.calls == []
 
-        # 当前 Cycle 5 必须先因 0019 尚未发布而 RED；Task 27 发布后才核验真实 StampStep。
+        # 0019仍是已发布历史版本；后继索引发布不改变历史StampStep拒绝契约。
         authority = load_published_alembic_authority(guarded_config)
-        assert authority.head_revision == _CALENDAR_AAD_REVISION
+        assert authority.contains(_CALENDAR_AAD_REVISION)
         assert migration_error is not None
         assert type(migration_error) is AlembicMigrationInvariantError
         assert type(migration_error).__module__ == "ai_employee.infrastructure.db.alembic"
@@ -1204,24 +1204,24 @@ def test_calendar_aad_0019_official_stamp_fails_closed_and_rolls_back(
 def test_calendar_aad_0019_guard_fresh_empty_database_uses_strict_zero_bootstrap(
     empty_migration_database: URL,
 ) -> None:
-    """全新空库必须通过 ordinary upgrade head 的内建 strict-empty guard 到达 0019。"""
+    """全新空库必须通过 ordinary upgrade head 的内建 strict-empty guard 跨0019到达当前head。"""
     config = _calendar_aad_config(empty_migration_database)
 
     run_alembic_upgrade(config, "head")
 
-    assert _alembic_revisions(empty_migration_database) == {_CALENDAR_AAD_REVISION}
+    assert _alembic_revisions(empty_migration_database) == {"20261001_0020"}
 
 
 def test_calendar_aad_0019_guard_revision_0018_strict_empty_uses_zero_bootstrap(
     empty_migration_database: URL,
 ) -> None:
-    """0018 严格空 affected set 必须通过 ordinary upgrade head 到达 0019。"""
+    """0018 严格空 affected set 必须通过 ordinary upgrade head 跨0019到达当前head。"""
     config = _calendar_aad_config(empty_migration_database)
     run_alembic_upgrade(config, "20260809_0018")
 
     run_alembic_upgrade(config, "head")
 
-    assert _alembic_revisions(empty_migration_database) == {_CALENDAR_AAD_REVISION}
+    assert _alembic_revisions(empty_migration_database) == {"20261001_0020"}
 
 
 def test_calendar_aad_0019_guard_typed_fake_runs_both_phases_in_one_root_transaction(
@@ -1233,7 +1233,7 @@ def test_calendar_aad_0019_guard_typed_fake_runs_both_phases_in_one_root_transac
     guard = _CalendarAadMigrationGuardFake()
     guarded_config = _calendar_aad_config(empty_migration_database, guard)
 
-    run_alembic_upgrade(guarded_config, "head")
+    run_alembic_upgrade(guarded_config, _CALENDAR_AAD_REVISION)
 
     assert len(guard.calls) == 2
     first_connection, first_transaction, first_phase = guard.calls[0]
@@ -1259,7 +1259,7 @@ def test_calendar_aad_0019_migrates_only_complete_groups_and_exact_affected_pair
         events_before = _calendar_aad_0019_matrix_rows(matrix, table="calendar_events")
         cursors_before = _calendar_aad_0019_matrix_rows(matrix, table="sync_cursors")
 
-        run_alembic_upgrade(guarded_config, "head")
+        run_alembic_upgrade(guarded_config, _CALENDAR_AAD_REVISION)
 
         assert _calendar_aad_0019_matrix_rows(matrix, table="calendar_events") == events_before
         assert _calendar_aad_0019_matrix_rows(
@@ -1625,7 +1625,7 @@ def test_calendar_aad_0019_downgrade_is_forward_only_and_zero_mutation(
             )
 
     try:
-        run_alembic_upgrade(guarded_config, "head")
+        run_alembic_upgrade(guarded_config, _CALENDAR_AAD_REVISION)
         assert _alembic_revisions(empty_migration_database) == {_CALENDAR_AAD_REVISION}
         before = _calendar_aad_0019_partial_fingerprint(matrix)
         events_before = versioned_event_rows()
@@ -2009,7 +2009,7 @@ def test_calendar_aad_0019_guard_freezes_one_identity_before_running_migrations(
     guard = _ReplacingCalendarAadMigrationGuardFake(config=config, replacement=replacement)
     config.attributes[_CALENDAR_AAD_GUARD_ATTRIBUTE] = guard
 
-    run_alembic_upgrade(config, "head")
+    run_alembic_upgrade(config, _CALENDAR_AAD_REVISION)
 
     assert len(guard.calls) == 2
     first_connection, first_transaction, first_phase = guard.calls[0]
@@ -2037,7 +2037,7 @@ def test_calendar_aad_0019_guard_final_rejection_rolls_back_entire_step(
             RuntimeError,
             match=r"^synthetic final calendar AAD guard rejection$",
         ):
-            run_alembic_upgrade(guarded_config, "head")
+            run_alembic_upgrade(guarded_config, _CALENDAR_AAD_REVISION)
 
         assert len(guard.calls) == 2
         first_connection, first_transaction, first_phase = guard.calls[0]
@@ -2048,6 +2048,71 @@ def test_calendar_aad_0019_guard_final_rejection_rolls_back_entire_step(
         assert guard.observed_revision == _CALENDAR_AAD_REVISION
         assert _calendar_aad_0019_fingerprint(fixture) == before
         assert _alembic_revisions(empty_migration_database) == {"20260809_0018"}
+    finally:
+        fixture.engine.dispose()
+
+
+@pytest.mark.parametrize("reject_final", [False, True])
+def test_history_head_final_guard_observes_index_and_rolls_back_root_transaction(
+    empty_migration_database: URL,
+    reject_final: bool,
+) -> None:
+    """最终守卫必须看见0020索引及授权；拒绝会连同0019字段、游标和授权一起回滚。"""
+    from ai_employee.infrastructure.db.database_grants import GrantPhase, verify_object_grants
+
+    config = _calendar_aad_config(empty_migration_database)
+    run_alembic_upgrade(config, "20260809_0018")
+    fixture = _seed_calendar_aad_0019_complete_description(empty_migration_database)
+    before = _calendar_aad_0019_fingerprint(fixture)
+    calls: list[tuple[Connection, RootTransaction, str]] = []
+
+    class FinalGuard:
+        """仅在真实最终callback检查目录，用合成拒绝证明普通索引DDL的事务性。"""
+
+        def verify(self, *, connection: Connection, phase: str) -> None:
+            """记录同根事务并在提交前检查最终版本、有效索引及完整baseline权限。"""
+            transaction = connection.get_transaction()
+            assert isinstance(transaction, RootTransaction)
+            calls.append((connection, transaction, phase))
+            if phase == "before_commit":
+                assert (
+                    connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+                    == "20261001_0020"
+                )
+                assert (
+                    connection.execute(
+                        text(
+                            "SELECT indisvalid FROM pg_index JOIN pg_class ON oid = indexrelid "
+                            "WHERE relname = 'ix_task_runs_user_created_id'"
+                        )
+                    ).scalar_one()
+                    is True
+                )
+                verify_object_grants(
+                    connection, revision="20261001_0020", phase=GrantPhase.BASELINE
+                )
+                if reject_final:
+                    raise RuntimeError("synthetic history final rejection")
+
+    try:
+        guarded = _calendar_aad_config(empty_migration_database, FinalGuard())
+        if reject_final:
+            with pytest.raises(RuntimeError, match="^synthetic history final rejection$"):
+                run_alembic_upgrade(guarded, "head")
+            assert _calendar_aad_0019_fingerprint(fixture) == before
+            with fixture.engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        text("SELECT to_regclass('public.ix_task_runs_user_created_id')")
+                    ).scalar_one()
+                    is None
+                )
+        else:
+            run_alembic_upgrade(guarded, "head")
+            assert _alembic_revisions(empty_migration_database) == {"20261001_0020"}
+        assert [call[2] for call in calls] == ["before_mutation", "before_commit"]
+        assert calls[0][0] is calls[1][0]
+        assert calls[0][1] is calls[1][1]
     finally:
         fixture.engine.dispose()
 
@@ -3242,7 +3307,7 @@ def test_head_migration_starts_from_empty_database_and_has_no_metadata_drift(
         "users",
         "user_sessions",
     }
-    assert _alembic_revisions(empty_migration_database) == {_CALENDAR_AAD_REVISION}
+    assert _alembic_revisions(empty_migration_database) == {"20261001_0020"}
     assert _check_constraint_names(empty_migration_database) == {
         "ck_user_sessions_token_hash_octet_length_32",
         "ck_user_sessions_csrf_hash_octet_length_32",

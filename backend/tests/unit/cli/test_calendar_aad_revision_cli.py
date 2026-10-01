@@ -48,7 +48,7 @@ def test_calendar_aad_revision_cli_uses_only_fixed_owner_secret(monkeypatch, cap
     }
     read.assert_called_once()
     assert read.call_args.args == (engine,)
-    assert read.call_args.kwargs["authority"].head_revision == "20260809_0019"
+    assert read.call_args.kwargs["authority"].head_revision == "20261001_0020"
     engine.dispose.assert_called_once()
     assert capsys.readouterr() == (revision + "\n", "")
 
@@ -90,7 +90,11 @@ def test_calendar_aad_revision_reader_rejects_other_published_revisions(monkeypa
     module = importlib.import_module("ai_employee.cli.calendar_aad_revision_0019")
     from alembic.config import Config
 
-    authority = module.load_published_alembic_authority(Config(module._CONFIG_PATH))
+    published = module.load_published_alembic_authority(Config(module._CONFIG_PATH))
+    # 此例验证历史0019镜像内的数据库版本拒绝，后继镜像由独立零连接测试覆盖。
+    authority = module.PublishedAlembicAuthority(
+        revisions=published.revisions[: published.revisions.index("20260809_0019") + 1]
+    )
     engine = Mock()
     connection = Mock()
     connection.execution_options.return_value = connection
@@ -103,3 +107,16 @@ def test_calendar_aad_revision_reader_rejects_other_published_revisions(monkeypa
     connection.execution_options.assert_called_once_with(
         isolation_level="REPEATABLE READ", postgresql_readonly=True
     )
+
+
+def test_calendar_aad_revision_reader_rejects_history_head_before_connecting():
+    """0020发布后旧0019专用CLI仍拒绝后继镜像，不能借索引迁移放宽维护准入。"""
+    from alembic.config import Config
+
+    module = importlib.import_module("ai_employee.cli.calendar_aad_revision_0019")
+    authority = module.load_published_alembic_authority(Config(module._CONFIG_PATH))
+    engine = Mock()
+    with pytest.raises(CalendarAadRolloutError) as failure:
+        module.read_rollout_revision(engine, authority=authority)
+    assert failure.value.error_code == "calendar_aad_revision_mismatch"
+    engine.connect.assert_not_called()

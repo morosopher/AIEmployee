@@ -122,14 +122,14 @@ def _issue_synthetic_live_authority(
 def test_published_authority_comes_only_from_current_script_chain() -> None:
     """发布权威必须只来自实际 migration 脚本链。
 
-    0019 发布后必须成为唯一 head；grant inventory 或调用方标签仍不能把一个没有对应
+    0020 发布后必须成为唯一 head；grant inventory 或调用方标签仍不能把一个没有对应
     脚本的合成 revision 补进发布链。
     """
     authority = alembic_module.load_published_alembic_authority(
         Config(_backend_root() / "alembic.ini")
     )
 
-    assert authority.head_revision == "20260809_0019"
+    assert authority.head_revision == "20261001_0020"
     assert authority.revisions[0] == "base"
     assert authority.revisions[-1] == authority.head_revision
     assert authority.contains("base")
@@ -793,3 +793,146 @@ def test_empty_migration_database_bootstraps_exact_base_posture_before_alembic()
     assert "management_engine:" in bootstrap_source
     assert "target_engine.dispose()" in bootstrap_source
     assert "management_engine.dispose()" not in bootstrap_source
+
+
+@pytest.mark.parametrize("phase", list(GrantPhase))
+def test_history_index_preserves_complete_0019_grants(phase: GrantPhase) -> None:
+    """索引后继在两个阶段都保持0019完整表、列、序列授权，不退回旧retention策略。"""
+    from ai_employee.infrastructure.db.database_grants import _expected_object_grants
+
+    assert _expected_object_grants(
+        revision="20261001_0020", phase=phase, relation_owner="synthetic_owner"
+    ) == _expected_object_grants(
+        revision="20260809_0019", phase=phase, relation_owner="synthetic_owner"
+    )
+
+
+@pytest.mark.parametrize("source", ["20260809_0018", "20260809_0019"])
+@pytest.mark.parametrize("guard_kind", ["explicit", "empty", "affected", "none", "wrong"])
+def test_history_head_binds_guard_only_when_crossing_0019(
+    monkeypatch: pytest.MonkeyPatch, source: str, guard_kind: str
+) -> None:
+    """模拟线性step并执行真实guard与lifecycle；跨0019严格双阶段，后继不重跑AAD。"""
+    from ai_employee.application.ports.calendar_aad_migration_guard import (
+        CALENDAR_AAD_0019_GUARD_ATTRIBUTE,
+        CalendarAadMigrationInvariantError,
+        resolve_calendar_aad_migration_guard,
+    )
+
+    target = "20261001_0020"
+    published = alembic_module.PublishedAlembicAuthority(
+        revisions=("base", "20260809_0018", "20260809_0019", target)
+    )
+    monkeypatch.setattr(
+        alembic_module, "load_published_alembic_authority", lambda config: published
+    )
+    config = Config()
+    events: list[str] = []
+    guard_connections: list[object] = []
+
+    class Guard:
+        """合成artifact guard替换attribute，证明最终回调仍使用冻结实例。"""
+
+        def verify(self, *, connection: object, phase: str) -> None:
+            events.append(phase)
+            if phase == "before_commit":
+                assert observed == target
+            guard_connections.append(connection)
+            config.attributes[CALENDAR_AAD_0019_GUARD_ATTRIBUTE] = None
+
+    if guard_kind == "explicit":
+        config.attributes[CALENDAR_AAD_0019_GUARD_ATTRIBUTE] = Guard()
+    elif guard_kind in {"none", "wrong"}:
+        config.attributes[CALENDAR_AAD_0019_GUARD_ATTRIBUTE] = (
+            None if guard_kind == "none" else object()
+        )
+
+    class ScalarResult:
+        """只给strict-empty提供合成affected集合事实，不替换守卫本身。"""
+
+        def scalar_one(self) -> bool:
+            return guard_kind == "affected"
+
+    def affected_query(connection: Connection, statement: str) -> ScalarResult:
+        assert "affected_set_exists" in statement
+        events.append("strict-empty")
+        if len(events) == 2:
+            assert observed == target
+        guard_connections.append(connection)
+        return ScalarResult()
+
+    observed = source
+
+    def snapshot(
+        connection: Connection,
+        *,
+        revision: str,
+        phase: GrantPhase,
+        destination_revision: str | None = None,
+    ) -> CatalogObjectSnapshot:
+        del connection, destination_revision
+        return CatalogObjectSnapshot(revision=revision, phase=phase, grants=())
+
+    monkeypatch.setattr(Connection, "exec_driver_sql", affected_query)
+    monkeypatch.setattr(
+        alembic_module, "read_current_alembic_revision", lambda connection, *, authority: observed
+    )
+    monkeypatch.setattr(alembic_module, "verify_pre_migration_object_grants", snapshot)
+    monkeypatch.setattr(alembic_module, "verify_object_grants", snapshot)
+    monkeypatch.setattr(alembic_module, "apply_migration_grant_delta", lambda *a, **kw: None)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    fake_context = ModuleType("alembic.context")
+    fake_context.config = config  # type: ignore[attr-defined]
+    fake_context.is_offline_mode = lambda: False  # type: ignore[attr-defined]
+    fake_context.configure = lambda **kw: None  # type: ignore[attr-defined]
+    engine = create_engine("sqlite://")
+    try:
+        with engine.connect() as connection:
+            token = _issue_synthetic_live_authority(
+                monkeypatch,
+                connection=connection,
+                published=published,
+                current_revision=source,
+                expected_target_revision=target,
+            )
+            alembic_module.bind_alembic_connection(config, token)
+            fake_context.begin_transaction = connection.begin  # type: ignore[attr-defined]
+
+            def run_steps() -> None:
+                """使用真实最终callback，模拟已通过SQL的相邻迁移版本。"""
+                nonlocal observed
+                for destination in published.revisions[published.revisions.index(source) + 1 :]:
+                    if destination == "20260809_0019":
+                        resolve_calendar_aad_migration_guard(config).verify(
+                            connection=connection, phase="before_mutation"
+                        )
+                    previous, observed = observed, destination
+                    token.grant_lifecycle.on_version_apply(
+                        ctx=_SyntheticMigrationContext(connection),
+                        step=_SyntheticMigrationStep(True, False, (previous,), (destination,)),
+                        heads={destination},
+                        run_args={},
+                    )
+
+            fake_context.run_migrations = run_steps  # type: ignore[attr-defined]
+            monkeypatch.setattr(alembic_package, "context", fake_context)
+            monkeypatch.setitem(sys.modules, "alembic.context", fake_context)
+            if source == "20260809_0018" and guard_kind in {"affected", "none", "wrong"}:
+                with pytest.raises(CalendarAadMigrationInvariantError):
+                    runpy.run_path(str(_backend_root() / "migrations" / "env.py"))
+                assert observed == source
+            else:
+                runpy.run_path(str(_backend_root() / "migrations" / "env.py"))
+                assert observed == target
+                assert events == (
+                    []
+                    if source == "20260809_0019"
+                    else (
+                        ["before_mutation", "before_commit"]
+                        if guard_kind == "explicit"
+                        else ["strict-empty", "strict-empty"]
+                    )
+                )
+            assert all(value is connection for value in guard_connections)
+    finally:
+        engine.dispose()
