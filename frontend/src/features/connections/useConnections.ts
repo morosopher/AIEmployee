@@ -15,10 +15,22 @@ import {
 } from '@/features/actions/recovery'
 
 /**
+ * 仅提供展示层确认结果；实际断开请求仍由本 composable 在确认后发送。
+ * @param message 完整断开警告，不含账户凭据或远端正文。
+ * @returns 同意为 true，取消为 false；可异步等待 Dialog，关闭或卸载应结算为取消。
+ */
+export type ConfirmConnectionDisconnect = (
+  message: string,
+) => boolean | Promise<boolean>
+
+/**
  * 连接页面的受控行为。授权链接只来自已验证 API，不持久化 OAuth 响应或自动换账户。
+ * @param options.confirmDisconnect 可替换的 UI 确认端口；缺省保留原生确认及原警告。
  * @returns 目录、互斥请求状态、明确授权链接及固定能力动作。
  */
-export function useConnections() {
+export function useConnections({
+  confirmDisconnect = (message) => window.confirm(message),
+}: { confirmDisconnect?: ConfirmConnectionDisconnect } = {}) {
   const catalog = useConnectionCatalog()
   const busy = ref(false),
     notice = ref('')
@@ -97,15 +109,27 @@ export function useConnections() {
       if (!disposed) notice.value = '同步已排队，数据完整性以任务结果为准。'
     })
   }
-  /** @param connection 待断开账户。保留既有明确确认，绝不暗示远端写入已撤销。 */
-  function disconnect(connection: Connection): Promise<void> {
-    if (
-      !window.confirm(
+  /**
+   * 等待 UI 的精确确认后断开账户；取消保留当前授权链接、通知和错误，不发送请求。
+   * @param connection 待断开账户。确认不能撤销已经执行的远端写入。
+   * @returns 确认、断开和既有目录刷新全部落定后结束；卸载后不发后续请求或写状态。
+   */
+  async function disconnect(connection: Connection): Promise<void> {
+    if (busy.value || disposed) return
+    busy.value = true
+    let accepted = false
+    try {
+      accepted = await confirmDisconnect(
         '确定断开此连接？未认领操作会停止；已执行的邮件或日程不会撤回。',
       )
-    )
-      return Promise.resolve()
-    return perform(async () => {
+    } catch (cause) {
+      if (!disposed) error.value = actionRecovery(cause)
+    } finally {
+      if (!disposed) busy.value = false
+    }
+    if (!accepted || disposed) return
+    // 不在确认取消时清空原提示；同一同步续段立即由 perform 接管锁，没有可交互空隙。
+    await perform(async () => {
       await disconnectConnection(connection.id)
       if (!disposed) await catalog.load()
     })
