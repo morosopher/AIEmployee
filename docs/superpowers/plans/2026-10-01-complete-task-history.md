@@ -364,6 +364,8 @@ def downgrade() -> None:
 
 env.py原先只在expected_target_revision==0019时绑定guard。保留该既有条件，并额外按已验证的线性迁移路径是否跨过0019这一步判定（source位置 < 0019位置 <= target位置），不根据字符串大小／任意revision猜测；保留同一guard identity、锁顺序及原after-step断言。实际经过0019时，before_mutation仍由原revision执行，before_commit在最终target步骤完整权限核验后作为最终callback检查执行；总共两个阶段，目标0019保持原行为，0019→0020不重新触发AAD。真实artifact guard及专用CLI仍精确绑定0018/0019，不扩大准入。0019专用CLI仍保留其版本限制，不能借新增历史索引放宽恢复／重同步准入。若既有测试曾将发布head固定写成0019，只更新“当前head”断言；历史0019场景仍精确验证0019。
 
+Task 9 完整 CI 的补充兼容验证同时覆盖历史运维／保留测试：synthetic runner 必须模拟0018→0019→0020完整相邻 callback，并验证最终 guard 位于0020完整权限核验之后；retention helper 只要求0019属于真实发布链，显式迁移目标与完整ACL矩阵仍是0019。历史专用CLI成功用例通过临时复制真实0019完整祖先脚本和env，再由原 published reader 验证副本；当前0020镜像另行验证拒绝，不能改生产版本限制。release wrapper全stub测试显式提供原脚本要求的精确Task13合成环境，不继承外层受管anchor，也不放宽脚本准入。
+
 - [ ] **Step 4: GREEN 与迁移回归**
 
 Run: 本任务单元／集成，再 `uv run --project backend pytest backend/tests/integration/db/test_migrations.py -q`、`just check`、`git diff --check`。用合成数据运行索引查询EXPLAIN，记录键序与无逐行明细加载；不以微秒计时作脆弱断言。只有数据证明需要第二索引时才提出精确查询计划证据，不提前新增。
@@ -752,6 +754,10 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 先将真实 PostgreSQL 诊断转为正常退出的回归，保留 pre_ping 期间断线导致 checkedout 未归零、GC warning 和 terminate error 的 RED。仅在 `backend/src/ai_employee/api/sse.py` 三种有限数据库读取边界适配 AnyIO 与 asyncio 取消，明确资源所有者和有界清理；不得关闭 pre_ping、吞取消、过滤 warning 或丢弃后台任务。保持用户隔离及同一 REPEATABLE READ 快照，不修改事件协议／任务状态／审批／执行或共享会话工厂。对应修复与规格 §8.1、根／后端规则同步为独立 `fix:` 提交，不混入前端导航修复。
 
 测试覆盖三种读取与复用 pre_ping 的真实 EventSourceResponse 断线、正常读取、单次取消、重复外层取消和收尾预算；确认池回到基线、没有依赖 GC 的归还或残留读取任务。通过受管选集入口运行新回归及原 SSE 12 项，再串行运行任务历史／reconnect 相关 E2E 和 `just check`；完整 `just ci` 仍由后续门禁执行，不能以聚焦结果替代。
+
+- [ ] **Step 1b: 完整 CI 揭示的历史测试夹具兼容**
+
+按Task 3的历史／当前发布链区分口径，限定修改 `backend/tests/integration/operations/test_database_maintenance_gate.py`、`test_postgres_backup_restore.py`、`test_calendar_aad_0019_preflight.py`、`test_calendar_aad_0019_deadline_restore.py`、仅测试支持 `calendar_aad_0019_release.py` 及 `backend/tests/integration/retention/test_role_permissions.py`。保留真实失败日志，先聚焦复验再验证完整受影响模块和 `just check`，独立提交 `test: align lifecycle fixtures with published task history revision` 并复审；不改生产迁移、CLI、权限、保留清理或受管fixture准入。
 
 - [ ] **Step 2: 执行完整门禁**
 

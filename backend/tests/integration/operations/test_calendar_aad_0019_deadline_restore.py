@@ -11,6 +11,7 @@ from sqlalchemy.pool import NullPool
 
 from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadRolloutError
 from tests.integration.alembic_commands import run_alembic_upgrade
+from tests.integration.operations.calendar_aad_0019_release import freeze_calendar_aad_0019_release
 from tests.integration.operations.test_calendar_aad_0019_preflight import (
     BASENAME,
     IMAGE,
@@ -519,12 +520,15 @@ async def test_calendar_aad_artifact_tampering_is_rejected_before_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("published_head", ["20260809_0019", "20261001_0020"])
 async def test_calendar_aad_dedicated_migration_composes_real_three_lock_authority(
-    aad_oauth, tmp_path, monkeypatch
+    aad_oauth, tmp_path, monkeypatch, published_head
 ):
-    """产品无参迁移入口注入真实 guard；typed 三锁、授权 token 与 frozen env 保持真实。"""
+    """历史发布链运行真实三锁迁移；当前 0020 镜像必须保留版本拒绝且不运行 guard。"""
+    from alembic.config import Config
+
     from ai_employee.application.use_cases.calendar_aad_rollout import CalendarAadBinding
-    from ai_employee.cli.calendar_aad_migrate_0019 import run_migration
+    from ai_employee.cli import calendar_aad_migrate_0019 as module
     from ai_employee.infrastructure.db.repositories.calendar_aad_preflight import (
         CalendarAadArtifactFile,
         CalendarAadMigrationArtifactGuard,
@@ -533,6 +537,13 @@ async def test_calendar_aad_dedicated_migration_composes_real_three_lock_authori
     sessions, _, _, _ = aad_oauth
     await seed_pair(sessions)
     await run_fixture(aad_oauth, tmp_path)
+    if published_head == "20260809_0019":
+        # 只换历史镜像的脚本位置；CLI、published reader、env 及 artifact guard 均真实。
+        monkeypatch.setattr(module, "_CONFIG_PATH", freeze_calendar_aad_0019_release(tmp_path))
+    assert (
+        module.load_published_alembic_authority(Config(module._CONFIG_PATH)).head_revision
+        == published_head
+    )
     phases = []
     original = CalendarAadMigrationArtifactGuard.verify
 
@@ -551,7 +562,7 @@ async def test_calendar_aad_dedicated_migration_composes_real_three_lock_authori
         )
         target = create_engine(url, poolclass=NullPool, hide_parameters=True)
         try:
-            run_migration(
+            module.run_migration(
                 management_engine=management,
                 target_engine=target,
                 artifact_file=CalendarAadArtifactFile(
@@ -563,6 +574,17 @@ async def test_calendar_aad_dedicated_migration_composes_real_three_lock_authori
             target.dispose()
             management.dispose()
 
+    if published_head == "20261001_0020":
+        with pytest.raises(CalendarAadRolloutError) as failure:
+            await asyncio.to_thread(migrate)
+        assert failure.value.error_code == "calendar_aad_revision_mismatch"
+        assert phases == []
+        async with sessions() as session:
+            assert (
+                await session.scalar(text("SELECT version_num FROM alembic_version"))
+                == "20260809_0018"
+            )
+        return
     await asyncio.to_thread(migrate)
     assert len(phases) == 2
     assert phases[0][:2] == phases[1][:2]

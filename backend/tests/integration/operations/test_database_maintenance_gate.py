@@ -1013,6 +1013,10 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
     runner_authorities: list[OnlineMigrationAuthority] = []
     required_revisions: list[str | None] = []
     revision_reads = iter(("20260809_0018", PUBLISHED_AUTHORITY.head_revision))
+    steps = (("20260809_0018", "20260809_0019"), ("20260809_0019", "20261001_0020"))
+    delta_steps = iter(steps)
+    verified_destinations = iter(("20260809_0019", "20261001_0020"))
+    lifecycle_events: list[tuple[str, str]] = []
 
     def fake_read_revision(
         _connection: Connection,
@@ -1031,9 +1035,11 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
         phase: GrantPhase,
     ) -> CatalogObjectSnapshot:
         """在测试 fake 中保留 source admission 与同连接断言。"""
-        assert connection is not None
+        assert connection is runner_authorities[0].connection
         assert revision == "20260809_0018"
-        assert destination_revision == PUBLISHED_AUTHORITY.head_revision
+        assert destination_revision == "20260809_0019"
+        assert phase is GrantPhase.BASELINE
+        lifecycle_events.append(("precheck", revision))
         return CatalogObjectSnapshot(revision=revision, phase=phase, grants=())
 
     def fake_delta(
@@ -1045,10 +1051,11 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
         before: CatalogObjectSnapshot,
     ) -> None:
         """模拟真实 callback 的 grant delta，但不向 SQLite 发 PostgreSQL SQL。"""
-        assert connection is not None
-        assert source_revision == before.revision == "20260809_0018"
-        assert destination_revision == PUBLISHED_AUTHORITY.head_revision
+        assert connection is runner_authorities[0].connection
+        assert source_revision == before.revision
+        assert (source_revision, destination_revision) == next(delta_steps)
         assert phase is GrantPhase.BASELINE
+        lifecycle_events.append(("delta", destination_revision))
 
     def fake_destination_verify(
         connection: Connection,
@@ -1057,8 +1064,10 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
         phase: GrantPhase,
     ) -> CatalogObjectSnapshot:
         """模拟 destination inventory verifier 的 typed 返回值。"""
-        assert connection is not None
-        assert revision == PUBLISHED_AUTHORITY.head_revision
+        assert connection is runner_authorities[0].connection
+        assert revision == next(verified_destinations)
+        assert phase is GrantPhase.BASELINE
+        lifecycle_events.append(("inventory", revision))
         return CatalogObjectSnapshot(revision=revision, phase=phase, grants=())
 
     class SyntheticCalendarAadGuard:
@@ -1073,6 +1082,7 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
             assert connection is self.expected_connection
             assert phase in {"before_mutation", "before_commit"}
             self.phases.append(phase)
+            lifecycle_events.append(("guard", phase))
 
     monkeypatch.setattr(alembic_module, "read_current_alembic_revision", fake_read_revision)
     monkeypatch.setattr(
@@ -1093,19 +1103,32 @@ def test_sqlalchemy_target_typed_runner_rechecks_idle_and_uses_same_connection(
         calendar_guard = SyntheticCalendarAadGuard(authority.connection)
         lifecycle.bind_calendar_aad_guard(calendar_guard)
         lifecycle.verify_before_migrations()
-        lifecycle.on_version_apply(
-            ctx=SimpleNamespace(connection=authority.connection),
-            step=SimpleNamespace(
-                is_upgrade=True,
-                is_stamp=False,
-                source_revision_ids=("20260809_0018",),
-                destination_revision_ids=(PUBLISHED_AUTHORITY.head_revision,),
-            ),
-            heads={PUBLISHED_AUTHORITY.head_revision},
-            run_args={},
-        )
+        # 原 0019 revision 在 mutation 前调用 guard；随后官方 env 逐步送入相邻 callback。
+        # 即使 head 增加，也不能伪造直接从 0018 跳到 head 或在 0019 提前做最终复核。
+        calendar_guard.verify(connection=authority.connection, phase="before_mutation")
+        for source, destination in steps:
+            lifecycle.on_version_apply(
+                ctx=SimpleNamespace(connection=authority.connection),
+                step=SimpleNamespace(
+                    is_upgrade=True,
+                    is_stamp=False,
+                    source_revision_ids=(source,),
+                    destination_revision_ids=(destination,),
+                ),
+                heads={destination},
+                run_args={},
+            )
         lifecycle.verify_after_migrations()
-        assert calendar_guard.phases == ["before_commit"]
+        assert calendar_guard.phases == ["before_mutation", "before_commit"]
+        assert lifecycle_events == [
+            ("precheck", "20260809_0018"),
+            ("guard", "before_mutation"),
+            ("delta", "20260809_0019"),
+            ("inventory", "20260809_0019"),
+            ("delta", "20261001_0020"),
+            ("inventory", "20261001_0020"),
+            ("guard", "before_commit"),
+        ]
 
     try:
         with engine.connect() as connection:

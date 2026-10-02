@@ -39,6 +39,7 @@ from tests.integration.m2.test_credential_rotation_repository import (
     seed_oauth_connection,
     token_response,
 )
+from tests.integration.operations.calendar_aad_0019_release import freeze_calendar_aad_0019_release
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
 IMAGE = "sha256:" + "0123456789abcdef" * 4
@@ -382,13 +383,15 @@ async def aad_oauth(aad_source):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("revision", ["20260809_0018", "20260809_0019"])
+@pytest.mark.parametrize("published_head", ["20260809_0019", "20261001_0020"])
 async def test_calendar_aad_revision_screen_is_read_only_and_preserves_facts(
-    aad_oauth, monkeypatch, revision
+    aad_oauth, monkeypatch, tmp_path, revision, published_head
 ):
     """真实 PostgreSQL 筛查仅打开一个只读目标快照，0018/0019 都不改变任何持久事实。
 
-    用已有 lifecycle 准备版本；仅附加 SQL/transaction 观察器，原 published reader 照常
-    执行。artifact、凭据刷新、业务写入、maintenance/grant 和供应商路径均不参与筛查。
+    用已有 lifecycle 准备版本；历史成功场景从真实脚本副本加载完整 0019 发布链，当前
+    0020 镜像必须零连接拒绝。原 published reader、SQL/transaction 观察器和完整持久
+    事实比较均保留，artifact、凭据刷新、业务写入和供应商路径不参与筛查。
     """
     from sqlalchemy import create_engine, event
     from sqlalchemy.pool import NullPool
@@ -428,7 +431,13 @@ async def test_calendar_aad_revision_screen_is_read_only_and_preserves_facts(
         return result
 
     before = await persisted_facts()
-    authority = module.load_published_alembic_authority(config)
+    published_config = (
+        Config(freeze_calendar_aad_0019_release(tmp_path))
+        if published_head == "20260809_0019"
+        else config
+    )
+    authority = module.load_published_alembic_authority(published_config)
+    assert authority.head_revision == published_head
     engine = create_engine(
         sessions.engine.url.set(drivername="postgresql+psycopg"),
         poolclass=NullPool,
@@ -467,16 +476,24 @@ async def test_calendar_aad_revision_screen_is_read_only_and_preserves_facts(
 
     monkeypatch.setattr(module, "read_current_alembic_revision", observed_reader)
     try:
-        assert (
-            await asyncio.to_thread(module.read_rollout_revision, engine, authority=authority)
-            == revision
-        )
+        if published_head == "20261001_0020":
+            with pytest.raises(CalendarAadRolloutError) as failure:
+                await asyncio.to_thread(module.read_rollout_revision, engine, authority=authority)
+            assert failure.value.error_code == "calendar_aad_revision_mismatch"
+        else:
+            assert (
+                await asyncio.to_thread(module.read_rollout_revision, engine, authority=authority)
+                == revision
+            )
     finally:
         engine.dispose()
+    assert await persisted_facts() == before
+    if published_head == "20261001_0020":
+        assert observations == checkouts == transactions == statements == []
+        return
     assert observations == [("on", "repeatable read", "10s")]
     assert checkouts == [1] and transactions == ["rollback"]
     assert statements.count("SELECT") == 2 and set(statements) <= {"SELECT", "SHOW"}
-    assert await persisted_facts() == before
 
 
 @pytest.mark.asyncio

@@ -362,9 +362,9 @@ class _DisposableRoleDatabase:
     def upgrade_to_0019(self) -> None:
         """经测试专用三锁入口把当前 disposable database 精确升级到 0019。
 
-        发布权威断言必须先于 Alembic command 或任何数据库 mutation；Cycle 5 RED 因此只
-        在尚未发布的 0019 head 上失败。发布后，同一 helper 仍消费 typed authority、绑定
-        外部连接并核验 migration 结果，最后由 owner 再验证 destination baseline ACL。
+        发布权威断言必须先于 Alembic command 或任何数据库 mutation；0019 必须确实
+        位于发布链中，但不要求它仍是最新 head。历史测试仍精确停在 0019，并消费 typed
+        authority、绑定外部连接及核验迁移结果，最后由 owner 验证完整 baseline ACL。
         """
         owner_sync_url = make_url(self.owner_url).set(drivername="postgresql+psycopg")
         owner_engine = create_engine(
@@ -379,7 +379,7 @@ class _DisposableRoleDatabase:
         )
         try:
             published_authority = load_published_alembic_authority(config)
-            assert published_authority.head_revision == "20260809_0019"
+            assert published_authority.contains("20260809_0019")
             run_alembic_upgrade(config, "20260809_0019")
             with owner_engine.connect() as connection:
                 revision = connection.execute(
