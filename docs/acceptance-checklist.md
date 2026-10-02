@@ -76,14 +76,14 @@ Token、Cookie、OAuth 凭据、Secret、原始允许列表身份键、完整邮
 本段对应已批准的 M2.1「前端组件库重构」，事实来源为
 [M2.1 设计](superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md) 与
 [实施计划](superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md)。M2.1 只替换前端
-展示层，不重新打开上文 M2 验收项，也不改变 M2 发布证据。勾选前必须有本轮新鲜命令输出，
+展示层；已批准的完整任务历史及其取消清理例外见下节，不重新打开上文 M2 验收项，也不改变 M2 发布证据。勾选前必须有本轮新鲜命令输出，
 证据写入 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`；未完成任一项不得宣称
 M2.1 完成。
 
 ## 选型、许可与只读边界
 
-- [ ] `frontend/pnpm-lock.yaml` 中 `primevue`、`@primevue/forms`、`@primevue/auto-import-resolver`、`@primevue/core`、`@primevue/icons` 均为精确 `4.5.5`，`@primeuix/themes` 为 2.x，不存在 `primevue@5`、`@primeui/*` 或 `@primeuix/themes@3`；保存 `scripts/check-frontend-licenses.sh` 的完整输出，生产依赖只含 MIT/ISC/BSD/Apache-2.0。
-- [ ] 以 `git diff <M2.1 起点>..HEAD --stat` 证明 `src/api/**`、`src/stores/**`、`src/composables/**`、`src/router/**` 及 `src/features/**` 中非 `schema.ts`/`presentation.ts` 文件未被视觉重构提交修改；行为层修复若存在，均为独立 `fix:` 提交并附回归测试。
+- [ ] `frontend/pnpm-lock.yaml` 中 `primevue`、`@primevue/forms`、`@primevue/auto-import-resolver`、`@primevue/core`、`@primevue/icons` 均为精确 `4.5.5`，`@primeuix/themes` 为 2.x，不存在 `primevue@5`、`@primeui/*` 或 `@primeuix/themes@3`；保存 `scripts/check-frontend-licenses.sh` 的完整输出，生产依赖满足 MIT/ISC/BSD/Apache-2.0 白名单或规格 §3.2 已批准的包名＋精确版本＋许可证例外，升级不继承例外。
+- [ ] 以 `git diff <M2.1 起点>..HEAD --stat` 证明既有行为层未被视觉重构任意修改；仅允许计划列出的展示校验文件、独立异步断开确认修复和完整任务历史补充限定文件。摘要不覆盖完整 Store；行为层缺陷修复均以独立 `fix:` 提交并附回归，SSE 例外只处理已批准的取消清理。
 - [ ] 审计全部页面与组件，确认没有新增 M2 范围外的可操作入口或占位 UI，没有暗色模式、多语言或主题切换。
 
 ## 设计系统与样式清理
@@ -97,7 +97,7 @@ M2.1 完成。
 - [ ] `e2e/accessibility.spec.ts` 对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图的 axe 结果 `serious`/`critical` 为零，保存原始报告哈希。
 - [ ] `src/test-support/liveRegionInventory.spec.ts` 证明 `role="status"`、`role="alert"`、`role="dialog"` 数量与迁移前冻结值一致，或每次增减都有提交说明记录。
 - [ ] 所有 `Dialog`/`Drawer` 有组件测试证明键盘打开、Esc 关闭、关闭后焦点返回触发元素、背景 `inert`。
-- [ ] 表单字段错误由服务端 `error_code` 映射，`features/forms/problemFields.spec.ts` 覆盖每个已知错误码；zod schema 只含格式级规则。
+- [ ] 服务端 `error_code` 映射为安全表单级错误，`features/forms/problemFields.spec.ts` 覆盖每个已知错误码；字段格式错误来自 zod，不新增 `errors` 契约，schema 只含格式级规则。
 - [ ] 既有零浏览器存储断言、SSE 重放测试、Markdown 清洗测试在最终提交上原样通过。
 
 ## 门禁与体积
@@ -106,13 +106,13 @@ M2.1 完成。
 - [ ] 最终提交上 `just check` 与 `just ci` 均退出码 0，读取完整输出并记录起止时间、后端/前端测试数与 E2E 数。
 - [ ] `frontend/AGENTS.md`、根 `AGENTS.md`、README 的技术栈、浏览器基线和门禁描述与实现一致。
 
-## 完整任务历史补充（设计已确认，尚未实施）
+## 完整任务历史补充（2026-10-02 基准验收通过）
 
-事实来源：[完整任务历史补充设计](superpowers/specs/2026-10-01-complete-task-history-design.md)。详细验收矩阵见该规格第 10 节；本段不更改 M1/M2 历史证据。
+事实来源：[完整任务历史补充设计](superpowers/specs/2026-10-01-complete-task-history-design.md)及[验收记录](releases/2026-10-01-task-history-evidence.md)。`9aa1b3b` 的完整 CI 和体积预算通过，详细14项矩阵见验收记录；文档提交后的复验按计划独立留档。本段不更改 M1/M2 历史证据，也不表示整个 M2.1 完成。
 
-- [ ] 业务／全部分类和 PostgreSQL 保留记录完整查询，按类型、状态和用户时区日期筛选。
-- [ ] 双向游标分页、并列时间、插入／状态变化／清理边界、游标篡改和跨用户拒绝通过。
-- [ ] 摘要白名单、no-store、后台失败记录计数真实，无正文／输入／租约或凭据泄漏。
-- [ ] 列表与详情状态隔离，新任务提示不跳页，原 SSE、取消／幂等重试、replacement 和恢复入口保留。
-- [ ] 30 秒可见性探测、错误／空态／迟到响应、键盘与多视口行为通过。
-- [ ] 索引迁移和 schema/ACL 守卫、后端集成／契约、前端 E2E 及最终完整 just ci 有当前提交证据。
+- [x] 业务／全部分类和 PostgreSQL 保留记录完整查询，按类型、状态和用户时区日期筛选。
+- [x] 双向游标分页、并列时间、插入／状态变化／清理边界、游标篡改和跨用户拒绝通过。
+- [x] 摘要白名单、no-store、后台失败记录计数真实，无正文／输入／租约或凭据泄漏。
+- [x] 列表与详情状态隔离，新任务提示不跳页，原 SSE 协议、取消／幂等重试、replacement 和恢复入口保留，限定取消清理缺陷已修复。
+- [x] 30 秒可见性探测、错误／空态／迟到响应、键盘与多视口行为通过。
+- [x] 索引迁移和 schema/ACL 守卫、后端集成／契约、前端 E2E 及完整 just ci 有基准提交证据。

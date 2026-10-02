@@ -445,24 +445,24 @@ git commit -m "feat: migrate chat page to PrimeVue"
 
 **前置条件：** 完整任务历史规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 已获用户复核。先执行 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 1～7，交付受用户隔离的真实任务列表查询与前端列表状态；该补充计划 Task 8 同时执行本任务的展示迁移与集成，不重复实现。迁移前的前后端没有历史列表接口，禁止以单个选中任务或 Pinia 缓存替代完整历史。补充计划必须划清 TasksPage 与本任务的文件／验证归属；新增能力仅限补充规格第 8 节，其余行为层继续只读。
 
-**实施交接（2026-10-01）：** 补充计划 Task 8 已完成真实列表与本任务的同一次展示迁移，提交主题为 `feat: migrate task history and timeline to PrimeVue`。本任务不再安排第二次迁移；两计划的最终完成标记由独立审查后统一关闭。功能使用 PostgreSQL 摘要 API 与独立列表状态，摘要不写入完整 Task Store；取消、重试幂等及恢复提案审批保持原契约。最小范围补充为 AppShell 在 `/tasks` 排除全局时间线副本／第三布局列，其他页面保留原抽屉。
+**实施交接（2026-10-01）：** 补充计划 Task 8 已完成真实列表与本任务的同一次展示迁移，提交主题为 `feat: migrate task history and timeline to PrimeVue`。本任务不再安排第二次迁移；独立审查已通过，2026-10-02补充基准 `9aa1b3b` 的完整CI及显式体积预算通过，详见[任务历史验收记录](../../releases/2026-10-01-task-history-evidence.md)。文档提交后的复验按补充计划独立留档，再从Task 8前置及Task 8～17接续。功能使用 PostgreSQL 摘要 API 与独立列表状态，摘要不写入完整 Task Store；取消、重试幂等及恢复提案审批保持原契约。最小范围补充为 AppShell 在 `/tasks` 排除全局时间线副本／第三布局列，其他页面保留原抽屉。
 
 验证：旧 11 项组件安全网和 10 项相关 E2E 先绿色，新列表／接线／Timeline／AppShell／分页焦点均有 RED；最终 `just check` 通过（后端 2725、前端 41 文件 450 测试），相关 E2E 12 项通过，含真实认证与既有 POST 创建 25 条未访问任务后跨页找回。恢复提案原精确文案、审批及写入断言未降低；仅登记新增 GET `/tasks` 的精确参数契约，并允许合法可见性探测。
 
-Live region：TasksPage 的 3 status／2 alert、TaskTimeline 的 1 status／2 alert 静态语义与旧文案全部保留，改由显式 role 的 Message 承载；TaskHistoryList 新增 2 status（加载／新任务）及 1 alert（安全错误）。DataView／Timeline 不新增播报；任务页移除外壳重复时间线，避免同一错误或空提示重复播报。角色运行时、窄屏焦点、旧 SSE 重放及恢复入口均有本轮测试证据。详细日志见补充计划私有执行目录 `task-8-*.log`；未将此次 UI 集成称为 M2.1 发布验收。
+Live region：TasksPage 的 3 status／2 alert、TaskTimeline 的 1 status／2 alert 静态语义与旧文案全部保留，改由显式 role 的 Message 承载；TaskHistoryList 新增 2 status（加载／新任务）及 1 alert（安全错误）。DataView／Timeline 不新增播报；任务页移除外壳重复时间线，避免同一错误或空提示重复播报。角色运行时、窄屏焦点、旧 SSE 重放及恢复入口均有本轮测试证据。运行证据与最终修复见[任务历史验收记录](../../releases/2026-10-01-task-history-evidence.md)；未将此次 UI 集成称为 M2.1 发布验收。
 
 **Files:**
 - Modify: `frontend/src/pages/TasksPage.vue`、`frontend/src/pages/TasksPage.spec.ts`
 - Modify: `frontend/src/components/TaskTimeline.vue`、`frontend/src/components/TaskTimeline.spec.ts`
 - 同次集成补充文件由完整任务历史计划 Task 8 列出，包含 TaskHistoryList、AppShell 去重与必要 E2E 契约 fixture。
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/TasksPage.spec.ts src/components/TaskTimeline.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：任务列表为 `DataView` 且每项状态用 `StatusTag`；时间线为 `Timeline`，每个事件文案与旧实现完全一致（用既有 fixture 逐条比对）；重试按钮在非终态禁用；空列表 `EmptyState`；SSE 重放测试不改动。
 
@@ -470,17 +470,17 @@ Run: `pnpm --dir frontend test:unit --run src/pages/TasksPage.spec.ts src/compon
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建**
+- [x] **Step 3: 重建**
 
 删除两者的 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/TasksPage.spec.ts src/components/TaskTimeline.spec.ts src/stores/tasks.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
 git add frontend/src/pages/TasksPage.vue frontend/src/pages/TasksPage.spec.ts frontend/src/components/TaskTimeline.vue frontend/src/components/TaskTimeline.spec.ts

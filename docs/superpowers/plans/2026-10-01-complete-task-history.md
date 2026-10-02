@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`（用户已复核确认）。
 
+**实施状态（2026-10-02）：** Task 1～8及Task 9基准门禁已完成，验证HEAD为 `9aa1b3b`，完整CI和显式体积预算均退出0；见[验收记录](../../releases/2026-10-01-task-history-evidence.md)。Task 8同时完成原M2.1 Task 7。本次文档提交后的最终CI按Task 9 Step 4执行并独立留档，不回写自身SHA；完成后接续原Task 8前置及Task 8～17。
+
 ## Global Constraints
 
 - “完整”指可遍历当前用户保留中的真实 TaskRun 记录，不是浏览器曾访问的任务缓存，不包括没有 TaskRun 的内部队列作业，也不恢复已删除的数据。
@@ -155,7 +157,7 @@ class TaskHistoryPage:
 
 **Interfaces:** 消费现有 `TaskStatus`；产出“共享接口约定”的全部值类型、两个固定异常及所列纯函数。
 
-- [ ] **Step 1: 写失败的分类与真实日期用例**
+- [x] **Step 1: 写失败的分类与真实日期用例**
 
 ```python
 from datetime import UTC, date, datetime
@@ -190,12 +192,12 @@ def test_skipped_civil_day_is_empty_not_another_days_records():
 
 同文件参数化覆盖规格完整类型表、未知 kind、所有十个状态、默认 limit20、limit0/101/bool、未知 scope/status、business+sync_mail 和 business+other 冲突、非法／倒置日期、闰日、日期极值越界、25小时日期及午夜重叠／跳跃；非法输入统一固定异常，不暴露原输入。
 
-- [ ] **Step 2: 观察 RED**
+- [x] **Step 2: 观察 RED**
 
 Run: `uv run --project backend pytest backend/tests/unit/application/test_task_history_filters.py backend/tests/unit/application/test_task_history_dates.py -q`
 Expected: 新模块缺失导致失败。
 
-- [ ] **Step 3: 实现纯值类型和规范化**
+- [x] **Step 3: 实现纯值类型和规范化**
 
 ```python
 BUSINESS_KINDS = frozenset({
@@ -219,11 +221,11 @@ def history_category(kind: str) -> HistoryCategory:
 
 日期算法先验证两个 fold 的午夜 UTC 往返；有有效候选时取最早。午夜处于跳跃时，在两个候选 UTC 的有界区间内按微秒二分首次本地日期达到目标的瞬间；整日跳过自然得到与次日起点相同的值。不得按分钟扫全年、硬加24小时或静默使用UTC代替非法时区。所有 date/datetime 溢出转换为固定过滤错误。
 
-- [ ] **Step 4: GREEN 与提交前检查**
+- [x] **Step 4: GREEN 与提交前检查**
 
 Run: 上述聚焦命令，然后 `just check`、`git diff --check`。Expected: 全通过；现有状态机不改。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add backend/src/ai_employee/application/task_history.py backend/src/ai_employee/application/task_history_dates.py backend/tests/unit/application/test_task_history_filters.py backend/tests/unit/application/test_task_history_dates.py
@@ -238,7 +240,7 @@ git commit -m "feat: define task history filters and summaries"
 
 **Interfaces:** 消费 Task 1 `TaskHistoryFilters`、`HistoryCursorState`、`HistoryKey`、hash 与异常。产出 `TaskHistoryCursorCodec(master_key: bytes)`、`from_file(path: Path)`、`encode(state: HistoryCursorState) -> str`、`decode(token: str, *, filters: TaskHistoryFilters, now: datetime) -> HistoryCursorState`。
 
-- [ ] **Step 1: 写错误绑定／时效失败测试**
+- [x] **Step 1: 写错误绑定／时效失败测试**
 
 ```python
 from dataclasses import replace
@@ -268,12 +270,12 @@ def test_cursor_is_bound_to_user_filter_and_exact_expiry():
 
 增加独立固定向量、字节篡改、正确签名但错误schema、重复JSON键、NaN/Infinity、额外键、bool冒充版本/整数、超2048长度、非法base64url、非UTF8、错误签名长度、naive日期、anchor>upper、非canonical UUID、未来60秒边界、错误用户／时区／日期／scope／kind／status、密钥变化测试。测试错误消息不得包含 token 或 key。
 
-- [ ] **Step 2: 运行观察 RED**
+- [x] **Step 2: 运行观察 RED**
 
 Run: `uv run --project backend pytest backend/tests/unit/infrastructure/test_task_history_cursor.py -q`
 Expected: 新 codec 不存在。
 
-- [ ] **Step 3: 实现编码规则**
+- [x] **Step 3: 实现编码规则**
 
 ```python
 import hashlib
@@ -292,11 +294,11 @@ mac = hmac.new(signing_key, payload_bytes, hashlib.sha256).digest()
 
 from_file 兼容现有32字节标准Base64和Base64URL主密钥文件（CI使用openssl rand -base64）；Secret文件读取与外部游标严格URLsafe解码分开；不访问 AeadCipher 私有属性，不改变 encryption.py 或 OAuth/命令加密。文件读取只发生在受认证查询需要游标 codec 时，不在模块 import 或 create_app 时提前读取 Secret。
 
-- [ ] **Step 4: GREEN、`just check`、diff检查**
+- [x] **Step 4: GREEN、`just check`、diff检查**
 
 Run: 聚焦命令、`just check`、`git diff --check`。Expected: 通过，无生产凭据或原始游标输出。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add backend/src/ai_employee/infrastructure/security/task_history_cursor.py backend/tests/unit/infrastructure/test_task_history_cursor.py
@@ -318,7 +320,7 @@ git commit -m "feat: add signed task history cursors"
 
 **Interfaces:** 新 revision=`20261001_0020`，down_revision=`20260809_0019`；索引名 `ix_task_runs_user_created_id`，列 `(user_id, created_at, id)`。不增加表／列／角色／grant，不修改旧 revision 文件。
 
-- [ ] **Step 1: 写迁移准入与目录失败回归**
+- [x] **Step 1: 写迁移准入与目录失败回归**
 
 在现有 migration lifecycle 单测 fixture 中加入0020链，断言：published head由真实新脚本派生；0020两个phase的完整表／列／序列权限与0019完全相同；跨越0019仍绑定同一真实AAD guard并执行原before/after检查；0019→0020不重新执行AAD变更；缺显式guard且affected集合非空时不能从0018跨过0019；缺显式guard但affected为空时必须调用原内置strict-empty守卫的两个阶段，允许既有受管空库升级。显式注入错误类型／空值仍拒绝，不能把“没有显式attribute”误当成“没有守卫”。
 
@@ -340,12 +342,12 @@ assert '(user_id, created_at, id)' in row.pg_get_indexdef
 
 测试中 `session` 必须由本模块已声明的、受管 `ManagedAsyncSessionMaker` fixture 创建；不直接连接任意环境URL。新测试模块不得用SQL补索引令旧代码通过。
 
-- [ ] **Step 2: RED**
+- [x] **Step 2: RED**
 
 Run: `uv run --project backend pytest backend/tests/unit/infrastructure/db/test_alembic_migration_lifecycle.py backend/tests/integration/db/test_task_history_index.py -q`
 Expected: 新revision／index／inventory尚不存在，明确失败。
 
-- [ ] **Step 3: 实现事务型索引与严格后继目录**
+- [x] **Step 3: 实现事务型索引与严格后继目录**
 
 ```python
 from alembic import op
@@ -366,11 +368,11 @@ env.py原先只在expected_target_revision==0019时绑定guard。保留该既有
 
 Task 9 完整 CI 的补充兼容验证同时覆盖历史运维／保留测试：synthetic runner 必须模拟0018→0019→0020完整相邻 callback，并验证最终 guard 位于0020完整权限核验之后；retention helper 只要求0019属于真实发布链，显式迁移目标与完整ACL矩阵仍是0019。历史专用CLI成功用例通过临时复制真实0019完整祖先脚本和env，再由原 published reader 验证副本；当前0020镜像另行验证拒绝，不能改生产版本限制。release wrapper全stub测试显式提供原脚本要求的精确Task13合成环境，不继承外层受管anchor，也不放宽脚本准入。
 
-- [ ] **Step 4: GREEN 与迁移回归**
+- [x] **Step 4: GREEN 与迁移回归**
 
 Run: 本任务单元／集成，再 `uv run --project backend pytest backend/tests/integration/db/test_migrations.py -q`、`just check`、`git diff --check`。用合成数据运行索引查询EXPLAIN，记录键序与无逐行明细加载；不以微秒计时作脆弱断言。只有数据证明需要第二索引时才提出精确查询计划证据，不提前新增。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/superpowers/plans/2026-10-01-complete-task-history.md backend/src/ai_employee/infrastructure/db/alembic.py backend/tests/integration/db/test_migrations.py backend/migrations/versions/20261001_0020_task_history_index.py backend/src/ai_employee/infrastructure/db/models/tasks.py backend/src/ai_employee/infrastructure/db/database_grants.py backend/migrations/env.py backend/tests/unit/infrastructure/db/test_alembic_migration_lifecycle.py backend/tests/integration/db/test_task_history_index.py backend/tests/unit/cli/test_calendar_aad_revision_cli.py
@@ -392,7 +394,7 @@ git commit -m "feat: index task history with guarded schema upgrade"
 - `ListTaskHistoryUseCase(reader, codec_factory: Callable[[], HistoryCursorCodec], clock: Clock)`；`execute(*, user_id: UUID, timezone: str, query: TaskHistoryQuery) -> TaskHistoryPage`（async）。
 - `SqlAlchemyTaskHistoryReader(session_factory: ManagedAsyncSessionMaker)` 实现 reader；不导入旧TaskViewStore以免读取payload。
 
-- [ ] **Step 1: 写失败的两个用户、排序和隔离测试**
+- [x] **Step 1: 写失败的两个用户、排序和隔离测试**
 
 `history_fixtures.py` 声明 `HistoryDataset(owner_id, other_id, owner_task_ids)` dataclass及 `seed_history_dataset(session_factory) -> HistoryDataset`，使用固定合成UUID、用户资料和精确UTC微秒，创建25条所属任务、另一用户任务及不同kind/status；不包含真实正文。
 
@@ -412,12 +414,12 @@ async def test_pages_are_user_scoped_and_bidirectional(history_reader, history_d
 
 在该模块明确定义 `history_reader`、`history_dataset` fixture，依赖受管regular数据库fixture，调用上述seed方法。补齐下一页5条、回上一页20条、同微秒UUID排序、每个筛选、background含other、失败计数只受user/date限制、空列表、边界行删除、全部窗口消失、并发提交／状态更新的一致性读取测试。单元FakeReader/FakeCodec/FakeClock验证无效游标零reader调用、正常读零dispatcher／provider调用、空页方向cursor必须由仍存方向记录的EXISTS支持。
 
-- [ ] **Step 2: RED**
+- [x] **Step 2: RED**
 
 Run: `uv run --project backend pytest backend/tests/unit/application/test_task_history.py backend/tests/integration/tasks/test_task_history_views.py -q`
 Expected: 模块缺失。
 
-- [ ] **Step 3: 实现显式列投影及keyset**
+- [x] **Step 3: 实现显式列投影及keyset**
 
 ```python
 columns = (
@@ -435,11 +437,11 @@ statement = select(*columns).where(TaskRunModel.user_id == filters.user_id)
 
 当前窗口为空时返回空items，检查输入anchor的反方向是否仍有记录：older空页且有key>anchor时以原anchor返回previous；newer空页且有key<anchor时以原anchor返回next；对应seek方向确实不存在才返回null。不依赖被删除边界行，不制造虚构anchor；前端始终提供重新加载首页，方向查询不得返回同一空窗口造成自动循环。保留期／状态变化不是500，不能为了固定分页去锁业务行。用例用同一clock时间验证／签发cursor；需要解码或有方向anchor需签发时，通过 asyncio.to_thread 调用同步codec_factory，每次execute最多构造一次并复用，避免Secret文件I/O阻塞事件循环；分别编码older/newer，仅有anchor时编码；所有字段都从固定DTO构造。
 
-- [ ] **Step 4: GREEN、SQL证据与提交检查**
+- [x] **Step 4: GREEN、SQL证据与提交检查**
 
 Run: 聚焦、`just check`、`git diff --check`。记录SQL列清单和合成EXPLAIN；同一只读事务中并发更改记录，证明摘要／count／方向判断来自相同快照；事务随请求结束关闭。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add backend/src/ai_employee/infrastructure/db/repositories/task_history_views.py backend/src/ai_employee/application/use_cases/task_history.py backend/tests/unit/application/test_task_history.py backend/tests/integration/tasks/test_task_history_views.py backend/tests/integration/tasks/history_fixtures.py
@@ -456,7 +458,7 @@ git commit -m "feat: query task history from consistent database snapshots"
 
 **Interfaces:** 新 `get_task_history_use_case(request: Request) -> ListTaskHistoryUseCase`；HTTP字段／错误严格按规格§5，无修改现有TaskResponse、POST／detail／SSE。
 
-- [ ] **Step 1: 注册、401、摘要白名单和原端点回归RED**
+- [x] **Step 1: 注册、401、摘要白名单和原端点回归RED**
 
 ```python
 @pytest.mark.asyncio
@@ -476,12 +478,12 @@ async def test_list_exposes_only_summary_fields(history_client):
 
 本模块定义 `history_client` fixture，仿照 `integration/api/test_tasks.py` 的真实Cookie登录、受管session生命周期，调用Task4 seed；设置合成32字节Secret临时文件并在退出清理，禁止写仓库.env。测试用户timezone非UTC，另一客户端访问别人的cursor统一422且无计数泄漏。参数错scope/kind/status/date/limit/cursor均断言稳定错误码和无输入回显；增加GET零TaskRun/Outbox/审计创建和未登录不读取Secret的断言。
 
-- [ ] **Step 2: RED**
+- [x] **Step 2: RED**
 
 Run: `uv run --project backend pytest backend/tests/unit/api/test_task_history_contract.py backend/tests/integration/api/test_task_history.py -q`
 Expected: GET返回405／依赖不存在／契约不符。
 
-- [ ] **Step 3: 实现只读路由和惰性注入**
+- [x] **Step 3: 实现只读路由和惰性注入**
 
 ```python
 @router.get('', response_model=TaskHistoryPageResponse)
@@ -509,12 +511,12 @@ async def list_task_history(
 
 依赖从 `request.app.state.auth_session_factory` 构造stateless reader，Clock用既有get_auth_clock；codec_factory闭包按当前配置读取主密钥，非列表请求不受影响。响应datetime全部转UTC，用六位微秒Z字符串，不丢失分页比较精度；不改变其它API的时间序列化。
 
-- [ ] **Step 4: GREEN与旧REST/SSE回归**
+- [x] **Step 4: GREEN与旧REST/SSE回归**
 
 Run: 本任务聚焦，再 `uv run --project backend pytest backend/tests/integration/api/test_tasks.py backend/tests/integration/api/test_task_sse.py -q`、`just check`、diff检查。
 Expected: 新GET和既有POST/detail/cancel/retry/SSE同时通过，四种真实写命令无变化。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add backend/src/ai_employee/api/routers/tasks.py backend/src/ai_employee/api/deps.py backend/tests/unit/api/test_task_history_contract.py backend/tests/integration/api/test_task_history.py
@@ -530,7 +532,7 @@ git commit -m "feat: expose authenticated task history listing"
 
 **Interfaces:** 输出 `TaskHistoryFilters`（scope/kind/status/created_from_date/created_to_date）、`TaskHistoryItem`、`TaskHistoryPage`、`listTaskHistory(filters, cursor: string | null = null): Promise<TaskHistoryPage>`、`historyItemKey(item): string`。limit固定20；列表独立于现有TaskSnapshot。
 
-- [ ] **Step 1: 写摘要解析／请求参数RED**
+- [x] **Step 1: 写摘要解析／请求参数RED**
 
 fixture导出 `historyItem(overrides?: Partial<TaskHistoryItem>)`、`historyPage(overrides?: Partial<TaskHistoryPage>)`，全部合成固定UUID、时间、无内容数据。
 
@@ -550,12 +552,12 @@ it('reads summaries without replacing task snapshots', async () => {
 
 补齐null字段、非法UUID／时间／状态／category、额外敏感字段不进入返回值、数组类型、count非负整数、cursor长度、已知kind和other、错误ProblemDetails/trace、GET携带Cookie的真实统一client行为测试。测试保持全文件Vitest风格，afterEach恢复fetch，不能借导入stores产生初始化副作用。
 
-- [ ] **Step 2: RED**
+- [x] **Step 2: RED**
 
 Run: `pnpm --dir frontend test:unit --run src/api/taskHistory.spec.ts`
 Expected: 模块缺失。
 
-- [ ] **Step 3: 实现类型与明确投影**
+- [x] **Step 3: 实现类型与明确投影**
 
 ```typescript
 export interface TaskHistoryFilters {
@@ -578,11 +580,11 @@ export function listTaskHistory(filters: TaskHistoryFilters, cursor: string | nu
 
 在本文件定义 `parseTaskHistoryPage(value: unknown): TaskHistoryPage`，使用统一requestJson与现有类型收窄模式；不更改client.ts、TaskSnapshot或Store。时间必须匹配服务端六位微秒UTC契约并验证真实日历日期；historyItemKey使用规范UTC原文+canonical UUID比较，不用JS毫秒精度丢失后三位微秒。未知kind可显示“其他任务”，不能因未来kind就丢掉整页；未知状态/category拒绝并显示读取失败，不猜成功。
 
-- [ ] **Step 4: GREEN、类型、lint、check**
+- [x] **Step 4: GREEN、类型、lint、check**
 
 Run: 聚焦、`pnpm --dir frontend type-check`、`pnpm --dir frontend lint`、`just check`、diff检查。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add frontend/src/api/taskHistory.ts frontend/src/api/taskHistory.spec.ts frontend/src/test-support/taskHistoryFixtures.ts
@@ -601,7 +603,7 @@ git commit -m "feat: add typed task history client"
 - `parseHistoryRoute(query: LocationQuery)`返回明确filters/cursor或本地固定校验错误；`historyRouteQuery(query, filters, cursor)`保留task_id及非历史公开参数，替换本功能参数。
 - `useTaskHistory({ timezone: Readonly<Ref<string | null>> })`在Vue组件setup内调用，内部使用现有router；返回 `page, filters, cursor, loading, error, hasNewTasks, setFilters, nextPage, previousPage, refreshCurrent, refreshFirst`。`setFilters(next: TaskHistoryFilters): Promise<void>`，其余四个导航／刷新方法均无参数并返回 `Promise<void>`；内部导航失败不得伪造成功。page为独立摘要ref；error区分本地过滤错误与真实ProblemError，不伪造服务端异常。
 
-- [ ] **Step 1: 写乱序和轮询RED**
+- [x] **Step 1: 写乱序和轮询RED**
 
 测试用 `renderWithPlugins` 挂载合成探针组件，在setup调用composable并暴露返回接口给测试；mock仅Task6 API函数与受控时间，不mock生产状态机。
 
@@ -624,12 +626,12 @@ it('does not replace the visible page when a probe finds a newer task', async ()
 
 `HistoryProbe`在该测试文件中完整定义，仅模板打印 page首项created_at及hasNewTasks，不创建产品组件。补齐：首次空页→新任务、深链接cursor初始探测只建baseline不误报旧任务、隐藏/卸载停止、慢探测不并发、失败等到下个30秒、切回读取当前页、手刷/筛选从首页、旧响应丢弃、task_id变化不重载列表、无local/sessionStorage写入、服务端cursor_invalid不静默重置、timezone变化重置。
 
-- [ ] **Step 2: RED**
+- [x] **Step 2: RED**
 
 Run: `pnpm --dir frontend test:unit --run src/features/tasks`
 Expected: 新模块缺失。
 
-- [ ] **Step 3: 实现有界生命周期**
+- [x] **Step 3: 实现有界生命周期**
 
 ```typescript
 let generation = 0
@@ -657,11 +659,11 @@ async function readCurrentPage(): Promise<void> {
 
 filter表单先验证再写URL；非法URL不静默当默认条件执行。旧数据在刷新失败时保留且显示失败。游标失效提供refreshFirst显式恢复，不能自动降级过滤。用户timezone ref初次从null变为已知不误清深链接，之后真实变更重置cursor；无用户时区时不推断本机时区。
 
-- [ ] **Step 4: GREEN与check**
+- [x] **Step 4: GREEN与check**
 
 Run: 本任务聚焦、类型、lint、`just check`、diff检查；原Store/SSE测试不变。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add frontend/src/features/tasks/historyRoute.ts frontend/src/features/tasks/historyRoute.spec.ts frontend/src/features/tasks/useTaskHistory.ts frontend/src/features/tasks/useTaskHistory.spec.ts
@@ -682,11 +684,11 @@ git commit -m "feat: manage task history navigation and refresh"
 
 **Interfaces:** TaskHistoryList接收page/filters/loading/error/newTaskHint；只emit过滤、翻页、刷新和select(id)，不调用API。TasksPage组合useTaskHistory和原选中任务详情；TaskTimeline保持既有task/retry/follow Props。本任务就是原M2.1 Task7，不另派第二个Task7实现者。
 
-- [ ] **Step 1: 先建立旧单测／E2E安全网**
+- [x] **Step 1: 先建立旧单测／E2E安全网**
 
 将既有TasksPage/TaskTimeline测试必要选择器转为角色／名称；保留原cancel/retry/replacement、步骤摘要、安全错误及恢复提案断言。运行旧页面聚焦和 `reconnect/action-workspace/calendar-restore`；不得先改SSE协议fixture或降低请求次数。
 
-- [ ] **Step 2: 写新列表与UI RED**
+- [x] **Step 2: 写新列表与UI RED**
 
 ```typescript
 it('keeps filtered history visible while opening a task detail', async () => {
@@ -701,7 +703,7 @@ it('keeps filtered history visible while opening a task detail', async () => {
 
 fixture应与failed过滤相符，测试使用 `historyItem({status:'failed'})` 和对应page，不能用不匹配成功记录伪造结果。补默认业务/全部/后台跳转、日期筛选、准确失败口径、上一页/下一页、空页恢复、单次选中SSE、敏感字段不存在、pending无重试、failed重试关联、清理404、keyboard/focus/narrow布局和所有旧live文案。
 
-- [ ] **Step 3: 实现DataView、Timeline与明确状态**
+- [x] **Step 3: 实现DataView、Timeline与明确状态**
 
 ```vue
 <DataView :value="page?.items ?? []" data-key="id">
@@ -722,11 +724,11 @@ fixture应与failed过滤相符，测试使用 `historyItem({status:'failed'})` 
 
 无任务、无筛选结果、加载中和错误分别呈现；后台失败提示点击明确设scope=background/status=failed/kind=null、保留日期、清cursor。详情保留原查询与mutations，仅在原操作结束后通知history.refreshCurrent；不把列表返回写入TaskStore。Timeline保留原步骤名、状态、耗时和摘要文本，重试只在原允许状态可触发。删除旧scoped布局，以Tailwind/PrimeVue实现；不要复制全局AppShell时间线。
 
-- [ ] **Step 4: GREEN与浏览器证据**
+- [x] **Step 4: GREEN与浏览器证据**
 
 Run: 目标组件/页面/feature单测与未改Store/SSE单测、type-check、lint、相关E2E、`just check`。新增浏览器场景使用真实任务列表API与合成数据库，覆盖刷新后找回未曾访问任务；不能全部用page.route模拟列表后声称数据库联通。使用已认证 `page.request` 调用现有 POST /api/v1/tasks 与合成已支持的 kind、精确幂等键创建可见任务；默认关闭真实写入且工具为Fake，不新增生产seed端点。先停留在其他页面创建至少25条任务，再进入历史，证明此前未访问的ID可找到。共享测试管理员可能有其他测试记录，按本例ID集合验证分页可达与不重复，不断言全库仅有25条。
 
-- [ ] **Step 5: 提交与双计划记账**
+- [x] **Step 5: 提交与双计划记账**
 
 ```bash
 git add frontend/src/pages/TasksPage.vue frontend/src/pages/TasksPage.spec.ts frontend/src/components/TaskTimeline.vue frontend/src/components/TaskTimeline.spec.ts frontend/src/components/TaskHistoryList.vue frontend/src/components/TaskHistoryList.spec.ts frontend/e2e/task-history.spec.ts frontend/e2e/reconnect.spec.ts frontend/e2e/action-workspace.spec.ts frontend/e2e/calendar-restore.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
@@ -745,21 +747,21 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 
 **Interfaces:** 本补充全部14条规格验收证据；交接到M2.1 Task8前置异步确认修复，保留原Task1～6提交和所有deferred findings。
 
-- [ ] **Step 1: 逐项审计规格§10**
+- [x] **Step 1: 逐项审计规格§10**
 
 对14项逐一写出代码、测试文件、命令、输出与commit依据。不能以“单测全绿”代替双向分页／跨用户／迁移／真实API浏览器证据。补充所有发现的失败重现和最小修复，仍按独立fix+复审，不改范围以求通过。
 
-- [ ] **Step 1a: 限定修复 SSE 取消清理缺陷（2026-10-01 用户已批准）**
+- [x] **Step 1a: 限定修复 SSE 取消清理缺陷（2026-10-01 用户已批准）**
 
 先将真实 PostgreSQL 诊断转为正常退出的回归，保留 pre_ping 期间断线导致 checkedout 未归零、GC warning 和 terminate error 的 RED。仅在 `backend/src/ai_employee/api/sse.py` 三种有限数据库读取边界适配 AnyIO 与 asyncio 取消，明确资源所有者和有界清理；不得关闭 pre_ping、吞取消、过滤 warning 或丢弃后台任务。保持用户隔离及同一 REPEATABLE READ 快照，不修改事件协议／任务状态／审批／执行或共享会话工厂。对应修复与规格 §8.1、根／后端规则同步为独立 `fix:` 提交，不混入前端导航修复。
 
 测试覆盖三种读取与复用 pre_ping 的真实 EventSourceResponse 断线、正常读取、单次取消、重复外层取消和收尾预算；确认池回到基线、没有依赖 GC 的归还或残留读取任务。通过受管选集入口运行新回归及原 SSE 12 项，再串行运行任务历史／reconnect 相关 E2E 和 `just check`；完整 `just ci` 仍由后续门禁执行，不能以聚焦结果替代。
 
-- [ ] **Step 1b: 完整 CI 揭示的历史测试夹具兼容**
+- [x] **Step 1b: 完整 CI 揭示的历史测试夹具兼容**
 
 按Task 3的历史／当前发布链区分口径，限定修改 `backend/tests/integration/operations/test_database_maintenance_gate.py`、`test_postgres_backup_restore.py`、`test_calendar_aad_0019_preflight.py`、`test_calendar_aad_0019_deadline_restore.py`、仅测试支持 `calendar_aad_0019_release.py` 及 `backend/tests/integration/retention/test_role_permissions.py`。保留真实失败日志，先聚焦复验再验证完整受影响模块和 `just check`，独立提交 `test: align lifecycle fixtures with published task history revision` 并复审；不改生产迁移、CLI、权限、保留清理或受管fixture准入。
 
-- [ ] **Step 2: 执行完整门禁**
+- [x] **Step 2: 执行完整门禁**
 
 ```bash
 just check
@@ -769,11 +771,11 @@ bash scripts/report-frontend-bundle.sh --budget
 
 在同一个已验证临时环境串行执行并完整读取输出。若宿主8000端口不可绑定，使用同一Docker网络namespace执行完整 `just ci`；挂载所需just/Docker/uv/pnpm和受管测试配置，不能拆开若干命令冒充完整ci。任何环境适配保持仓库just为唯一正式入口、不连接真实账号或手工修共享库。
 
-- [ ] **Step 3: 写证据与同步完成状态**
+- [x] **Step 3: 写证据与同步完成状态**
 
 证据记录实际验证HEAD、后端/前端/E2E数、分页/权限/日期/签名/索引矩阵、原SSE与幂等回归、体积和已知限制，链接实际留档摘要；不提交Secret、完整cursor、截图原始敏感数据或测试报告。确认新索引不改变0019最终ACL，TaskHistory清理行为未改。
 
-- [ ] **Step 4: 提交并复验最终HEAD**
+- [ ] **Step 4: 提交并复验最终HEAD（提交后独立留档，不回写本清单）**
 
 ```bash
 git add docs/releases/2026-10-01-task-history-evidence.md docs/acceptance-checklist.md docs/superpowers/plans/2026-10-01-complete-task-history.md docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md AGENTS.md backend/AGENTS.md frontend/AGENTS.md
