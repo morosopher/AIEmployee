@@ -22,7 +22,7 @@ async function injectScenario(
   if (!existingSession) {
     await page.goto('/login')
     await page.getByLabel('邮箱').fill(email)
-    await page.getByLabel('密码').fill(password)
+    await page.getByLabel('密码', { exact: true }).fill(password)
     await page.getByRole('button', { name: '登录' }).click()
     await expect(page).not.toHaveURL(/\/login/)
   }
@@ -81,7 +81,7 @@ test('revoked OAuth shows reconnect action through the test-only scenario contra
   const email = process.env.E2E_ADMIN_EMAIL!
   const password = readFileSync(process.env.E2E_ADMIN_PASSWORD_FILE!, 'utf8').trimEnd()
   await page.getByLabel('邮箱').fill(email)
-  await page.getByLabel('密码').fill(password)
+  await page.getByLabel('密码', { exact: true }).fill(password)
   await page.getByRole('button', { name: '登录' }).click()
   // 登录请求是异步的；先等待受保护路由完成导航，再读取服务端设置的 CSRF Cookie。
   await expect(page).not.toHaveURL(/\/login/)
@@ -119,7 +119,7 @@ test('partial brief presents a single-source failure warning with repair context
   const email = process.env.E2E_ADMIN_EMAIL!
   const password = readFileSync(process.env.E2E_ADMIN_PASSWORD_FILE!, 'utf8').trimEnd()
   await page.getByLabel('邮箱').fill(email)
-  await page.getByLabel('密码').fill(password)
+  await page.getByLabel('密码', { exact: true }).fill(password)
   await page.getByRole('button', { name: '登录' }).click()
   await expect(page).not.toHaveURL(/\/login/)
   const { csrf, connectionId } = await seedGoogleSource(page)
