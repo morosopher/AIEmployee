@@ -362,10 +362,10 @@ for (const provider of ['google', 'microsoft'] as const) {
     expect(connected.status()).toBe(200)
     const { connection_id: connectionId } = await connected.json() as { connection_id: string }
     await page.getByRole('button', { name: '刷新连接', exact: true }).click()
-    const card = page.locator(`[data-connection-id="${connectionId}"]`)
+    const card = page.getByTestId(`connection-${connectionId}`)
     const capability = provider === 'google' ? 'mail.read' : 'mail.send'
-    const row = card.locator(`[data-capability="${capability}"]`)
-    if (provider === 'google') await row.getByRole('button', { name: `关闭 ${capability}`, exact: true }).click()
+    const row = card.getByTestId(`capability-${capability}`)
+    if (provider === 'google') await row.getByRole('switch', { name: `关闭 ${capability}`, exact: true }).check()
     await row.getByRole('button', { name: `启用 ${capability}`, exact: true }).click()
     const denied = await completeOAuth(page, provider, provider === 'microsoft' ? 'consent_required' : 'access_denied')
     expect(denied.status()).toBeGreaterThanOrEqual(400)

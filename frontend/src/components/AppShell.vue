@@ -89,6 +89,7 @@ watch(
 const navigationOpen = ref(false)
 const timelineOpen = ref(false)
 const confirmationOpen = ref(false)
+const mainContent = ref<HTMLElement | null>(null)
 let confirmationTrigger: HTMLElement | null = null
 /** 确认框显示前保存焦点，Dialog 原生归还焦点时背景可能仍处于更新中的 inert。 */
 function showConfirmation(): void {
@@ -98,11 +99,23 @@ function showConfirmation(): void {
       : null
   confirmationOpen.value = true
 }
-/** 等 Vue 把 inert 属性移除后再次归还焦点，兼容浏览器原生隔离。 */
+/**
+ * 退出动画结束后解除隔离并归还焦点，留出异步确认结算及按钮更新的时间。
+ * 触发器已禁用、移除或无法接收焦点时退回主内容，不把焦点留在已关闭的浮层。
+ */
 async function hideConfirmation(): Promise<void> {
   confirmationOpen.value = false
   await nextTick()
-  if (confirmationTrigger?.isConnected) confirmationTrigger.focus()
+  const trigger = confirmationTrigger
+  confirmationTrigger = null
+  if (
+    trigger?.isConnected &&
+    !trigger.matches(':disabled, [aria-disabled="true"]')
+  ) {
+    trigger.focus()
+    if (document.activeElement === trigger) return
+  }
+  mainContent.value?.focus()
 }
 const modalOpen = computed(
   () => navigationOpen.value || timelineOpen.value || confirmationOpen.value,
@@ -138,7 +151,11 @@ watch(
       </Message>
     </div>
     <AppNavigation @modal-change="navigationOpen = $event" />
-    <main class="min-w-0 p-4 md:p-6">
+    <main
+      ref="mainContent"
+      tabindex="-1"
+      class="min-w-0 p-4 md:p-6"
+    >
       <RouterView />
     </main>
     <TimelineDrawer
@@ -165,6 +182,6 @@ watch(
   />
   <ConfirmDialog
     @show="showConfirmation"
-    @hide="hideConfirmation"
+    @after-hide="hideConfirmation"
   />
 </template>

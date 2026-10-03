@@ -486,12 +486,12 @@ test('both provider capabilities and explicit work defaults are usable with boun
     await editorJson(route, settings)
   })
   await page.goto('/connections')
-  const googleCard = page.locator(`[data-connection-id="${google.id}"]`)
-  const microsoftCard = page.locator(`[data-connection-id="${microsoft.id}"]`)
-  await expect(googleCard.locator('[data-capability]')).toHaveCount(4)
-  await expect(microsoftCard.locator('[data-capability]')).toHaveCount(4)
+  const googleCard = page.getByTestId(`connection-${google.id}`)
+  const microsoftCard = page.getByTestId(`connection-${microsoft.id}`)
+  await expect(googleCard.getByTestId(/^capability-/)).toHaveCount(4)
+  await expect(microsoftCard.getByTestId(/^capability-/)).toHaveCount(4)
   await expect(
-    googleCard.locator('button[name="disable-mail.read"]'),
+    googleCard.getByRole('switch', { name: '关闭 mail.read', exact: true }),
   ).toBeDisabled()
   await expect(microsoftCard).toContainText('管理员同意')
   await page.getByRole('button', { name: '连接 Google', exact: true }).click()
@@ -506,7 +506,7 @@ test('both provider capabilities and explicit work defaults are usable with boun
     'href',
     'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
   )
-  await microsoftCard.locator('button[name="enable-calendar.write"]').click()
+  await microsoftCard.getByRole('button', { name: '重新授权 calendar.write', exact: true }).click()
   // 提示只表示已生成授权链接；仍需用户继续供应商同意并经回调返回连接页。
   await expect(
     page.getByText(

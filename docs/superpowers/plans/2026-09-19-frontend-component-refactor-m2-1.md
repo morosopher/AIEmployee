@@ -241,7 +241,7 @@ Run: `pnpm --dir frontend test:unit --run src/components/AppShell.spec.ts src/co
 
 Expected: PASS。
 
-Run: `pnpm --dir frontend test:e2e -- e2e/reconnect.spec.ts`
+Run: `pnpm --dir frontend test:e2e e2e/reconnect.spec.ts`
 
 Expected: PASS。
 
@@ -350,7 +350,7 @@ Expected: FAIL。
 
 - [x] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/LoginPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/daily-brief.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/LoginPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/daily-brief.spec.ts`
 
 Expected: PASS。
 
@@ -390,7 +390,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/TodayBriefPage.spec.ts src/components/BriefView.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/daily-brief.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/TodayBriefPage.spec.ts src/components/BriefView.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/daily-brief.spec.ts`
 
 Expected: PASS。
 
@@ -491,6 +491,8 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 
 ### Task 8 前置独立修复：异步确认展示端口
 
+实施完成：`70aedc0`，新增8项确认边界回归及原页面11项、连接E2E4项通过，`just check`后端2730／前端466通过。后续页面只消费该端口。
+
 **Files:**
 - Modify: `frontend/src/features/connections/useConnections.ts`
 - Create: `frontend/src/features/connections/useConnections.spec.ts`
@@ -499,7 +501,7 @@ git commit -m "feat: migrate task history and timeline to PrimeVue"
 
 最小实现为可注入并 await 的异步确认回调，默认保留既有确认语义；不全局替换 `window.confirm`，不在页面复制 API 请求路径。该端口不改变外部写入和审批规则。Task 8 页面通过 `ConfirmDialog` 提供回调，只有一次确认。
 
-Run: `pnpm --dir frontend test:unit --run src/features/connections/useConnections.spec.ts src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/connections.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/features/connections/useConnections.spec.ts src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/connections.spec.ts`
 
 读取完整输出，通过 `just check` 并审阅 diff 后独立提交：
 
@@ -510,39 +512,49 @@ git commit -m "fix: inject async connection disconnect confirmation"
 
 ### Task 8: 迁移连接页与能力行
 
+实施验证：原11项组件安全网及28项相关E2E先绿色；迁移、显式IANA、确认焦点及Message默认播报各有RED。最终聚焦44项、相关E2E33项通过；just check后端2730／前端477项通过，类型、lint、生产构建和体积预算通过。JS gzip333429B，相对基线增加193056B，CSS9026B，仍在既定预算内。
+
+Live region：页面原4 status／2 alert、能力行原1 status／0 alert数量保持。加载、空态、通知用Message并显式polite；两类错误仍alert/assertive；原连接状态文案由sr-only保留，可见中文StatusTag不重复播报。能力状态沿用原文案，新降级Message为note/off，状态行已播报“暂不可用”。真实DOM测试覆盖加载、空、错误恢复、部分失败、授权通知、降级；ConfirmDialog唯一出口、Esc焦点、禁用／移除触发器回退均有运行证据。
+
 **Files:**
 - Modify: `frontend/src/pages/ConnectionsPage.vue`、`frontend/src/pages/ConnectionsPage.spec.ts`
 - Modify: `frontend/src/components/CapabilityRows.vue`
+- Modify（确认框退出后的背景隔离解除与焦点恢复）: `frontend/src/components/AppShell.vue`、`frontend/src/components/AppShell.spec.ts`
 - Modify: `frontend/e2e/connections.spec.ts`
+- Modify（仅连接页语义选择器）: `frontend/e2e/action-workspace.spec.ts`、`frontend/e2e/m2-actions.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+执行口径核对：旧页面的“继续授权”是已验证URL链接，管理员同意是说明文字和原重新授权入口，不能为迁移增加管理员权限动作。保持这些控件和原文；测试定位只用角色、名称及自有 `data-testid`，跨页面用例的HTTP／审批／未知请求断言不变。原 `data-connection-id`／`data-capability` 可在迁移前补等价自有测试标识，先证明旧UI语义安全网。
 
-Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend test:e2e -- e2e/connections.spec.ts`
+确认焦点回归：PrimeVue 4.5.5 的 `hide` 在退出动画开始时触发，异步取消仍可能尚未解除触发按钮禁用。AppShell 在 `after-hide` 后移除背景 `inert` 并等待 DOM 更新，再向有效触发按钮归还焦点；按钮已禁用或移除时聚焦可程序化聚焦的主内容。保持退出期间背景隔离，不延时轮询、不改变断开请求逻辑。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
+
+Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend test:e2e e2e/connections.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
-覆盖：每个连接为 `Card`，能力为 `DataTable` 且列头有 `scope`；`ToggleSwitch` 有程序化 label 且切换中禁用；「启用」「继续授权」「重新授权」「管理员同意」保持独立按钮且只在服务端能力状态允许时可用；能力降级用 `Message warn`；仅保留既有去设置入口（默认账户/日历 `Select` 属于 Task 9）；断开连接走 `ConfirmDialog` 且焦点返回。
+覆盖：每个连接为 `Card`，能力为 `DataTable` 且列头有 `scope`；`ToggleSwitch` 有程序化 label 且切换中禁用；保留独立启用／重新授权按钮、继续授权链接及管理员同意说明，操作可用性沿用服务端状态；能力降级用 `Message warn`；仅保留既有去设置入口（默认账户/日历 `Select` 属于 Task 9）；断开连接走 `ConfirmDialog` 且焦点返回。
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建**
+- [x] **Step 3: 重建**
 
 `useConnectionCatalog` 不动；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/connections.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/ConnectionsPage.spec.ts src/components/AppShell.spec.ts src/features/connections/useConnections.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/connections.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts e2e/reconnect.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/pages/ConnectionsPage.vue frontend/src/pages/ConnectionsPage.spec.ts frontend/src/components/CapabilityRows.vue frontend/e2e/connections.spec.ts
+git add frontend/src/pages/ConnectionsPage.vue frontend/src/pages/ConnectionsPage.spec.ts frontend/src/components/CapabilityRows.vue frontend/src/components/AppShell.vue frontend/src/components/AppShell.spec.ts frontend/e2e/connections.spec.ts frontend/e2e/action-workspace.spec.ts frontend/e2e/m2-actions.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate connections page to PrimeVue"
 ~~~
 
@@ -604,7 +616,7 @@ git commit -m "feat: migrate settings to PrimeVue forms"
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts && pnpm --dir frontend test:e2e -- e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts && pnpm --dir frontend test:e2e e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
@@ -622,7 +634,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts src/stores/actions.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts src/stores/actions.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
@@ -645,7 +657,7 @@ git commit -m "feat: migrate action center to PrimeVue"
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/MailDraftPage.spec.ts && pnpm --dir frontend test:e2e -- e2e/mail-editor.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/MailDraftPage.spec.ts && pnpm --dir frontend test:e2e e2e/mail-editor.spec.ts`
 
 Expected: PASS。
 
@@ -663,7 +675,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/features/mail src/pages/MailDraftPage.spec.ts src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/mail-editor.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/features/mail src/pages/MailDraftPage.spec.ts src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/mail-editor.spec.ts`
 
 Expected: PASS。
 
@@ -686,7 +698,7 @@ git commit -m "feat: migrate mail editor to PrimeVue forms"
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/CalendarProposalPage.spec.ts && pnpm --dir frontend test:e2e -- e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/CalendarProposalPage.spec.ts && pnpm --dir frontend test:e2e e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
 
 Expected: PASS。
 
@@ -704,7 +716,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/features/calendar src/pages/CalendarProposalPage.spec.ts src/api/calendarEditors.spec.ts src/api/calendarRestore.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/features/calendar src/pages/CalendarProposalPage.spec.ts src/api/calendarEditors.spec.ts src/api/calendarRestore.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
 
 Expected: PASS。
 
@@ -726,7 +738,7 @@ git commit -m "feat: migrate calendar editor to PrimeVue forms"
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts && pnpm --dir frontend test:e2e -- e2e/calendar-reprepare.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts && pnpm --dir frontend test:e2e e2e/calendar-reprepare.spec.ts`
 
 Expected: PASS。
 
@@ -742,7 +754,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts src/api/calendarReprepare.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/calendar-reprepare.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts src/api/calendarReprepare.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/calendar-reprepare.spec.ts`
 
 Expected: PASS。
 
@@ -766,7 +778,7 @@ git commit -m "feat: migrate calendar reprepare to PrimeVue"
 
 - [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
-Run: `pnpm --dir frontend test:unit --run src/components/ApprovalCard.spec.ts && pnpm --dir frontend test:e2e -- e2e/provider-errors.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/components/ApprovalCard.spec.ts && pnpm --dir frontend test:e2e e2e/provider-errors.spec.ts`
 
 Expected: PASS。
 
@@ -784,7 +796,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/provider-errors.spec.ts e2e/m2-actions.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/provider-errors.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
@@ -820,7 +832,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e -- e2e/m2-actions.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 

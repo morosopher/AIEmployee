@@ -1,5 +1,5 @@
 import { useConfirm } from 'primevue/useconfirm'
-import { defineComponent, h, nextTick } from 'vue'
+import { defineComponent, h, nextTick, ref } from 'vue'
 import { useTasksStore } from '@/stores/tasks'
 import { fireEvent, waitFor, within } from '@testing-library/vue'
 import {
@@ -213,6 +213,45 @@ it('isolates the background and restores focus for the global confirmation outle
   expect(trigger.closest('[inert]')).toBeNull()
   await waitFor(() => expect(trigger).toHaveFocus())
 })
+
+/** 确认完成后触发器可能已禁用或移除，焦点应回到仍可访问的主内容。 */
+it.each(['disabled', 'removed'] as const)(
+  'returns confirmation focus to main content when the accepted trigger is %s',
+  async (mode) => {
+    const ConfirmationTrigger = defineComponent({
+      setup() {
+        const confirm = useConfirm()
+        const accepted = ref(false)
+        return () =>
+          accepted.value && mode === 'removed'
+            ? h('p', '操作已完成')
+            : h('button', {
+                type: 'button',
+                disabled: accepted.value,
+                onClick: () => confirm.require({
+                  header: '测试确认',
+                  message: '合成确认内容',
+                  acceptProps: { label: '确认' },
+                  accept: () => { accepted.value = true },
+                }),
+              }, '测试操作')
+      },
+    })
+    const view = await renderWithPlugins(AppShell, {
+      global: { stubs: { RouterView: ConfirmationTrigger } },
+    })
+    const trigger = view.getByRole('button', { name: '测试操作' })
+    trigger.focus()
+    await fireEvent.click(trigger)
+    const dialog = await view.findByRole('alertdialog', { name: '测试确认' })
+    await fireEvent.click(within(dialog).getByRole('button', { name: '确认' }))
+    await waitFor(() => {
+      expect(view.queryByRole('alertdialog')).not.toBeInTheDocument()
+    })
+    await waitFor(() => { expect(view.getByRole('main')).toHaveFocus() })
+    expect(view.getByRole('main').closest('[inert]')).toBeNull()
+  },
+)
 
 /** Toast 使用 Portal，不能只把页面根节点设为 inert 而遗漏外部关闭按钮。 */
 it('also isolates the recovery toast while a modal drawer is open', async () => {
