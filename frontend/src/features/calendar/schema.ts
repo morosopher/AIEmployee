@@ -2,7 +2,8 @@
 import { z } from 'zod'
 import { zodResolver } from '@primevue/forms/resolvers/zod'
 import { recipientList } from '@/features/actions/editorInput'
-import { wallToInstant } from './time'
+import { instantToWall, wallToInstant } from './time'
+import type { CalendarProposal } from '@/api/types'
 
 /** @returns Intl 可识别的显式 IANA 标识；不读取宿主默认区、不接受 offset 代替时区。 */
 function validTimezone(value: string): boolean {
@@ -36,55 +37,94 @@ function validDate(value: string): boolean {
     date.getUTCDate() === day
   )
 }
-/** 原字符串不 trim/transform 回写；全天采用排他结束日期，定时沿用既有唯一 IANA 时刻解析。 */
-export const calendarSchema = z
-  .object({
-    title: z
-      .string()
-      .refine((value) => value.trim().length > 0, '请填写日程标题。'),
-    starts_at: z.string(),
-    ends_at: z.string(),
-    all_day: z.boolean(),
-    timezone: z.string().refine(validTimezone, '请输入有效的 IANA 时区。'),
-    attendees: z.string().superRefine((value, context) => {
-      try {
-        recipientList(value)
-      } catch {
+/** 已采纳服务端快照的最小只读时间上下文；不包含版本更新、错误或请求能力。 */
+export type CalendarTimeSnapshot = Readonly<
+  Pick<CalendarProposal, 'starts_at' | 'ends_at' | 'timezone' | 'all_day'>
+>
+
+/**
+ * @param snapshot 原 hook 已采纳的权威时间；缺省表示全新输入，没有原 offset 豁免。
+ * @returns 不改写输入的格式 schema。每个未改字段沿用精确原时刻；新输入仍使用唯一 IANA 解析。
+ */
+export function calendarSchemaFor(snapshot?: CalendarTimeSnapshot) {
+  // 只复制不可变标量，避免后续原对象更新悄悄改变当前 Form 的校验基线。
+  const saved = snapshot
+    ? {
+        starts_at: snapshot.starts_at,
+        ends_at: snapshot.ends_at,
+        timezone: snapshot.timezone,
+        all_day: snapshot.all_day,
+      }
+    : undefined
+  return z
+    .object({
+      title: z
+        .string()
+        .refine((value) => value.trim().length > 0, '请填写日程标题。'),
+      starts_at: z.string(),
+      ends_at: z.string(),
+      all_day: z.boolean(),
+      timezone: z.string().refine(validTimezone, '请输入有效的 IANA 时区。'),
+      attendees: z.string().superRefine((value, context) => {
+        try {
+          recipientList(value)
+        } catch {
+          context.addIssue({
+            code: 'custom',
+            message: '请填写有效的参会人邮箱地址，多个地址用逗号分隔。',
+          })
+        }
+      }),
+    })
+    .superRefine((value, context) => {
+      if (!validTimezone(value.timezone)) return
+      const parsed: Partial<Record<'starts_at' | 'ends_at', number>> = {}
+      for (const key of ['starts_at', 'ends_at'] as const) {
+        try {
+          if (value.all_day) {
+            if (!validDate(value[key]))
+              throw new Error('请填写有效的全天日期。')
+            parsed[key] = Date.parse(`${value[key]}T00:00:00Z`)
+          } else {
+            const original = saved?.[key]
+            const unchanged =
+              original &&
+              value.timezone === (saved.timezone ?? 'UTC') &&
+              value.all_day === (saved.all_day ?? false) &&
+              value[key] === instantToWall(original, value.timezone)
+            // 与只读 hook 的 temporal 边界一致：明确 offset 已经消除歧义，不能再次猜测未改墙上时间。
+            parsed[key] = Date.parse(
+              unchanged ? original : wallToInstant(value[key], value.timezone),
+            )
+            if (!Number.isFinite(parsed[key]))
+              throw new Error('请填写有效的日期和时间。')
+          }
+        } catch (cause) {
+          context.addIssue({
+            code: 'custom',
+            path: [key],
+            message:
+              cause instanceof Error
+                ? cause.message
+                : '请填写有效的日期和时间。',
+          })
+        }
+      }
+      if (
+        parsed.starts_at !== undefined &&
+        parsed.ends_at !== undefined &&
+        parsed.ends_at <= parsed.starts_at
+      )
         context.addIssue({
           code: 'custom',
-          message: '请填写有效的参会人邮箱地址，多个地址用逗号分隔。',
+          path: ['ends_at'],
+          message: '结束时间必须晚于开始时间；全天结束日期不包含当天。',
         })
-      }
-    }),
-  })
-  .superRefine((value, context) => {
-    if (!validTimezone(value.timezone)) return
-    const parsed: Partial<Record<'starts_at' | 'ends_at', string>> = {}
-    for (const key of ['starts_at', 'ends_at'] as const) {
-      try {
-        if (value.all_day) {
-          if (!validDate(value[key])) throw new Error('请填写有效的全天日期。')
-          parsed[key] = value[key]
-        } else parsed[key] = wallToInstant(value[key], value.timezone)
-      } catch (cause) {
-        context.addIssue({
-          code: 'custom',
-          path: [key],
-          message:
-            cause instanceof Error ? cause.message : '请填写有效的日期和时间。',
-        })
-      }
-    }
-    if (
-      parsed.starts_at &&
-      parsed.ends_at &&
-      parsed.ends_at <= parsed.starts_at
-    )
-      context.addIssue({
-        code: 'custom',
-        path: ['ends_at'],
-        message: '结束时间必须晚于开始时间；全天结束日期不包含当天。',
-      })
-  })
-/** 真实 Form 使用同一格式 resolver；保存后续请求和错误仍归原 hook。 */
-export const calendarResolver = zodResolver(calendarSchema)
+    })
+}
+/** 无已保存上下文的独立格式入口，保留新输入的严格 DST 与先后校验。 */
+export const calendarSchema = calendarSchemaFor()
+/** @param snapshot 当前已采纳快照；只为 Form 提供格式上下文，保存与原精度回写仍归原 hook。 */
+export function calendarResolverFor(snapshot: CalendarTimeSnapshot) {
+  return zodResolver(calendarSchemaFor(snapshot))
+}

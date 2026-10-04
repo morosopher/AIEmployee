@@ -238,6 +238,7 @@ PrimeVue 商业产品线禁令保持不变。
 | `components/EditorConnectionSelect.vue` | `Select` | 选项展示供应商与能力状态 |
 | `components/EditorRecovery.vue` | `Message`、`Button` | 版本冲突与刷新恢复文案不变 |
 | `pages/CalendarProposalPage.vue`、`components/CalendarProposalFields.vue`、`components/CalendarTargetFields.vue` | `Form`、`DatePicker`、`Select`、`Chip`、`Message` | 全天日期与定时墙上时间分支保留，只有定时分支用 showTime；时区明示，不做自动推断 |
+| `components/CalendarWallTimeFields.vue` | `InputText`、`Button` | 日程 DatePicker 定时 footer 的小时／分钟／秒直接编辑墙上字符串，替换会按宿主 DST 归一的原生 clock 子视图 |
 | `components/CalendarConflictNotice.vue` | `Message warn`、`Button` | 最多三个候选时间以按钮列表呈现 |
 | `components/CalendarRepreparePanel.vue`、`components/CalendarFieldsComparison.vue` | `Panel`、`DataTable`（字段对比） | 前后差异逐字段高亮 |
 | `components/MissingCalendarConnections.vue` | `Message info`、`Button link` | 无 |
@@ -267,6 +268,16 @@ PrimeVue 商业产品线禁令保持不变。
   与用户显式输入的合法 IANA 时区；有限 fallback 不得误拒已有值。不新增服务端列表接口，
   不从宿主机推断用户时区。日程保留全天日期及定时墙上时间转换、既有 `time.ts` 与 DST
   歧义拒绝，不直接用 `Date.toISOString()` 把本地选值解释为宿主机时区。
+- DatePicker 保留定时 `showTime` 模式、日期弹层及原组合输入；原生 clock 子视图通过公开 PT
+  隐藏且退出焦点／无障碍树，公开 footer 的 `CalendarWallTimeFields` 用 InputText/Buttons
+  直接编辑墙上时分秒。日期 Date 仅作中午的日历显示载体，日格点击／键盘选值读取公开
+  `context.date` 并保留原时间后缀，不让宿主 DST 归一后的 Date 回流业务输入。
+  无效、未完整数字即时保留并由 schema 拒绝；全天切回定时不自动填小时。
+  footer 保留原时钟的正反 Tab 循环与 Esc 返回输入；非模态声明不取消已有键盘循环。
+- 日程格式 resolver 可读取原 hook 已采纳快照的最小只读时间上下文：每个墙上时间、时区
+  及全天类型均未变化的字段保留其原明确 offset／秒内精度，按真实时刻判断先后；修改时间
+  或时区后仍必须拒绝 DST 歧义。这只是展示校验与库兼容定制，不修改既有 hook/time.ts
+  或宣称修复 PrimeVue 库本身。
 - 默认发送账户、默认日历账户及默认日历的 `Select` 属于 Task 9 设置页；Task 8 连接页
   只保留既有前往设置入口，不复制默认值写操作。
 - 提交按钮在请求进行中 `loading`，请求完成前禁止重复提交；409 冲突显示

@@ -7,6 +7,7 @@ import ConfirmDialog from 'primevue/confirmdialog'
 import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import CalendarProposalPage from './CalendarProposalPage.vue'
 import CalendarConflictNotice from '@/components/CalendarConflictNotice.vue'
+import CalendarDateTimeInput from '@/components/CalendarDateTimeInput.vue'
 import CalendarApprovalPreview from '@/components/CalendarApprovalPreview.vue'
 import * as calendar from '@/api/calendar'
 import * as connections from '@/api/connections'
@@ -403,6 +404,212 @@ describe('calendar presentation migration', () => {
     expect(view.getByLabelText('开始时间')).toHaveFocus()
     expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
   })
+  it.each([
+    {
+      name: 'title only',
+      start: '2030-11-03T01:30:42.123456-04:00',
+      end: '2030-11-03T02:30:21.654321-05:00',
+      editedEnd: null,
+    },
+    {
+      name: 'only the other endpoint',
+      start: '2030-11-03T01:30:42.123456-04:00',
+      end: '2030-11-03T02:30:21.654321-05:00',
+      editedEnd: '2030-11-03T03:30',
+    },
+    {
+      name: 'wall end earlier but instant later',
+      start: '2030-11-03T01:50:42.123456-04:00',
+      end: '2030-11-03T01:10:21.654321-05:00',
+      editedEnd: null,
+    },
+  ])(
+    'keeps the saved offset for $name without reinterpreting the unchanged fold time',
+    async ({ start, end, editedEnd }) => {
+      current = {
+        ...current,
+        timezone: 'America/New_York',
+        starts_at: start,
+        ends_at: end,
+      }
+      const view = await page()
+      if (editedEnd)
+        await fireEvent.update(view.getByLabelText('结束时间'), editedEnd)
+      else
+        await fireEvent.update(
+          view.getByLabelText('日程标题'),
+          'Synthetic saved offset',
+        )
+      await fireEvent.click(view.getByRole('button', { name: '保存提案' }))
+      await waitFor(() =>
+        expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
+          PROPOSAL_ID,
+          expect.objectContaining({
+            starts_at: start,
+            ends_at: editedEnd ? '2030-11-03T08:30:00.000Z' : end,
+            timezone: 'America/New_York',
+          }),
+        ),
+      )
+      expect(view.queryByText(/夏令时跳跃或重复/)).toBeNull()
+    },
+  )
+  it.each(['time', 'timezone'])(
+    'does not apply the saved offset exemption to newly edited %s',
+    async (field) => {
+      current = {
+        ...current,
+        timezone: 'America/New_York',
+        starts_at: '2030-11-03T01:30:00-04:00',
+        ends_at: '2030-11-03T02:30:00-05:00',
+      }
+      const view = await page()
+      await fireEvent.update(
+        view.getByLabelText(field === 'time' ? '开始时间' : 'IANA 时区'),
+        field === 'time' ? '2030-11-03T01:40' : 'US/Eastern',
+      )
+      await fireEvent.click(view.getByRole('button', { name: '保存提案' }))
+      await view.findByText(/夏令时跳跃或重复/)
+      expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+  it.each(['date click', 'date keyboard', 'hour increment', 'hour decrement'])(
+    'keeps wall digits across host DST for %s and sends the exact UTC command',
+    async (operation) => {
+      const dayOperation = operation.startsWith('date')
+      current = {
+        ...current,
+        timezone: 'UTC',
+        starts_at: dayOperation
+          ? '2030-03-09T02:30:00Z'
+          : operation === 'hour increment'
+            ? '2030-03-10T01:30:00Z'
+            : '2030-03-10T03:30:00Z',
+        ends_at: '2030-03-10T04:00:00Z',
+      }
+      const view = await page()
+      await fireEvent.click(view.getByRole('button', { name: '选择开始时间' }))
+      const dialog = await view.findByRole('dialog')
+      if (operation === 'date click')
+        await fireEvent.click(
+          within(dialog).getByRole('button', { name: '2030-03-10' }),
+        )
+      else if (operation === 'date keyboard') {
+        const day = within(dialog).getByRole('button', { name: '2030-03-09' })
+        day.focus()
+        await fireEvent.keyDown(day, { key: 'ArrowRight', code: 'ArrowRight' })
+        await fireEvent.keyDown(document.activeElement ?? day, {
+          key: 'Enter',
+          code: 'Enter',
+        })
+      } else {
+        const button = within(dialog).getByRole('button', {
+          name: operation === 'hour increment' ? '下一小时' : '上一小时',
+        })
+        await fireEvent.mouseDown(button)
+        await fireEvent.mouseUp(button)
+        await fireEvent.click(button)
+      }
+      await waitFor(() =>
+        expect(view.getByLabelText('开始时间')).toHaveValue('2030-03-10T02:30'),
+      )
+      await fireEvent.keyDown(view.getByLabelText('开始时间'), {
+        key: 'Escape',
+        code: 'Escape',
+      })
+      await fireEvent.click(view.getByRole('button', { name: '保存提案' }))
+      await waitFor(() =>
+        expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
+          PROPOSAL_ID,
+          expect.objectContaining({
+            starts_at: '2030-03-10T02:30:00.000Z',
+            ends_at: '2030-03-10T04:00:00Z',
+            timezone: 'UTC',
+          }),
+        ),
+      )
+    },
+  )
+  it.each([
+    {
+      start: '2030-03-09T02:30:00-05:00',
+      end: '2030-03-10T04:00:00-04:00',
+      day: '2030-03-10',
+      wall: '2030-03-10T02:30',
+    },
+    {
+      start: '2030-11-02T01:30:00-04:00',
+      end: '2030-11-03T04:00:00-05:00',
+      day: '2030-11-03',
+      wall: '2030-11-03T01:30',
+    },
+  ])(
+    'refuses actual target DST when the new calendar date is $day',
+    async ({ start, end, day, wall }) => {
+      current = {
+        ...current,
+        timezone: 'America/New_York',
+        starts_at: start,
+        ends_at: end,
+      }
+      const view = await page()
+      await fireEvent.click(view.getByRole('button', { name: '选择开始时间' }))
+      const dialog = await view.findByRole('dialog')
+      await fireEvent.click(within(dialog).getByRole('button', { name: day }))
+      await waitFor(() =>
+        expect(view.getByLabelText('开始时间')).toHaveValue(wall),
+      )
+      await fireEvent.keyDown(view.getByLabelText('开始时间'), {
+        key: 'Escape',
+        code: 'Escape',
+      })
+      await fireEvent.click(view.getByRole('button', { name: '保存提案' }))
+      await view.findByText(/夏令时跳跃或重复/)
+      expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+  it.each(['click', 'Enter'])(
+    'does not let an old date node %s overwrite a replacement input with the same public id',
+    async (operation) => {
+      const first = ref(true)
+      const oldValue = ref('2030-01-01T09:00')
+      const newValue = ref('2031-02-01T11:00')
+      const view = await renderWithPlugins(
+        defineComponent({
+          render() {
+            const value = first.value ? oldValue : newValue
+            return h(CalendarDateTimeInput, {
+              key: first.value ? 'old' : 'new',
+              inputId: 'reused-calendar-time',
+              label: '开始时间',
+              modelValue: value.value,
+              allDay: false,
+              disabled: false,
+              'onUpdate:modelValue': (next: string) => {
+                value.value = next
+              },
+            })
+          },
+        }),
+      )
+      await fireEvent.click(view.getByRole('button', { name: '选择开始时间' }))
+      const oldDay = within(await view.findByRole('dialog')).getByRole(
+        'button',
+        { name: '2030-01-02' },
+      )
+      first.value = false
+      await waitFor(() =>
+        expect(view.getByLabelText('开始时间')).toHaveValue('2031-02-01T11:00'),
+      )
+      // 原离场 portal 的节点可仍被事件队列持有；不能通过全局同 ID 找到新实例并写旧值。
+      if (operation === 'click') await fireEvent.click(oldDay)
+      else await fireEvent.keyDown(oldDay, { key: 'Enter', code: 'Enter' })
+      await waitFor(() =>
+        expect(view.getByLabelText('开始时间')).toHaveValue('2031-02-01T11:00'),
+      )
+      expect(newValue.value).toBe('2031-02-01T11:00')
+    },
+  )
   it('preserves 409 user input and maps a real error code inside the sole recovery alert', async () => {
     vi.mocked(calendar.updateCalendarProposal).mockRejectedValue(
       new ProblemError({

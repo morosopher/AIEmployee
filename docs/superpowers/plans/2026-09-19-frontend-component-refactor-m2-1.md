@@ -724,6 +724,8 @@ git commit -m "feat: migrate mail editor to PrimeVue forms"
 ### Task 12: 迁移日程编辑器
 
 **Files:**
+- Create（Task12 审查修复）：`frontend/src/components/CalendarWallTimeFields.vue`、`frontend/src/components/CalendarWallTimeFields.spec.ts`（公开 footer 中的墙上时分秒校验／按钮交互）；规格 §6／7 已同步限定替代原生 clock，保留 showTime 日期弹层。
+
 - Create: `frontend/src/components/CalendarEditorForm.vue`（异步 Form/zod 展示边界）、`frontend/src/components/CalendarDateTimeInput.vue`（日期／墙上时间控件适配）、`frontend/src/pages/CalendarPresentation.spec.ts`（真实展示交互与格式验证）
 - Modify: `frontend/src/pages/CalendarRepreparePage.spec.ts`（仅共享输入选择器兼容）
 - Modify: `frontend/src/components/CalendarApprovalPreview.vue`（仅向冲突展示传冻结 `after.timezone`，不改 Task 14 其余展示）；冲突保留完整原 ISO，另附显式 IANA 可读范围。

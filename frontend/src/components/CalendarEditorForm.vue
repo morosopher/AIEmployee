@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, shallowRef, watch } from 'vue'
 import Form, {
   type FormInstance,
   type FormSubmitEvent,
@@ -11,7 +11,7 @@ import type { CalendarProposal } from '@/api/types'
 import type { ConnectionCatalogEntry } from '@/composables/useConnectionCatalog'
 import type { CalendarEditorForm } from '@/features/calendar/useCalendarProposalEditor'
 import type { ActionRecovery } from '@/features/actions/recovery'
-import { calendarResolver } from '@/features/calendar/schema'
+import { calendarResolverFor } from '@/features/calendar/schema'
 import { problemToFormError } from '@/features/forms/problemFields'
 import CalendarProposalFields from './CalendarProposalFields.vue'
 import CalendarTargetFields from './CalendarTargetFields.vue'
@@ -45,6 +45,8 @@ const emit = defineEmits<{
 const formApi = ref<FormInstance | null>(null)
 const initialValues = ref({ ...props.modelValue })
 const formKey = ref(0)
+/** resolver 与权威快照绑定；局部输入变化和409不会建立新的已保存时间豁免。 */
+const resolver = shallowRef(calendarResolverFor(props.proposal))
 const saving = ref(false)
 const mappedError = computed(() =>
   props.error?.problem ? problemToFormError(props.error.problem) : null,
@@ -62,6 +64,7 @@ watch(
   () => props.proposal,
   () => {
     initialValues.value = { ...props.modelValue }
+    resolver.value = calendarResolverFor(props.proposal)
     formKey.value += 1
   },
 )
@@ -92,7 +95,7 @@ function saveForm(event: FormSubmitEvent): void {
     ref="formApi"
     v-slot="$form"
     :initial-values="initialValues"
-    :resolver="calendarResolver"
+    :resolver="resolver"
     :validate-on-value-update="false"
     :validate-on-blur="false"
     aria-label="日程提案表单"

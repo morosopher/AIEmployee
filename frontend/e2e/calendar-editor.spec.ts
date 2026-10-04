@@ -745,6 +745,11 @@ test('calendar date picker keeps keyboard selection, manual editing and Escape f
   await page.getByRole('button', { name: '选择开始时间' }).click()
   const dialog = page.getByRole('dialog')
   await expect(dialog).toHaveAttribute('aria-modal', 'false')
+  await dialog.getByRole('button', { name: '上一秒', exact: true }).focus()
+  await page.keyboard.press('Tab')
+  await expect(dialog.getByRole('button', { name: '上个月', exact: true })).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
+  await expect(dialog.getByRole('button', { name: '上一秒', exact: true })).toBeFocused()
   const current = dialog.getByRole('button', {
     name: '2030-01-01',
     exact: true,
@@ -772,3 +777,263 @@ test('calendar date picker keeps keyboard selection, manual editing and Escape f
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })
+
+/** 已保存的 offset 本来就是明确时刻；只有新编辑的端点需要重新解析 IANA 墙上时间。 */
+for (const scenario of ['title', 'other-end', 'wall-order'] as const) {
+  test(`calendar preserves saved fold offsets for ${scenario}`, async ({
+    page,
+  }) => {
+    const capture = await editorWorkspace(page)
+    const starts =
+      scenario === 'wall-order'
+        ? '2030-11-03T01:50:42.123456-04:00'
+        : '2030-11-03T01:30:42.123456-04:00'
+    const ends =
+      scenario === 'wall-order'
+        ? '2030-11-03T01:10:21.654321-05:00'
+        : '2030-11-03T02:30:21.654321-05:00'
+    let proposal: CalendarProposal = {
+      ...calendarProposal(),
+      ...calendarFields(),
+      calendar_id: 'synthetic-google-calendar',
+      notification_policy: 'none',
+      timezone: 'America/New_York',
+      starts_at: starts,
+      ends_at: ends,
+      editor_facts: {
+        reprepare_source: null,
+        restore_source: null,
+        before_status: 'not_applicable',
+        before: null,
+        conflict_status: 'checked',
+        conflicts: [],
+      },
+    }
+    await page.route(
+      `**/api/v1/calendar/proposals/${PROPOSAL_ID}`,
+      async (route) => {
+        if (route.request().method() === 'PATCH') {
+          const input = route
+            .request()
+            .postDataJSON() as UpdateCalendarProposalInput
+          proposal = {
+            ...proposal,
+            ...input,
+            attendees:
+              ('attendees' in input ? input.attendees : null) ??
+              proposal.attendees,
+            version: proposal.version + 1,
+          }
+          await editorJson(route, { ...proposal, editor_facts: null })
+        } else await editorJson(route, proposal)
+      },
+    )
+    await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+    if (scenario === 'other-end')
+      await page
+        .getByLabel('结束时间', { exact: true })
+        .fill('2030-11-03T03:30')
+    else
+      await page
+        .getByLabel('日程标题', { exact: true })
+        .fill('Synthetic fold title')
+    await page.getByRole('button', { name: '保存提案', exact: true }).click()
+    await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+    expect(capture.mutations).toHaveLength(1)
+    expect(capture.mutations[0]?.payload).toMatchObject({
+      version: 1,
+      starts_at: starts,
+      ends_at: scenario === 'other-end' ? '2030-11-03T08:30:00.000Z' : ends,
+      timezone: 'America/New_York',
+    })
+    await page.getByLabel('开始时间', { exact: true }).fill('2030-11-03T01:40')
+    await page.getByRole('button', { name: '保存提案', exact: true }).click()
+    await expect(page.getByText(/该时间处于夏令时跳跃或重复时段/)).toBeVisible()
+    expect(capture.mutations).toHaveLength(1)
+    expect(capture.unexpected).toEqual([])
+    expect(capture.pageErrors).toEqual([])
+  })
+}
+
+/** DatePicker 日格与 clock 都必须操作墙上数字，不能把宿主 DST 归一后的 Date 写回提案。 */
+for (const hostTimezone of ['Asia/Shanghai', 'America/New_York']) {
+  test.describe(`calendar picker preserves wall digits in ${hostTimezone}`, () => {
+    test.use({ timezoneId: hostTimezone })
+    for (const operation of [
+      'date click',
+      'date Enter',
+      'date Space',
+      'hour increment',
+      'hour decrement',
+    ]) {
+      test(`${operation} keeps a legal UTC gap hour and exact PATCH`, async ({
+        page,
+      }) => {
+        const capture = await editorWorkspace(page)
+        const dateOperation = operation.startsWith('date')
+        let proposal: CalendarProposal = {
+          ...calendarProposal(),
+          ...calendarFields(),
+          calendar_id: 'synthetic-google-calendar',
+          notification_policy: 'none',
+          timezone: 'UTC',
+          starts_at: dateOperation
+            ? '2030-03-09T02:30:00Z'
+            : operation === 'hour increment'
+              ? '2030-03-10T01:30:00Z'
+              : '2030-03-10T03:30:00Z',
+          ends_at: '2030-03-10T04:00:00Z',
+          editor_facts: {
+            reprepare_source: null,
+            restore_source: null,
+            before_status: 'not_applicable',
+            before: null,
+            conflict_status: 'checked',
+            conflicts: [],
+          },
+        }
+        await page.route(
+          `**/api/v1/calendar/proposals/${PROPOSAL_ID}`,
+          async (route) => {
+            if (route.request().method() === 'PATCH') {
+              const input = route
+                .request()
+                .postDataJSON() as UpdateCalendarProposalInput
+              proposal = {
+                ...proposal,
+                ...input,
+                attendees:
+                  ('attendees' in input ? input.attendees : null) ??
+                  proposal.attendees,
+                version: proposal.version + 1,
+              }
+              await editorJson(route, { ...proposal, editor_facts: null })
+            } else await editorJson(route, proposal)
+          },
+        )
+        await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+        await page.getByRole('button', { name: '选择开始时间' }).click()
+        const dialog = page.getByRole('dialog')
+        await expect(
+          dialog.getByRole('button', { name: '下一小时', exact: true }),
+        ).toHaveCount(1)
+        await dialog.getByRole('button', { name: dateOperation ? '2030-03-09' : '2030-03-10', exact: true }).focus()
+        await page.keyboard.press('Tab')
+        await expect(dialog.getByRole('button', { name: '下一小时', exact: true })).toBeFocused()
+        if (operation === 'date click')
+          await dialog
+            .getByRole('button', { name: '2030-03-10', exact: true })
+            .click()
+        else if (dateOperation) {
+          await dialog
+            .getByRole('button', { name: '2030-03-09', exact: true })
+            .focus()
+          await page.keyboard.press('ArrowRight')
+          await page.keyboard.press(
+            operation === 'date Enter' ? 'Enter' : 'Space',
+          )
+        } else
+          await dialog
+            .getByRole('button', {
+              name: operation === 'hour increment' ? '下一小时' : '上一小时',
+              exact: true,
+            })
+            .click()
+        await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+          '2030-03-10T02:30',
+        )
+        await expect(
+          dialog.getByLabel('开始时间小时', { exact: true }),
+        ).toHaveValue('02')
+        await dialog.getByLabel('开始时间小时', { exact: true }).focus()
+        await page.keyboard.press('Escape')
+        await expect(dialog).toHaveCount(0)
+        await expect(page.getByLabel('开始时间', { exact: true })).toBeFocused()
+        await page
+          .getByRole('button', { name: '保存提案', exact: true })
+          .click()
+        await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+        expect(capture.mutations).toHaveLength(1)
+        expect(capture.mutations[0]?.payload).toMatchObject({
+          version: 1,
+          starts_at: '2030-03-10T02:30:00.000Z',
+          ends_at: '2030-03-10T04:00:00Z',
+          timezone: 'UTC',
+        })
+        await page.getByRole('button', { name: '选择开始时间' }).click()
+        await dialog.getByLabel('开始时间小时', { exact: true }).fill('1.5')
+        await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+          '2030-03-10T1.5:30',
+        )
+        await page.keyboard.press('Escape')
+        await page
+          .getByRole('button', { name: '保存提案', exact: true })
+          .click()
+        await expect(page.getByText('请填写完整的日期和时间。')).toBeVisible()
+        expect(capture.mutations).toHaveLength(1)
+        expect(capture.unexpected).toEqual([])
+        expect(capture.pageErrors).toEqual([])
+      })
+    }
+    for (const [start, end, day, wall] of [
+      [
+        '2030-03-09T02:30:00-05:00',
+        '2030-03-10T04:00:00-04:00',
+        '2030-03-10',
+        '2030-03-10T02:30',
+      ],
+      [
+        '2030-11-02T01:30:00-04:00',
+        '2030-11-03T04:00:00-05:00',
+        '2030-11-03',
+        '2030-11-03T01:30',
+      ],
+    ] as const) {
+      test(`new target DST time ${day} still rejects without PATCH`, async ({
+        page,
+      }) => {
+        const capture = await editorWorkspace(page)
+        await page.route(
+          `**/api/v1/calendar/proposals/${PROPOSAL_ID}`,
+          (route) =>
+            editorJson(route, {
+              ...calendarProposal(),
+              ...calendarFields(),
+              calendar_id: 'synthetic-google-calendar',
+              notification_policy: 'none',
+              timezone: 'America/New_York',
+              starts_at: start,
+              ends_at: end,
+              editor_facts: {
+                reprepare_source: null,
+                restore_source: null,
+                before_status: 'not_applicable',
+                before: null,
+                conflict_status: 'checked',
+                conflicts: [],
+              },
+            }),
+        )
+        await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+        await page.getByRole('button', { name: '选择开始时间' }).click()
+        await page
+          .getByRole('dialog')
+          .getByRole('button', { name: day, exact: true })
+          .click()
+        await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+          wall,
+        )
+        await page.keyboard.press('Escape')
+        await page
+          .getByRole('button', { name: '保存提案', exact: true })
+          .click()
+        await expect(
+          page.getByText(/该时间处于夏令时跳跃或重复时段/),
+        ).toBeVisible()
+        expect(capture.mutations).toEqual([])
+        expect(capture.unexpected).toEqual([])
+        expect(capture.pageErrors).toEqual([])
+      })
+    }
+  })
+}
