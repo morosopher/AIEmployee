@@ -51,7 +51,7 @@ grep -Fq 'scripts/run_integration_tests.py' <<<"${integration_definition}"
   <<<"${integration_definition}"
 
 # M2.1 前端门禁脚本必须随仓库以可执行位提交，并真正接入统一入口：check 执行许可证与
-# PrimeVue 主版本检查及样式字面量检查，ci 在生产构建后报告首屏体积。只核对 recipe 展开
+# PrimeVue 主版本检查及强制样式字面量检查，ci 在生产构建后强制检查首屏体积预算。只核对 recipe 展开
 # 内容，注释中的命令不算接线证据。
 for frontend_gate in check-frontend-licenses.sh check-frontend-styles.sh report-frontend-bundle.sh; do
   if [[ ! -f "scripts/${frontend_gate}" || ! -x "scripts/${frontend_gate}" ]]; then
@@ -60,7 +60,7 @@ for frontend_gate in check-frontend-licenses.sh check-frontend-styles.sh report-
   fi
 done
 check_definition="$(just --show check)"
-for check_gate in 'bash scripts/check-frontend-licenses.sh' 'bash scripts/check-frontend-styles.sh'; do
+for check_gate in 'bash scripts/check-frontend-licenses.sh' 'bash scripts/check-frontend-styles.sh --strict'; do
   if ! grep -Eq "^[[:space:]]+${check_gate}([[:space:]]|$)" <<<"${check_definition}"; then
     printf 'check recipe does not run: %s\n' "${check_gate}" >&2
     exit 1
@@ -68,8 +68,8 @@ for check_gate in 'bash scripts/check-frontend-licenses.sh' 'bash scripts/check-
 done
 ci_definition="$(just --show ci)"
 if ! grep -A1 -E '^[[:space:]]+pnpm --dir frontend build$' <<<"${ci_definition}" |
-  grep -Eq '^[[:space:]]+bash scripts/report-frontend-bundle\.sh([[:space:]]|$)'; then
-  printf 'ci recipe must report the frontend bundle right after the production build\n' >&2
+  grep -Eq '^[[:space:]]+bash scripts/report-frontend-bundle\.sh --budget$'; then
+  printf 'ci recipe must report the frontend bundle with --budget right after the production build\n' >&2
   exit 1
 fi
 
@@ -84,7 +84,7 @@ fi
     exit 1
   }
   mkdir -p "${gate_sandbox}/scripts" "${gate_sandbox}/frontend/src/components" "${gate_sandbox}/bin"
-  cp scripts/check-frontend-licenses.sh scripts/check-frontend-styles.sh "${gate_sandbox}/scripts/"
+  cp scripts/check-frontend-licenses.sh scripts/check-frontend-styles.sh scripts/report-frontend-bundle.sh "${gate_sandbox}/scripts/"
   cat >"${gate_sandbox}/bin/pnpm" <<'FAKE_PNPM'
 #!/usr/bin/env bash
 # 只模拟 `pnpm licenses list --prod|--dev --json`，按参数输出预先写好的合成清单。
@@ -179,6 +179,43 @@ APPROVED_BASELINE_FIXTURE
   ! grep -Fq '#8212' <<<"${styles_output}" || gate_fail 'styles gate flagged an HTML entity'
   ! bash "${gate_sandbox}/scripts/check-frontend-styles.sh" --strict >/dev/null 2>&1 ||
     gate_fail 'styles gate --strict accepted colour literals'
+  # 断点单独做反例，避免颜色失败遮蔽 @media 检测；纯实体必须保持零误报。
+  printf '%s\n' '<template><p>&#8212;</p></template><style>@media(min-width:1px){p{display:block}}</style>' >"${gate_sandbox}/frontend/src/components/Probe.vue"
+  ! bash "${gate_sandbox}/scripts/check-frontend-styles.sh" --strict >/dev/null 2>&1 ||
+    gate_fail 'styles gate --strict accepted @media'
+  printf '%s\n' '<template><p>&#8212;</p></template>' >"${gate_sandbox}/frontend/src/components/Probe.vue"
+  bash "${gate_sandbox}/scripts/check-frontend-styles.sh" --strict >/dev/null ||
+    gate_fail 'styles gate rejected a clean component'
+
+  # 合成构建产物使用固定伪随机字节，压缩后仍超过默认预算；不构建前端，也不改变真实 dist。
+  # 仅在测试子shell清除可选覆盖，反例必须验证脚本默认预算及本次私有dist，不能受调用环境影响。
+  unset FRONTEND_DIST_DIR FRONTEND_JS_BUDGET_KB FRONTEND_CSS_BUDGET_KB
+  mkdir -p "${gate_sandbox}/frontend/dist/assets"
+  node - "${gate_sandbox}/frontend/dist" <<'BUNDLE_FIXTURE'
+const fs = require('node:fs')
+const path = require('node:path')
+const root = process.argv[2]
+fs.writeFileSync(path.join(root, 'index.html'), '<script type="module" src="/assets/entry.js"></script><link rel="stylesheet" href="/assets/style.css">')
+let state = 123456789
+const bytes = Buffer.alloc(500000)
+for (let index = 0; index < bytes.length; index++) {
+  state ^= state << 13; state ^= state >>> 17; state ^= state << 5
+  bytes[index] = state & 255
+}
+fs.writeFileSync(path.join(root, 'assets/entry.js'), bytes)
+fs.writeFileSync(path.join(root, 'assets/style.css'), '')
+BUNDLE_FIXTURE
+  ! bash "${gate_sandbox}/scripts/report-frontend-bundle.sh" --budget >"${gate_sandbox}/bundle.log" 2>&1 ||
+    gate_fail 'bundle --budget accepted JS beyond the default increment budget'
+  grep -Fq 'exceeds 200 kB' "${gate_sandbox}/bundle.log" || gate_fail 'JS failure did not use the default 200 kB budget'
+  mv "${gate_sandbox}/frontend/dist/assets/entry.js" "${gate_sandbox}/frontend/dist/assets/style.css"
+  printf 'export {}' >"${gate_sandbox}/frontend/dist/assets/entry.js"
+  ! bash "${gate_sandbox}/scripts/report-frontend-bundle.sh" --budget >"${gate_sandbox}/bundle.log" 2>&1 ||
+    gate_fail 'bundle --budget accepted CSS beyond the default budget'
+  grep -Fq 'exceeds 60 kB' "${gate_sandbox}/bundle.log" || gate_fail 'CSS failure did not use the default 60 kB budget'
+  printf 'body{}' >"${gate_sandbox}/frontend/dist/assets/style.css"
+  bash "${gate_sandbox}/scripts/report-frontend-bundle.sh" --budget >/dev/null ||
+    gate_fail 'bundle --budget rejected a small local entry'
 )
 
 # 所有普通数据库生命周期入口必须路由 typed CLI；recipe 不得保留 shell Alembic、

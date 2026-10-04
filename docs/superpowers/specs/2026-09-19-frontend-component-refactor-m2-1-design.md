@@ -323,6 +323,10 @@ Task 16 无障碍前置修复仅将浅色 Button `outlined.secondary.color` 与
 
 `Toast` 是临时提示，不承载必须阅读的信息；任何需要用户决定的内容都使用内联 `Message`
 或 `Dialog`。迁移前先核对并冻结真实 live region 清单，逐项记录触发场景、语义及文案。
+基准 `4ce84ae` 的历史全源码词法清点为 status 43 / alert 32 / dialog 1；其中
+`WorkSettingsForm.vue:240` 与 `ConnectionsPage.vue:166` 是 CSS `[role='alert']`
+选择器，排除后模板声明实际为 43 / 30 / 1（74 处），另需核对无 role 的 aria-live 场景。
+两处非节点只记录排除原因，不建立替代 alert。
 现有 `status`、`alert`、`dialog` 语义和文案逐一保留；源码计数仅为清单辅助，不能替代运行时
 验收。组件抽取、PrimeVue 内置 role、新增导航或时间线抽屉引起的数量变化，必须逐项在
 同一提交记录原因，并用运行时测试证明没有漏报或重复播报。禁止添加空 role 凑数。

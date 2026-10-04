@@ -24,7 +24,7 @@
 - PrimeVue 相关包固定精确版本 `4.5.5`；出现 `primevue@5`、`@primeui/*`、`@primeuix/themes@3` 即视为违规。
 - 每个任务的提交只包含该任务列出的文件，提交信息使用任务末尾给定的文本。
 - Task 16 之前 `just check` 中的样式检查为警告模式；Task 16 之后转为失败模式。`check` 保持快速许可/版本/样式等检查；`ci` 在构建后生成体积报告并检查预算。Task 17 提交前及最终文档提交后均运行完整 `just ci`，读取并留档输出。
-- Task 2 迁移前核对并冻结真实 live region 清单（触发场景、语义、文案）。2026-10-01 的迁移前源码清点为 status 43 / alert 32 / dialog 1，基准提交为 `4ce84ae`，可从该提交的 `frontend/src/**/*.vue` 按单双引号 `role` 属性重新清点；本地执行产物 `.superpowers/sdd/2026-09-19-frontend-component-refactor-m2-1/live-region-baseline.json` 仅作辅助，不作为唯一事实来源。该计数不包含运行时组件内置 role。Task 2～15 逐项保留旧语义/文案，组件抽取、内置 role、新抽屉导致的数量变化在同一提交记录并补运行时测试；禁止空 role 凑数。Task 16 汇总清单及运行时证据。
+- Task 2 迁移前核对并冻结真实 live region 清单（触发场景、语义、文案）。2026-10-01 的迁移前全源码词法清点为 status 43 / alert 32 / dialog 1（含 WorkSettingsForm.vue:240、ConnectionsPage.vue:166 两处 CSS `[role='alert']` 选择器；模板声明实际为 status 43 / alert 30 / dialog 1，共 74 处），基准提交为 `4ce84ae`，可从该提交的 `frontend/src/**/*.vue` 按单双引号 `role` 属性重新清点；本地执行产物 `.superpowers/sdd/2026-09-19-frontend-component-refactor-m2-1/live-region-baseline.json` 仅作辅助，不作为唯一事实来源。该计数不包含运行时组件内置 role。Task 2～15 逐项保留旧语义/文案，组件抽取、内置 role、新抽屉导致的数量变化在同一提交记录并补运行时测试；禁止空 role 凑数。Task 16 汇总清单及运行时证据。
 - Forms + zod 仅用于工作设置、邮件与日程；登录聊天保留提交逻辑。时区沿用本地 Intl IANA + UTC，保留服务端当前值及显式合法 IANA，不新增列表接口或推断用户时区。
 - 页面相关 E2E 在旧实现和迁移后都必须运行；Task 6/7 补跑 daily-brief、action-workspace、reconnect，Task 9 补跑 settings。共享编辑器组件变更覆盖 calendar/actions/brief 消费者；因 DOM 调整需扩充 E2E 文件名单时先记录差异，业务断言不变。
 - 所有测试数据使用 `src/test-support/` 既有合成 fixture；不复制真实邮件、姓名或地址。
@@ -981,10 +981,20 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 - Create: `frontend/e2e/support/axe.ts`、`frontend/e2e/accessibility.spec.ts`、`frontend/e2e/layout.spec.ts`
 - Modify: `frontend/playwright.config.ts`、`justfiles/test.just`、`scripts/check-frontend-styles.sh`、`scripts/test-tooling.sh`
 - Create: `frontend/src/test-support/liveRegionInventory.spec.ts`
+- Create: `frontend/src/test-support/live-regions/inventory.ts`、`assertions.ts`、`coreScenarios.ts`、`editorScenarios.ts`、`workspaceScenarios.ts`（测试专用清单、唯一播报断言与真实组件场景）
+- Create: `frontend/e2e/support/visualWorkspace.ts`（复用既有 editorApi 与合成 fixture 的七视图装配）
 
 - [ ] **Step 1: 写失败的门禁与 E2E**
 
-`liveRegionInventory.spec.ts`：汇总 Task 2 前核对冻结的真实基线（源码 status 43 / alert 32 / dialog 1），逐项对照既有 `status`、`alert`、`dialog` 的触发场景、语义与文案；源码扫描只辅助清单，不能机械计数代替运行时验收。组件抽取、PrimeVue 内置 role、新抽屉造成的数量变化须有同提交的逐项原因与运行时测试，证明无漏报/重复播报；禁止空 role 凑数。样式断言沿用 Task 1 已落地的颜色检测（含八位颜色并排除 HTML 实体）及 `@media` 检查。
+`liveRegionInventory.spec.ts`：汇总 Task 2 前核对冻结的真实基线（历史全源码词法 status 43 / alert 32 / dialog 1；排除两处 CSS 选择器后模板为 43 / 30 / 1，共 74 处；另核对 aria-live 场景），逐项对照既有 `status`、`alert`、`dialog` 的触发场景、语义与文案；源码扫描只辅助清单，不能机械计数代替运行时验收。组件抽取、PrimeVue 内置 role、新抽屉造成的数量变化须有同提交的逐项原因与运行时测试，证明无漏报/重复播报；禁止空 role 凑数。样式断言沿用 Task 1 已落地的颜色检测（含八位颜色并排除 HTML 实体）及 `@media` 检查。
+
+逐项源码出处、原触发/文案片段、迁移提交、当前组件与数量变化原因保存在
+`frontend/src/test-support/live-regions/inventory.ts`；三个场景模块执行真实组件／表单／API边界，
+`assertions.ts` 核对唯一语义根、polite/assertive与非嵌套播报。新增公告与原74项分列，
+浏览器专属模块失败／页面确认项明确引用具体既有E2E，不把清单存在当作通过。需要留档时，
+在仓库根设置 `M21_LIVE_REGION_REPORT` 为已有目录下的绝对JSON路径并运行下述聚焦单测；
+只在全部运行时项通过后输出观察文字与实例数。Task16主报告关联本轮单测与完整E2E日志，
+截图等待字体与有限动画完成，记录实际产物路径和SHA-256；生成物不提交。
 
 `accessibility.spec.ts`：对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图运行 axe，`serious`/`critical` 为零。`layout.spec.ts`：在 375、900、1400 三个宽度截图并断言导航、时间线的呈现形式。`playwright.config.ts` 增加 `tablet` 与 `mobile` project，仅这两个新 spec 在三种 project 运行。
 
