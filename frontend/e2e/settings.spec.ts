@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 import {
   editorJson,
   editorProblem,
@@ -278,4 +279,119 @@ test('the heavy form is loaded on settings demand with visible loading and retry
     page.getByRole('button', { name: '保存', exact: true }),
   ).toBeVisible()
   expect(capture.pageErrors).toEqual([])
+})
+
+/** 工作时间是每日墙上字符串；浏览器当天的 DST 不能改变用户在时钟里明确选择的小时。 */
+test.describe('settings time picker on a host DST gap day', () => {
+  test.use({ timezoneId: 'America/New_York' })
+  for (const initial of ['', '25:00']) {
+    test(`keeps raw ${initial || 'empty'} text until an explicit 02:30 clock choice`, async ({
+      page,
+    }) => {
+      const capture = await settingsWorkspace(page)
+      // 保持 NY 的 DST 日但让 Date.now 继续前进；冻结 Date.now 会触发 Vue 的旧冒泡事件守卫。
+      await page.clock.setSystemTime(new Date('2026-03-08T06:30:00Z'))
+      let snapshot = userSettings()
+      await page.route('**/api/v1/settings', (route) => {
+        if (route.request().method() === 'PATCH')
+          snapshot = { ...snapshot, ...route.request().postDataJSON() }
+        return editorJson(route, snapshot)
+      })
+      await page.goto('/settings')
+      const field = page.getByLabel('星期一开始 1', { exact: true })
+      await expect(field).toHaveValue('09:00')
+      await field.fill(initial)
+      await field.focus()
+      await field.press('Tab')
+      await expect(field).toHaveValue(initial)
+      const trigger = page.getByRole('button', {
+        name: '选择星期一开始 1',
+        exact: true,
+      })
+      await trigger.press('Enter')
+      const popup = page.getByRole('dialog', { name: '选择日期', exact: true })
+      await expect(popup).toBeVisible()
+      await expect(popup).toHaveAttribute('aria-modal', 'false')
+      expect(
+        await page
+          .locator('main')
+          .evaluate((node) => node.closest('[inert]') !== null),
+      ).toBe(false)
+      await expect(field).toHaveValue(initial)
+      expect(capture.mutations).toEqual([])
+      // 打开后原生焦点仍在组合输入；ArrowDown 按公开键盘约定进入时钟，然后验证正反循环。
+      await expect(field).toBeFocused()
+      await field.press('ArrowDown')
+      await expect
+        .poll(() =>
+          popup.evaluate((node) => node.contains(document.activeElement)),
+        )
+        .toBe(true)
+      for (const key of [
+        'Tab',
+        'Tab',
+        'Tab',
+        'Tab',
+        'Shift+Tab',
+        'Shift+Tab',
+        'Shift+Tab',
+        'Shift+Tab',
+      ]) {
+        await page.keyboard.press(key)
+        expect(
+          await popup.evaluate((node) => node.contains(document.activeElement)),
+        ).toBe(true)
+      }
+      for (let index = 0; index < 2; index += 1)
+        await popup
+          .getByRole('button', { name: '下一小时', exact: true })
+          .press('Enter')
+      for (let index = 0; index < 30; index += 1)
+        await popup
+          .getByRole('button', { name: '下一分钟', exact: true })
+          .press('Enter')
+      await expect(field).toHaveValue('02:30')
+      expect(capture.mutations).toEqual([])
+      // 等待有限动画实际完成，保留真实颜色规则，扫描真实时间弹层而非替身。
+      await page.evaluate(async () => {
+        await Promise.all(
+          document
+            .getAnimations()
+            .filter((animation) =>
+              Number.isFinite(
+                Number(animation.effect?.getComputedTiming().endTime),
+              ),
+            )
+            .map((animation) => animation.finished.catch(() => undefined)),
+        )
+      })
+      const scan = await new AxeBuilder({ page })
+        .include('[role="dialog"]')
+        .analyze()
+      expect(
+        scan.violations
+          .filter((item) => ['serious', 'critical'].includes(item.impact ?? ''))
+          .map((item) => item.id),
+      ).toEqual([])
+      await page.keyboard.press('Escape')
+      await expect(popup).toHaveCount(0)
+      await expect(field).toBeFocused()
+      await page.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(
+        page.getByRole('region', { name: '工作设置' }).getByRole('status'),
+      ).toHaveText('已保存')
+      expect(capture.mutations).toHaveLength(1)
+      expect(capture.mutations[0]?.payload).toMatchObject({
+        working_hours: { monday: [['02:30', '17:00']] },
+      })
+      await field.fill('25:00')
+      await field.press('Tab')
+      await expect(field).toHaveValue('25:00')
+      await page.getByRole('button', { name: '保存', exact: true }).click()
+      await expect(page.getByRole('alert')).toContainText('HH:mm')
+      expect(capture.mutations).toHaveLength(1)
+      expect(capture.unexpected).toEqual([])
+      expect(capture.pageErrors).toEqual([])
+    })
+  }
 })

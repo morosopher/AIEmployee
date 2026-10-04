@@ -932,6 +932,22 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 
 ---
 
+### Task 16 前置：修复设置工作时间弹层载体与非模态语义
+
+**Files:** `frontend/src/components/SettingsTimeInput.vue`、新建同目录 `SettingsTimeInput.spec.ts`、
+`frontend/e2e/settings.spec.ts`，以及本计划与对应规格。
+
+- 先在旧组件上运行失败回归：NY 宿主 DST 缺失小时日，空／无效工作时间经 timeOnly 选 02:30
+  必须保持 02:30；挂载、打开、父级换无效值零隐式回写，blur 保留原文本，卸载不写新实例。
+- 用公开 modelValue 提供 2000-01-01 稳定载体；空／无效的 00:00 只定位弹层，不进入原表单。
+  用公开 inputId 和更新后同步恢复原字符串；不引用库私有状态或不存在的 defaultDate。
+- 沿用日程锚定弹层 `aria-modal=false`，不新增背景 inert；实测 Tab 循环、Esc 回组合输入、
+  基本 axe 与用户显式选择前零写请求。API、schema、设置 hook 和共享 time.ts 均不变。
+- 运行聚焦组件、设置 E2E、type-check、lint、提交前 check；独立提交
+  `fix: preserve settings wall times in time picker`，审查通过后继续 Task 16。
+
+---
+
 ### Task 16: 清理旧样式，启用强制门禁，加入无障碍与布局 E2E
 
 **Files:**

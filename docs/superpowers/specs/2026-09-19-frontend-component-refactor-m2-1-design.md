@@ -278,6 +278,13 @@ PrimeVue 商业产品线禁令保持不变。
   及全天类型均未变化的字段保留其原明确 offset／秒内精度，按真实时刻判断先后；修改时间
   或时区后仍必须拒绝 DST 歧义。这只是展示校验与库兼容定制，不修改既有 hook/time.ts
   或宣称修复 PrimeVue 库本身。
+- Task 16 前置修复设置工作时间的 `SettingsTimeInput`：所有 timeOnly 日期载体固定为
+  2000-01-01，空／无效输入仅以 00:00 为弹层定位，不成为表单默认值。挂载、打开、父级换值
+  不隐式 emit；公开 inputId 在更新后恢复原字符串，blur 不用载体覆盖无效输入，卸载后不回写。
+  只有显式时钟选择或手工输入才更新原字符串。DatePicker 4.5.5 没有 defaultDate prop，
+  不使用 min/maxDate 伪造领域限制，不修改共享 time.ts、schema、API 或设置行为 hook。
+  与日程 DatePicker 一致，锚定时间弹层显式 `aria-modal=false`，保留 Tab 焦点循环、Esc
+  关闭后回到组合输入，不宣称背景 inert；真实模态 Dialog/Drawer 的约束不变。
 - 默认发送账户、默认日历账户及默认日历的 `Select` 属于 Task 9 设置页；Task 8 连接页
   只保留既有前往设置入口，不复制默认值写操作。
 - 提交按钮在请求进行中 `loading`，请求完成前禁止重复提交；409 冲突显示
