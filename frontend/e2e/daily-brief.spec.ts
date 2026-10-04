@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 import { CONNECTION_ID, userSettings } from '../src/test-support/actionFixtures'
 test('brief generation, version switching and settings use controllable API fixtures', async ({ page }) => {
   await page.route('**/api/v1/auth/me', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'u1', email: 'admin@example.com', display_name: 'Admin', timezone: 'UTC', locale: 'zh-CN', brief_time: '08:00' }) }))
@@ -77,6 +78,11 @@ test('login preserves the requested page and allows correcting rejected credenti
   await expect(
     page.getByRole('heading', { name: '登录 AI Employee' }),
   ).toBeVisible()
+  // 无反馈 Password 不声明不存在的弹层；真实密码态与全页 axe 同时验证。
+  for (const attribute of ['aria-expanded', 'aria-controls', 'aria-haspopup'])
+    await expect(page.getByLabel('密码', { exact: true })).not.toHaveAttribute(attribute)
+  const maskedScan = await new AxeBuilder({ page }).analyze()
+  expect(maskedScan.violations.filter(item => ['serious', 'critical'].includes(item.impact ?? '')).map(item => item.id)).toEqual([])
   await page.getByLabel('邮箱').fill(user.email)
   await page.getByLabel('密码', { exact: true }).fill('synthetic-test-password')
   // 原生按钮的 Enter/Space 行为与切换后的焦点都在浏览器验证，避免 jsdom 模拟激活。
@@ -87,6 +93,10 @@ test('login preserves the requested page and allows correcting rejected credenti
   await expect(toggle).toHaveAttribute('aria-pressed', 'true')
   await expect(toggle).toBeFocused()
   await expect(page.getByLabel('密码', { exact: true })).toHaveAttribute('type', 'text')
+  for (const attribute of ['aria-expanded', 'aria-controls', 'aria-haspopup'])
+    await expect(page.getByLabel('密码', { exact: true })).not.toHaveAttribute(attribute)
+  const unmaskedScan = await new AxeBuilder({ page }).analyze()
+  expect(unmaskedScan.violations.filter(item => ['serious', 'critical'].includes(item.impact ?? '')).map(item => item.id)).toEqual([])
   await toggle.press('Space')
   await expect(toggle).toHaveAttribute('aria-pressed', 'false')
   await expect(page.getByLabel('密码', { exact: true })).toHaveAttribute('type', 'password')

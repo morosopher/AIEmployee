@@ -92,11 +92,17 @@ async function submit(): Promise<void> {
           </div>
           <div class="grid gap-1">
             <label for="login-password">密码</label>
-            <!-- 关闭强度提示；隐藏内置强度播报，避免无反馈模式仍宣告无关的密码提示。 -->
+            <!-- 关闭强度提示；无对应 popup 时经公开 input-props 移除展开语义，保留原密码标签与显隐。
+                 隐藏内置强度播报，避免无反馈模式仍宣告无关的密码提示。 -->
             <Password
               v-model="password"
               input-id="login-password"
-              :input-props="{ autocomplete: 'current-password' }"
+              :input-props="{
+                autocomplete: 'current-password',
+                'aria-expanded': undefined,
+                'aria-controls': undefined,
+                'aria-haspopup': undefined,
+              }"
               :feedback="false"
               toggle-mask
               required

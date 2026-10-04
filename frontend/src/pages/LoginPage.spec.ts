@@ -60,6 +60,23 @@ describe('LoginPage', () => {
     expect(view.queryByRole('dialog')).toBeNull()
   })
 
+  /** 没有强度弹层时，隐藏／显示输入都不能声明可展开控件，辅助技术仍读原密码标签。 */
+  it('keeps a password without feedback free of unsupported popup attributes in both mask states', async () => {
+    const view = await renderWithPlugins(LoginPage)
+    for (const type of ['password', 'text']) {
+      const input = view.getByLabelText('密码')
+      expect(input).toHaveAttribute('type', type)
+      for (const attribute of [
+        'aria-expanded',
+        'aria-controls',
+        'aria-haspopup',
+      ])
+        expect(input).not.toHaveAttribute(attribute)
+      expect(view.queryByRole('dialog')).toBeNull()
+      await fireEvent.click(view.getByRole('button', { name: '显示密码' }))
+    }
+  })
+
   it('labels credentials and disables submission while authentication is pending', async () => {
     let resolveResponse: (value: Response) => void = () => {
       throw new Error('请求尚未建立')

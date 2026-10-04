@@ -948,6 +948,19 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 
 ---
 
+### Task 16 前置 A：修正无反馈 Password 的输入语义
+
+**Files:** `frontend/src/pages/LoginPage.vue`、`LoginPage.spec.ts`、
+`frontend/e2e/daily-brief.spec.ts`，以及本计划与对应规格。
+
+- 正式 RED 验证真实 Password 在隐藏／显示两态没有无对应 popup 的 expanded/controls/haspopup；
+  保留原 label、类型、显隐键盘与登录失败恢复的三条既有 E2E 流程。
+- 仅用公开 input-props 移除三属性；真实浏览器 axe 无严重／关键问题，认证和路由只读。
+- 与前置 B 源码稳定后统一运行聚焦单测、相关 E2E、一次 check 和构建预算；独立提交
+  `fix: correct password input accessibility`，不依赖 Task16 未提交辅助文件。
+
+---
+
 ### Task 16: 清理旧样式，启用强制门禁，加入无障碍与布局 E2E
 
 **Files:**

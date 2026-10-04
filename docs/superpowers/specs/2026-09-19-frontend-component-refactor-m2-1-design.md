@@ -285,6 +285,9 @@ PrimeVue 商业产品线禁令保持不变。
   不使用 min/maxDate 伪造领域限制，不修改共享 time.ts、schema、API 或设置行为 hook。
   与日程 DatePicker 一致，锚定时间弹层显式 `aria-modal=false`，保留 Tab 焦点循环、Esc
   关闭后回到组合输入，不宣称背景 inert；真实模态 Dialog/Drawer 的约束不变。
+- Task 16 无障碍前置修复：登录 Password 的 `feedback=false` 没有对应 popup，使用公开
+  `input-props` 移除其无效 `aria-expanded`／`aria-controls`／`aria-haspopup`。保留原密码类型、
+  显隐按钮及键盘、文案、登录提交、认证与路由，不增加或伪造 popup／role。
 - 默认发送账户、默认日历账户及默认日历的 `Select` 属于 Task 9 设置页；Task 8 连接页
   只保留既有前往设置入口，不复制默认值写操作。
 - 提交按钮在请求进行中 `loading`，请求完成前禁止重复提交；409 冲突显示
