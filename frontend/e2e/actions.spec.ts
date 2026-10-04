@@ -514,6 +514,9 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await page.getByRole('option', { name: '全部供应商', exact: true }).click()
   await page.getByRole('combobox', { name: '操作类型筛选' }).click()
   await page.getByRole('option', { name: '全部类型', exact: true }).click()
+  // Select 浮层挂在页面外层；离场动画仍可能保留桌面坐标。
+  // 稳定布局验收先等所有浮层真正卸载，再切换视口；隐藏但未卸载也不能当作关闭完成。
+  await expect(page.getByRole('listbox', { includeHidden: true })).toHaveCount(0)
   await expect(page.getByText('当前页 6 项操作')).toBeVisible()
   await page.getByRole('tab', { name: /^需要人工确认 / }).click()
   const trigger = page.getByRole('button', { name: '查看发送邮件详情' })
