@@ -219,7 +219,7 @@ for (const provider of ['google', 'microsoft'] as const) {
       await expect.poll(() => status(page, taskId)).toBe('succeeded')
       await runTask(page, taskId)
       await page.reload()
-      await expect(page.locator('.action-detail')).toContainText('已完成')
+      await expect(page.getByRole('article')).toContainText('已完成')
       const facts = await evidence(page, taskId)
       expect(facts.execution_count).toBe(1)
       expect(facts.write_calls).toBe(1)
@@ -279,7 +279,7 @@ test('two editors preserve a stale user edit and reject the conflicting version'
     await page.getByRole('button', { name: '保存草稿', exact: true }).click()
     await expect(page.getByRole('button', { name: '提交审批', exact: true })).toBeEnabled()
     await other.getByRole('button', { name: '保存草稿', exact: true }).click()
-    await expect(other.locator('.editor-error[role="alert"]')).toContainText('版本')
+    await expect(other.getByRole('alert').filter({ hasText: '版本' })).toContainText('版本')
     await expect(other.getByLabel('主题', { exact: true })).toHaveValue('Synthetic second editor')
     await expect(other.getByRole('button', { name: '提交审批', exact: true })).toBeDisabled()
   } finally { await other.close() }
@@ -333,7 +333,7 @@ for (const resolution of ['confirmed_executed', 'confirmed_not_executed'] as con
     expect(facts.write_calls).toBe(1)
     expect(facts.reconcile_calls).toBe(4)
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-    await expect(page.locator('[aria-live="polite"]:visible')).toContainText('实时连接')
+    await expect(page.getByRole('status').filter({ hasText: '实时连接' })).toContainText('实时连接')
   })
 }
 
@@ -393,8 +393,8 @@ test('delayed reconciliation reconnects real SSE and restores the durable termin
   const proxy = await streamProxy(`/api/v1/tasks/${taskId}/events`)
   try {
     await page.goto(`${proxy.origin}/actions?task=${taskId}`)
-    await expect(page.locator('[aria-live="polite"]:visible').filter({ hasText: '实时连接' })).toContainText('核对')
-    await expect(page.locator('[aria-live="polite"]:visible').filter({ hasText: '实时连接' })).toContainText('实时连接正常')
+    await expect(page.getByRole('status').filter({ hasText: '实时连接' })).toContainText('核对')
+    await expect(page.getByRole('status').filter({ hasText: '实时连接' })).toContainText('实时连接正常')
     await expect.poll(() => proxy.cursors.length).toBe(1)
     // Chromium 的 offline 模式可能保留既有长流；此处实际断开本测试拥有的转发 socket。
     proxy.disconnect()
@@ -404,13 +404,13 @@ test('delayed reconciliation reconnects real SSE and restores the durable termin
     }
     expect(await status(page, taskId)).toBe('succeeded')
     proxy.resume()
-    await expect(page.locator('.action-detail')).toContainText('已完成')
+    await expect(page.getByRole('article')).toContainText('已完成')
     await expect.poll(() => proxy.cursors.slice(1).some((cursor) => cursor !== null && BigInt(cursor) > 0n)).toBe(true)
     const facts = await evidence(page, taskId)
     expect(facts.write_calls).toBe(1)
     expect(facts.reconcile_calls).toBe(2)
     await page.reload()
-    await expect(page.locator('.action-detail')).toContainText('已完成')
+    await expect(page.getByRole('article')).toContainText('已完成')
   } finally {
     await page.goto('/actions')
     await proxy.close()

@@ -635,17 +635,22 @@ Live region 同提交记录：WorkSettingsForm 原 3 个 status 场景（设置�
 ### Task 10: 迁移操作中心与详情
 
 **Files:**
+- Create: `frontend/src/components/ActionCenterWorkspace.vue`（Task 10 展示组合的真实异步边界；页面宿主保留加载、失败与完整重载重试，行为层不变）
 - Modify: `frontend/src/pages/ActionsPage.vue`、`frontend/src/pages/ActionsPage.spec.ts`
 - Modify: `frontend/src/components/ActionDetail.vue`、`frontend/src/components/LinkedActionPanel.vue`
 - Modify: `frontend/e2e/actions.spec.ts`、`frontend/e2e/action-workspace.spec.ts`、`frontend/e2e/m2-actions.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+Live region 同提交记录：原 ActionsPage 的创建／列表／连接／快照四个 status 与列表／快照错误两个 alert 原文移入唯一 ActionCenterWorkspace；ActionDetail 的核对／内容到期／缺失来源三个 status 与动作错误一个 alert、LinkedActionPanel 的关联加载／连接恢复两个 status 与读取失败／归属不匹配两个 alert 均用 Message 原文承载。原九个 status、五个 alert 的业务场景保持，页面宿主仅增加互斥的模块加载 status／失败 alert；StatusTag、历史到期 Tag、Panel 与 Timeline 不增加 live region。详情与既有 ApprovalCard 同时显示的两条到期公告沿用原基线，未凑数或删减；运行时验证两处仍各一条。
+
+展示适配记录：六个 Tabs 只切当前页分组；Paginator 使用公开 headless slot 的 first（1-based）／rows 映射旧 offset／limit，不提供 totalRecords，不显示总页数，失败后重试仍读取同一偏移。Splitter 保留单一工作区和详情实例，按 Tailwind 默认 xl/md 断点改变布局；DataTable 使用原类型＋ID稳定键以保留刷新重排后的焦点。异步展示边界只在操作中心下载，加载失败明确完整重载重试；行为层与路由仍只读。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts && pnpm --dir frontend test:e2e e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：六个分组为 `Tabs`，Tab 键盘可切换且 `aria-selected` 正确；列表为 `DataTable`，列头 `scope="col"`，状态列用 `StatusTag`；供应商/类型/状态筛选为带 label 的 `Select`，变更后调用的 API 参数与旧实现完全一致（用 `vi.mocked(listActions).mock.calls` 比对）；`Paginator` 的 `first`/`rows` 仅在展示层映射为既有 `offset`/`limit`，API 参数不变；详情在 `≥ xl` 为 `Splitter` 右栏、`< md` 为独立区域；内容到期时显示「内容已过期」历史状态；聚焦与重连后重读快照的既有测试不动；零浏览器存储断言保留。
 
@@ -653,20 +658,20 @@ Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建**
+- [x] **Step 3: 重建**
 
 `useActionCenter`、`useActionControls`、`stores/actions.ts` 不动；删除 168 行 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ActionsPage.spec.ts src/stores/actions.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/actions.spec.ts e2e/action-workspace.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/pages/ActionsPage.vue frontend/src/pages/ActionsPage.spec.ts frontend/src/components/ActionDetail.vue frontend/src/components/LinkedActionPanel.vue frontend/e2e/actions.spec.ts frontend/e2e/action-workspace.spec.ts frontend/e2e/m2-actions.spec.ts
+git add frontend/src/components/ActionCenterWorkspace.vue frontend/src/pages/ActionsPage.vue frontend/src/pages/ActionsPage.spec.ts frontend/src/components/ActionDetail.vue frontend/src/components/LinkedActionPanel.vue frontend/e2e/actions.spec.ts frontend/e2e/action-workspace.spec.ts frontend/e2e/m2-actions.spec.ts
 git commit -m "feat: migrate action center to PrimeVue"
 ~~~
 

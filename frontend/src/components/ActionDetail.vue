@@ -1,14 +1,19 @@
 <script setup lang="ts">
 import { computed, toRef } from 'vue'
 import { RouterLink } from 'vue-router'
-import type { ActionSnapshot } from '@/api/types'
+import Button from 'primevue/button'
+import Message from 'primevue/message'
+import Panel from 'primevue/panel'
+import Tag from 'primevue/tag'
+import Timeline from 'primevue/timeline'
+import StatusTag from './StatusTag.vue'
+import type { ActionSnapshot, ActionTimelineEvent } from '@/api/types'
 import { useActionControls } from '@/features/actions/useActionControls'
 import ApprovalCard from './ApprovalCard.vue'
 import NeedsAttentionPanel from './NeedsAttentionPanel.vue'
 import {
   actionEventLabel,
   actionLabel,
-  actionStatusLabel,
   formatActionTime,
   providerLabel,
   safeProviderUrl,
@@ -45,197 +50,197 @@ const missingSources = computed(() => {
         .flatMap((conflict) => conflict.missing_connection_ids).length
     : 0
 })
-const approvalLabels = {
-  pending: '待审批',
-  approved: '已批准',
-  rejected: '已拒绝',
-  expired: '已过期',
-  invalidated: '已失效',
-}
+/**
+ * Live region 迁移：只读核对、正文到期、缺失来源三个 status 与动作错误 alert
+ * 逐字保留在 Message；到期 Tag 只是历史标签，不重复 live 播报。Panel/Timeline 无额外公告。
+ */
 </script>
 
 <template>
-  <article class="action-detail">
-    <h2>{{ actionLabel(snapshot.action) }}</h2>
-    <p>
-      {{ providerLabel(snapshot.provider) }} ·
-      {{ actionStatusLabel(snapshot.status) }}
-    </p>
-    <p
-      v-if="snapshot.status === 'needs_attention'"
-      class="attention"
-    >
-      结果需要核实。请先在供应商中查看实际结果。
-    </p>
-    <p
-      v-if="snapshot.status === 'reconciling'"
-      role="status"
-    >
-      正在只读核对执行结果，请等待服务端更新。
-    </p>
-    <p
-      v-if="snapshot.error_code"
-      class="error"
-    >
-      错误代码：{{ snapshot.error_code }}
-    </p>
-    <p
-      v-if="snapshot.approval?.content_status === 'redacted'"
-      class="content-expired"
-      role="status"
-    >
-      内容已到期，仅保留执行历史。
-    </p>
-    <p
-      v-if="missingSources"
-      class="attention"
-      role="status"
-    >
-      部分日历来源尚未同步（{{ missingSources }} 个连接），冲突检查可能不完整。
-    </p>
-    <dl>
-      <template v-if="snapshot.approval">
-        <dt>审批状态</dt>
-        <dd>{{ approvalLabels[snapshot.approval.status] }}</dd>
-        <dt>审批版本 / 冻结版本</dt>
-        <dd>
-          {{ snapshot.approval.version }} /
-          {{ snapshot.approval.proposal_version }}
-        </dd>
+  <article class="min-w-0 wrap-anywhere">
+    <Panel>
+      <template #header="{ id }">
+        <h2
+          :id="id"
+          class="text-lg font-semibold"
+        >
+          {{ actionLabel(snapshot.action) }}
+        </h2>
       </template>
-      <template v-if="snapshot.execution">
-        <dt>写入尝试</dt>
-        <dd>{{ snapshot.execution.write_attempt_count }}</dd>
-        <dt>核对尝试</dt>
-        <dd>{{ snapshot.execution.reconciliation_attempt_count }}</dd>
-      </template>
-      <dt>最近更新</dt>
-      <dd>
-        {{ formatActionTime(snapshot.updated_at, timezone) }}（{{ timezone }}）
-      </dd>
-    </dl>
-    <p v-if="snapshot.execution?.manual_resolution">
-      人工结论：{{
-        snapshot.execution.manual_resolution === 'confirmed_executed'
-          ? '确认已执行'
-          : '确认未执行'
-      }}。该记录不会自动重新发送或修改日程。
-    </p>
-    <RouterLink
-      v-if="editorUrl"
-      :to="editorUrl"
-    >
-      打开{{
-        snapshot.local_action?.item_kind === 'mail_draft'
-          ? '邮件草稿'
-          : '日程提案'
-      }}
-    </RouterLink>
-    <ApprovalCard
-      v-if="snapshot.approval"
-      :approval="snapshot.approval"
-      :decide="decide"
-      :reload="() => refresh()"
-      :editor-url="editorUrl"
-      :timezone="timezone"
-      :locked="busy"
-    />
-    <button
-      v-if="canWithdraw"
-      type="button"
-      name="withdraw-action"
-      :disabled="busy"
-      @click="withdraw"
-    >
-      撤回审批以继续编辑
-    </button>
-    <p
-      v-if="error"
-      role="alert"
-    >
-      {{ error.message
-      }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
-    </p>
-    <NeedsAttentionPanel
-      v-if="snapshot.status === 'needs_attention'"
-      :snapshot="snapshot"
-      :reconcile="reconcile"
-      :resolve="resolve"
-      :reload="() => refresh()"
-      :locked="busy"
-    />
-    <a
-      v-if="providerUrl"
-      :href="providerUrl"
-      target="_blank"
-      rel="noopener noreferrer"
-    >在 {{ providerLabel(snapshot.provider) }} 中检查结果</a>
-    <h3>执行时间线</h3>
-    <!-- 不渲染原始 payload 或完整预览，未知事件只呈现固定兼容文案。 -->
-    <ol
-      v-if="snapshot.timeline.length"
-      aria-label="审计时间线"
-    >
-      <li
-        v-for="event in snapshot.timeline"
-        :key="event.id"
-      >
-        <strong>{{ actionEventLabel(event.event) }}</strong>
-        <time :datetime="event.occurred_at">{{
-          formatActionTime(event.occurred_at, timezone)
-        }}</time>
-      </li>
-    </ol>
-    <p v-else>
-      尚无可展示的持久事件。
-    </p>
+      <div class="space-y-4">
+        <p>
+          {{ providerLabel(snapshot.provider) }} ·
+          <StatusTag
+            kind="action"
+            :value="snapshot.status"
+          />
+        </p>
+        <p
+          v-if="snapshot.status === 'needs_attention'"
+          class="rounded-lg border-l-4 border-orange-600 bg-orange-50 p-3 text-color"
+        >
+          结果需要核实。请先在供应商中查看实际结果。
+        </p>
+        <Message
+          v-if="snapshot.status === 'reconciling'"
+          role="status"
+          severity="warn"
+          aria-live="polite"
+        >
+          正在只读核对执行结果，请等待服务端更新。
+        </Message>
+        <p
+          v-if="snapshot.error_code"
+          class="text-red-700"
+        >
+          错误代码：{{ snapshot.error_code }}
+        </p>
+        <Message
+          v-if="snapshot.approval?.content_status === 'redacted'"
+          role="status"
+          severity="warn"
+          aria-live="polite"
+        >
+          内容已到期，仅保留执行历史。
+        </Message>
+        <Message
+          v-if="missingSources"
+          class="rounded-lg border-l-4 border-orange-600 bg-orange-50 p-3 text-color"
+          role="status"
+          severity="warn"
+          aria-live="polite"
+        >
+          部分日历来源尚未同步（{{ missingSources }}
+          个连接），冲突检查可能不完整。
+        </Message>
+        <Tag
+          v-if="snapshot.approval?.content_status === 'redacted'"
+          value="内容已过期"
+          severity="secondary"
+        />
+        <dl class="grid grid-cols-[minmax(6rem,1fr)_minmax(0,1.5fr)] gap-3">
+          <template v-if="snapshot.approval">
+            <dt class="text-muted-color">
+              审批状态
+            </dt>
+            <dd class="m-0">
+              <StatusTag
+                kind="approval"
+                :value="snapshot.approval.status"
+              />
+            </dd>
+            <dt class="text-muted-color">
+              审批版本 / 冻结版本
+            </dt>
+            <dd class="m-0">
+              {{ snapshot.approval.version }} /
+              {{ snapshot.approval.proposal_version }}
+            </dd>
+          </template>
+          <template v-if="snapshot.execution">
+            <dt class="text-muted-color">
+              写入尝试
+            </dt>
+            <dd class="m-0">
+              {{ snapshot.execution.write_attempt_count }}
+            </dd>
+            <dt class="text-muted-color">
+              核对尝试
+            </dt>
+            <dd class="m-0">
+              {{ snapshot.execution.reconciliation_attempt_count }}
+            </dd>
+          </template>
+          <dt class="text-muted-color">
+            最近更新
+          </dt>
+          <dd class="m-0">
+            {{ formatActionTime(snapshot.updated_at, timezone) }}（{{
+              timezone
+            }}）
+          </dd>
+        </dl>
+        <p v-if="snapshot.execution?.manual_resolution">
+          人工结论：{{
+            snapshot.execution.manual_resolution === 'confirmed_executed'
+              ? '确认已执行'
+              : '确认未执行'
+          }}。该记录不会自动重新发送或修改日程。
+        </p>
+        <Button
+          v-if="editorUrl"
+          :as="RouterLink"
+          :to="editorUrl"
+          link
+          :label="`打开${snapshot.local_action?.item_kind === 'mail_draft' ? '邮件草稿' : '日程提案'}`"
+        />
+        <ApprovalCard
+          v-if="snapshot.approval"
+          :approval="snapshot.approval"
+          :decide="decide"
+          :reload="() => refresh()"
+          :editor-url="editorUrl"
+          :timezone="timezone"
+          :locked="busy"
+        />
+        <Button
+          v-if="canWithdraw"
+          name="withdraw-action"
+          label="撤回审批以继续编辑"
+          :disabled="busy"
+          severity="secondary"
+          outlined
+          @click="withdraw"
+        />
+        <Message
+          v-if="error"
+          role="alert"
+          severity="error"
+        >
+          {{ error.message
+          }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
+        </Message>
+        <NeedsAttentionPanel
+          v-if="snapshot.status === 'needs_attention'"
+          :snapshot="snapshot"
+          :reconcile="reconcile"
+          :resolve="resolve"
+          :reload="() => refresh()"
+          :locked="busy"
+        />
+        <Button
+          v-if="providerUrl"
+          as="a"
+          :href="providerUrl"
+          target="_blank"
+          rel="noopener noreferrer"
+          link
+          :label="`在 ${providerLabel(snapshot.provider)} 中检查结果`"
+        />
+        <h3>执行时间线</h3>
+        <!-- 不渲染原始 payload 或完整预览，未知事件只呈现固定兼容文案。 -->
+        <Timeline
+          v-if="snapshot.timeline.length"
+          :value="snapshot.timeline"
+          data-key="id"
+          aria-label="审计时间线"
+          :pt="{
+            eventOpposite: { class: 'hidden' },
+            eventContent: { class: 'min-w-0 pb-4' },
+          }"
+        >
+          <template #content="{ item: event }: { item: ActionTimelineEvent }">
+            <strong>{{ actionEventLabel(event.event) }}</strong>
+            <time
+              :datetime="event.occurred_at"
+              class="mt-1 block text-sm text-muted-color"
+            >{{ formatActionTime(event.occurred_at, timezone) }}</time>
+          </template>
+        </Timeline>
+        <p v-else>
+          尚无可展示的持久事件。
+        </p>
+      </div>
+    </Panel>
   </article>
 </template>
-
-<style scoped>
-.action-detail {
-  overflow-wrap: anywhere;
-}
-h2 {
-  margin-top: 0.5rem;
-}
-dl {
-  display: grid;
-  grid-template-columns: minmax(6rem, 1fr) minmax(0, 1.5fr);
-  gap: 0.75rem;
-}
-dt {
-  color: #485365;
-}
-dd {
-  margin: 0;
-}
-ol {
-  padding-left: 1.25rem;
-}
-li {
-  margin-bottom: 1rem;
-}
-time {
-  display: block;
-  color: #485365;
-  font-size: 0.875rem;
-  margin-top: 0.25rem;
-}
-.error {
-  color: #a61b1b;
-}
-.attention,
-.content-expired {
-  padding: 0.75rem;
-  background: #fff5df;
-  border-left: 3px solid #946200;
-}
-a {
-  color: #164e9c;
-}
-a:focus-visible {
-  outline: 3px solid #164e9c;
-  outline-offset: 3px;
-}
-</style>

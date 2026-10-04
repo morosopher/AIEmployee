@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import Button from 'primevue/button'
+import Message from 'primevue/message'
+import Panel from 'primevue/panel'
 import { computed, watch } from 'vue'
 import { RouterLink, type LocationQueryValue } from 'vue-router'
 import { useActionsStore } from '@/stores/actions'
@@ -44,51 +47,63 @@ watch(
   },
   { immediate: true },
 )
+/** 原关联加载/连接恢复两个 status 与读取失败/归属不匹配两个 alert 原文保留，Panel 不增 live region。 */
 </script>
 <template>
   <section
     v-if="taskId"
     aria-label="关联审批任务"
   >
-    <p
-      v-if="actions.snapshotLoading[taskId]"
-      role="status"
-    >
-      正在读取关联任务…
-    </p>
-    <p
-      v-if="actions.snapshotErrors[taskId]"
-      role="alert"
-    >
-      关联任务读取失败，请到操作中心重新加载。<span
-        v-if="actions.snapshotErrors[taskId]?.trace_id"
-      >
-        追踪编号：{{ actions.snapshotErrors[taskId]?.trace_id }}</span>
-    </p>
-    <p
-      v-if="snapshot && !matching"
-      role="alert"
-    >
-      此任务与当前编辑对象不匹配，请在操作中心核对。
-    </p>
-    <template v-if="matching">
-      <p
-        v-if="connection !== 'connected'"
-        role="status"
-      >
-        任务连接正在恢复，状态以服务端为准。
-      </p>
-      <ActionDetail
-        :snapshot="matching"
-        :timezone="auth.user?.timezone ?? 'UTC'"
-        @changed="$emit('changed')"
-      />
-    </template>
+    <Panel header="关联审批任务">
+      <div class="space-y-4">
+        <Message
+          v-if="actions.snapshotLoading[taskId]"
+          severity="secondary"
+          role="status"
+          aria-live="polite"
+        >
+          正在读取关联任务…
+        </Message>
+        <Message
+          v-if="actions.snapshotErrors[taskId]"
+          severity="error"
+          role="alert"
+        >
+          关联任务读取失败，请到操作中心重新加载。<span
+            v-if="actions.snapshotErrors[taskId]?.trace_id"
+          >
+            追踪编号：{{ actions.snapshotErrors[taskId]?.trace_id }}</span>
+        </Message>
+        <Message
+          v-if="snapshot && !matching"
+          severity="error"
+          role="alert"
+        >
+          此任务与当前编辑对象不匹配，请在操作中心核对。
+        </Message>
+        <template v-if="matching">
+          <Message
+            v-if="connection !== 'connected'"
+            severity="secondary"
+            role="status"
+            aria-live="polite"
+          >
+            任务连接正在恢复，状态以服务端为准。
+          </Message>
+          <ActionDetail
+            :snapshot="matching"
+            :timezone="auth.user?.timezone ?? 'UTC'"
+            @changed="$emit('changed')"
+          />
+        </template>
+      </div>
+    </Panel>
   </section>
-  <RouterLink
+  <Button
     v-else
+    :as="RouterLink"
     to="/actions"
-  >
-    在操作中心查看与撤回审批
-  </RouterLink>
+    link
+    label="在操作中心查看与撤回审批"
+  />
 </template>

@@ -137,7 +137,7 @@ for (const eventName of M2_EVENTS) {
       })
     })
     await page.route(`**/api/v1/tasks/${TASK_ID}/events*`, async (route) => {
-      await expect(page.locator('.action-detail')).toContainText('执行中')
+      await expect(page.getByRole('article')).toContainText('执行中')
       await route.fulfill({
         status: 200,
         contentType: 'text/event-stream',
@@ -145,13 +145,12 @@ for (const eventName of M2_EVENTS) {
       })
     })
     await page.goto('/actions')
+    await page.getByRole('tab', { name: /^需要人工确认 / }).click()
     await page.getByRole('button', { name: '查看发送邮件详情' }).click()
-    await expect(page.locator('.action-detail')).toContainText('结果需要核实')
+    await expect(page.getByRole('article')).toContainText('结果需要核实')
     await expect.poll(() => actionReads).toBe(2)
     await expect.poll(() => taskReads).toBe(1)
-    await expect(page.locator('.action-detail')).not.toContainText(
-      'Google · 已完成',
-    )
+    await expect(page.getByRole('article')).not.toContainText('已完成')
   })
 }
 
@@ -201,7 +200,7 @@ test('unknown native named event recovers once through id-less heartbeats and ke
       new URL(route.request().url()).searchParams.get('last_event_id'),
     )
     if (streamCursors.length === 1) {
-      await expect(page.locator('.action-detail')).toContainText('执行中')
+      await expect(page.getByRole('article')).toContainText('执行中')
       await route.fulfill({
         status: 200,
         contentType: 'text/event-stream',
@@ -221,11 +220,12 @@ test('unknown native named event recovers once through id-less heartbeats and ke
     })
   })
   await page.goto('/actions')
+  await page.getByRole('tab', { name: /^需要人工确认 / }).click()
   await page.getByRole('button', { name: '查看发送邮件详情' }).click()
   await expect.poll(() => taskReads).toBe(1)
   // 两个心跳均在同一读取完成前到达，只合并恢复需求，不发送第二个并行读取。
   releaseTask()
-  await expect(page.locator('.action-detail')).toContainText('结果需要核实')
+  await expect(page.getByRole('article')).toContainText('结果需要核实')
   // 初次各读取一次；恢复时先采纳的一侧使另一侧补读，总计恰好五次，不能分别放宽上界。
   await expect.poll(() => listReads + actionReads).toBe(5)
   await expect(
@@ -240,6 +240,7 @@ test('unknown native named event recovers once through id-less heartbeats and ke
   ]).toContainEqual([listReads, actionReads])
   expect(taskReads).toBe(1)
   await page.getByRole('button', { name: '关闭操作详情' }).click()
+  await page.getByRole('tab', { name: /^需要人工确认 / }).click()
   await page.getByRole('button', { name: '查看发送邮件详情' }).click()
   await expect.poll(() => streamCursors.length).toBe(2)
   expect(streamCursors).toEqual([null, RECOVERED_CURSOR])
@@ -331,10 +332,11 @@ test('unknown native event followed by a known nonterminal event recovers throug
       })
     })
     await page.route(`**/api/v1/tasks/${TASK_ID}/events*`, async (route) => {
-      await expect(page.locator('.action-detail')).toContainText('执行中')
+      await expect(page.getByRole('article')).toContainText('执行中')
       await route.continue({ url: `http://127.0.0.1:${address.port}/events` })
     })
     await page.goto('/actions')
+    await page.getByRole('tab', { name: /^执行或核对中 / }).click()
     await page.getByRole('button', { name: '查看发送邮件详情' }).click()
     await expect.poll(() => streamRequests).toBe(1)
     const stream = await streamReady
@@ -370,7 +372,7 @@ test('unknown native event followed by a known nonterminal event recovers throug
     ])
     await expect.poll(() => taskReads).toBe(1)
     releaseTask()
-    await expect(page.locator('.action-detail')).toContainText('结果需要核实')
+    await expect(page.getByRole('article')).toContainText('结果需要核实')
     // 两类刷新可能以任一次序完成；先等待真实加载结束，再固定只有一侧补读的精确计数对。
     await expect.poll(() => listReads + actionReads).toBe(5)
     await expect(
@@ -493,19 +495,27 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
     '已完成历史',
   ])
     await expect(
-      page.getByRole('region', { name: `${label} 1`, exact: true }),
+      page.getByRole('tab', { name: `${label} 1`, exact: true }),
     ).toBeVisible()
   // Task29 已提供本地编辑入口；同时校验可访问名称与合成草稿路径，避免放过错误目标。
-  const draftLink = page.getByRole('link', { name: '编辑本地草稿', exact: true })
+  const draftLink = page.getByRole('link', {
+    name: '编辑本地草稿',
+    exact: true,
+  })
   await expect(draftLink).toBeVisible()
   await expect(draftLink).toHaveAttribute('href', `/mail/drafts/${DRAFT_ID}`)
-  await page.getByLabel('供应商筛选').selectOption('microsoft')
-  await page.getByLabel('操作类型筛选').selectOption('calendar_proposal')
+  await page.getByRole('combobox', { name: '供应商筛选' }).click()
+  await page.getByRole('option', { name: 'Microsoft', exact: true }).click()
+  await page.getByRole('combobox', { name: '操作类型筛选' }).click()
+  await page.getByRole('option', { name: '日程提案', exact: true }).click()
   await expect(page.getByText('当前页 1 项操作')).toBeVisible()
   expect(queries.at(-1)).toBe('?provider=microsoft&item_kind=calendar_proposal')
-  await page.getByLabel('供应商筛选').selectOption('')
-  await page.getByLabel('操作类型筛选').selectOption('')
+  await page.getByRole('combobox', { name: '供应商筛选' }).click()
+  await page.getByRole('option', { name: '全部供应商', exact: true }).click()
+  await page.getByRole('combobox', { name: '操作类型筛选' }).click()
+  await page.getByRole('option', { name: '全部类型', exact: true }).click()
   await expect(page.getByText('当前页 6 项操作')).toBeVisible()
+  await page.getByRole('tab', { name: /^需要人工确认 / }).click()
   const trigger = page.getByRole('button', { name: '查看发送邮件详情' })
   await trigger.focus()
   await page.keyboard.press('Enter')
@@ -524,9 +534,12 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
     )
     await expect(providerLink).toHaveAttribute('rel', 'noopener noreferrer')
   }
-  await expect(detail.locator('[aria-live="polite"]')).toContainText(
-    '需要人工确认',
-  )
+  await expect(
+    detail.getByRole('status').filter({ hasText: '连接' }),
+  ).toContainText('需要人工确认')
+  await expect(
+    page.getByRole('separator', { name: '调整操作列表与详情宽度' }),
+  ).toBeVisible()
   await page.screenshot({
     path: testInfo.outputPath('action-center-desktop.png'),
     fullPage: true,
@@ -534,6 +547,10 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await page.setViewportSize({ width: 390, height: 844 })
   await expect(page.getByRole('form', { name: '操作筛选' })).toBeHidden()
   await expect(detail).toBeVisible()
+  // CSS 隐藏筛选早于 Vue 的断点更新；先确认 Splitter 已退出桌面分隔语义，再检查同一严格宽度不变量。
+  await expect(
+    page.getByRole('separator', { name: '调整操作列表与详情宽度' }),
+  ).toHaveCount(0)
   expect(
     await page.evaluate(
       () =>
@@ -551,7 +568,15 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await trigger.click()
   // 不安全供应商地址必须在两个位置都消失；本地编辑入口仍应精确绑定原草稿与任务。
   await expect(providerLinks).toHaveCount(0)
-  await expect(detail.locator('a[href^="javascript:"]')).toHaveCount(0)
+  expect(
+    await detail
+      .getByRole('link')
+      .evaluateAll((links) =>
+        links.some((link) =>
+          link.getAttribute('href')?.startsWith('javascript:'),
+        ),
+      ),
+  ).toBe(false)
   const editorLink = detail.getByRole('link', {
     name: '打开邮件草稿',
     exact: true,
@@ -564,13 +589,93 @@ test('action groups, filters, provider links, keyboard focus and narrow detail u
   await page.reload()
   // task 查询参数让刷新恢复原详情；窄屏须显式返回列表后才显示原有分组计数。
   await expect(detail).toBeVisible()
-  await expect(detail.locator('[aria-live="polite"]')).toContainText(
-    '需要人工确认',
-  )
+  await expect(
+    detail.getByRole('status').filter({ hasText: '连接' }),
+  ).toContainText('需要人工确认')
   await expect(page.getByRole('form', { name: '操作筛选' })).toBeHidden()
   await page.getByRole('button', { name: '关闭操作详情' }).click()
   await expect(page.getByText('当前页 6 项操作')).toBeVisible()
   expect(
     await page.evaluate(() => [localStorage.length, sessionStorage.length]),
   ).toEqual([0, 0])
+})
+
+/** 真实动态模块下载边界；其他路由不预载，等待/失败不会提前运行工作区的 REST/SSE hooks。 */
+test('action workspace downloads on demand and keeps a visible loading state', async ({
+  page,
+}) => {
+  await authenticateFixture(page)
+  await page.route('**/api/v1/connections', (route) => fulfillJson(route, []))
+  await page.route('**/api/v1/actions', (route) =>
+    fulfillJson(route, { items: [], limit: 50, offset: 0 }),
+  )
+  let downloads = 0
+  let release: () => void = () => undefined
+  const permitted = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route(
+    '**/src/components/ActionCenterWorkspace.vue*',
+    async (route) => {
+      downloads += 1
+      await permitted
+      await route.continue()
+    },
+  )
+  await page.goto('/connections')
+  await expect(
+    page.getByRole('heading', { name: '连接与能力', exact: true }),
+  ).toBeVisible()
+  expect(downloads).toBe(0)
+  await page.getByRole('link', { name: '操作中心', exact: true }).click()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载操作中心…' }),
+  ).toHaveCount(1)
+  expect(downloads).toBe(1)
+  release()
+  await expect(
+    page.getByRole('heading', { name: '操作中心', exact: true }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载操作中心…' }),
+  ).toHaveCount(0)
+})
+
+/** 失败的 ES 模块不能只靠重复 import 恢复；点击明示的整页重试才产生新请求。 */
+test('action workspace module failure exposes a full reload retry', async ({
+  page,
+}) => {
+  await authenticateFixture(page)
+  await page.route('**/api/v1/actions', (route) =>
+    fulfillJson(route, { items: [], limit: 50, offset: 0 }),
+  )
+  let fail = true
+  let downloads = 0
+  await page.route(
+    '**/src/components/ActionCenterWorkspace.vue*',
+    async (route) => {
+      downloads += 1
+      if (fail) await route.abort('failed')
+      else await route.continue()
+    },
+  )
+  await page.goto('/actions')
+  await expect(
+    page.getByRole('alert').filter({ hasText: '操作中心加载失败' }),
+  ).toContainText('重试会重新加载页面')
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载操作中心…' }),
+  ).toHaveCount(0)
+  expect(downloads).toBe(1)
+  fail = false
+  await page
+    .getByRole('button', { name: '重试加载操作中心', exact: true })
+    .click()
+  await expect(
+    page.getByRole('heading', { name: '操作中心', exact: true }),
+  ).toBeVisible()
+  expect(downloads).toBe(2)
+  await expect(
+    page.getByRole('alert').filter({ hasText: '操作中心加载失败' }),
+  ).toHaveCount(0)
 })
