@@ -1,4 +1,6 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Locator } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
+import { contrastRatio } from '../src/design/tokens'
 import type {
   Brief,
   Message,
@@ -7,6 +9,7 @@ import type {
   UserSettings,
 } from '../src/api/types'
 import {
+  actionSnapshot,
   calendarProposal,
   DRAFT_ID,
   mailDraft,
@@ -20,7 +23,7 @@ import {
   connection,
   connectionCapabilities,
 } from '../src/test-support/editorFixtures'
-import { editorJson, editorWorkspace } from './fixtures/editorApi'
+import { editorAction, editorJson, editorWorkspace } from './fixtures/editorApi'
 
 /** 每种简报来源单独验证本地主键绑定；点击前没有 mutation，点击后也不产生审批。 */
 for (const kind of ['mail.reply', 'calendar.update'] as const) {
@@ -539,6 +542,61 @@ test('both provider capabilities and explicit work defaults are usable with boun
   expect(
     capture.mutations.filter((item) => item.path === '/settings'),
   ).toHaveLength(1)
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/**
+ * 从真实按钮及其可见祖先取得有效底色；不依赖 PrimeVue 内部节点或 class。
+ * @param button 当前正常／悬停／按下状态的公开语义按钮。
+ * @returns 不透明 sRGB 前景及有效背景，用生产的精确 WCAG 公式核对。
+ */
+async function secondaryButtonColors(button: Locator) {
+  return button.evaluate(node => {
+    const style = getComputedStyle(node)
+    let background = style.backgroundColor
+    let ancestor = node.parentElement
+    while (background === 'rgba(0, 0, 0, 0)' && ancestor) {
+      background = getComputedStyle(ancestor).backgroundColor
+      ancestor = ancestor.parentElement
+    }
+    return { color: style.color, background, opacity: style.opacity }
+  })
+}
+
+/** @param rgb 浏览器计算出的不透明 rgb；拒绝无法证明底色的 alpha 值，不猜测白色。 */
+function opaqueRgbHex(rgb: string): string {
+  const channels = /^rgb\((\d+), (\d+), (\d+)\)$/.exec(rgb)
+  if (!channels) throw new Error(`Expected opaque sRGB: ${rgb}`)
+  return '#' + channels.slice(1).map(value => Number(value).toString(16).padStart(2, '0')).join('')
+}
+
+/** 旧 outlined secondary 在页面底色上为4.47；键鼠状态只验证颜色，释放鼠标前移出按钮避免创建。 */
+test('secondary action buttons stay readable at rest, on hover and while pressed without mutations', async ({ page }) => {
+  const capture = await editorWorkspace(page)
+  await editorAction(page, () => actionSnapshot({ status: 'succeeded', error_code: null, approval: null, execution: null, local_action: null }))
+  await page.goto(`/actions?task=${TASK_ID}`)
+  for (const name of ['新日程', '关闭操作详情']) {
+    const button = page.getByRole('button', { name, exact: true })
+    await expect(button).toBeVisible()
+    for (const state of ['normal', 'hover', 'active']) {
+      if (state === 'normal') await page.mouse.move(0, 0)
+      else await button.hover()
+      if (state === 'active') await page.mouse.down()
+      // 完成真实有限颜色过渡，再测有效前后景；不关闭规则、不用固定睡眠。
+      await page.evaluate(async () => {
+        await Promise.all(document.getAnimations().filter(animation => Number.isFinite(Number(animation.effect?.getComputedTiming().endTime))).map(animation => animation.finished.catch(() => undefined)))
+      })
+      const colors = await secondaryButtonColors(button)
+      expect(colors.opacity).toBe('1')
+      expect(colors.color).toBe('rgb(72, 83, 101)')
+      expect(contrastRatio(opaqueRgbHex(colors.color), opaqueRgbHex(colors.background)), `${name}: ${state}`).toBeGreaterThanOrEqual(4.5)
+      if (state === 'active') { await page.mouse.move(0, 0); await page.mouse.up() }
+    }
+  }
+  const scan = await new AxeBuilder({ page }).analyze()
+  expect(scan.violations.filter(item => ['serious', 'critical'].includes(item.impact ?? '')).map(item => item.id)).toEqual([])
+  expect(capture.mutations).toEqual([])
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })

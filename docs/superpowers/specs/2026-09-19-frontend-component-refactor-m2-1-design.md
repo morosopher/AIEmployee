@@ -167,6 +167,11 @@ PrimeVue 商业产品线禁令保持不变。
 新增 `success` 与 `info` 由 Aura 默认 token 派生。任务状态、能力状态和审批状态的
 颜色映射集中在 `src/design/status.ts`，组件只引用语义名。
 
+Task 16 无障碍前置修复仅将浅色 Button `outlined.secondary.color` 与
+`text.secondary.color` 指向既有 `surface.600`（`semanticColors.text.secondary`）。原
+`surface.500` 在页面 `surface.50` 上实际对比度约 4.47，不满足 AA；正常、悬停、按下均在
+真实页面／卡片及各状态背景验证未经舍入的比值。边框、背景、其他严重度与状态 token 不变。
+
 ### 4.3 排版、间距与圆角
 
 - 字体栈使用系统 UI 字体，中文优先 `"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC"`，

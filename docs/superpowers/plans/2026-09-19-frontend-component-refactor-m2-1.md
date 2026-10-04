@@ -961,6 +961,19 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 
 ---
 
+### Task 16 前置 B：提高次级透明按钮文字对比度
+
+**Files:** `frontend/src/design/tokens.ts`、`tokens.spec.ts`、
+`frontend/e2e/action-workspace.spec.ts`，以及本计划与对应规格。
+
+- 正式 RED 由 PrimeVue 真实解析 token 验证 outlined/text secondary 在 card、surface.50
+  及悬停／按下背景的未经舍入比值，明确捕获原 4.47 < 4.5。
+- 仅将两种浅色 variant 的 color 指向既有 surface.600；不改变边框、背景或其他状态。
+- 浏览器使用真实操作中心按钮测量静态／悬停／按下颜色并执行 axe，保留零副作用与所有旧流程。
+- 完成前置 A/B 的统一验证后独立提交 `fix: improve secondary button contrast`，组合审查后继续Task16。
+
+---
+
 ### Task 16: 清理旧样式，启用强制门禁，加入无障碍与布局 E2E
 
 **Files:**

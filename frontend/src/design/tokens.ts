@@ -231,6 +231,16 @@ export const appPreset = definePreset(Aura, {
     },
   },
   components: {
+    button: {
+      colorScheme: {
+        light: {
+          // 透明次级按钮也出现在 surface.50 页面；原 surface.500 的 normal/hover/active 低于4.5。
+          // 只提高读色，保留 Aura 的背景、边框和其他严重度，三状态共享现有 surface.600。
+          outlined: { secondary: { color: '{surface.600}' } },
+          text: { secondary: { color: '{surface.600}' } },
+        },
+      },
+    },
     toggleswitch: {
       colorScheme: {
         light: {

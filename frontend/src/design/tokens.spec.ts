@@ -185,6 +185,31 @@ describe('appPreset', () => {
     expect(failing).toEqual([])
   })
 
+  /** 透明按钮的真实底色可能是页面；normal／hover／active 均比较原始比值，不能四舍五入放行。 */
+  it('keeps outlined and text secondary readable on card and page through every interaction state', () => {
+    const failing: Array<{
+      variant: string
+      surface: string
+      state: string
+      ratio: number
+    }> = []
+    for (const variant of ['outlined', 'text']) {
+      const foreground = solidColour(`button.${variant}.secondary.color`)
+      for (const surface of ['content.background', 'surface.50']) {
+        const backgrounds = {
+          normal: solidColour(surface),
+          hover: solidColour(`button.${variant}.secondary.hover.background`),
+          active: solidColour(`button.${variant}.secondary.active.background`),
+        }
+        for (const [state, background] of Object.entries(backgrounds)) {
+          const ratio = contrastRatio(foreground, background)
+          if (ratio < 4.5) failing.push({ variant, surface, state, ratio })
+        }
+      }
+    }
+    expect(failing).toEqual([])
+  })
+
   it('keeps form-field borders, field icons and switch tracks at WCAG 1.4.11 non-text contrast on card and page', () => {
     // 1.4.11 要求识别可交互控件及其状态所需的图形与背景至少 3:1；表单控件出现在卡片
     // （surface.0）与页面（surface.50）两种底色上，两者都要核对。
