@@ -981,7 +981,7 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 - Create: `frontend/e2e/support/axe.ts`、`frontend/e2e/accessibility.spec.ts`、`frontend/e2e/layout.spec.ts`
 - Modify: `frontend/playwright.config.ts`、`justfiles/test.just`、`scripts/check-frontend-styles.sh`、`scripts/test-tooling.sh`
 - Create: `frontend/src/test-support/liveRegionInventory.spec.ts`
-- Create: `frontend/src/test-support/live-regions/inventory.ts`、`assertions.ts`、`coreScenarios.ts`、`editorScenarios.ts`、`workspaceScenarios.ts`（测试专用清单、唯一播报断言与真实组件场景）
+- Create: `frontend/src/test-support/live-regions/inventory.ts`、`assertions.ts`、`assertions.spec.ts`、`coreScenarios.ts`、`editorScenarios.ts`、`workspaceScenarios.ts`（测试专用清单、唯一播报断言与真实组件场景）
 - Create: `frontend/e2e/support/visualWorkspace.ts`（复用既有 editorApi 与合成 fixture 的七视图装配）
 
 - [ ] **Step 1: 写失败的门禁与 E2E**

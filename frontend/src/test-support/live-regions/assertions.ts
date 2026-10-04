@@ -1,4 +1,4 @@
-import { screen, waitFor } from '@testing-library/vue'
+import { isInaccessible, screen, waitFor } from '@testing-library/vue'
 import { expect, vi } from 'vitest'
 import {
   additionalInventory,
@@ -19,7 +19,42 @@ export function setScenario(name: string): void {
 }
 const normalize = (text: string) => text.replace(/\s+/g, ' ').trim()
 
-/** 校验真实DOM语义根、有效播报优先级与非嵌套结构，并收集逐次观察。 */
+/** 只检查当前可感知的DOM；inert尚未被Testing Library的隐藏判断涵盖，需显式排除。 */
+function perceptible(node: Element): boolean {
+  return node.isConnected && !node.closest('[inert]') && !isInaccessible(node)
+}
+
+/**
+ * 取未隐藏文本节点，排除aria-hidden/hidden/inert装饰和退出副本；不模拟读屏器名称计算。
+ * @param node 已可感知的公告根或其文本子树。
+ */
+function visibleText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
+  if (node instanceof Element && !perceptible(node)) return ''
+  return Array.from(node.childNodes).map(visibleText).join('')
+}
+
+/**
+ * 合并ARIA默认会播报的三种role与显式live根；同节点的role/live只计一次。
+ * 自身off覆盖默认role；关闭的静态父区不成为根，明确开启的子根仍单独检查。
+ */
+function activeRoots(): HTMLElement[] {
+  const implicitRoles = ['status', 'alert', 'log'] as const
+  const candidates = new Set<HTMLElement>([
+    ...implicitRoles.flatMap((role) => screen.queryAllByRole(role)),
+    ...document.querySelectorAll<HTMLElement>(
+      '[aria-live="polite"], [aria-live="assertive"]',
+    ),
+  ])
+  // screen以body为容器，仅查其后代；body若自己声明live role，也要参与祖先检查。
+  if (implicitRoles.some((role) => document.body.getAttribute('role') === role))
+    candidates.add(document.body)
+  return [...candidates].filter(
+    (node) => perceptible(node) && node.getAttribute('aria-live') !== 'off',
+  )
+}
+
+/** 校验真实DOM语义、同文根集合及双向嵌套；不同文案不因匹配查询的相同前缀而混为一项。 */
 async function verify(
   id: string,
   role: InventoryEntry['role'],
@@ -30,25 +65,46 @@ async function verify(
   expect(activeScenario, id).toBe(scenario)
   let actual: string[] = []
   await waitFor(() => {
+    const roots = activeRoots()
+    const live = role !== 'dialog' && role !== 'alertdialog'
+    const texts = new Map<HTMLElement, string>()
+    const textOf = (node: HTMLElement): string => {
+      const value = texts.get(node) ?? normalize(visibleText(node))
+      texts.set(node, value)
+      return value
+    }
     const regions = screen
       .queryAllByRole(role)
-      .filter((node) =>
-        normalize(node.textContent ?? '').includes(normalize(text)),
+      .filter(
+        (node) =>
+          perceptible(node) &&
+          (!live || roots.includes(node)) &&
+          textOf(node).includes(normalize(text)),
       )
     expect(regions, `${id}: ${text}`).toHaveLength(count)
     for (const node of regions) {
-      expect(normalize(node.textContent ?? '')).not.toBe('')
-      if (role !== 'dialog' && role !== 'alertdialog') {
+      const announcement = textOf(node)
+      expect(announcement).not.toBe('')
+      if (live) {
         const politeness = role === 'alert' ? 'assertive' : 'polite'
         expect(node.getAttribute('aria-live') ?? politeness).toBe(politeness)
         expect(
-          node.parentElement?.closest(
-            '[role="status"], [role="alert"], [aria-live="polite"], [aria-live="assertive"]',
+          roots.filter(
+            (other) =>
+              other !== node && (other.contains(node) || node.contains(other)),
           ),
-        ).toBeNull()
+          `${id}: nested active announcements`,
+        ).toHaveLength(0)
+        // 原有双实例或同字段族的已登记数量由regions保留；额外role／无role同文根不能漏算。
+        expect(
+          roots.filter((other) => textOf(other) === announcement),
+          `${id}: duplicate announcement across roles or explicit live roots`,
+        ).toHaveLength(
+          regions.filter((other) => textOf(other) === announcement).length,
+        )
       }
     }
-    actual = regions.map((node) => normalize(node.textContent ?? ''))
+    actual = regions.map(textOf)
   })
   observed.add(id)
   observations.set(id, [

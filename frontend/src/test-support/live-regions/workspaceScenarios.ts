@@ -174,6 +174,12 @@ async function chatPage() {
   await assertLive('ChatPage:90', '任务：执行中 · 正在恢复实时连接')
   await assertLive('ChatPage:97', '操作快照读取失败，请在操作中心重新加载。')
   source.onopen?.(new Event('open'))
+  // 先等实际DOM完整文本恢复；短前缀也存在于断线文案，不能让includes提前保存旧观察。
+  await waitFor(() => {
+    const status = screen.getByTestId('chat-task-status')
+    expect(status.textContent?.replace(/\s+/g, ' ').trim()).toBe('任务：执行中')
+    expect(status).not.toHaveTextContent('正在恢复实时连接')
+  })
   await assertLive('ChatPage:90', '任务：执行中')
 }
 
