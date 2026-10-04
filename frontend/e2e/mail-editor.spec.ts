@@ -443,3 +443,93 @@ test('mail form loads on demand and retries a failed module without stale loadin
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })
+
+/** 活动项的实际样式必须跟随键盘目标；ARIA 关联或 class 存在本身不能证明删除目标可见。 */
+test('keyboard chip navigation visibly identifies the address that Backspace removes', async ({
+  page,
+}) => {
+  const capture = await editorWorkspace(page)
+  const addresses = ['First@example.test', 'Second@example.test']
+  await page.route(`**/api/v1/mail/drafts/${DRAFT_ID}`, (route) =>
+    editorJson(route, {
+      ...mailDraft(),
+      to: addresses,
+      subject: 'Synthetic heading',
+      body_text: 'Synthetic body',
+    }),
+  )
+  await page.goto(`/mail/drafts/${DRAFT_ID}`)
+  const input = page.getByRole('combobox', { name: '收件人 To', exact: true })
+  const selection = page.getByRole('group', {
+    name: '收件人 To已确认地址',
+    exact: true,
+  })
+  const first = page.getByRole('group', { name: addresses[0], exact: true })
+  const second = page.getByRole('group', { name: addresses[1], exact: true })
+  /** 通过公开具名 group 检查自身与后代的绘制属性；不依赖库内部 class 或固定 DOM 深度。 */
+  const visualState = (chip: typeof first) =>
+    chip.evaluate((node) =>
+      [node, ...node.querySelectorAll('*')].map((element) => {
+        const style = getComputedStyle(element)
+        return {
+          background: style.backgroundColor,
+          color: style.color,
+          outline: style.outline,
+          shadow: style.boxShadow,
+          border: style.borderColor,
+        }
+      }),
+    )
+  await input.focus()
+  const firstRest = await visualState(first)
+  const secondRest = await visualState(second)
+  const firstId = await first.getAttribute('id')
+  const secondId = await second.getAttribute('id')
+  expect(firstId).toBeTruthy()
+  expect(secondId).toBeTruthy()
+
+  await input.press('ArrowLeft')
+  await expect(selection).toBeFocused()
+  await expect(selection).toHaveAttribute(
+    'aria-activedescendant',
+    secondId ?? '',
+  )
+  await expect.poll(() => visualState(second)).not.toEqual(secondRest)
+  await expect.poll(() => visualState(first)).toEqual(firstRest)
+
+  await selection.press('ArrowLeft')
+  await expect(selection).toHaveAttribute(
+    'aria-activedescendant',
+    firstId ?? '',
+  )
+  await expect.poll(() => visualState(first)).not.toEqual(firstRest)
+  await expect.poll(() => visualState(second)).toEqual(secondRest)
+
+  await selection.press('ArrowRight')
+  await expect(selection).toHaveAttribute(
+    'aria-activedescendant',
+    secondId ?? '',
+  )
+  await expect.poll(() => visualState(second)).not.toEqual(secondRest)
+  await selection.press('ArrowRight')
+  await expect(input).toBeFocused()
+  await expect.poll(() => visualState(first)).toEqual(firstRest)
+  await expect.poll(() => visualState(second)).toEqual(secondRest)
+
+  await input.press('ArrowLeft')
+  await expect(selection).toHaveAttribute(
+    'aria-activedescendant',
+    secondId ?? '',
+  )
+  await selection.press('Backspace')
+  await expect(second).toHaveCount(0)
+  await expect(first).toBeVisible()
+  await expect(input).toBeFocused()
+  await expect.poll(() => recipientValue(page, '收件人 To')).toBe(addresses[0])
+  expect(capture.mutations).toEqual([])
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+  expect(
+    await page.evaluate(() => [localStorage.length, sessionStorage.length]),
+  ).toEqual([0, 0])
+})

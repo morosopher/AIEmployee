@@ -2,6 +2,7 @@
 import { computed, reactive, watch } from 'vue'
 import AutoComplete from 'primevue/autocomplete'
 import Button from 'primevue/button'
+import Chip from 'primevue/chip'
 import InputText from 'primevue/inputtext'
 import Textarea from 'primevue/textarea'
 import Message from 'primevue/message'
@@ -110,6 +111,14 @@ function search(name: RecipientField, query: string): void {
     address.toLowerCase().includes(query.toLowerCase()),
   )
 }
+/**
+ * PrimeVue 4.5.5 运行时公开 chip slot 的 class 未列入其声明；只收窄实际字符串，不断言未知形状。
+ * @param slot 当前 chip 的公开 slot 数据。
+ * @returns 主题活动样式类；缺少公开值时保持未设置，不拼接库内部类名。
+ */
+function chipStyleClass(slot: object): string | undefined {
+  return 'class' in slot && typeof slot.class === 'string' ? slot.class : undefined
+}
 </script>
 <template>
   <div class="grid min-w-0 gap-4">
@@ -169,23 +178,25 @@ function search(name: RecipientField, query: string): void {
         @update:model-value="updateChips(field.name, $event)"
         @complete="search(field.name, $event.query)"
       >
-        <template #chip="{ value, removeCallback }">
-          <span
-            class="inline-flex max-w-full items-center gap-1 rounded-md bg-surface-100 pl-2"
+        <template #chip="chip">
+          <!-- 公开 slot class 连接活动项主题样式；普通及活动背景均由 Chip token 决定，避免工具类覆盖。 -->
+          <Chip
+            :class="chipStyleClass(chip)"
+            class="max-w-full gap-1 pl-2"
           >
-            <span class="min-w-0 break-all">{{ value }}</span>
+            <span class="min-w-0 break-all">{{ chip.value }}</span>
             <Button
               type="button"
               icon="pi pi-times"
-              :aria-label="`移除${field.label}中的${value}`"
+              :aria-label="`移除${field.label}中的${chip.value}`"
               text
               rounded
               severity="secondary"
               size="small"
               :disabled="disabled"
-              @click="removeCallback"
+              @click="chip.removeCallback"
             />
-          </span>
+          </Chip>
         </template>
       </AutoComplete>
       <Message
