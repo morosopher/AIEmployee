@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import type { ActionSnapshot, MailDraft } from '../src/api/types'
 import type { UpdateMailDraftInput } from '../src/api/mail'
 import {
@@ -11,6 +11,33 @@ import {
 import { connection, mailApproval } from '../src/test-support/editorFixtures'
 import { editorAction, editorJson, editorWorkspace } from './fixtures/editorApi'
 
+/** 只按公开角色编辑多选输入；既有芯片与未确认文字一并核对，不丢弃保存载荷。 */
+async function fillRecipient(
+  page: Page,
+  label: string,
+  value: string,
+): Promise<void> {
+  const remove = page.getByRole('button', {
+    name: new RegExp(`^移除${label}中的`),
+  })
+  while (await remove.count()) await remove.first().click()
+  await page.getByRole('combobox', { name: label, exact: true }).fill(value)
+}
+
+/** 汇总完整可见地址，保持原大小写和顺序断言，不依赖 PrimeVue 内部结构。 */
+async function recipientValue(page: Page, label: string): Promise<string> {
+  const labels = await page
+    .getByRole('button', { name: new RegExp(`^移除${label}中的`) })
+    .evaluateAll((buttons) =>
+      buttons.map((button) => button.getAttribute('aria-label') ?? ''),
+    )
+  const chips = labels.map((value) => value.replace(`移除${label}中的`, ''))
+  const pending = await page
+    .getByRole('combobox', { name: label, exact: true })
+    .inputValue()
+  return [...chips, ...(pending ? [pending] : [])].join(', ')
+}
+
 /** 邮箱身份只归一域名；真实输入控件、人数与保存请求必须保留用户给出的本地部分大小写。 */
 test('mailbox identity preserves local part case and original input through visible count and save', async ({
   page,
@@ -19,7 +46,14 @@ test('mailbox identity preserves local part case and original input through visi
   const to = 'CaseUser@mail.example.test'
   const duplicate = 'CaseUser@MAIL.EXAMPLE.TEST'
   const distinct = 'caseUser@MAIL.EXAMPLE.TEST'
-  let draft: MailDraft = { ...mailDraft(), to: [to], cc: [], bcc: [] }
+  let draft: MailDraft = {
+    ...mailDraft(),
+    to: [to],
+    cc: [],
+    bcc: [],
+    subject: 'Synthetic heading',
+    body_text: 'Synthetic body',
+  }
   await page.route(`**/api/v1/mail/drafts/${DRAFT_ID}`, async (route) => {
     if (route.request().method() === 'PATCH') {
       const input = route.request().postDataJSON() as UpdateMailDraftInput
@@ -36,28 +70,27 @@ test('mailbox identity preserves local part case and original input through visi
     await editorJson(route, draft)
   })
   await page.goto(`/mail/drafts/${DRAFT_ID}`)
-  const toInput = page.getByLabel('收件人 To', { exact: true })
   const ccInput = page.getByLabel('抄送 CC', { exact: true })
   await ccInput.fill(duplicate)
-  await expect(page.getByTestId('recipient-count')).toContainText(
-    '收件人地址重复',
-  )
-  await page.locator('button[name="save-draft"]').click()
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toContainText('收件人地址重复')
+  await page.getByRole('button', { name: '保存草稿', exact: true }).click()
   await expect(page.getByRole('alert')).toContainText('收件人地址重复')
   expect(capture.mutations).toHaveLength(0)
   await expect(ccInput).toHaveValue(duplicate)
 
   await ccInput.fill(distinct)
-  await expect(page.getByTestId('recipient-count')).toHaveText(
-    '当前收件人数：2 位',
-  )
-  await page.locator('button[name="save-draft"]').click()
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toHaveText('当前收件人数：2 位')
+  await page.getByRole('button', { name: '保存草稿', exact: true }).click()
   await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
-  await expect(page.getByTestId('recipient-count')).toHaveText(
-    '当前收件人数：2 位',
-  )
-  await expect(toInput).toHaveValue(to)
-  await expect(ccInput).toHaveValue(distinct)
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toHaveText('当前收件人数：2 位')
+  await expect.poll(() => recipientValue(page, '收件人 To')).toBe(to)
+  await expect.poll(() => recipientValue(page, '抄送 CC')).toBe(distinct)
   expect(capture.mutations.map((item) => item.path)).toEqual([
     `/mail/drafts/${DRAFT_ID}`,
   ])
@@ -162,31 +195,28 @@ test('new mail stays local until explicit submission and can withdraw its frozen
   expect(capture.mutations).toHaveLength(0)
   await page.getByRole('button', { name: '新邮件', exact: true }).click()
   await expect(page).toHaveURL(new RegExp(`/mail/drafts/${DRAFT_ID}$`))
-  await page.getByLabel('发送账户', { exact: true }).selectOption(microsoft.id)
-  await page
-    .getByLabel('收件人 To', { exact: true })
-    .fill('recipient@example.test')
+  await page.getByRole('combobox', { name: '发送账户', exact: true }).click()
+  await page.getByRole('option', { name: /Microsoft/ }).click()
+  await fillRecipient(page, '收件人 To', 'recipient@example.test')
   await page.getByLabel('抄送 CC', { exact: true }).fill('copy@example.test')
   await page.getByLabel('密送 BCC', { exact: true }).fill('blind@example.test')
-  await expect(page.getByTestId('recipient-count')).toHaveText(
-    '当前收件人数：3 位',
-  )
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toHaveText('当前收件人数：3 位')
   const bccInput = page.getByLabel('密送 BCC', { exact: true })
-  const originalBcc = await bccInput.inputValue()
+  const originalBcc = await recipientValue(page, '密送 BCC')
   await bccInput.fill(`${originalBcc}, synthetic-extra@example.test`)
-  await expect(page.getByTestId('recipient-count')).toHaveText(
-    '当前收件人数：4 位',
-  )
-  await bccInput.fill(
-    await page.getByLabel('收件人 To', { exact: true }).inputValue(),
-  )
-  await expect(page.getByTestId('recipient-count')).toContainText(
-    '收件人数待核对',
-  )
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toHaveText('当前收件人数：4 位')
+  await bccInput.fill(await recipientValue(page, '收件人 To'))
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toContainText('收件人数待核对')
   await bccInput.fill(originalBcc)
-  await expect(page.getByTestId('recipient-count')).toHaveText(
-    '当前收件人数：3 位',
-  )
+  await expect(
+    page.getByRole('status').filter({ hasText: /收件人数/ }),
+  ).toHaveText('当前收件人数：3 位')
   await page
     .getByLabel('主题', { exact: true })
     .fill('Synthetic subject browser review')
@@ -209,10 +239,10 @@ test('new mail stays local until explicit submission and can withdraw its frozen
   await expect(preview).toContainText('不可撤回')
   expect(
     await preview
-      .locator('.plain-text')
+      .getByText('Synthetic body <strong>plain text</strong>', { exact: true })
       .evaluate((node) => node.children.length),
   ).toBe(0)
-  await expect(page.locator('.action-detail pre')).toHaveCount(0)
+  await expect(page.getByRole('article').locator('pre')).toHaveCount(0)
   expect(
     capture.mutations.filter((item) => item.path.endsWith('/decision')),
   ).toHaveLength(0)
@@ -226,7 +256,7 @@ test('new mail stays local until explicit submission and can withdraw its frozen
   expect(submission?.intent).toMatch(/^[0-9a-f-]{36}$/)
   expect(creation?.intent).not.toBe(submission?.intent)
   await page.getByRole('button', { name: '撤回审批以继续编辑' }).click()
-  await expect(page.locator('.action-detail')).toContainText('已取消')
+  await expect(page.getByRole('article')).toContainText('已取消')
   await page.getByRole('link', { name: '打开邮件草稿', exact: true }).click()
   await expect(page.getByLabel('纯文本正文', { exact: true })).toBeEnabled()
   expect(
@@ -355,14 +385,12 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
         ).length,
     )
     .toBe(1)
-  await expect(page.locator('.action-detail')).not.toContainText('人工结论：')
+  await expect(page.getByRole('article')).not.toContainText('人工结论：')
   await expect(
     dialog.getByRole('button', { name: '确认记录结果' }),
   ).toBeDisabled()
   releaseRead()
-  await expect(page.locator('.action-detail')).toContainText(
-    '人工结论：确认未执行',
-  )
+  await expect(page.getByRole('article')).toContainText('人工结论：确认未执行')
   await expect(page.getByRole('dialog')).toHaveCount(0)
   expect(capture.mutations.map((item) => item.path)).toEqual([
     `/actions/${TASK_ID}/reconcile`,
@@ -373,6 +401,45 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true)
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 邮件重表单按需加载；失败与加载公告互斥，显式重载后恢复同一服务端草稿。 */
+test('mail form loads on demand and retries a failed module without stale loading or implicit writes', async ({
+  page,
+}) => {
+  const capture = await editorWorkspace(page)
+  await page.route(`**/api/v1/mail/drafts/${DRAFT_ID}`, (route) =>
+    editorJson(route, mailDraft()),
+  )
+  let attempts = 0
+  let release: (() => void) | undefined
+  await page.route('**/src/components/MailEditorForm.vue*', async (route) => {
+    attempts += 1
+    if (attempts === 1) return route.abort('failed')
+    await new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await route.continue()
+  })
+  await page.goto('/connections')
+  expect(attempts).toBe(0)
+  await page.goto(`/mail/drafts/${DRAFT_ID}`)
+  await expect(
+    page.getByRole('alert').filter({ hasText: '邮件表单加载失败' }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载邮件表单…' }),
+  ).toHaveCount(0)
+  await page.getByRole('button', { name: '重试加载表单' }).click()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载邮件表单…' }),
+  ).toHaveText('正在加载邮件表单…')
+  await expect.poll(() => attempts).toBe(2)
+  release?.()
+  await expect(page.getByRole('form', { name: '邮件草稿表单' })).toBeVisible()
+  expect(capture.mutations).toEqual([])
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })

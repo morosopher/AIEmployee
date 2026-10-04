@@ -1,5 +1,8 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
+import PrimeVue from 'primevue/config'
+import { primeVueOptions } from '@/design/primevue'
+import { installViewport, restoreViewport } from '@/test-support/viewport'
 import { defineComponent, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -40,6 +43,7 @@ vi.mock('@/composables/useTaskEvents', () => ({
 let current: CalendarProposal
 let wrappers: ReturnType<typeof mount>[] = []
 beforeEach(() => {
+  installViewport()
   vi.clearAllMocks()
   current = {
     ...calendarProposal(),
@@ -115,6 +119,7 @@ beforeEach(() => {
 afterEach(() => {
   wrappers.forEach((wrapper) => wrapper.unmount())
   wrappers = []
+  restoreViewport()
 })
 
 /** 页面使用真实受保护路由形状；目录、提案与候选全部来自合成端口。 */
@@ -133,7 +138,7 @@ async function renderPage() {
   })
   await router.push(`/calendar/proposals/${PROPOSAL_ID}`)
   const wrapper = mount(CalendarProposalPage, {
-    global: { plugins: [createPinia(), router] },
+    global: { plugins: [createPinia(), router, [PrimeVue, primeVueOptions]] },
   })
   wrappers.push(wrapper)
   await flushPromises()
@@ -562,9 +567,10 @@ describe('CalendarProposalPage', () => {
 
   it('reselects the exact calendar with a standalone confirmation and locks update sources', async () => {
     const { wrapper } = await renderPage()
-    await wrapper
-      .get('select[aria-label="日历账户"]')
-      .setValue(connection('microsoft').id)
+    const account = wrapper.get('[role="combobox"]')
+    await account.trigger('click')
+    await account.trigger('keydown', { key: 'End', code: 'End' })
+    await account.trigger('keydown', { key: 'Enter', code: 'Enter' })
     await wrapper
       .get('select[aria-label="目标日历"]')
       .setValue('synthetic-microsoft-calendar')
@@ -599,8 +605,8 @@ describe('CalendarProposalPage', () => {
     await wrapper.get('button[name="reload-editor"]').trigger('click')
     await flushPromises()
     expect(
-      wrapper.get('select[aria-label="日历账户"]').attributes('disabled'),
-    ).toBeDefined()
+      wrapper.get('[role="combobox"]').attributes('aria-disabled'),
+    ).toBe('true')
     expect(wrapper.text()).toContain('Synthetic original location')
     expect(wrapper.text()).toContain('synthetic-etag')
   })

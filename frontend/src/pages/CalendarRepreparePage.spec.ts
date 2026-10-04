@@ -1,5 +1,8 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
+import PrimeVue from 'primevue/config'
+import { primeVueOptions } from '@/design/primevue'
+import { installViewport, restoreViewport } from '@/test-support/viewport'
 import { ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -75,6 +78,7 @@ function knownFacts(value: CalendarProposal) {
 }
 
 beforeEach(() => {
+  installViewport()
   vi.clearAllMocks()
   current = updateProposal()
   prepared = {
@@ -109,6 +113,7 @@ beforeEach(() => {
 afterEach(() => {
   wrappers.forEach((wrapper) => wrapper.unmount())
   wrappers = []
+  restoreViewport()
 })
 
 /** 同一编辑器组件随真实路由参数变化；不用独立 DOM 壳掩盖晚到响应导航。 */
@@ -129,7 +134,7 @@ async function render(query = '') {
   await router.push(`/calendar/proposals/${PROPOSAL_ID}${query}`)
   const pinia = createPinia()
   const wrapper = mount(CalendarProposalPage, {
-    global: { plugins: [pinia, router] },
+    global: { plugins: [pinia, router, [PrimeVue, primeVueOptions]] },
   })
   wrappers.push(wrapper)
   await flushPromises()

@@ -680,18 +680,21 @@ git commit -m "feat: migrate action center to PrimeVue"
 ### Task 11: 迁移邮件编辑器
 
 **Files:**
+- Create: `frontend/src/components/MailEditorForm.vue`（真实异步 Form 展示边界；原 hook 留在页面）
+- Modify: `frontend/src/components/ProblemMessage.vue`、`frontend/src/components/ProblemMessage.spec.ts`（受控本地 description-only 模式，无伪造错误码）
+- Modify: `frontend/src/pages/CalendarProposalPage.spec.ts`、`frontend/src/pages/CalendarRepreparePage.spec.ts`（共享 Select 的最小角色选择器／PrimeVue 插件适配）
 - Create: `frontend/src/features/mail/schema.ts`、`frontend/src/features/mail/schema.spec.ts`
 - Modify: `frontend/src/pages/MailDraftPage.vue`、`frontend/src/pages/MailDraftPage.spec.ts`
 - Modify: `frontend/src/components/MailDraftFields.vue`、`frontend/src/components/LocalEditorFrame.vue`、`frontend/src/components/EditorConnectionSelect.vue`、`frontend/src/components/EditorRecovery.vue`
-- Modify: `frontend/e2e/mail-editor.spec.ts`
+- Modify: `frontend/e2e/mail-editor.spec.ts`、`frontend/e2e/calendar-editor.spec.ts`（后者仅适配 Task 10 后共享详情的旧 class 选择器）
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/MailDraftPage.spec.ts && pnpm --dir frontend test:e2e e2e/mail-editor.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的 schema 与迁移断言**
+- [x] **Step 2: 写失败的 schema 与迁移断言**
 
 schema 只校验：To 至少一个格式合法的地址、CC/BCC 每项格式合法、主题非空且长度上限、正文非空。断言：收件人为 `AutoComplete multiple`，建议只来自当前草稿已有收件人且不发起任何请求；回复/全部回复时线程与收件人锁定字段只读并有说明；「生成正文」按钮在生成中 `loading`，失败显示 `ProblemMessage`；保存冲突显示 `EditorRecovery` 且不清空输入；提交审批前显示收件人数与不可撤销提示；页面不含任何附件、格式或富文本控件（断言 `queryByRole('toolbar')` 为空、无 `input[type=file]`）；零浏览器存储。
 
@@ -699,20 +702,20 @@ Run: `pnpm --dir frontend test:unit --run src/features/mail src/pages/MailDraftP
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建**
+- [x] **Step 3: 重建**
 
 `features/mail` 既有逻辑、`useLocalActionCreation`、`api/mail.ts` 不动；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/features/mail src/pages/MailDraftPage.spec.ts src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/mail-editor.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/features/mail/schema.ts frontend/src/features/mail/schema.spec.ts frontend/src/pages/MailDraftPage.vue frontend/src/pages/MailDraftPage.spec.ts frontend/src/components/MailDraftFields.vue frontend/src/components/LocalEditorFrame.vue frontend/src/components/EditorConnectionSelect.vue frontend/src/components/EditorRecovery.vue frontend/e2e/mail-editor.spec.ts
+git add frontend/e2e/calendar-editor.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md frontend/src/components/MailEditorForm.vue frontend/src/components/ProblemMessage.vue frontend/src/components/ProblemMessage.spec.ts frontend/src/pages/CalendarProposalPage.spec.ts frontend/src/pages/CalendarRepreparePage.spec.ts frontend/src/features/mail/schema.ts frontend/src/features/mail/schema.spec.ts frontend/src/pages/MailDraftPage.vue frontend/src/pages/MailDraftPage.spec.ts frontend/src/components/MailDraftFields.vue frontend/src/components/LocalEditorFrame.vue frontend/src/components/EditorConnectionSelect.vue frontend/src/components/EditorRecovery.vue frontend/e2e/mail-editor.spec.ts
 git commit -m "feat: migrate mail editor to PrimeVue forms"
 ~~~
 

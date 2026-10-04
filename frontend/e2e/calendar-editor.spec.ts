@@ -428,7 +428,7 @@ test('calendar candidates advance the saved version before four explicit confirm
   await expect(preview).toContainText('外部同步')
   await expect(preview.getByRole('table')).toBeVisible()
   await page.getByRole('button', { name: '批准', exact: true }).click()
-  await expect(page.locator('.action-detail')).toContainText('已批准')
+  await expect(page.getByRole('article')).toContainText('已批准')
   expect(
     capture.mutations.filter((item) => item.path.endsWith('/decision')),
   ).toHaveLength(1)

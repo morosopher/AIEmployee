@@ -6,6 +6,20 @@ import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import ProblemMessage from './ProblemMessage.vue'
 
 describe('ProblemMessage', () => {
+  it('announces a controlled local failure without fabricating a server problem or trace', async () => {
+    const view = await renderWithPlugins(ProblemMessage, {
+      props: {
+        description: '草拟失败，原草稿仍保留。请检查任务历史并重新加载后再试。',
+      },
+    })
+    expect(view.getAllByRole('alert')).toHaveLength(1)
+    expect(view.getByRole('alert')).toHaveTextContent(
+      '草拟失败，原草稿仍保留。请检查任务历史并重新加载后再试。',
+    )
+    expect(view.queryByText(/追踪编号/)).toBeNull()
+    expect(view.queryByRole('button')).toBeNull()
+  })
+
   it('renders a controlled local explanation without exposing the remote title', async () => {
     const problem = new ProblemError({
       type: 'about:blank',
