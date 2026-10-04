@@ -89,6 +89,8 @@ watch(
 const navigationOpen = ref(false)
 const timelineOpen = ref(false)
 const confirmationOpen = ref(false)
+const pageModalOpen = ref(false)
+let pageModalTrigger: HTMLElement | null = null
 const mainContent = ref<HTMLElement | null>(null)
 let confirmationTrigger: HTMLElement | null = null
 /** 确认框显示前保存焦点，Dialog 原生归还焦点时背景可能仍处于更新中的 inert。 */
@@ -117,13 +119,32 @@ async function hideConfirmation(): Promise<void> {
   }
   mainContent.value?.focus()
 }
+/** 页面 Dialog 的 show／after-hide 复用外壳隔离；动画后解除 inert，再归还可用焦点。 */
+async function pageModalChanged(open: boolean): Promise<void> {
+  if (open) {
+    pageModalTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    pageModalOpen.value = true
+    return
+  }
+  if (!pageModalOpen.value) return
+  pageModalOpen.value = false
+  await nextTick()
+  const trigger = pageModalTrigger
+  pageModalTrigger = null
+  if (trigger?.isConnected && !trigger.matches(':disabled, [aria-disabled="true"]')) {
+    trigger.focus()
+    if (document.activeElement === trigger) return
+  }
+  mainContent.value?.focus()
+}
 const modalOpen = computed(
-  () => navigationOpen.value || timelineOpen.value || confirmationOpen.value,
+  () => navigationOpen.value || timelineOpen.value || confirmationOpen.value || pageModalOpen.value,
 )
 watch(
   () => route.path,
   () => {
     timelineOpen.value = false
+    void pageModalChanged(false)
   },
 )
 </script>
@@ -156,7 +177,7 @@ watch(
       tabindex="-1"
       class="min-w-0 p-4 md:p-6"
     >
-      <RouterView />
+      <RouterView @modal-change="pageModalChanged" />
     </main>
     <TimelineDrawer
       v-if="hasGlobalTimeline"

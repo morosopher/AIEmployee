@@ -1,31 +1,29 @@
 <script setup lang="ts">
+import Button from 'primevue/button'
+import ToggleSwitch from 'primevue/toggleswitch'
 import type { Weekday, WorkingHours } from '@/api/types'
+import { WEEKDAYS } from '@/features/settings/schema'
+import SettingsTimeInput from './SettingsTimeInput.vue'
 
-/** 每日区间以完整七日映射提交，空数组明确表示当天无工作时间。 */
-const props = defineProps<{ modelValue: WorkingHours }>()
+/** 七日时间是 Form 的一个复合字段；[] 明确表示非工作日，开关不新增传输字段。 */
+const props = defineProps<{
+  modelValue: WorkingHours
+  disabled?: boolean
+  invalid?: boolean
+  describedby?: string
+}>()
 const emit = defineEmits<{ 'update:modelValue': [hours: WorkingHours] }>()
-const weekdays: Array<{ key: Weekday; label: string }> = [
-  { key: 'monday', label: '星期一' },
-  { key: 'tuesday', label: '星期二' },
-  { key: 'wednesday', label: '星期三' },
-  { key: 'thursday', label: '星期四' },
-  { key: 'friday', label: '星期五' },
-  { key: 'saturday', label: '星期六' },
-  { key: 'sunday', label: '星期日' },
-]
-/** @param day 星期。@param intervals 用户编辑后的区间，只更新该天。 */
+/** @param day 星期。@param intervals 用户编辑后的区间；保持七日完整映射且不猜默认时间。 */
 function replace(day: Weekday, intervals: Array<[string, string]>): void {
   emit('update:modelValue', { ...props.modelValue, [day]: intervals })
 }
-/** @param day 星期。@param index 区间位置。@param endpoint 端点。@param event 原生时间输入。 */
+/** @param day 星期。@param index 位置。@param endpoint 端点。@param value 用户原始墙上时间。 */
 function change(
   day: Weekday,
   index: number,
   endpoint: 0 | 1,
-  event: Event,
+  value: string,
 ): void {
-  if (!(event.target instanceof HTMLInputElement)) return
-  const value = event.target.value
   replace(
     day,
     props.modelValue[day].map((interval, i) =>
@@ -39,78 +37,88 @@ function change(
 }
 </script>
 <template>
-  <fieldset>
-    <legend>每周工作时间（按所选 IANA 时区）</legend>
+  <fieldset
+    class="min-w-0 space-y-3"
+    :disabled="disabled"
+    :aria-describedby="describedby"
+  >
+    <legend class="font-semibold">
+      每周工作时间（按所选 IANA 时区）
+    </legend>
     <section
-      v-for="day in weekdays"
+      v-for="day in WEEKDAYS"
       :key="day.key"
-      :data-weekday="day.key"
-      class="working-day"
+      class="space-y-3 border-t border-surface-200 py-3"
     >
-      <h3>{{ day.label }}</h3>
-      <p v-if="!modelValue[day.key].length">
+      <div class="flex items-center gap-3">
+        <h3
+          :id="`${day.key}-heading`"
+          class="font-medium"
+        >
+          {{ day.label }}
+        </h3>
+        <ToggleSwitch
+          :input-id="`${day.key}-enabled`"
+          :model-value="modelValue[day.key].length > 0"
+          :form-control="{ novalidate: true }"
+          :disabled="disabled"
+          :aria-label="`${day.label}工作日`"
+          @update:model-value="replace(day.key, $event ? [['', '']] : [])"
+        />
+      </div>
+      <p
+        v-if="!modelValue[day.key].length"
+        class="text-muted-color"
+      >
         非工作日
       </p>
       <div
         v-for="(interval, index) in modelValue[day.key]"
         :key="index"
-        class="interval"
+        class="grid min-w-0 items-end gap-3 md:grid-cols-[1fr_1fr_auto]"
       >
-        <label>{{ day.label }}开始 {{ index + 1
-        }}<input
-          :name="`${day.key}-start-${index}`"
-          :value="interval[0]"
-          type="time"
-          required
-          @input="change(day.key, index, 0, $event)"
-        ></label>
-        <label>{{ day.label }}结束 {{ index + 1
-        }}<input
-          :name="`${day.key}-end-${index}`"
-          :value="interval[1]"
-          type="time"
-          required
-          @input="change(day.key, index, 1, $event)"
-        ></label>
-        <button
+        <div
+          v-for="endpoint in [0, 1] as const"
+          :key="endpoint"
+          class="grid min-w-0 gap-1"
+        >
+          <label
+            :for="`${day.key}-${endpoint === 0 ? 'start' : 'end'}-${index}`"
+          >{{ day.label }}{{ endpoint === 0 ? '开始' : '结束' }}
+            {{ index + 1 }}</label>
+          <SettingsTimeInput
+            :input-id="`${day.key}-${endpoint === 0 ? 'start' : 'end'}-${index}`"
+            :label="`${day.label}${endpoint === 0 ? '开始' : '结束'} ${index + 1}`"
+            :model-value="interval[endpoint]"
+            :disabled="disabled"
+            :invalid="invalid"
+            :describedby="describedby"
+            @update:model-value="change(day.key, index, endpoint, $event)"
+          />
+        </div>
+        <Button
           type="button"
+          label="删除区间"
+          severity="secondary"
+          outlined
           :aria-label="`删除${day.label}区间 ${index + 1}`"
+          :disabled="disabled"
           @click="
             replace(
               day.key,
               modelValue[day.key].filter((_, i) => i !== index),
             )
           "
-        >
-          删除区间
-        </button>
+        />
       </div>
-      <button
+      <Button
         type="button"
+        :label="`添加${day.label}区间`"
+        severity="secondary"
+        outlined
+        :disabled="disabled"
         @click="replace(day.key, [...modelValue[day.key], ['', '']])"
-      >
-        添加{{ day.label }}区间
-      </button>
+      />
     </section>
   </fieldset>
 </template>
-<style scoped>
-.working-day {
-  border-top: 1px solid #dce2ea;
-  padding: 0.75rem 0;
-}
-.interval {
-  display: flex;
-  align-items: end;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  margin-bottom: 0.5rem;
-}
-label {
-  display: grid;
-  gap: 0.3rem;
-}
-h3 {
-  font-size: 1rem;
-}
-</style>

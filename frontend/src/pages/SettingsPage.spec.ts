@@ -1,11 +1,33 @@
-import { flushPromises, mount } from '@vue/test-utils'
+/** 页面保留隐私／会话状态机；测试仅通过角色与 label 操作真实控件。 */
+import {
+  DOMWrapper,
+  enableAutoUnmount,
+  flushPromises,
+  mount,
+  type VueWrapper,
+} from '@vue/test-utils'
+import {
+  getByLabelText,
+  getByRole,
+  getAllByRole,
+  queryByRole,
+} from '@testing-library/vue'
 import { createPinia } from 'pinia'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
+import { primeVueOptions } from '@/design/primevue'
+import { installViewport, restoreViewport } from '@/test-support/viewport'
 import { getCurrentUser, getTask, ProblemError } from '@/api/client'
-import { requestSourceCacheDeletion } from '@/api/privacy'
+import {
+  requestAllDataDeletion,
+  requestSourceCacheDeletion,
+} from '@/api/privacy'
+import { listSessions, revokeSession } from '@/api/auth'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import SettingsPage from './SettingsPage.vue'
 import { getSettings, updateSettings } from '@/api/settings'
+import { listConnections, getConnectionCapabilities } from '@/api/connections'
 import { userSettings } from '@/test-support/actionFixtures'
 import {
   connection,
@@ -13,102 +35,151 @@ import {
 } from '@/test-support/editorFixtures'
 
 vi.mock('@/api/connections', () => ({
-  listConnections: vi.fn().mockResolvedValue([]),
+  listConnections: vi.fn(),
   getConnectionCapabilities: vi.fn(),
 }))
-
 vi.mock('@/api/privacy', () => ({
-  requestSourceCacheDeletion: vi
-    .fn()
-    .mockResolvedValue({ task_id: 'source-task', status: 'queued' }),
-  requestAllDataDeletion: vi
-    .fn()
-    .mockResolvedValue({ task_id: 'all-task', status: 'queued' }),
+  requestSourceCacheDeletion: vi.fn(),
+  requestAllDataDeletion: vi.fn(),
 }))
-vi.mock('@/api/auth', () => ({
-  listSessions: vi.fn().mockResolvedValue([]),
-  revokeSession: vi.fn(),
-}))
+vi.mock('@/api/auth', () => ({ listSessions: vi.fn(), revokeSession: vi.fn() }))
 vi.mock('@/api/settings', () => ({
-  getSettings: vi
-    .fn()
-    .mockResolvedValue({
-      timezone: 'UTC',
-      locale: 'zh-CN',
-      brief_time: '08:00',
-      email_body_retention_days: 30,
-      source_metadata_retention_days: 180,
-      workspace_history_retention_days: 365,
-      updated_at: '2026-08-04T00:00:00Z',
-    }),
+  getSettings: vi.fn(),
   updateSettings: vi.fn(),
 }))
-vi.mock('@/api/client', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/api/client')>()
-  return {
-    ...actual,
-    getTask: vi
-      .fn()
-      .mockResolvedValue({
-        id: 'source-task',
-        kind: 'privacy.source_cache_deletion',
-        status: 'queued',
-        retry_of_task_id: null,
-        error_code: null,
-        event_cursor: '0',
-        steps: [],
-      }),
-    getCurrentUser: vi.fn(),
-  }
+vi.mock('@/api/client', async (original) => ({
+  ...(await original<typeof import('@/api/client')>()),
+  getTask: vi.fn(),
+  getCurrentUser: vi.fn(),
+}))
+
+enableAutoUnmount(afterEach)
+beforeEach(() => {
+  vi.resetAllMocks()
+  installViewport()
+  vi.mocked(getSettings).mockResolvedValue(userSettings())
+  vi.mocked(updateSettings).mockImplementation(async (patch) => ({
+    ...userSettings(),
+    ...patch,
+    working_hours: { ...userSettings().working_hours, ...patch.working_hours },
+  }))
+  vi.mocked(listConnections).mockResolvedValue([])
+  vi.mocked(listSessions).mockResolvedValue([])
+  vi.mocked(requestSourceCacheDeletion).mockResolvedValue({
+    task_id: 'source-task',
+    status: 'queued',
+  })
+  vi.mocked(requestAllDataDeletion).mockResolvedValue({
+    task_id: 'all-task',
+    status: 'queued',
+  })
+  vi.mocked(getTask).mockResolvedValue({
+    id: 'source-task',
+    kind: 'privacy.source_cache_deletion',
+    status: 'queued',
+    retry_of_task_id: null,
+    error_code: null,
+    event_cursor: '0',
+    steps: [],
+  })
+})
+afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+  restoreViewport()
 })
 
-/** 测试挂载真实路由实例，避免缺失注入把组件生命周期告警混入行为证据。 */
-function settingsRouter() {
-  return createRouter({
+/** 真实内存路由保留会话撤销跳转；挂载后的工作表单异步依赖由 flushPromises 等待。 */
+async function renderSettings() {
+  const router = createRouter({
     history: createMemoryHistory(),
     routes: [
       { path: '/settings', component: { template: '<p>settings</p>' } },
       { path: '/login', component: { template: '<p>login</p>' } },
+      { path: '/tasks', component: { template: '<p>tasks</p>' } },
     ],
+  })
+  await router.push('/settings')
+  const wrapper = mount(SettingsPage, {
+    attachTo: document.body,
+    global: {
+      plugins: [
+        createPinia(),
+        [PrimeVue, primeVueOptions],
+        ConfirmationService,
+        router,
+      ],
+      stubs: { transition: false },
+    },
+  })
+  await vi.waitFor(() => {
+    expect(queryByRole(wrapper.element as HTMLElement, 'form')).not.toBeNull()
+  })
+  return { wrapper, router }
+}
+function button(wrapper: VueWrapper, name: string) {
+  return new DOMWrapper(
+    getByRole(wrapper.element as HTMLElement, 'button', { name }),
+  )
+}
+function field(label: string) {
+  return new DOMWrapper(getByLabelText(document.body, label))
+}
+/** 控件由原生 select 迁移为 Select；选项仍由用户明确选择，不直接改组件状态。 */
+async function select(label: string, option: string | RegExp) {
+  const control = getByRole(document.body, 'combobox', { name: label })
+  await new DOMWrapper(control).trigger('click')
+  const list = document.getElementById(
+    control.getAttribute('aria-controls') ?? '',
+  )
+  if (!list) throw new Error('Select listbox is missing')
+  await new DOMWrapper(getByRole(list, 'option', { name: option })).trigger(
+    'mousedown',
+  )
+}
+async function submit() {
+  await new DOMWrapper(getByRole(document.body, 'form')).trigger('submit')
+  await flushPromises()
+}
+async function confirmAll(wrapper: VueWrapper) {
+  await button(wrapper, '删除全部数据').trigger('click')
+  await field('确认全部删除').setValue('DELETE ALL DATA')
+  await new DOMWrapper(
+    getByRole(document.body, 'button', { name: '确认删除全部数据' }),
+  ).trigger('click')
+  await flushPromises()
+}
+function problem(status: number) {
+  return new ProblemError({
+    type: 'about:blank',
+    title: 'Synthetic',
+    status,
+    detail: '',
+    instance: '',
+    error_code: status === 401 ? 'session_expired' : 'task_not_found',
+    trace_id: 'test',
   })
 }
 
 describe('SettingsPage', () => {
   it('edits seven-day intervals, exact defaults and a bounded meeting buffer', async () => {
-    const { listConnections, getConnectionCapabilities } =
-      await import('@/api/connections')
-    vi.mocked(getSettings).mockResolvedValue(userSettings())
-    vi.mocked(updateSettings).mockImplementation(async (patch) => ({
-      ...userSettings(),
-      ...patch,
-      working_hours: {
-        ...userSettings().working_hours,
-        ...patch.working_hours,
-      },
-    }))
     vi.mocked(listConnections).mockResolvedValue([connection()])
     vi.mocked(getConnectionCapabilities).mockResolvedValue(
       connectionCapabilities(),
     )
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    await flushPromises()
-    expect(wrapper.findAll('[data-weekday]')).toHaveLength(7)
-    await wrapper.get('select[name="default-mail"]').setValue(connection().id)
-    await wrapper
-      .get('select[name="default-calendar-connection"]')
-      .setValue(connection().id)
-    await wrapper
-      .get('select[name="default-calendar"]')
-      .setValue('synthetic-google-calendar')
-    await wrapper.get('input[name="meeting-buffer"]').setValue(120)
-    await wrapper.get('input[name="monday-start-0"]').setValue('10:00')
-    await wrapper.get('form').trigger('submit')
-    await flushPromises()
+    const { wrapper } = await renderSettings()
+    expect(
+      getAllByRole(wrapper.element as HTMLElement, 'heading', {
+        name: /^星期/,
+      }),
+    ).toHaveLength(7)
+    await select('默认发送账户', /Google/)
+    await select('默认日历账户', /Google/)
+    await select('默认日历', /Synthetic calendar/)
+    await field('会议缓冲（0–120 分钟）').setValue('120')
+    await field('会议缓冲（0–120 分钟）').trigger('blur')
+    await field('星期一开始 1').setValue('10:00')
+    await submit()
     expect(updateSettings).toHaveBeenLastCalledWith(
       expect.objectContaining({
         default_mail_connection_id: connection().id,
@@ -125,16 +196,14 @@ describe('SettingsPage', () => {
       'updated_at',
     )
     vi.mocked(updateSettings).mockClear()
-    await wrapper.get('input[name="meeting-buffer"]').setValue(121)
-    await wrapper.get('form').trigger('submit')
+    await field('会议缓冲（0–120 分钟）').setValue('121')
+    await field('会议缓冲（0–120 分钟）').trigger('blur')
+    await submit()
     expect(updateSettings).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('0–120')
-    wrapper.unmount()
   })
 
   it('keeps an inactive saved default visible and never silently picks another account', async () => {
-    const { listConnections, getConnectionCapabilities } =
-      await import('@/api/connections')
     vi.mocked(getSettings).mockResolvedValue({
       ...userSettings(),
       default_mail_connection_id: connection('microsoft').id,
@@ -143,151 +212,87 @@ describe('SettingsPage', () => {
     vi.mocked(getConnectionCapabilities).mockResolvedValue(
       connectionCapabilities(),
     )
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    await flushPromises()
+    const { wrapper } = await renderSettings()
     expect(
-      (wrapper.get('select[name="default-mail"]').element as HTMLSelectElement)
-        .value,
-    ).toBe(connection('microsoft').id)
-    expect(wrapper.text()).toContain('默认账户已不可用')
-    wrapper.unmount()
+      getByRole(wrapper.element as HTMLElement, 'combobox', {
+        name: '默认发送账户',
+      }).textContent,
+    ).toContain('默认账户已不可用')
+    await submit()
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        default_mail_connection_id: connection('microsoft').id,
+      }),
+    )
   })
 
   it('renders retention controls and saves settings', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi
-        .fn()
-        .mockResolvedValue({
-          ok: true,
-          json: async () => ({
-            timezone: 'UTC',
-            locale: 'zh-CN',
-            brief_time: '08:00',
-            email_body_retention_days: 30,
-            source_metadata_retention_days: 180,
-            workspace_history_retention_days: 365,
-            updated_at: '2026-08-04T00:00:00Z',
-          }),
-        }),
+    await renderSettings()
+    await field('邮件正文保留天数').setValue('45')
+    await field('邮件正文保留天数').trigger('blur')
+    await submit()
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ email_body_retention_days: 45 }),
     )
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: {
-          RouterLink: {
-            template:
-              '<a :href="to.path + \'?task_id=\' + to.query.task_id"><slot /></a>',
-            props: ['to'],
-          },
-        },
-      },
-    })
-    await flushPromises()
-    expect(wrapper.text()).toContain('邮件正文保留天数')
   })
 
-  it('requires exact confirmation and links accepted deletion tasks', async () => {
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: {
-          RouterLink: {
-            template:
-              '<a :href="to.path + \'?task_id=\' + to.query.task_id"><slot /></a>',
-            props: ['to'],
-          },
-        },
-      },
-    })
-    // 用户输入确认前必须可见外部副作用说明；本地删除成功不能被理解为供应商撤回成功。
+  it('requires an exact modal confirmation and links accepted deletion tasks', async () => {
+    const { wrapper } = await renderSettings()
     expect(wrapper.text()).toContain(
       '删除本地数据不能撤回已发送的邮件或已生效的日程变更。',
     )
     expect(wrapper.text()).toContain('结果未知的操作也可能已在供应商侧生效。')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    expect(allDataButton).toBeDefined()
-    if (!allDataButton) throw new Error('All-data button missing')
-    await allDataButton.trigger('click')
-    expect(wrapper.text()).toContain('DELETE ALL DATA')
-    const input = wrapper
-      .findAll('input')
-      .find((node) => node.attributes('autocomplete') === 'off')
-    expect(input).toBeDefined()
-    if (!input) throw new Error('Confirmation input missing')
-    await input.setValue('DELETE ALL DATA')
-    await allDataButton.trigger('click')
+    await button(wrapper, '删除全部数据').trigger('click')
+    const dialog = getByRole(document.body, 'dialog', { name: '删除全部数据' })
+    expect(dialog.getAttribute('aria-modal')).toBe('true')
+    expect(dialog.textContent).toContain('DELETE ALL DATA')
+    await field('确认全部删除').setValue('delete all data')
+    await new DOMWrapper(
+      getByRole(dialog, 'button', { name: '确认删除全部数据' }),
+    ).trigger('click')
+    expect(requestAllDataDeletion).not.toHaveBeenCalled()
+    expect(getByRole(dialog, 'alert').textContent).toContain(
+      '请输入 DELETE ALL DATA 以确认。',
+    )
+    await field('确认全部删除').setValue('DELETE ALL DATA')
+    await new DOMWrapper(
+      getByRole(dialog, 'button', { name: '确认删除全部数据' }),
+    ).trigger('click')
     await flushPromises()
-    expect(wrapper.find('a[href="/tasks?task_id=all-task"]').exists()).toBe(
-      true,
+    expect(requestAllDataDeletion).toHaveBeenCalledWith(
+      'DELETE ALL DATA',
+      expect.stringMatching(/^all-data-/),
     )
-    expect(wrapper.find('a[href="/tasks?task_id=source-task"]').exists()).toBe(
-      false,
-    )
+    expect(
+      getByRole(wrapper.element as HTMLElement, 'link', {
+        name: '查看全部数据删除任务',
+      }).getAttribute('href'),
+    ).toBe('/tasks?task_id=all-task')
+    expect(
+      queryByRole(wrapper.element as HTMLElement, 'link', {
+        name: '查看来源缓存删除任务',
+      }),
+    ).toBeNull()
   })
 
   it('keeps both destructive controls disabled after a 202 task receipt', async () => {
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: {
-          RouterLink: {
-            template:
-              '<a :href="to.path + \'?task_id=\' + to.query.task_id"><slot /></a>',
-            props: ['to'],
-          },
-        },
-      },
-    })
-    const sourceButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除来源缓存')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!sourceButton || !allDataButton)
-      throw new Error('Deletion controls missing')
-    await sourceButton.trigger('click')
+    const { wrapper } = await renderSettings()
+    await button(wrapper, '删除来源缓存').trigger('click')
     await flushPromises()
+    expect(button(wrapper, '删除来源缓存').attributes('disabled')).toBeDefined()
+    expect(button(wrapper, '删除全部数据').attributes('disabled')).toBeDefined()
     expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除来源缓存')
-        ?.attributes('disabled'),
-    ).toBeDefined()
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除全部数据')
-        ?.attributes('disabled'),
-    ).toBeDefined()
-    expect(wrapper.find('a[href="/tasks?task_id=source-task"]').exists()).toBe(
-      true,
-    )
+      getByRole(wrapper.element as HTMLElement, 'link', {
+        name: '查看来源缓存删除任务',
+      }).getAttribute('href'),
+    ).toBe('/tasks?task_id=source-task')
   })
 
   it('submits a source-cache deletion only once during a rapid double click', async () => {
-    vi.mocked(requestSourceCacheDeletion).mockClear()
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const sourceButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除来源缓存')
-    if (!sourceButton) throw new Error('Source deletion control missing')
+    const { wrapper } = await renderSettings()
     await Promise.all([
-      sourceButton.trigger('click'),
-      sourceButton.trigger('click'),
+      button(wrapper, '删除来源缓存').trigger('click'),
+      button(wrapper, '删除来源缓存').trigger('click'),
     ])
     await flushPromises()
     expect(requestSourceCacheDeletion).toHaveBeenCalledTimes(1)
@@ -295,32 +300,21 @@ describe('SettingsPage', () => {
 
   it('does not start task polling when an unmounted deletion request later resolves', async () => {
     vi.useFakeTimers()
-    vi.mocked(getTask).mockClear()
-    let resolveRequest:
+    let resolve:
       ((value: { task_id: string; status: string }) => void) | undefined
     vi.mocked(requestSourceCacheDeletion).mockImplementationOnce(
       () =>
-        new Promise((resolve) => {
-          resolveRequest = resolve
+        new Promise((done) => {
+          resolve = done
         }),
     )
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const sourceButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除来源缓存')
-    if (!sourceButton) throw new Error('Source deletion control missing')
-    await sourceButton.trigger('click')
+    const { wrapper } = await renderSettings()
+    await button(wrapper, '删除来源缓存').trigger('click')
     wrapper.unmount()
-    resolveRequest?.({ task_id: 'source-task', status: 'queued' })
+    resolve?.({ task_id: 'source-task', status: 'queued' })
     await flushPromises()
-    await vi.advanceTimersByTimeAsync(4_000)
+    await vi.advanceTimersByTimeAsync(4000)
     expect(getTask).not.toHaveBeenCalled()
-    vi.useRealTimers()
   })
 
   it('restores controls and shows failure after the accepted task becomes failed', async () => {
@@ -333,243 +327,91 @@ describe('SettingsPage', () => {
       event_cursor: '1',
       steps: [],
     })
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), settingsRouter()],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const sourceButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除来源缓存')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!sourceButton || !allDataButton)
-      throw new Error('Deletion controls missing')
-    await sourceButton.trigger('click')
+    const { wrapper } = await renderSettings()
+    await button(wrapper, '删除来源缓存').trigger('click')
     await flushPromises()
-    expect(sourceButton.attributes('disabled')).toBeUndefined()
-    expect(allDataButton.attributes('disabled')).toBeUndefined()
-    expect(wrapper.text()).toContain('删除任务失败')
+    expect(
+      button(wrapper, '删除来源缓存').attributes('disabled'),
+    ).toBeUndefined()
+    expect(
+      button(wrapper, '删除全部数据').attributes('disabled'),
+    ).toBeUndefined()
+    expect(
+      getByRole(wrapper.element as HTMLElement, 'alert').textContent,
+    ).toContain('删除任务失败')
   })
 
   it('redirects when all-data task polling returns the expected revoked-session status', async () => {
-    vi.mocked(getTask).mockRejectedValueOnce(
-      new ProblemError({
-        type: 'about:blank',
-        title: 'Unauthorized',
-        status: 401,
-        detail: '',
-        instance: '',
-        error_code: 'session_expired',
-        trace_id: 'test',
-      }),
-    )
-    vi.mocked(getCurrentUser).mockRejectedValueOnce(
-      new ProblemError({
-        type: 'about:blank',
-        title: 'Unauthorized',
-        status: 401,
-        detail: '',
-        instance: '',
-        error_code: 'session_expired',
-        trace_id: 'test',
-      }),
-    )
-    const router = createRouter({
-      history: createMemoryHistory(),
-      routes: [
-        { path: '/settings', component: SettingsPage },
-        { path: '/login', component: { template: '<p>login</p>' } },
-      ],
-    })
-    await router.push('/settings')
-    await router.isReady()
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), router],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const confirmation = wrapper
-      .findAll('input')
-      .find((node) => node.attributes('autocomplete') === 'off')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!confirmation || !allDataButton)
-      throw new Error('All-data controls missing')
-    await confirmation.setValue('DELETE ALL DATA')
-    await allDataButton.trigger('click')
-    await flushPromises()
+    vi.mocked(getTask).mockRejectedValueOnce(problem(401))
+    vi.mocked(getCurrentUser).mockRejectedValueOnce(problem(401))
+    const { wrapper, router } = await renderSettings()
+    await confirmAll(wrapper)
     expect(router.currentRoute.value.path).toBe('/login')
     expect(getCurrentUser).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps deletion pending when missing all-data task does not mean the session was revoked', async () => {
-    vi.mocked(getTask).mockRejectedValueOnce(
-      new ProblemError({
-        type: 'about:blank',
-        title: 'Not found',
-        status: 404,
-        detail: '',
-        instance: '',
-        error_code: 'task_not_found',
-        trace_id: 'test',
-      }),
-    )
-    vi.mocked(getCurrentUser).mockResolvedValueOnce({
-      id: 'user-1',
-      email: 'admin@example.test',
-      display_name: 'Admin',
-      timezone: 'UTC',
-      locale: 'zh-CN',
-      brief_time: '08:00',
-    })
-    const router = createRouter({
-      history: createMemoryHistory(),
-      routes: [
-        { path: '/settings', component: SettingsPage },
-        { path: '/login', component: { template: '<p>login</p>' } },
-      ],
-    })
-    await router.push('/settings')
-    await router.isReady()
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), router],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const confirmation = wrapper
-      .findAll('input')
-      .find((node) => node.attributes('autocomplete') === 'off')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!confirmation || !allDataButton)
-      throw new Error('All-data controls missing')
-    await confirmation.setValue('DELETE ALL DATA')
-    await allDataButton.trigger('click')
-    await flushPromises()
-    expect(router.currentRoute.value.path).toBe('/settings')
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除来源缓存')
-        ?.attributes('disabled'),
-    ).toBeDefined()
-    expect(allDataButton.attributes('disabled')).toBeDefined()
-  })
+  it.each(['valid', 'network', 'succeeded'] as const)(
+    'keeps deletion pending while the all-data session is %s',
+    async (mode) => {
+      if (mode === 'succeeded')
+        vi.mocked(getTask).mockResolvedValueOnce({
+          id: 'all-task',
+          kind: 'privacy.all_data_deletion',
+          status: 'succeeded',
+          retry_of_task_id: null,
+          error_code: null,
+          event_cursor: '1',
+          steps: [],
+        })
+      else vi.mocked(getTask).mockRejectedValueOnce(problem(404))
+      if (mode === 'network')
+        vi.mocked(getCurrentUser).mockRejectedValueOnce(
+          new Error('temporary network failure'),
+        )
+      else
+        vi.mocked(getCurrentUser).mockResolvedValueOnce({
+          id: 'user-1',
+          email: 'admin@example.test',
+          display_name: 'Admin',
+          timezone: 'UTC',
+          locale: 'zh-CN',
+          brief_time: '08:00',
+        })
+      const { wrapper, router } = await renderSettings()
+      await confirmAll(wrapper)
+      expect(router.currentRoute.value.path).toBe('/settings')
+      expect(getCurrentUser).toHaveBeenCalledTimes(1)
+      expect(
+        button(wrapper, '删除来源缓存').attributes('disabled'),
+      ).toBeDefined()
+      expect(
+        button(wrapper, '删除全部数据').attributes('disabled'),
+      ).toBeDefined()
+    },
+  )
 
-  it('keeps deletion pending when the follow-up session check temporarily fails', async () => {
-    vi.mocked(getTask).mockRejectedValueOnce(
-      new ProblemError({
-        type: 'about:blank',
-        title: 'Not found',
-        status: 404,
-        detail: '',
-        instance: '',
-        error_code: 'task_not_found',
-        trace_id: 'test',
-      }),
-    )
-    vi.mocked(getCurrentUser).mockRejectedValueOnce(
-      new Error('temporary network failure'),
-    )
-    const router = createRouter({
-      history: createMemoryHistory(),
-      routes: [
-        { path: '/settings', component: SettingsPage },
-        { path: '/login', component: { template: '<p>login</p>' } },
-      ],
-    })
-    await router.push('/settings')
-    await router.isReady()
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), router],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
+  it('retains explicit current-session revocation and redirects only after its response', async () => {
+    vi.mocked(listSessions).mockResolvedValue([
+      {
+        id: 'session-1',
+        created_at: '2026-10-01T00:00:00Z',
+        expires_at: '2026-10-05T00:00:00Z',
+        last_seen_at: '2026-10-04T00:00:00Z',
+        is_current: true,
       },
-    })
-    const confirmation = wrapper
-      .findAll('input')
-      .find((node) => node.attributes('autocomplete') === 'off')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!confirmation || !allDataButton)
-      throw new Error('All-data controls missing')
-    await confirmation.setValue('DELETE ALL DATA')
-    await allDataButton.trigger('click')
+    ])
+    const confirm = vi
+      .spyOn(window, 'confirm')
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true)
+    const { wrapper, router } = await renderSettings()
+    await button(wrapper, '撤销').trigger('click')
+    expect(revokeSession).not.toHaveBeenCalled()
+    await button(wrapper, '撤销').trigger('click')
     await flushPromises()
-    expect(router.currentRoute.value.path).toBe('/settings')
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除来源缓存')
-        ?.attributes('disabled'),
-    ).toBeDefined()
-    expect(allDataButton.attributes('disabled')).toBeDefined()
-  })
-
-  it('keeps destructive controls pending when all-data task succeeds but the session remains valid', async () => {
-    vi.mocked(getTask).mockResolvedValueOnce({
-      id: 'all-task',
-      kind: 'privacy.all_data_deletion',
-      status: 'succeeded',
-      retry_of_task_id: null,
-      error_code: null,
-      event_cursor: '1',
-      steps: [],
-    })
-    vi.mocked(getCurrentUser).mockResolvedValueOnce({
-      id: 'user-1',
-      email: 'admin@example.test',
-      display_name: 'Admin',
-      timezone: 'UTC',
-      locale: 'zh-CN',
-      brief_time: '08:00',
-    })
-    const router = createRouter({
-      history: createMemoryHistory(),
-      routes: [
-        { path: '/settings', component: SettingsPage },
-        { path: '/login', component: { template: '<p>login</p>' } },
-      ],
-    })
-    await router.push('/settings')
-    await router.isReady()
-    const wrapper = mount(SettingsPage, {
-      global: {
-        plugins: [createPinia(), router],
-        stubs: { RouterLink: { template: '<a><slot /></a>' } },
-      },
-    })
-    const confirmation = wrapper
-      .findAll('input')
-      .find((node) => node.attributes('autocomplete') === 'off')
-    const allDataButton = wrapper
-      .findAll('button')
-      .find((button) => button.text() === '删除全部数据')
-    if (!confirmation || !allDataButton)
-      throw new Error('All-data controls missing')
-    await confirmation.setValue('DELETE ALL DATA')
-    await allDataButton.trigger('click')
-    await flushPromises()
-    expect(router.currentRoute.value.path).toBe('/settings')
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除来源缓存')
-        ?.attributes('disabled'),
-    ).toBeDefined()
-    expect(
-      wrapper
-        .findAll('button')
-        .find((button) => button.text() === '删除全部数据')
-        ?.attributes('disabled'),
-    ).toBeDefined()
+    expect(confirm).toHaveBeenCalledWith('确定撤销该会话？')
+    expect(revokeSession).toHaveBeenCalledWith('session-1')
+    expect(router.currentRoute.value.path).toBe('/login')
+    confirm.mockRestore()
   })
 })

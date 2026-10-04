@@ -515,26 +515,25 @@ test('both provider capabilities and explicit work defaults are usable with boun
     ),
   ).toBeVisible()
   await page.goto('/settings')
-  await page
-    .getByRole('combobox', { name: '默认发送账户', exact: true })
-    .selectOption(microsoft.id)
-  await page
-    .getByRole('combobox', { name: '默认日历账户', exact: true })
-    .selectOption(google.id)
-  await page
-    .getByRole('combobox', { name: '默认日历', exact: true })
-    .selectOption('synthetic-google-calendar')
-  await page.locator('input[name="meeting-buffer"]').fill('121')
+  await page.getByRole('combobox', { name: '默认发送账户', exact: true }).click()
+  await page.getByRole('option', { name: `Microsoft · ${microsoft.account_email}`, exact: true }).click()
+  await expect(page.getByRole('listbox')).toHaveCount(0)
+  await page.getByRole('combobox', { name: '默认日历账户', exact: true }).click()
+  await page.getByRole('option', { name: `Google · ${google.account_email}`, exact: true }).click()
+  await expect(page.getByRole('listbox')).toHaveCount(0)
+  await page.getByRole('combobox', { name: '默认日历', exact: true }).click()
+  await page.getByRole('option', { name: /Synthetic calendar/ }).click()
+  await page.getByLabel('会议缓冲（0–120 分钟）', { exact: true }).fill('121')
   await page.getByRole('button', { name: '保存', exact: true }).click()
   expect(
     capture.mutations.filter((item) => item.path === '/settings'),
   ).toHaveLength(0)
-  await page.locator('input[name="meeting-buffer"]').fill('30')
+  await page.getByLabel('会议缓冲（0–120 分钟）', { exact: true }).fill('30')
   await page
     .getByRole('button', { name: '添加星期二区间', exact: true })
     .click()
-  await page.locator('input[name="tuesday-start-0"]').fill('10:00')
-  await page.locator('input[name="tuesday-end-0"]').fill('16:00')
+  await page.getByLabel('星期二开始 1', { exact: true }).fill('10:00')
+  await page.getByLabel('星期二结束 1', { exact: true }).fill('16:00')
   await page.getByRole('button', { name: '保存', exact: true }).click()
   await expect(page.getByText('已保存', { exact: true })).toBeVisible()
   expect(

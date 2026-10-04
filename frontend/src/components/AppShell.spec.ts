@@ -266,3 +266,37 @@ it('also isolates the recovery toast while a modal drawer is open', async () => 
   await view.findByRole('dialog', { name: '主导航' })
   expect(recovery.closest('[inert]')).not.toBeNull()
 })
+
+/** 页面私有 Dialog 通过相同展示事件通知外壳；与路由配置和 Store 无关。 */
+it('isolates the shell and restores focus for a routed page modal', async () => {
+  const PageModal = defineComponent({
+    emits: ['modal-change'],
+    setup(_props, { emit }) {
+      return () => h('div', [
+        h('button', { onClick: () => emit('modal-change', true) }, '打开页面确认'),
+        h('button', { onClick: () => emit('modal-change', false) }, '关闭页面确认'),
+      ])
+    },
+  })
+  const view = await renderWithPlugins(AppShell, { global: { stubs: { RouterView: PageModal } } })
+  const trigger = view.getByRole('button', { name: '打开页面确认' })
+  trigger.focus()
+  await fireEvent.click(trigger)
+  expect(trigger.closest('[inert]')).not.toBeNull()
+  await fireEvent.click(view.getByRole('button', { name: '关闭页面确认' }))
+  await waitFor(() => expect(trigger.closest('[inert]')).toBeNull())
+  await waitFor(() => expect(trigger).toHaveFocus())
+})
+
+it('clears a page modal isolation when its route leaves before an after-hide event', async () => {
+  const PageModal = defineComponent({
+    emits: ['modal-change'],
+    setup(_props, { emit }) { return () => h('button', { onClick: () => emit('modal-change', true) }, '页面确认') },
+  })
+  const view = await renderWithPlugins(AppShell, { route: '/settings', global: { stubs: { RouterView: PageModal } } })
+  const trigger = view.getByRole('button', { name: '页面确认' })
+  await fireEvent.click(trigger)
+  expect(trigger.closest('[inert]')).not.toBeNull()
+  await view.router.push('/actions')
+  await waitFor(() => expect(view.getByRole('main').closest('[inert]')).toBeNull())
+})

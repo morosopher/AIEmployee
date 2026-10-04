@@ -582,14 +582,20 @@ git commit -m "feat: migrate connections page to PrimeVue"
 - Create: `frontend/src/features/settings/schema.ts`、`frontend/src/features/settings/schema.spec.ts`
 - Modify: `frontend/src/pages/SettingsPage.vue`、`frontend/src/pages/SettingsPage.spec.ts`
 - Modify: `frontend/src/components/WorkSettingsForm.vue`、`frontend/src/components/WorkingHoursFields.vue`
+- Create: `frontend/src/components/WorkSettingsForm.spec.ts`、`frontend/src/components/SettingsTimeInput.vue`（timeOnly 墙上时间适配）、`frontend/e2e/settings.spec.ts`
+- Modify: `frontend/src/components/AppShell.vue`、`frontend/src/components/AppShell.spec.ts`（仅复用页面 `modal-change` 展示通知与背景隔离／焦点回归）
+- Verify: `frontend/e2e/daily-brief.spec.ts`（原语义选择器可继续使用，无需修改）
+- Modify: `frontend/e2e/action-workspace.spec.ts`（设置段语义选择器与原业务断言）
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+2026-10-04 展示细化：设置页异步加载现有 `WorkSettingsForm`，Form/zod/重控件保留于该边界内，并提供加载、失败、重试（浏览器缓存失败模块，明确整页重载重试）；不改路由配置及预算。七日字段作为完整 tuple 映射注册，增删与重载同步 Form；格式校验仅在提交时更新，避免 blur 错误提示重排导致按钮点击落空；每日 `ToggleSwitch` 仅派生空／非空，开启空日插入空区间要求明确填写。简报时间只无损归一零秒 `HH:mm:00`，非零秒／小数秒明确提示重新选择，不静默截断。页面注册未保存离开提示，使用全局 `ConfirmDialog`；删除确认 `Dialog` 通过既有 `modal-change` 模式通知 AppShell，不引入新 Store。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/SettingsPage.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的 schema 与错误映射测试**
+- [x] **Step 2: 写失败的 schema 与错误映射测试**
 
 测试使用既有合成 `UserSettings` fixture 和完整 `working_hours`（monday 至 sunday，每日零到多个 `[start, end]` 字符串二元组）：逐日逐区间构造结束不晚于开始的失败用例，同时覆盖合法多区间与空日。不得引入 `{ start, end }`、`work_start`/`work_end` 第二套字段。
 
@@ -597,28 +603,32 @@ Expected: PASS。
 
 错误映射测试使用现有七字段 `ProblemDetails` fixture 的最小码投影：逐个已知 `error_code` 映射安全中文表单级错误，未知码（包括继承属性名）得到安全 fallback；改变 `title`/`detail` 不影响映射，也不显示原文。真实页面从前置修复的 `ActionRecovery.problem` 接线，保留恢复动作、追踪编号及必要上下文原文。字段格式错误由 zod 提供；不制造 `errors` 数组或扩展 API 解析。
 
-- [ ] **Step 3: 运行并观察预期失败**
+- [x] **Step 3: 运行并观察预期失败**
 
 Run: `pnpm --dir frontend test:unit --run src/features/forms src/features/settings`
 
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 4: 实现 schema、映射与设置页**
+- [x] **Step 4: 实现 schema、映射与设置页**
 
 `problemFields.ts` 导出 `problemToFormError` 与已知 `error_code` 到安全中文表单级说明的冻结映射表；`settings/schema.ts` 导出 zod schema 与 `zodResolver`。`WorkSettingsForm.vue` 改用 `Form`，字段用 `Select filter`（时区）、`DatePicker timeOnly`（工作时间）、`InputNumber`（会议缓冲）、`ToggleSwitch`；默认发送账户、默认日历账户与默认日历使用 `Select`，保留失效原值与明确重选提示；七日多区间模型与提交参数不变；提交中 `loading`；409 显示 `EditorRecovery` 风格恢复动作且不清空输入。「删除全部数据」入口沿用既有 `DELETE ALL DATA` 输入确认，改为 `Dialog modal`，说明文案不变。删除 scoped CSS。
 
-- [ ] **Step 5: 运行聚焦检查**
+- [x] **Step 5: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/features/forms src/features/settings src/pages/SettingsPage.spec.ts src/api/privacy.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ~~~bash
-git add frontend/src/features/forms frontend/src/features/settings frontend/src/pages/SettingsPage.vue frontend/src/pages/SettingsPage.spec.ts frontend/src/components/WorkSettingsForm.vue frontend/src/components/WorkingHoursFields.vue
+git add frontend/src/features/forms frontend/src/features/settings/schema.ts frontend/src/features/settings/schema.spec.ts frontend/src/pages/SettingsPage.vue frontend/src/pages/SettingsPage.spec.ts frontend/src/components/WorkSettingsForm.vue frontend/src/components/WorkSettingsForm.spec.ts frontend/src/components/WorkingHoursFields.vue frontend/src/components/SettingsTimeInput.vue frontend/src/components/AppShell.vue frontend/src/components/AppShell.spec.ts frontend/e2e/settings.spec.ts frontend/e2e/action-workspace.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate settings to PrimeVue forms"
 ~~~
+
+2026-10-04 实施证据：旧页选择器／完整 fixture 基线单测 12 项、相关 E2E 9 项通过；schema／映射及真实 Form 已观察 RED 后实现。最终聚焦 66 项、相关 E2E 16 项、`just check`（后端 2730、前端 532）、生产构建及体积预算通过。入口 JS gzip 332902 B（比基线增加 192529 B），CSS 8959 B；异步表单 59010 B。生产浏览器 `/brief` 仅加载入口，进入 `/settings` 才加载表单 chunk；加载失败重载重试、删除 Dialog 焦点陷阱／Esc／返回、未保存取消／离开、409 草稿保留及两种宿主时区已实测。完整里程碑 CI 仍在 Task 17。
+
+Live region 同提交记录：WorkSettingsForm 原 3 个 status 场景（设置加载、目录加载、已保存）保持原文并显式 polite，原 3 个 alert 场景（目录失败、validation、恢复错误）保持；Message 内置 alert/assertive 承接原 role，真实错误码说明与原文相同只渲染一次。SettingsPage 原会话／删除错误两个 alert 场景保持，删除错误在页面与 Dialog 间互斥呈现。新增异步模块加载 status、失败 alert、字段格式错误 alert、删除 Dialog 与未保存 ConfirmDialog 场景；DatePicker 为新增控件浮层语义。运行时单测与浏览器校验上述实际状态，无空 role 补数。
 
 ---
 

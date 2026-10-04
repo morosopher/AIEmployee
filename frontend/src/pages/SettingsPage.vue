@@ -1,6 +1,20 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, computed } from 'vue'
-import WorkSettingsForm from '@/components/WorkSettingsForm.vue'
+import {
+  onMounted,
+  onUnmounted,
+  ref,
+  computed,
+  defineAsyncComponent,
+  defineComponent,
+  h,
+} from 'vue'
+import Button from 'primevue/button'
+import Card from 'primevue/card'
+import Dialog from 'primevue/dialog'
+import InputText from 'primevue/inputtext'
+import Message from 'primevue/message'
+import Skeleton from 'primevue/skeleton'
+import { useConfirm } from 'primevue/useconfirm'
 import { listSessions, revokeSession } from '@/api/auth'
 import {
   requestAllDataDeletion,
@@ -11,6 +25,51 @@ import { getCurrentUser, getTask, ProblemError } from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { RouterLink, useRouter } from 'vue-router'
 
+/** 页面浮层只通知外壳隔离背景，外壳负责动画结束后的焦点归还。 */
+const emit = defineEmits<{ 'modal-change': [open: boolean] }>()
+const moduleFailed = ref(false)
+/** Form/zod/DatePicker 在设置页才下载；失败必须有真实重试入口，不把失败变成空白。 */
+const WorkSettingsForm = defineAsyncComponent({
+  loader: () => import('@/components/WorkSettingsForm.vue'),
+  delay: 0,
+  loadingComponent: defineComponent({
+    setup: () => () =>
+      moduleFailed.value
+        ? null
+        : h('div', { class: 'space-y-2' }, [
+            h(
+              Message,
+              { severity: 'secondary', role: 'status', 'aria-live': 'polite' },
+              () => '正在加载工作设置表单…',
+            ),
+            h(Skeleton, { height: '3rem' }),
+          ]),
+  }),
+  onError() {
+    moduleFailed.value = true
+  },
+})
+/** 浏览器缓存失败的 ES 模块导入；明确整页重载后重试，避免假装重新发出了请求。 */
+function retryForm(): void {
+  window.location.reload()
+}
+const allDataDialogOpen = ref(false)
+const workSettingsDirty = ref(false)
+const confirmation = useConfirm()
+let settleLeave: ((accepted: boolean) => void) | null = null
+/** 同意、拒绝、Esc 与卸载只结算一次；提示不包含用户正文或字段摘录。 */
+function finishLeave(accepted: boolean): void {
+  const settle = settleLeave
+  settleLeave = null
+  settle?.(accepted)
+}
+/** 浏览器关闭只能使用原生提示，不能保证浏览器一定显示自定义确认框。 */
+function beforeUnload(event: BeforeUnloadEvent): void {
+  if (workSettingsDirty.value) {
+    event.preventDefault()
+    event.returnValue = ''
+  }
+}
 /** 工作设置交由专用组件；此页面保留已验证的隐私删除和会话生命周期。 */
 const sessions = ref<Session[]>([])
 const error = ref<string | null>(null)
@@ -29,6 +88,30 @@ let disposed = false
 let deletionSubmission = 0
 const auth = useAuthStore()
 const router = useRouter()
+/** 页面存续期间注册离开提示；认证失效跳登录必须继续遵循原会话生命周期。 */
+const removeLeaveGuard = router.beforeEach((to, from) => {
+  if (!workSettingsDirty.value || to.path === from.path || to.path === '/login')
+    return true
+  finishLeave(false)
+  return new Promise<boolean>((resolve) => {
+    settleLeave = resolve
+    confirmation.require({
+      header: '离开设置页',
+      message: '工作设置尚未保存，确定离开？',
+      defaultFocus: 'reject',
+      rejectProps: { label: '继续编辑', severity: 'secondary', outlined: true },
+      acceptProps: { label: '放弃修改并离开' },
+      accept: () => finishLeave(true),
+      reject: () => finishLeave(false),
+      onHide: () => finishLeave(false),
+    })
+  })
+})
+/** 仅组合确认 UI 和原删除动作；202 回执后关闭弹窗，轮询仍由原状态机管理。 */
+async function confirmAllData(): Promise<void> {
+  await deleteAllData()
+  if (allDataDeletionTaskId.value) allDataDialogOpen.value = false
+}
 /** 只读取当前用户活动会话，工作设置失败不抹掉隐私控制的状态。 */
 async function load() {
   try {
@@ -172,87 +255,179 @@ async function deleteAllData(): Promise<void> {
       deletionSubmitting.value = false
   }
 }
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  window.addEventListener('beforeunload', beforeUnload)
+})
 onUnmounted(() => {
+  removeLeaveGuard()
+  window.removeEventListener('beforeunload', beforeUnload)
+  if (settleLeave) {
+    finishLeave(false)
+    confirmation.close()
+  }
+  emit('modal-change', false)
   disposed = true
   stopDeletionMonitor()
 })
 </script>
 <template>
-  <section>
-    <h1>设置</h1>
-    <WorkSettingsForm />
-    <p
+  <section class="space-y-6">
+    <h1 class="text-2xl font-semibold">
+      设置
+    </h1>
+    <WorkSettingsForm @dirty-change="workSettingsDirty = $event" />
+    <Message
+      v-if="moduleFailed"
+      severity="error"
+    >
+      工作设置表单加载失败，请重试。重试会重新加载页面。
+      <Button
+        type="button"
+        label="重试加载表单"
+        severity="secondary"
+        @click="retryForm"
+      />
+    </Message>
+    <Message
       v-if="error"
-      role="alert"
+      severity="error"
     >
       {{ error }}
-    </p>
-
-    <section aria-labelledby="privacy-heading">
-      <h2 id="privacy-heading">
-        隐私与数据
-      </h2>
-      <button
-        type="button"
-        :disabled="deletionPending"
-        @click="deleteSourceCache"
-      >
-        删除来源缓存
-      </button>
-      <RouterLink
-        v-if="sourceDeletionTaskId"
-        :to="{ path: '/tasks', query: { task_id: sourceDeletionTaskId } }"
-      >
-        查看来源缓存删除任务
-      </RouterLink>
-      <!-- 确认前说明本地删除边界，避免把未知写结果或删除完成理解为供应商撤回。 -->
-      <p id="all-data-deletion-notice">
-        删除本地数据不能撤回已发送的邮件或已生效的日程变更。结果未知的操作也可能已在供应商侧生效。
-      </p>
-      <label>
-        确认全部删除
-        <input
-          v-model="allDataConfirmation"
-          autocomplete="off"
-          aria-describedby="all-data-deletion-notice"
+    </Message>
+    <Card>
+      <template #title>
+        <h2
+          id="privacy-heading"
+          class="text-lg font-semibold"
         >
-      </label>
-      <button
-        type="button"
-        :disabled="deletionPending"
-        @click="deleteAllData"
-      >
-        删除全部数据
-      </button>
-      <RouterLink
-        v-if="allDataDeletionTaskId"
-        :to="{ path: '/tasks', query: { task_id: allDataDeletionTaskId } }"
-      >
-        查看全部数据删除任务
-      </RouterLink>
-      <p
-        v-if="deletionError"
-        role="alert"
-      >
-        {{ deletionError }}
-      </p>
-    </section>
-
-    <h2>活动会话</h2>
-    <ul>
-      <li
-        v-for="session in sessions"
-        :key="session.id"
-      >
-        {{ session.created_at }} · {{ session.expires_at }}
-        <button
+          隐私与数据
+        </h2>
+      </template>
+      <template #content>
+        <section
+          aria-labelledby="privacy-heading"
+          class="space-y-4"
+        >
+          <Button
+            type="button"
+            label="删除来源缓存"
+            severity="secondary"
+            outlined
+            :disabled="deletionPending"
+            :loading="deletionSubmitting && !allDataDialogOpen"
+            @click="deleteSourceCache"
+          />
+          <RouterLink
+            v-if="sourceDeletionTaskId"
+            :to="{ path: '/tasks', query: { task_id: sourceDeletionTaskId } }"
+            class="block text-primary underline"
+          >
+            查看来源缓存删除任务
+          </RouterLink>
+          <!-- 确认前说明本地删除边界，不能把未知写结果或本地清理理解为供应商撤回。 -->
+          <p id="all-data-deletion-notice">
+            删除本地数据不能撤回已发送的邮件或已生效的日程变更。结果未知的操作也可能已在供应商侧生效。
+          </p>
+          <Button
+            type="button"
+            label="删除全部数据"
+            severity="danger"
+            outlined
+            :disabled="deletionPending"
+            @click="allDataDialogOpen = true"
+          />
+          <RouterLink
+            v-if="allDataDeletionTaskId"
+            :to="{ path: '/tasks', query: { task_id: allDataDeletionTaskId } }"
+            class="block text-primary underline"
+          >
+            查看全部数据删除任务
+          </RouterLink>
+          <Message
+            v-if="deletionError && !allDataDialogOpen"
+            severity="error"
+          >
+            {{ deletionError }}
+          </Message>
+        </section>
+      </template>
+    </Card>
+    <Card>
+      <template #title>
+        <h2 class="text-lg font-semibold">
+          活动会话
+        </h2>
+      </template>
+      <template #content>
+        <ul class="space-y-3">
+          <li
+            v-for="session in sessions"
+            :key="session.id"
+            class="flex flex-wrap items-center gap-3"
+          >
+            <span>{{ session.created_at }} · {{ session.expires_at }}</span>
+            <Button
+              type="button"
+              label="撤销"
+              severity="secondary"
+              outlined
+              @click="revoke(session.id)"
+            />
+          </li>
+        </ul>
+      </template>
+    </Card>
+    <Dialog
+      v-model:visible="allDataDialogOpen"
+      modal
+      header="删除全部数据"
+      class="mx-4 w-full max-w-xl"
+      @show="emit('modal-change', true)"
+      @after-hide="emit('modal-change', false)"
+    >
+      <div class="space-y-4">
+        <p id="all-data-confirmation-notice">
+          删除本地数据不能撤回已发送的邮件或已生效的日程变更。结果未知的操作也可能已在供应商侧生效。
+        </p>
+        <p>请输入 DELETE ALL DATA 以确认。</p>
+        <div class="grid gap-1">
+          <label for="all-data-confirmation">确认全部删除</label>
+          <InputText
+            id="all-data-confirmation"
+            v-model="allDataConfirmation"
+            autofocus
+            autocomplete="off"
+            aria-describedby="all-data-confirmation-notice"
+            :disabled="deletionPending"
+          />
+        </div>
+        <Message
+          v-if="deletionError"
+          severity="error"
+        >
+          {{
+            deletionError
+          }}
+        </Message>
+      </div>
+      <template #footer>
+        <Button
           type="button"
-          @click="revoke(session.id)"
-        >
-          撤销
-        </button>
-      </li>
-    </ul>
+          label="取消"
+          severity="secondary"
+          outlined
+          @click="allDataDialogOpen = false"
+        />
+        <Button
+          type="button"
+          label="确认删除全部数据"
+          severity="danger"
+          :disabled="deletionPending"
+          :loading="deletionSubmitting"
+          @click="confirmAllData"
+        />
+      </template>
+    </Dialog>
   </section>
 </template>
