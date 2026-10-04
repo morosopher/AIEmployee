@@ -59,7 +59,8 @@ const {
   newCalendar,
 } = useLocalActionCreation()
 const detailRegion = ref<HTMLElement | null>(null)
-let selectionTrigger: HTMLElement | null = null
+const listRegion = ref<HTMLElement | null>(null)
+const pageHeading = ref<HTMLElement | null>(null)
 const connectionLabels = {
   connecting: '正在建立实时连接',
   connected: '实时连接正常',
@@ -69,21 +70,30 @@ const connectionLabels = {
 
 /**
  * @param taskId 真实任务 ID。
- * @param event 选择触发器。
  * @returns 详情区域成为键盘焦点。
  */
-async function openDetail(taskId: string, event: Event): Promise<void> {
-  selectionTrigger =
-    event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+async function openDetail(taskId: string): Promise<void> {
   selectTask(taskId)
   await nextTick()
   detailRegion.value?.focus()
 }
-/** 关闭独立详情后恢复原触发器焦点，键盘用户无需重新定位列表。 */
+/**
+ * 关闭详情后按已验证 UUID 重新定位当前任务按钮，不能缓存 lazy Tabs 已卸载的 DOM。
+ * nextTick 让窄屏列表先恢复可见；lazy 只挂载当前分组，因此查询不会命中后台隐藏分组。
+ * 任务已移出当前页或用户保留其他分组时，聚焦始终可见的页面标题，不擅自切组或请求数据。
+ * @returns 焦点归还当前任务按钮；没有可见按钮则落到操作中心标题，卸载后不再操作 DOM。
+ */
 async function closeSelected(): Promise<void> {
+  const taskId = selectedTaskId.value
   closeDetail()
   await nextTick()
-  selectionTrigger?.focus()
+  const trigger = taskId
+    ? listRegion.value?.querySelector<HTMLButtonElement>(
+        `button[data-action-task="${taskId}"]`,
+      )
+    : null
+  const focusTarget = trigger ?? pageHeading.value
+  focusTarget?.focus()
 }
 
 /** 本地展示状态只控制当前页可见分组；服务端刷新不能改写它或移动键盘焦点。 */
@@ -155,7 +165,9 @@ const statusOptions: Array<{ label: string; value: ActionStatus | '' }> = [
       <div>
         <h1
           id="actions-title"
-          class="text-2xl font-semibold"
+          ref="pageHeading"
+          tabindex="-1"
+          class="text-2xl font-semibold focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         >
           操作中心
         </h1>
@@ -213,6 +225,7 @@ const statusOptions: Array<{ label: string; value: ActionStatus | '' }> = [
         }"
       >
         <div
+          ref="listRegion"
           class="min-w-0 space-y-4"
           :class="{ 'xl:pr-4': selectedTaskId }"
         >
@@ -381,8 +394,9 @@ const statusOptions: Array<{ label: string; value: ActionStatus | '' }> = [
                         label="查看详情"
                         :aria-label="`查看${actionLabel(data.action)}详情`"
                         :aria-pressed="data.task_id === selectedTaskId"
+                        :data-action-task="data.task_id"
                         link
-                        @click="openDetail(data.task_id, $event)"
+                        @click="openDetail(data.task_id)"
                       />
                       <Button
                         v-else

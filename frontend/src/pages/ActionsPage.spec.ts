@@ -796,3 +796,81 @@ it('keeps the selected task trigger identity when a refreshed table reorders row
   await flushPromises()
   expect(trigger).toHaveFocus()
 })
+
+/** lazy 分组卸载按钮后按真实任务身份恢复；原任务不可见时给出可见落点，不替用户切组。 */
+describe('action detail focus after lazy tab unmount', () => {
+  it.each(['return_to_group', 'other_group', 'task_removed'] as const)(
+    'restores a visible focus target for %s without changing the selected group',
+    async (scenario) => {
+      let removed = false
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async (url: string) =>
+            new Response(
+              JSON.stringify(
+                url === '/api/v1/actions'
+                  ? {
+                      items: removed
+                        ? actionItems().filter((item) => item.id !== TASK_ID)
+                        : actionItems(),
+                      limit: 50,
+                      offset: 0,
+                    }
+                  : actionSnapshot(),
+              ),
+            ),
+        ),
+      )
+      setViewport(1440)
+      await renderPage()
+      await flushPromises()
+      await selectGroup('需要人工确认')
+      const originalTrigger = screen.getByRole('button', {
+        name: '查看发送邮件详情',
+      })
+      await fireEvent.click(originalTrigger)
+      await flushPromises()
+      if (scenario === 'task_removed') {
+        removed = true
+        window.dispatchEvent(new Event('focus'))
+        await waitFor(() =>
+          expect(
+            screen.queryByRole('button', { name: '查看发送邮件详情' }),
+          ).not.toBeInTheDocument(),
+        )
+      } else {
+        await selectGroup('邮件草稿')
+        expect(originalTrigger).not.toBeInTheDocument()
+        if (scenario === 'return_to_group') {
+          await selectGroup('需要人工确认')
+          expect(
+            screen.getByRole('button', { name: '查看发送邮件详情' }),
+          ).not.toBe(originalTrigger)
+        }
+      }
+      await fireEvent.click(
+        screen.getByRole('button', { name: '关闭操作详情' }),
+      )
+      await flushPromises()
+      if (scenario === 'return_to_group') {
+        expect(
+          screen.getByRole('button', { name: '查看发送邮件详情' }),
+        ).toHaveFocus()
+      } else {
+        expect(screen.getByRole('heading', { name: '操作中心' })).toHaveFocus()
+      }
+      expect(
+        screen.getByRole('tab', {
+          name: new RegExp(
+            `^${scenario === 'other_group' ? '邮件草稿' : '需要人工确认'} `,
+          ),
+        }),
+      ).toHaveAttribute('aria-selected', 'true')
+      expect(
+        screen.queryByRole('complementary', { name: '操作详情与时间线' }),
+      ).not.toBeInTheDocument()
+      expect(TaskEventSource.instances).toHaveLength(1)
+    },
+  )
+})

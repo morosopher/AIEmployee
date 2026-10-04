@@ -679,3 +679,87 @@ test('action workspace module failure exposes a full reload retry', async ({
     page.getByRole('alert').filter({ hasText: '操作中心加载失败' }),
   ).toHaveCount(0)
 })
+
+/** 真实浏览器验证 lazy 分组卸载后的任务身份与可见焦点落点；不修改当前组或审批状态。 */
+for (const scenario of [
+  'return_to_group',
+  'other_group',
+  'task_removed',
+] as const) {
+  test(`lazy group focus restores a visible target for ${scenario}`, async ({
+    page,
+  }) => {
+    await authenticateFixture(page)
+    let removed = false
+    let listReads = 0
+    await page.route('**/api/v1/actions', (route) => {
+      listReads += 1
+      return fulfillJson(route, {
+        items: removed
+          ? actionItems().filter((item) => item.id !== TASK_ID)
+          : actionItems(),
+        limit: 50,
+        offset: 0,
+      })
+    })
+    await page.route(`**/api/v1/actions/${TASK_ID}`, (route) =>
+      fulfillJson(route, actionSnapshot()),
+    )
+    await page.route(`**/api/v1/tasks/${TASK_ID}/events*`, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: 'retry: 60000\n\nevent: heartbeat\ndata: {}\n\n',
+      }),
+    )
+    await page.setViewportSize({ width: 1440, height: 1000 })
+    await page.goto('/actions')
+    await page.getByRole('tab', { name: /^需要人工确认 / }).click()
+    const trigger = page.getByRole('button', {
+      name: '查看发送邮件详情',
+      exact: true,
+    })
+    const originalTrigger = await trigger.elementHandle()
+    if (!originalTrigger) throw new Error('Synthetic task trigger is absent')
+    await trigger.click()
+    await expect(
+      page.getByRole('complementary', { name: '操作详情与时间线' }),
+    ).toBeFocused()
+    if (scenario === 'task_removed') {
+      removed = true
+      await page.getByRole('button', { name: '刷新操作', exact: true }).click()
+      await expect(trigger).toHaveCount(0)
+    } else {
+      const readsBeforeSwitch = listReads
+      await page.getByRole('tab', { name: /^邮件草稿 / }).click()
+      expect(await originalTrigger.evaluate((node) => node.isConnected)).toBe(
+        false,
+      )
+      if (scenario === 'return_to_group')
+        await page.getByRole('tab', { name: /^需要人工确认 / }).click()
+      expect(listReads).toBe(readsBeforeSwitch)
+    }
+    await page
+      .getByRole('button', { name: '关闭操作详情', exact: true })
+      .click()
+    if (scenario === 'return_to_group') await expect(trigger).toBeFocused()
+    else {
+      const heading = page.getByRole('heading', {
+        name: '操作中心',
+        exact: true,
+      })
+      await expect(heading).toBeVisible()
+      await expect(heading).toBeFocused()
+    }
+    await expect(
+      page.getByRole('tab', {
+        name: new RegExp(
+          `^${scenario === 'other_group' ? '邮件草稿' : '需要人工确认'} `,
+        ),
+      }),
+    ).toHaveAttribute('aria-selected', 'true')
+    await expect(
+      page.getByRole('complementary', { name: '操作详情与时间线' }),
+    ).toHaveCount(0)
+  })
+}
