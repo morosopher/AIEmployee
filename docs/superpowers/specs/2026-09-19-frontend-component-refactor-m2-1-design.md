@@ -35,7 +35,7 @@ M2.1 的目标是**只替换展示层**：用成熟的组件库和统一的设�
   页面或一组基础组件；里程碑结束时不允许两套样式体系并存。
 - `api/`、`stores/`、`composables/useTaskEvents`、`features/` 中的领域投影逻辑、
   Markdown 清洗和路由守卫**不在本里程碑修改**；如迁移过程中发现这些层的缺陷，单独
-  记录并按 `fix:` 提交，不混入视觉重构。Task 8 前已批准的唯一确认端口例外见 §7。
+  记录并按 `fix:` 提交，不混入视觉重构。Task 8 前确认端口及 Task 9 前最小错误码元数据的已批准例外见 §7。
 - 前端 `AGENTS.md` 中「未获批准不要引入新的 UI 框架或 CSS 体系」的规则由本规格批准
   修订为明确的技术栈清单。
 
@@ -256,6 +256,13 @@ PrimeVue 商业产品线禁令保持不变。
   `features/forms/problemFields.ts` 按已知 `error_code` 映射安全中文表单级错误，未知码使用
   安全 fallback，不匹配服务端文案，不渲染原始 detail。字段格式错误由 zod 提供，
   不伪造 `errors` fixture，不修改 `api/validation.ts` 或其他 API 解析。
+- 2026-10-03 用户批准最小错误码元数据例外：仅在 `features/actions/recovery.ts`
+  的 `ActionRecovery` 增加可选只读 `problem.error_code`，只从真实 `ProblemError`
+  复制；保留原 `message`、`action`、`traceId`，不携带 `title`、`detail` 或完整响应。
+  `features/calendar/useCalendarProposalEditor.ts` 两处特殊恢复对象只保留该元数据，
+  原提示、版本锁、请求顺序、幂等意图、epoch 和卸载保护不变。普通异常和
+  `EditorInputError` 不伪造元数据。先独立修复并回归，再由 Task 9／11／12 的真实
+  Form 将最小投影交给 `problemToFormError`；上下文恢复说明及动作继续保留。
 - 时区选项沿用本地 `Intl.supportedValuesOf('timeZone')` 加 `UTC`，保留服务端快照当前值
   与用户显式输入的合法 IANA 时区；有限 fallback 不得误拒已有值。不新增服务端列表接口，
   不从宿主机推断用户时区。日程保留全天日期及定时墙上时间转换、既有 `time.ts` 与 DST
@@ -274,7 +281,7 @@ PrimeVue 商业产品线禁令保持不变。
 - 显式新增文件为 `features/settings/schema.ts`、`features/mail/schema.ts`、
   `features/calendar/schema.ts` 及各自 `schema.spec.ts`，以及
   `features/forms/problemFields.ts`、`features/forms/problemFields.spec.ts`；这些展示校验
-  与测试文件不等于开放既有 feature 行为层，其他既有行为文件继续只读。
+  与测试文件不等于开放既有 feature 行为层；除本节两项明确例外外，其他既有行为文件继续只读。
 
 ## 8. 反馈与状态呈现
 

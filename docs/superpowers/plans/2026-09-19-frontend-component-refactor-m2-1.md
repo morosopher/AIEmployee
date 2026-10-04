@@ -15,7 +15,7 @@
 - 事实来源是 `docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md`。若实现证据与规格的选型、许可、只读边界、无障碍或安全约束冲突，停止并向用户说明。
 - 每个任务按红—绿—重构执行：先新增或调整聚焦测试并运行观察预期失败，再实现，再运行聚焦测试、`pnpm --dir frontend type-check`、`pnpm --dir frontend lint`，最后提交。
 - 页面迁移任务（Task 4～15）在动模板前必须先把该页面既有单测和相关 E2E 的选择器改为 `getByRole`/`getByLabelText`/`getByText`，并在旧实现上确认通过；这一步与迁移本身在同一任务内但作为 Step 1 单独完成。
-- 行为层文件（`src/api/**`、`src/stores/**`、`src/composables/**`、`src/features/**` 中既有非 `schema.ts`/`presentation.ts` 的文件、`src/router/**`）在 M2.1 视为只读。显式新增的 `schema.spec.ts`、`features/forms/problemFields.ts` 及其测试属于本计划文件清单许可；Task 8 前的 `useConnections.ts` 异步确认端口及对应回归仅按独立 fix 执行，其他既有行为层仍只读。若迁移暴露行为层缺陷，先停止当前任务，以独立 `fix:` 提交修复并附回归测试，再继续。
+- 行为层文件（`src/api/**`、`src/stores/**`、`src/composables/**`、`src/features/**` 中既有非 `schema.ts`/`presentation.ts` 的文件、`src/router/**`）在 M2.1 视为只读。显式新增的 `schema.spec.ts`、`features/forms/problemFields.ts` 及其测试属于本计划文件清单许可；Task 8 前异步确认端口及 Task 9 前两文件最小错误码元数据例外仅按各自独立 fix 和回归执行，其他既有行为层仍只读。若迁移暴露行为层缺陷，先停止当前任务，以独立 `fix:` 提交修复并附回归测试，再继续。
 - 测试禁止依赖 PrimeVue 内部 class（`p-*`）、内部 DOM 层级或 `data-pc-*` 属性；只依赖角色、label、可见文本和自有 `data-testid`。
 - 组件测试新增内容使用 `@testing-library/vue`；需要断言 Emits/Props 的既有 Vue Test Utils 测试可保留，同一文件不混用两种风格。
 - 不新增任何 `localStorage`/`sessionStorage`/`document.cookie` 写入；不引入 CDN 资源；不使用 `v-html` 或 `escape=false` 渲染 API 返回的字符串。
@@ -55,6 +55,7 @@
 - 创建：`frontend/src/features/settings/schema.ts`、`frontend/src/features/mail/schema.ts`、`frontend/src/features/calendar/schema.ts` 及对应 `schema.spec.ts`
 - 创建：`frontend/src/features/forms/problemFields.ts`、`frontend/src/features/forms/problemFields.spec.ts`
 - Task 8 前独立 fix：修改 `frontend/src/features/connections/useConnections.ts`，创建 `frontend/src/features/connections/useConnections.spec.ts`（仅确认端口回归）。
+- Task 9 前独立 fix：修改 `features/actions/recovery.ts` 与 `features/calendar/useCalendarProposalEditor.ts` 的最小错误码投影，新增 `features/actions/recovery.spec.ts` 并增强 `pages/CalendarProposalPage.spec.ts`；具体边界见 Task 9 前置。
 
 ### E2E 与验收
 
@@ -560,6 +561,20 @@ git commit -m "feat: migrate connections page to PrimeVue"
 
 ---
 
+### Task 9 前置独立修复：最小错误码元数据（2026-10-03 用户已批准）
+
+**Files:**
+- Modify: `frontend/src/features/actions/recovery.ts`
+- Modify: `frontend/src/features/calendar/useCalendarProposalEditor.ts`（仅两处特殊恢复对象保留元数据）
+- Create: `frontend/src/features/actions/recovery.spec.ts`
+- Modify: `frontend/src/pages/CalendarProposalPage.spec.ts`（真实错误投影及原恢复边界回归）
+
+现有设置／邮件／日程逻辑已在内部将 `ProblemError` 转为 `ActionRecovery`，UI 无法读取原始错误码。给该安全恢复对象增加可选只读 `problem?: Readonly<Pick<ProblemDetails, 'error_code'>>`，仅复制真实 `ProblemError` 的码；不传 title/detail/status 或完整响应。原 message/action/traceId、普通异常和 EditorInputError 的处理不变。日程两处特殊对象保留元数据，同时逐字保留“提案事实尚未读取完整，请重新加载后继续编辑或提交。”和“候选已保存，请重新加载最新提案后继续编辑。”。
+
+先写失败回归证明原码在两条路径丢失；覆盖真实码最小复制、原文案／动作／追踪编号不变、普通错误无伪造投影及特殊恢复、版本锁、迟到响应与卸载保护。仅展示元数据，不改请求、意图、epoch、refreshRequired 或最低版本。运行相关页面／动作／恢复测试、类型、lint、相关 E2E 和 `just check`，独立提交 `fix: preserve minimal problem codes for form presentation` 并审查。Task 9／11／12 随后把该真实投影接入表单映射，禁止从中文消息反推错误码或复制 API 请求。
+
+- [x] **实现与回归（2026-10-04）**：RED 10 项因缺少错误码失败，GREEN 43 项通过；相关页面与恢复回归 101 项通过；类型、lint、相关 E2E 17 项及 `just check`（后端 2730 项、前端 496 项）通过。两个生产文件以外的行为层未修改，Form 接线仍按后续 Task 9／11／12 执行。
+
 ### Task 9: 迁移设置页并建立表单校验与服务端错误映射
 
 **Files:**
@@ -576,11 +591,11 @@ Expected: PASS。
 
 - [ ] **Step 2: 写失败的 schema 与错误映射测试**
 
-测试使用既有合成 `UserSettings` fixture 和完整 `working_hours`（monday 至 sunday，每日零到多个 `{ start, end }` 区间）：逐日逐区间构造结束不晚于开始的失败用例，同时覆盖合法多区间与空日。不得引入 `work_start`/`work_end` 第二套字段。
+测试使用既有合成 `UserSettings` fixture 和完整 `working_hours`（monday 至 sunday，每日零到多个 `[start, end]` 字符串二元组）：逐日逐区间构造结束不晚于开始的失败用例，同时覆盖合法多区间与空日。不得引入 `{ start, end }`、`work_start`/`work_end` 第二套字段。
 
 时区测试覆盖本地 `Intl.supportedValuesOf('timeZone')` 加 `UTC`、服务端当前值，以及未出现在有限 fallback 但显式合法的 IANA；不读取不存在的服务端列表，也不按宿主时区自动选择。
 
-错误映射测试直接使用现有七字段 `ProblemDetails` fixture：逐个已知 `error_code` 映射安全中文表单级错误，未知码得到安全 fallback；改变 `title`/`detail` 不影响映射，也不显示原文。字段格式错误由 zod 提供；不制造 `errors` 数组或扩展 API 解析。
+错误映射测试使用现有七字段 `ProblemDetails` fixture 的最小码投影：逐个已知 `error_code` 映射安全中文表单级错误，未知码（包括继承属性名）得到安全 fallback；改变 `title`/`detail` 不影响映射，也不显示原文。真实页面从前置修复的 `ActionRecovery.problem` 接线，保留恢复动作、追踪编号及必要上下文原文。字段格式错误由 zod 提供；不制造 `errors` 数组或扩展 API 解析。
 
 - [ ] **Step 3: 运行并观察预期失败**
 

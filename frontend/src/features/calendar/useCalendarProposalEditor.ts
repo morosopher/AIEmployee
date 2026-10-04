@@ -313,6 +313,8 @@ export function useCalendarProposalEditor(
             message: '提案事实尚未读取完整，请重新加载后继续编辑或提交。',
             traceId: recovery.traceId,
             action: 'reload',
+            // 仅延续真实错误码投影；普通异常仍无元数据，恢复动作与版本锁不变。
+            ...(recovery.problem ? { problem: recovery.problem } : {}),
           }
         : recovery
     // 版本失效可能先于 GET 状态抵达；错误当下即锁定旧输入，不能继续保存或重复提交。
@@ -404,6 +406,8 @@ export function useCalendarProposalEditor(
               message: '候选已保存，请重新加载最新提案后继续编辑。',
               traceId: recovery.traceId,
               action: 'reload',
+              // 候选已保存的上下文提示不能丢失表单所需的最小错误码。
+              ...(recovery.problem ? { problem: recovery.problem } : {}),
             }
           : recovery
       }

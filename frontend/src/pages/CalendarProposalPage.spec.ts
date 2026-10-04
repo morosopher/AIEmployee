@@ -1,6 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
-import { ref } from 'vue'
+import { defineComponent, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import CalendarProposalPage from './CalendarProposalPage.vue'
@@ -8,6 +8,8 @@ import * as calendar from '@/api/calendar'
 import * as connections from '@/api/connections'
 import { ProblemError } from '@/api/client'
 import type { CalendarProposal } from '@/api/types'
+import EditorRecovery from '@/components/EditorRecovery.vue'
+import { useCalendarProposalEditor } from '@/features/calendar/useCalendarProposalEditor'
 import {
   calendarProposal,
   CONNECTION_ID,
@@ -161,6 +163,19 @@ function useUpdateFixture(
   }
 }
 
+/** 真实客户端错误类型只承载合成数据；页面不得回显原始 title/detail。 */
+function readProblem(): ProblemError {
+  return new ProblemError({
+    type: 'about:blank',
+    title: 'Synthetic private read title',
+    detail: 'Synthetic private read detail',
+    status: 503,
+    instance: '/synthetic/calendar-read',
+    error_code: 'synthetic_calendar_read_unavailable',
+    trace_id: 'synthetic-calendar-read-trace',
+  })
+}
+
 describe('CalendarProposalPage', () => {
   it.each(['domain-case', 'local-case'] as const)(
     'preserves attendees and applies the shared mailbox identity rule for %s',
@@ -180,6 +195,11 @@ describe('CalendarProposalPage', () => {
       if (difference === 'domain-case') {
         expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
         expect(wrapper.get('[role="alert"]').text()).toContain('收件人地址重复')
+        expect(wrapper.getComponent(EditorRecovery).props('error')).toEqual({
+          message: '收件人地址重复，请检查 To、CC、BCC。',
+          traceId: null,
+          action: 'retry',
+        })
       } else {
         expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
           PROPOSAL_ID,
@@ -195,9 +215,14 @@ describe('CalendarProposalPage', () => {
     },
   )
 
-  it.each(['save', 'last-confirmation'] as const)(
-    'keeps the acknowledged version locked after %s when the facts read fails',
-    async (operation) => {
+  it.each([
+    { operation: 'save', errorKind: 'plain' },
+    { operation: 'last-confirmation', errorKind: 'plain' },
+    { operation: 'save', errorKind: 'problem' },
+    { operation: 'last-confirmation', errorKind: 'problem' },
+  ])(
+    'keeps the acknowledged version locked after $operation when the facts read fails with $errorKind',
+    async ({ operation, errorKind }) => {
       useUpdateFixture(
         operation === 'save' ? ['time'] : ['notification_policy'],
       )
@@ -207,7 +232,9 @@ describe('CalendarProposalPage', () => {
         wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
       ).toBeDefined()
       vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
-        new Error('Synthetic post-mutation read failure'),
+        errorKind === 'problem'
+          ? readProblem()
+          : new Error('Synthetic post-mutation read failure'),
       )
       if (operation === 'save') {
         await wrapper
@@ -228,6 +255,20 @@ describe('CalendarProposalPage', () => {
       expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
       expect(wrapper.text()).toContain('版本 2')
       expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(false)
+      expect(wrapper.get('[role="alert"]').text()).toContain(
+        '提案事实尚未读取完整，请重新加载后继续编辑或提交。',
+      )
+      // 通过真实 hook → EditorRecovery 的 Props 检查 UI 端口，不能用测试 helper 伪造接线。
+      expect(wrapper.getComponent(EditorRecovery).props('error')).toEqual({
+        message: '提案事实尚未读取完整，请重新加载后继续编辑或提交。',
+        traceId:
+          errorKind === 'problem' ? 'synthetic-calendar-read-trace' : null,
+        action: 'reload',
+        ...(errorKind === 'problem'
+          ? { problem: { error_code: 'synthetic_calendar_read_unavailable' } }
+          : {}),
+      })
+      expect(wrapper.text()).not.toContain('Synthetic private read')
       // PATCH 已成功，缺失事实期间必须同时锁住输入、后续确认与提交，不能重发旧版本。
       expect
         .soft(
@@ -254,6 +295,7 @@ describe('CalendarProposalPage', () => {
         wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
       ).toBeUndefined()
       expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
+      expect(wrapper.getComponent(EditorRecovery).props('error')).toBeNull()
       if (operation === 'save') {
         await wrapper.get('button[name="confirm-time"]').trigger('click')
         await flushPromises()
@@ -664,7 +706,7 @@ describe('CalendarProposalPage', () => {
     )
   })
 
-  it('requires a fresh read when a candidate version was saved but reloading failed', async () => {
+  it.each(['plain', 'problem'] as const)('requires a fresh read when a candidate version was saved but reloading failed with %s', async (errorKind) => {
     vi.mocked(calendar.suggestCalendarTimes).mockImplementation(async () => {
       const availability = {
         proposal_id: PROPOSAL_ID,
@@ -684,7 +726,9 @@ describe('CalendarProposalPage', () => {
     })
     const { wrapper } = await renderPage()
     vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
-      new Error('Synthetic read unavailable'),
+      errorKind === 'problem'
+        ? readProblem()
+        : new Error('Synthetic read unavailable'),
     )
     await wrapper.get('button[name="suggest-times"]').trigger('click')
     await flushPromises()
@@ -695,7 +739,23 @@ describe('CalendarProposalPage', () => {
       wrapper.get('button[name="suggest-times"]').attributes('disabled'),
     ).toBeDefined()
     expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(0)
-    expect(wrapper.text()).toContain('重新加载')
+    expect(wrapper.get('[role="alert"]').text()).toContain(
+      '候选已保存，请重新加载最新提案后继续编辑。',
+    )
+    expect(wrapper.getComponent(EditorRecovery).props('error')).toEqual({
+      message: '候选已保存，请重新加载最新提案后继续编辑。',
+      traceId: errorKind === 'problem' ? 'synthetic-calendar-read-trace' : null,
+      action: 'reload',
+      ...(errorKind === 'problem'
+        ? { problem: { error_code: 'synthetic_calendar_read_unavailable' } }
+        : {}),
+    })
+    expect(wrapper.text()).not.toContain('Synthetic private read')
+    expect(calendar.suggestCalendarTimes).toHaveBeenCalledExactlyOnceWith(
+      PROPOSAL_ID,
+      { version: 1 },
+    )
+    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
     expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
     // 候选回执已证明版本推进；显式刷新同样不能用较旧 GET 解除锁定。
     vi.mocked(calendar.getCalendarProposal).mockResolvedValueOnce({
@@ -714,6 +774,91 @@ describe('CalendarProposalPage', () => {
     expect(
       wrapper.get('button[name="confirm-time"]').attributes('disabled'),
     ).toBeUndefined()
+    expect(wrapper.getComponent(EditorRecovery).props('error')).toBeNull()
+    expect(calendar.suggestCalendarTimes).toHaveBeenCalledTimes(1)
+    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(4)
+    expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+    expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { operation: 'save', boundary: 'route-change' },
+    { operation: 'save', boundary: 'unmount' },
+    { operation: 'suggest', boundary: 'route-change' },
+    { operation: 'suggest', boundary: 'unmount' },
+  ])('ignores a late $operation problem after $boundary', async ({ operation, boundary }) => {
+    const proposalId = ref(PROPOSAL_ID)
+    let editor: ReturnType<typeof useCalendarProposalEditor> | undefined
+    // 保留真实 hook 的响应式输出，卸载后仍可检查迟到异常没有写回状态。
+    const host = mount(
+      defineComponent({
+        setup() {
+          editor = useCalendarProposalEditor(proposalId, async () => undefined)
+          return () => null
+        },
+      }),
+    )
+    wrappers.push(host)
+    await flushPromises()
+    if (!editor) throw new Error('Synthetic editor did not mount')
+    const activeEditor = editor
+    let rejectRead: (cause: ProblemError) => void = () => undefined
+    vi.mocked(calendar.getCalendarProposal).mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectRead = reject
+      }),
+    )
+    vi.mocked(calendar.suggestCalendarTimes).mockResolvedValueOnce({
+      proposal_id: PROPOSAL_ID,
+      version: 2,
+      completeness: 'complete',
+      missing_connections: [],
+      attendee_availability_checked: false,
+      candidates: [],
+    })
+    const pending =
+      operation === 'save' ? activeEditor.save() : activeEditor.suggest()
+    await flushPromises()
+    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
+    expect(activeEditor.busy.value).toBe(true)
+
+    if (boundary === 'unmount') {
+      host.unmount()
+      wrappers = wrappers.filter((wrapper) => wrapper !== host)
+    } else {
+      current = {
+        ...current,
+        id: '00000000-0000-0000-0000-000000000399',
+        version: 1,
+      }
+      proposalId.value = current.id
+      await flushPromises()
+      expect(activeEditor.locked.value).toBe(false)
+    }
+    rejectRead(readProblem())
+    await pending
+    await flushPromises()
+    expect(activeEditor.error.value).toBeNull()
+    if (boundary === 'unmount') {
+      expect(activeEditor.proposal.value).toBeNull()
+      expect(activeEditor.form.description).toBe('')
+    } else {
+      expect(activeEditor.proposal.value?.id).toBe(
+        '00000000-0000-0000-0000-000000000399',
+      )
+      expect(activeEditor.proposal.value?.version).toBe(1)
+      expect(activeEditor.locked.value).toBe(false)
+    }
+    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(
+      boundary === 'unmount' ? 2 : 3,
+    )
+    expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(
+      operation === 'save' ? 1 : 0,
+    )
+    expect(calendar.suggestCalendarTimes).toHaveBeenCalledTimes(
+      operation === 'suggest' ? 1 : 0,
+    )
+    expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
   })
 
   it('saves all-day exclusive dates and explicit notification policy without UTC shifting', async () => {
