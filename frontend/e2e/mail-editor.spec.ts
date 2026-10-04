@@ -11,6 +11,7 @@ import {
 } from '../src/test-support/actionFixtures'
 import { connection, mailApproval } from '../src/test-support/editorFixtures'
 import { editorAction, editorJson, editorProblem, editorWorkspace } from './fixtures/editorApi'
+import { settlePresentation } from './support/axe'
 
 /** 只按公开角色编辑多选输入；既有芯片与未确认文字一并核对，不丢弃保存载荷。 */
 async function fillRecipient(
@@ -246,9 +247,8 @@ test('new mail stays local until explicit submission and can withdraw its frozen
   await expect(page.getByRole('article').locator('pre')).toHaveCount(0)
   const approvalCard = page.getByRole('region', { name: '人工审批', exact: true })
   await expect(preview.getByRole('table', { name: '邮件冻结载荷' })).toBeVisible()
-  await approvalCard.evaluate(async (node) => {
-    await Promise.all(node.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished))
-  })
+  await expect(approvalCard).toBeVisible()
+  await settlePresentation(page)
   const approvalAccessibility = await new AxeBuilder({ page }).include('[aria-label="人工审批"]').analyze()
   expect(approvalAccessibility.violations.filter((item) => item.impact === 'serious' || item.impact === 'critical')).toEqual([])
   expect(
@@ -372,10 +372,37 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
   expect(await start.evaluate((node) => node.closest('[inert]') !== null)).toBe(true)
   expect(await dialog.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
   await expect(dialog).toHaveAttribute('aria-modal', 'true')
-  // 等待实际入场动画结束后扫描，避免将中间透明度误判为文字对比度；没有任意 sleep。
-  await dialog.evaluate(async (node) => {
-    await Promise.all(node.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished))
+  // 真实动画在等待者取得原生 Promise 后取消，稳定覆盖取消边界；不伪造成功或修改库动画。
+  await dialog.evaluate((node) => {
+    const probe = document.createElement('span')
+    probe.dataset.testid = 'presentation-animation-probe'
+    probe.setAttribute('aria-hidden', 'true')
+    node.append(probe)
+    const animation = probe.animate([{ opacity: 1 }, { opacity: 1 }], { duration: 10_000 })
+    const finished = animation.finished
+    void finished.catch((error: unknown) => {
+      probe.dataset.result = error instanceof DOMException ? error.name : 'unexpected-error'
+    })
+    Object.defineProperty(animation, 'finished', {
+      get() {
+        queueMicrotask(() => {
+          probe.dataset.cancelled = 'true'
+          animation.cancel()
+        })
+        // 必须返回未转换的原生 Promise，旧裸等待才能真正因 AbortError 失败。
+        return finished
+      },
+    })
   })
+  // 复用全局等待处理真实取消；其余有限入场动画仍须结束，随后执行原真实对比度扫描。
+  try {
+    await settlePresentation(page)
+  } finally {
+    const probe = page.getByTestId('presentation-animation-probe')
+    await expect(probe).toHaveAttribute('data-cancelled', 'true')
+    await expect(probe).toHaveAttribute('data-result', 'AbortError')
+    await probe.evaluate((node) => node.remove())
+  }
   const accessibility = await new AxeBuilder({ page }).include('[role="dialog"]').analyze()
   expect(accessibility.violations.filter((item) => item.impact === 'serious' || item.impact === 'critical')).toEqual([])
   await page.keyboard.press('Shift+Tab')

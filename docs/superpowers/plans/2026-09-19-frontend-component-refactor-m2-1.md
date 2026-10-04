@@ -1025,6 +1025,21 @@ git commit -m "test: enforce frontend style, accessibility, and bundle gates"
 
 ---
 
+### Task 17 前置：修正浏览器验收的动画取消等待
+
+**Files:** `frontend/e2e/mail-editor.spec.ts` 与本计划的本节。
+
+- 首轮完整 CI 的 147/148 E2E 中，窄屏人工确认在裸 `Animation.finished` 等待处抛出
+  `AbortError`；原 CI 具体取消来源未复现，不以有界诊断重跑通过作为根因结论。
+- 在原用例附加无内容合成节点与真实有限 Web Animation，仅用该实例公开 `finished`
+  getter 在返回原生 Promise 后微任务取消。先在旧等待上观察 RED，并核对真实 AbortError
+  与取消确已触发；清理探针后保留原 axe、键盘、inert、请求与状态断言。
+- 两处邮件测试等待复用既有 `settlePresentation`；不新增并列等待逻辑，不改产品、
+  无障碍规则、阈值或依赖。聚焦邮件六项及静态／check 验证后独立提交
+  `test: tolerate cancelled presentation animations`，限定复审通过再在新 HEAD 重跑完整 CI。
+
+---
+
 ### Task 17: 更新文档并冻结 M2.1 验收记录
 
 **Files:**
