@@ -10,6 +10,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 
 import AppShell from './AppShell.vue'
+import NeedsAttentionPanel from './NeedsAttentionPanel.vue'
+import ActionConfirmationDialog from './ActionConfirmationDialog.vue'
+import { actionSnapshot } from '@/test-support/actionFixtures'
 import { getSystemAlerts } from '@/api/system'
 
 vi.mock('@/api/system', () => ({
@@ -298,5 +301,68 @@ it('clears a page modal isolation when its route leaves before an after-hide eve
   await fireEvent.click(trigger)
   expect(trigger.closest('[inert]')).not.toBeNull()
   await view.router.push('/actions')
+  await waitFor(() => expect(view.getByRole('main').closest('[inert]')).toBeNull())
+})
+
+/** 真正的深层消费者不转发 modal-change；必须由 UI 注入端口直接通知外壳。 */
+it.each(['cancel', 'terminal', 'unmount'] as const)(
+  'isolates a deeply nested result dialog and releases it after %s',
+  async (reason) => {
+    const snapshot = ref(actionSnapshot())
+    const mounted = ref(true)
+    const DeepConsumer = defineComponent({
+      setup() {
+        return () => h('section', [h('div', [mounted.value ? h(NeedsAttentionPanel, {
+          snapshot: snapshot.value,
+          resolve: vi.fn().mockResolvedValue(undefined),
+          reconcile: vi.fn().mockResolvedValue(undefined),
+          reload: vi.fn(),
+        }) : null])])
+      },
+    })
+    const view = await renderWithPlugins(AppShell, { route: '/actions', global: { stubs: { RouterView: DeepConsumer } } })
+    const trigger = view.getByRole('button', { name: '确认未执行' })
+    trigger.focus()
+    await fireEvent.click(trigger)
+    const dialog = await view.findByRole('dialog', { name: '确认未执行' })
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: '取消' })).toHaveFocus())
+    expect(trigger.closest('[inert]')).not.toBeNull()
+    expect(dialog.closest('[inert]')).toBeNull()
+    if (reason === 'cancel') await fireEvent.keyDown(dialog, { key: 'Escape', code: 'Escape' })
+    else if (reason === 'terminal') snapshot.value = actionSnapshot({ status: 'failed' })
+    else mounted.value = false
+    await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
+    await waitFor(() => expect(view.getByRole('main').closest('[inert]')).toBeNull())
+    await waitFor(() => expect(reason === 'cancel' ? trigger : view.getByRole('main')).toHaveFocus())
+  },
+)
+
+it('does not let a disposed dialog release the isolation owned by its replacement', async () => {
+  const instance = ref(1)
+  const open = ref(false)
+  const Page = defineComponent({
+    setup() {
+      return () => h('section', [
+        h('button', { onClick: () => { open.value = true } }, '人工核对'),
+        open.value ? h(ActionConfirmationDialog, {
+          key: instance.value, title: `合成确认 ${instance.value}`, busy: false,
+          onCancel: () => { open.value = false },
+        }) : null,
+      ])
+    },
+  })
+  const view = await renderWithPlugins(AppShell, { route: '/actions', global: { stubs: { RouterView: Page } } })
+  const trigger = view.getByRole('button', { name: '人工核对' })
+  trigger.focus()
+  await fireEvent.click(trigger)
+  const first = await view.findByRole('dialog', { name: '合成确认 1' })
+  // 在取消的 nextTick 等待期替换实例；旧回调不能关闭替代模态或归还其隔离。
+  within(first).getByRole('button', { name: '取消' }).click()
+  instance.value = 2
+  const replacement = await view.findByRole('dialog', { name: '合成确认 2' })
+  await waitFor(() => expect(within(replacement).getByRole('button', { name: '取消' })).toHaveFocus())
+  expect(trigger.closest('[inert]')).not.toBeNull()
+  await fireEvent.keyDown(replacement, { key: 'Escape', code: 'Escape' })
+  await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
   await waitFor(() => expect(view.getByRole('main').closest('[inert]')).toBeNull())
 })

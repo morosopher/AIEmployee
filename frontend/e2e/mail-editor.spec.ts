@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import AxeBuilder from '@axe-core/playwright'
 import type { ActionSnapshot, MailDraft } from '../src/api/types'
 import type { UpdateMailDraftInput } from '../src/api/mail'
 import {
@@ -243,6 +244,13 @@ test('new mail stays local until explicit submission and can withdraw its frozen
       .evaluate((node) => node.children.length),
   ).toBe(0)
   await expect(page.getByRole('article').locator('pre')).toHaveCount(0)
+  const approvalCard = page.getByRole('region', { name: '人工审批', exact: true })
+  await expect(preview.getByRole('table', { name: '邮件冻结载荷' })).toBeVisible()
+  await approvalCard.evaluate(async (node) => {
+    await Promise.all(node.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished))
+  })
+  const approvalAccessibility = await new AxeBuilder({ page }).include('[aria-label="人工审批"]').analyze()
+  expect(approvalAccessibility.violations.filter((item) => item.impact === 'serious' || item.impact === 'critical')).toEqual([])
   expect(
     capture.mutations.filter((item) => item.path.endsWith('/decision')),
   ).toHaveLength(0)
@@ -359,6 +367,15 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
   await expect(
     dialog.getByRole('button', { name: '取消', exact: true }),
   ).toBeFocused()
+  expect(await start.evaluate((node) => node.closest('[inert]') !== null)).toBe(true)
+  expect(await dialog.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
+  await expect(dialog).toHaveAttribute('aria-modal', 'true')
+  // 等待实际入场动画结束后扫描，避免将中间透明度误判为文字对比度；没有任意 sleep。
+  await dialog.evaluate(async (node) => {
+    await Promise.all(node.getAnimations({ subtree: true }).filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished))
+  })
+  const accessibility = await new AxeBuilder({ page }).include('[role="dialog"]').analyze()
+  expect(accessibility.violations.filter((item) => item.impact === 'serious' || item.impact === 'critical')).toEqual([])
   await page.keyboard.press('Shift+Tab')
   await expect(
     dialog.getByRole('button', { name: '确认记录结果' }),
@@ -366,6 +383,7 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
   await page.keyboard.press('Escape')
   await expect(dialog).toHaveCount(0)
   await expect(start).toBeFocused()
+  expect(await start.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
   expect(
     capture.mutations.filter((item) =>
       item.path.endsWith('/manual-resolution'),
@@ -385,13 +403,18 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
         ).length,
     )
     .toBe(1)
-  await expect(page.getByRole('article')).not.toContainText('人工结论：')
+  // 模态隔离中的背景不可操作，但仍须检查它尚未伪造人工结论。
+  await expect(page.getByRole('article', { includeHidden: true })).not.toContainText('人工结论：')
   await expect(
     dialog.getByRole('button', { name: '确认记录结果' }),
   ).toBeDisabled()
+  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(dialog).toBeVisible()
   releaseRead()
   await expect(page.getByRole('article')).toContainText('人工结论：确认未执行')
   await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(page.getByRole('main')).toBeFocused()
   expect(capture.mutations.map((item) => item.path)).toEqual([
     `/actions/${TASK_ID}/reconcile`,
     `/actions/${TASK_ID}/manual-resolution`,

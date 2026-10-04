@@ -1,6 +1,12 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
+import Button from 'primevue/button'
+import Card from 'primevue/card'
+import Column from 'primevue/column'
+import DataTable from 'primevue/datatable'
+import Message from 'primevue/message'
+import Tag from 'primevue/tag'
 import { ProblemError } from '@/api/client'
 import type { ActionApproval } from '@/api/types'
 import {
@@ -90,6 +96,31 @@ const statusLabels: Record<string, string> = {
 }
 let generation = 0
 let expiryTimer: ReturnType<typeof setTimeout> | undefined
+let countdownTimer: ReturnType<typeof setTimeout> | undefined
+const displayNow = ref(Date.now())
+/** 仅作显示，不写入原 now/expired 或审批状态；秒级公告为 polite，避免 assertive 打断。 */
+const remainingSeconds = computed(() =>
+  Math.max(
+    0,
+    Math.ceil(
+      (Date.parse(props.approval.expires_at) - displayNow.value) / 1000,
+    ),
+  ),
+)
+const legacyRows = computed(() =>
+  Object.entries(legacy.value?.payload ?? {}).map(([field, value]) => ({
+    field,
+    value: typeof value === 'object' ? JSON.stringify(value) : value,
+  })),
+)
+/** 展示 timer 只在待审批且有效的截止时间运行；原最长截止 timer 与服务端裁决不变。 */
+function scheduleCountdown(): void {
+  clearTimeout(countdownTimer)
+  displayNow.value = Date.now()
+  const remaining = Date.parse(props.approval.expires_at) - displayNow.value
+  if (props.approval.status === 'pending' && remaining > 0)
+    countdownTimer = setTimeout(scheduleCountdown, Math.min(remaining, 1000))
+}
 
 /** 到期只禁用本地交互，最终有效性由服务端时钟验证；长截止时间避免计时器溢出。 */
 function scheduleExpiry(): void {
@@ -115,9 +146,15 @@ watch(
   { immediate: true },
 )
 watch(() => props.approval.expires_at, scheduleExpiry, { immediate: true })
+watch(
+  () => [props.approval.expires_at, props.approval.status],
+  scheduleCountdown,
+  { immediate: true },
+)
 onUnmounted(() => {
   generation += 1
   clearTimeout(expiryTimer)
+  clearTimeout(countdownTimer)
 })
 
 /**
@@ -151,133 +188,166 @@ async function submitDecision(
 }
 </script>
 <template>
-  <section
-    class="approval-card"
+  <Card
+    role="region"
     aria-label="人工审批"
+    class="mt-4 min-w-0 wrap-anywhere"
   >
-    <h2>人工审批{{ legacy ? `：${legacy.tool}` : '' }}</h2>
-    <template v-if="structured?.content_status === 'available'">
-      <MailApprovalPreview
-        v-if="structured.preview.kind === 'mail'"
-        :preview="structured.preview"
-      />
-      <CalendarApprovalPreview
-        v-else
-        :preview="structured.preview"
-      />
+    <template #title>
+      <h2 class="text-lg font-semibold">
+        人工审批{{ legacy ? `：${legacy.tool}` : '' }}
+      </h2>
     </template>
-    <p
-      v-else-if="structured"
-      role="status"
-    >
-      内容已到期，仅保留执行历史。
-    </p>
-    <dl v-else-if="legacy">
-      <template
-        v-for="(value, key) in legacy.payload"
-        :key="key"
-      >
-        <dt>{{ key }}</dt>
-        <dd>
-          {{ typeof value === 'object' ? JSON.stringify(value) : value }}
-        </dd>
-      </template>
-    </dl>
-    <p>
-      审批版本 {{ approval.version
-      }}<template v-if="structured">
-        · 冻结版本 {{ structured.proposal_version }} ·
-        {{ structured.risk_level === 'high' ? '高风险' : '中风险' }}
-      </template>
-      ·
-      {{
-        expired ? '已过期' : statusLabels[approval.status] || approval.status
-      }}
-    </p>
-    <p>
-      到期时间：{{ formatActionTime(approval.expires_at, timezone) }}（{{
-        timezone
-      }}）
-    </p>
-    <div class="controls">
-      <button
-        type="button"
-        name="approved"
-        :disabled="disabled"
-        @click="submitDecision('approved')"
-      >
-        批准
-      </button><button
-        type="button"
-        name="rejected"
-        :disabled="disabled"
-        @click="submitDecision('rejected')"
-      >
-        拒绝
-      </button>
-    </div>
-    <p
-      v-if="busy || decided"
-      role="status"
-    >
-      {{
-        busy ? '正在记录决定…' : '决定已记录，执行结果以服务端后续状态为准。'
-      }}
-    </p>
-    <div
-      v-if="error"
-      role="alert"
-      data-testid="approval-error"
-      class="error"
-    >
-      <p>
-        {{ error.message
-        }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
-      </p>
-      <RouterLink
-        v-if="error.action === 'reauthorize'"
-        to="/connections"
-      >
-        重新授权
-      </RouterLink>
-      <RouterLink
-        v-else-if="error.action === 'new_version' && editorUrl"
-        :to="recoveryUrl ?? editorUrl"
-      >
-        创建新版本
-      </RouterLink>
-      <button
-        v-else-if="reload"
-        type="button"
-        @click="reload"
-      >
-        重新加载
-      </button>
-    </div>
-  </section>
+    <template #content>
+      <div class="space-y-4">
+        <template v-if="structured?.content_status === 'available'">
+          <MailApprovalPreview
+            v-if="structured.preview.kind === 'mail'"
+            :preview="structured.preview"
+          />
+          <CalendarApprovalPreview
+            v-else
+            :preview="structured.preview"
+          />
+        </template>
+        <Message
+          v-else-if="structured"
+          severity="info"
+          role="status"
+          aria-live="polite"
+        >
+          内容已到期，仅保留执行历史。
+        </Message>
+        <div
+          v-else-if="legacy"
+          class="overflow-x-auto"
+          tabindex="0"
+          aria-label="历史工具载荷滚动区域"
+        >
+          <DataTable
+            :value="legacyRows"
+            data-key="field"
+            :table-props="{ 'aria-label': '历史工具冻结载荷' }"
+          >
+            <Column
+              field="field"
+              header="字段"
+              :pt="{
+                headerCell: { scope: 'col' },
+                bodyCell: { role: 'rowheader' },
+              }"
+            />
+            <Column
+              field="value"
+              header="精确载荷"
+              class="whitespace-pre-wrap wrap-anywhere"
+              :pt="{ headerCell: { scope: 'col' } }"
+            />
+          </DataTable>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <p>
+            审批版本 {{ approval.version
+            }}<template v-if="structured">
+              · 冻结版本 {{ structured.proposal_version }}
+            </template>
+          </p>
+          <Tag
+            v-if="structured"
+            :value="structured.risk_level === 'high' ? '高风险' : '中风险'"
+            :severity="structured.risk_level === 'high' ? 'danger' : 'warn'"
+          />
+          <span>{{
+            expired
+              ? '已过期'
+              : statusLabels[approval.status] || approval.status
+          }}</span>
+        </div>
+        <p>
+          到期时间：{{ formatActionTime(approval.expires_at, timezone) }}（{{
+            timezone
+          }}）
+        </p>
+        <!-- 到期提示与倒计时共用一个真实 status；不替代原 expired/disabled 判断。 -->
+        <Message
+          v-if="approval.status === 'pending'"
+          severity="info"
+          role="status"
+          aria-live="polite"
+        >
+          <template v-if="expired">
+            审批已过期，请重新加载权威状态。
+          </template>
+          <template v-else>
+            审批剩余 {{ Math.floor(remainingSeconds / 60) }} 分
+            {{ remainingSeconds % 60 }} 秒
+          </template>
+        </Message>
+        <div class="flex flex-wrap gap-3">
+          <Button
+            type="button"
+            name="approved"
+            label="批准"
+            :disabled="disabled"
+            :loading="busy"
+            :aria-busy="busy"
+            @click="submitDecision('approved')"
+          />
+          <Button
+            type="button"
+            name="rejected"
+            label="拒绝"
+            severity="secondary"
+            :disabled="disabled"
+            :loading="busy"
+            :aria-busy="busy"
+            @click="submitDecision('rejected')"
+          />
+        </div>
+        <!-- 原记录中／已记录共用 status 原文保留；Message 不嵌套新的 live region。 -->
+        <Message
+          v-if="busy || decided"
+          severity="info"
+          role="status"
+          aria-live="polite"
+        >
+          {{
+            busy
+              ? '正在记录决定…'
+              : '决定已记录，执行结果以服务端后续状态为准。'
+          }}
+        </Message>
+        <Message
+          v-if="error"
+          severity="error"
+          role="alert"
+        >
+          <p>
+            {{ error.message
+            }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
+          </p>
+          <Button
+            v-if="error.action === 'reauthorize'"
+            :as="RouterLink"
+            to="/connections"
+            label="重新授权"
+            link
+          />
+          <Button
+            v-else-if="error.action === 'new_version' && editorUrl"
+            :as="RouterLink"
+            :to="recoveryUrl ?? editorUrl"
+            label="创建新版本"
+            link
+          />
+          <Button
+            v-else-if="reload"
+            type="button"
+            label="重新加载"
+            @click="reload"
+          />
+        </Message>
+      </div>
+    </template>
+  </Card>
 </template>
-<style scoped>
-.approval-card {
-  margin-top: 1rem;
-  padding: 1rem;
-  border: 1px solid #dce2ea;
-  border-radius: 0.65rem;
-  overflow-wrap: anywhere;
-}
-h2 {
-  font-size: 1.2rem;
-}
-.controls {
-  display: flex;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-}
-.error {
-  color: #a61b1b;
-}
-button:focus-visible,
-a:focus-visible {
-  outline: 3px solid #164e9c;
-  outline-offset: 3px;
-}
-</style>

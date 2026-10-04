@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { CalendarApprovalPreview } from '@/api/types'
+import Message from 'primevue/message'
 import { providerLabel } from '@/features/actions/presentation'
 import CalendarFieldsComparison from './CalendarFieldsComparison.vue'
 import CalendarConflictNotice from './CalendarConflictNotice.vue'
@@ -13,7 +14,10 @@ const operations = {
 }
 </script>
 <template>
-  <section aria-label="日程审批预览">
+  <section
+    aria-label="日程审批预览"
+    class="min-w-0 space-y-3"
+  >
     <p>
       {{ operations[preview.operation] }} ·
       {{ providerLabel(preview.provider) }} · {{ preview.account_email }}
@@ -40,25 +44,21 @@ const operations = {
           : '此操作不提供自动撤销。'
       }}
     </p>
-    <p
+    <Message
       v-if="
         preview.provider_warnings.includes(
           'google_send_updates_none_external_sync',
         )
       "
-      class="warning"
+      severity="warn"
+      role="note"
+      aria-live="off"
     >
       Google 不发送通知可能影响外部同步，请核对参会人的日历。
-    </p>
+    </Message>
     <CalendarConflictNotice
       :conflicts="preview.conflicts"
       :timezone="preview.after.timezone"
     />
   </section>
 </template>
-<style scoped>
-.warning {
-  background: #fff5df;
-  padding: 0.75rem;
-}
-</style>

@@ -834,14 +834,20 @@ git commit -m "feat: migrate calendar reprepare to PrimeVue"
 - Modify: `frontend/src/components/ActionConfirmationDialog.vue`
 - Create: `frontend/src/components/ActionConfirmationDialog.spec.ts`
 - Modify: `frontend/e2e/provider-errors.spec.ts`
+- Modify: `frontend/src/components/AppShell.vue`、`frontend/src/components/AppShell.spec.ts`、`frontend/src/components/NeedsAttentionPanel.spec.ts`
+- Create: `frontend/src/components/actionDialogContext.ts`
+- Modify: 本计划 Task 14 的文件范围、live region 与验证记录
+- Modify: `frontend/e2e/m2-actions.spec.ts`、`frontend/e2e/mail-editor.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+**Task 14 共享消费者预检补充：** 深层 `ActionConfirmationDialog` 通过类型化 UI 注入端口通知 AppShell 隔离背景；每次打开持有独立释放凭据，退出动画后或卸载时幂等释放，旧实例不得解除新模态。只扩展 AppShell 展示层和对应测试，不新增 Store 或修改 NeedsAttentionPanel 行为。其既有测试迁移语义查询与真实 Dialog。旧／新 E2E 扩充 `m2-actions`、`mail-editor`、`calendar-editor`、`calendar-restore`、`calendar-reprepare`、`daily-brief`，保留所有请求／版本／副作用断言；仅有新增断言的文件提交。live region 逐项变化与运行时证据在本任务完成记录同步。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/components/ApprovalCard.spec.ts && pnpm --dir frontend test:e2e e2e/provider-errors.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：风险等级 `Tag`；载荷字段为 `DataTable` 且正文以纯文本 `<p>`/`<pre>` 之外的方式逐字渲染（既有「不含 `img`/`pre`、Markdown 不解析」断言保留）；过期倒计时在 `role="status"` 内；批准/拒绝期间两个按钮均 `loading` 禁用；409 后显示恢复动作且既有 `recovery=new_version` 链接断言通过；确认对话框为 `Dialog modal`，打开后焦点在首个按钮，Esc 关闭，关闭后焦点返回触发按钮，背景 `inert`；能力撤销、哈希冲突、版本变化各显示对应恢复动作。
 
@@ -849,22 +855,31 @@ Run: `pnpm --dir frontend test:unit --run src/components/ApprovalCard.spec.ts sr
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建并删除 scoped CSS**
+- [x] **Step 3: 重建并删除 scoped CSS**
 
 `api/approvals.ts`、`api/approvalPreviews.ts` 不动。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/provider-errors.spec.ts e2e/m2-actions.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/components/ApprovalCard.vue frontend/src/components/ApprovalCard.spec.ts frontend/src/components/MailApprovalPreview.vue frontend/src/components/CalendarApprovalPreview.vue frontend/src/components/ActionConfirmationDialog.vue frontend/src/components/ActionConfirmationDialog.spec.ts frontend/e2e/provider-errors.spec.ts
+git add frontend/src/components/ApprovalCard.vue frontend/src/components/ApprovalCard.spec.ts frontend/src/components/MailApprovalPreview.vue frontend/src/components/CalendarApprovalPreview.vue frontend/src/components/ActionConfirmationDialog.vue frontend/src/components/ActionConfirmationDialog.spec.ts frontend/e2e/provider-errors.spec.ts frontend/src/components/AppShell.vue frontend/src/components/AppShell.spec.ts frontend/src/components/actionDialogContext.ts frontend/src/components/NeedsAttentionPanel.spec.ts frontend/e2e/m2-actions.spec.ts frontend/e2e/mail-editor.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate approval previews to PrimeVue"
 ~~~
+
+**Task 14 完成记录（2026-10-05）：**
+
+- 旧实现先完成 ApprovalCard／NeedsAttentionPanel 单测语义查询迁移（15 项通过），相关七文件 E2E 59 项通过后才改消费源码；迁移 RED 为 8 项预期失败、30 项通过。
+- 风险以 Tag 展示，M1 legacy 与 M2 冻结载荷保留各自 Props；邮件正文逐字纯文本，日程复用原冻结前后值、时区、通知、ETag 与恢复信息。批准／拒绝均 loading＋disabled，原决定、哈希、版本、409 锁与恢复路由未修改。删除审批错误和邮件主题原可被角色／文本替代的 testid。
+- 原 ApprovalCard 的到期内容 status、记录中／已记录 status 和错误 alert 原文不变；新增一个 polite status 展示剩余时间及本地截止提示，源码 status 2→3、alert 1→1。展示 timer 独立于原 expiry timer 和权威状态，卸载清理且保留最长时限保护。邮件／日程静态风险 Message 使用 note/off，均不新增 alert；CalendarConflictNotice 的原 polite region 不变。
+- ActionConfirmationDialog 的源码显式 dialog 1→0，由真实 PrimeVue modal Dialog 提供同一个运行时 dialog；父级插槽内原人工结果警告 alert 原文保留。AppShell 原有 role 数量不变，新增专用 UI 注入端口让深层浮层直接隔离背景；凭据按实例释放，旧实例关闭不得解除新模态。取消先锁按钮、nextTick 后退出再经 after-hide 完成；离场节点的迟到点击及 busy 往返不能重新启用确认，等待期卸载和替换由 disposed/实例凭据隔离，权威终态或卸载同样清理，先解除 inert 再回有效 trigger 或 main。
+- 聚焦组件目录 115 项通过；完整 just check 含后端 2730／前端 640 项通过（含退出动画竞争新增回归）。迁移后七文件 E2E 59 项通过；补充审批预览与人工确认 Dialog 的 axe（serious／critical 为零）后 mail-editor 5 项再次通过，保留原请求计数、版本与供应商副作用断言。type-check、lint、构建及原体积预算通过（入口 JS gzip 330057B／上限 340373B，CSS 8338B），无依赖变更。
+- 非门禁失败的既有提示：后端 Starlette 弃用警告，尚待 Task 15 迁移的 NeedsAttentionPanel 四个颜色字面量，以及构建的 Zod 注释解释和默认大块提示。Task 15 继续核对打开模态期间人工核对 busy/error 的单次可感知位置；本任务不提前改动其组件行为或样式。完整里程碑 CI 仍归 Task 17。
 
 ---
 

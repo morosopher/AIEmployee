@@ -8,7 +8,8 @@ import ConfirmDialog from 'primevue/confirmdialog'
 import Message from 'primevue/message'
 import { useToast } from 'primevue/usetoast'
 import TaskTimeline from './TaskTimeline.vue'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from 'vue'
+import { actionDialogContext } from './actionDialogContext'
 import { useRoute } from 'vue-router'
 import { useTasksStore } from '@/stores/tasks'
 import { getSystemAlerts, type SystemAlert } from '@/api/system'
@@ -90,6 +91,7 @@ const navigationOpen = ref(false)
 const timelineOpen = ref(false)
 const confirmationOpen = ref(false)
 const pageModalOpen = ref(false)
+const actionDialogs = ref(new Set<symbol>())
 let pageModalTrigger: HTMLElement | null = null
 const mainContent = ref<HTMLElement | null>(null)
 let confirmationTrigger: HTMLElement | null = null
@@ -138,8 +140,27 @@ async function pageModalChanged(open: boolean): Promise<void> {
   mainContent.value?.focus()
 }
 const modalOpen = computed(
-  () => navigationOpen.value || timelineOpen.value || confirmationOpen.value || pageModalOpen.value,
+  () => navigationOpen.value || timelineOpen.value || confirmationOpen.value || pageModalOpen.value || actionDialogs.value.size > 0,
 )
+/**
+ * 深层人工结果确认持有各自的隔离凭据；旧实例卸载只能释放自己的凭据。
+ * 先等待 Vue 移除 inert 与已关闭浮层，再验证触发器；终态禁用或卸载时退回主内容。
+ * 新模态在同一轮更新打开时保持其焦点，不让旧释放回调抢走焦点。
+ */
+provide(actionDialogContext, (trigger) => {
+  const owner = Symbol('action-dialog')
+  actionDialogs.value.add(owner)
+  return async () => {
+    if (!actionDialogs.value.delete(owner)) return
+    await nextTick()
+    if (modalOpen.value) return
+    if (trigger?.isConnected && !trigger.matches(':disabled, [aria-disabled="true"]') && !trigger.closest('[inert]')) {
+      trigger.focus()
+      if (document.activeElement === trigger) return
+    }
+    mainContent.value?.focus()
+  }
+})
 watch(
   () => route.path,
   () => {

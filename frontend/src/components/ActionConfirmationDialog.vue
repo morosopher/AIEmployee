@@ -1,103 +1,100 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { inject, nextTick, onUnmounted, ref } from 'vue'
+import Button from 'primevue/button'
+import Dialog from 'primevue/dialog'
+import { actionDialogContext } from './actionDialogContext'
 
-/** 对话框仅收集显式点击；调用者负责枚举提交及随后权威状态刷新。 */
-defineProps<{ title: string; busy: boolean }>()
+/** 对话框仅收集显式点击；调用者仍负责枚举提交、忙碌状态和权威快照刷新。 */
+const props = defineProps<{ title: string; busy: boolean }>()
 const emit = defineEmits<{ confirm: []; cancel: [] }>()
-const region = ref<HTMLElement | null>(null)
+const visible = ref(true)
+const openDialog = inject(actionDialogContext, null)
 const previousFocus =
   document.activeElement instanceof HTMLElement ? document.activeElement : null
-onMounted(
-  () =>
-    void nextTick(() =>
-      region.value
-        ?.querySelector<HTMLButtonElement>('button[name="cancel-resolution"]')
-        ?.focus(),
-    ),
-)
-onUnmounted(() => previousFocus?.focus())
+let release: (() => Promise<void>) | undefined
+const cancelled = ref(false)
+let disposed = false
 
-/** @param event 对话框键盘事件。保持焦点循环，防止触发背景动作。 */
-function containFocus(event: KeyboardEvent): void {
-  if (event.key !== 'Tab') return
-  const buttons = Array.from(
-    region.value?.querySelectorAll<HTMLButtonElement>(
-      'button:not(:disabled)',
-    ) ?? [],
-  )
-  const first = buttons[0],
-    last = buttons[buttons.length - 1]
-  if (!first || !last) {
-    event.preventDefault()
+/** Portal 已显示才隔离背景；AppShell 不存在时仍支持独立组件的有效触发器返回。 */
+function shown(): void {
+  if (disposed) return
+  release = openDialog?.(previousFocus)
+}
+/**
+ * 取消先锁住按钮，再退出浮层并发出原 cancel，避免父级 v-if 立即卸载跳过退出动画。
+ * Dialog 的离场节点保留关闭前 VNode，因此等待一次 DOM 更新再隐藏，防止退出期按钮重新可用。
+ * Escape 始终由 Dialog 监听，回调在 busy 时拒绝关闭；初始 busy 后恢复也可正常 Escape。
+ */
+async function requestCancel(): Promise<void> {
+  if (props.busy || cancelled.value || disposed) return
+  cancelled.value = true
+  await nextTick()
+  if (!disposed) visible.value = false
+}
+/** 隔离释放幂等；强制卸载与正常 after-hide 可能同时触发，不重复归还焦点。 */
+async function restoreFocus(): Promise<void> {
+  if (release) {
+    const close = release
+    release = undefined
+    await close()
     return
   }
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault()
-    last.focus()
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault()
-    first.focus()
-  }
+  if (openDialog) return
+  await nextTick()
+  if (
+    previousFocus?.isConnected &&
+    !previousFocus.matches(':disabled, [aria-disabled="true"]') &&
+    !previousFocus.closest('[inert]')
+  )
+    previousFocus.focus()
 }
+/** 正常关闭动画后才通知父组件；确认不关闭，等待调用者刷新权威结果后卸载。 */
+function hidden(): void {
+  void restoreFocus()
+  if (cancelled.value && !disposed) emit('cancel')
+}
+onUnmounted(() => {
+  disposed = true
+  void restoreFocus()
+})
 </script>
+
 <template>
-  <div class="dialog-backdrop">
-    <section
-      ref="region"
-      role="dialog"
-      aria-modal="true"
-      :aria-label="title"
-      class="confirmation-dialog"
-      @keydown="containFocus"
-      @keydown.esc.prevent="!busy && emit('cancel')"
-    >
-      <h3>{{ title }}</h3>
-      <slot />
-      <div class="controls">
-        <button
+  <Dialog
+    :visible="visible"
+    :header="title"
+    modal
+    :closable="false"
+    :draggable="false"
+    :close-on-escape="true"
+    class="m-4 w-full max-w-lg"
+    @update:visible="requestCancel"
+    @show="shown"
+    @after-hide="hidden"
+  >
+    <slot />
+    <template #footer>
+      <!-- 退出动画保留节点期间也锁住原按钮，防止取消后的迟到点击变成确认。 -->
+      <div class="flex flex-wrap gap-3">
+        <Button
           type="button"
           name="cancel-resolution"
-          :disabled="busy"
-          @click="emit('cancel')"
-        >
-          取消
-        </button><button
+          label="取消"
+          severity="secondary"
+          autofocus
+          :disabled="busy || cancelled"
+          @click="requestCancel"
+        />
+        <Button
           type="button"
           name="confirm-resolution"
-          :disabled="busy"
-          @click="emit('confirm')"
-        >
-          确认记录结果
-        </button>
+          label="确认记录结果"
+          :disabled="busy || cancelled"
+          :loading="busy"
+          :aria-busy="busy"
+          @click="!busy && !cancelled && !disposed && emit('confirm')"
+        />
       </div>
-    </section>
-  </div>
+    </template>
+  </Dialog>
 </template>
-<style scoped>
-.dialog-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  background: #0f172a80;
-  padding: 1rem;
-}
-.confirmation-dialog {
-  background: white;
-  padding: 1.25rem;
-  border-radius: 0.75rem;
-  max-width: 32rem;
-  max-height: 90vh;
-  overflow: auto;
-}
-.controls {
-  display: flex;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-}
-button:focus-visible {
-  outline: 3px solid #164e9c;
-  outline-offset: 3px;
-}
-</style>
