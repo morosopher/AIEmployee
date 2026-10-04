@@ -724,18 +724,31 @@ git commit -m "feat: migrate mail editor to PrimeVue forms"
 ### Task 12: 迁移日程编辑器
 
 **Files:**
+- Create: `frontend/src/components/CalendarEditorForm.vue`（异步 Form/zod 展示边界）、`frontend/src/components/CalendarDateTimeInput.vue`（日期／墙上时间控件适配）、`frontend/src/pages/CalendarPresentation.spec.ts`（真实展示交互与格式验证）
+- Modify: `frontend/src/pages/CalendarRepreparePage.spec.ts`（仅共享输入选择器兼容）
+- Modify: `frontend/src/components/CalendarApprovalPreview.vue`（仅向冲突展示传冻结 `after.timezone`，不改 Task 14 其余展示）；冲突保留完整原 ISO，另附显式 IANA 可读范围。
+- Validate: `frontend/e2e/action-workspace.spec.ts`、`frontend/e2e/calendar-reprepare.spec.ts`、`frontend/e2e/m2-actions.spec.ts`（共享字段、冲突／缺失来源组件及冻结审批消费者）；保留原业务、安全与存储断言。
+
 - Create: `frontend/src/features/calendar/schema.ts`、`frontend/src/features/calendar/schema.spec.ts`
 - Modify: `frontend/src/pages/CalendarProposalPage.vue`、`frontend/src/pages/CalendarProposalPage.spec.ts`
 - Modify: `frontend/src/components/CalendarProposalFields.vue`、`frontend/src/components/CalendarTargetFields.vue`、`frontend/src/components/CalendarConflictNotice.vue`、`frontend/src/components/MissingCalendarConnections.vue`
 - Modify: `frontend/e2e/calendar-editor.spec.ts`、`frontend/e2e/calendar-restore.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+**Task 12 同提交运行时记录（2026-10-04）：**
+
+- 原页面加载、恢复来源缺失、未保存、来源未确认、冲突未检查、候选部分来源六个 `status` 及原快照不可用 `alert` 逐字保留；其中未保存／来源未确认迁入异步 Form。`EditorRecovery` 仍只有一个实例承担当前错误、原动作与追踪号，真实错误码映射补在同一公告内。
+- 异步表单新增互斥的加载 `status`／失败 `alert`；zod 最多五个字段错误 `alert`。未保存离开复用外壳 `ConfirmDialog`，不重复挂载。
+- 冲突组件的命名 section 原本已形成 region；现在以单一 `Message warn` 显式保持 `region` + `aria-live=polite`。缺失连接 `Message info` 使用 `role=presentation` + `aria-live=off`，不在父公告中重复播报。完整原 ISO 及文案保留，附加明确 IANA 可读范围；冻结审批只传冻结时区。
+- DatePicker 的内置日历公告保留；锚定浮层明确 `aria-modal=false`，与允许在原输入继续手输的真实交互一致。公开 PT 将 `aria-selected` 从普通 span 移到 gridcell，并提供日期按钮与选中／今日键盘入口；Esc 回原输入、键盘选日以及弹层 axe 均经实际 dist 验证。
+- 新鲜验证：`just check`（后端 2730、前端 592 项）、五组相关 E2E 36 项、纽约宿主格式／展示 33 项全部通过；实际 dist 三视口（1440／1024／390）、弹层及错误态 axe serious/critical 为零。首屏 JS gzip 328486 B、CSS gzip 8656 B，预算通过。本任务未执行完整 `just ci`，最终门禁仍归 Task 16／17。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/CalendarProposalPage.spec.ts && pnpm --dir frontend test:e2e e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的 schema 与迁移断言**
+- [x] **Step 2: 写失败的 schema 与迁移断言**
 
 schema 只校验：标题非空、开始/结束为合法时间且结束晚于开始、时区为显式合法 IANA（本地 Intl 列表 + UTC，保留服务端当前值，不以有限 fallback 排除合法值）、参会人地址格式。断言：全天字段用日期分支，定时字段用 `DatePicker showTime` 墙上时间分支；沿用既有全天日期转换与 `features/calendar/time.ts`、DST 歧义拒绝，提交值仍是既有日期或 ISO 格式与 IANA 时区（比对 API mock 参数），不得直接 `Date.toISOString()` 推断宿主机时区；时区 `Select` 明示且无自动推断；修改任一时间字段后旧冲突结果被清除并重新计算（既有逻辑，只改断言选择器）；冲突提示 `Message warn` 最多三个候选时间按钮，选择后回填字段；工作时间外警告可见；参会人 `Chip` 列表；无删除/取消/重复日程/会议链接控件；ETag 冲突显示恢复动作。
 
@@ -743,20 +756,20 @@ Run: `pnpm --dir frontend test:unit --run src/features/calendar src/pages/Calend
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建**
+- [x] **Step 3: 重建**
 
 `api/calendar.ts`、`api/calendarFields.ts`、`features/calendar` 既有逻辑不动；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/features/calendar src/pages/CalendarProposalPage.spec.ts src/api/calendarEditors.spec.ts src/api/calendarRestore.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/calendar-editor.spec.ts e2e/calendar-restore.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/features/calendar/schema.ts frontend/src/features/calendar/schema.spec.ts frontend/src/pages/CalendarProposalPage.vue frontend/src/pages/CalendarProposalPage.spec.ts frontend/src/components/CalendarProposalFields.vue frontend/src/components/CalendarTargetFields.vue frontend/src/components/CalendarConflictNotice.vue frontend/src/components/MissingCalendarConnections.vue frontend/e2e/calendar-editor.spec.ts frontend/e2e/calendar-restore.spec.ts
+git add frontend/src/features/calendar/schema.ts frontend/src/features/calendar/schema.spec.ts frontend/src/pages/CalendarProposalPage.vue frontend/src/pages/CalendarProposalPage.spec.ts frontend/src/components/CalendarProposalFields.vue frontend/src/components/CalendarTargetFields.vue frontend/src/components/CalendarConflictNotice.vue frontend/src/components/MissingCalendarConnections.vue frontend/e2e/calendar-editor.spec.ts frontend/e2e/calendar-restore.spec.ts frontend/src/components/CalendarEditorForm.vue frontend/src/components/CalendarDateTimeInput.vue frontend/src/pages/CalendarPresentation.spec.ts frontend/src/pages/CalendarRepreparePage.spec.ts frontend/src/components/CalendarApprovalPreview.vue docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate calendar editor to PrimeVue forms"
 ~~~
 

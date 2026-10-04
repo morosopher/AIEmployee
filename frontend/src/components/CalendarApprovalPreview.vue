@@ -50,7 +50,10 @@ const operations = {
     >
       Google 不发送通知可能影响外部同步，请核对参会人的日历。
     </p>
-    <CalendarConflictNotice :conflicts="preview.conflicts" />
+    <CalendarConflictNotice
+      :conflicts="preview.conflicts"
+      :timezone="preview.after.timezone"
+    />
   </section>
 </template>
 <style scoped>

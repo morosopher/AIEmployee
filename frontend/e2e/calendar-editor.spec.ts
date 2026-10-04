@@ -120,9 +120,8 @@ for (const operation of ['save', 'last-confirmation'] as const) {
       await page
         .getByLabel('日程标题', { exact: true })
         .fill('Synthetic refreshed title')
-      await page.locator('button[name="save-proposal"]').click()
-    } else
-      await page.locator('button[name="confirm-notification_policy"]').click()
+      await page.getByRole('button', { name: /^保存提案/ }).click()
+    } else await page.getByRole('button', { name: /^确认通知策略/ }).click()
 
     await expect(page.getByRole('alert')).toContainText(
       'synthetic-editor-trace',
@@ -130,8 +129,8 @@ for (const operation of ['save', 'last-confirmation'] as const) {
     await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
     await expect(page.getByRole('table')).toHaveCount(0)
     await expect(page.getByLabel('日程标题', { exact: true })).toBeDisabled()
-    await expect(page.locator('button[name="confirm-time"]')).toBeDisabled()
-    await expect(page.locator('button[name="submit-proposal"]')).toBeDisabled()
+    await expect(page.getByRole('button', { name: /^确认时间/ })).toBeDisabled()
+    await expect(page.getByRole('button', { name: /^提交审批/ })).toBeDisabled()
     expect(reads).toBe(2)
     expect(capture.mutations).toHaveLength(1)
     expect(capture.mutations[0]?.method).toBe('PATCH')
@@ -139,21 +138,21 @@ for (const operation of ['save', 'last-confirmation'] as const) {
       capture.mutations.filter((item) => item.path.endsWith('/submit')),
     ).toHaveLength(0)
 
-    await page.locator('button[name="reload-editor"]').click()
+    await page.getByRole('button', { name: /^重新加载提案/ }).click()
     await expect(page.getByRole('table')).toContainText(before.location)
     await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
     await expect(page.getByLabel('日程标题', { exact: true })).toBeEnabled()
     expect(reads).toBe(3)
     expect(capture.mutations).toHaveLength(1)
     if (operation === 'save') {
-      await page.locator('button[name="confirm-time"]').click()
+      await page.getByRole('button', { name: /^确认时间/ }).click()
       await expect(page.getByText('版本 3', { exact: false })).toBeVisible()
       expect(capture.mutations[1]?.payload).toEqual({
         version: 2,
         confirmation: { kind: 'time' },
       })
     }
-    await expect(page.locator('button[name="submit-proposal"]')).toBeEnabled()
+    await expect(page.getByRole('button', { name: /^提交审批/ })).toBeEnabled()
     expect(
       capture.mutations.filter((item) => item.path.endsWith('/submit')),
     ).toHaveLength(0)
@@ -358,11 +357,12 @@ test('calendar candidates advance the saved version before four explicit confirm
   await page.getByLabel('开始时间', { exact: true }).fill('2030-01-01T09:00')
   await page.getByLabel('结束时间', { exact: true }).fill('2030-01-01T10:00')
   await page.getByLabel('参会人', { exact: true }).fill('attendee@example.test')
-  await page.getByLabel('通知策略', { exact: true }).selectOption('none')
+  await page.getByRole('combobox', { name: '通知策略', exact: true }).click()
+  await page.getByRole('option', { name: '不发送通知', exact: true }).click()
   await page.getByRole('button', { name: '保存提案', exact: true }).click()
   await expect(page.getByText('待确认：4 项', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '查询三个候选时间' }).click()
-  await expect(page.locator('button[name="choose-candidate"]')).toHaveCount(3)
+  await expect(page.getByRole('button', { name: /至.*（/ })).toHaveCount(3)
   await expect(page.getByText('版本 3', { exact: false })).toBeVisible()
   await expect(
     page.getByRole('region', { name: '服务端候选时间' }),
@@ -372,14 +372,19 @@ test('calendar candidates advance the saved version before four explicit confirm
   ).toContainText('未检查参会人可用性')
   for (const region of [
     page.getByRole('region', { name: '服务端候选时间' }),
-    page.getByTestId('calendar-conflicts'),
+    page.getByRole('region', { name: '日程冲突检查' }),
   ]) {
     await expect(region).toContainText('Microsoft')
     await expect(region).toContainText(connection('microsoft').account_email)
   }
-  await page.locator('button[name="choose-candidate"]').first().click()
-  await expect(page.locator('button[name="choose-candidate"]')).toHaveCount(0)
-  await expect(page.getByTestId('calendar-conflicts')).toHaveCount(0)
+  await page
+    .getByRole('button', { name: /至.*（/ })
+    .first()
+    .click()
+  await expect(page.getByRole('button', { name: /至.*（/ })).toHaveCount(0)
+  await expect(page.getByRole('region', { name: '日程冲突检查' })).toHaveCount(
+    0,
+  )
   await page.getByRole('button', { name: '保存提案', exact: true }).click()
   await expect(page.getByText('版本 4', { exact: false })).toBeVisible()
   for (const [index, kind] of [
@@ -388,7 +393,17 @@ test('calendar candidates advance the saved version before four explicit confirm
     'attendees',
     'notification_policy',
   ].entries()) {
-    await page.locator(`button[name="confirm-${kind}"]`).click()
+    await page
+      .getByRole('button', {
+        name: {
+          calendar: '确认此日历',
+          time: '确认时间',
+          attendees: '确认参会人',
+          notification_policy: '确认通知策略',
+        }[kind],
+        exact: true,
+      })
+      .click()
     // 每次完整 GET 后再进入下一个确认，不能并发发送旧版本。
     await expect(
       page.getByText(`版本 ${index + 5}`, { exact: false }),
@@ -540,6 +555,220 @@ test('a production event version conflict opens a new editable update while pres
   expect(proposal.status).toBe('stale')
   expect(proposal.editor_facts?.before).toEqual(before)
   expect(proposal.base_etag).toBe('synthetic-etag-original')
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 宿主时区只是 DatePicker 的显示载体，API 时刻必须由显式 IANA 字段决定。 */
+for (const hostTimezone of ['Asia/Shanghai', 'America/New_York']) {
+  test.describe(`calendar wall input in ${hostTimezone}`, () => {
+    test.use({ timezoneId: hostTimezone })
+    test('keeps manual strings, rejects target DST ambiguity and sends exact UTC instants', async ({
+      page,
+    }) => {
+      const capture = await editorWorkspace(page)
+      let proposal: CalendarProposal = {
+        ...calendarProposal(),
+        ...calendarFields(),
+        calendar_id: 'synthetic-google-calendar',
+        notification_policy: 'none',
+        starts_at: '2030-01-01T01:00:42.123456Z',
+        editor_facts: {
+          reprepare_source: null,
+          restore_source: null,
+          before_status: 'not_applicable',
+          before: null,
+          conflict_status: 'checked',
+          conflicts: [],
+        },
+      }
+      await page.route(
+        `**/api/v1/calendar/proposals/${PROPOSAL_ID}`,
+        async (route) => {
+          if (route.request().method() === 'PATCH') {
+            const input = route
+              .request()
+              .postDataJSON() as UpdateCalendarProposalInput
+            expect(input).not.toHaveProperty('confirmation')
+            proposal = {
+              ...proposal,
+              ...input,
+              attendees:
+                ('attendees' in input ? input.attendees : null) ??
+                proposal.attendees,
+              version: proposal.version + 1,
+            }
+            await editorJson(route, { ...proposal, editor_facts: null })
+          } else await editorJson(route, proposal)
+        },
+      )
+      await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+      await page
+        .getByLabel('日程标题', { exact: true })
+        .fill('Synthetic precise timestamp')
+      await page.getByRole('button', { name: '保存提案', exact: true }).click()
+      await expect(page.getByText('版本 2', { exact: false })).toBeVisible()
+      expect(capture.mutations[0]?.payload).toMatchObject({
+        version: 1,
+        starts_at: '2030-01-01T01:00:42.123456Z',
+        ends_at: '2030-01-01T10:00:00+08:00',
+      })
+      await page
+        .getByLabel('IANA 时区', { exact: true })
+        .fill('America/New_York')
+      for (const wall of ['2030-03-10T02:30', '2030-11-03T01:30']) {
+        await page.getByLabel('开始时间', { exact: true }).fill(wall)
+        await page
+          .getByLabel('结束时间', { exact: true })
+          .fill(`${wall.slice(0, 10)}T04:00`)
+        await page
+          .getByRole('button', { name: '保存提案', exact: true })
+          .click()
+        await expect(
+          page.getByText(/该时间处于夏令时跳跃或重复时段/),
+        ).toBeVisible()
+        expect(capture.mutations).toHaveLength(1)
+      }
+      await page.getByLabel('IANA 时区', { exact: true }).fill('UTC')
+      await page.getByLabel('开始时间', { exact: true }).fill('invalid-time')
+      await page
+        .getByLabel('结束时间', { exact: true })
+        .fill('2030-03-10T03:30')
+      await page.getByRole('button', { name: '保存提案', exact: true }).click()
+      await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+        'invalid-time',
+      )
+      expect(capture.mutations).toHaveLength(1)
+      await page
+        .getByLabel('开始时间', { exact: true })
+        .fill('2030-03-10T02:30')
+      await page.getByLabel('结束时间', { exact: true }).focus()
+      await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+        '2030-03-10T02:30',
+      )
+      await page.getByRole('button', { name: '保存提案', exact: true }).click()
+      await expect(page.getByText('版本 3', { exact: false })).toBeVisible()
+      expect(capture.mutations[1]?.payload).toMatchObject({
+        version: 2,
+        starts_at: '2030-03-10T02:30:00.000Z',
+        ends_at: '2030-03-10T03:30:00.000Z',
+        timezone: 'UTC',
+        all_day: false,
+      })
+      expect(capture.mutations).toHaveLength(2)
+      expect(capture.unexpected).toEqual([])
+      expect(capture.pageErrors).toEqual([])
+      expect(
+        await page.evaluate(() => [localStorage.length, sessionStorage.length]),
+      ).toEqual([0, 0])
+    })
+  })
+}
+
+/** 真异步模块的失败与重试也属于可见状态；只读重载不得复制任何日程写操作。 */
+test('calendar form loads on demand and recovers only after an explicit retry', async ({
+  page,
+}) => {
+  const capture = await editorWorkspace(page)
+  await page.route(`**/api/v1/calendar/proposals/${PROPOSAL_ID}`, (route) =>
+    editorJson(route, {
+      ...calendarProposal(),
+      ...calendarFields(),
+      calendar_id: 'synthetic-google-calendar',
+      notification_policy: 'none',
+      editor_facts: {
+        reprepare_source: null,
+        restore_source: null,
+        before_status: 'not_applicable',
+        before: null,
+        conflict_status: 'checked',
+        conflicts: [],
+      },
+    }),
+  )
+  let attempts = 0
+  let release: (() => void) | undefined
+  await page.route(
+    '**/src/components/CalendarEditorForm.vue*',
+    async (route) => {
+      attempts += 1
+      if (attempts === 1) return route.abort('failed')
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      await route.continue()
+    },
+  )
+  await page.goto('/connections')
+  expect(attempts).toBe(0)
+  await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+  await expect(
+    page.getByRole('alert').filter({ hasText: '日程表单加载失败' }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载日程表单…' }),
+  ).toHaveCount(0)
+  await page.getByRole('button', { name: '重试加载表单' }).click()
+  await expect(
+    page.getByRole('status').filter({ hasText: '正在加载日程表单…' }),
+  ).toHaveText('正在加载日程表单…')
+  await expect.poll(() => attempts).toBe(2)
+  release?.()
+  await expect(page.getByRole('form', { name: '日程提案表单' })).toBeVisible()
+  expect(capture.mutations).toEqual([])
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 日历格选择使用键盘且不造成隐式保存；非模态浮层仍允许在原字段手输。 */
+test('calendar date picker keeps keyboard selection, manual editing and Escape focus usable', async ({
+  page,
+}) => {
+  const capture = await editorWorkspace(page)
+  await page.route(`**/api/v1/calendar/proposals/${PROPOSAL_ID}`, (route) =>
+    editorJson(route, {
+      ...calendarProposal(),
+      ...calendarFields(),
+      calendar_id: 'synthetic-google-calendar',
+      notification_policy: 'none',
+      editor_facts: {
+        reprepare_source: null,
+        restore_source: null,
+        before_status: 'not_applicable',
+        before: null,
+        conflict_status: 'checked',
+        conflicts: [],
+      },
+    }),
+  )
+  await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+  await page.getByRole('button', { name: '选择开始时间' }).click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toHaveAttribute('aria-modal', 'false')
+  const current = dialog.getByRole('button', {
+    name: '2030-01-01',
+    exact: true,
+  })
+  await current.focus()
+  await expect(current).toBeFocused()
+  await page.keyboard.press('ArrowRight')
+  await expect(
+    dialog.getByRole('button', { name: '2030-01-02', exact: true }),
+  ).toBeFocused()
+  await page.keyboard.press('Enter')
+  await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+    '2030-01-02T09:00',
+  )
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByLabel('开始时间', { exact: true })).toBeFocused()
+  await page.getByRole('button', { name: '选择开始时间' }).click()
+  await page.getByLabel('开始时间', { exact: true }).fill('2030-01-03T09:00')
+  await page.getByLabel('结束时间', { exact: true }).focus()
+  await expect(page.getByLabel('开始时间', { exact: true })).toHaveValue(
+    '2030-01-03T09:00',
+  )
+  expect(capture.mutations).toEqual([])
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })

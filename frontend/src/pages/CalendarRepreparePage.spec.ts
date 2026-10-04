@@ -1,6 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
 import { primeVueOptions } from '@/design/primevue'
 import { installViewport, restoreViewport } from '@/test-support/viewport'
 import { ref } from 'vue'
@@ -134,9 +135,20 @@ async function render(query = '') {
   await router.push(`/calendar/proposals/${PROPOSAL_ID}${query}`)
   const pinia = createPinia()
   const wrapper = mount(CalendarProposalPage, {
-    global: { plugins: [pinia, router, [PrimeVue, primeVueOptions]] },
+    global: {
+      stubs: { transition: false, 'transition-group': false },
+      plugins: [
+        pinia,
+        router,
+        [PrimeVue, primeVueOptions],
+        ConfirmationService,
+      ],
+    },
   })
   wrappers.push(wrapper)
+  await vi.waitFor(() =>
+    expect(wrapper.find('[aria-label="日程标题"]').exists()).toBe(true),
+  )
   await flushPromises()
   return { wrapper, router, tasks: useTasksStore(pinia) }
 }

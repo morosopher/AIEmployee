@@ -1,6 +1,8 @@
-import { flushPromises, mount } from '@vue/test-utils'
+import { getByRole, queryAllByRole } from '@testing-library/vue'
+import { DOMWrapper, flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
 import PrimeVue from 'primevue/config'
+import ConfirmationService from 'primevue/confirmationservice'
 import { primeVueOptions } from '@/design/primevue'
 import { installViewport, restoreViewport } from '@/test-support/viewport'
 import { defineComponent, ref } from 'vue'
@@ -40,6 +42,14 @@ vi.mock('@/api/connections', () => ({
 vi.mock('@/composables/useTaskEvents', () => ({
   useTaskEvents: () => ref('connected'),
 }))
+/** 用公开按钮名称选择现有 Vue Test Utils 实例，保留恢复 Props 契约断言。 */
+function byButton(wrapper: ReturnType<typeof mount>, name: string) {
+  return new DOMWrapper(
+    getByRole(wrapper.element as HTMLElement, 'button', {
+      name: new RegExp(`^${name}`),
+    }),
+  )
+}
 let current: CalendarProposal
 let wrappers: ReturnType<typeof mount>[] = []
 beforeEach(() => {
@@ -119,6 +129,7 @@ beforeEach(() => {
 afterEach(() => {
   wrappers.forEach((wrapper) => wrapper.unmount())
   wrappers = []
+  document.body.innerHTML = ''
   restoreViewport()
 })
 
@@ -138,9 +149,21 @@ async function renderPage() {
   })
   await router.push(`/calendar/proposals/${PROPOSAL_ID}`)
   const wrapper = mount(CalendarProposalPage, {
-    global: { plugins: [createPinia(), router, [PrimeVue, primeVueOptions]] },
+    attachTo: document.body,
+    global: {
+      stubs: { transition: false, 'transition-group': false },
+      plugins: [
+        createPinia(),
+        router,
+        [PrimeVue, primeVueOptions],
+        ConfirmationService,
+      ],
+    },
   })
   wrappers.push(wrapper)
+  await vi.waitFor(() =>
+    expect(wrapper.find('[aria-label="日程标题"]').exists()).toBe(true),
+  )
   await flushPromises()
   return { wrapper, router }
 }
@@ -193,8 +216,8 @@ describe('CalendarProposalPage', () => {
       ]
       const { wrapper } = await renderPage()
       const input = attendees.join(', ')
-      await wrapper.get('input[aria-label="参会人"]').setValue(input)
-      await wrapper.get('button[name="save-proposal"]').trigger('click')
+      await wrapper.get('[aria-label="参会人"]').setValue(input)
+      await byButton(wrapper, '保存提案').trigger('click')
       await flushPromises()
       // 邮件与日程共用同一即时校验；合法的不同本地部分必须原样进入 PATCH。
       if (difference === 'domain-case') {
@@ -212,7 +235,7 @@ describe('CalendarProposalPage', () => {
         )
         expect(wrapper.text()).toContain('版本 2')
       }
-      expect(wrapper.get('input[aria-label="参会人"]').element).toHaveProperty(
+      expect(wrapper.get('[aria-label="参会人"]').element).toHaveProperty(
         'value',
         input,
       )
@@ -233,9 +256,7 @@ describe('CalendarProposalPage', () => {
       )
       const { wrapper } = await renderPage()
       expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
-      expect(
-        wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-      ).toBeDefined()
+      expect(byButton(wrapper, '提交审批').attributes('disabled')).toBeDefined()
       vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
         errorKind === 'problem'
           ? readProblem()
@@ -243,13 +264,10 @@ describe('CalendarProposalPage', () => {
       )
       if (operation === 'save') {
         await wrapper
-          .get('input[aria-label="日程标题"]')
+          .get('[aria-label="日程标题"]')
           .setValue('Synthetic revised calendar title')
-        await wrapper.get('button[name="save-proposal"]').trigger('click')
-      } else
-        await wrapper
-          .get('button[name="confirm-notification_policy"]')
-          .trigger('click')
+        await byButton(wrapper, '保存提案').trigger('click')
+      } else await byButton(wrapper, '确认通知策略').trigger('click')
       await flushPromises()
 
       expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
@@ -276,40 +294,36 @@ describe('CalendarProposalPage', () => {
       expect(wrapper.text()).not.toContain('Synthetic private read')
       // PATCH 已成功，缺失事实期间必须同时锁住输入、后续确认与提交，不能重发旧版本。
       expect
-        .soft(
-          wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
-        )
+        .soft(wrapper.get('[aria-label="日程标题"]').attributes('disabled'))
         .toBeDefined()
       expect
-        .soft(wrapper.get('button[name="confirm-time"]').attributes('disabled'))
+        .soft(byButton(wrapper, '确认时间').attributes('disabled'))
         .toBeDefined()
       expect
-        .soft(
-          wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-        )
+        .soft(byButton(wrapper, '提交审批').attributes('disabled'))
         .toBeDefined()
-      await wrapper.get('button[name="submit-proposal"]').trigger('click')
+      await byButton(wrapper, '提交审批').trigger('click')
       await flushPromises()
       expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
 
-      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await byButton(wrapper, '重新加载提案').trigger('click')
       await flushPromises()
       expect(wrapper.text()).toContain('版本 2')
       expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
       expect(
-        wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
+        wrapper.get('[aria-label="日程标题"]').attributes('disabled'),
       ).toBeUndefined()
       expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
       expect(wrapper.getComponent(EditorRecovery).props('error')).toBeNull()
       if (operation === 'save') {
-        await wrapper.get('button[name="confirm-time"]').trigger('click')
+        await byButton(wrapper, '确认时间').trigger('click')
         await flushPromises()
         expect(calendar.updateCalendarProposal).toHaveBeenLastCalledWith(
           PROPOSAL_ID,
           { version: 2, confirmation: { kind: 'time' } },
         )
       }
-      await wrapper.get('button[name="submit-proposal"]').trigger('click')
+      await byButton(wrapper, '提交审批').trigger('click')
       await flushPromises()
       expect(calendar.submitCalendarProposal).toHaveBeenCalledTimes(1)
       expect(calendar.submitCalendarProposal).toHaveBeenCalledWith(
@@ -335,38 +349,32 @@ describe('CalendarProposalPage', () => {
         return { ...current, editor_facts: null }
       }
       vi.mocked(calendar.getCalendarProposal).mockImplementationOnce(unreadable)
-      await wrapper
-        .get('button[name="confirm-notification_policy"]')
-        .trigger('click')
+      await byButton(wrapper, '确认通知策略').trigger('click')
       await flushPromises()
       expect(wrapper.text()).toContain('版本 2')
       expect
-        .soft(
-          wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-        )
+        .soft(byButton(wrapper, '提交审批').attributes('disabled'))
         .toBeDefined()
       expect.soft(wrapper.find('[role="alert"]').exists()).toBe(true)
 
       // 显式重新加载也必须遵守已确认的版本下界和同对象事实，不能借刷新回退 CAS。
       vi.mocked(calendar.getCalendarProposal).mockImplementationOnce(unreadable)
-      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await byButton(wrapper, '重新加载提案').trigger('click')
       await flushPromises()
       expect.soft(wrapper.text()).toContain('版本 2')
       expect
-        .soft(
-          wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
-        )
+        .soft(wrapper.get('[aria-label="日程标题"]').attributes('disabled'))
         .toBeDefined()
       expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
       expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
 
       current = { ...current, version: 3 }
-      await wrapper.get('button[name="reload-editor"]').trigger('click')
+      await byButton(wrapper, '重新加载提案').trigger('click')
       await flushPromises()
       expect(wrapper.text()).toContain('版本 3')
       expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(true)
       expect(
-        wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
+        byButton(wrapper, '提交审批').attributes('disabled'),
       ).toBeUndefined()
       expect(calendar.updateCalendarProposal).toHaveBeenCalledTimes(1)
     },
@@ -467,7 +475,7 @@ describe('CalendarProposalPage', () => {
     }
     const { wrapper, router } = await renderPage()
     expect(calendar.createRestoreProposal).not.toHaveBeenCalled()
-    await wrapper.get('button[name="prepare-restore"]').trigger('click')
+    await byButton(wrapper, '准备恢复提案').trigger('click')
     await flushPromises()
     expect(calendar.createRestoreProposal).toHaveBeenCalledWith(
       eventId,
@@ -504,7 +512,7 @@ describe('CalendarProposalPage', () => {
       }),
     )
     const { wrapper } = await renderPage()
-    const button = wrapper.get('button[name="prepare-restore"]')
+    const button = byButton(wrapper, '准备恢复提案')
     await button.trigger('click')
     await button.trigger('click')
     expect(calendar.createRestoreProposal).toHaveBeenCalledTimes(1)
@@ -536,7 +544,11 @@ describe('CalendarProposalPage', () => {
       },
     }
     const { wrapper } = await renderPage()
-    expect(wrapper.find('button[name="prepare-restore"]').exists()).toBe(false)
+    expect(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /^准备恢复提案/,
+      }).length > 0,
+    ).toBe(false)
     expect(wrapper.text()).toContain('恢复来源已不可用')
     expect(calendar.createRestoreProposal).not.toHaveBeenCalled()
   })
@@ -544,19 +556,15 @@ describe('CalendarProposalPage', () => {
   it('keeps shell confirmations explicit and never confirms ordinary saves', async () => {
     const { wrapper } = await renderPage()
     expect(wrapper.text()).toContain('Asia/Shanghai')
-    expect(
-      wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-    ).toBeDefined()
-    await wrapper
-      .get('input[aria-label="日程标题"]')
-      .setValue('Synthetic revision')
-    await wrapper.get('button[name="save-proposal"]').trigger('click')
+    expect(byButton(wrapper, '提交审批').attributes('disabled')).toBeDefined()
+    await wrapper.get('[aria-label="日程标题"]').setValue('Synthetic revision')
+    await byButton(wrapper, '保存提案').trigger('click')
     await flushPromises()
     expect(
       vi.mocked(calendar.updateCalendarProposal).mock.calls[0]?.[1],
     ).not.toHaveProperty('confirmation')
     expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
-    await wrapper.get('button[name="confirm-time"]').trigger('click')
+    await byButton(wrapper, '确认时间').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenLastCalledWith(
       PROPOSAL_ID,
@@ -567,14 +575,23 @@ describe('CalendarProposalPage', () => {
 
   it('reselects the exact calendar with a standalone confirmation and locks update sources', async () => {
     const { wrapper } = await renderPage()
-    const account = wrapper.get('[role="combobox"]')
+    const account = new DOMWrapper(
+      getByRole(wrapper.element as HTMLElement, 'combobox', {
+        name: '日历账户',
+      }),
+    )
     await account.trigger('click')
     await account.trigger('keydown', { key: 'End', code: 'End' })
     await account.trigger('keydown', { key: 'Enter', code: 'Enter' })
-    await wrapper
-      .get('select[aria-label="目标日历"]')
-      .setValue('synthetic-microsoft-calendar')
-    await wrapper.get('button[name="confirm-calendar"]').trigger('click')
+    const target = new DOMWrapper(
+      getByRole(wrapper.element as HTMLElement, 'combobox', {
+        name: '目标日历',
+      }),
+    )
+    await target.trigger('click')
+    await target.trigger('keydown', { key: 'End', code: 'End' })
+    await target.trigger('keydown', { key: 'Enter', code: 'Enter' })
+    await byButton(wrapper, '确认此日历').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(PROPOSAL_ID, {
       version: 1,
@@ -602,10 +619,14 @@ describe('CalendarProposalPage', () => {
         conflicts: [],
       },
     }
-    await wrapper.get('button[name="reload-editor"]').trigger('click')
+    await byButton(wrapper, '重新加载提案').trigger('click')
     await flushPromises()
     expect(
-      wrapper.get('[role="combobox"]').attributes('aria-disabled'),
+      new DOMWrapper(
+        getByRole(wrapper.element as HTMLElement, 'combobox', {
+          name: '日历账户',
+        }),
+      ).attributes('aria-disabled'),
     ).toBe('true')
     expect(wrapper.text()).toContain('Synthetic original location')
     expect(wrapper.text()).toContain('synthetic-etag')
@@ -629,17 +650,19 @@ describe('CalendarProposalPage', () => {
       },
     }
     const { wrapper } = await renderPage()
-    expect(wrapper.find('[data-testid="calendar-conflicts"]').exists()).toBe(
-      true,
-    )
-    expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(1)
-    await wrapper
-      .get('input[aria-label="开始时间"]')
-      .setValue('2030-01-03T09:00')
-    expect(wrapper.find('[data-testid="calendar-conflicts"]').exists()).toBe(
-      false,
-    )
-    expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(0)
+    expect(wrapper.find('[aria-label="日程冲突检查"]').exists()).toBe(true)
+    expect(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /至.*（/,
+      }),
+    ).toHaveLength(1)
+    await wrapper.get('[aria-label="开始时间"]').setValue('2030-01-03T09:00')
+    expect(wrapper.find('[aria-label="日程冲突检查"]').exists()).toBe(false)
+    expect(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /至.*（/,
+      }),
+    ).toHaveLength(0)
     expect(wrapper.text()).toContain('保存后重新检查')
   })
 
@@ -661,20 +684,28 @@ describe('CalendarProposalPage', () => {
       return availability
     })
     const { wrapper } = await renderPage()
-    await wrapper.get('button[name="suggest-times"]').trigger('click')
+    await byButton(wrapper, '查询三个候选时间').trigger('click')
     await flushPromises()
-    expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(3)
+    expect(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /至.*（/,
+      }),
+    ).toHaveLength(3)
     expect(wrapper.text()).toContain('部分日历来源')
     expect(wrapper.text()).toContain('未检查参会人可用性')
     expect(wrapper.text()).toContain('版本 2')
     expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
-    await wrapper.get('button[name="choose-candidate"]').trigger('click')
-    expect(wrapper.get('input[aria-label="开始时间"]').element).toHaveProperty(
+    await new DOMWrapper(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /至.*（/,
+      })[0] as HTMLElement,
+    ).trigger('click')
+    expect(wrapper.get('[aria-label="开始时间"]').element).toHaveProperty(
       'value',
       '2030-01-02T09:00',
     )
     expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
-    await wrapper.get('button[name="save-proposal"]').trigger('click')
+    await byButton(wrapper, '保存提案').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenLastCalledWith(
       PROPOSAL_ID,
@@ -700,11 +731,15 @@ describe('CalendarProposalPage', () => {
       }
     })
     const { wrapper } = await renderPage()
-    await wrapper.get('button[name="suggest-times"]').trigger('click')
+    await byButton(wrapper, '查询三个候选时间').trigger('click')
     await flushPromises()
     expect(wrapper.text()).toContain('版本 3')
-    expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(0)
-    await wrapper.get('button[name="confirm-time"]').trigger('click')
+    expect(
+      queryAllByRole(wrapper.element as HTMLElement, 'button', {
+        name: /至.*（/,
+      }),
+    ).toHaveLength(0)
+    await byButton(wrapper, '确认时间').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenLastCalledWith(
       PROPOSAL_ID,
@@ -712,80 +747,84 @@ describe('CalendarProposalPage', () => {
     )
   })
 
-  it.each(['plain', 'problem'] as const)('requires a fresh read when a candidate version was saved but reloading failed with %s', async (errorKind) => {
-    vi.mocked(calendar.suggestCalendarTimes).mockImplementation(async () => {
-      const availability = {
-        proposal_id: PROPOSAL_ID,
-        version: 2,
-        completeness: 'complete' as const,
-        missing_connections: [],
-        attendee_availability_checked: false as const,
-        candidates: [
-          {
-            starts_at: '2030-01-02T01:00:00Z',
-            ends_at: '2030-01-02T02:00:00Z',
-          },
-        ],
-      }
-      current = { ...current, version: 2, availability }
-      return availability
-    })
-    const { wrapper } = await renderPage()
-    vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
-      errorKind === 'problem'
-        ? readProblem()
-        : new Error('Synthetic read unavailable'),
-    )
-    await wrapper.get('button[name="suggest-times"]').trigger('click')
-    await flushPromises()
-    expect(
-      wrapper.get('button[name="confirm-time"]').attributes('disabled'),
-    ).toBeDefined()
-    expect(
-      wrapper.get('button[name="suggest-times"]').attributes('disabled'),
-    ).toBeDefined()
-    expect(wrapper.findAll('button[name="choose-candidate"]')).toHaveLength(0)
-    expect(wrapper.get('[role="alert"]').text()).toContain(
-      '候选已保存，请重新加载最新提案后继续编辑。',
-    )
-    expect(wrapper.getComponent(EditorRecovery).props('error')).toEqual({
-      message: '候选已保存，请重新加载最新提案后继续编辑。',
-      traceId: errorKind === 'problem' ? 'synthetic-calendar-read-trace' : null,
-      action: 'reload',
-      ...(errorKind === 'problem'
-        ? { problem: { error_code: 'synthetic_calendar_read_unavailable' } }
-        : {}),
-    })
-    expect(wrapper.text()).not.toContain('Synthetic private read')
-    expect(calendar.suggestCalendarTimes).toHaveBeenCalledExactlyOnceWith(
-      PROPOSAL_ID,
-      { version: 1 },
-    )
-    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
-    expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
-    // 候选回执已证明版本推进；显式刷新同样不能用较旧 GET 解除锁定。
-    vi.mocked(calendar.getCalendarProposal).mockResolvedValueOnce({
-      ...current,
-      version: 1,
-      availability: null,
-    })
-    await wrapper.get('button[name="reload-editor"]').trigger('click')
-    await flushPromises()
-    expect(
-      wrapper.get('button[name="confirm-time"]').attributes('disabled'),
-    ).toBeDefined()
-    await wrapper.get('button[name="reload-editor"]').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('版本 2')
-    expect(
-      wrapper.get('button[name="confirm-time"]').attributes('disabled'),
-    ).toBeUndefined()
-    expect(wrapper.getComponent(EditorRecovery).props('error')).toBeNull()
-    expect(calendar.suggestCalendarTimes).toHaveBeenCalledTimes(1)
-    expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(4)
-    expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
-    expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
-  })
+  it.each(['plain', 'problem'] as const)(
+    'requires a fresh read when a candidate version was saved but reloading failed with %s',
+    async (errorKind) => {
+      vi.mocked(calendar.suggestCalendarTimes).mockImplementation(async () => {
+        const availability = {
+          proposal_id: PROPOSAL_ID,
+          version: 2,
+          completeness: 'complete' as const,
+          missing_connections: [],
+          attendee_availability_checked: false as const,
+          candidates: [
+            {
+              starts_at: '2030-01-02T01:00:00Z',
+              ends_at: '2030-01-02T02:00:00Z',
+            },
+          ],
+        }
+        current = { ...current, version: 2, availability }
+        return availability
+      })
+      const { wrapper } = await renderPage()
+      vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
+        errorKind === 'problem'
+          ? readProblem()
+          : new Error('Synthetic read unavailable'),
+      )
+      await byButton(wrapper, '查询三个候选时间').trigger('click')
+      await flushPromises()
+      expect(byButton(wrapper, '确认时间').attributes('disabled')).toBeDefined()
+      expect(
+        byButton(wrapper, '查询三个候选时间').attributes('disabled'),
+      ).toBeDefined()
+      expect(
+        queryAllByRole(wrapper.element as HTMLElement, 'button', {
+          name: /至.*（/,
+        }),
+      ).toHaveLength(0)
+      expect(wrapper.get('[role="alert"]').text()).toContain(
+        '候选已保存，请重新加载最新提案后继续编辑。',
+      )
+      expect(wrapper.getComponent(EditorRecovery).props('error')).toEqual({
+        message: '候选已保存，请重新加载最新提案后继续编辑。',
+        traceId:
+          errorKind === 'problem' ? 'synthetic-calendar-read-trace' : null,
+        action: 'reload',
+        ...(errorKind === 'problem'
+          ? { problem: { error_code: 'synthetic_calendar_read_unavailable' } }
+          : {}),
+      })
+      expect(wrapper.text()).not.toContain('Synthetic private read')
+      expect(calendar.suggestCalendarTimes).toHaveBeenCalledExactlyOnceWith(
+        PROPOSAL_ID,
+        { version: 1 },
+      )
+      expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(2)
+      expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+      // 候选回执已证明版本推进；显式刷新同样不能用较旧 GET 解除锁定。
+      vi.mocked(calendar.getCalendarProposal).mockResolvedValueOnce({
+        ...current,
+        version: 1,
+        availability: null,
+      })
+      await byButton(wrapper, '重新加载提案').trigger('click')
+      await flushPromises()
+      expect(byButton(wrapper, '确认时间').attributes('disabled')).toBeDefined()
+      await byButton(wrapper, '重新加载提案').trigger('click')
+      await flushPromises()
+      expect(wrapper.text()).toContain('版本 2')
+      expect(
+        byButton(wrapper, '确认时间').attributes('disabled'),
+      ).toBeUndefined()
+      expect(wrapper.getComponent(EditorRecovery).props('error')).toBeNull()
+      expect(calendar.suggestCalendarTimes).toHaveBeenCalledTimes(1)
+      expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(4)
+      expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
 
   it.each([
     { operation: 'save', boundary: 'route-change' },
@@ -869,16 +908,20 @@ describe('CalendarProposalPage', () => {
 
   it('saves all-day exclusive dates and explicit notification policy without UTC shifting', async () => {
     const { wrapper } = await renderPage()
-    await wrapper.get('input[aria-label="全天日程"]').setValue(true)
-    await wrapper.get('input[aria-label="开始日期"]').setValue('2030-01-05')
-    await wrapper
-      .get('input[aria-label="结束日期（不含）"]')
-      .setValue('2030-01-06')
-    await wrapper
-      .get('input[aria-label="参会人"]')
-      .setValue('attendee@example.test')
-    await wrapper.get('select[aria-label="通知策略"]').setValue('all')
-    await wrapper.get('button[name="save-proposal"]').trigger('click')
+    await wrapper.get('[aria-label="全天日程"]').setValue(true)
+    await wrapper.get('[aria-label="开始日期"]').setValue('2030-01-05')
+    await wrapper.get('[aria-label="结束日期（不含）"]').setValue('2030-01-06')
+    await wrapper.get('[aria-label="参会人"]').setValue('attendee@example.test')
+    const policy = new DOMWrapper(
+      getByRole(wrapper.element as HTMLElement, 'combobox', {
+        name: '通知策略',
+      }),
+    )
+    await policy.trigger('click')
+    await policy.trigger('keydown', { key: 'Home', code: 'Home' })
+    await policy.trigger('keydown', { key: 'ArrowDown', code: 'ArrowDown' })
+    await policy.trigger('keydown', { key: 'Enter', code: 'Enter' })
+    await byButton(wrapper, '保存提案').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
       PROPOSAL_ID,
@@ -896,10 +939,8 @@ describe('CalendarProposalPage', () => {
   it('preserves original instant precision when unrelated fields are edited', async () => {
     current = { ...current, starts_at: '2030-01-01T01:00:42.123456Z' }
     const { wrapper } = await renderPage()
-    await wrapper
-      .get('input[aria-label="日程标题"]')
-      .setValue('Precision retained')
-    await wrapper.get('button[name="save-proposal"]').trigger('click')
+    await wrapper.get('[aria-label="日程标题"]').setValue('Precision retained')
+    await byButton(wrapper, '保存提案').trigger('click')
     await flushPromises()
     expect(calendar.updateCalendarProposal).toHaveBeenCalledWith(
       PROPOSAL_ID,
@@ -921,7 +962,7 @@ describe('CalendarProposalPage', () => {
       }),
     )
     const { wrapper } = await renderPage()
-    await wrapper.get('button[name="submit-proposal"]').trigger('click')
+    await byButton(wrapper, '提交审批').trigger('click')
     await flushPromises()
     expect(wrapper.text()).toContain('synthetic-etag-trace')
     expect(wrapper.text()).toContain('创建新版本')
@@ -951,8 +992,6 @@ describe('CalendarProposalPage', () => {
     expect(wrapper.text()).toContain('原始修改前快照已不可用')
     expect(wrapper.text()).not.toContain('拟创建的日程')
     expect(wrapper.find('[aria-label="日程前后对比"]').exists()).toBe(false)
-    expect(
-      wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-    ).toBeDefined()
+    expect(byButton(wrapper, '提交审批').attributes('disabled')).toBeDefined()
   })
 })

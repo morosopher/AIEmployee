@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import Message from 'primevue/message'
+import Button from 'primevue/button'
 import { RouterLink } from 'vue-router'
 import type { ConnectionCatalogEntry } from '@/composables/useConnectionCatalog'
 import { providerLabel } from '@/features/actions/presentation'
@@ -25,21 +27,38 @@ const missing = computed(() =>
 )
 </script>
 <template>
-  <ul aria-label="缺失日历账户">
-    <li
-      v-for="item in missing"
-      :key="item.id"
+  <!-- 列表本身是静态来源说明，由父冲突／候选状态公告；覆盖 Message 默认 alert，避免二次播报。 -->
+  <Message
+    severity="info"
+    role="presentation"
+    aria-live="off"
+  >
+    <ul aria-label="缺失日历账户">
+      <li
+        v-for="item in missing"
+        :key="item.id"
+      >
+        <template v-if="item.connection">
+          {{ providerLabel(item.connection.provider) }} ·
+          {{ item.connection.account_email }}
+        </template>
+        <template v-else>
+          {{ item.id }} · 账户资料暂不可用
+        </template>
+      </li>
+    </ul>
+    <RouterLink
+      v-slot="{ href, navigate }"
+      to="/connections"
+      custom
     >
-      <template v-if="item.connection">
-        {{ providerLabel(item.connection.provider) }} ·
-        {{ item.connection.account_email }}
-      </template>
-      <template v-else>
-        {{ item.id }} · 账户资料暂不可用
-      </template>
-    </li>
-  </ul>
-  <RouterLink to="/connections">
-    查看连接与同步状态
-  </RouterLink>
+      <Button
+        as="a"
+        :href="href"
+        label="查看连接与同步状态"
+        link
+        @click="navigate"
+      />
+    </RouterLink>
+  </Message>
 </template>

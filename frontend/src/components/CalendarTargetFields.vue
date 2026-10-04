@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import Select from 'primevue/select'
+import Button from 'primevue/button'
 import type { CalendarProposal } from '@/api/types'
 import type { CalendarEditorForm } from '@/features/calendar/useCalendarProposalEditor'
 import {
@@ -32,10 +34,29 @@ const available = computed(
     hasCapability(entry.value, 'calendar.write') &&
     selected.value?.can_write,
 )
+/** 失效当前日历仍保留可读原值，不能因目录刷新自动改选另一个精确目标。 */
+const options = computed(() => [
+  ...(!selected.value
+    ? [
+        {
+          label: '当前日历不可用，请明确选择',
+          value: form.value.calendar_id,
+          disabled: true,
+        },
+      ]
+    : []),
+  ...calendars.value.map((calendar) => ({
+    label: `${calendar.name} · ${calendar.timezone}`,
+    value: calendar.id,
+    disabled: !calendar.can_write,
+  })),
+])
 </script>
 <template>
-  <fieldset>
-    <legend>精确目标日历</legend>
+  <fieldset class="min-w-0 space-y-3 rounded-lg border border-surface-200 p-4">
+    <legend class="font-semibold">
+      精确目标日历
+    </legend>
     <EditorConnectionSelect
       v-model="form.connection_id"
       :entries="entries"
@@ -43,38 +64,34 @@ const available = computed(
       label="日历账户"
       :disabled="disabled || proposal.operation_kind !== 'create'"
     />
-    <label>目标日历<select
-      v-model="form.calendar_id"
-      aria-label="目标日历"
-      :disabled="disabled || proposal.operation_kind !== 'create'"
-    >
-      <option
-        v-if="!selected"
-        :value="form.calendar_id"
-        disabled
-      >
-        当前日历不可用，请明确选择
-      </option>
-      <option
-        v-for="calendar in calendars"
-        :key="calendar.id"
-        :value="calendar.id"
-        :disabled="!calendar.can_write"
-      >
-        {{ calendar.name }} · {{ calendar.timezone }}
-      </option>
-    </select></label>
+    <div class="grid gap-1">
+      <label
+        id="calendar-target-label"
+        for="calendar-target"
+      >目标日历</label>
+      <Select
+        v-model="form.calendar_id"
+        input-id="calendar-target"
+        aria-labelledby="calendar-target-label"
+        :options="options"
+        option-label="label"
+        option-value="value"
+        option-disabled="disabled"
+        :disabled="disabled || proposal.operation_kind !== 'create'"
+        fluid
+      />
+    </div>
     <p v-if="proposal.operation_kind !== 'create'">
       来源已锁定：{{ proposal.calendar_id }} / {{ proposal.target_event_id }} ·
       ETag：{{ proposal.base_etag }}
     </p>
-    <button
+    <Button
       type="button"
       name="confirm-calendar"
       :disabled="disabled || fieldsDirty || !available"
       @click="$emit('confirm')"
     >
       确认此日历
-    </button>
+    </Button>
   </fieldset>
 </template>

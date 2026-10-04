@@ -1,5 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import {
+  computed,
+  onMounted,
+  onUnmounted,
+  defineAsyncComponent,
+  defineComponent,
+  h,
+  ref,
+  watch,
+} from 'vue'
+import Button from 'primevue/button'
+import Message from 'primevue/message'
+import Skeleton from 'primevue/skeleton'
+import { useConfirm } from 'primevue/useconfirm'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import type { CalendarConfirmation } from '@/api/types'
 import { useConnectionCatalog } from '@/composables/useConnectionCatalog'
@@ -12,14 +25,39 @@ import {
   formatActionTime,
 } from '@/features/actions/presentation'
 import LocalEditorFrame from '@/components/LocalEditorFrame.vue'
-import CalendarProposalFields from '@/components/CalendarProposalFields.vue'
-import CalendarTargetFields from '@/components/CalendarTargetFields.vue'
 import CalendarFieldsComparison from '@/components/CalendarFieldsComparison.vue'
 import CalendarConflictNotice from '@/components/CalendarConflictNotice.vue'
 import MissingCalendarConnections from '@/components/MissingCalendarConnections.vue'
 import CalendarRepreparePanel from '@/components/CalendarRepreparePanel.vue'
 import EditorRecovery from '@/components/EditorRecovery.vue'
 import LinkedActionPanel from '@/components/LinkedActionPanel.vue'
+
+/** 重型表单只在打开编辑器后加载；失败须显式重试，不能把加载失败伪装成空白提案。 */
+const moduleFailed = ref(false)
+const CalendarEditorForm = defineAsyncComponent({
+  loader: () => import('@/components/CalendarEditorForm.vue'),
+  delay: 0,
+  loadingComponent: defineComponent({
+    setup: () => () =>
+      moduleFailed.value
+        ? null
+        : h('div', { class: 'space-y-2' }, [
+            h(
+              Message,
+              { role: 'status', severity: 'secondary', 'aria-live': 'polite' },
+              () => '正在加载日程表单…',
+            ),
+            h(Skeleton, { height: '12rem' }),
+          ]),
+  }),
+  onError() {
+    moduleFailed.value = true
+  },
+})
+/** 显式整页重试重新取得权威提案；不在本地复制请求、状态或重放写操作。 */
+function retryForm(): void {
+  window.location.reload()
+}
 
 /** 页面只组合服务端前后值、确认与冲突事实；不实现排程算法或本地审批状态机。 */
 const route = useRoute(),
@@ -102,30 +140,81 @@ const {
   error: creationError,
   busy: creating,
 } = useLocalActionCreation()
+/** 仅展示当前显式审批提交的加载态；实际互斥与版本仍由原 hook 负责。 */
+const submitting = ref(false)
+watch(busy, (value) => { if (!value) submitting.value = false })
 const confirmations: Array<{ kind: CalendarConfirmation; label: string }> = [
   { kind: 'time', label: '时间' },
   { kind: 'attendees', label: '参会人' },
   { kind: 'notification_policy', label: '通知策略' },
 ]
+const confirmation = useConfirm()
+let settleLeave: ((accepted: boolean) => void) | null = null
+/** 关闭或后续导航只结算当前确认；不把关闭视为批准。 */
+function finishLeave(accepted: boolean): void {
+  const settle = settleLeave
+  settleLeave = null
+  settle?.(accepted)
+}
+/** 页面只提示丢弃本地输入；认证跳登录继续沿用原会话和卸载清理边界。 */
+const removeLeaveGuard = router.beforeEach((to, from) => {
+  if (!dirty.value || to.path === from.path || to.path === '/login') return true
+  finishLeave(false)
+  return new Promise<boolean>((resolve) => {
+    settleLeave = resolve
+    confirmation.require({
+      header: '离开日程编辑器',
+      message: '提案尚未保存或确认，确定离开？',
+      defaultFocus: 'reject',
+      rejectProps: { label: '继续编辑', severity: 'secondary', outlined: true },
+      acceptProps: { label: '放弃修改并离开' },
+      accept: () => finishLeave(true),
+      reject: () => finishLeave(false),
+      onHide: () => finishLeave(false),
+    })
+  })
+})
+/** 浏览器卸载只能使用原生固定提示，不提供正文摘录，也不写浏览器存储。 */
+function beforeUnload(event: BeforeUnloadEvent): void {
+  if (dirty.value) {
+    event.preventDefault()
+    event.returnValue = ''
+  }
+}
 onMounted(() => {
   void loadCatalog()
+  window.addEventListener('beforeunload', beforeUnload)
+})
+onUnmounted(() => {
+  removeLeaveGuard()
+  window.removeEventListener('beforeunload', beforeUnload)
+  if (settleLeave) {
+    finishLeave(false)
+    confirmation.close()
+  }
 })
 </script>
 <template>
   <LocalEditorFrame title="日程提案">
-    <RouterLink to="/actions">
+    <RouterLink
+      to="/actions"
+      class="text-primary underline"
+    >
       返回操作中心
     </RouterLink>
-    <p class="editor-note">
+    <p class="rounded-lg border-l-4 border-orange-600 bg-orange-50 p-3">
       保存和确认只修改本地提案。提交审批后，请核对冻结的时间、目标日历和通知策略。
     </p>
-    <p
+    <Message
       v-if="loading || catalogLoading"
       role="status"
+      aria-live="polite"
+      severity="secondary"
     >
       正在加载提案与日历目录…
-    </p>
+    </Message>
     <EditorRecovery
+      v-if="!proposal || moduleFailed"
       :error="
         error || reprepareError || restoreError || catalogError || creationError
       "
@@ -137,14 +226,14 @@ onMounted(() => {
       @new-object="newCalendar"
       @new-version="prepareVersion"
     />
-    <button
+    <Button
       type="button"
       name="reload-editor"
       :disabled="busy || restoreBusy || reprepareBusy"
       @click="reload"
     >
       重新加载提案
-    </button>
+    </Button>
     <template v-if="proposal">
       <p>
         版本 {{ proposal.version }} · {{ actionStatusLabel(proposal.status) }}
@@ -170,7 +259,7 @@ onMounted(() => {
         aria-label="恢复已应用修改"
       >
         <p>恢复会准备新的提案，读取当前日程后仍需核对通知策略并重新审批。</p>
-        <button
+        <Button
           v-if="restoreSource"
           type="button"
           name="prepare-restore"
@@ -178,53 +267,61 @@ onMounted(() => {
           @click="prepareRestore"
         >
           {{ restoreBusy ? '正在创建准备任务…' : '准备恢复提案' }}
-        </button>
-        <p
+        </Button>
+        <Message
           v-else
           role="status"
+          aria-live="polite"
+          severity="secondary"
         >
           恢复来源已不可用，请核对历史快照保留期和目标日程。
-        </p>
+        </Message>
       </section>
-      <CalendarTargetFields
+      <CalendarEditorForm
         :model-value="form"
         :proposal="proposal"
         :entries="entries"
-        :disabled="locked"
+        :locked="locked"
+        :busy="busy"
+        :dirty="dirty"
         :fields-dirty="fieldsDirty"
-        @confirm="confirm('calendar')"
+        :source-dirty="sourceDirty"
+        :error="
+          error ||
+            reprepareError ||
+            restoreError ||
+            catalogError ||
+            creationError
+        "
+        :recovery-busy="busy || reprepareBusy || restoreBusy || creating"
+        :new-version-available="
+          reprepareEligible &&
+            !!reprepareSource &&
+            !reprepareSource.requires_sync
+        "
+        @save="save"
+        @confirm-calendar="confirm('calendar')"
+        @reload="reload"
+        @new-object="newCalendar"
+        @new-version="prepareVersion"
       />
-      <CalendarProposalFields
-        :model-value="form"
-        :disabled="locked"
-      />
-      <p
-        v-if="dirty"
-        role="status"
+      <Message
+        v-if="moduleFailed"
+        severity="error"
       >
-        有未保存或未确认的修改，请保存后重新检查。
-      </p>
-      <p
-        v-if="sourceDirty"
-        role="status"
-      >
-        请先确认目标日历，再编辑其他字段。
-      </p>
-      <div class="editor-controls">
-        <button
+        日程表单加载失败，请重试。重试会重新加载页面。
+        <Button
           type="button"
-          name="save-proposal"
-          :disabled="locked || !fieldsDirty || sourceDirty"
-          @click="save"
-        >
-          保存提案
-        </button>
-      </div>
+          label="重试加载表单"
+          severity="secondary"
+          @click="retryForm"
+        />
+      </Message>
       <section aria-label="逐项确认">
         <h2>确认当前已保存版本</h2>
         <p>待确认：{{ proposal.required_confirmations.length }} 项</p>
-        <div class="editor-controls">
-          <button
+        <div class="flex flex-wrap gap-3">
+          <Button
             v-for="item in confirmations"
             :key="item.kind"
             type="button"
@@ -242,15 +339,16 @@ onMounted(() => {
                 ? ''
                 : '（已确认）'
             }}
-          </button>
+          </Button>
         </div>
       </section>
-      <p
+      <Message
         v-if="proposal.editor_facts?.before_status === 'unavailable'"
+        severity="error"
         role="alert"
       >
         原始修改前快照已不可用，无法核对前后差异。请返回来源重新创建提案。
-      </p>
+      </Message>
       <!-- 修改或恢复缺少原快照时只展示输入与错误，不能把 null before 误标为新建。 -->
       <CalendarFieldsComparison
         v-if="
@@ -263,35 +361,39 @@ onMounted(() => {
       />
       <CalendarConflictNotice
         v-if="conflicts !== null"
-        data-testid="calendar-conflicts"
         :conflicts="conflicts"
+        :timezone="form.timezone"
         :entries="entries"
       />
-      <p
+      <Message
         v-else
         role="status"
+        aria-live="polite"
+        severity="secondary"
       >
         尚无当前输入的冲突检查，请补齐并保存后重新检查。未检查参会人可用性。
-      </p>
-      <button
+      </Message>
+      <Button
         type="button"
         name="suggest-times"
         :disabled="locked || dirty || !after || form.all_day"
         @click="suggest"
       >
         查询三个候选时间
-      </button>
+      </Button>
       <section
         v-if="candidates"
         aria-label="服务端候选时间"
       >
-        <p
+        <Message
           v-if="candidates.completeness === 'partial'"
           role="status"
+          aria-live="polite"
+          severity="warn"
         >
           部分日历来源缺失（{{ candidates.missing_connections.length }}
           个连接）。
-        </p>
+        </Message>
         <MissingCalendarConnections
           v-if="candidates.completeness === 'partial'"
           :connection-ids="candidates.missing_connections"
@@ -301,8 +403,8 @@ onMounted(() => {
         <p v-if="!candidates.candidates.length">
           当前范围没有可用候选，可调整时间后重试。
         </p>
-        <div class="editor-controls">
-          <button
+        <div class="flex flex-wrap gap-3">
+          <Button
             v-for="candidate in candidates.candidates"
             :key="candidate.starts_at"
             type="button"
@@ -314,12 +416,12 @@ onMounted(() => {
             {{ formatActionTime(candidate.ends_at, form.timezone) }}（{{
               form.timezone
             }}）
-          </button>
+          </Button>
         </div>
       </section>
       <p
         v-if="form.notification_policy === 'none'"
-        class="editor-note"
+        class="rounded-lg border-l-4 border-orange-600 bg-orange-50 p-3"
       >
         不发送通知仍可能触发供应商的外部同步；请在审批预览中核对供应商警告。
       </p>
@@ -331,14 +433,16 @@ onMounted(() => {
       >
         尚无真实字段变更，不能提交空修改。
       </p>
-      <button
+      <Button
         type="button"
         name="submit-proposal"
+        :loading="busy && submitting"
+        :aria-busy="busy && submitting"
         :disabled="!canSubmit || locked"
-        @click="submit"
+        @click="submitting = true; submit()"
       >
         提交审批
-      </button>
+      </Button>
       <LinkedActionPanel
         :local-id="proposal.id"
         item-kind="calendar_proposal"
