@@ -887,14 +887,18 @@ git commit -m "feat: migrate approval previews to PrimeVue"
 
 **Files:**
 - Modify: `frontend/src/components/NeedsAttentionPanel.vue`、`frontend/src/components/NeedsAttentionPanel.spec.ts`
+- Modify: `frontend/e2e/mail-editor.spec.ts`（仅补充真实模态隔离下忙碌／错误提示可感知、单次呈现及既有恢复动作的展示断言）
+- Modify: 本实施计划（准确文件名单、live region 与验证记录）
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+Task 14 已提供真实 `Dialog modal` 与 AppShell 背景隔离。本任务保持 `act`、generation、choice、两个 watcher、最新 task_version 及请求语义不变；若原 busy／error 位于 inert 背景，则根据 choice 有无将同一原提示单次呈现于 Dialog 或普通面板，保留原文、traceId、reload 与 Dialog 完整警告。事实摘要使用静态 `Message error`，不增加无条件 assertive 播报。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：当前核对尝试与最后错误在 `Message error` 内；供应商检查链接 `rel="noopener noreferrer"`；「重新核对」「确认已执行」「确认未执行」三个按钮，任一进行中全部禁用；「确认未执行不会自动重发」警告紧邻按钮且可被辅助技术读到；人工确认走 `Dialog modal`；409 竞争后显示服务端最新状态。
 
@@ -902,20 +906,29 @@ Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spe
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建并删除 scoped CSS**
+- [x] **Step 3: 重建并删除 scoped CSS**
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
-Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/m2-actions.spec.ts`
+Run: `pnpm --dir frontend test:unit --run src/components/NeedsAttentionPanel.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/m2-actions.spec.ts e2e/mail-editor.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/components/NeedsAttentionPanel.vue frontend/src/components/NeedsAttentionPanel.spec.ts
+git add frontend/src/components/NeedsAttentionPanel.vue frontend/src/components/NeedsAttentionPanel.spec.ts frontend/e2e/mail-editor.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate needs-attention panel to PrimeVue"
 ~~~
+
+**执行记录（2026-10-05）：**
+
+- 旧组件单测5项、相关E2E23项先通过；迁移RED为6项单测失败及2项浏览器失败，后者均证明原busy/error节点实际位于inert背景。迁移后12项单测通过；额外Panel标题关联RED先证明具名region缺失，再绑定公开header slot id并恢复通过。
+- 原act、generation、choice、task_id/status watcher、最新task_version及回调语义保持不变。供应商链接继续安全过滤；三个决定按钮互斥禁用，原不自动重发警告紧邻按钮并通过aria-describedby关联。
+- NeedsAttentionPanel源码status由1增为2、alert由2增为3，原因是choice互斥的面板／Dialog分支；运行时同一busy/error各仅一份。原人工决定警告仍为一个alert；核对事实新增一个note/aria-live=off，不添加assertive公告。取消后错误回到面板；409经原reload显式读取服务端终态，无自动重发。
+- 迁移后的m2-actions 18项通过；mail-editor完整6项通过。首次新增409测试的终态fixture误写execution枚举，解析器正确拒绝，已仅修正测试数据并完整复验；最后header修正后的2项受影响浏览器复验通过，覆盖实际区域名、模态内busy/error、原文／trace／reload与权威结果。没有修改API、Store、feature、composable、router或后端。
+- 最终`just check` exit0：后端2730／前端647，类型、lint、许可证与样式检查通过，源码颜色／媒体查询均为零。最终build与预算exit0：JS gzip330082B、CSS8244B，未提高原340373B／60000B上限。E2E与check串行，suite数据库、应用角色和advisory锁均为零，anchor仍为20260809_0018。
+- 既有Starlette弃用、Zod注释解释与默认大块提示保留；完整里程碑CI归Task17。原始日志和Task15报告仅留本地SDD目录，不提交。
 
 ---
 

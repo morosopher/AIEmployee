@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, useId, watch } from 'vue'
+import Button from 'primevue/button'
+import Message from 'primevue/message'
+import Panel from 'primevue/panel'
 import type { ActionSnapshot, ManualResolution } from '@/api/types'
 import { providerLabel, safeProviderUrl } from '@/features/actions/presentation'
 import {
@@ -21,6 +24,8 @@ interface Props {
   locked?: boolean
 }
 const props = defineProps<Props>()
+/** 每个面板独立关联原警告，使键盘聚焦按钮时可读到只读核对／不自动重发的边界。 */
+const warningId = useId()
 const choice = ref<ManualResolution | null>(null),
   busy = ref(false)
 const error = ref<ActionRecovery | null>(null)
@@ -77,69 +82,113 @@ async function act(resolution: ManualResolution | null): Promise<void> {
 }
 </script>
 <template>
-  <section
-    class="needs-attention"
+  <Panel
+    role="region"
+    class="mt-4 min-w-0 break-words"
     aria-label="人工结果确认"
   >
-    <h3>先核实供应商中的实际结果</h3>
-    <p>
-      核对尝试：{{ snapshot.reconciliation_attempt_count }} · 最后错误：{{
-        snapshot.execution?.error_code || snapshot.error_code || '无'
-      }}
-    </p>
-    <a
-      v-if="providerUrl"
-      :href="providerUrl"
-      target="_blank"
-      rel="noopener noreferrer"
-    >在 {{ providerLabel(snapshot.provider) }} 中检查结果</a>
-    <p>重新核对只读取供应商结果。确认未执行不会自动重发。</p>
-    <div class="controls">
-      <button
-        type="button"
-        name="reconcile"
-        :disabled="disabled"
-        @click="act(null)"
+    <template #header="{ id }">
+      <!-- 接回 Panel 公开标题 ID，保留内置内容区域的可访问名称。 -->
+      <h3
+        :id="id"
+        class="m-0 text-base font-semibold"
       >
-        重新核对
-      </button><button
-        type="button"
-        name="confirmed_executed"
-        :disabled="disabled"
-        @click="choice = 'confirmed_executed'"
+        先核实供应商中的实际结果
+      </h3>
+    </template>
+    <div class="space-y-4">
+      <!-- 核对事实不是新失败事件；覆盖 Message 默认 assertive，避免每次快照刷新打断用户。 -->
+      <Message
+        severity="error"
+        role="note"
+        aria-live="off"
       >
-        确认已执行
-      </button><button
-        type="button"
-        name="confirmed_not_executed"
-        :disabled="disabled"
-        @click="choice = 'confirmed_not_executed'"
+        核对尝试：{{ snapshot.reconciliation_attempt_count }} · 最后错误：{{
+          snapshot.execution?.error_code || snapshot.error_code || '无'
+        }}
+      </Message>
+      <Button
+        v-if="providerUrl"
+        as="a"
+        variant="link"
+        :href="providerUrl"
+        target="_blank"
+        rel="noopener noreferrer"
       >
-        确认未执行
-      </button>
-    </div>
-    <p
-      v-if="busy"
-      role="status"
-    >
-      正在记录核对请求…
-    </p>
-    <div
-      v-if="error"
-      role="alert"
-      class="error"
-    >
-      <p>
-        {{ error.message
-        }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
-      </p>
-      <button
-        v-if="reload"
-        type="button"
-        @click="reload"
+        在 {{ providerLabel(snapshot.provider) }} 中检查结果
+      </Button>
+      <div class="space-y-3">
+        <p
+          :id="warningId"
+          class="text-sm"
+        >
+          重新核对只读取供应商结果。确认未执行不会自动重发。
+        </p>
+        <div class="flex flex-wrap gap-3">
+          <Button
+            type="button"
+            name="reconcile"
+            severity="secondary"
+            :aria-describedby="warningId"
+            :loading="busy && !choice"
+            :aria-busy="busy && !choice"
+            :disabled="disabled"
+            @click="act(null)"
+          >
+            重新核对
+          </Button>
+          <Button
+            type="button"
+            name="confirmed_executed"
+            :aria-describedby="warningId"
+            :loading="busy && choice === 'confirmed_executed'"
+            :aria-busy="busy && choice === 'confirmed_executed'"
+            :disabled="disabled"
+            @click="choice = 'confirmed_executed'"
+          >
+            确认已执行
+          </Button>
+          <Button
+            type="button"
+            name="confirmed_not_executed"
+            severity="secondary"
+            :aria-describedby="warningId"
+            :loading="busy && choice === 'confirmed_not_executed'"
+            :aria-busy="busy && choice === 'confirmed_not_executed'"
+            :disabled="disabled"
+            @click="choice = 'confirmed_not_executed'"
+          >
+            确认未执行
+          </Button>
+        </div>
+      </div>
+      <!-- choice 存在时背景被 AppShell inert；同一状态只在当前可感知位置呈现一份。 -->
+      <Message
+        v-if="busy && !choice"
+        severity="info"
+        role="status"
+        aria-live="polite"
       >
-        重新加载
-      </button>
+        正在记录核对请求…
+      </Message>
+      <Message
+        v-if="error && !choice"
+        severity="error"
+        role="alert"
+      >
+        <p>
+          {{ error.message
+          }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
+        </p>
+        <Button
+          v-if="reload"
+          type="button"
+          severity="secondary"
+          @click="reload"
+        >
+          重新加载
+        </Button>
+      </Message>
     </div>
     <ActionConfirmationDialog
       v-if="choice"
@@ -151,28 +200,35 @@ async function act(resolution: ManualResolution | null): Promise<void> {
       <p role="alert">
         此决定只记录人工结果，不会调用供应商写接口。确认未执行不会自动重发；如需再次执行，必须创建新草稿或提案并重新审批。
       </p>
+      <!-- 原 act 仍控制 busy/error；这里只投影提示，取消后由上面的互斥分支保留恢复入口。 -->
+      <Message
+        v-if="busy"
+        severity="info"
+        role="status"
+        aria-live="polite"
+        class="mt-4"
+      >
+        正在记录核对请求…
+      </Message>
+      <Message
+        v-if="error"
+        severity="error"
+        role="alert"
+        class="mt-4"
+      >
+        <p>
+          {{ error.message
+          }}<span v-if="error.traceId"> 追踪编号：{{ error.traceId }}</span>
+        </p>
+        <Button
+          v-if="reload"
+          type="button"
+          severity="secondary"
+          @click="reload"
+        >
+          重新加载
+        </Button>
+      </Message>
     </ActionConfirmationDialog>
-  </section>
+  </Panel>
 </template>
-<style scoped>
-.needs-attention {
-  background: #fff5df;
-  border-left: 3px solid #946200;
-  padding: 1rem;
-  margin-top: 1rem;
-  overflow-wrap: anywhere;
-}
-.controls {
-  display: flex;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-}
-.error {
-  color: #a61b1b;
-}
-button:focus-visible,
-a:focus-visible {
-  outline: 3px solid #164e9c;
-  outline-offset: 3px;
-}
-</style>

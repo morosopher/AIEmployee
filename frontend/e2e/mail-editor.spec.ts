@@ -10,7 +10,7 @@ import {
   TASK_ID,
 } from '../src/test-support/actionFixtures'
 import { connection, mailApproval } from '../src/test-support/editorFixtures'
-import { editorAction, editorJson, editorWorkspace } from './fixtures/editorApi'
+import { editorAction, editorJson, editorProblem, editorWorkspace } from './fixtures/editorApi'
 
 /** 只按公开角色编辑多选输入；既有芯片与未确认文字一并核对，不丢弃保存载荷。 */
 async function fillRecipient(
@@ -354,6 +354,8 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
   )
 
   await page.goto(`/actions?task=${TASK_ID}`)
+  // 用实际可访问名称验证自定义 Panel header 与内容区域保持关联。
+  await expect(page.getByRole('region', { name: '先核实供应商中的实际结果' }).getByRole('note')).toContainText('核对尝试：2')
   await page.getByRole('button', { name: '重新核对', exact: true }).click()
   await expect(
     page.getByRole('region', { name: '人工结果确认' }),
@@ -409,6 +411,12 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
     dialog.getByRole('button', { name: '确认记录结果' }),
   ).toBeDisabled()
   await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeDisabled()
+  // busy 原文只能有一份，且必须离开 inert 背景进入当前模态的无障碍树。
+  const pending = page.getByText('正在记录核对请求…', { exact: true })
+  await expect(pending).toHaveCount(1)
+  expect(await pending.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
+  await expect(dialog.getByRole('status')).toHaveText('正在记录核对请求…')
+  await expect(dialog.getByRole('status')).toHaveAttribute('aria-live', 'polite')
   await page.keyboard.press('Escape')
   await expect(dialog).toBeVisible()
   releaseRead()
@@ -424,6 +432,59 @@ test('narrow keyboard confirmation sends only an enum and waits for the authorit
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true)
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 409 的恢复决定必须在当前模态可见；重新加载只读取权威状态，不能重放人工提交。 */
+test('manual conflict stays perceptible in the active dialog and reloads the authoritative result', async ({ page }) => {
+  const capture = await editorWorkspace(page)
+  let snapshot = actionSnapshot()
+  await editorAction(page, () => snapshot)
+  await page.route(`**/api/v1/actions/${TASK_ID}/manual-resolution`, (route) =>
+    editorProblem(route, 'manual_resolution_version_conflict'),
+  )
+  await page.goto(`/actions?task=${TASK_ID}`)
+  const start = page.getByRole('button', { name: '确认已执行', exact: true })
+  await start.click()
+  const dialog = page.getByRole('dialog')
+  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused()
+  await dialog.getByRole('button', { name: '确认记录结果' }).click()
+  const recovery = page.getByText(/版本或状态已变化，请重新加载后核对。/)
+  await expect(recovery).toHaveCount(1)
+  expect(await recovery.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
+  const alert = dialog.getByRole('alert').filter({ hasText: '版本或状态已变化' })
+  await expect(alert).toContainText('版本或状态已变化，请重新加载后核对。')
+  await expect(alert).toContainText('追踪编号：synthetic-editor-trace')
+  await expect(dialog.getByRole('status')).toHaveCount(0)
+  await expect(dialog.getByRole('alert')).toHaveCount(2)
+  await expect(dialog).toContainText('此决定只记录人工结果，不会调用供应商写接口。确认未执行不会自动重发；如需再次执行，必须创建新草稿或提案并重新审批。')
+  expect(await dialog.evaluate((node) => node.closest('[inert]') === null)).toBe(true)
+  // 竞争标签页产生的服务端终态只能通过原 reload 入口读回，fixture 不提前推送它。
+  snapshot = actionSnapshot({
+    status: 'succeeded', error_code: null,
+    task_version: '9007199254740995', event_cursor: '9007199254740995',
+    local_action: {
+      id: DRAFT_ID, item_kind: 'mail_draft', version: 3,
+      status: 'sent', editor_url: `/mail/drafts/${DRAFT_ID}`,
+    },
+    execution: snapshot.execution ? {
+      ...snapshot.execution, status: 'succeeded', error_code: null,
+      manual_resolution: 'confirmed_executed', completed_at: NOW,
+    } : null,
+    timeline: [{
+      id: '9007199254740995', event: 'tool.manually_resolved',
+      occurred_at: NOW, payload: { status: 'succeeded' },
+    }],
+  })
+  await dialog.getByRole('button', { name: '重新加载', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByRole('article')).toContainText('人工结论：确认已执行')
+  await expect(page.getByRole('main')).toBeFocused()
+  expect(capture.mutations.map(({ path, payload }) => ({ path, payload }))).toEqual([{
+    path: `/actions/${TASK_ID}/manual-resolution`,
+    payload: { resolution: 'confirmed_executed', task_version: '9007199254740993' },
+  }])
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })
