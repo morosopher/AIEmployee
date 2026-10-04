@@ -149,6 +149,65 @@ const confirmations: Array<{ kind: CalendarConfirmation; label: string }> = [
   { kind: 'notification_policy', label: '通知策略' },
 ]
 const confirmation = useConfirm()
+/** 仅为等待用户决定提供页面级互斥；真正重读、意图复用和创建仍由原 hook 执行。 */
+const confirmingPreparation = ref(false)
+let preparationGeneration = 0
+
+/**
+ * 只结算当前确认一次；旧 accept／reject／hide 即使晚到也不能影响新确认。
+ * @param generation 打开确认时捕获的 UI 代次，不是业务版本或请求意图。
+ * @param accepted 只有用户确认按钮为 true，取消、Esc 和关闭都为 false。
+ */
+function finishPreparation(generation: number, accepted: boolean): void {
+  if (!confirmingPreparation.value || generation !== preparationGeneration) return
+  confirmingPreparation.value = false
+  preparationGeneration += 1
+  if (accepted && canPrepare.value) void prepareVersion()
+}
+/**
+ * 所有三处新版本入口共用本确认；文案不包含日程正文或敏感摘要。
+ * 等待时保留触发按钮供焦点归还，AppShell inert 隔离背景；代次门禁同时拒绝重复 DOM 事件。
+ */
+function confirmPreparation(): void {
+  if (confirmingPreparation.value || !canPrepare.value) return
+  confirmingPreparation.value = true
+  const generation = ++preparationGeneration
+  confirmation.require({
+    header: '准备新版本',
+    message: '将重新读取来源并创建本地新提案。原提案和审批保留不变。新提案需要独立核对、逐项确认并提交审批。',
+    defaultFocus: 'reject',
+    rejectProps: { label: '取消', severity: 'secondary', outlined: true },
+    acceptProps: { label: '确认准备' },
+    accept: () => finishPreparation(generation, true),
+    reject: () => finishPreparation(generation, false),
+    onHide: () => finishPreparation(generation, false),
+  })
+}
+/** 路由或来源投影变化时关闭旧 UI 决定，不把新对象沿用为旧确认的目标。 */
+function cancelPreparation(): void {
+  if (!confirmingPreparation.value) return
+  finishPreparation(preparationGeneration, false)
+  confirmation.close()
+}
+watch(
+  [
+    () => route.fullPath,
+    proposal,
+    () => proposal.value?.version,
+    () => proposal.value?.status,
+    () => proposal.value?.connection_id,
+    () => proposal.value?.calendar_id,
+    () => proposal.value?.target_event_id,
+    () => proposal.value?.base_etag,
+    () => proposal.value?.before_snapshot_id,
+    () => reprepareSource.value?.event_id,
+    () => reprepareSource.value?.requires_sync,
+    canPrepare,
+    reprepareVisible,
+  ],
+  cancelPreparation,
+  { flush: 'sync' },
+)
 let settleLeave: ((accepted: boolean) => void) | null = null
 /** 关闭或后续导航只结算当前确认；不把关闭视为批准。 */
 function finishLeave(accepted: boolean): void {
@@ -158,6 +217,7 @@ function finishLeave(accepted: boolean): void {
 }
 /** 页面只提示丢弃本地输入；认证跳登录继续沿用原会话和卸载清理边界。 */
 const removeLeaveGuard = router.beforeEach((to, from) => {
+  cancelPreparation()
   if (!dirty.value || to.path === from.path || to.path === '/login') return true
   finishLeave(false)
   return new Promise<boolean>((resolve) => {
@@ -186,6 +246,7 @@ onMounted(() => {
   window.addEventListener('beforeunload', beforeUnload)
 })
 onUnmounted(() => {
+  cancelPreparation()
   removeLeaveGuard()
   window.removeEventListener('beforeunload', beforeUnload)
   if (settleLeave) {
@@ -224,12 +285,12 @@ onUnmounted(() => {
       "
       @reload="reload"
       @new-object="newCalendar"
-      @new-version="prepareVersion"
+      @new-version="confirmPreparation"
     />
     <Button
       type="button"
       name="reload-editor"
-      :disabled="busy || restoreBusy || reprepareBusy"
+      :disabled="busy || restoreBusy || reprepareBusy || confirmingPreparation"
       @click="reload"
     >
       重新加载提案
@@ -243,12 +304,12 @@ onUnmounted(() => {
         :connection-id="proposal.connection_id"
         :entries="entries"
         :source="reprepareSource"
-        :busy="busy || reprepareBusy || restoreBusy"
+        :busy="busy || reprepareBusy || restoreBusy || confirmingPreparation"
         :can-prepare="canPrepare"
         :sync-task-id="syncTaskId"
         :sync-status="syncStatus"
         :sync-running="syncRunning"
-        @prepare="prepareVersion"
+        @prepare="confirmPreparation"
         @sync="syncReprepare"
         @refresh="refreshReprepare"
       />
@@ -303,7 +364,7 @@ onUnmounted(() => {
         @confirm-calendar="confirm('calendar')"
         @reload="reload"
         @new-object="newCalendar"
-        @new-version="prepareVersion"
+        @new-version="confirmPreparation"
       />
       <Message
         v-if="moduleFailed"

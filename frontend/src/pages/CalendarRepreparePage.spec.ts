@@ -1,12 +1,10 @@
-import { flushPromises, mount } from '@vue/test-utils'
-import { createPinia } from 'pinia'
-import PrimeVue from 'primevue/config'
-import ConfirmationService from 'primevue/confirmationservice'
-import { primeVueOptions } from '@/design/primevue'
-import { installViewport, restoreViewport } from '@/test-support/viewport'
-import { ref } from 'vue'
-import { createMemoryHistory, createRouter } from 'vue-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, waitFor, within } from '@testing-library/vue'
+import { defineComponent, h, reactive, ref } from 'vue'
+import { RouterView } from 'vue-router'
+import ConfirmDialog from 'primevue/confirmdialog'
+import { useConfirm } from 'primevue/useconfirm'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { renderWithPlugins } from '@/test-support/renderWithPlugins'
 import CalendarProposalPage from './CalendarProposalPage.vue'
 import * as calendar from '@/api/calendar'
 import * as connections from '@/api/connections'
@@ -42,7 +40,6 @@ vi.mock('@/composables/useTaskEvents', () => ({
 const EVENT_ID = '00000000-0000-0000-0000-000000000501'
 const NEW_ID = '00000000-0000-0000-0000-000000000599'
 let current: CalendarProposal, prepared: CalendarProposal
-let wrappers: ReturnType<typeof mount>[] = []
 
 /** 后端已证明的原 update，供应商 ID 与本地事件 UUID 刻意不同。 */
 function updateProposal(
@@ -79,7 +76,6 @@ function knownFacts(value: CalendarProposal) {
 }
 
 beforeEach(() => {
-  installViewport()
   vi.clearAllMocks()
   current = updateProposal()
   prepared = {
@@ -111,46 +107,41 @@ beforeEach(() => {
     calendar_task_id: TASK_ID,
   })
 })
-afterEach(() => {
-  wrappers.forEach((wrapper) => wrapper.unmount())
-  wrappers = []
-  restoreViewport()
-})
-
-/** 同一编辑器组件随真实路由参数变化；不用独立 DOM 壳掩盖晚到响应导航。 */
+/** 真实 RouterView 保留路由参数／卸载边界，ConfirmDialog 与应用共用相同服务出口。 */
 async function render(query = '') {
-  const router = createRouter({
-    history: createMemoryHistory(),
-    routes: [
-      {
-        path: '/calendar/proposals/:proposalId',
-        component: CalendarProposalPage,
+  let confirmation: ReturnType<typeof useConfirm> | undefined
+  const view = await renderWithPlugins(
+    defineComponent({
+      setup() {
+        confirmation = useConfirm()
+        return () => h('div', [h(RouterView), h(ConfirmDialog)])
       },
-      ...['actions', 'tasks', 'connections', 'brief'].map((name) => ({
-        path: `/${name}`,
-        component: { template: '<p>目标页面</p>' },
-      })),
-    ],
-  })
-  await router.push(`/calendar/proposals/${PROPOSAL_ID}${query}`)
-  const pinia = createPinia()
-  const wrapper = mount(CalendarProposalPage, {
-    global: {
-      stubs: { transition: false, 'transition-group': false },
-      plugins: [
-        pinia,
-        router,
-        [PrimeVue, primeVueOptions],
-        ConfirmationService,
-      ],
-    },
-  })
-  wrappers.push(wrapper)
-  await vi.waitFor(() =>
-    expect(wrapper.find('[aria-label="日程标题"]').exists()).toBe(true),
+    }),
   )
-  await flushPromises()
-  return { wrapper, router, tasks: useTasksStore(pinia) }
+  if (!confirmation) throw new Error('Synthetic confirmation service missing')
+  view.router.addRoute({
+    path: '/calendar/proposals/:proposalId',
+    component: CalendarProposalPage,
+  })
+  for (const name of ['actions', 'tasks', 'connections', 'brief'])
+    view.router.addRoute({
+      path: `/${name}`,
+      component: { render: () => h('p', '目标页面') },
+    })
+  await view.router.push(`/calendar/proposals/${PROPOSAL_ID}${query}`)
+  await view.findByLabelText('日程标题')
+  return { ...view, confirmation, tasks: useTasksStore(view.pinia) }
+}
+
+/** 只通过真实用户确认按钮继续；未确认之前不得读新版本或创建本地提案。 */
+async function acceptPreparation(view: Awaited<ReturnType<typeof render>>) {
+  const dialog = await view.findByRole('alertdialog', { name: '准备新版本' })
+  await fireEvent.click(
+    within(dialog).getByRole('button', { name: '确认准备' }),
+  )
+  await waitFor(() =>
+    expect(view.queryByRole('alertdialog')).not.toBeInTheDocument(),
+  )
 }
 
 describe('calendar reprepare recovery', () => {
@@ -168,24 +159,33 @@ describe('calendar reprepare recovery', () => {
         trace_id: 'synthetic-conflict-trace',
       })
     })
-    const { wrapper, router } = await render()
-    await wrapper.get('button[name="submit-proposal"]').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('创建新版本')
-    expect(
-      wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
-    ).toBeDefined()
+    const view = await render()
+    await fireEvent.click(view.getByRole('button', { name: '提交审批' }))
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    expect(view.baseElement.textContent).toContain('创建新版本')
+    expect(view.getByLabelText('日程标题')).toBeDisabled()
     expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
-    await wrapper.get('button[name="recover-new-version"]').trigger('click')
-    await flushPromises()
+    await fireEvent.click(view.getByRole('button', { name: '创建新版本' }))
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
     expect(calendar.getCalendarProposal).toHaveBeenCalledWith(PROPOSAL_ID)
-    expect(calendar.createCalendarProposal).toHaveBeenCalledWith(
-      {
-        operation_kind: 'update',
-        initialization: 'shell',
-        event_id: EVENT_ID,
-      },
-      expect.objectContaining({ key: expect.any(String) }),
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledWith(
+        {
+          operation_kind: 'update',
+          initialization: 'shell',
+          event_id: EVENT_ID,
+        },
+        expect.objectContaining({ key: expect.any(String) }),
+      ),
     )
     const readOrders = vi.mocked(calendar.getCalendarProposal).mock
       .invocationCallOrder
@@ -193,13 +193,13 @@ describe('calendar reprepare recovery', () => {
       vi.mocked(calendar.createCalendarProposal).mock.invocationCallOrder[0] ??
         0,
     )
-    expect(router.currentRoute.value.path).toBe(`/calendar/proposals/${NEW_ID}`)
-    expect(
-      wrapper.get('input[aria-label="日程标题"]').attributes('disabled'),
-    ).toBeUndefined()
-    expect(
-      wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-    ).toBeDefined()
+    await waitFor(() =>
+      expect(view.router.currentRoute.value.path).toBe(
+        `/calendar/proposals/${NEW_ID}`,
+      ),
+    )
+    expect(view.getByLabelText('日程标题')).toBeEnabled()
+    expect(view.getByRole('button', { name: '提交审批' })).toBeDisabled()
     expect(calendar.submitCalendarProposal).toHaveBeenCalledTimes(1)
     expect(calendar.updateCalendarProposal).not.toHaveBeenCalled()
     expect(current.status).toBe('stale')
@@ -212,18 +212,33 @@ describe('calendar reprepare recovery', () => {
         reject = failure
       }),
     )
-    const { wrapper } = await render('?recovery=new_version')
-    const button = wrapper.get('button[name="prepare-version"]')
-    await button.trigger('click')
-    await flushPromises()
-    await button.trigger('click')
-    expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1)
-    expect(button.attributes('disabled')).toBeDefined()
+    const view = await render('?recovery=new_version')
+    const button = view.getByRole('button', { name: '准备新版本' })
+    await fireEvent.click(button)
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    await fireEvent.click(button)
+    expect(view.queryByRole('alertdialog')).not.toBeInTheDocument()
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1),
+    )
+    expect(button).toBeDisabled()
     reject(new TypeError('Synthetic transport interruption'))
-    await flushPromises()
-    await button.trigger('click')
-    await flushPromises()
-    expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(button).toBeEnabled())
+    await fireEvent.click(button)
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(2),
+    )
     expect(vi.mocked(calendar.createCalendarProposal).mock.calls[1]?.[1]).toBe(
       vi.mocked(calendar.createCalendarProposal).mock.calls[0]?.[1],
     )
@@ -232,23 +247,25 @@ describe('calendar reprepare recovery', () => {
 
   it('waits for the existing account sync task, then explicitly reloads before preparing', async () => {
     current = updateProposal('stale', true)
-    const { wrapper, tasks } = await render()
-    const panel = () => wrapper.get('[aria-label="重新准备修改提案"]')
-    expect(panel().text()).toContain(connection().account_email)
-    expect(panel().text()).toContain('Google')
-    expect(
-      wrapper.get('button[name="prepare-version"]').attributes('disabled'),
-    ).toBeDefined()
-    await wrapper.get('button[name="sync-reprepare-source"]').trigger('click')
-    await flushPromises()
-    expect(connections.syncConnection).toHaveBeenCalledWith(connection().id)
-    expect(panel().text()).toContain('同步进行中')
-    expect(panel().find(`a[href="/tasks?task_id=${TASK_ID}"]`).exists()).toBe(
-      true,
+    const view = await render()
+    const panel = () => view.getByRole('region', { name: '重新准备修改提案' })
+    expect(panel().textContent).toContain(connection().account_email)
+    expect(panel().textContent).toContain('Google')
+    expect(view.getByRole('button', { name: '准备新版本' })).toBeDisabled()
+    await fireEvent.click(view.getByRole('button', { name: '同步来源账户' }))
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
     )
+    expect(connections.syncConnection).toHaveBeenCalledWith(connection().id)
+    expect(panel().textContent).toContain('同步进行中')
+    expect(
+      within(panel()).getByRole('link', { name: '查看同步任务' }),
+    ).toHaveAttribute('href', `/tasks?task_id=${TASK_ID}`)
     expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
     current = updateProposal('stale', false)
-    tasks.setTask({
+    view.tasks.setTask({
       id: TASK_ID,
       kind: 'sync_calendar',
       status: 'succeeded',
@@ -257,24 +274,37 @@ describe('calendar reprepare recovery', () => {
       event_cursor: '3',
       steps: [],
     })
-    await flushPromises()
-    expect(panel().text()).toContain('同步已完成')
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    expect(panel().textContent).toContain('同步已完成')
     expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
-    await wrapper.get('button[name="refresh-reprepare"]').trigger('click')
-    await flushPromises()
-    expect(
-      wrapper.get('button[name="prepare-version"]').attributes('disabled'),
-    ).toBeUndefined()
-    await wrapper.get('button[name="prepare-version"]').trigger('click')
-    await flushPromises()
-    expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1)
+    await fireEvent.click(view.getByRole('button', { name: '重新读取提案' }))
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    expect(view.getByRole('button', { name: '准备新版本' })).toBeEnabled()
+    await fireEvent.click(view.getByRole('button', { name: '准备新版本' }))
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1),
+    )
     expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
   })
 
   it.each(['source-lost', 'became-executing', 'requires-sync', 'read-failed'])(
     'does not prepare when the fresh read reports %s',
     async (change) => {
-      const { wrapper } = await render()
+      const view = await render()
       if (change === 'read-failed')
         vi.mocked(calendar.getCalendarProposal).mockRejectedValueOnce(
           new Error('Synthetic read failure'),
@@ -296,17 +326,31 @@ describe('calendar reprepare recovery', () => {
                 : { event_id: EVENT_ID, requires_sync: true },
           },
         }
-      await wrapper.get('button[name="prepare-version"]').trigger('click')
-      await flushPromises()
+      await fireEvent.click(view.getByRole('button', { name: '准备新版本' }))
+      await acceptPreparation(view)
+      await waitFor(() =>
+        expect(
+          view.queryByText('正在加载提案与日历目录…'),
+        ).not.toBeInTheDocument(),
+      )
       expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
       expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
-      expect(
-        wrapper.get('button[name="submit-proposal"]').attributes('disabled'),
-      ).toBeDefined()
+      expect(view.getByRole('button', { name: '提交审批' })).toBeDisabled()
       if (change === 'source-lost') {
-        expect(wrapper.text()).toContain('重新选择来源')
-        expect(wrapper.find('a[href="/brief"]').exists()).toBe(true)
-        expect(wrapper.find('a[href="/connections"]').exists()).toBe(true)
+        const sourceStatus = within(
+          view.getByRole('region', { name: '重新准备修改提案' }),
+        ).getByRole('status')
+        expect(sourceStatus).toHaveTextContent(
+          /原来源无法核实，请\s*重新选择来源\s*。/,
+        )
+        expect(sourceStatus).toHaveAttribute('aria-live', 'polite')
+        expect(view.baseElement.textContent).toContain('重新选择来源')
+        expect(
+          view.getByRole('link', { name: '重新选择来源' }),
+        ).toHaveAttribute('href', '/brief')
+        expect(
+          view.getByRole('link', { name: '检查连接、同步或重新授权' }),
+        ).toHaveAttribute('href', '/connections')
       }
     },
   )
@@ -318,19 +362,34 @@ describe('calendar reprepare recovery', () => {
         complete = resolve
       }),
     )
-    const { wrapper, router } = await render()
-    await wrapper.get('button[name="prepare-version"]').trigger('click')
-    await flushPromises()
+    const view = await render()
+    await fireEvent.click(view.getByRole('button', { name: '准备新版本' }))
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
     const another = '00000000-0000-0000-0000-000000000597'
     current = { ...updateProposal(), id: another }
-    await router.push(`/calendar/proposals/${another}`)
-    await flushPromises()
+    await view.router.push(`/calendar/proposals/${another}`)
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
     complete(prepared)
-    await flushPromises()
-    expect(router.currentRoute.value.path).toBe(
+    await waitFor(() =>
+      expect(
+        view.queryByText('正在加载提案与日历目录…'),
+      ).not.toBeInTheDocument(),
+    )
+    expect(view.router.currentRoute.value.path).toBe(
       `/calendar/proposals/${another}`,
     )
-    expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1)
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1),
+    )
   })
 
   it.each([
@@ -348,10 +407,10 @@ describe('calendar reprepare recovery', () => {
           reprepare_source: null,
         },
       }
-      const { wrapper } = await render('?recovery=new_version')
-      expect(wrapper.find('button[name="prepare-version"]').exists()).toBe(
-        false,
-      )
+      const view = await render('?recovery=new_version')
+      expect(
+        view.queryByRole('button', { name: '准备新版本' }),
+      ).not.toBeInTheDocument()
       expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
     },
   )
@@ -360,18 +419,153 @@ describe('calendar reprepare recovery', () => {
     'ignores a non-enum recovery query %s',
     async (query) => {
       current = updateProposal('editing')
-      const { wrapper } = await render(query)
-      expect(wrapper.find('[aria-label="重新准备修改提案"]').exists()).toBe(
-        false,
-      )
+      const view = await render(query)
+      expect(
+        view.queryByRole('region', { name: '重新准备修改提案' }),
+      ).not.toBeInTheDocument()
       expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
     },
   )
 
   it('shows an editing recovery link as a separate explicit preparation step', async () => {
     current = updateProposal('editing')
-    const { wrapper } = await render('?recovery=new_version')
-    expect(wrapper.find('button[name="prepare-version"]').exists()).toBe(true)
+    const view = await render('?recovery=new_version')
+    expect(
+      view.queryByRole('button', { name: '准备新版本' }),
+    ).toBeInTheDocument()
     expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+  })
+  it.each(['取消', 'Escape'])(
+    'keeps cancellation %s read-only and accepts just one later explicit decision',
+    async (choice) => {
+      current.description = 'Synthetic private description'
+      const view = await render()
+      const trigger = view.getByRole('button', { name: '准备新版本' })
+      trigger.focus()
+      await fireEvent.click(trigger)
+      const dialog = await view.findByRole('alertdialog', {
+        name: '准备新版本',
+      })
+      expect(dialog).toHaveTextContent('原提案和审批保留不变')
+      expect(dialog).not.toHaveTextContent('Synthetic private description')
+      expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(1)
+      expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+      // 即便测试直接派发第二个 DOM 事件，等待中的页面回调也必须保持互斥。
+      await fireEvent.click(trigger)
+      expect(view.getAllByRole('alertdialog')).toHaveLength(1)
+      expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+      if (choice === 'Escape') {
+        await waitFor(() =>
+          expect(
+            within(dialog).getByRole('button', { name: '取消' }),
+          ).toHaveFocus(),
+        )
+        await fireEvent.keyDown(document, { key: 'Escape', code: 'Escape' })
+      } else
+        await fireEvent.click(
+          within(dialog).getByRole('button', { name: '取消' }),
+        )
+      await waitFor(() =>
+        expect(view.queryByRole('alertdialog')).not.toBeInTheDocument(),
+      )
+      expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+      expect(calendar.getCalendarProposal).toHaveBeenCalledTimes(1)
+      await fireEvent.click(trigger)
+      await acceptPreparation(view)
+      await waitFor(() =>
+        expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1),
+      )
+    },
+  )
+
+  it.each(['route', 'query', 'unmount', 'version', 'source', 'status'])(
+    'discards a pending decision after %s changes',
+    async (change) => {
+      // 可控响应投影允许模拟等待期间权威对象改变，不调用私有页面方法或复制 hook。
+      current = reactive(updateProposal())
+      const view = await render()
+      const requests = vi.spyOn(view.confirmation, 'require')
+      await fireEvent.click(view.getByRole('button', { name: '准备新版本' }))
+      await view.findByRole('alertdialog', { name: '准备新版本' })
+      const staleAccept = requests.mock.calls[0]?.[0].accept
+      if (!staleAccept)
+        throw new Error('Synthetic confirmation callback missing')
+      if (change === 'route')
+        await view.router.push(`/calendar/proposals/${NEW_ID}`)
+      else if (change === 'query')
+        await view.router.push(
+          `/calendar/proposals/${PROPOSAL_ID}?recovery=new_version`,
+        )
+      else if (change === 'unmount') await view.router.push('/actions')
+      else if (change === 'version') current.version += 1
+      else if (change === 'status') current.status = 'executing'
+      else knownFacts(current).reprepare_source = null
+      await waitFor(() =>
+        expect(view.queryByRole('alertdialog')).not.toBeInTheDocument(),
+      )
+      // 直接调用页面交给公开服务的旧回调，避免点击已销毁的第三方 DOM。
+      staleAccept()
+      expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+      expect(calendar.submitCalendarProposal).not.toHaveBeenCalled()
+    },
+  )
+
+  it('ignores an earlier accept and hide callback while a later confirmation is open', async () => {
+    const view = await render()
+    const requests = vi.spyOn(view.confirmation, 'require')
+    const trigger = view.getByRole('button', { name: '准备新版本' })
+    await fireEvent.click(trigger)
+    const first = await view.findByRole('alertdialog', { name: '准备新版本' })
+    const earlier = requests.mock.calls[0]?.[0]
+    if (!earlier?.accept || !earlier.onHide)
+      throw new Error('Synthetic confirmation callbacks missing')
+    await fireEvent.click(within(first).getByRole('button', { name: '取消' }))
+    await waitFor(() =>
+      expect(view.queryByRole('alertdialog')).not.toBeInTheDocument(),
+    )
+    await fireEvent.click(trigger)
+    await view.findByRole('alertdialog', { name: '准备新版本' })
+    earlier.accept()
+    earlier.onHide()
+    expect(view.getAllByRole('alertdialog')).toHaveLength(1)
+    expect(calendar.createCalendarProposal).not.toHaveBeenCalled()
+    await acceptPreparation(view)
+    await waitFor(() =>
+      expect(calendar.createCalendarProposal).toHaveBeenCalledTimes(1),
+    )
+  })
+
+  it('preserves each real synchronization status once and never adds an assertive duplicate', async () => {
+    current = updateProposal('stale', true)
+    const view = await render()
+    const panel = within(view.getByRole('region', { name: '重新准备修改提案' }))
+    const status = panel.getByRole('status')
+    expect(status).toHaveTextContent(
+      '本地日程版本尚未更新，请先同步来源账户，任务完成后重新读取提案。',
+    )
+    expect(status).toHaveAttribute('aria-live', 'polite')
+    expect(panel.queryByRole('alert')).not.toBeInTheDocument()
+    await fireEvent.click(panel.getByRole('button', { name: '同步来源账户' }))
+    await waitFor(() => expect(panel.getAllByRole('status')).toHaveLength(2))
+    expect(
+      panel
+        .getAllByRole('status')
+        .filter((node) => node.textContent?.includes('同步进行中')),
+    ).toHaveLength(1)
+    view.tasks.setTask({
+      id: TASK_ID,
+      kind: 'sync_calendar',
+      status: 'failed',
+      retry_of_task_id: null,
+      error_code: null,
+      event_cursor: '2',
+      steps: [],
+    })
+    expect(
+      await panel.findByText('同步未完成，请检查任务结果和连接。', {
+        exact: false,
+      }),
+    ).toBeVisible()
+    expect(panel.queryByRole('alert')).not.toBeInTheDocument()
   })
 })

@@ -781,16 +781,27 @@ git commit -m "feat: migrate calendar editor to PrimeVue forms"
 
 **Files:**
 - Modify: `frontend/src/components/CalendarRepreparePanel.vue`、`frontend/src/components/CalendarFieldsComparison.vue`
-- Modify: `frontend/src/pages/CalendarRepreparePage.spec.ts`
-- Modify: `frontend/e2e/calendar-reprepare.spec.ts`
+- Modify: `frontend/src/pages/CalendarProposalPage.vue`、`frontend/src/pages/CalendarRepreparePage.spec.ts`
+- Create: `frontend/src/components/CalendarFieldsComparison.spec.ts`
+- Modify: `frontend/e2e/calendar-reprepare.spec.ts`、`frontend/e2e/calendar-editor.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+**展示层接线补充（2026-10-05）：** 页面三处重新准备绑定共用同一 UI ConfirmDialog 回调；只在用户确认且原提案／来源仍有效时调用原 hook。取消、Esc、等待互斥、路由切换及卸载清理仅属于展示交互，不改行为层。共享字段表格同时被编辑器和冻结审批预览消费，旧实现及迁移后补跑 `calendar-editor`、`calendar-restore`、`provider-errors` 和 `m2-actions` 日程相关 E2E；只适配必要语义选择器，不更改请求次数或幂等断言。
+
+**Task 13 同提交运行时记录（2026-10-05）：**
+
+- CalendarRepreparePanel 原三个条件 `status`（来源要求同步、同步任务进度、来源不可核实）均由 Message 原文承载，并显式 `aria-live="polite"`；进行中／成功／未完成仍按原任务事实选择文字，没有新增默认 assertive 副本。Panel 内置 region 取代原 section，公开 header slot id 维持唯一名称“重新准备修改提案”，不增加 live region。
+- CalendarFieldsComparison 不增加 live region；DataTable 保留日程修改前后／拟创建的日程名称、列头 scope 与纯文本。修改有原值／新值列，创建无伪造原值；字段行增加可见“已变化／未变化／拟创建”及 aria-label。空值原“无”附“（未填写）”，原语和数组元素保真比较，不让真实文字“无”与空值占位碰撞，不写回业务 diff。
+- 页面三处恢复入口复用 AppShell 已有 ConfirmDialog 的单一 `alertdialog`，仅用户点击时出现；不复制审批警告或业务状态公告。取消／Esc 零创建、等待互斥、旧回调／路由／源版本失效、全局背景 inert 与焦点归还均由运行时回归验证。原审批、同步、刷新、ETag 和未知结果的请求意图不变。
+
+**本任务验证：** 旧实现语义化单测 15 项、相关 E2E 49 项通过；迁移后聚焦 116 项、完整前端单测 628 项、相关 E2E 51 项通过，`just check` 通过。最终构建首屏 JS gzip 329,922 B（上限 340,373 B），CSS gzip 8,582 B，预算通过。完整 CI 和剩余旧样式门禁按 Task 16／17 执行。
+
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts && pnpm --dir frontend test:e2e e2e/calendar-reprepare.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：字段对比为 `DataTable`，列为「字段 / 原值 / 新值」，变化行有 `aria-label` 说明差异且不只靠颜色；重新准备走 `ConfirmDialog`；版本冲突 `calendar_event_version_conflict` 显示 `recovery=new_version` 入口且需再次显式操作。
 
@@ -798,18 +809,18 @@ Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.t
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建并删除 scoped CSS**
+- [x] **Step 3: 重建并删除 scoped CSS**
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/CalendarRepreparePage.spec.ts src/api/calendarReprepare.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/calendar-reprepare.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/components/CalendarRepreparePanel.vue frontend/src/components/CalendarFieldsComparison.vue frontend/src/pages/CalendarRepreparePage.spec.ts frontend/e2e/calendar-reprepare.spec.ts
+git add frontend/src/components/CalendarRepreparePanel.vue frontend/src/components/CalendarFieldsComparison.vue frontend/src/components/CalendarFieldsComparison.spec.ts frontend/src/pages/CalendarProposalPage.vue frontend/src/pages/CalendarRepreparePage.spec.ts frontend/e2e/calendar-reprepare.spec.ts frontend/e2e/calendar-editor.spec.ts docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate calendar reprepare to PrimeVue"
 ~~~
 

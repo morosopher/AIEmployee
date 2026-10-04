@@ -93,6 +93,14 @@ async function workspace(page: Page, requiresSync = false) {
   return { capture, state }
 }
 
+/** 对本地新提案的确认不等于外部写审批；每次重试仍需一次显式 UI 决定。 */
+async function confirmPreparation(page: Page): Promise<void> {
+  const dialog = page.getByRole('alertdialog', { name: '准备新版本' })
+  await expect(dialog).toBeVisible()
+  await dialog.getByRole('button', { name: '确认准备', exact: true }).click()
+  await expect(dialog).not.toBeVisible()
+}
+
 test('sync completion requires an explicit reread and an unknown creation response retries the same intent', async ({
   page,
 }) => {
@@ -176,6 +184,7 @@ test('sync completion requires an explicit reread and an unknown creation respon
   await expect(prepare).toBeEnabled()
   expect(attempts).toBe(0)
   await prepare.click()
+  await confirmPreparation(page)
   await expect(prepare).toBeDisabled()
   // 原生 disabled 点击不能发出第二个请求；第一回执仍未到达。
   await prepare.evaluate((button) => (button as HTMLButtonElement).click())
@@ -185,6 +194,7 @@ test('sync completion requires an explicit reread and an unknown creation respon
   await expect(page.getByRole('alert')).toContainText('请求失败')
   expect(attempts).toBe(1)
   await prepare.click()
+  await confirmPreparation(page)
   await expect(page).toHaveURL(new RegExp(`/calendar/proposals/${NEW_ID}$`))
   await expect(page.getByLabel('日程标题', { exact: true })).toBeEnabled()
   await expect(page.getByText('待确认：4 项', { exact: true })).toBeVisible()
@@ -261,6 +271,7 @@ test('an approval conflict links to explicit preparation without repeating the f
     capture.mutations.filter((item) => item.path === '/calendar/proposals'),
   ).toEqual([])
   await page.getByRole('button', { name: '准备新版本', exact: true }).click()
+  await confirmPreparation(page)
   await expect(page).toHaveURL(new RegExp(`/calendar/proposals/${NEW_ID}$`))
   await expect(page.getByLabel('日程标题', { exact: true })).toBeEnabled()
   await expect(page.getByText('待确认：4 项', { exact: true })).toBeVisible()
@@ -291,6 +302,7 @@ test('leaving the editor isolates a late preparation response', async ({
   await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
   const prepare = page.getByRole('button', { name: '准备新版本', exact: true })
   await prepare.click()
+  await confirmPreparation(page)
   await expect(prepare).toBeDisabled()
   await page.getByRole('link', { name: '返回操作中心', exact: true }).click()
   await expect(page).toHaveURL(/\/actions$/)
@@ -303,6 +315,72 @@ test('leaving the editor isolates a late preparation response', async ({
   expect(
     capture.mutations.filter((item) => item.path.endsWith('/submit')),
   ).toEqual([])
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 使用应用真实 ConfirmDialog 出口验证 inert、键盘环及关闭后的焦点，不模拟其服务。 */
+test('preparation confirmation cancels without requests and restores focus after Escape', async ({ page }) => {
+  const { capture, state } = await workspace(page)
+  state.current.description = 'Synthetic private description'
+  await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+  const trigger = page.getByRole('button', { name: '准备新版本', exact: true })
+  await trigger.click()
+  const dialog = page.getByRole('alertdialog', { name: '准备新版本' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog).toContainText('原提案和审批保留不变')
+  await expect(dialog).not.toContainText('Synthetic private description')
+  expect(await page.getByRole('main', { includeHidden: true }).evaluate((node) => Boolean(node.closest('[inert]')))).toBe(true)
+  await expect(dialog.getByRole('button', { name: '取消', exact: true })).toBeFocused()
+  for (const key of ['Tab', 'Tab', 'Tab', 'Shift+Tab', 'Shift+Tab', 'Shift+Tab']) {
+    await page.keyboard.press(key)
+    expect(await dialog.evaluate((node) => node.contains(document.activeElement))).toBe(true)
+  }
+  // 测试主动派发重复事件也不得越过页面等待门禁，真实用户由 AppShell inert 隔离。
+  await page.getByRole('button', { name: '准备新版本', exact: true, includeHidden: true }).evaluate((node) => (node as HTMLButtonElement).click())
+  await expect(page.getByRole('alertdialog')).toHaveCount(1)
+  expect(capture.mutations).toEqual([])
+  await page.keyboard.press('Escape')
+  await expect(dialog).not.toBeVisible()
+  await expect(trigger).toBeFocused()
+  expect(await page.getByRole('main').evaluate((node) => Boolean(node.closest('[inert]')))).toBe(false)
+  await trigger.click()
+  await dialog.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(dialog).not.toBeVisible()
+  await expect(trigger).toBeFocused()
+  expect(capture.mutations).toEqual([])
+  expect(capture.unexpected).toEqual([])
+  expect(capture.pageErrors).toEqual([])
+})
+
+/** 表单模块失败时仍保留页面级 EditorRecovery，不能从第三处入口绕过确认。 */
+test('fallback recovery after a form module failure shares the explicit preparation confirmation', async ({ page }) => {
+  const { capture, state } = await workspace(page)
+  await page.route('**/src/components/CalendarEditorForm.vue*', (route) => route.abort('failed'))
+  let reads = 0
+  await page.route(`**/api/v1/calendar/proposals/${PROPOSAL_ID}`, (route) => {
+    reads += 1
+    return reads === 2 ? editorProblem(route, 'calendar_event_version_conflict') : editorJson(route, state.current)
+  })
+  await page.route('**/api/v1/calendar/proposals', (route) => editorJson(route, { ...state.prepared, editor_facts: null }, 201))
+  await page.goto(`/calendar/proposals/${PROPOSAL_ID}`)
+  await expect(page.getByRole('alert').filter({ hasText: '日程表单加载失败' })).toBeVisible()
+  await page.getByRole('button', { name: '重新加载提案', exact: true }).click()
+  const recovery = page.getByRole('button', { name: '创建新版本', exact: true })
+  await expect(recovery).toBeVisible()
+  await recovery.click()
+  const dialog = page.getByRole('alertdialog', { name: '准备新版本' })
+  await expect(dialog).toBeVisible()
+  expect(capture.mutations).toEqual([])
+  await dialog.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(dialog).not.toBeVisible()
+  expect(capture.mutations).toEqual([])
+  await recovery.click()
+  await confirmPreparation(page)
+  await expect(page).toHaveURL(new RegExp(`/calendar/proposals/${NEW_ID}$`))
+  expect(capture.mutations.filter((item) => item.path === '/calendar/proposals')).toHaveLength(1)
+  expect(capture.mutations.filter((item) => item.path.endsWith('/submit') || item.path.endsWith('/decision'))).toEqual([])
+  expect(state.current.status).toBe('stale')
   expect(capture.unexpected).toEqual([])
   expect(capture.pageErrors).toEqual([])
 })
