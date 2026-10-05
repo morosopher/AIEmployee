@@ -1057,6 +1057,18 @@ git commit -m "test: enforce frontend style, accessibility, and bundle gates"
 
 ---
 
+### Task 17 前置：等待真实异步表单并拆分字段公告场景
+
+**Files:** `frontend/src/pages/CalendarRepreparePage.spec.ts`、`frontend/src/pages/CalendarPresentation.spec.ts`、`frontend/src/test-support/live-regions/editorScenarios.ts`、`frontend/src/test-support/live-regions/inventory.ts` 与本计划的本节。
+
+- 原候选 CI 的恢复测试在真实日程 Form 尚未加载完成时耗尽默认字段查询等待；有界时序诊断再次确认父版本先可见、字段查询结束早于模块完成。测试先等待稳定父版本 DOM，再用 Vitest 公开 `dynamicImportSettled` 等真实模块完成，随后保留原字段查询和全部恢复断言。后续默认 check 在 `CalendarPresentation.spec.ts` 的同形 `page()` 暴露同一加载中查询失败，仅将该助手按同一就绪顺序同步，31 个原场景断言不变。
+- 原 `fieldAdditions` 串行执行三种 Form，实际 CI 达 5263ms，超过默认 5000ms。拆为邮件、设置、日程三个独立场景，仅同步三条 inventory scenario 映射，保留全部字段、角色、数量与观察记录。
+- 设置场景后续默认 check 仍超时；真实 DOM 反例确认 editable 时区输入后仅 blur 不会关闭 Select，419 个选项一直留到提交。输入后用真实 Escape，等待公开 `aria-expanded=false` 及 `listbox`（包含隐藏节点）退出 DOM，同时断言非法输入值未被覆盖；八条字段公告仍在同一次真实提交中同时核验，不缩小公告查询范围或隐藏真实节点。
+- 不预加载或假替 Form，不修改默认 1s/5s、workers、生产页面或行为层；专属懒加载 E2E 不变。库存从 23 组拆为 25 组，94 项记录／92 项有效观察不变。
+- 原失败 CI 与有效时序诊断作为 RED；修改后运行恢复页／库存／helper 聚焦、完整默认单测及静态/check，并核对观察仅三处场景名称和自然时间变化。独立提交 `test: wait for async editor readiness and isolate form scenarios`，限定复审后再运行新候选完整 CI。
+
+---
+
 ### Task 17: 更新文档并冻结 M2.1 验收记录
 
 **Files:**

@@ -1114,14 +1114,14 @@ export const additionalInventory = [
   {
     id: 'MailEditorForm:fieldErrors',
     role: 'alert',
-    scenario: 'fieldAdditions',
+    scenario: 'mailFieldAdditions',
     currentComponent: 'MailEditorForm/MailDraftFields',
     change: '674ae1d五个格式字段各一个Message，来自实际Form/zod提交校验。',
   },
   {
     id: 'WorkSettingsForm:fieldErrors',
     role: 'alert',
-    scenario: 'fieldAdditions',
+    scenario: 'settingsFieldAdditions',
     currentComponent: 'WorkSettingsForm',
     change:
       '7a138f3八个格式字段的错误Message；包含旧validation语义的提前投影，不能与旧兜底重复计数。',
@@ -1129,7 +1129,7 @@ export const additionalInventory = [
   {
     id: 'CalendarEditorForm:fieldErrors',
     role: 'alert',
-    scenario: 'fieldAdditions',
+    scenario: 'calendarFieldAdditions',
     currentComponent: 'CalendarEditorForm/CalendarProposalFields',
     change:
       'ee0ad29五字段格式错误；非法时区时不猜测日期错误，修正时区后再验证两个日期字段。',

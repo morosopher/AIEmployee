@@ -355,11 +355,13 @@ export const editorScenarios = {
   calendarFacts,
   settingsForm,
   linkedAction,
-  fieldAdditions,
+  mailFieldAdditions,
+  settingsFieldAdditions,
+  calendarFieldAdditions,
 }
 
-/** 三类Form均通过真实提交生成字段公告；边界只提供合成快照，绝不把错误角色替换成桩。 */
-async function fieldAdditions() {
+/** 邮件字段通过真实Form提交生成公告；独立场景保留默认时限，不把错误角色替换成桩。 */
+async function mailFieldAdditions() {
   const mail = reactive({
     connection_id: CONNECTION_ID,
     to: '',
@@ -407,7 +409,10 @@ async function fieldAdditions() {
       '请填写纯文本正文。',
     ].sort(),
   )
-  cleanup()
+}
+
+/** 设置字段独立验证真实八条公告，避免与其他表单累计共用一个用例时限。 */
+async function settingsFieldAdditions() {
   network((url) =>
     url.endsWith('/settings') ? json(userSettings()) : json([]),
   )
@@ -425,6 +430,18 @@ async function fieldAdditions() {
   ] as const) {
     const input = screen.getByLabelText(label)
     await fireEvent.update(input, value)
+    if (label === 'IANA 时区') {
+      // editable Select 会展开全部时区，blur 不关闭浮层；先用真实 Esc 完成键盘离开，
+      // 避免后续字段查询与公告核验持续遍历无关选项，同时确认关闭没有覆盖非法原值。
+      expect(input).toHaveAttribute('aria-expanded', 'true')
+      await fireEvent.keyDown(input, { key: 'Escape', code: 'Escape' })
+      await waitFor(() => expect(input).toHaveAttribute('aria-expanded', 'false'))
+      // 公开展开状态会先更新；连隐藏的退出副本也须离开DOM后，再开始下一字段交互。
+      await waitFor(() =>
+        expect(screen.queryByRole('listbox', { hidden: true })).not.toBeInTheDocument(),
+      )
+      expect(input).toHaveValue(value)
+    }
     await fireEvent.blur(input)
   }
   await fireEvent.submit(screen.getByRole('form'))
@@ -434,7 +451,10 @@ async function fieldAdditions() {
       .getAllByRole('alert')
       .filter((node) => node.textContent?.includes('1–3650')),
   ).toHaveLength(3)
-  cleanup()
+}
+
+/** 日程保留非法时区和更正后日期错误两阶段，使用同一个真实Form验证依赖校验顺序。 */
+async function calendarFieldAdditions() {
   const calendar = reactive({
     connection_id: CONNECTION_ID,
     calendar_id: 'synthetic-google-calendar',

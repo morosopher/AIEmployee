@@ -129,6 +129,9 @@ async function render(query = '') {
       component: { render: () => h('p', '目标页面') },
     })
   await view.router.push(`/calendar/proposals/${PROPOSAL_ID}${query}`)
+  // 父快照可见后异步Form已开始加载；等待真实模块，避免把加载耗时塞进字段的默认查询窗口。
+  await view.findByText(/^版本 \d+ ·/)
+  await vi.dynamicImportSettled()
   await view.findByLabelText('日程标题')
   return { ...view, confirmation, tasks: useTasksStore(view.pinia) }
 }
