@@ -8,9 +8,9 @@
 
 ## 项目定位与当前范围
 
-AI Employee 是面向个人长期使用的智能办公助手。M1「可信任务中心 + 每日办公简报」已经完成，M2「可执行邮件与日历助手」已于 2026-09-15 验收通过（见 `docs/releases/2026-08-06-m2-release-evidence.md`）。当前实施目标是已批准的 **M2.1：前端组件库重构**，它只用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 替换前端展示层，不改动服务端契约、状态管理、SSE 行为、安全清洗和下列 M2 范围边界。M2.1 之后的 M2.2「上线收尾」尚未起草规格，不得提前实施。
+AI Employee 是面向个人长期使用的智能办公助手。M1「可信任务中心 + 每日办公简报」已经完成，M2「可执行邮件与日历助手」已于 2026-09-15 验收通过（见 `docs/releases/2026-08-06-m2-release-evidence.md`）。**M2.1：前端组件库重构**已于 2026-10-05 完成验收（见 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`），它只用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 替换前端展示层，不改动服务端契约、状态管理、SSE 行为、安全清洗和下列 M2 范围边界。M2.1 之后的 M2.2「上线收尾」尚未起草规格，不得提前实施。
 
-任务历史的限定补充：用户已于 2026-10-01 确认完整任务历史列表设计，2026-10-02 已实施并通过基准验收，见 `docs/releases/2026-10-01-task-history-evidence.md`。其规格为 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`，仅开放第 8 节列出的只读列表查询、必要索引、前端列表状态及下述已批准的 SSE 取消清理修复；其他后端、API、Store、SSE 或执行逻辑不开放。独立计划 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 8 已同时完成原 Task 7；文档提交复验后从原 Task 8 前置及 Task 8～17 接续，M2.1 其余任务边界不变。
+任务历史的限定补充：用户已于 2026-10-01 确认完整任务历史列表设计，2026-10-02 已实施并通过基准验收，见 `docs/releases/2026-10-01-task-history-evidence.md`。其规格为 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md`，仅开放第 8 节列出的只读列表查询、必要索引、前端列表状态及下述已批准的 SSE 取消清理修复；其他后端、API、Store、SSE 或执行逻辑不开放。独立计划 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 8 已同时完成原 Task 7；当时从原 Task 8 前置及 Task 8～17 接续，现已完成 M2.1；已批准例外的限定边界继续保留，不因验收自动开放其他行为层。
 
 M2 已交付并在 M2.1 中必须原样保留的能力：
 
@@ -68,7 +68,7 @@ AIEmployee/
 └── justfile                 # 唯一统一命令入口
 ```
 
-仓库已具备 M1 与 M2 实现。M2.1 缺少的目标文件、脚本或 recipe 应按当前实施计划补齐，不得为了临时可运行而建立第二套目录、命令或架构。
+仓库已具备 M1、M2 与 M2.1 实现。M2.1 规格、计划与验收记录共同描述当前基线；M2.2 尚无获批规格，不得提前实施，也不得建立第二套目录、命令或架构。
 
 ## 开发环境
 
@@ -83,7 +83,7 @@ AIEmployee/
 
 ## 构建、测试与验证命令
 
-以下是脚手架完成后的标准入口；若当前 recipe 尚未落地，应先完成实施计划中的工具链任务，不能假装命令已通过。
+以下为已落地的标准入口；`just check` 包含前端许可证、版本及严格样式检查，`just ci` 在构建后强制检查体积预算，并执行集成与浏览器门禁。
 
 | 目的 | 命令 |
 |---|---|

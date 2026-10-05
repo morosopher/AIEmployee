@@ -76,39 +76,39 @@ Token、Cookie、OAuth 凭据、Secret、原始允许列表身份键、完整邮
 本段对应已批准的 M2.1「前端组件库重构」，事实来源为
 [M2.1 设计](superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md) 与
 [实施计划](superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md)。M2.1 只替换前端
-展示层；已批准的完整任务历史及其取消清理例外见下节，不重新打开上文 M2 验收项，也不改变 M2 发布证据。勾选前必须有本轮新鲜命令输出，
-证据写入 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`；未完成任一项不得宣称
-M2.1 完成。
+展示层；已批准的完整任务历史及其取消清理例外见下节，不重新打开上文 M2 验收项，也不改变 M2 发布证据。本轮验收日期为 2026-10-05，
+新鲜命令、构建基准、逐项映射及限制见[M2.1 验收记录](releases/2026-09-19-m2-1-frontend-refactor-evidence.md)。
+最终文档提交后的 CI 按计划另存完整输出；完成状态以该最终门禁通过为准。
 
 ## 选型、许可与只读边界
 
-- [ ] `frontend/pnpm-lock.yaml` 中 `primevue`、`@primevue/forms`、`@primevue/auto-import-resolver`、`@primevue/core`、`@primevue/icons` 均为精确 `4.5.5`，`@primeuix/themes` 为 2.x，不存在 `primevue@5`、`@primeui/*` 或 `@primeuix/themes@3`；保存 `scripts/check-frontend-licenses.sh` 的完整输出，生产依赖满足 MIT/ISC/BSD/Apache-2.0 白名单或规格 §3.2 已批准的包名＋精确版本＋许可证例外，升级不继承例外。
-- [ ] 以 `git diff <M2.1 起点>..HEAD --stat` 证明既有行为层未被视觉重构任意修改；仅允许计划列出的展示校验文件、独立异步断开确认修复和完整任务历史补充限定文件。摘要不覆盖完整 Store；行为层缺陷修复均以独立 `fix:` 提交并附回归，SSE 例外只处理已批准的取消清理。
-- [ ] 审计全部页面与组件，确认没有新增 M2 范围外的可操作入口或占位 UI，没有暗色模式、多语言或主题切换。
+- [x] `frontend/pnpm-lock.yaml` 中 `primevue`、`@primevue/forms`、`@primevue/auto-import-resolver`、`@primevue/core`、`@primevue/icons` 均为精确 `4.5.5`，`@primeuix/themes` 为 2.x，不存在 `primevue@5`、`@primeui/*` 或 `@primeuix/themes@3`；保存 `scripts/check-frontend-licenses.sh` 的完整输出，生产依赖满足 MIT/ISC/BSD/Apache-2.0 白名单或规格 §3.2 已批准的包名＋精确版本＋许可证例外，升级不继承例外。
+- [x] 以 `git diff <M2.1 起点>..HEAD --stat` 证明既有行为层未被视觉重构任意修改；仅允许计划列出的展示校验文件、独立异步断开确认修复、用户批准的两文件最小真实错误码投影、完整任务历史补充限定文件及 2026-10-05 批准的两个故障演练测试文件。摘要不覆盖完整 Store；行为层缺陷修复均以独立 `fix:` 提交并附回归，SSE 例外只处理已批准的取消清理。
+- [x] 审计全部页面与组件，确认没有新增 M2 范围外的可操作入口或占位 UI，没有暗色模式、多语言或主题切换。
 
 ## 设计系统与样式清理
 
-- [ ] `bash scripts/check-frontend-styles.sh --strict` 退出码为 0：`src/**/*.vue` 不含十六进制颜色字面量与 `@media` 查询，残留 scoped 样式均有注释说明且不含颜色与断点。
-- [ ] `src/design/tokens.spec.ts` 证明现有 12 种颜色全部映射为语义 token，且文字/背景与白字/主色、白字/危险色对比度不低于 4.5。
-- [ ] 保存 375、900、1400 三种视口的 Playwright 截图，证明单栏抽屉、双栏折叠时间线、三栏布局，以及操作中心在任何视口都不显示全局时间线栏。
+- [x] `bash scripts/check-frontend-styles.sh --strict` 退出码为 0：`src/**/*.vue` 不含十六进制颜色字面量与 `@media` 查询，全部 48 个 Vue 文件均无 `<style>` 块，不再保留旧 scoped 样式。
+- [x] `src/design/tokens.spec.ts` 证明现有 12 种颜色全部映射为语义 token，且文字/背景与白字/主色、白字/危险色对比度不低于 4.5。
+- [x] 保存 375、900、1400 三种视口的 Playwright 截图，证明单栏抽屉、双栏折叠时间线、三栏布局，以及操作中心在任何视口都不显示全局时间线栏。
 
 ## 无障碍与交互
 
-- [ ] `e2e/accessibility.spec.ts` 对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图的 axe 结果 `serious`/`critical` 为零，保存原始报告哈希。
-- [ ] `src/test-support/liveRegionInventory.spec.ts` 证明 `role="status"`、`role="alert"`、`role="dialog"` 数量与迁移前冻结值一致，或每次增减都有提交说明记录。
-- [ ] 所有 `Dialog`/`Drawer` 有组件测试证明键盘打开、Esc 关闭、关闭后焦点返回触发元素、背景 `inert`。
-- [ ] 服务端 `error_code` 映射为安全表单级错误，`features/forms/problemFields.spec.ts` 覆盖每个已知错误码；字段格式错误来自 zod，不新增 `errors` 契约，schema 只含格式级规则。
-- [ ] 既有零浏览器存储断言、SSE 重放测试、Markdown 清洗测试在最终提交上原样通过。
+- [x] `e2e/accessibility.spec.ts` 对登录、简报、操作中心、邮件编辑器、日程编辑器、审批预览、`needs_attention` 七个视图的 axe 结果 `serious`/`critical` 为零，保存本轮 21 份主视图与 2 份 Drawer 的原始 axe 摘要 JSON 及 SHA-256；minor／moderate 项完整披露。
+- [x] `src/test-support/liveRegionInventory.spec.ts` 逐项验证 74 处旧模板公告及额外运行时场景；历史词法 43／32／1 中的两处 CSS 选择器明确排除，模板基线为 43／30／1。语义、文案及数量变化原因可追溯，22 项断言正负控验证跨 role／显式 live／嵌套重复不能漏过。
+- [x] 真实模态 `Dialog`/`Drawer` 有组件及浏览器证据验证键盘、Esc、焦点返回和背景 `inert`；DatePicker 锚定弹层明确非模态，保留原 Tab 循环与 Esc 返回输入，不虚称背景隔离。
+- [x] 服务端 `error_code` 映射为安全表单级错误，`features/forms/problemFields.spec.ts` 覆盖每个已知错误码；字段格式错误来自 zod，不新增 `errors` 契约，schema 只含格式级规则。
+- [x] 既有零浏览器存储、SSE 重放和 Markdown 不安全链接清洗断言在完整 CI 中继续通过；清洗、Store、SSE reducer 与路由守卫未被展示迁移改写。
 
 ## 门禁与体积
 
-- [ ] 保存 Task 1 记录的构建体积基线与最终 `bash scripts/report-frontend-bundle.sh --budget` 输出，首屏 JS gzip 增量不超过 200 KB、CSS gzip 不超过 60 KB；超预算须有用户确认记录。
-- [ ] 最终提交上 `just check` 与 `just ci` 均退出码 0，读取完整输出并记录起止时间、后端/前端测试数与 E2E 数。
-- [ ] `frontend/AGENTS.md`、根 `AGENTS.md`、README 的技术栈、浏览器基线和门禁描述与实现一致。
+- [x] 保存 Task 1 记录的构建体积基线与最终 `bash scripts/report-frontend-bundle.sh --budget` 输出，首屏 JS gzip 增量不超过 200 KB、CSS gzip 不超过 60 KB；超预算须有用户确认记录。
+- [x] 文档前独立 `just check` 与完整 `just ci` 退出码 0；最终文档提交再次完整 `just ci`（包含 check），退出码、完整输出、起止时间与测试数单独留档，不循环提交自身 SHA。
+- [x] `frontend/AGENTS.md`、根 `AGENTS.md`、新建 `CLAUDE.md`、README、规格与计划的技术栈、浏览器基线、完成状态和门禁描述与实现一致；M2.2 仍待批准。
 
 ## 完整任务历史补充（2026-10-02 基准验收通过）
 
-事实来源：[完整任务历史补充设计](superpowers/specs/2026-10-01-complete-task-history-design.md)及[验收记录](releases/2026-10-01-task-history-evidence.md)。`9aa1b3b` 的完整 CI 和体积预算通过，详细14项矩阵见验收记录；文档提交后的复验按计划独立留档。本段不更改 M1/M2 历史证据，也不表示整个 M2.1 完成。
+事实来源：[完整任务历史补充设计](superpowers/specs/2026-10-01-complete-task-history-design.md)及[验收记录](releases/2026-10-01-task-history-evidence.md)。`9aa1b3b` 的完整 CI 和体积预算通过，详细14项矩阵见验收记录；文档提交后的复验按计划独立留档。本段只记录该补充在 2026-10-02 的基准验收，不更改 M1/M2 历史证据；整个 M2.1 的 2026-10-05 验收见上节。
 
 - [x] 业务／全部分类和 PostgreSQL 保留记录完整查询，按类型、状态和用户时区日期筛选。
 - [x] 双向游标分页、并列时间、插入／状态变化／清理边界、游标篡改和跨用户拒绝通过。

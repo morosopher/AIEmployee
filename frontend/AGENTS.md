@@ -2,7 +2,7 @@
 
 ## 适用范围
 
-本文件适用于 `frontend/` 下的 Vue 应用、组件测试和 Playwright E2E，并继承根目录 `AGENTS.md`。M2「可执行邮件与日历助手」已于 2026-09-15 验收通过；当前已批准并正在实施的里程碑是 M2.1「前端组件库重构」，事实来源为 `docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md` 与 `docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md`。本文件不得放宽根文件中的 M2 范围、继承自 M1 的可信执行不变量、安全、隐私、审批和真实性要求。
+本文件适用于 `frontend/` 下的 Vue 应用、组件测试和 Playwright E2E，并继承根目录 `AGENTS.md`。M2「可执行邮件与日历助手」已于 2026-09-15 验收通过；M2.1「前端组件库重构」已于 2026-10-05 完成验收（见 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`）；后续 M2.2 尚无获批规格，不得提前实施。当前基线的事实来源为 `docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md` 与 `docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md`。本文件不得放宽根文件中的 M2 范围、继承自 M1 的可信执行不变量、安全、隐私、审批和真实性要求。
 
 ## 前端定位与目录边界
 
@@ -27,7 +27,7 @@ frontend/
 
 ## 技术栈与 M2.1 展示层边界
 
-本节引用的 `src/design/`、`src/test-support/renderWithPlugins.ts`、`src/test-support/liveRegionInventory.spec.ts`、`e2e/accessibility.spec.ts`、`e2e/layout.spec.ts` 与 `scripts/check-frontend-*.sh`、`scripts/report-frontend-bundle.sh` 由 M2.1 实施计划的 Task 1、2、16 建立；对应任务提交前，以实施计划为准，不得把尚未落地的门禁描述为已生效。
+本节引用的 `src/design/`、`src/test-support/renderWithPlugins.ts`、`src/test-support/liveRegionInventory.spec.ts`、`e2e/accessibility.spec.ts`、`e2e/layout.spec.ts` 与 `scripts/check-frontend-*.sh`、`scripts/report-frontend-bundle.sh` 已按 M2.1 实施计划的 Task 1、2、16 建立，许可证／版本、严格样式、axe／布局及构建预算门禁均已落地；原迁移期警告模式已结束。
 
 - UI 技术栈固定为 PrimeVue `4.5.5`（styled 模式 + 定制 Aura 预设）、`@primevue/forms` `4.5.5`、`@primeuix/themes` 2.x、`primeicons` 7、Tailwind CSS 4、`tailwindcss-primeui`、`@vueuse/core`、`zod`。引入其他 UI 库、图标库、CSS 体系、状态库、请求库，或升级 PrimeVue 主版本，必须先获 ADR 批准。
 - 禁止安装 PrimeVue 5、任何 `@primeui/*` 包或 `@primeuix/themes` 3.x：它们采用 PrimeUI 商业许可并含许可 Key 机制。`scripts/check-frontend-licenses.sh` 会在 `just check` 中拒绝这些包，以及默认 MIT/ISC/BSD/Apache-2.0 白名单以外且未匹配已批准基线例外的生产依赖。基线例外唯一完整清单见 M2.1 规格 §3.2：包名、精确版本与许可证原文必须同时匹配；生产例外可用于开发树，开发例外不得用于生产树，升级不继承例外。新增例外须先获用户批准并同步规格、计划、规则和测试。
@@ -44,7 +44,7 @@ frontend/
 - `just check` 运行快速许可证、版本、样式等检查；`just ci` 在构建后报告体积并检查预算。最终验收文档提交后追加 `just ci` 并另行留档输出，正文保留构建基准 HEAD，不循环修改自引用 SHA。
 - 首屏 JS gzip 增量预算 200 KB、CSS gzip 预算 60 KB，由 `scripts/report-frontend-bundle.sh --budget` 在 `just ci` 中检查。
 
-完整任务历史补充已于2026-10-02实施并通过基准验收，见 `docs/releases/2026-10-01-task-history-evidence.md`。规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 限定独立摘要 API 客户端、列表状态及 Task 7 页面集成；不允许以摘要覆盖 `stores/tasks.ts` 的完整快照／SSE 游标，不修改认证路由守卫，不增加每行 SSE。独立计划 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 8 已同时完成原 Task 7，文档复验后继续原 Task 8 前置及后续页面；其他行为层继续只读。
+完整任务历史补充已于2026-10-02实施并通过基准验收，见 `docs/releases/2026-10-01-task-history-evidence.md`。规格 `docs/superpowers/specs/2026-10-01-complete-task-history-design.md` 限定独立摘要 API 客户端、列表状态及 Task 7 页面集成；不允许以摘要覆盖 `stores/tasks.ts` 的完整快照／SSE 游标，不修改认证路由守卫，不增加每行 SSE。独立计划 `docs/superpowers/plans/2026-10-01-complete-task-history.md` 的 Task 8 已同时完成原 Task 7，此后原 Task 8 前置及后续页面已经完成；其他行为层继续遵守已批准边界。
 
 ## 开发与验证命令
 

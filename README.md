@@ -2,9 +2,11 @@
 
 AI Employee 是面向单管理员长期使用的可信办公助手。M1「可信任务中心 + 每日办公简报」已经
 交付；M2「可执行邮件与日历助手」已于 2026-09-15 完成验收，详见
-[发布证据](docs/releases/2026-08-06-m2-release-evidence.md)。当前实施目标是 M2.1「前端组件库
-重构」：用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 重建前端展示层，不改动后端与 M2 范围，
+[发布证据](docs/releases/2026-08-06-m2-release-evidence.md)。M2.1「前端组件库重构」已于 2026-10-05 完成，见
+[M2.1 验收记录](docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md)。当前展示层使用 PrimeVue 4.5.5（MIT）+
+Tailwind CSS 4；完整任务历史及 SSE 取消清理仅按已批准补充交付，M2 功能与安全边界保留。
 规格见 [M2.1 设计](docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md)。
+后续 M2.2「上线收尾」尚无获批规格，不得提前实施。
 M2 保留 PostgreSQL 业务事实、
 任务审计、Outbox、Checkpoint、SSE 重放和崩溃恢复底座，并增加 Google 与 Microsoft 邮件/日历
 连接、只读增量同步、本地草稿与提案，以及受控的真实写入。
@@ -62,7 +64,7 @@ just restore backup-file
 ```
 
 `just dev` 启动完整开发进程，`just infra-up` 只启动 PostgreSQL 和 Redis。部署构成、Caddy、
-备份恢复与 observability profile 见 [运行手册](docs/operations.md)。本轮已完成当前镜像的合成部署、
+备份恢复与 observability profile 见 [运行手册](docs/operations.md)。M2 验收已完成当时镜像的合成部署、
 HTTPS、加密备份恢复及旧格式隔离转换，[验收清单](docs/acceptance-checklist.md) 记录实际覆盖范围。
 生产环境尚未部署；非空生产 0019 升级仍须执行运行手册中的专用维护窗口流程。
 
@@ -74,7 +76,7 @@ M2 自动化发布检查从仓库根目录执行 `bash scripts/test-m2-release.s
 自动化使用 Google/Microsoft Fake，覆盖本地邮件及日程编辑、冻结审批、结果核对和人工确认。
 独立 Worker 演练会杀死真实 Taskiq 进程组，以原 pending 消息恢复并核对唯一 ToolExecution；
 浏览器结果与进程/队列证据分别记录。敏感扫描在输出生产者全部退出后绑定原始输出摘要，报告和
-Secret 不进入提交。本轮完整发布门禁、独立审查和另行授权的 12 项专用账户操作均已通过；真实写入
+Secret 不进入提交。M2 验收的完整发布门禁、独立审查和另行授权的 12 项专用账户操作均已通过；真实写入
 开关已关闭。发布证据区分各候选版本的执行事实，Microsoft 另一账户类型只完成自动化契约验证。
 
 ## 架构与连接
@@ -87,12 +89,16 @@ PostgreSQL 是连接、任务、审批、ToolExecution、审计、Outbox 与 Che
 ## 前端技术栈
 
 前端是 Vue 3 + TypeScript + Vite 单页应用，状态用 Pinia，路由用 vue-router，服务端通信统一经
-`frontend/src/api/`。已批准的 M2.1 把 UI 技术栈固定为 PrimeVue 4.5.5（styled 模式 + 定制 Aura
-预设）、PrimeVue Forms + zod、Tailwind CSS 4 与 `tailwindcss-primeui`；PrimeVue 5 及 `@primeui/*`
-包采用商业许可，M2.1 将以许可证检查拒绝引入。Tailwind 4 会把浏览器基线提升到 Chrome 111、
-Safari 16.4、Firefox 128 及以上。按 M2.1 实施计划，`just check` 将增加前端许可证与样式 token
-检查，`just ci` 将报告并限制首屏包体积，E2E 将包含 axe 无障碍扫描与三种视口布局检查；这些
-门禁在对应任务提交后才生效，以 `justfiles/test.just` 的实际内容为准。
+`frontend/src/api/`。UI 技术栈固定为 PrimeVue 4.5.5（styled 模式 + 定制 Aura 预设）、
+PrimeVue Forms + zod、Tailwind CSS 4 与 `tailwindcss-primeui`；设计常量集中在 `src/design/`。
+许可证与版本门禁拒绝 PrimeVue 5、`@primeui/*` 和 `@primeuix/themes` 3.x，保留规格 §3.2
+的精确版本基线许可例外。Forms 仅承担设置、邮件与日程格式校验，领域规则仍由服务端裁决。
+
+浏览器基线为 Chrome 111、Safari 16.4、Firefox 128 及以上；本轮自动化在 Chromium 执行，
+未把三种视口等同于三个浏览器引擎。`just check` 已包含许可证、版本及严格样式检查；
+`just ci` 在构建后限制首屏 JS gzip 相对迁移前基线的增量不超过 200 KB，CSS gzip 不超过
+60 KB，并执行七视图 axe 与 375／900／1400 像素布局验证。axe 门禁要求 serious／critical
+为零；保留的 minor／moderate 项和测试覆盖边界见验收记录。
 
 ## M2 范围边界
 

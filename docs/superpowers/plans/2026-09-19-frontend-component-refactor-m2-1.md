@@ -2,6 +2,8 @@
 
 > **执行方式：** 严格按任务编号串行执行，一次只做一个任务；每个任务先写失败测试并观察预期失败，再实现最小完整改动，最后用指定提交信息提交。步骤使用复选框（`- [ ]`）跟踪。未经用户要求不启动子 Agent 或并行代理。
 
+**完成状态（2026-10-05）：** Tasks 1～17 已按本计划及批准补充执行；Task 7 由完整任务历史补充交付。逐项提交、验证与实际文件差异见[验收记录](../../releases/2026-09-19-m2-1-frontend-refactor-evidence.md)。最终文档提交后的 CI 另存日志与 SHA，完成状态以该最终门禁通过为准；M2.2 尚无获批规格，不得提前实施。
+
 **目标：** 在不改动服务端契约、状态管理、SSE 行为、安全清洗和 M2 范围边界的前提下，用 PrimeVue 4.5.5（MIT）+ Tailwind CSS 4 重建前端全部页面的外观与交互，建立统一设计 token、无障碍门禁、许可证与主版本锁定门禁，并写出 M2.1 验收记录。
 
 **架构：** 展示层替换。`src/api/`、`src/stores/`、`src/composables/useTaskEvents.ts`、`src/features/*` 中的投影与恢复逻辑、`MarkdownMessage.vue` 的 DOMPurify 清洗、`src/router/` 守卫在本里程碑视为只读。新增 `src/design/` 作为 token 与状态映射的唯一来源；组件按需自动注册；旧 scoped CSS 逐页删除。
@@ -61,8 +63,8 @@
 
 - 修改：`frontend/e2e/*.spec.ts`
 - 创建：`frontend/e2e/support/axe.ts`、`frontend/e2e/accessibility.spec.ts`、`frontend/e2e/layout.spec.ts`
-- 修改：`frontend/AGENTS.md`、`AGENTS.md`、`CLAUDE.md`、`README.md`、`docs/acceptance-checklist.md`
-- 创建：`docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`
+- 修改：`frontend/AGENTS.md`、`backend/AGENTS.md`（仅首段里程碑状态）、`AGENTS.md`、`README.md`、`docs/acceptance-checklist.md`、本计划与对应 M2.1 规格
+- 创建：`CLAUDE.md`、`docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`
 
 ---
 
@@ -77,7 +79,7 @@
 - Create: `scripts/check-frontend-licenses.sh`、`scripts/check-frontend-styles.sh`、`scripts/report-frontend-bundle.sh`
 - Modify: `justfiles/test.just`、`scripts/test-tooling.sh`
 
-- [ ] **Step 1: 写失败的 token、状态映射与 PrimeVue 配置测试**
+- [x] **Step 1: 写失败的 token、状态映射与 PrimeVue 配置测试**
 
 ~~~typescript
 // frontend/src/design/tokens.spec.ts
@@ -118,19 +120,19 @@ it('reads the CSP nonce from the meta tag when present', () => {
 
 `TASK_STATUSES` 从 `src/api/types.ts` 既有联合类型派生；`contrastRatio` 是 `tokens.ts` 内的纯函数。
 
-- [ ] **Step 2: 运行并观察预期失败**
+- [x] **Step 2: 运行并观察预期失败**
 
 Run: `pnpm --dir frontend test:unit --run src/design`
 
 Expected: FAIL，`src/design` 模块不存在。
 
-- [ ] **Step 3: 安装依赖并锁定版本**
+- [x] **Step 3: 安装依赖并锁定版本**
 
 在 `frontend/` 执行 `pnpm add primevue@4.5.5 @primevue/forms@4.5.5 @primeuix/themes@2 primeicons@7 tailwindcss@4 @tailwindcss/vite@4 tailwindcss-primeui@0.6 @vueuse/core@15 zod@4` 与 `pnpm add -D @primevue/auto-import-resolver@4.5.5 unplugin-vue-components@32 @testing-library/vue@8 @testing-library/jest-dom @axe-core/playwright`。随后把 `package.json` 中四个 PrimeVue 包改为精确版本 `4.5.5`，`@primeuix/themes` 改为 `~2.x` 当前次版本。`pnpm-workspace.yaml` 的 `allowBuilds` 只在实际需要时新增条目，并在注释中说明原因。
 
 记录 `pnpm licenses list --prod --json` 与 `pnpm audit` 输出摘要，写入提交说明正文；出现默认白名单以外且不精确匹配规格 §3.2 授权基线例外的生产依赖即停止。
 
-- [ ] **Step 4: 建立设计 token、状态映射、locale 与 PrimeVue 配置**
+- [x] **Step 4: 建立设计 token、状态映射、locale 与 PrimeVue 配置**
 
 `tokens.ts` 导出 `semanticColors`、`contrastRatio` 和由 `definePreset(Aura, …)` 生成的 `appPreset`；`status.ts` 导出任务、能力、审批、连接状态到 `severity`/label 的映射；`locale.ts` 导出完整 zh-CN PrimeVue locale；`primevue.ts` 导出 `primeVueOptions` 与 `resolveCspNonce`。`app.css` 只包含 `@import "tailwindcss"`、`@plugin "tailwindcss-primeui"`、`@layer` 顺序声明、字体栈和 `prefers-reduced-motion` 规则。
 
@@ -138,7 +140,7 @@ Expected: FAIL，`src/design` 模块不存在。
 
 `renderWithPlugins.ts` 为 Testing Library 提供安装了 PrimeVue、Pinia 和路由 stub 的 `render` 包装，后续所有组件测试复用。
 
-- [ ] **Step 5: 添加许可证、主版本、样式与体积门禁**
+- [x] **Step 5: 添加许可证、主版本、样式与体积门禁**
 
 `scripts/check-frontend-licenses.sh`：读取 `pnpm licenses list --prod --json`，允许 MIT、ISC、BSD-2-Clause、BSD-3-Clause、Apache-2.0，开发依赖额外允许 MPL-2.0；基线例外严格匹配规格 §3.2 授权表的包名、精确版本和许可证原文，生产例外可用于开发树，开发例外不得用于生产树，同包升级不继承例外；扫描 `pnpm-lock.yaml`，出现 `primevue@5`、`/@primeui/`、`@primeuix/themes@3` 即 exit 1。
 
@@ -150,7 +152,7 @@ Expected: FAIL，`src/design` 模块不存在。
 
 `justfiles/test.just` 的 `check` 增加 `bash scripts/check-frontend-licenses.sh` 与 `bash scripts/check-frontend-styles.sh`；`ci` 在 `pnpm --dir frontend build` 后增加 `bash scripts/report-frontend-bundle.sh`。`scripts/test-tooling.sh` 断言三个脚本存在、可执行，并断言 `check` recipe 包含许可证检查。
 
-- [ ] **Step 6: 运行聚焦检查**
+- [x] **Step 6: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/design`
 
@@ -168,7 +170,7 @@ Run: `pnpm --dir frontend test:unit --run`
 
 Expected: PASS，既有页面不受影响。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ~~~bash
 git add frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml frontend/vite.config.ts frontend/tsconfig.app.json frontend/eslint.config.js frontend/index.html frontend/src/main.ts frontend/src/env.d.ts frontend/src/design frontend/src/test-support/renderWithPlugins.ts .gitignore scripts/check-frontend-licenses.sh scripts/check-frontend-styles.sh scripts/report-frontend-bundle.sh justfiles/test.just scripts/test-tooling.sh
@@ -185,13 +187,13 @@ git commit -m "feat: add PrimeVue and Tailwind design foundation"
 - Create: `frontend/src/components/AppNavigation.spec.ts`、`frontend/src/components/SystemAlertBanner.spec.ts`、`frontend/src/components/TimelineDrawer.spec.ts`
 - Modify: `frontend/e2e/reconnect.spec.ts`
 
-- [ ] **Step 1: 把 AppShell 既有测试改为角色选择器并在旧实现上确认通过**
+- [x] **Step 1: 把 AppShell 既有测试改为角色选择器并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/components/AppShell.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的骨架测试**
+- [x] **Step 2: 写失败的骨架测试**
 
 ~~~typescript
 it('marks the current route in the primary navigation', async () => {
@@ -226,17 +228,17 @@ it('hides the global timeline column on /actions at every breakpoint', async () 
 
 `setViewport` 是 `renderWithPlugins.ts` 提供的 `matchMedia` stub 助手。
 
-- [ ] **Step 3: 运行并观察预期失败**
+- [x] **Step 3: 运行并观察预期失败**
 
 Run: `pnpm --dir frontend test:unit --run src/components/AppShell.spec.ts src/components/AppNavigation.spec.ts src/components/SystemAlertBanner.spec.ts src/components/TimelineDrawer.spec.ts`
 
 Expected: FAIL，新组件不存在且旧实现无 `aria-current`/抽屉。
 
-- [ ] **Step 4: 实现骨架**
+- [x] **Step 4: 实现骨架**
 
 `AppNavigation.vue` 用 PrimeVue `Menu` 渲染六个既有入口，`RouterLink` 作为 item 模板，当前路由加 `aria-current="page"`；`< md` 时包裹在 `Drawer` 中，触发按钮 `aria-label="打开导航"`，关闭后焦点返回触发按钮。`SystemAlertBanner.vue` 用 `Message` 渲染加载（`severity="secondary"`、`role="status"`）、失败（`warn`、`role="alert"`）、逾期（`error`、`role="alert"`）三种状态，60 秒轮询与任务终态触发逻辑原样保留在 `AppShell.vue`。`TimelineDrawer.vue` 在 `≥ xl` 渲染为 `<aside aria-label="任务时间线">`，`md` 到 `< xl` 为可折叠 `Panel`，`< md` 为 `Drawer`。`AppShell.vue` 挂载 `Toast` 与 `ConfirmDialog` 出口，用 Tailwind grid 实现三档布局，删除全部 scoped CSS。
 
-- [ ] **Step 5: 运行聚焦检查**
+- [x] **Step 5: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/components/AppShell.spec.ts src/components/AppNavigation.spec.ts src/components/SystemAlertBanner.spec.ts src/components/TimelineDrawer.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint`
 
@@ -246,7 +248,7 @@ Run: `pnpm --dir frontend test:e2e e2e/reconnect.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ~~~bash
 git add frontend/src/components/AppShell.vue frontend/src/components/AppShell.spec.ts frontend/src/components/AppNavigation.vue frontend/src/components/AppNavigation.spec.ts frontend/src/components/SystemAlertBanner.vue frontend/src/components/SystemAlertBanner.spec.ts frontend/src/components/TimelineDrawer.vue frontend/src/components/TimelineDrawer.spec.ts frontend/e2e/reconnect.spec.ts
@@ -264,7 +266,7 @@ git commit -m "feat: rebuild app shell with PrimeVue layout"
 - Modify: `frontend/src/components/SourceLink.vue`、`frontend/src/components/MarkdownMessage.vue`
 - Modify: `frontend/src/components/BriefView.spec.ts`（仅选择器）
 
-- [ ] **Step 1: 写失败的基础组件测试**
+- [x] **Step 1: 写失败的基础组件测试**
 
 ~~~typescript
 it('renders an empty state with icon hidden from assistive technology and an optional action', async () => {
@@ -294,23 +296,23 @@ it('keeps sanitized markdown output and external link attributes', async () => {
 })
 ~~~
 
-- [ ] **Step 2: 运行并观察预期失败**
+- [x] **Step 2: 运行并观察预期失败**
 
 Run: `pnpm --dir frontend test:unit --run src/components/EmptyState.spec.ts src/components/StatusTag.spec.ts src/components/ProblemMessage.spec.ts`
 
 Expected: FAIL，组件不存在。
 
-- [ ] **Step 3: 实现基础组件**
+- [x] **Step 3: 实现基础组件**
 
 `EmptyState.vue`：图标（`aria-hidden`）、标题、可选说明与 `Button`。`StatusTag.vue`：接收 `kind` 与状态值，通过 `design/status.ts` 得到 `severity` 与 label，渲染 `Tag`。`ProblemMessage.vue`：接收 `ProblemError`，渲染 `Message severity="error"` 加 `role="alert"`，文本只用 `title`/`error_code` 映射的中文说明与 `trace_id`，不渲染 `detail` 原文；可选恢复按钮。`SourceLink.vue` 改用 `Button link` 外观并保留 `rel`。`MarkdownMessage.vue` 只调整排版类，清洗逻辑不动。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/components && pnpm --dir frontend type-check && pnpm --dir frontend lint`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
 git add frontend/src/components/EmptyState.vue frontend/src/components/EmptyState.spec.ts frontend/src/components/StatusTag.vue frontend/src/components/StatusTag.spec.ts frontend/src/components/ProblemMessage.vue frontend/src/components/ProblemMessage.spec.ts frontend/src/components/SourceLink.vue frontend/src/components/MarkdownMessage.vue frontend/src/components/BriefView.spec.ts
@@ -371,13 +373,13 @@ git commit -m "feat: migrate login page to PrimeVue"
 - Modify: `frontend/src/components/BriefView.vue`、`frontend/src/components/BriefView.spec.ts`
 - Modify: `frontend/e2e/daily-brief.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/TodayBriefPage.spec.ts src/components/BriefView.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：加载时 Skeleton 与 `role="status"` 文本并存；部分成功时 `Message warn` 列出缺失来源与最后同步时间；来源引用在 `Accordion` 内且键盘可展开；空简报显示 `EmptyState` 与「生成简报」按钮；生成中按钮 `loading` 禁用。
 
@@ -385,17 +387,17 @@ Run: `pnpm --dir frontend test:unit --run src/pages/TodayBriefPage.spec.ts src/c
 
 Expected: FAIL。
 
-- [ ] **Step 3: 用 Card、Tag、Skeleton、Message、Accordion 重建**
+- [x] **Step 3: 用 Card、Tag、Skeleton、Message、Accordion 重建**
 
 来源引用、数据截止时间、完整性文案原样保留；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/TodayBriefPage.spec.ts src/components/BriefView.spec.ts && pnpm --dir frontend type-check && pnpm --dir frontend lint && pnpm --dir frontend test:e2e e2e/daily-brief.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
 git add frontend/src/pages/TodayBriefPage.vue frontend/src/pages/TodayBriefPage.spec.ts frontend/src/components/BriefView.vue frontend/src/components/BriefView.spec.ts frontend/e2e/daily-brief.spec.ts
@@ -409,13 +411,13 @@ git commit -m "feat: migrate daily brief to PrimeVue"
 **Files:**
 - Modify: `frontend/src/pages/ChatPage.vue`、`frontend/src/pages/ChatPage.spec.ts`
 
-- [ ] **Step 1: 选择器改为角色并在旧实现上确认通过**
+- [x] **Step 1: 选择器改为角色并在旧实现上确认通过**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ChatPage.spec.ts`
 
 Expected: PASS。
 
-- [ ] **Step 2: 写失败的迁移断言**
+- [x] **Step 2: 写失败的迁移断言**
 
 覆盖：输入框为 `Textarea autoResize` 且 Enter 发送、Shift+Enter 换行；发送中按钮 `loading`；现有 REST 最终消息、重连重读与实时任务持久状态正确呈现，不增加当前不存在的临时 delta 投影；断线时显示 `Message warn` 且不把任务标为失败；保留可信本地邮件/日程编辑器链接及打开行为，操作中心按钮仍只指向既有 `/actions`，不新增入口。登录与聊天提交逻辑保持，Enter 处理尊重 IME composition。
 
@@ -423,17 +425,17 @@ Run: `pnpm --dir frontend test:unit --run src/pages/ChatPage.spec.ts`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 重建对话页**
+- [x] **Step 3: 重建对话页**
 
 `useTaskEvents` 与 Store 调用不动；删除 scoped CSS。
 
-- [ ] **Step 4: 运行聚焦检查**
+- [x] **Step 4: 运行聚焦检查**
 
 Run: `pnpm --dir frontend test:unit --run src/pages/ChatPage.spec.ts src/composables && pnpm --dir frontend type-check && pnpm --dir frontend lint`
 
 Expected: PASS，`useTaskEvents.spec.ts` 未改动且通过。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
 git add frontend/src/pages/ChatPage.vue frontend/src/pages/ChatPage.spec.ts
@@ -734,7 +736,8 @@ git commit -m "feat: migrate mail editor to PrimeVue forms"
 - Create: `frontend/src/features/calendar/schema.ts`、`frontend/src/features/calendar/schema.spec.ts`
 - Modify: `frontend/src/pages/CalendarProposalPage.vue`、`frontend/src/pages/CalendarProposalPage.spec.ts`
 - Modify: `frontend/src/components/CalendarProposalFields.vue`、`frontend/src/components/CalendarTargetFields.vue`、`frontend/src/components/CalendarConflictNotice.vue`、`frontend/src/components/MissingCalendarConnections.vue`
-- Modify: `frontend/e2e/calendar-editor.spec.ts`、`frontend/e2e/calendar-restore.spec.ts`
+- Modify: `frontend/e2e/calendar-editor.spec.ts`
+- Validate: `frontend/e2e/calendar-restore.spec.ts`（原选择器已为公开 role/name，旧基线和最终 E2E 均执行，无需制造代码改动）
 
 **Task 12 同提交运行时记录（2026-10-04）：**
 
@@ -771,7 +774,7 @@ Expected: PASS。
 - [x] **Step 5: 提交**
 
 ~~~bash
-git add frontend/src/features/calendar/schema.ts frontend/src/features/calendar/schema.spec.ts frontend/src/pages/CalendarProposalPage.vue frontend/src/pages/CalendarProposalPage.spec.ts frontend/src/components/CalendarProposalFields.vue frontend/src/components/CalendarTargetFields.vue frontend/src/components/CalendarConflictNotice.vue frontend/src/components/MissingCalendarConnections.vue frontend/e2e/calendar-editor.spec.ts frontend/e2e/calendar-restore.spec.ts frontend/src/components/CalendarEditorForm.vue frontend/src/components/CalendarDateTimeInput.vue frontend/src/pages/CalendarPresentation.spec.ts frontend/src/pages/CalendarRepreparePage.spec.ts frontend/src/components/CalendarApprovalPreview.vue docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
+git add frontend/src/features/calendar/schema.ts frontend/src/features/calendar/schema.spec.ts frontend/src/pages/CalendarProposalPage.vue frontend/src/pages/CalendarProposalPage.spec.ts frontend/src/components/CalendarProposalFields.vue frontend/src/components/CalendarTargetFields.vue frontend/src/components/CalendarConflictNotice.vue frontend/src/components/MissingCalendarConnections.vue frontend/e2e/calendar-editor.spec.ts frontend/src/components/CalendarEditorForm.vue frontend/src/components/CalendarDateTimeInput.vue frontend/src/pages/CalendarPresentation.spec.ts frontend/src/pages/CalendarRepreparePage.spec.ts frontend/src/components/CalendarApprovalPreview.vue docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "feat: migrate calendar editor to PrimeVue forms"
 ~~~
 
@@ -984,7 +987,7 @@ git commit -m "feat: migrate needs-attention panel to PrimeVue"
 - Create: `frontend/src/test-support/live-regions/inventory.ts`、`assertions.ts`、`assertions.spec.ts`、`coreScenarios.ts`、`editorScenarios.ts`、`workspaceScenarios.ts`（测试专用清单、唯一播报断言与真实组件场景）
 - Create: `frontend/e2e/support/visualWorkspace.ts`（复用既有 editorApi 与合成 fixture 的七视图装配）
 
-- [ ] **Step 1: 写失败的门禁与 E2E**
+- [x] **Step 1: 写失败的门禁与 E2E**
 
 `liveRegionInventory.spec.ts`：汇总 Task 2 前核对冻结的真实基线（历史全源码词法 status 43 / alert 32 / dialog 1；排除两处 CSS 选择器后模板为 43 / 30 / 1，共 74 处；另核对 aria-live 场景），逐项对照既有 `status`、`alert`、`dialog` 的触发场景、语义与文案；源码扫描只辅助清单，不能机械计数代替运行时验收。组件抽取、PrimeVue 内置 role、新抽屉造成的数量变化须有同提交的逐项原因与运行时测试，证明无漏报/重复播报；禁止空 role 凑数。样式断言沿用 Task 1 已落地的颜色检测（含八位颜色并排除 HTML 实体）及 `@media` 检查。
 
@@ -1002,21 +1005,21 @@ Run: `pnpm --dir frontend test:unit --run src/test-support/liveRegionInventory.s
 
 Expected: FAIL（若仍有残留颜色/`@media`），或 PASS（若前面任务已清理干净；此时直接进入 Step 3）。
 
-- [ ] **Step 2: 清理残留样式**
+- [x] **Step 2: 清理残留样式**
 
 删除全部 `.vue` 中的 `<style scoped>` 布局块，只允许保留无法用工具类表达且不含颜色与断点的极少数规则，并在注释中说明原因。
 
-- [ ] **Step 3: 把样式检查改为强制并把 axe 加入 E2E**
+- [x] **Step 3: 把样式检查改为强制并把 axe 加入 E2E**
 
 `justfiles/test.just` 的 `check` 改为 `bash scripts/check-frontend-styles.sh --strict`；`ci` 在 `report-frontend-bundle.sh` 加 `--budget`，预算变量默认 JS 200 KB、CSS 60 KB。`scripts/test-tooling.sh` 断言 `--strict` 与 `--budget` 存在。
 
-- [ ] **Step 4: 运行完整前端验证**
+- [x] **Step 4: 运行完整前端验证**
 
 Run: `pnpm --dir frontend test:unit --run && pnpm --dir frontend type-check && pnpm --dir frontend lint && bash scripts/check-frontend-styles.sh --strict && bash scripts/check-frontend-licenses.sh && pnpm --dir frontend build && bash scripts/report-frontend-bundle.sh --budget && pnpm --dir frontend test:e2e`
 
 Expected: 全部 PASS；记录体积数字。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ~~~bash
 git add frontend/src frontend/e2e/support/axe.ts frontend/e2e/accessibility.spec.ts frontend/e2e/layout.spec.ts frontend/playwright.config.ts justfiles/test.just scripts/check-frontend-styles.sh scripts/test-tooling.sh
@@ -1072,10 +1075,13 @@ git commit -m "test: enforce frontend style, accessibility, and bundle gates"
 ### Task 17: 更新文档并冻结 M2.1 验收记录
 
 **Files:**
-- Modify: `frontend/AGENTS.md`、`AGENTS.md`、`CLAUDE.md`、`README.md`、`docs/acceptance-checklist.md`
-- Create: `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`
+- Modify: `frontend/AGENTS.md`、`backend/AGENTS.md`（仅首段里程碑状态）、`AGENTS.md`、`README.md`、`docs/acceptance-checklist.md`
+- Modify: `docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md`、本计划（仅完成状态、既有事实澄清与证据链接）
+- Create: `CLAUDE.md`、`docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md`
 
-- [ ] **Step 1: 运行完整门禁**
+2026-10-05 文件清单核对：当前仓库没有 `CLAUDE.md`，因此按新建协作入口处理；规格与计划纳入同一文档提交，避免其他规则已标完成而权威清单仍全部待办。后端指南只同步首段旧里程碑状态，其他后端规则与代码不变。本任务共九份文档，不新增产品要求或 M2.2 实施内容。
+
+- [x] **Step 1: 运行完整门禁**
 
 Run: `just check`
 
@@ -1085,22 +1091,22 @@ Run: `just ci`
 
 Expected: PASS，读取完整输出；记录后端/前端测试数、E2E 数、axe 结果、体积数字、许可证检查结果与 HEAD SHA。
 
-- [ ] **Step 2: 写验收记录**
+- [x] **Step 2: 写验收记录**
 
 `docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md` 记录：验证基准 HEAD、`just ci` 起止时间与退出码、前端单测/E2E 通过数、axe 七视图结果、三种布局截图哈希、live region 基线逐项语义/文案比对、数量变化原因与运行时测试结果、`pnpm-lock.yaml` 中 PrimeVue 版本与许可证检查输出、体积基线与最终值、浏览器基线声明、未覆盖项。不记录任何真实数据。
 
-- [ ] **Step 3: 同步文档**
+- [x] **Step 3: 同步文档**
 
 README：技术栈段落写明 PrimeVue 4.5.5 + Tailwind 4、浏览器基线、`check` 新增门禁，并把「当前实施目标 M2.1」改为「M2.1 已于 <日期> 完成」。验收清单：勾选 M2.1 各项并链接验收记录。前端 `AGENTS.md` 与根 `AGENTS.md`/`CLAUDE.md`：确认技术栈与门禁描述与实现一致，把当前实施目标指向 M2.2 待批准状态。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ~~~bash
-git add frontend/AGENTS.md AGENTS.md CLAUDE.md README.md docs/acceptance-checklist.md docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md
+git add frontend/AGENTS.md backend/AGENTS.md AGENTS.md CLAUDE.md README.md docs/acceptance-checklist.md docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md docs/superpowers/plans/2026-09-19-frontend-component-refactor-m2-1.md
 git commit -m "docs: freeze M2.1 frontend refactor evidence"
 ~~~
 
-- [ ] **Step 5: 在最终文档提交上追加完整门禁并留档**
+- [x] **Step 5: 在最终文档提交上追加完整门禁并留档**
 
 Run: `just ci`
 
