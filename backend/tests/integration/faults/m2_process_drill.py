@@ -13,7 +13,7 @@ import json
 import os
 import signal
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -58,6 +58,14 @@ ROOT = Path(__file__).resolve().parents[4]
 
 
 @dataclass(frozen=True)
+class CheckpointDigest:
+    """数据库侧计算的checkpoint身份与整行摘要；Python不接收原checkpoint内容。"""
+
+    identity_sha256: str
+    content_sha256: str
+
+
+@dataclass(frozen=True)
 class ProcessFacts:
     """仅投影演练断言所需的状态和计数，不读取审批命令或其他用户内容。"""
 
@@ -71,10 +79,42 @@ class ProcessFacts:
     lease_expires_at: datetime | None
     scheduled_for: datetime | None
     checkpoints: int
+    checkpoint_records: tuple[CheckpointDigest, ...]
+
+
+def _committed_fact_differences(before: ProcessFacts, after: ProcessFacts) -> tuple[str, ...]:
+    """核对SIGKILL前后已有事实保留，允许真实后台checkpoint在kill之前追加。
+
+    Args:
+        before: 供应商/ACK暂停点的独立采样；Worker其他协程此时仍可提交checkpoint。
+        after: 自有进程组完全退出后的独立采样。
+
+    Returns:
+        只含字段名/固定分类的失败原因，不输出标识符、正文或checkpoint内容。租约可在kill前
+        最后一次合法续租；除此以外业务事实严格相等。旧checkpoint身份与整行摘要必须全保留，
+        丢失、同ID改写、替换或不一致计数均拒绝。kill后到重启前仍由调用方执行完整快照相等比较。
+    """
+    differences = [
+        field.name for field in fields(ProcessFacts)
+        if field.name not in {"lease_expires_at", "checkpoints", "checkpoint_records"}
+        and getattr(before, field.name) != getattr(after, field.name)
+    ]
+    for label, facts in (("before", before), ("after", after)):
+        if facts.checkpoints != len(facts.checkpoint_records):
+            differences.append(f"{label}_checkpoint_count")
+        if len({record.identity_sha256 for record in facts.checkpoint_records}) != len(facts.checkpoint_records):
+            differences.append(f"{label}_checkpoint_identity_duplicate")
+    after_records = {record.identity_sha256: record.content_sha256 for record in after.checkpoint_records}
+    for record in before.checkpoint_records:
+        if record.identity_sha256 not in after_records:
+            differences.append("checkpoint_missing")
+        elif after_records[record.identity_sha256] != record.content_sha256:
+            differences.append("checkpoint_changed")
+    return tuple(dict.fromkeys(differences))
 
 
 async def _facts(sessions: ManagedAsyncSessionMaker, task_id: UUID) -> ProcessFacts:
-    """每次用独立新会话读取已提交事实，包含真实 LangGraph checkpoint 的数量。"""
+    """独立读取已提交事实；checkpoint只从数据库接收稳定身份/整行摘要及其数量。"""
     from sqlalchemy import text
 
     async with sessions() as session:
@@ -83,11 +123,21 @@ async def _facts(sessions: ManagedAsyncSessionMaker, task_id: UUID) -> ProcessFa
         executions = tuple((await session.scalars(select(ToolExecutionModel).where(
             ToolExecutionModel.task_id == task_id,
         ))).all())
-        checkpoints = 0
+        checkpoint_records: tuple[CheckpointDigest, ...] = ()
         if await session.scalar(text("SELECT to_regclass('public.checkpoints') IS NOT NULL")):
-            checkpoints = int(await session.scalar(text(
-                "SELECT count(*) FROM checkpoints WHERE thread_id = :task_id"
-            ), {"task_id": str(task_id)}) or 0)
+            # PostgreSQL 17内置sha256，无新增扩展；jsonb在数据库侧规范编码，正文/metadata不进入Python。
+            rows = await session.execute(text("""
+                SELECT encode(sha256(convert_to(
+                    jsonb_build_array(checkpoint_ns, checkpoint_id)::text, 'UTF8'
+                )), 'hex') AS identity_sha256,
+                encode(sha256(convert_to(to_jsonb(c)::text, 'UTF8')), 'hex') AS content_sha256
+                FROM checkpoints AS c WHERE thread_id = :task_id
+                ORDER BY checkpoint_ns, checkpoint_id
+            """), {"task_id": str(task_id)})
+            checkpoint_records = tuple(
+                CheckpointDigest(identity_sha256=str(row.identity_sha256), content_sha256=str(row.content_sha256))
+                for row in rows
+            )
         execution = executions[0] if executions else None
         return ProcessFacts(
             task_status=task.status, execution_status=execution.status if execution else None,
@@ -96,7 +146,7 @@ async def _facts(sessions: ManagedAsyncSessionMaker, task_id: UUID) -> ProcessFa
             request_started=execution is not None and execution.request_started_at is not None,
             request_started_at=execution.request_started_at if execution else None,
             lease_expires_at=task.lease_expires_at, scheduled_for=task.scheduled_for,
-            checkpoints=checkpoints,
+            checkpoints=len(checkpoint_records), checkpoint_records=checkpoint_records,
         )
 
 
@@ -213,11 +263,11 @@ async def exercise_worker_crash(*, database_url: str, redis_url: str, point: str
                 await asyncio.to_thread(stop_owned_process, first)
                 assert first.returncode == -signal.SIGKILL
                 after_kill = await _facts(sessions, seed.task_id)
-                # SIGKILL 前最后一次合法续租可以晚于暂停点快照，因此用进程组完全退出后
-                # 的新会话作为租约基准；请求、结果与 checkpoint 的业务事实仍需保持。
-                result_fields = tuple(name for name in asdict(before) if name != "lease_expires_at")
-                committed_preserved = all(getattr(after_kill, name) == getattr(before, name) for name in result_fields)
-                assert committed_preserved
+                # 暂停execute不暂停异步checkpoint保存或最后续租；kill前追加合法，旧记录必须完整保留。
+                # 返回安全差异名，避免再次只得到无法定位字段的布尔失败；不输出原checkpoint内容。
+                differences = _committed_fact_differences(before, after_kill)
+                committed_preserved = not differences
+                assert committed_preserved, f"process preservation failed: {', '.join(differences)}"
                 pending_observed_at = monotonic()
                 pending_after_kill = await redis.xpending_range("ai_employee_tasks", "ai_employee_workers", "-", "+", 10)
                 assert len(pending_after_kill) == 1 and pending_after_kill[0]["message_id"] == pending[0]["message_id"]

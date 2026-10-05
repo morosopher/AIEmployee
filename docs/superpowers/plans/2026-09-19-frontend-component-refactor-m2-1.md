@@ -1040,6 +1040,23 @@ git commit -m "test: enforce frontend style, accessibility, and bundle gates"
 
 ---
 
+### Task 17 前置：保留崩溃采样间的已提交 checkpoint
+
+**授权：** 用户于 2026-10-05 明确批准两个后端测试文件的限定修复并同步范围文档。
+
+**Files:**
+- Modify: `backend/tests/integration/faults/m2_process_drill.py`
+- Create: `backend/tests/unit/test_m2_process_drill.py`
+- Modify: `AGENTS.md`、`backend/AGENTS.md`、对应规格与本计划的限定范围段落
+- Validate: `backend/tests/integration/faults/test_m2_write_recovery.py` 原两个参数场景，不修改该文件
+
+- 受控 RED 证明默认异步持久化允许真实 claim checkpoint 在暂停点采样之后、SIGKILL 之前提交（4→5）；原 CI 具体差异字段仍未知，不据此追溯声称已识别原失败。
+- 数据库侧计算 checkpoint 身份与整行摘要，仅取回摘要和数量。八项非租约业务事实继续严格相等；旧记录身份/内容全保留，拒绝丢失、替换、改写、重复身份和计数不一致。允许 kill 前真实追加，kill 后到 replacement 前仍完整快照严格不变。
+- 保留真实 SIGKILL、原 pending/重投、唯一写入、只读核对和 ACK 断言。生产、SSE、迁移、期限、租约、审批、写入开关与依赖不变；受控调度只在本地测试证据中，不建立产品注入框架。
+- 已审副本 18 项正负控、原两场景和受控完整恢复证据保留；应用后再运行新鲜单元、原两场景、必要受控回归、静态及 `just check`。独立提交 `test: preserve committed checkpoints across crash sampling`，限定复审后在新 HEAD 完整 `just ci`，不得用副本结果替代最终门禁。
+
+---
+
 ### Task 17: 更新文档并冻结 M2.1 验收记录
 
 **Files:**

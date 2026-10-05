@@ -75,6 +75,8 @@ M2.1 的目标是**只替换展示层**：用成熟的组件库和统一的设�
 - 生产部署、CSP 策略、TLS 与运维流程；这些属于 M2.2。
 - 修改 Playwright 覆盖的用户流程语义；E2E 只允许因 DOM 结构变化而调整选择器。
 
+2026-10-05 用户批准的 Task 17 测试例外：仅开放 `backend/tests/integration/faults/m2_process_drill.py` 与新增 `backend/tests/unit/test_m2_process_drill.py`，用于修正已证实的 SIGKILL 采样比较合法并发反例。身份与整行摘要在 PostgreSQL 内计算，Python 只读取摘要；非租约业务事实严格相等，旧 checkpoint 身份及摘要全保留，允许 kill 前真实追加，kill 后到重启前完整快照仍严格不变。原真实进程、pending、唯一写入、核对与 ACK 要求保持。原 CI 的具体变化字段仍未知；不修改生产后端、SSE、迁移、期限、租约、审批、写入开关或依赖，不开放其他后端测试路径。
+
 ### 2.3 发布边界
 
 M2.1 完成的定义是：全部页面迁移完毕、旧 scoped CSS 与硬编码颜色清零、`just ci` 通过、

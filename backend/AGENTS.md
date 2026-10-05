@@ -8,6 +8,8 @@ M2.1 的完整任务历史补充已于2026-10-02实施并通过基准验收，�
 
 用户于 2026-10-01 明确批准任务历史验收中的限定缺陷修复并同步规格、计划和规则：仅允许在 `backend/src/ai_employee/api/sse.py` 的有限数据库读取边界适配断线取消并保证连接清理，及其单元／真实 PostgreSQL 回归。根因是 AnyIO 重复取消中断 SQLAlchemy pre_ping 失效归还；不修改 SSE 事件协议、任务状态、审批／执行、全局 Session 工厂或第三方依赖，不关闭 pre_ping、不吞取消、不屏蔽告警。详见完整任务历史补充规格 §8、§9 和补充计划 Task 9；其他 M2.1 后端边界不变。
 
+用户于 2026-10-05 明确批准 Task 17 的两个后端测试文件限定修复：仅修改 `backend/tests/integration/faults/m2_process_drill.py`、新增 `backend/tests/unit/test_m2_process_drill.py`。数据库侧计算 `checkpoints` 表身份与整行摘要，所有非租约业务事实严格相等，旧 checkpoint 身份及内容摘要必须全保留，只允许 SIGKILL 前的真实追加；进程组退出到 replacement 启动前仍比较完整快照。保留真实 SIGKILL、原 Redis pending、唯一写入与恢复断言，不读取或输出原 checkpoint 内容。原 CI 的具体变化字段仍未知，受控反例只证明计数恒等假设过强。生产后端、SSE、迁移、执行期限、租约、审批、写入开关和依赖均不修改，其他后端测试路径不开放。
+
 ## 后端定位与目录边界
 
 后端负责身份与会话、REST/SSE 接口、可信任务与操作状态、领域规则、Google/Microsoft 邮件和日历同步、类型化真实写入、结果核对、模型调用、任务编排、持久化和后台进程。目标结构：
