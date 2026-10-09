@@ -64,7 +64,8 @@ const options = computed(() => [
       label="日历账户"
       :disabled="disabled || proposal.operation_kind !== 'create'"
     />
-    <div class="grid gap-1">
+    <!-- 目标名称和时区可能很长；列宽随 fieldset 收缩，完整选项仍可通过下拉框查看。 -->
+    <div class="grid grid-cols-1 gap-1">
       <label
         id="calendar-target-label"
         for="calendar-target"

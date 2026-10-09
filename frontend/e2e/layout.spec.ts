@@ -3,6 +3,11 @@ import { createHash } from 'node:crypto'
 import { expect, test } from '@playwright/test'
 import { settlePresentation, expectAccessible } from './support/axe'
 import { openVisualView, visualViews } from './support/visualWorkspace'
+import {
+  connection,
+  connectionCapabilities,
+} from '../src/test-support/editorFixtures'
+import { editorJson } from './fixtures/editorApi'
 
 /** 截图只使用共享合成数据；哈希使 Task17 可关联实际产物，不把二进制或报告提交进仓库。 */
 for (const view of visualViews) {
@@ -56,6 +61,79 @@ for (const view of visualViews) {
       body: JSON.stringify(record),
       contentType: 'application/json',
     })
+    expect(capture.mutations).toEqual([])
+    expect(capture.unexpected).toEqual([])
+    expect(capture.pageErrors).toEqual([])
+  })
+}
+
+/**
+ * 长目录名称必须在真实编辑器内收缩，不能把单列 Grid 或整页撑宽。
+ * 只覆盖合成只读目录并重新加载原路由；完整选项文字、键盘展开/关闭和零写请求一并验证。
+ * 删除账户或目标日历的列宽约束，应使此浏览器尺寸断言失败，不能用样式类名断言替代。
+ */
+for (const view of ['mail', 'calendar'] as const) {
+  test(`${view} keeps long account and calendar labels within the editor`, async ({
+    page,
+  }) => {
+    const capture = await openVisualView(page, view)
+    const accountEmail =
+      'synthetic-layout-regression-with-a-long-account-name@mail.example.test'
+    const calendarName =
+      'Synthetic planning calendar with a deliberately long name for narrow editor layouts'
+    const capabilities = connectionCapabilities()
+    await page.route('**/api/v1/connections', (route) =>
+      editorJson(route, [
+        { ...connection(), account_email: accountEmail },
+        connection('microsoft'),
+      ]),
+    )
+    await page.route(
+      `**/api/v1/connections/${connection().id}/capabilities`,
+      (route) =>
+        editorJson(route, {
+          ...capabilities,
+          provider_calendars: capabilities.provider_calendars.map(
+            (calendar) => ({ ...calendar, name: calendarName }),
+          ),
+        }),
+    )
+    await page.reload()
+    const labels = [
+      {
+        name: view === 'mail' ? '发送账户' : '日历账户',
+        text: `Google · ${accountEmail}`,
+      },
+      ...(view === 'calendar'
+        ? [{ name: '目标日历', text: `${calendarName} · Asia/Shanghai` }]
+        : []),
+    ]
+    for (const { name, text } of labels)
+      await expect(
+        page.getByRole('combobox', { name, exact: true }),
+      ).toHaveText(text)
+    await settlePresentation(page)
+    const width = page.viewportSize()?.width ?? 0
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width)
+    for (const { name, text } of labels) {
+      const select = page.getByRole('combobox', { name, exact: true })
+      await select.focus()
+      await select.press('Space')
+      await expect(select).toHaveAttribute('aria-expanded', 'true')
+      await expect(
+        page.getByRole('option', { name: text, exact: true }),
+      ).toBeVisible()
+      await select.press('Escape')
+      await expect(select).toHaveAttribute('aria-expanded', 'false')
+      await expect(select).toBeFocused()
+      await expect(select).toHaveText(text)
+      await settlePresentation(page)
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth),
+      ).toBeLessThanOrEqual(width)
+    }
     expect(capture.mutations).toEqual([])
     expect(capture.unexpected).toEqual([])
     expect(capture.pageErrors).toEqual([])

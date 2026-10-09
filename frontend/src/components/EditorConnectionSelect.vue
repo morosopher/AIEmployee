@@ -42,7 +42,8 @@ const options = computed(() => [
 ])
 </script>
 <template>
-  <div class="grid gap-1">
+  <!-- 显式零最小列宽让长账户名在 Select 内省略，避免 fluid 的百分比宽度被隐式 auto 列撑开。 -->
+  <div class="grid grid-cols-1 gap-1">
     <label
       :id="labelId"
       :for="inputId"
