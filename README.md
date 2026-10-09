@@ -1,108 +1,151 @@
 # AI Employee
 
-AI Employee 是面向单管理员长期使用的可信办公助手。M1「可信任务中心 + 每日办公简报」已经
-交付；M2「可执行邮件与日历助手」已于 2026-09-15 完成验收，详见
-[发布证据](docs/releases/2026-08-06-m2-release-evidence.md)。M2.1「前端组件库重构」已于 2026-10-05 完成，见
-[M2.1 验收记录](docs/releases/2026-09-19-m2-1-frontend-refactor-evidence.md)。当前展示层使用 PrimeVue 4.5.5（MIT）+
-Tailwind CSS 4；完整任务历史及 SSE 取消清理仅按已批准补充交付，M2 功能与安全边界保留。
-规格见 [M2.1 设计](docs/superpowers/specs/2026-09-19-frontend-component-refactor-m2-1-design.md)。
-后续 M2.2「上线收尾」尚无获批规格，不得提前实施。
-M2 保留 PostgreSQL 业务事实、
-任务审计、Outbox、Checkpoint、SSE 重放和崩溃恢复底座，并增加 Google 与 Microsoft 邮件/日历
-连接、只读增量同步、本地草稿与提案，以及受控的真实写入。
+**面向个人的智能办公助手，让邮件、日程与每日待办有序衔接。**
 
-真实外部写入默认关闭，且严格限于 `mail.send`、`calendar.create`、`calendar.update`、
-`calendar.restore`。每次写入都必须通过全局开关、供应商开关、连接能力、适用环境的专用账户
-白名单、冻结载荷哈希和单次人工审批；请求结果未知时只允许只读核对或人工确认，不得盲目重放。
+AI Employee 将每日简报、邮件草稿、日程提案和任务追踪整合到一个工作台。连接 Google 或 Microsoft 账户后，你可以整理当天信息、准备回复、安排日程，并在确认具体内容后授权执行。
+
+项目采用单管理员模式，支持自行部署。外部写入默认关闭，每封邮件的发送、每项日程的创建、修改或恢复，都需要你逐项审批。
+
+[核心功能](#核心功能) · [使用流程](#使用流程) · [快速开始](#快速开始) · [技术栈](#技术栈) · [文档](#文档)
+
+## 核心功能
+
+| 功能           | 你可以做什么                                                                                               |
+| -------------- | ---------------------------------------------------------------------------------------------------------- |
+| 每日办公简报   | 定时生成或手动刷新简报，查看邮件摘要、待回复事项、今日日程与来源引用                                       |
+| 邮件助手       | 准备新邮件、回复或全部回复，在本地编辑并加密保存草稿，确认后提交审批                                       |
+| 日程助手       | 创建或修改非重复日程，结合自己的已连接日历、工作时间与会议缓冲查看冲突建议；需要时从修改前快照准备恢复提案 |
+| 对话入口       | 查看或生成简报，通过明确指令准备邮件草稿与日程提案，跟踪任务进度                                           |
+| 操作中心       | 按状态查看草稿、提案、待审批操作和执行结果，筛选历史记录，处理需要人工确认的结果                           |
+| 任务历史       | 分页查询任务，查看实时状态、执行时间线和审计记录，断线后恢复进度展示                                       |
+| 账户与工作设置 | 管理 Google、Microsoft 连接及各项能力，设置默认发送账户、默认日历、时区和每周工作时间                      |
+
+支持 Gmail、Google Calendar，以及 Microsoft 个人账户和 Microsoft 365 工作或学校账户的邮件与日历。读取邮件、发送邮件、读取日历和写入日历分别授权，可按需启用。
+
+## 使用流程
+
+1. **连接账户**：在「连接与能力」中选择供应商，按需启用能力，并通过「继续授权」完成供应商授权。
+2. **设置工作习惯**：选择默认发送账户、默认日历、时区、工作时间和会议缓冲。
+3. **查看简报，准备行动**：从简报、对话或操作中心进入邮件与日程编辑器，检查收件人、正文、时间等具体内容。
+4. **预览并审批**：提交后冻结当前版本，审批只针对这一次操作。修改内容后需要重新提交，日程恢复也需要独立审批。
+5. **跟踪执行结果**：在操作中心和任务时间线查看进度；如果外部请求结果不明确，系统进入结果核对或人工确认流程。
 
 ## 快速开始
 
-在当前开发分支的仓库根目录复制 `.env.example` 为本地 `.env`，按
-[本地 Compose 启动说明](docs/operations.md#本地-compose-开发与专用账户验收) 准备未提交的
-Secret 文件、宿主 UID/GID 和不可变镜像标签，然后执行：
+### 环境要求
+
+- Docker Engine 与 Docker Compose **2.24.4 或更新版本**。
+- [just](https://github.com/casey/just)，作为统一命令入口。
+- 本机安装依赖、诊断和运行检查时，还需要 **Python 3.12 + uv**、**Node.js 24 LTS + pnpm**。
+- 浏览器最低版本：Chrome 111、Safari 16.4 或 Firefox 128。
+
+### 1. 获取代码
 
 ```bash
-just doctor
+git clone https://github.com/morosopher/AIEmployee.git
+cd AIEmployee
+```
+
+以下命令均在仓库根目录执行。本节用于首次本地启动；已有 `.env`、Secret 或数据库时，请保留原配置和数据。
+
+### 2. 准备配置
+
+首次创建本地配置文件：
+
+```bash
+cp -n .env.example .env
+chmod 600 .env
+```
+
+启动前，按[本地配置说明](docs/operations.md#本地-compose-开发与专用账户验收)准备 `secrets/development/` 下的 Secret 文件，并检查以下配置：
+
+| 配置项                                                 | 说明                                                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `LOCAL_UID` / `LOCAL_GID`                              | 分别填写 `id -u` / `id -g` 的结果，让容器能够读取本地 Secret                                     |
+| `APP_IMAGE_TAG`                                        | 为本次构建设置唯一标签；依赖变化后使用新标签                                                     |
+| 数据库密码、应用主密钥及其他 Secret                    | 按运行手册的文件清单准备，目录权限为 `0700`，文件权限为 `0600`；已有加密数据后不要重新生成主密钥 |
+| `MODEL_BASE_URL` / `MODEL_NAME` / `model_api_key` 文件 | 模型任务需要有效的服务地址、模型名称与密钥；地址填写兼容 API 根路径，通常以 `/v1` 结尾           |
+| Google / Microsoft OAuth 配置                          | 连接相应供应商前填写 Client ID，并准备对应 Secret；控制台回调地址必须与 `.env` 一致              |
+| 外部写入开关                                           | 保持示例中的关闭状态；启动服务不会自动启用邮件发送或日历写入                                     |
+
+完整 Secret 清单、OAuth 回调地址和供应商配置排查见[运行手册](docs/operations.md)。`.env` 与 Secret 文件仅保存在本地，不应提交到仓库。
+
+### 3. 启动服务
+
+```bash
 just dev
 ```
 
-`just dev` 会构建镜像并依次完成数据库角色初始化、迁移和服务启动。保持该终端运行，另开终端
-在同一目录创建首次管理员；密码文件须事先准备，内容不会进入命令参数：
+该命令通过 Docker Compose 构建镜像、初始化数据库角色、执行迁移并启动服务。首次构建可能需要一些时间；保持此终端运行。
+
+### 4. 创建管理员并登录
+
+先将管理员密码保存在本地 `secrets/development/admin_password` 文件中，权限设为 `0600`。另开终端，进入仓库根目录后执行：
 
 ```bash
 just create-admin admin@example.test secrets/development/admin_password compose
 just health
 ```
 
-浏览器访问 `http://localhost:5173` 后登录；OAuth 回调经 `http://localhost:8000` 进入 API，
-成功后自动返回连接页。点击“启用”后还需完成“继续授权”；未完成或刷新丢失链接时可重新授权。
-管理员创建拒绝覆盖已有身份，项目不提供公开注册。使用宿主进程开发时，先 `just bootstrap`，
-并为宿主配置可达数据库及 Secret 绝对路径；`just create-admin email password_file` 默认在宿主执行。
-自动化测试使用合成数据时设置 `APP_ENV=test` 与 `APP_TEST_MODE=true`，二者缺一不可，且不得用于生产。
-默认的三层写入开关保持关闭，常规开发、测试和演示不得连接个人 Google/Microsoft 账户或执行
-真实外部写入。
+`admin@example.test` 是示例登录名，可替换为自己的管理员邮箱。命令从文件读取密码，拒绝覆盖已有管理员；项目不提供公开注册。
 
-登录后可从主导航进入 `/actions` 操作中心，按草稿、提案、待审批、执行或核对、人工确认和
-历史查看服务端状态。列表支持筛选与分页；真实任务可展开只读详情、供应商检查链接和审计时间线，
-窄屏以独立区域展示详情。重新聚焦或恢复连接会重读快照，敏感预览只驻留内存，内容到期后显示
-保留的执行历史。本地编辑对象保留自身标识，操作列表不直接提供编辑、审批或重新发送入口。
+服务健康后，访问 **<http://localhost:5173>** 登录。OAuth 回调通过本机 `http://localhost:8000` 的 API 接收，授权成功后返回连接页。
+
+本地启动仅验证服务运行，模型调用与账户连接仍依赖有效配置。常规测试和演示使用模拟供应商与合成数据；真实账户验证须在另行授权的专用测试环境中进行，并遵守账户允许列表、写入开关和逐项审批要求。
+
+部署所需的域名、TLS、Secret 挂载、数据库维护及备份恢复步骤见[运行手册](docs/operations.md)。
+
+## 安全与隐私
+
+- **精确审批**：只支持发送邮件、创建日程、修改日程和恢复日程四种外部写操作。审批绑定冻结版本及其内容哈希，内容变化、审批过期或版本冲突都会拒绝执行。
+- **按需授权**：OAuth 权限按连接和能力逐步申请；真实写入还必须同时满足全局开关、供应商开关、连接能力及适用环境的账户允许列表。
+- **加密保存**：OAuth Token、邮件草稿和日程敏感内容加密存储，应用密钥与模型密钥通过 Secret 文件注入。未批准草稿只保存在本地，不写入供应商草稿箱。
+- **结果可核对**：每次执行保留任务与审计记录。只有能证明先前操作未应用时才允许重试；结果未知时进行只读核对或请求人工确认。
+- **最小披露**：发送给模型的内容先在本地清洗，减少签名、引用历史和敏感信息披露；敏感预览不写入浏览器持久存储。
+
+## 支持范围
+
+AI Employee 专注于个人办公中的简报、邮件与日程协助，采用单管理员登录，不提供公开注册或多用户协作。
+
+- 邮件支持纯文本新建、回复和全部回复；不支持转发、附件、富文本、通讯录、批量发送或供应商草稿箱同步。
+- 日程写入仅支持非重复日程的创建、修改和恢复；不支持删除或取消、重复日程写入、自动创建会议链接或查询参会人空闲时间。冲突建议仅基于当前用户自己的日历。
+- 不提供完整收件箱或日历客户端、本地 Exchange、共享邮箱、代理发送、文件上传、知识库检索、长期记忆、通用任务规划或工具市场。
+
+## 技术栈
+
+| 层级           | 技术                                                |
+| -------------- | --------------------------------------------------- |
+| Web 界面       | Vue 3、TypeScript、Vite、Pinia、Vue Router          |
+| UI 与表单      | PrimeVue 4.5.5、Tailwind CSS 4、PrimeVue Forms、zod |
+| API 与领域逻辑 | Python 3.12、FastAPI、SQLAlchemy 2、Alembic         |
+| 任务执行       | Taskiq、LangGraph、持久化 Checkpoint、Outbox        |
+| 数据与队列     | PostgreSQL、Redis                                   |
+| 部署与入口     | Docker Compose、Caddy                               |
+| 测试与检查     | pytest、Vitest、Playwright、axe、Ruff、mypy         |
+
+API、Worker 和 Scheduler 以独立进程运行。PostgreSQL 保存业务数据、任务、审批、审计与恢复状态；Redis 承载队列和实时通知。浏览器通过 REST 与 SSE 获取数据和任务进度。
 
 ## 常用命令
 
-```bash
-just doctor
-just test
-just test-integration
-just test-e2e
-just lint
-just typecheck
-just check
-just ci
-just health
-just backup
-just restore backup-file
-```
+在仓库根目录运行 `just` 可查看全部命令。安装本机工具链后，可用 `just bootstrap` 安装前后端依赖。
 
-`just dev` 启动完整开发进程，`just infra-up` 只启动 PostgreSQL 和 Redis。部署构成、Caddy、
-备份恢复与 observability profile 见 [运行手册](docs/operations.md)。M2 验收已完成当时镜像的合成部署、
-HTTPS、加密备份恢复及旧格式隔离转换，[验收清单](docs/acceptance-checklist.md) 记录实际覆盖范围。
-生产环境尚未部署；非空生产 0019 升级仍须执行运行手册中的专用维护窗口流程。
+| 命令                      | 用途                                                             |
+| ------------------------- | ---------------------------------------------------------------- |
+| `just doctor`             | 检查本机工具与 Docker Compose                                    |
+| `just dev`                | 启动完整本地环境                                                 |
+| `just test`               | 运行前后端单元测试                                               |
+| `just check`              | 运行静态检查、类型检查、单元测试，以及前端许可证、版本和样式检查 |
+| `just test-integration`   | 运行集成测试                                                     |
+| `just test-e2e`           | 运行浏览器端到端测试                                             |
+| `just ci`                 | 运行完整检查、集成测试、构建、体积预算与浏览器测试               |
+| `just ps` / `just health` | 查看服务状态与健康情况                                           |
+| `just logs api`           | 查看 API 服务日志                                                |
 
-M2 自动化发布检查从仓库根目录执行 `bash scripts/test-m2-release.sh`。运行前按运行手册准备
-固定 Task13 测试 PostgreSQL、独立 Redis DB15、合成 Secret、浏览器与 Docker Compose；脚本在
-第一个子命令前拒绝其他数据库地址，随后顺序执行完整 CI、显式审计、故障/迁移/恢复矩阵和敏感
-输出扫描。直接运行集成 pytest 与浏览器测试也会复用受管临时数据库，原始测试库只作为只读锚点。
+集成测试和端到端测试需要独立测试数据库、Redis 与合成 Secret，具体准备方式见[运行手册](docs/operations.md)。
 
-自动化使用 Google/Microsoft Fake，覆盖本地邮件及日程编辑、冻结审批、结果核对和人工确认。
-独立 Worker 演练会杀死真实 Taskiq 进程组，以原 pending 消息恢复并核对唯一 ToolExecution；
-浏览器结果与进程/队列证据分别记录。敏感扫描在输出生产者全部退出后绑定原始输出摘要，报告和
-Secret 不进入提交。M2 验收的完整发布门禁、独立审查和另行授权的 12 项专用账户操作均已通过；真实写入
-开关已关闭。发布证据区分各候选版本的执行事实，Microsoft 另一账户类型只完成自动化契约验证。
+## 文档
 
-## 架构与连接
-
-FastAPI API、Taskiq Worker 和 Scheduler 是独立进程；应用层协调领域规则和供应商无关端口。
-PostgreSQL 是连接、任务、审批、ToolExecution、审计、Outbox 与 Checkpoint 的唯一事实来源，Redis
-仅承载队列、通知和可重建协调数据。Google 与 Microsoft OAuth 按连接渐进申请 `mail.read`、
-`mail.send`、`calendar.read`、`calendar.write` 最小委托 scope，Token 以版本化 AEAD 密文保存。
-
-## 前端技术栈
-
-前端是 Vue 3 + TypeScript + Vite 单页应用，状态用 Pinia，路由用 vue-router，服务端通信统一经
-`frontend/src/api/`。UI 技术栈固定为 PrimeVue 4.5.5（styled 模式 + 定制 Aura 预设）、
-PrimeVue Forms + zod、Tailwind CSS 4 与 `tailwindcss-primeui`；设计常量集中在 `src/design/`。
-许可证与版本门禁拒绝 PrimeVue 5、`@primeui/*` 和 `@primeuix/themes` 3.x，保留规格 §3.2
-的精确版本基线许可例外。Forms 仅承担设置、邮件与日程格式校验，领域规则仍由服务端裁决。
-
-浏览器基线为 Chrome 111、Safari 16.4、Firefox 128 及以上；本轮自动化在 Chromium 执行，
-未把三种视口等同于三个浏览器引擎。`just check` 已包含许可证、版本及严格样式检查；
-`just ci` 在构建后限制首屏 JS gzip 相对迁移前基线的增量不超过 200 KB，CSS gzip 不超过
-60 KB，并执行七视图 axe 与 375／900／1400 像素布局验证。axe 门禁要求 serious／critical
-为零；保留的 minor／moderate 项和测试覆盖边界见验收记录。
-
-## M2 范围边界
-
-M2 不是完整邮箱或日历客户端。供应商草稿箱同步、附件、HTML/富文本邮件、转发、通讯录、批量
-操作、日程删除/取消、重复日程写入、会议链接自动创建、参会人 Free/Busy、完整收件箱/日历、
-共享邮箱或代理发送、文件上传、RAG、长期记忆、通用 Planner、通用工具或工具市场、多用户、产品
-多 Agent 和 Kubernetes 均不在当前里程碑内。
+- [运行手册](docs/operations.md)：本地配置、OAuth、部署、备份恢复和故障排查。
+- [配置示例](.env.example)：环境变量与 Secret 路径说明。
+- [设计文档](docs/superpowers/specs/)：产品规则、系统架构和数据契约。
+- [协作指南](AGENTS.md)：代码规范、测试要求与贡献约定。
